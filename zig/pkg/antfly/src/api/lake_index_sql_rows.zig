@@ -29,6 +29,7 @@ const Owner = struct {
     a: A,
     arena: std.heap.ArenaAllocator,
     source: *local.serverless_query_lake_serving.ServingSource,
+    row_resolver: ?local.serverless_query_lake_serving.ServingSource.RowResolver = null,
     store: Store,
     owns_store: bool = true,
     store_identity: [32]u8,
@@ -153,9 +154,14 @@ const Owner = struct {
         while (true) {
             const entries = try self.reader.nextEntries(a, limit);
             if (entries.len != 0 or !try self.advanceProbe()) {
-                if (self.source.row_resolver == null) return entries;
+                if (!self.isRelocated()) return entries;
                 const mapped = try a.dupe(ordered.Reader.Entry, entries);
-                for (mapped) |*entry| entry.ref = try self.source.fromIndex(a, entry.ref);
+                const refs = try a.alloc(local.storage_rowsource_types.RowRef, entries.len);
+                defer a.free(refs);
+                for (entries, refs) |entry, *ref| ref.* = entry.ref;
+                const translated = try self.mapRefs(a, refs);
+                for (mapped, translated) |*entry, ref| entry.ref = ref;
+                a.free(translated);
                 return mapped;
             }
         }
@@ -167,10 +173,31 @@ const Owner = struct {
         }
     }
     fn mapRefs(self: *Owner, a: A, refs: []const local.storage_rowsource_types.RowRef) ![]const local.storage_rowsource_types.RowRef {
-        if (self.source.row_resolver == null) return refs;
-        const mapped = try a.alloc(local.storage_rowsource_types.RowRef, refs.len);
-        for (refs, mapped) |ref, *target| target.* = try self.source.fromIndex(a, ref);
-        return mapped;
+        if (!self.isRelocated()) return refs;
+        const resolver = self.row_resolver.?;
+        if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, true);
+        const result = try a.alloc(local.storage_rowsource_types.RowRef, refs.len);
+        for (refs, result) |ref, *target| target.* = try resolver.from_index(resolver.ptr, a, ref);
+        return result;
+    }
+    fn isRelocated(self: *const Owner) bool {
+        return if (self.row_resolver) |resolver| resolver.relocated else false;
+    }
+    fn acceptsCut(self: *const Owner, source: []const u8, snapshot: []const u8) bool {
+        if (self.row_resolver) |resolver| return std.mem.eql(u8, source, resolver.source) and std.mem.eql(u8, snapshot, resolver.snapshot);
+        return self.source.isCurrentCut(source, snapshot);
+    }
+    fn toIndex(self: *Owner, a: A, ref: local.storage_rowsource_types.RowRef) !local.storage_rowsource_types.RowRef {
+        if (self.row_resolver) |resolver| return resolver.to_index(resolver.ptr, a, ref);
+        return ref;
+    }
+    fn mapToIndex(self: *Owner, a: A, refs: []const local.storage_rowsource_types.RowRef) ![]const local.storage_rowsource_types.RowRef {
+        if (!self.isRelocated()) return refs;
+        const resolver = self.row_resolver.?;
+        if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, false);
+        const result = try a.alloc(local.storage_rowsource_types.RowRef, refs.len);
+        for (refs, result) |ref, *target| target.* = try resolver.to_index(resolver.ptr, a, ref);
+        return result;
     }
     fn prepare(self: *Owner) !bool {
         try self.read_context.ensureActive();
@@ -535,20 +562,20 @@ pub const Predicate = struct {
         try owner.read_context.ensureActive();
         var scratch = std.heap.ArenaAllocator.init(owner.a);
         defer scratch.deinit();
-        const index_ref = try owner.source.toIndex(scratch.allocator(), ref);
+        const index_ref = try owner.toIndex(scratch.allocator(), ref);
         return owner.reader.containsPhysical(index_ref, owner.predicate_lower, owner.predicate_upper);
     }
     pub fn intersectsPhysical(self: *Predicate, first: local.storage_rowsource_types.RowRef, last: local.storage_rowsource_types.RowRef) !?bool {
         if (self.scan) return null;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
-        if (owner.source.row_resolver != null) return null;
+        if (owner.isRelocated()) return null;
         return owner.reader.intersectsPhysical(first, last, owner.predicate_lower, owner.predicate_upper);
     }
     pub fn hasBlocks(self: Predicate) bool {
         if (self.scan) return false;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
-        return owner.source.row_resolver == null and owner.reader.root.predicates != null;
+        return !owner.isRelocated() and owner.reader.root.predicates != null;
     }
     pub fn nextBlocks(self: *Predicate, a: A) ![]const ordered.predicate_blocks.Block {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -655,7 +682,7 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
         const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
         const root = owner.reader.root;
         if (root.reverse == null) continue;
-        if (!source.acceptsIndexCut(root.source, root.snapshot)) return error.ExternalLakeSnapshotMismatch;
+        if (!owner.acceptsCut(root.source, root.snapshot)) return error.ExternalLakeSnapshotMismatch;
         const result = try out.alloc(?local.storage_db_types.ColumnSource, refs_.len);
         @memset(result, null);
         var transferred = false;
@@ -663,22 +690,46 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
             for (result) |value| if (value) |row| row.deinit();
             out.free(result);
         };
+        const Pending = struct { entry: ordered.Reader.Entry, position: usize };
+        const pending = try scratch.allocator().alloc(Pending, refs_.len);
+        // Sort the bounded gather by block identity: one lease, decode and
+        // read-budget charge per block, while preserving ranked output order.
+        const index_refs = try owner.mapToIndex(scratch.allocator(), refs_);
+        for (index_refs, pending, 0..) |ref, *item, position| {
+            try owner.read_context.ensureActive();
+            const entry = (try owner.reader.entryAtPhysical(scratch.allocator(), ref)) orelse return null;
+            if (entry.cover == null) return null;
+            item.* = .{ .entry = entry, .position = position };
+        }
+        std.mem.sort(Pending, pending, {}, struct {
+            fn less(_: void, left: Pending, right: Pending) bool {
+                return std.mem.order(u8, left.entry.cover.?.block.artifact_id, right.entry.cover.?.block.artifact_id) == .lt;
+            }
+        }.less);
         var row_arena = std.heap.ArenaAllocator.init(a);
         defer row_arena.deinit();
-        for (refs_, result) |ref, *target| {
-            try owner.read_context.ensureActive();
-            _ = row_arena.reset(.retain_capacity);
-            const ra = row_arena.allocator();
-            const entry = (try owner.reader.entryAtPhysical(ra, try source.toIndex(ra, ref))) orelse return null;
-            const reference = entry.cover orelse return null;
+        var begin: usize = 0;
+        while (begin < pending.len) {
+            const reference = pending[begin].entry.cover.?;
+            var end = begin + 1;
+            while (end < pending.len and std.mem.eql(u8, pending[end].entry.cover.?.block.artifact_id, reference.block.artifact_id)) : (end += 1) {
+                const same = pending[end].entry.cover.?.block;
+                if (same.byte_len != reference.block.byte_len or !std.mem.eql(u8, same.checksum, reference.block.checksum)) return error.InvalidNativeLakeRowIndex;
+            }
             const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context };
             try @import("../serverless/artifacts/store.zig").chargeReadBudget(&owner.reader.remaining_reads, reference.block.byte_len);
             const block = try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(cached, owner.artifacts, reference.block, owner.reader.pages.cancellation);
             defer block.release();
-            if (block.value.keys.len != 1 or reference.row >= block.value.count()) return error.InvalidNativeLakeRowIndex;
-            const key = try block.value.keyCell(reference.row, 0);
-            if (key.sql_null or key.value != .string or !std.mem.eql(u8, key.value.string, entry.key)) return error.InvalidNativeLakeRowIndex;
-            target.* = try coveringSource(out, ra, table, root, block.value.*, reference.row, ref, fields);
+            for (pending[begin..end]) |item| {
+                try owner.read_context.ensureActive();
+                _ = row_arena.reset(.retain_capacity);
+                const row = item.entry.cover.?.row;
+                if (block.value.keys.len != 1 or row >= block.value.count()) return error.InvalidNativeLakeRowIndex;
+                const key = try block.value.keyCell(row, 0);
+                if (key.sql_null or key.value != .string or !std.mem.eql(u8, key.value.string, item.entry.key)) return error.InvalidNativeLakeRowIndex;
+                result[item.position] = try coveringSource(out, row_arena.allocator(), table, root, block.value.*, row, refs_[item.position], fields);
+            }
+            begin = end;
         }
         transferred = true;
         return result;
@@ -1003,7 +1054,7 @@ fn orderedCandidate(a: A, table: catalog.Table, index: local.storage_relational_
 
 fn preparePublicOrder(a: A, cursor: catalog.Cursor, definition: local.storage_relational_index.RelationalIndexDefinition, parsed: anytype, request: catalog.Scan, reverse: bool, search_order: SearchOrder) !bool {
     const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
-    if (owner.source.row_resolver != null) return false;
+    if (owner.isRelocated()) return false;
     if (owner.reader.root.tie_version != 1) return false;
     var equal: usize = 0;
     for (definition.keys) |key| {
@@ -1470,6 +1521,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
             return err;
         };
         owner.read_context = owner.lease.?.readContext();
+        server.attachLakeRepairHint(source);
         selected = (try @import("lake_index_selection.zig").selectCachedWithLease(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache, owner.lease)) orelse return null;
     }
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
@@ -1544,11 +1596,12 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
     const declaration = for (declarations) |decl| {
         if (decl.artifact.kind == .ordered_row_index and std.mem.eql(u8, decl.name, name)) break decl;
     } else return if (policy == .automatic) null else error.ExternalLakeRowIndexNotPublished;
+    owner.row_resolver = try source.resolverForIndex(declaration.name);
     const cancel: operation.CancellationToken = .{ .ptr = owner, .is_cancelled_fn = Owner.canceled };
     const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, declaration.artifact) else false;
     owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.VerifiedRoot.load);
     const root = owner.metadata.?.value.value;
-    if ((identities_only or dynamic != null) and !source.acceptsIndexCut(root.source, root.snapshot)) return error.ExternalLakeSnapshotMismatch;
+    if ((identities_only or dynamic != null) and !owner.acceptsCut(root.source, root.snapshot)) return error.ExternalLakeSnapshotMismatch;
     const domain = if (pinned) |shared| shared.domain else @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, owner.store_identity, selected.?.publication().namespace);
     if (!std.mem.eql(u8, &root.domain, &domain)) return error.InvalidNativeLakeRowIndex;
     const expected = native_rows.fingerprint(tuple, predicate, try native_rows.coverColumns(ca, definition));

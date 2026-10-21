@@ -110,7 +110,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
-    const definitions = (try parsed.relationalIndexDefinitions(ca)).?;
+    const all_definitions = (try parsed.relationalIndexDefinitions(ca)).?;
+    var selected_definitions: std.ArrayList(local.storage_relational_index.RelationalIndexDefinition) = .empty;
+    for (all_definitions) |definition| if (provider.wantsIndex(try logicalName(ca, definition.name))) try selected_definitions.append(ca, definition);
+    const definitions = selected_definitions.items;
+    if (definitions.len == 0) return &.{};
     const schema = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
     defer local.storage_schema.freeSchema(a, schema);
     var layout = try local.storage_db_algebraic_relational_row_codec.PhysicalLayout.init(a, schema);

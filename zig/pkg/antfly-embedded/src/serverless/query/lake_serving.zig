@@ -396,6 +396,9 @@ pub const ServingSource = struct {
         file: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?[]const u8,
         digest: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]const u8,
         tie_rank: *const fn (*anyopaque, std.mem.Allocator, @import("../../storage/rowsource/types.zig").RowRef) anyerror!u64,
+        translate_many: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, bool) anyerror![]const @import("../../storage/rowsource/types.zig").RowRef = null,
+        bind_index: ?*const fn (*anyopaque, []const u8) anyerror!RowResolver = null,
+        relocated: bool = true,
         close: *const fn (*anyopaque) void,
     };
     pub const FileVersions = struct { etag: []u8, version_id: []u8 };
@@ -408,6 +411,10 @@ pub const ServingSource = struct {
     };
     file_navigation: ?FileNavigation = null,
     row_resolver: ?RowResolver = null,
+    repair_hint: ?struct {
+        ptr: *anyopaque,
+        report: *const fn (*anyopaque, u64, u64, [16]u8) void,
+    } = null,
     planner_statistics: []const external_source_api.types.ColumnStatistics = &.{},
     statistics_owner: ?struct { ptr: *anyopaque, close: *const fn (*anyopaque) void } = null,
     deferred_snapshot: ?DeferredSnapshot = null,
@@ -451,10 +458,19 @@ pub const ServingSource = struct {
     delete_qualification: ?*@import("lake_delete_qualification.zig").Qualification = null,
     delete_qualification_owned: bool = false,
 
+    pub fn isCurrentCut(self: *const ServingSource, source: []const u8, snapshot: []const u8) bool {
+        return std.mem.eql(u8, source, self.inventory.source_id) and std.mem.eql(u8, snapshot, self.inventory.snapshot_id);
+    }
     pub fn acceptsIndexCut(self: *const ServingSource, source: []const u8, snapshot: []const u8) bool {
-        const expected_source = if (self.row_resolver) |resolver| resolver.source else self.inventory.source_id;
-        const expected_snapshot = if (self.row_resolver) |resolver| resolver.snapshot else self.inventory.snapshot_id;
-        return std.mem.eql(u8, source, expected_source) and std.mem.eql(u8, snapshot, expected_snapshot);
+        if (self.isCurrentCut(source, snapshot)) return true;
+        if (self.row_resolver) |resolver| {
+            return std.mem.eql(u8, source, resolver.source) and std.mem.eql(u8, snapshot, resolver.snapshot);
+        }
+        return false;
+    }
+    pub fn resolverForIndex(self: *const ServingSource, name: []const u8) !?RowResolver {
+        const resolver = self.row_resolver orelse return null;
+        return if (resolver.bind_index) |bind| try bind(resolver.ptr, name) else resolver;
     }
     pub fn fromIndex(self: *const ServingSource, a: std.mem.Allocator, ref: @import("../../storage/rowsource/types.zig").RowRef) !@import("../../storage/rowsource/types.zig").RowRef {
         if (self.row_resolver) |resolver| return resolver.from_index(resolver.ptr, a, ref);
@@ -463,6 +479,16 @@ pub const ServingSource = struct {
     pub fn toIndex(self: *const ServingSource, a: std.mem.Allocator, ref: @import("../../storage/rowsource/types.zig").RowRef) !@import("../../storage/rowsource/types.zig").RowRef {
         if (self.row_resolver) |resolver| return resolver.to_index(resolver.ptr, a, ref);
         return ref;
+    }
+
+    pub fn translateMany(self: *const ServingSource, a: std.mem.Allocator, refs: []const @import("../../storage/rowsource/types.zig").RowRef, forward: bool) ![]const @import("../../storage/rowsource/types.zig").RowRef {
+        if (self.row_resolver) |resolver| {
+            if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, forward);
+            const result = try a.alloc(@import("../../storage/rowsource/types.zig").RowRef, refs.len);
+            for (refs, result) |ref, *target| target.* = if (forward) try resolver.from_index(resolver.ptr, a, ref) else try resolver.to_index(resolver.ptr, a, ref);
+            return result;
+        }
+        return refs;
     }
 
     /// Parent remains pinned and quiescent until every view joins. Immutable

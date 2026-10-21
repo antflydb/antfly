@@ -148,14 +148,16 @@ pub const Collector = struct {
             const identity = try @import("lake_row_identity.zig").load(a, self.store, ref, self.cancellation(), null);
             const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, publication.namespace);
             if (!std.mem.eql(u8, &identity.domain, &domain)) return error.InvalidLogicalRowIdentity;
-            for (@import("lake_row_identity.zig").dependencies(identity)) |page| try self.markPages(a, identity.domain, page, false);
-            for (@import("lake_row_identity.zig").navigationDependencies(identity)) |navigation_ref| if (navigation_ref) |ref_| {
+            var identity_pages = @import("lake_row_identity.zig").dependencies(identity);
+            while (identity_pages.next()) |page| try self.markPages(a, identity.domain, page, false);
+            var identity_navigation = @import("lake_row_identity.zig").navigationDependencies(identity);
+            while (identity_navigation.next()) |ref_| {
                 _ = try self.mark(.{ .artifact_id = ref_.artifact_id, .checksum = ref_.checksum, .byte_len = ref_.byte_len });
                 try stores.chargeReadBudget(&self.remaining_reads, ref_.byte_len);
                 const navigation = try @import("lake_source_navigation.zig").load(a, self.store, ref_, self.cancellation(), null);
                 if (!std.mem.eql(u8, &navigation.domain, &domain)) return error.InvalidLogicalRowIdentity;
                 for (@import("lake_source_navigation.zig").dependencies(navigation)) |page| try self.markPages(a, navigation.domain, page, false);
-            };
+            }
         }
         for (hydrated.declarations) |declaration| try self.markArtifact(a, declaration.artifact);
         for (hydrated.file_contributions) |contribution| try self.markArtifact(a, contribution.artifact);

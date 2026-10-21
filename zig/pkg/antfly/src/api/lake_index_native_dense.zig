@@ -70,6 +70,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     var result: std.ArrayList(Declared) = .empty;
     errdefer result.deinit(out);
     for (desired.artifacts) |wanted| {
+        if (!provider.wantsIndex(wanted.name)) continue;
         if (wanted.kind != .vector_segment) continue;
         try provider.context.ensureActive();
         var binding = wanted.binding;

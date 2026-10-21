@@ -48,7 +48,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
 pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, delivery: ?local.api_query_response.Delivery) !?local.api_query.QueryResponse {
     return executePinned(a, server, table, req, request, delivery, false) catch |err| switch (err) {
         error.ExternalLakeIndexNotPublished, error.ExternalLakeIndexUnavailable => error.IndexRebuilding,
-        error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch => changed: {
+        error.LakeIndexArtifactUnavailable, error.InvalidLogicalRowIdentity, error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch => changed: {
             try server.requestLakePublication(table.name);
             break :changed error.CatalogGenerationChanged;
         },
@@ -186,6 +186,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const ca = arena.allocator();
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, ca, table.schema_json, table.table_id, table.name);
     sql_table.external_indexes = .{ .object_generation = table.object_storage_generation, .schema_json = table.schema_json, .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table) };
+    server.attachLakeRepairHint(&source);
     var selected = blk: {
         const publication_started = @import("antfly_platform").time.monotonicNs();
         defer server.lake_query_metrics.record(.publication, publication_started);
@@ -420,6 +421,7 @@ const Execution = struct {
     private_files: std.StringHashMapUnmanaged([]const u8) = .empty,
     private_digests: std.StringHashMapUnmanaged([]const u8) = .empty,
     active_text: ?types.TextQuery = null,
+    index_resolver: ?local.serverless_query_lake_serving.ServingSource.RowResolver = null,
     forced_selection: ?[]const [32]u8 = null,
     overlay_preparation: ?*@import("lake_index_text_frontier.zig") = null,
     ordered_membership: ?*OrderedMembership = null,
@@ -430,13 +432,27 @@ const Execution = struct {
     dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
     relocated_ties: std.ArrayList(*RelocatedTie) = .empty,
     runtimes: std.ArrayList(*@import("lake_index_native_runtime_cache.zig").Entry) = .empty,
+    fn bindIndex(self: *Execution, name: []const u8) !void {
+        self.index_resolver = try self.source.resolverForIndex(name);
+    }
+    fn relocated(self: *const Execution) bool {
+        return if (self.index_resolver) |resolver| resolver.relocated else false;
+    }
+    fn fromIndex(self: *Execution, a: A, ref: local.storage_rowsource_types.RowRef) !local.storage_rowsource_types.RowRef {
+        if (self.index_resolver) |resolver| return resolver.from_index(resolver.ptr, a, ref);
+        return ref;
+    }
+    fn toIndex(self: *Execution, a: A, ref: local.storage_rowsource_types.RowRef) !local.storage_rowsource_types.RowRef {
+        if (self.index_resolver) |resolver| return resolver.to_index(resolver.ptr, a, ref);
+        return ref;
+    }
     fn fileFor(self: *Execution, hex: []const u8, public: bool) !?[]const u8 {
-        if (!public) if (self.source.row_resolver) |resolver| return resolver.file(resolver.ptr, self.arena, hex);
+        if (!public) if (self.index_resolver) |resolver| return resolver.file(resolver.ptr, self.arena, hex);
         if (self.navigation) |resolver| return resolver.file(self.arena, hex, public);
         return if (public) self.files.get(hex) else self.private_files.get(hex);
     }
     fn privateDigest(self: *Execution, file: []const u8) ![]const u8 {
-        if (self.source.row_resolver) |resolver| return resolver.digest(resolver.ptr, self.arena, file);
+        if (self.index_resolver) |resolver| return resolver.digest(resolver.ptr, self.arena, file);
         if (self.navigation) |resolver| return resolver.digest(self.arena, file);
         return self.private_digests.get(file) orelse error.ExternalLakeSnapshotMismatch;
     }
@@ -465,7 +481,7 @@ const Execution = struct {
     }
     fn selectSparseConstraints(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup) !?types.SparseOrdinalSelection {
         const self: *Execution = @ptrCast(@alignCast(raw));
-        if (self.source.row_resolver != null) return null;
+        if (self.relocated()) return null;
         if (self.overlay != null or self.active_recent) return null;
         var result: types.SparseOrdinalSelection = .{};
         errdefer result.deinit();
@@ -545,7 +561,7 @@ const Execution = struct {
     }
     fn selectSparseRange(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup, first: u32, last: u32) !?types.SparseOrdinalSelection {
         const self: *Execution = @ptrCast(@alignCast(raw));
-        if (self.source.row_resolver != null) return null;
+        if (self.relocated()) return null;
         if (self.overlay != null or self.active_recent) return null;
         if (self.vector_include_provider) |provider| if (provider.complete == null) return null;
         if (self.vector_exclude_provider) |provider| if (provider.complete == null) return null;
@@ -618,10 +634,10 @@ const Execution = struct {
         };
         const coordinate = try @import("lake_index_native_state.zig").coordinates(key);
         const file = (try self.fileFor(key[6..70], false)) orelse return error.ExternalLakeSnapshotMismatch;
-        const index_ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = if (self.source.row_resolver) |resolver| resolver.source else self.source.inventory.source_id, .snapshot_id = if (self.source.row_resolver) |resolver| resolver.snapshot else self.source.inventory.snapshot_id, .identity_version = self.source.inventory.row_identity_version, .file_id = file, .row_group_ordinal = coordinate.group, .row_ordinal = coordinate.row } };
+        const index_ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = if (self.index_resolver) |resolver| resolver.source else self.source.inventory.source_id, .snapshot_id = if (self.index_resolver) |resolver| resolver.snapshot else self.source.inventory.snapshot_id, .identity_version = self.source.inventory.row_identity_version, .file_id = file, .row_group_ordinal = coordinate.group, .row_ordinal = coordinate.row } };
         var scratch = std.heap.ArenaAllocator.init(self.result_allocator);
         defer scratch.deinit();
-        const ref = try self.source.fromIndex(scratch.allocator(), index_ref);
+        const ref = try self.fromIndex(scratch.allocator(), index_ref);
         const current = ref.external;
         if (self.overlay) |pending_overlay| if (pending_overlay.physical) |*mask| if (mask.contains(current.file_id, current.row_group_ordinal, current.row_ordinal)) return false;
         if (self.vector_include_provider) |*provider| if (!try provider.allows(ref)) return false;
@@ -680,8 +696,8 @@ const Execution = struct {
             return units.rebind(a, member_key, key);
         }
         const file = (try self.fileFor(key[6..70], false)) orelse return error.ExternalLakeSnapshotMismatch;
-        const index_ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = if (self.source.row_resolver) |resolver| resolver.source else self.source.inventory.source_id, .snapshot_id = if (self.source.row_resolver) |resolver| resolver.snapshot else self.source.inventory.snapshot_id, .identity_version = self.source.inventory.row_identity_version, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } };
-        const parent_key = try local.storage_rowsource_identity.allocId(a, try self.source.fromIndex(a, index_ref));
+        const index_ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = if (self.index_resolver) |resolver| resolver.source else self.source.inventory.source_id, .snapshot_id = if (self.index_resolver) |resolver| resolver.snapshot else self.source.inventory.snapshot_id, .identity_version = self.source.inventory.row_identity_version, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } };
+        const parent_key = try local.storage_rowsource_identity.allocId(a, try self.fromIndex(a, index_ref));
         defer a.free(parent_key);
         return units.rebind(a, member_key, parent_key);
     }
@@ -700,7 +716,7 @@ const Execution = struct {
         const position = try @import("lake_index_native_state.zig").coordinates(key);
         const file = (try self.fileFor(try local.storage_rowsource_identity.publicFile(key), true)) orelse return a.dupe(u8, key);
         const current_ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .identity_version = self.source.inventory.row_identity_version, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } };
-        const index_ref = try self.source.toIndex(a, current_ref);
+        const index_ref = try self.toIndex(a, current_ref);
         const digest = try self.privateDigest(index_ref.external.file_id);
         const parent_key = try std.fmt.allocPrint(a, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, index_ref.external.row_group_ordinal, index_ref.external.row_ordinal });
         defer a.free(parent_key);
@@ -744,7 +760,7 @@ const Execution = struct {
         for (self.declarations) |declaration| if (declaration.artifact.kind == .text_segment and corpus.supportsBuildMetadata(declaration.artifact.metadata_version)) {
             count += 1;
         };
-        return for (self.declarations) |declaration| {
+        const selected = for (self.declarations) |declaration| {
             if (declaration.artifact.kind == .text_segment and corpus.supportsBuildMetadata(declaration.artifact.metadata_version) and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1 or std.mem.eql(u8, declaration.name, local.common_full_text_index_defaults.default_full_text_index_name))) break declaration;
         } else {
             // A known text index awaiting a format refresh is rebuilding,
@@ -754,6 +770,8 @@ const Execution = struct {
             }
             return if (name == null) null else error.IndexNotFound;
         };
+        try self.bindIndex(selected.name);
+        return selected;
     }
     const HighlightPlan = struct { query: search.HighlightQuery, name: []const u8, stores_source: bool };
     fn highlightPlan(self: *Execution, name: ?[]const u8, text: types.TextQuery) !?HighlightPlan {
@@ -833,7 +851,7 @@ const Execution = struct {
         };
         errdefer pin.deinit();
         var identities = @as(*const @import("lake_index_text_predicate.zig").Identities, @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus))).*;
-        identities.row_resolver = self.source.row_resolver;
+        identities.row_resolver = if (self.relocated()) self.index_resolver else null;
         if (self.overlay) |overlay| {
             const joined = if (self.overlay_preparation) |preparation| bounded: {
                 var excluded = try identities.bitmapForPhysical(self.arena, &overlay.physical.?, self.store.artifactStore(), cached);
@@ -1389,7 +1407,7 @@ const Execution = struct {
         errdefer pin.deinit();
         if (pin.provider_metadata) |raw_identities| {
             const identities: *const @import("lake_index_text_predicate.zig").Identities = @ptrCast(@alignCast(raw_identities));
-            if (self.source.row_resolver) |resolver| {
+            if (if (self.relocated()) self.index_resolver else null) |resolver| {
                 const tie = try self.arena.create(RelocatedTie);
                 tie.* = .{ .execution = self, .identities = identities.*, .resolver = resolver, .live = .{ .backing = self.result_allocator } };
                 tie.identities.row_resolver = null;
@@ -1413,7 +1431,6 @@ const Execution = struct {
     // bounded coordinator. The composed owner retains fusion and source leases;
     // source-dependent transforms run once on the global candidate pool.
     fn predicatePacks(self: *Execution, root: corpus.Root, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, json: []const u8) !?[]const [32]u8 {
-        if (self.source.row_resolver != null) return null;
         if (root.source_routes_version != 1) return null;
         var budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 16 * 1024 * 1024 };
         var arena = std.heap.ArenaAllocator.init(budget.allocator());
@@ -1429,7 +1446,12 @@ const Execution = struct {
         var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = root.domain, .artifacts = &store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
         var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store() };
         defer cache.deinit();
-        const selected = try @import("lake_index_source_routes.zig").select(a, cache.store(), root, store, cached, token, &candidates, self.source.inventory.source_id, self.source.inventory.snapshot_id);
+        var index_candidates: ?@import("lake_index_physical_set.zig").Set = null;
+        defer if (index_candidates) |*set| set.deinit();
+        if (self.relocated()) index_candidates = try @import("lake_index_text_predicate.zig").indexSelection(a, self.source, self.index_resolver, &candidates);
+        const source_id = if (self.index_resolver) |resolver_| resolver_.source else self.source.inventory.source_id;
+        const snapshot_id = if (self.index_resolver) |resolver_| resolver_.snapshot else self.source.inventory.snapshot_id;
+        const selected = try @import("lake_index_source_routes.zig").select(a, cache.store(), root, store, cached, token, if (index_candidates) |*set| set else &candidates, source_id, snapshot_id);
         return try self.arena.dupe([32]u8, selected);
     }
 
@@ -1459,6 +1481,7 @@ const Execution = struct {
             if (declaration.artifact.kind == .text_segment and corpus.supportsBuildMetadata(declaration.artifact.metadata_version) and
                 (if (req.index_name) |name| std.mem.eql(u8, declaration.name, name) else indexes == 1 or std.mem.eql(u8, declaration.name, local.common_full_text_index_defaults.default_full_text_index_name))) break declaration;
         } else return null;
+        try self.bindIndex(selected.name);
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
         const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
@@ -1507,7 +1530,7 @@ const Execution = struct {
         var pack_probe: ?*pack_probe_mod = null;
         defer if (pack_probe) |probe| probe.deinit();
         const stream_predicate = req.filter_query_json.len != 0 and scoreFrontierEligible(req, if (ordering) |*order| order else null);
-        if (stream_predicate and self.source.row_resolver == null) {
+        if (stream_predicate and !self.relocated()) {
             const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
             pack_probe = pack_probe_mod.create(root, cached, resolver, req.filter_query_json, cancellation) catch |err| switch (err) {
                 error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.QueryCandidateBudgetExceeded => null,
@@ -1518,7 +1541,7 @@ const Execution = struct {
                 else => return err,
             };
         }
-        const predicate_selection = if (!stream_predicate and req.filter_query_json.len != 0)
+        const predicate_selection = if ((!stream_predicate or self.relocated()) and req.filter_query_json.len != 0)
             self.predicatePacks(root, cached, cancellation, req.filter_query_json) catch |err| switch (err) {
                 error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.QueryCandidateBudgetExceeded => null,
                 else => return err,
@@ -1754,7 +1777,7 @@ const Execution = struct {
                     const pin = child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus;
                     break :archive @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus));
                 } else null;
-                if (self.source.row_resolver) |resolver| {
+                if (if (self.relocated()) self.index_resolver else null) |resolver| {
                     if (recent_window) {
                         const rank = std.math.add(u64, resolver.rows, ordinal - root.collection.?.documents) catch return error.InvalidSearchTieRank;
                         try winners.addLocated(hit, rank, location);
@@ -1764,7 +1787,7 @@ const Execution = struct {
                     const position = try @import("lake_index_native_state.zig").coordinates(key);
                     const file = (try self.fileFor(try local.storage_rowsource_identity.publicFile(key), true)) orelse return error.ExternalLakeSnapshotMismatch;
                     const current: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } };
-                    const original = try self.source.toIndex(wa, current);
+                    const original = try self.toIndex(wa, current);
                     try winners.addLocated(hit, try resolver.tie_rank(resolver.ptr, wa, original), location);
                 } else try winners.addWindowHit(hit, ordinal, identities, recent_window, location);
             }
@@ -1941,7 +1964,7 @@ const Execution = struct {
             }
             scanned += refs.len;
             var selected: std.AutoHashMapUnmanaged([32]u8, std.ArrayList(local.storage_rowsource_types.RowRef)) = .empty;
-            for (refs) |ref| if (try @import("lake_index_source_routes.zig").lookup(sa, page_cache.store(), root, store, cached, token, &live, try self.source.toIndex(sa, ref))) |id| {
+            for (refs) |ref| if (try @import("lake_index_source_routes.zig").lookup(sa, page_cache.store(), root, store, cached, token, &live, try self.toIndex(sa, ref))) |id| {
                 const entry = try selected.getOrPut(sa, id);
                 if (!entry.found_existing) entry.value_ptr.* = .empty;
                 try entry.value_ptr.append(sa, ref);
@@ -2048,6 +2071,7 @@ const Execution = struct {
         const selected = for (declarations) |declaration| {
             if (declaration.artifact.kind == .vector_segment and native.supportsMetadata(declaration.artifact.metadata_version) and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
         } else return error.IndexNotFound;
+        if (!self.active_recent) try self.bindIndex(selected.name);
         if (entries.get(if (self.active_recent) selected.artifact.artifact_id else selected.name)) |entry| {
             for (self.runtimes.items) |runtime| if (runtime.dense_entry == entry) {
                 self.unit_runtime = runtime;
@@ -2097,7 +2121,7 @@ const Execution = struct {
     /// Clone immutable request inputs; mutable maps, cursors and pins start
     /// empty in every lane/partition. Source ownership is explicit at the caller.
     fn childExecution(base: *Execution, source: *local.serverless_query_lake_serving.ServingSource, scratch: A, output: A) Execution {
-        return .{ .scheduled_component = base.scheduled_component, .server = base.server, .overlay = base.overlay, .wal_cut = base.wal_cut, .table = base.table, .source = source, .store = base.store, .domain = base.domain, .declarations = base.declarations, .context = base.context, .request = base.request, .schema_json = base.schema_json, .hydration_fields = base.hydration_fields, .vector_filter = base.vector_filter, .vector_exclusion = base.vector_exclusion, .recent_runs = base.recent_runs, .recent_declarations = base.recent_declarations, .recent_cloud = base.recent_cloud, .cloud_generations = base.cloud_generations, .typed_delivery = base.typed_delivery, .navigation = base.navigation, .files = base.files, .private_files = base.private_files, .private_digests = base.private_digests, .arena = scratch, .result_allocator = output };
+        return .{ .scheduled_component = base.scheduled_component, .server = base.server, .overlay = base.overlay, .wal_cut = base.wal_cut, .table = base.table, .source = source, .store = base.store, .domain = base.domain, .declarations = base.declarations, .context = base.context, .request = base.request, .schema_json = base.schema_json, .hydration_fields = base.hydration_fields, .index_resolver = base.index_resolver, .vector_filter = base.vector_filter, .vector_exclusion = base.vector_exclusion, .recent_runs = base.recent_runs, .recent_declarations = base.recent_declarations, .recent_cloud = base.recent_cloud, .cloud_generations = base.cloud_generations, .typed_delivery = base.typed_delivery, .navigation = base.navigation, .files = base.files, .private_files = base.private_files, .private_digests = base.private_digests, .arena = scratch, .result_allocator = output };
     }
     fn prepareVectorMembership(self: *Execution, a: A, req: types.SearchRequest) !void {
         if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return;
@@ -2409,6 +2433,7 @@ const Execution = struct {
         const selected = for (declarations) |declaration| {
             if (declaration.artifact.kind == .sparse_segment and native.supportsMetadata(declaration.artifact.metadata_version) and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
         } else return error.IndexNotFound;
+        if (!self.active_recent) try self.bindIndex(selected.name);
         if (entries.get(if (self.active_recent) selected.artifact.artifact_id else selected.name)) |entry| {
             for (self.runtimes.items) |runtime| if (runtime.sparse_entry == entry) {
                 self.unit_runtime = runtime;

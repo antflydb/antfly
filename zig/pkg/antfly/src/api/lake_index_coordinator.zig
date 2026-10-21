@@ -35,6 +35,8 @@ pub const Authority = struct {
 pub const Options = struct {
     lease_ms: u64 = 5 * 60 * 1000,
     retry_ms: u64 = 1000,
+    force_rebuild: bool = false,
+    identity_spill_bytes: u64 = 1024 * 1024 * 1024,
     build_limits: limits.Limits = .{},
     embedding_options: ?local.inference_managed_embedder.InitOptions = null,
 };
@@ -46,8 +48,12 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     const signature = try publication.signatureFor(a, table, source, store.identity, context);
     var current = try catalog.parse(a, table.lake_index_catalog_json);
     defer current.deinit();
+    var repair = options.force_rebuild;
     if (current.value.published) |ready| {
-        if (current.value.pending == null and std.meta.eql(ready.signature, signature) and try durableDirectoryAvailable(a, store, ready, cancellation)) return;
+        if (current.value.pending == null and std.meta.eql(ready.signature, signature)) {
+            if (!repair and try durableDirectoryAvailable(a, store, ready, cancellation)) return;
+            repair = true;
+        }
     }
     if (current.value.failure) |failure| {
         if (std.mem.eql(u8, &failure.desired, &signature.desired) and now < failure.retry_at_ms) return error.LakeIndexRetryDeferred;
@@ -82,7 +88,7 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     const build_alloc = working.allocator();
     var artifact_reads = @import("lake_index_artifact_recovery.zig").Reads.init(store.artifactStore());
     var handle = artifact_reads.store();
-    const published_bytes = publication.buildWithLeaseAndEmbedding(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot, .save_checkpoint = Renewal.saveCheckpoint, .discard_checkpoint = Renewal.discardCheckpoint }, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = build_context }) catch |reported_error| {
+    const published_bytes = publication.buildWithReuse(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot, .save_checkpoint = Renewal.saveCheckpoint, .discard_checkpoint = Renewal.discardCheckpoint }, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = build_context }, .{ .allow_reuse = !repair, .identity_spill_bytes = options.identity_spill_bytes }) catch |reported_error| {
         heartbeat.cancel(io);
         heartbeat_active = false;
         if (lease.terminal_error) |err| return err;
@@ -139,8 +145,14 @@ fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, ca
         else => return err,
     };
     if (ready.row_identity) |ref| {
-        _ = @import("lake_row_identity.zig").load(arena.allocator(), handle, ref, cancellation, null) catch |err| switch (err) {
+        const root = @import("lake_row_identity.zig").load(arena.allocator(), handle, ref, cancellation, null) catch |err| switch (err) {
             error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidLogicalRowIdentity, error.CloudGenerationMapUnavailable => return false,
+            else => return err,
+        };
+        // Bounded roots detect unavailable navigation without a full archive
+        // walk. A deeper read failure reports generation-specific repair.
+        @import("lake_row_identity.zig").validateRoots(a, &handle, root, cancellation) catch |err| switch (err) {
+            error.LakeIndexArtifactUnavailable, error.InvalidLogicalRowIdentity => return false,
             else => return err,
         };
     }
@@ -806,11 +818,46 @@ test "external lake global frontier coordinator rebuilds missing cloud map direc
     defer a.free(navigation_bytes);
     var navigation = try artifacts.put(navigation_bytes);
     defer navigation.deinit(a);
+    const logical = @import("lake_row_identity.zig");
+    const page_api = @import("../serverless/graph_segment/page_store.zig");
+    var marker: u8 = 0;
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call };
+    defer manager.deinit();
+    var builder = try logical.Builder.init(a, &manager, &.{"file"}, 64 * 1024, .{ .source = "source", .snapshot = "snapshot" });
+    defer builder.deinit();
+    try builder.add(.{ .id = @splat(5), .values = @splat(6) }, .{ .file = 0, .group = 0, .row = 0 });
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    var pages: page_api.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var row_root = try builder.finish(&pages, "source", "snapshot", @splat(1), @splat(2), @splat(3));
+    row_root.artifacts = @splat(7);
+    const row_ref = try logical.publish(a, &artifacts, row_root, .none);
+    defer a.free(row_ref.artifact_id);
+    defer a.free(row_ref.checksum);
     const map = (try writer.finish(.none)).?;
     defer maps.freeRef(a, map);
     store.implementation.cloud_writer = null;
-    const published: catalog.Publication = .{ .reader_protocol = catalog.native_reader_protocol, .namespace = @splat(4), .generation = 1, .token = @splat(1), .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = store.identity }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://source/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len }, .source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = navigation.artifact_id, .checksum = navigation.checksum, .byte_len = navigation.byte_len }, .directory = directory, .cloud_generations = .{ .root = map, .complete = true } };
+    const published: catalog.Publication = .{ .reader_protocol = catalog.native_reader_protocol, .namespace = @splat(4), .generation = 1, .token = @splat(1), .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = store.identity }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://source/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len }, .source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = navigation.artifact_id, .checksum = navigation.checksum, .byte_len = navigation.byte_len }, .directory = directory, .row_identity = row_ref, .cloud_generations = .{ .root = map, .complete = true } };
     try std.testing.expect(try durableDirectoryAvailable(a, &store, published, .none));
+    const missing_id = try page_api.PageStore.identity(scope.domain, row_root.current.by_location.?);
+    const missing_suffix = try @import("../serverless/artifacts/store.zig").storageSuffixAlloc(a, &missing_id);
+    defer a.free(missing_suffix);
+    var missing_version = (try writer.lookup(a, &missing_id, .none)) orelse return error.TestUnexpectedResult;
+    defer missing_version.deinit(a);
+    const missing_key = try std.fmt.allocPrint(a, "native/{s}@{s}", .{ missing_suffix, missing_version.generation });
+    defer a.free(missing_key);
+    var memory_for_row = provider.memory.client();
+    var saved_row = try memory_for_row.getObject("bucket", missing_key, .{});
+    defer saved_row.deinit(a);
+    try memory_for_row.deleteObject("bucket", missing_key, .{});
+    try std.testing.expect(!try durableDirectoryAvailable(a, &store, published, .none));
+    var restored_row = try memory_for_row.putObject("bucket", missing_key, saved_row.body, .{});
+    restored_row.deinit(a);
+    try std.testing.expect(try durableDirectoryAvailable(a, &store, published, .none));
+
     const suffix = try @import("../serverless/artifacts/store.zig").storageSuffixAlloc(a, map.artifact_id);
     defer a.free(suffix);
     const version_key = try std.fmt.allocPrint(a, "native/{s}@{s}", .{ suffix, map.generation });

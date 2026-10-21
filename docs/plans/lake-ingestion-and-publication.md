@@ -3672,11 +3672,12 @@ Decision and implementation contract: [Lake row identity and index reuse](lake-r
 
 Antfly-owned serving compaction retains canonical source coordinates and can
 reuse their immutable index artifacts. External Parquet/Iceberg rewrites cannot
-be inferred from file names, row counts or offsets. The intended extension has
-two verified inputs: a snapshot-bound rewrite map from a trusted producer, or a
-declared unique stable key with indexed-value version/fingerprint validation.
-A stable key alone cannot establish unchanged postings after a row update.
-Absent either proof, rebuild indexes for affected files.
+be inferred from file names, row counts or offsets. Stable-key reuse is now
+implemented with delete-aware key verification and per-index typed input
+fingerprints. Unchanged files retain copy-on-write identity state. Unchanged
+indexes retain their exact original artifacts; changed indexes rebuild in the
+same atomic publication. A stable key alone never establishes unchanged postings.
+Absent a complete proof, native index construction continues normally.
 
 A future durable rewrite map must bind both immutable inventories, source and
 destination row domains, deletion coverage and the indexed-value equivalence
@@ -3684,8 +3685,11 @@ proof. Publish it atomically with the new generation, include it in reader lease
 and artifact GC closure, and compose mappings to bounded lookup depth. Ambiguous
 keys, missing rows or changed indexed values force rebuild/update. Query readers
 must apply the same mapping to text, scalar predicates, deletes, covering values
-and public identity; a text-only mapping would be incorrect. This external
-rewrite reuse capability is not implemented by the publication optimizations.
+and public identity; a text-only mapping would be incorrect. The current
+stable-key implementation applies these boundaries to scoped resolver views,
+compact coordinate/rank maps, batched predicate translation and covering delivery.
+Trusted-producer mapping adapters and reuse across changed logical ID sets remain
+staged in the linked identity design.
 
 [Lance fragment reuse](https://lance.org/format/index/system/frag_reuse/) defers
 physical index remapping using verified compaction transitions.

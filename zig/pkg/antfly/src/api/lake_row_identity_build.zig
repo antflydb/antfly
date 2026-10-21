@@ -29,47 +29,31 @@ fn bytes(hash: *std.crypto.hash.Blake3, value: []const u8) void {
     hash.update(&size);
     hash.update(value);
 }
-/// Includes validity, column domain and exact input representation. In
-/// particular SQL NULL and JSON null, integers and floats remain distinct.
-/// Encoding differences may conservatively rebuild; they never authorize reuse.
-fn values(a: A, recipe: identity.logical.Digest, batch: rows.ColumnBatch, row: usize, names: []const []const u8) !identity.logical.Digest {
-    var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("antfly.logical-row.physical-values.v1");
-    hash.update(&recipe);
-    for (names) |name| {
-        bytes(&hash, name);
-        const column = batch.findColumn(name) orelse return error.InvalidLogicalRowIdentity;
-        hash.update(&.{@intFromBool(column.nulls.isNull(row))});
-        if (column.nulls.isNull(row)) continue;
-        switch (column.values) {
-            .vector_f32 => |vectors| {
-                bytes(&hash, "vector_f32");
-                var count: [8]u8 = undefined;
-                std.mem.writeInt(u64, &count, vectors[row].len, .big);
-                hash.update(&count);
-                for (vectors[row]) |value| {
-                    var word: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &word, @bitCast(value), .big);
-                    hash.update(&word);
-                }
-            },
-            else => {
-                // jsonAt decodes dictionaries, retains exact decimal text and
-                // parses JSON numbers without an f64 round trip.
-                const value = try column.values.jsonAt(a, row);
-                bytes(&hash, @tagName(value));
-                const encoded = try std.json.Stringify.valueAlloc(a, value, .{});
-                defer a.free(encoded);
-                bytes(&hash, encoded);
-            },
-        }
-    }
-    var digest: identity.logical.Digest = undefined;
-    hash.final(&digest);
-    return digest;
-}
+const fingerprints = @import("lake_row_fingerprints.zig");
 
-pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cut: identity.logical.Digest, navigation: local.serverless_manifest_artifact_ref.ArtifactRef, previous: ?identity.Root, token: Token) !?identity.Root {
+pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cut: identity.logical.Digest, base: local.serverless_manifest_base_source.BaseSourceDescriptor, navigation: local.serverless_manifest_artifact_ref.ArtifactRef, previous: ?identity.Root, token: Token) !?identity.Root {
+    if (provider.identity_spill_bytes == 0) return error.LogicalRowIdentityAdmissionDeclined;
+    const io = provider.context.io orelse return error.InvalidLogicalRowIdentity;
+    const scheduler = local.sql_parallel_scheduler.global();
+    const retained = scheduler.reservePullUpTo(1, @min(provider.identity_working_set_bytes, 1024 * 1024), provider.identity_working_set_bytes) orelse return error.LogicalRowIdentityAdmissionDeclined;
+    defer scheduler.releasePull(1, retained);
+    const allowance = scheduler.cpuWorkspaceBudget(@min(retained, 8 * 1024 * 1024));
+    if (allowance < 1024 * 1024) return error.LogicalRowIdentityAdmissionDeclined;
+    var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = scheduler, .bytes = allowance, .checkpoint = .{ .ptr = provider, .check = checkpoint } };
+    defer execution.pause();
+    try execution.enter(io);
+    var phase: @import("../serverless/artifacts/store.zig").ExecutionIo = .{ .execution = &execution, .io = io };
+    var scoped = store.*;
+    scoped.io_phase = phase.capability();
+    var input = provider.*;
+    input.io_phase = scoped.io_phase;
+    var workspace: local.sql_memory_budget = .{ .backing = a, .limit = retained };
+    return buildInner(workspace.allocator(), out, table, &scoped, &input, cut, base, navigation, previous, token) catch |err| {
+        if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and workspace.isLocallyExhausted())) return error.LogicalRowIdentityAdmissionDeclined;
+        return err;
+    };
+}
+fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cut: identity.logical.Digest, base: local.serverless_manifest_base_source.BaseSourceDescriptor, navigation: local.serverless_manifest_artifact_ref.ArtifactRef, previous: ?identity.Root, token: Token) !?identity.Root {
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
     defer parsed.deinit(a);
     const binding = (parsed.external_base_source orelse return error.InvalidExternalTableBinding).binding;
@@ -93,104 +77,111 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sto
     var incarnation: identity.logical.Digest = undefined;
     hash.final(&incarnation);
     const namespace: identity.logical.Namespace = .{ .incarnation = incarnation, .adapter = .stable_key, .recipe = tuple.fingerprint };
-    // Whole-cut reuse initially hashes every declared source input. This is
-    // conservative for changes to fields that no current index consumes.
     const recipe = local.metadata_lake_index_catalog.desiredFingerprint(table);
-    const columns = try a.alloc([]const u8, runtime.relational_columns.len);
-    defer a.free(columns);
+    var metadata = std.heap.ArenaAllocator.init(a);
+    defer metadata.deinit();
+    const input_recipes = try @import("lake_row_input_recipes.zig").plan(a, metadata.allocator(), table, provider, base);
+    var needed: std.StringHashMapUnmanaged(void) = .empty;
+    defer needed.deinit(a);
+    for (input_recipes) |input_recipe| for (input_recipe.columns) |column| try needed.put(a, column, {});
+    var key_arena = std.heap.ArenaAllocator.init(a);
+    defer key_arena.deinit();
+    for (try tuple.columnBindings(key_arena.allocator())) |column| try needed.put(a, column, {});
+    const column_storage = try a.alloc([]const u8, runtime.relational_columns.len);
+    defer a.free(column_storage);
+    var column_count: usize = 0;
     const contract = try a.alloc(local.serverless_query_lake_schema.Column, runtime.relational_columns.len);
     defer a.free(contract);
-    for (runtime.relational_columns, columns, contract) |column, *name, *item| {
-        name.* = column.path;
+    for (runtime.relational_columns, contract) |column, *item| {
         item.* = .{ .name = column.path, .kind = @tagName(column.column_type), .required = column.required and !column.allows_null };
+        if (needed.contains(column.path) or needed.contains(column.name)) {
+            column_storage[column_count] = column.path;
+            column_count += 1;
+        }
     }
+    // Identity and index input evidence need no unrelated payload columns.
+    const columns = column_storage[0..column_count];
     const inventory = provider.source.inventory;
-    const files = try out.alloc([]const u8, inventory.files.len);
-    const slots = try a.alloc(u32, inventory.files.len);
-    defer a.free(slots);
-    var by_file: std.StringHashMapUnmanaged(u32) = .empty;
-    defer by_file.deinit(a);
-    for (inventory.files, files, slots, 0..) |file, *name, *slot, index| {
-        name.* = try out.dupe(u8, file.file_id);
-        slot.* = std.math.cast(u32, index) orelse return error.InvalidLogicalRowIdentity;
-        try by_file.put(a, file.file_id, slot.*);
-    }
-    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.InvalidLogicalRowIdentity, .context = provider, .checkpoint = checkpoint };
+    const files = try a.alloc([]const u8, inventory.files.len);
+    defer a.free(files);
+    for (inventory.files, files) |file, *name| name.* = file.file_id;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.InvalidLogicalRowIdentity, .context = provider, .checkpoint = checkpoint, .max_bytes = provider.identity_spill_bytes };
     defer manager.deinit();
-    var builder = try identity.Builder.init(a, &manager, files, 4 * 1024 * 1024, .{ .source = inventory.source_id, .snapshot = inventory.snapshot_id, .version = inventory.row_identity_version });
-    defer builder.deinit();
-    var read_bytes: u64 = 512 * 1024 * 1024;
-    var write_bytes: u64 = 1024 * 1024 * 1024;
+    var read_bytes: u64 = 0;
+    var write_bytes: u64 = 0;
     const scope = store.upload_scope orelse return error.InvalidLogicalRowIdentity;
     var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes, .cancellation = token, .streaming = true };
     pages.admitPublication();
-    // Reuse verified logical state for unchanged physical files. The source
-    // delta includes object versions and delete visibility; snapshot labels or
-    // file names alone cannot bypass decoding changed files.
-    var scan_files: ?[]bool = null;
-    defer if (scan_files) |mask| a.free(mask);
-    if (previous) |prior| if (provider.native_delta) |delta| {
-        if (delta.prior_snapshot != null and delta.count() == inventory.files.len and delta.prior_count == prior.current.file_count and
-            std.mem.eql(u8, &prior.domain, &scope.domain) and std.mem.eql(u8, &prior.namespace, &namespace.digest()) and
-            std.mem.eql(u8, &prior.values_recipe, &recipe) and std.mem.eql(u8, prior.current.source, inventory.source_id) and
-            std.mem.eql(u8, delta.prior_snapshot.?, prior.current.snapshot))
-        {
-            const remap = try a.alloc(u32, prior.current.file_count);
-            defer a.free(remap);
-            @memset(remap, std.math.maxInt(u32));
-            var files_cursor = @import("../serverless/graph_segment/page_tree.zig").Cursor.init(a, pages.store(), prior.current.files, "", null) catch |err| return identity.derivedReadFailure(err);
-            defer files_cursor.deinit();
-            var reused: usize = 0;
-            var seen_files: usize = 0;
-            while (files_cursor.next() catch |err| return identity.derivedReadFailure(err)) |record| {
-                if (record.key.len != 4 or std.mem.readInt(u32, record.key[0..4], .big) != seen_files or seen_files >= remap.len) return error.InvalidLogicalRowIdentity;
-                if (by_file.get(record.value)) |slot| if (!delta.isChanged(slot)) {
-                    remap[seen_files] = slot;
-                    reused += 1;
-                };
-                seen_files += 1;
-            }
-            if (seen_files != remap.len) return error.InvalidLogicalRowIdentity;
-            if (reused != 0) {
-                scan_files = try a.alloc(bool, inventory.files.len);
-                @memset(scan_files.?, true);
-                for (remap) |slot| if (slot != std.math.maxInt(u32)) {
-                    scan_files.?[slot] = false;
-                };
-                var cursor = @import("../serverless/graph_segment/page_tree.zig").Cursor.init(a, pages.store(), prior.current.by_id, "", null) catch |err| return identity.derivedReadFailure(err);
-                defer cursor.deinit();
-                var seen: u64 = 0;
-                while (cursor.next() catch |err| return identity.derivedReadFailure(err)) |record| {
-                    try token.check();
-                    try provider.context.ensureActive();
-                    const state = try identity.decodeState(prior.current, record.key, record.value);
-                    seen += 1;
-                    const slot = remap[state.coordinate.file];
-                    if (slot != std.math.maxInt(u32)) try builder.add(state.state, .{ .file = slot, .group = state.coordinate.group, .row = state.coordinate.row });
-                }
-                if (seen != prior.current.rows) return error.InvalidLogicalRowIdentity;
-            }
-        }
+    pages.read_phase = store.io_phase;
+    const prior: ?identity.Root = compatible: {
+        const old = previous orelse break :compatible null;
+        const delta = provider.native_delta orelse break :compatible null;
+        if (old.current.input_recipes.len != input_recipes.len or old.current.file_slots == null or old.values_format != fingerprints.format or delta.prior_snapshot == null or delta.count() != inventory.files.len or delta.prior_count != old.current.liveFiles() or
+            !std.mem.eql(u8, &old.domain, &scope.domain) or !std.mem.eql(u8, &old.namespace, &namespace.digest()) or
+            !std.mem.eql(u8, &old.values_recipe, &recipe) or !std.mem.eql(u8, old.current.source, inventory.source_id) or !std.mem.eql(u8, delta.prior_snapshot.?, old.current.snapshot)) break :compatible null;
+        for (old.current.input_recipes, input_recipes) |left, right| if (!std.mem.eql(u8, &left.digest, &right.digest)) break :compatible null;
+        break :compatible old;
     };
+    const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, files, prior, if (prior != null) provider.native_delta else null, input_recipes, inventory.source_id, inventory.snapshot_id);
+    defer builder.deinit();
+    var by_file: std.StringHashMapUnmanaged(u32) = .empty;
+    defer by_file.deinit(a);
+    for (files, builder.slots) |name, slot| try by_file.put(a, name, slot);
     var input = provider.*;
     input.only_file = null;
-    input.only_files = scan_files;
+    input.only_files = builder.scan;
     input.only_plan = null;
     input.replay = null;
     input.replay_consumer = null;
     input.enrichment_columns = false;
     input.schema_contract = contract;
     input.statistics = null;
-    var source = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, .{ .sidecar_kind = .text, .source_kind = if (inventory.format == .iceberg) .external_iceberg else .external_parquet, .row_ref_kind = .external, .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .schema_fingerprint = inventory.schema_fingerprint, .index_config_hash = "native-logical-row-state-v1", .column_bindings = columns }, token);
-    defer source.deinit(a);
+    var opening = try store.beginIo(1);
+    defer opening.abort();
+    var source = input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, .{ .sidecar_kind = .text, .source_kind = if (inventory.format == .iceberg) .external_iceberg else .external_parquet, .row_ref_kind = .external, .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .schema_fingerprint = inventory.schema_fingerprint, .index_config_hash = "native-logical-row-state-v1", .column_bindings = columns }, token) catch |err| return opening.failed(err);
+    defer {
+        // Joining speculative source work must not retain the CPU admission
+        // that its required progress can need.
+        if (store.io_phase) |phase| if (phase.park) |park| park(phase.ptr);
+        source.deinit(a);
+    }
+    try opening.finish();
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(a);
-    while (try source.next(a)) |batch| {
+    while (true) {
+        var phase = try store.beginIo(1);
+        defer phase.abort();
+        const next = source.next(a) catch |err| return phase.failed(err);
+        try phase.finish();
+        const batch = next orelse break;
         var bound = try tuple.bindExternalBatch(a, batch);
         defer bound.deinit();
+        var fingerprint_plan = try fingerprints.Plan.bind(a, recipe, batch, columns);
+        defer fingerprint_plan.deinit();
+        const input_plans = try a.alloc(fingerprints.Plan, input_recipes.len);
+        var bound_inputs: usize = 0;
+        defer {
+            for (input_plans[0..bound_inputs]) |*plan| plan.deinit();
+            a.free(input_plans);
+        }
+        for (input_recipes, input_plans) |recipe_, *plan| {
+            plan.* = try fingerprints.Plan.bind(a, recipe_.digest, batch, recipe_.columns);
+            bound_inputs += 1;
+        }
+        const input_tiles = try a.alloc([64]identity.logical.Digest, input_recipes.len);
+        defer a.free(input_tiles);
+        const row_inputs = try a.alloc(identity.logical.Digest, input_recipes.len);
+        defer a.free(row_inputs);
+        var digests: [64]identity.logical.Digest = undefined;
         for (0..batch.rowCount()) |row| {
+            if (row % digests.len == 0) {
+                const count = @min(digests.len, batch.rowCount() - row);
+                try fingerprint_plan.fill(a, row, digests[0..count]);
+                for (input_plans, input_tiles) |*plan, *tile| try plan.fill(a, row, tile[0..count]);
+            }
+            for (row_inputs, input_tiles) |*value, tile| value.* = tile[row % digests.len];
             try token.check();
             try provider.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
@@ -199,12 +190,18 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sto
             const ref = batch.rowRef(row);
             if (ref != .external) return error.InvalidLogicalRowIdentity;
             const slot = by_file.get(ref.external.file_id) orelse return error.InvalidLogicalRowIdentity;
-            try builder.add(.{ .id = try identity.logical.keyId(namespace, key.items), .values = try values(scratch.allocator(), recipe, batch, row, columns) }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal });
+            try builder.addWithInputs(.{ .id = try identity.logical.keyId(namespace, key.items), .values = digests[row % digests.len] }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, row_inputs);
         }
     }
-    var root = try builder.finish(&pages, try out.dupe(u8, inventory.source_id), try out.dupe(u8, inventory.snapshot_id), namespace.digest(), recipe, cut);
+    var root = try builder.finish(namespace.digest(), recipe, cut);
+    root.values_format = fingerprints.format;
     root.current.navigation = navigation;
-    return root;
+    const encoded = try std.json.Stringify.valueAlloc(a, root, .{});
+    defer a.free(encoded);
+    if (encoded.len > identity.max_root_bytes) return error.LogicalRowIdentityAdmissionDeclined;
+    // Only the small admitted root escapes the optional workspace. Temporary
+    // file dictionaries and recipe planning cannot consume publication memory.
+    return try std.json.parseFromSliceLeaky(identity.Root, out, encoded, .{ .allocate = .alloc_always });
 }
 fn checkpoint(raw: *anyopaque) !void {
     const provider: *@import("lake_index_row_source.zig").Provider = @ptrCast(@alignCast(raw));

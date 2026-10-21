@@ -4386,5 +4386,5 @@ test "external lake metadata navigation compiled programs share immutable plans 
             try testing.expect(matches.contains(0));
         }
     };
-    try testing.checkAllAllocationFailures(a, Failure.run, .{&writer.snapshot().segments[0]});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failure.run, .{&writer.snapshot().segments[0]});
 }

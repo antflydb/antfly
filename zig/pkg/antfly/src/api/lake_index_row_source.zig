@@ -28,6 +28,10 @@ const A = std.mem.Allocator;
 const stores = @import("../serverless/artifacts/store.zig");
 pub const Provider = struct {
     ordered_delta_plans: usize = 0,
+    identity_spill_bytes: u64 = 1024 * 1024 * 1024,
+    identity_working_set_bytes: usize = 64 * 1024 * 1024,
+    skip_indexes: []const []const u8 = &.{},
+
     /// Total work belongs to a configuration, across private file checkpoints.
     resume_work: ?*ResumeWork = null,
     source: *serving.ServingSource,
@@ -50,6 +54,10 @@ pub const Provider = struct {
     replay_consumer: ?usize = null,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
     statistics: ?Statistics = null,
+    pub fn wantsIndex(self: *const Provider, name: []const u8) bool {
+        for (self.skip_indexes) |skip| if (std.mem.eql(u8, skip, name)) return false;
+        return true;
+    }
     pub const ResumeWork = struct {
         /// Coordinator-owned append frontier; only the current immutable file
         /// changes. These private roots never serve an incomplete snapshot.

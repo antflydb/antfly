@@ -1043,6 +1043,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     var declarations: std.ArrayList(Declared) = .empty;
     errdefer declarations.deinit(out);
     for (desired.artifacts) |want| {
+        if (!provider.wantsIndex(want.name)) continue;
         if (want.kind != .text_segment) continue;
         const spec = want.build_spec.?.text;
         var arena = std.heap.ArenaAllocator.init(a);

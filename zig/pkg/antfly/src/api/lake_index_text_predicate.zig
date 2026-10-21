@@ -25,6 +25,50 @@ const Condition = local.sql_catalog.Condition;
 const Graph = local.storage_db_query_graph_exec;
 const Compiled = Graph.CompiledPatternFilter;
 
+/// Translate a complete physical selection in bounded tiles before deriving
+/// index-space pack/ordinal supersets. Residual predicates still use current rows.
+pub fn indexSelection(a: A, source: *local.serverless_query_lake_serving.ServingSource, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, selected: *const @import("lake_index_physical_set.zig").Set) !@import("lake_index_physical_set.zig").Set {
+    return indexSelectionCut(a, source.inventory.source_id, source.inventory.snapshot_id, binding, selected);
+}
+fn indexSelectionCut(a: A, source_id: []const u8, snapshot_id: []const u8, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, selected: *const @import("lake_index_physical_set.zig").Set) !@import("lake_index_physical_set.zig").Set {
+    const Set = @import("lake_index_physical_set.zig").Set;
+    const RowRef = local.storage_rowsource_types.RowRef;
+    var result = Set.init(a);
+    errdefer result.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var refs: [256]RowRef = undefined;
+    var count: usize = 0;
+    var files = selected.files.iterator();
+    while (files.next()) |file| {
+        var blocks = file.value_ptr.iterator();
+        while (blocks.next()) |block| {
+            var selected_rows = block.value_ptr.iterator();
+            while (selected_rows.next()) |low| {
+                refs[count] = .{ .external = .{ .source_id = source_id, .snapshot_id = snapshot_id, .file_id = file.key_ptr.*, .row_group_ordinal = block.key_ptr.group, .row_ordinal = (@as(u64, block.key_ptr.high) << 32) | low } };
+                count += 1;
+                if (count == refs.len) {
+                    const mapped = try indexBatch(scratch.allocator(), binding, refs[0..count]);
+                    for (mapped) |ref| try result.addRow(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
+                    _ = scratch.reset(.retain_capacity);
+                    count = 0;
+                }
+            }
+        }
+    }
+    const mapped = try indexBatch(scratch.allocator(), binding, refs[0..count]);
+    for (mapped) |ref| try result.addRow(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
+    return result;
+}
+
+fn indexBatch(a: A, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, refs: []const local.storage_rowsource_types.RowRef) ![]const local.storage_rowsource_types.RowRef {
+    const resolver = binding orelse return refs;
+    if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, false);
+    const result = try a.alloc(local.storage_rowsource_types.RowRef, refs.len);
+    for (refs, result) |ref, *target| target.* = try resolver.to_index(resolver.ptr, a, ref);
+    return result;
+}
+
 /// Four independently reusable slots bound decode/rank storage even when the
 /// request allocator is an arena. Each slot uses a fixed buffer, not an arena
 /// whose freed objects would remain resident in the request's parent arena.
@@ -370,28 +414,20 @@ pub const Identities = struct {
     }
     /// Translate a query-wide compressed physical tombstone set into just the
     /// admitted native window. Keep each temporary bitmap within one 2^20 block.
-    pub fn bitmapForPhysical(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) !Bitmap {
+    pub fn bitmapForPhysical(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) anyerror!Bitmap {
+        if (self.row_resolver) |resolver| {
+            var mapped = try indexSelectionCut(a, resolver.current_source, resolver.current_snapshot, resolver, selected);
+            defer mapped.deinit();
+            var direct = self;
+            direct.row_resolver = null;
+            // Run the native compressed block/rank kernel in the selected
+            // index's coordinate space after bounded batch translation.
+            return direct.bitmapForPhysical(a, &mapped, store, cached);
+        }
         var result = Bitmap.init(a);
         errdefer result.deinit();
         var cache: LiveRowsCache = .{ .backing = a };
         defer cache.deinit(a);
-        if (self.row_resolver) |resolver| {
-            var scratch = std.heap.ArenaAllocator.init(a);
-            defer scratch.deinit();
-            var files = selected.files.iterator();
-            while (files.next()) |file| {
-                var blocks = file.value_ptr.iterator();
-                while (blocks.next()) |block| {
-                    var iterator = block.value_ptr.iterator();
-                    while (iterator.next()) |low| {
-                        _ = scratch.reset(.retain_capacity);
-                        const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = resolver.current_source, .snapshot_id = resolver.current_snapshot, .file_id = file.key_ptr.*, .row_group_ordinal = block.key_ptr.group, .row_ordinal = (@as(u64, block.key_ptr.high) << 32) | low } };
-                        if (try self.ordinal(scratch.allocator(), &cache, store, cached, ref)) |number| try result.add(number);
-                    }
-                }
-            }
-            return result;
-        }
         var file_it = self.files.iterator();
         while (file_it.next()) |entry| {
             const item: FileSpan = .{ .file = entry.key_ptr.*, .span = entry.value_ptr.* };
@@ -412,6 +448,17 @@ pub const Identities = struct {
         return cache.load(a, store, cached, block);
     }
     fn addBlock(self: Identities, a: A, temporary: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, selected: @import("lake_index_predicate_blocks.zig").Block, result: *Bitmap) !void {
+        if (self.row_resolver != null) {
+            // An ordered index may be freshly rebuilt while this text index
+            // is retained. Its compressed blocks still describe current rows.
+            var physical = @import("lake_index_physical_set.zig").Set.init(temporary);
+            defer physical.deinit();
+            try physical.addBlock(selected);
+            var translated = try self.bitmapForPhysical(temporary, &physical, store, cached);
+            defer translated.deinit();
+            try result.orWith(&translated);
+            return;
+        }
         const file = self.files.get(selected.file) orelse {
             if (self.partial_inventory) return;
             return error.ExternalLakeSnapshotMismatch;
@@ -1863,4 +1910,58 @@ test "external lake bounded WAL physical masks preserve selected gaps and high r
     defer result.deinit();
     try std.testing.expectEqual(@as(u64, 3), result.cardinality());
     try std.testing.expect(result.contains(0) and result.contains(1) and result.contains(3));
+}
+
+test "external lake rebuilt predicate blocks translate into retained text coordinates" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("mixed-predicate-blocks");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    const store = fs.artifactStore();
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &cache, .scope = @splat(8), .context = .{ .io = std.testing.io } };
+    const Ref = local.storage_rowsource_types.RowRef;
+    const Mapping = struct {
+        fn reverse(_: *anyopaque, allocator: A, row: Ref) !Ref {
+            if (!std.mem.eql(u8, row.external.file_id, "new") or row.external.row_ordinal >= 4) return error.TestUnexpectedResult;
+            var result = row;
+            result.external.file_id = try allocator.dupe(u8, "old");
+            result.external.row_ordinal = 3 - row.external.row_ordinal;
+            return result;
+        }
+        fn forward(_: *anyopaque, _: A, _: Ref) !Ref {
+            return error.TestUnexpectedResult;
+        }
+        fn file(_: *anyopaque, _: A, _: []const u8) !?[]const u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn digest(_: *anyopaque, _: A, _: []const u8) ![]const u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn rank(_: *anyopaque, _: A, _: Ref) !u64 {
+            return error.TestUnexpectedResult;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var marker: u8 = 0;
+    var identities: Identities = .{ .offsets = &.{}, .row_resolver = .{ .ptr = &marker, .source = "source", .snapshot = "old-cut", .current_source = "source", .current_snapshot = "new-cut", .rows = 4, .to_index = Mapping.reverse, .from_index = Mapping.forward, .file = Mapping.file, .digest = Mapping.digest, .tie_rank = Mapping.rank, .close = Mapping.close } };
+    defer identities.files.deinit(a);
+    const blocks = [_]corpus.physical.Block{.{ .group = 0, .high = 0, .base = 0, .count = 4, .lower = 0 }};
+    try identities.files.put(a, "old", .{ .lower = 0, .upper = 4, .rows = &blocks });
+    var live: LiveRowsCache = .{ .backing = a };
+    defer live.deinit(a);
+    var result = Bitmap.init(a);
+    defer result.deinit();
+    try identities.addBlock(a, a, &live, store, cached, .{ .file = "new", .group = 0, .base = 0, .selection = .{ .interval = .{ .lower = 0, .count = 2 } } }, &result);
+    try std.testing.expectEqual(@as(u64, 2), result.cardinality());
+    try std.testing.expect(result.contains(2) and result.contains(3));
+    var selection = @import("lake_index_physical_set.zig").Set.init(a);
+    defer selection.deinit();
+    try selection.addRow("new", 0, 1);
+    var single = try identities.bitmapForPhysical(a, &selection, store, cached);
+    defer single.deinit();
+    try std.testing.expectEqual(@as(u64, 1), single.cardinality());
+    try std.testing.expect(single.contains(2));
 }

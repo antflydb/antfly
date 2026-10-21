@@ -1854,6 +1854,7 @@ const FastTopK = struct {
     hits: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty,
     total_count: u32 = 0,
     after: ?SearchCursor = null,
+    after_hit: ?scorer_mod.ScoredHit = null,
     pruned: bool = false,
     minimum_competitive_score: ?f32 = null,
     producers: ProducerConstraints = .{},
@@ -1931,13 +1932,15 @@ const FastTopK = struct {
     }
     fn collectAdmitted(self: *FastTopK, hit: scorer_mod.ScoredHit) !void {
         self.total_count += 1;
+        var candidate = hit;
         if (self.after) |cursor| {
-            const boundary = try scorer_mod.prepareHit(self.alloc, .{ .doc_id = cursor.doc_id, .score = cursor.score }, self.tie_rank);
-            const candidate = try scorer_mod.prepareHit(self.alloc, hit, self.tie_rank);
-            if (!scorer_mod.betterWithRank(boundary, candidate, self.tie_rank)) return;
+            if (self.after_hit == null) self.after_hit = try scorer_mod.prepareHit(self.alloc, .{ .doc_id = cursor.doc_id, .score = cursor.score }, self.tie_rank);
+            // Cursor score comparisons usually need no relocated identity at all.
+            if (cursor.score == hit.score) candidate = try scorer_mod.prepareHit(self.alloc, hit, self.tie_rank);
+            if (!scorer_mod.betterWithRank(self.after_hit.?, candidate, self.tie_rank)) return;
         }
         if (self.minimum_competitive_score) |floor| if (hit.score < floor) return;
-        try scorer_mod.offerTopKWithRank(self.alloc, &self.hits, self.k, hit, self.tie_rank);
+        try scorer_mod.offerTopKWithRank(self.alloc, &self.hits, self.k, candidate, self.tie_rank);
     }
 
     fn allows(self: *const FastTopK, doc_id: u32) bool {

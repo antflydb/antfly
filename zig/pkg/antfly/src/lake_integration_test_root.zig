@@ -51,6 +51,12 @@ test {
     _ = @import("api/lake_index_ordered_rows.zig");
     _ = @import("api/lake_index_native_files.zig");
     _ = @import("api/lake_index_native_text.zig");
+    _ = @import("api/lake_row_identity_delta.zig");
+    _ = @import("api/lake_row_translations.zig");
+    _ = @import("api/lake_row_fingerprints.zig");
+    _ = @import("api/lake_index_repairs.zig");
+    _ = @import("api/lake_index_navigation_warming.zig");
+    _ = @import("api/lake_row_identity_reader.zig");
     _ = @import("api/lake_row_identity.zig");
     _ = @import("antfly_local_sources").storage_rowsource_identity.logical;
     _ = @import("antfly_local_sources").search_scorer;
@@ -63,6 +69,7 @@ test {
     _ = @import("api/lake_index_refinements_test.zig");
     _ = @import("api/lake_index_sql_rows.zig");
     _ = @import("api/lake_index_text_query.zig");
+    _ = @import("api/lake_index_text_predicate.zig");
     _ = @import("api/lake_index_pack_proof.zig");
     _ = @import("api/lake_index_text_best_first.zig");
     _ = @import("api/lake_index_text_compaction.zig");

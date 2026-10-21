@@ -78,6 +78,10 @@ pub fn recipeFor(a: A, table: local.sql_catalog.Table, config: std.json.Value, m
     return .{ .keys = keys, .inputs = inputs };
 }
 
+pub fn compatibleInputGroup(left: recipes.Recipe, right: recipes.Recipe) bool {
+    return (recipes.Recipe{ .keys = left.keys, .inputs = &.{} }).eql(.{ .keys = right.keys, .inputs = &.{} }) and incrementalRecipe(left) == incrementalRecipe(right);
+}
+
 pub fn recipeIdentity(a: A, recipe: recipes.Recipe) ![]const u8 {
     return std.fmt.allocPrint(a, "native-sql-aggregate-v2:{s}", .{std.fmt.bytesToHex(&recipe.fingerprint(), .lower)});
 }
@@ -149,6 +153,7 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
             if (name != .string or name.string.len == 0) return error.InvalidAlgebraicConfig;
             const identity = try recipeIdentity(ca, recipe);
             const logical_name = try @import("lake_index_names.zig").materialization(out, entry.key_ptr.*, name.string);
+            if (!provider.wantsIndex(logical_name)) continue;
             const contributes = incrementalRecipe(recipe) and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
             // Whole-root reuse remains valid for recipes with no file tree
             // (floating reductions, DISTINCT, or delete-bearing snapshots).
@@ -176,8 +181,7 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
         // Larger sets form another bounded cohort with the same semantic keys.
         for (requests.items[first..], first..) |candidate, index| {
             if (consumed[index]) continue;
-            const key_recipe: recipes.Recipe = .{ .keys = request.recipe.keys, .inputs = &.{} };
-            if (!key_recipe.eql(.{ .keys = candidate.recipe.keys, .inputs = &.{} }) or incrementalRecipe(request.recipe) != incrementalRecipe(candidate.recipe)) continue;
+            if (!compatibleInputGroup(request.recipe, candidate.recipe)) continue;
             consumed[index] = true;
             try cohort.append(ca, index);
             if (cohort.items.len == 64) break;

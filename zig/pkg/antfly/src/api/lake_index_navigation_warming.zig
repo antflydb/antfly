@@ -219,11 +219,13 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     var count: usize = 0;
     if (publication.row_identity) |ref| {
         const identity = try @import("lake_row_identity.zig").load(state.arena.allocator(), store.artifactStore(), ref, token, cached);
-        for (@import("lake_row_identity.zig").dependencies(identity)) |root| if (root) |page| {
+        var identity_pages = @import("lake_row_identity.zig").dependencies(identity);
+        identity_roots: while (identity_pages.next()) |page| {
+            for (roots[0..count]) |prior| if (std.mem.eql(u8, &prior.domain, &identity.domain) and prior.ref.eql(page)) continue :identity_roots;
             if (count == roots.len) break;
             roots[count] = .{ .domain = identity.domain, .ref = page };
             count += 1;
-        };
+        }
     }
     for (declarations) |declaration| {
         try context.ensureActive();

@@ -160,7 +160,12 @@ pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: record
     return buildWithLeaseAndEmbedding(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, null, null);
 }
 pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo) ![]u8 {
-    return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, true) catch |err| {
+    return buildWithReuse(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, .{});
+}
+pub const BuildPolicy = struct { allow_reuse: bool = true, identity_spill_bytes: u64 = 1024 * 1024 * 1024 };
+/// Explicit generation repair must bypass every same-signature reuse shortcut.
+pub fn buildWithReuse(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, policy: BuildPolicy) ![]u8 {
+    return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, policy.allow_reuse, policy.identity_spill_bytes) catch |err| {
         switch (err) {
             error.LakeIndexArtifactUnavailable, error.CloudGenerationMapUnavailable, error.ArtifactIntegrityMismatch, error.InvalidLogicalRowIdentity => {},
             else => return err,
@@ -181,9 +186,9 @@ pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, t
             }
             const fresh = try owner.snapshot(owner.ptr, a);
             defer a.free(fresh.lake_index_catalog_json);
-            return buildAttempt(a, artifact_store, fresh, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false);
+            return buildAttempt(a, artifact_store, fresh, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false, policy.identity_spill_bytes);
         }
-        return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false);
+        return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false, policy.identity_spill_bytes);
     };
 }
 /// Prior inventory is an optional planning proof. Missing/corrupt derived
@@ -204,7 +209,7 @@ fn priorInventory(a: A, store: stores.ArtifactStore, ref: local.serverless_manif
     };
     return inventory;
 }
-fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, reuse: bool) ![]u8 {
+fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, reuse: bool, identity_spill_bytes: u64) ![]u8 {
     var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = backing };
     const a = allocations.allocator();
     try context.ensureActive();
@@ -252,7 +257,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     // Identity belongs to the pinned source binding, never the index build.
     try source.ensureInventory(context);
     try source.ensureCanonicalPlan(context);
-    var provider: @import("lake_index_row_source.zig").Provider = .{ .source = source, .context = context, .expected_delete_objects = pinned.delete_objects, .embedding_options = embedding_options, .vector_memo = memo };
+    var provider: @import("lake_index_row_source.zig").Provider = .{ .source = source, .context = context, .expected_delete_objects = pinned.delete_objects, .embedding_options = embedding_options, .vector_memo = memo, .identity_spill_bytes = identity_spill_bytes };
     // Same-label source replacements and credential/store changes prohibit
     // reuse even if a legacy sidecar's binding happens to look identical.
     var reusable_directory = true;
@@ -294,7 +299,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     // Physical per-file builders cannot treat a relocated source file as the
     // original contribution. Rebase through construction when values change;
     // pure relocation takes the verified whole-cut reuse path below.
-    const mapped_predecessor = (previous_identity != null and previous_identity.?.indexes != null) or (current.value.published != null and current.value.published.?.row_identity != null and previous_identity == null);
+    const mapped_predecessor = (previous_identity != null and previous_identity.?.hasRelocation()) or (current.value.published != null and current.value.published.?.row_identity != null and previous_identity == null);
     if (mapped_predecessor) {
         reusable = &.{};
         published_candidates = &.{};
@@ -418,28 +423,62 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
         if (owner.save_checkpoint != null) costing.checkpoint = .{ .ptr = &progress, .save = BuildProgress.saveNavigation };
     }
     const identity_unchanged = previous_identity != null and current.value.published != null and std.meta.eql(current.value.published.?.signature, signature) and relocatableFormats(current.value.published.?.declarations);
-    var row_identity = if (identity_unchanged) previous_identity else @import("lake_row_identity_build.zig").build(a, na, table, &scoped, &provider, signature.source, navigation.ref, previous_identity, cancellation) catch |err| switch (err) {
+    var row_identity = if (identity_unchanged) previous_identity else @import("lake_row_identity_build.zig").build(a, na, table, &scoped, &provider, signature.source, base_source, navigation.ref, previous_identity, cancellation) catch |err| switch (err) {
         // An optional identity declaration is not an enforced SQL constraint.
         // Insufficient identity evidence keeps ordinary complete construction.
-        error.NullLogicalRowKey, error.DuplicateLogicalRowKey => null,
+        error.NullLogicalRowKey, error.DuplicateLogicalRowKey, error.LogicalRowIdentityAdmissionDeclined => null,
         else => return err,
     };
     var relocated = identity_unchanged;
+    var retained_declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = &.{};
     if (row_identity) |*identity| if (previous_identity) |previous| {
         const published = current.value.published.?;
-        const configurations = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{});
-        const captured_inputs = for (configurations.object.values()) |config| {
-            // Generated multimodal inputs can read mutable remote URLs. Raw
-            // Parquet value equivalence alone cannot certify captured media.
-            if (config == .object and @import("lake_enrichment_units.zig").configured(config, "embedder") != null) break false;
-        } else true;
         const native_only = relocatableFormats(published.declarations);
-        if (!identity_unchanged and captured_inputs and native_only and published.directory != null and std.mem.eql(u8, &published.signature.desired, &signature.desired)) {
+        if (!identity_unchanged and native_only and published.directory != null and std.mem.eql(u8, &published.signature.desired, &signature.desired)) {
             var reads: u64 = 0;
             var writes: u64 = 0;
             var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &scoped, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .cancellation = cancellation, .streaming = true };
             pages.admitPublication();
-            relocated = try row_identity_api.proveReuse(a, &pages, previous, identity);
+            var bindings = try row_identity_api.proveIndexReuse(a, na, &pages, previous, identity.*, published.declarations);
+            if (bindings.len != 0) {
+                for (bindings, 0..) |*binding_, index| {
+                    var prior_translation: ?row_identity_api.Translation = null;
+                    for (bindings[0..index]) |earlier| if (earlier.translation != null and earlier.space.by_id != null and binding_.space.by_id != null and earlier.space.by_id.?.eql(binding_.space.by_id.?)) {
+                        prior_translation = earlier.translation;
+                        break;
+                    };
+                    binding_.translation = if (prior_translation) |translation| translation else try @import("lake_row_translations.zig").build(a, &pages, binding_.space, identity.current, context, identity_spill_bytes);
+                }
+                var prospective = identity.*;
+                prospective.reused = bindings;
+                prospective.artifacts = previous.artifacts;
+                try prospective.reseal(a);
+                const encoded = try std.json.Stringify.valueAlloc(a, prospective, .{});
+                defer a.free(encoded);
+                if (encoded.len > row_identity_api.max_root_bytes) bindings = &.{};
+            }
+            if (bindings.len != 0) {
+                identity.reused = bindings;
+                identity.artifacts = previous.artifacts;
+                try identity.reseal(a);
+                const names = try na.alloc([]const u8, bindings.len);
+                const retained = try na.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, bindings.len);
+                for (bindings, names, retained) |binding_, *name, *declaration| {
+                    name.* = binding_.name;
+                    declaration.* = for (published.declarations) |entry| {
+                        if (std.mem.eql(u8, entry.name, binding_.name)) break entry;
+                    } else return error.InvalidLogicalRowIdentity;
+                }
+                provider.skip_indexes = names;
+                retained_declarations = retained;
+                relocated = retained.len == published.declarations.len;
+            } else if (previous.reused.len == 0) {
+                const configurations = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{});
+                const captured_inputs = for (configurations.object.values()) |config| {
+                    if (!@import("lake_row_input_recipes.zig").configurationReusable(config)) break false;
+                } else true;
+                if (captured_inputs) relocated = try row_identity_api.proveReuse(a, &pages, previous, identity);
+            }
         }
     };
     var legacy_indexes = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{ .allocate = .alloc_always });
@@ -481,13 +520,14 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     const sparse = built.sparse;
     const dense = built.dense;
     const declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = if (relocated) current.value.published.?.declarations else assembled: {
-        const result = try na.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, manifest.artifacts.len + native_declarations.len + ordered.len + text.len + sparse.len + dense.len);
+        const result = try na.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, manifest.artifacts.len + native_declarations.len + ordered.len + text.len + sparse.len + dense.len + retained_declarations.len);
         @memcpy(result[0..manifest.artifacts.len], manifest.artifacts);
         @memcpy(result[manifest.artifacts.len .. manifest.artifacts.len + native_declarations.len], native_declarations);
         @memcpy(result[manifest.artifacts.len + native_declarations.len ..][0..ordered.len], ordered);
         @memcpy(result[manifest.artifacts.len + native_declarations.len + ordered.len ..][0..text.len], text);
         @memcpy(result[manifest.artifacts.len + native_declarations.len + ordered.len + text.len ..][0..sparse.len], sparse);
-        @memcpy(result[manifest.artifacts.len + native_declarations.len + ordered.len + text.len + sparse.len ..], dense);
+        @memcpy(result[manifest.artifacts.len + native_declarations.len + ordered.len + text.len + sparse.len ..][0..dense.len], dense);
+        @memcpy(result[result.len - retained_declarations.len ..], retained_declarations);
         break :assembled result;
     };
     navigation.ref = try costing.finish();
@@ -508,6 +548,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     try context.ensureActive();
     const row_identity_ref = if (row_identity) |*identity| published: {
         identity.artifacts = try row_identity_api.declarationDigest(a, declarations);
+        try identity.reseal(a);
         break :published try row_identity_api.publish(na, &scoped, identity.*, cancellation);
     } else null;
     // All uploads in this attempt are complete before its namespace evidence
@@ -557,7 +598,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     defer a.free(data);
     var put = try client.putObject("antfly", "part.parquet", data, .{});
     put.deinit(a);
-    const schema_json = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\"}},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"body\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}}}}}}}}", .{directory.path()});
+    const schema_json = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\",\"row_identity\":{{\"key_columns\":[\"body\"]}}}},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"body\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}}}}}}}}", .{directory.path()});
     defer a.free(schema_json);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
     defer binding.deinit(a);
@@ -586,12 +627,31 @@ test "external lake native publication builds scoped text artifacts and fences e
     const clock: Clock = .{ .ptr = &time, .now_ms = TestClock.read };
     const published_bytes = try build(a, &artifact_store, pending, &source, store_identity, .{ .io = std.testing.io }, .none, clock);
     defer a.free(published_bytes);
+    const declined_bytes = try buildWithReuse(a, &artifact_store, pending, &source, store_identity, .{ .io = std.testing.io }, .none, clock, null, null, null, .{ .identity_spill_bytes = 0 });
+    defer a.free(declined_bytes);
+    var declined = try catalog.parse(a, declined_bytes);
+    defer declined.deinit();
+    try std.testing.expect(declined.value.published.?.row_identity == null);
+    try std.testing.expect(declined.value.published.?.directory.?.count > 0);
     var published = pending;
     published.lake_index_catalog_json = published_bytes;
     try std.testing.expect(try catalog.transitionAllowed(a, pending, published));
     var parsed = try catalog.parse(a, published_bytes);
     defer parsed.deinit();
     try @import("lake_index_directory.zig").hydrate(parsed.arena.allocator(), artifact_store, &parsed.value.published.?, .none, null);
+    // A generation repair must bypass same-cut identity and native directory
+    // reuse, even when the old publication's signature remains current.
+    var repairing = published;
+    repairing.lake_index_catalog_json = try begin(a, std.testing.io, published, &source, store_identity, .{}, 100, 20);
+    defer a.free(repairing.lake_index_catalog_json);
+    const repaired_bytes = try buildWithReuse(a, &artifact_store, repairing, &source, store_identity, .{ .io = std.testing.io }, .none, clock, null, null, null, .{ .allow_reuse = false });
+    defer a.free(repaired_bytes);
+    var repaired = try catalog.parse(a, repaired_bytes);
+    defer repaired.deinit();
+    try @import("lake_index_directory.zig").hydrate(repaired.arena.allocator(), artifact_store, &repaired.value.published.?, .none, null);
+    try std.testing.expect(repaired.value.published.?.generation > parsed.value.published.?.generation);
+    try std.testing.expect(!std.mem.eql(u8, repaired.value.published.?.declarations[0].artifact.artifact_id, parsed.value.published.?.declarations[0].artifact.artifact_id));
+
     // Replacing the same current declaration must not retain save history.
     // Before bounded ownership this exhausted 1 MiB after 116 saves.
     const Checkpoints = struct {
@@ -922,7 +982,7 @@ test "external lake logical identity publishes native indexes once across reorde
             try std.testing.expect(root.indexes == null);
         } else if (step < 3) {
             try std.testing.expectEqualStrings(original_directory.?, publication.directory.?.artifact_id);
-            try std.testing.expectEqualStrings(original_snapshot.?, root.indexes.?.snapshot);
+            try std.testing.expectEqualStrings(original_snapshot.?, root.spaceForIndex("body_text").snapshot);
             var reads: u64 = 4 * 1024 * 1024;
             var writes: u64 = 0;
             var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = root.domain, .artifacts = &artifact_store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
@@ -932,7 +992,9 @@ test "external lake logical identity publishes native indexes once across reorde
             try std.testing.expectEqual(@as(u64, if (step == 1) 1 else 0), row.coordinate.row);
         } else {
             try std.testing.expect(!std.mem.eql(u8, original_directory.?, publication.directory.?.artifact_id));
-            try std.testing.expect(root.indexes == null);
+            try std.testing.expectEqualStrings(root.current.snapshot, root.spaceForIndex("body_text").snapshot);
+            const aggregate_name = try @import("lake_index_names.zig").materialization(arena.allocator(), "stats", "rows");
+            try std.testing.expectEqualStrings(original_snapshot.?, root.spaceForIndex(aggregate_name).snapshot);
         }
     }
 }

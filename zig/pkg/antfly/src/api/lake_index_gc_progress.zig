@@ -148,15 +148,17 @@ pub const Progress = struct {
                         try stores.chargeReadBudget(&collector.remaining_reads, ref.byte_len);
                         const identity = try @import("lake_row_identity.zig").load(a, collector.store, ref, collector.cancellation(), null);
                         if (!std.mem.eql(u8, &identity.domain, &self.value.domain)) return error.InvalidNativeLakeGcReference;
-                        for (@import("lake_row_identity.zig").dependencies(identity)) |root| if (root) |page| try self.enqueue(.{ .page = .{ .ref = page, .ordered_rows = false } });
-                        for (@import("lake_row_identity.zig").navigationDependencies(identity)) |navigation_ref| if (navigation_ref) |ref_| {
+                        var identity_pages = @import("lake_row_identity.zig").dependencies(identity);
+                        while (identity_pages.next()) |page| try self.enqueue(.{ .page = .{ .ref = page, .ordered_rows = false } });
+                        var identity_navigation = @import("lake_row_identity.zig").navigationDependencies(identity);
+                        while (identity_navigation.next()) |ref_| {
                             if (try self.expand(.{ .artifact_id = ref_.artifact_id, .checksum = ref_.checksum, .byte_len = ref_.byte_len }, "source-navigation")) {
                                 try stores.chargeReadBudget(&collector.remaining_reads, ref_.byte_len);
                                 const navigation = try @import("lake_source_navigation.zig").load(a, collector.store, ref_, collector.cancellation(), null);
                                 if (!std.mem.eql(u8, &navigation.domain, &self.value.domain)) return error.InvalidNativeLakeGcReference;
                                 for (@import("lake_source_navigation.zig").dependencies(navigation)) |root| if (root) |page| try self.enqueue(.{ .page = .{ .ref = page, .ordered_rows = false } });
                             }
-                        };
+                        }
                     }
                 }
                 var hydrated = publication;

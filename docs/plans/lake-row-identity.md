@@ -1,7 +1,8 @@
 # Lake row identity and index reuse
 
 Status: accepted decision; typed stable-key relocation implemented for Parquet and Iceberg.
-Additional identity adapters and finer-grained reuse are staged below.
+Per-index input proofs and incremental identity maps are implemented. Additional
+identity adapters and logical row-set delta reuse are staged below.
 
 ## Decision
 
@@ -36,7 +37,8 @@ new relocation map. The new resolver applies when underlying source rows move.
 - Sources without sufficient evidence keep ordinary index construction and
   query behavior. Only affected indexes/files rebuild; table attachment remains
   usable without a primary key. The first relocation implementation certifies
-  whole visible cuts; affected-only reuse remains a later refinement.
+  whole visible ID sets. Each native index can reuse its original artifacts when
+  its own captured inputs are unchanged, even when other indexes must rebuild.
 
 ## Durable contract
 
@@ -108,36 +110,74 @@ Unknown or unsupported key columns are rejected when binding the typed schema.
 Null or duplicate row keys decline optional relocation reuse; they do not make the
 table unavailable or imply an enforced SQL primary-key constraint.
 
-The builder streams delete-aware batches into bounded native spill sorts and
-publishes immutable ID-to-location and location-to-ID trees. Verified unchanged
-files reuse authenticated previous row state through the source delta; changed
-files are decoded. Current value fingerprints cover every declared input column
-and the desired index recipe. This intentionally declines reuse for changes to
-unused columns, added/deleted rows, and generated embeddings with uncaptured
-remote media inputs. A subsequent value change after relocation rebases physical
-indexes before resuming ordinary incremental publication.
+The builder reads only stable-key columns and the union of native index inputs
+from delete-aware batches. Typed vector kernels hash integers without a floating
+point conversion and distinguish SQL null from JSON null. Dictionary values are
+hashed by value. A per-index recipe includes keys, predicates, covering fields,
+stored source and aggregate cohort inputs. Generated embeddings or remote media
+with uncaptured dependencies cannot receive a reuse proof.
 
-Equivalent cuts reuse the complete native index directory. The certificate binds
-the original index closure, current source cut, namespace, recipe, and both row
-maps. Subsequent rewrites flatten to that original index space. A shared
-publication-pinned resolver translates forward hydration and reverse predicate
-membership for text, ordered rows, dense/sparse retrieval, covering values and
-highlights. Algebraic state reuses only the proven identical visible cut.
-Translated canonical ranks preserve default text score ties; explicit ordering
-and cursors retain current source semantics. Lookup failures propagate before
-heap comparisons; comparison callbacks never perform I/O.
+Identity state uses bounded native spill sorts and immutable copy-on-write trees.
+Stable file slots and per-file membership let an authenticated file delta retain
+unchanged rows without sorting or rebuilding the entire identity map. A separate
+ordered membership tree supplies canonical ranks without rewriting every retained
+row on append. Identity construction and compact translation construction share
+the node CPU scheduler and park CPU admission during artifact I/O.
 
-Reader leases, local GC traversal, cloud publication certificates, startup
-navigation warming, and recovery include the map and original navigation closure.
-Protocol 66 fences readers that cannot interpret relocated index bindings.
+Optional identity work has a 64 MiB working allowance, bounded by retained-state
+admission independently of its smaller CPU execution lease, and `lake_indexes.row_identity.max_spill_bytes` defaults to
+1 GiB. Zero disables optional construction. Local working-set/spill exhaustion,
+oversized root evidence, null keys and duplicate keys decline the optimization;
+ordinary complete native index construction continues. Cancellation, backing
+allocator failures, source failures and corrupt authenticated evidence still
+propagate. These limits are separate from SQL query limits.
+
+A rewrite with the same visible logical IDs proves reuse separately for each
+native declaration. A label-only change can keep a body-only text index and raw
+vectors while rebuilding covering rows or an index that stores the complete
+source. Shared aggregate cohorts certify the union of their inputs. The directory
+can therefore contain both fresh and retained indexes. Each retained declaration
+names its exact original coordinate space; later rewrites flatten directly to
+that space, even when different indexes originated in different snapshots.
+
+The certificate binds the declaration closure, current source cut, namespace,
+recipes, input evidence and exact name-to-space bindings. A shared publication
+owner exposes borrowed per-index resolver views. Snapshot labels alone never
+select a coordinate space: a provider can rewrite a snapshot under the same label.
+Forward hydration, reverse predicate membership, covering/highlight fields,
+dense/sparse retrieval and SQL consumers all use the selected index view. Fresh
+indexes in a mixed directory retain normal pruning and ordering fast paths.
+Compressed predicate blocks from a fresh metadata index are batch-translated
+before applying a retained text index’s ordinal kernels.
+Selective predicate pack proofs use shared encoded spill runs to avoid repeatedly
+merging an ever-growing prefix.
+
+A bounded optional construction pass joins verified IDs into compact forward and
+reverse trees keyed by 16-byte coordinates. Forward entries also store canonical
+rank, eliminating an additional rank-tree walk for score ties. Batch translation
+sorts probes and retains cursor paths; duplicate inputs share work. When the
+compact pass declines admission, readers use the authenticated ID maps instead.
+Shared decoded-page leases avoid repeated parsing and authentication of immutable
+pages, while every access still checks the pinned reader's authority and deadline.
+No query materializes the complete row map. Covering hydration groups requested
+rows by block and reads each authenticated block once, preserving result order.
+
+Reader leases, GC traversal, cloud publication certificates, startup navigation
+warming and recovery include all current and original navigation/map roots and
+compact translations. Protocol 67 fences readers that cannot interpret scoped
+index bindings. Reconciliation probes bounded unique navigation roots. A deeper
+reader failure records a generation- and publication-token-bound repair hint;
+the coordinator rebuilds that publication without reuse. Stale hints cannot
+invalidate a later publication. Hints are process-local and are rediscovered by a
+failed reader after restart.
+
 Existing physical public IDs remain unchanged; the logical ID codec is internal
-and does not introduce a public stable-ID promise.
-
-The resolver has a bounded page cache and two point lookups per translation;
-it does not materialize all row mappings in query memory. Mapping metadata still
-scales with row count, and broad equal-score searches can require substantial
-navigation. Compact dense translation pages and batched translation are future
-optimizations, to be measured against index rebuild savings.
+and does not introduce a public stable-ID promise. Added or removed logical IDs
+still require complete index rebase after relocation. Identity maps themselves
+remain incremental, but reusing native index postings across a changed logical ID
+set needs explicit membership/delta support in each consumer. Mapping metadata
+and proof comparisons still scale with row count; cross-file rewrite savings
+must be measured against this verification/publication cost.
 
 ## Staged extensions
 
@@ -145,8 +185,8 @@ optimizations, to be measured against index rebuild savings.
   The inheritance rules are modeled and tested, but the current reader does not
   claim automatic v3 lineage reuse.
 - Accept independently authenticated, snapshot-bound writer mapping proofs.
-- Track versions by index input recipe and reuse unchanged subsets on row/value
-  changes, without forcing a whole physical rebase.
+- Extend per-index reuse across added/deleted logical IDs with explicit native
+  membership and delta state; never retain stale aggregates or deleted postings.
 - Enable stable logical public IDs only with complete lookup, overlay, cursor,
   filtering and compatibility coverage.
 
@@ -157,7 +197,8 @@ may infer identity from file layout or silently trust a user-declared key.
 
 `zig/e2e/antfly/test_lake_row_identity.py` runs independent PyArrow Parquet and
 PyIceberg rewrites against fresh-build oracle tables. It checks repeated
-relocation, a changed value, append with shifted file slots, restart, text scores,
+relocation, per-index value changes, mixed original snapshot spaces, append with
+shifted file slots, restart, text scores,
 indexed filters, sorting, forward/backward paging, covering/highlight fields,
 dense/sparse membership and SQL aggregation. The Iceberg parameter participates
 in `e2e-full`. Native tests cover spill bounds, duplicate keys, proof tampering,

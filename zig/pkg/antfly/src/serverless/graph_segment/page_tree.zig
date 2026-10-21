@@ -108,7 +108,7 @@ pub const Cache = struct {
     }
 
     pub fn store(self: *Cache) Store {
-        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .check = check, .reduce = self.underlying.reduce };
+        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .decoded_page = self.underlying.decoded_page, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .check = check, .reduce = self.underlying.reduce };
     }
 
     fn check(ptr: *anyopaque) !void {
@@ -248,6 +248,25 @@ fn writeU64(bytes: []u8, offset: usize, value: u64) void {
 
 fn less(a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
+}
+
+/// Exact zero-based rank from authenticated subtree counts. Inserts into an
+/// ordered map update only touched paths; stored row payloads need no rank rewrite.
+pub fn rankOf(alloc: Allocator, store: Store, root: Ref, key: []const u8) !u64 {
+    var ref = root;
+    var rank: u64 = 0;
+    while (true) {
+        var page = try readPage(alloc, store, ref);
+        defer page.deinit(alloc);
+        var position: usize = 0;
+        while (position + 1 < page.entries.len and !less(key, page.entries[position + 1].key)) : (position += 1) {}
+        if (ref.height == 0) {
+            if (!std.mem.eql(u8, page.entries[position].key, key)) return error.InvalidGraphPage;
+            return std.math.add(u64, rank, position);
+        }
+        for (page.entries[0..position]) |entry| rank = try std.math.add(u64, rank, entry.child.?.records);
+        ref = page.entries[position].child.?;
+    }
 }
 
 /// An independently owned authenticated page. Callers may retain its immutable

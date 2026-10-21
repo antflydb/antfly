@@ -85,8 +85,12 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
         docs = [
             {
                 "id": base + i,
-                "body": "changed word" if step == 3 and i == 17 else "needle same text",
-                "label": f"row-{i}",
+                "body": (
+                    "changed word"
+                    if step in (3, 6) and i == 17
+                    else "needle same text"
+                ),
+                "label": f"updated-{i}" if step == 5 else f"row-{i}",
                 "dense_native": json.dumps([1, i / count]),
                 "sparse_native": json.dumps({"1": i + 1}),
             }
@@ -287,8 +291,8 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     and "values_recipe" in value
                     and "current" in value
                 ):
-                    result.append(value)
-            return result
+                    result.append((path.stat().st_mtime_ns, value))
+            return [value for _, value in sorted(result, key=lambda item: item[0])]
 
         attach("logical", True)
         revision = ready("logical")
@@ -296,24 +300,37 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
         assert first, "Logical identity state was not published"
         original = next(root for root in first if root.get("indexes") is None)
 
-        for step in (1, 2, 3, 4):
+        for step in (1, 2, 5, 3, 6, 4):
             write(step)
             revision = ready("logical", revision)
             candidates = states()
-            if step < 3:
-                assert any(
-                    root.get("indexes") is not None
-                    and root["artifacts"] == original["artifacts"]
-                    and root["indexes"]["snapshot"] == original["current"]["snapshot"]
-                    and root["current"]["snapshot"] != original["current"]["snapshot"]
-                    for root in candidates
-                ), "File rewrites rebuilt native index artifacts instead of relocating"
+            current = candidates[-1]
+            reused = {entry["name"]: entry["space"] for entry in current.get("reused", [])}
+            if step in (1, 2):
+                text_space = current.get("indexes") or reused.get("text")
+                assert text_space is not None, current
+                assert current["artifacts"] == original["artifacts"], {
+                    "reused": list(reused),
+                    "inputs": current["current"].get("input_recipes"),
+                    "original_inputs": original["current"].get("input_recipes"),
+                }
+                assert text_space["snapshot"] == original["current"]["snapshot"], current
+            elif step == 5:
+                assert "text" in reused, current
+                assert "all_text" not in reused, current
+                assert current["artifacts"] != original["artifacts"], current
+                assert reused["text"]["snapshot"] == original["current"]["snapshot"]
+            elif step == 3:
+                assert "text" not in reused and "all_text" not in reused, current
+                assert "dense_native" in reused and "sparse_native" in reused, current
+            elif step == 6:
+                assert "text" in reused and "dense_native" in reused, current
+                assert (
+                    reused["text"]["snapshot"] != reused["dense_native"]["snapshot"]
+                ), current
             else:
-                assert any(
-                    root.get("indexes") is None
-                    and root["artifacts"] != original["artifacts"]
-                    for root in candidates
-                ), "Changed indexed values reused stale index state"
+                assert not reused and current.get("indexes") is None, current
+                assert current["artifacts"] != original["artifacts"], current
             oracle = f"oracle{step}"
             attach(oracle, False)
             ready(oracle)
@@ -407,7 +424,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     "POST", "/sql", {"statement": statement.format(table=oracle)}
                 )["rows"]
                 assert actual == expected
-            if step == 2:
+            if step in (2, 6):
                 before = call("POST", "/tables/logical/query", text)
                 server.restart()
                 ready("logical")
