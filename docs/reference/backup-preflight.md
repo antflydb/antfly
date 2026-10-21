@@ -184,8 +184,12 @@ reported as `dependency_uninspectable`. This deliberately does not claim to
 interpret all Handlebars programs. The supported media schemes (`http`, `https`,
 `file`, `data` and `s3`) are shared with the runtime transport. Unsupported schemes, including `gs` and
 `gcs`, and structured locators are `source_unresolved`; destination attestations
-cannot enable an unsupported transport. Local paths/gateways and
-credential-bearing or expiring URLs block compatibility. Archive-member and page/fragment selection generate
+cannot enable an unsupported transport. S3 authority and object-key structure
+use the downloader's shared offline validator. Complete references need both;
+known template authorities can still contribute access requirements while their
+keys remain unknown. Invalid references stay unresolved despite destination
+evidence. Endpoint-style bucket/key selection also rejects empty keys at runtime.
+Local paths/gateways and credential-bearing or expiring URLs block compatibility. Archive-member and page/fragment selection generate
 separate destination retrieval requirements. URL credentials use the shared
 credential policy, including API keys, bearer tokens, and fragment parameters.
 Query parameters are split before

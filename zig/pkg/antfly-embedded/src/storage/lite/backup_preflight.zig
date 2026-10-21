@@ -1255,6 +1255,10 @@ pub const Inspector = struct {
                 try self.report.add(self.options, .source_external, origin, doc, field, 0);
             },
             .s3 => {
+                @import("antfly_scraping").validateS3Uri(uri, .{ .complete = path_complete }) catch {
+                    try self.report.add(self.options, .source_unresolved, "invalid_s3_uri", doc, field, 0);
+                    return;
+                };
                 const origin = try std.fmt.allocPrint(a, "{s}://{s}", .{ uri.scheme, host });
                 try self.report.add(self.options, .connection, origin, doc, field, 0);
             },
@@ -3114,4 +3118,64 @@ test "backup preflight known empty helper calls neither fetch nor invent opaque 
     );
     try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
     try std.testing.expect(report.analysis_complete);
+}
+
+test "backup preflight malformed S3 sources cannot be certified" {
+    const a = std.testing.allocator;
+    var incorrectly_compatible = false;
+    for ([_][]const u8{ "s3://bucket", "s3:relative", "s3:///key", "s3://bucket///" }) |uri| {
+        // This is the same location parser called before the runtime creates
+        // the S3 client. No credentials, allocator-backed I/O or network needed.
+        try std.testing.expectError(error.InvalidS3Url, @import("antfly_scraping").s3BucketAlloc(a, try std.Uri.parse(uri), "objects.example.org", true));
+        const source_template = try std.fmt.allocPrint(a, "{{{{remoteText url=\"{s}\"}}}}", .{uri});
+        defer a.free(source_template);
+        const producer = "{\"type\":\"copy\",\"config\":{}}";
+        try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "copy", .kind = .asset, .template = source_template, .producer_json = producer });
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "copy", .kind = "asset", .source_template = source_template, .producer_json = producer }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", "{}", "");
+        const caps = try a.alloc(Capability, report.requirements.items.len);
+        defer a.free(caps);
+        for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true };
+        const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "bucket-access", .requirements = caps }, .{});
+        defer a.free(evidence);
+        const json = try report.jsonAlloc(evidence);
+        defer a.free(json);
+        const compatible = std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"compatible\"") != null;
+        try std.testing.expectEqual(@as(u64, 2), count(report, .source_unresolved));
+        try std.testing.expectEqual(@as(u64, 0), count(report, .connection));
+        try std.testing.expect(!report.analysis_complete);
+        incorrectly_compatible = incorrectly_compatible or compatible;
+    }
+    try std.testing.expect(!incorrectly_compatible);
+}
+
+test "backup preflight S3 template prefixes defer only an open object key" {
+    const a = std.testing.allocator;
+    const Case = struct { text: []const u8, connection: u64, unresolved: u64 };
+    for ([_]Case{
+        .{ .text = "s3://bucket/{{id}}", .connection = 1, .unresolved = 0 },
+        .{ .text = "s3://bucket/key", .connection = 1, .unresolved = 0 },
+        .{ .text = "s3://bucket/", .connection = 0, .unresolved = 1 },
+        .{ .text = "s3://bucket/?page={{id}}", .connection = 0, .unresolved = 1 },
+        .{ .text = "s3:///{{id}}", .connection = 0, .unresolved = 1 },
+        .{ .text = "s3://{{host}}/key", .connection = 0, .unresolved = 0 },
+    }) |case| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "reader", .kind = "asset", .source_template = case.text, .producer = .{ .type = "reader" } }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        try std.testing.expectEqual(case.connection, count(report, .connection));
+        try std.testing.expectEqual(case.unresolved, count(report, .source_unresolved));
+        try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+        try std.testing.expectEqual(case.unresolved == 0, report.analysis_complete);
+    }
 }

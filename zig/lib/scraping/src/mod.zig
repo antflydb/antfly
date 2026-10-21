@@ -800,8 +800,7 @@ pub const PinnedRange = struct {
             if (kind != .strong_etag) return error.InvalidSourceReference;
             try validateHttpUri(parsed);
         } else if (std.ascii.eqlIgnoreCase(parsed.scheme, "s3")) {
-            const host = parsed.host orelse return error.InvalidS3Url;
-            if (host.percent_encoded.len == 0 or trimLeftSlash(parsed.path.percent_encoded).len == 0) return error.InvalidS3Url;
+            try validateS3Uri(parsed, .{});
         } else return error.UnsupportedUrlScheme;
         return parsed;
     }
@@ -914,6 +913,15 @@ fn validatePinnedContentRange(value: []const u8, offset: u64, length: usize, tot
     if (range.next() != null or first != offset or last < first or last >= total or last - first + 1 != length) return error.InvalidRemoteRange;
 }
 
+/// Structural S3 validation without credentials, allocation or transport I/O.
+/// A template prefix may have a known authority while its key is still open.
+pub fn validateS3Uri(uri: std.Uri, options: struct { complete: bool = true }) !void {
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "s3")) return error.UnsupportedUrlScheme;
+    const host = uri.host orelse return error.InvalidS3Url;
+    if (host.percent_encoded.len == 0) return error.InvalidS3Url;
+    if (options.complete and trimLeftSlash(uri.path.percent_encoded).len == 0) return error.InvalidS3Url;
+}
+
 fn downloadS3Alloc(
     alloc: Allocator,
     maybe_context: ?DownloadContext,
@@ -921,6 +929,7 @@ fn downloadS3Alloc(
     security: ?*const ContentSecurityConfig,
     s3_credentials: ?*const S3CredentialsConfig,
 ) !DownloadedContent {
+    try validateS3Uri(parsed, .{});
     var local_io_impl: ?std.Io.Threaded = if (maybe_context == null)
         std.Io.Threaded.init(alloc, .{})
     else
@@ -1033,13 +1042,13 @@ fn parseS3LocationAlloc(
     configured_endpoint: []const u8,
     use_ssl: bool,
 ) !struct { []u8, []u8 } {
-    const host = parsed.host orelse return error.InvalidS3Url;
-    const host_text = host.percent_encoded;
+    try validateS3Uri(parsed, .{});
+    const host_text = parsed.host.?.percent_encoded;
     const path = trimLeftSlash(parsed.path.percent_encoded);
-    if (path.len == 0) return error.InvalidS3Url;
 
     if (try s3AuthorityMatchesEndpoint(alloc, host_text, parsed.port, configured_endpoint, use_ssl)) {
         const slash = std.mem.indexOfScalar(u8, path, '/') orelse return error.InvalidS3Url;
+        if (slash == 0 or slash + 1 == path.len) return error.InvalidS3Url;
         const bucket = try alloc.dupe(u8, path[0..slash]);
         errdefer alloc.free(bucket);
         return .{
@@ -2219,4 +2228,29 @@ test "pinned source reference validation is shared and requires no allocator or 
     _ = try PinnedRange.validateReference("http://example.org/clip.mp4", "\"\"", .strong_etag, 1024);
     _ = try PinnedRange.validateReference("s3://bucket/clip.mp4", "v1", .s3_version_id, 1024);
     _ = try PinnedRange.validateReference("s3://endpoint/bucket/clip.mp4", "\"etag\"", .strong_etag, 1024);
+}
+
+test "S3 URI structure is checked before allocation credentials or transport" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    for ([_][]const u8{ "s3://bucket", "s3:relative", "s3:///key", "s3://bucket/", "s3://bucket///" }) |text| {
+        const uri = try std.Uri.parse(text);
+        try std.testing.expectError(error.InvalidS3Url, validateS3Uri(uri, .{}));
+        try std.testing.expectError(error.InvalidS3Url, downloadContentAlloc(failing.allocator(), text, null, null));
+        try std.testing.expectError(error.InvalidS3Url, PinnedRange.validateReference(text, "v1", .s3_version_id, 1024));
+    }
+    try validateS3Uri(try std.Uri.parse("s3://bucket/"), .{ .complete = false });
+    try std.testing.expectError(error.InvalidS3Url, validateS3Uri(try std.Uri.parse("s3:///key"), .{ .complete = false }));
+    try validateS3Uri(try std.Uri.parse("s3://bucket/key"), .{});
+    try validateS3Uri(try std.Uri.parse("S3://bucket/key"), .{});
+
+    for ([_][]const u8{ "s3://objects.example.org/bucket", "s3://objects.example.org/bucket/" }) |text| {
+        try std.testing.expectError(error.InvalidS3Url, s3BucketAlloc(a, try std.Uri.parse(text), "https://objects.example.org", true));
+    }
+    // A nonempty key ending in '/' is valid in either addressing style.
+    for ([_][]const u8{ "s3://bucket/folder/", "s3://objects.example.org/bucket/folder/" }) |text| {
+        const bucket = try s3BucketAlloc(a, try std.Uri.parse(text), "https://objects.example.org", true);
+        defer a.free(bucket);
+        try std.testing.expectEqualStrings("bucket", bucket);
+    }
 }
