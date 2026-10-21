@@ -1639,14 +1639,7 @@ pub const TxnManager = struct {
         var batch = try self.collectIntentBatchWithAdmission(alloc, txn_id, control);
         errdefer batch.deinit(alloc);
         if (batch.revision != record.intent_revision) return error.IntentSnapshotChanged;
-        var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("antfly-prepared-intents-v1");
-        hash.update(&txn_id);
-        var identity: [24]u8 = undefined;
-        std.mem.writeInt(u64, identity[0..8], record.begin_timestamp, .little);
-        std.mem.writeInt(u64, identity[8..16], record.created_at, .little);
-        std.mem.writeInt(u64, identity[16..24], batch.revision, .little);
-        hash.update(&identity);
+        var hash = preparedInputHasher(txn_id, record);
         // Collection returns physical keys in sorted order, for both legacy
         // manifests and the current member index. Length framing distinguishes
         // boundaries, deletes and prepared-row envelopes without re-parsing JSON.
@@ -1960,9 +1953,7 @@ pub const TxnManager = struct {
             else => return err,
         };
         defer alloc.free(raw);
-        if (raw.len != 5 or raw[0] > 1) return error.InvalidTxnRecord;
-        if (raw[0] == 0 and std.mem.readInt(u32, raw[1..5], .little) != 0) return error.InvalidTxnRecord;
-        return .{ .version = if (raw[0] == 1) std.mem.readInt(u32, raw[1..5], .little) else null };
+        return try decodeSchemaBinding(raw);
     }
 
     /// Called under the same apply fence as schema publication. A current
@@ -4115,6 +4106,101 @@ pub fn validatePreparedReadGuardTransition(previous: []const u8, candidate: ?[]c
     inline for (.{ "status", "commit_version", "finalized_at", "replay_sequence", "intents_resolved", "intents_resolved_known" }) |field|
         @field(before, field) = @field(after, field);
     if (!std.meta.eql(before, after)) return error.IntentConflict;
+}
+
+/// Derive a reservation against this exact DocStore writer view. Hash the
+/// complete physical intent prefix, rather than trusting a manifest or the
+/// caller's request to enumerate primary rows. The writer's publication gate
+/// spans this check and the later credit publication. Auxiliary request effects
+/// still come from the owning assembler; this is not a complete prepare vote.
+pub fn derivePreparedReplayPlanFromTxn(a: Allocator, txn: anytype, expected: prepared_effects.Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, accepted: prepared_effects.Effects, original: ?read_control.Port) !@import("prepared_replay_plan.zig").Plan {
+    var trace: MutationAdmissionTrace = .{};
+    var result = derivePreparedReplayPlanFromTxnInner(a, txn, expected, request, accepted, trace.bind(original)) catch |cause| return trace.failure orelse cause;
+    if (trace.failure) |cause| {
+        result.deinit();
+        return cause;
+    }
+    return result;
+}
+fn derivePreparedReplayPlanFromTxnInner(a: Allocator, txn: anytype, expected: prepared_effects.Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, accepted: prepared_effects.Effects, control: ?read_control.Port) !@import("prepared_replay_plan.zig").Plan {
+    if (control) |owner| try owner.checkpoint();
+    const record = try decodeRecord(txn.get(&makeRecordKey(expected.txn_id)) catch |cause| return if (cause == error.NotFound) error.TxnNotFound else cause);
+    if (record.status != .pending) return error.DecisionConflict;
+    if (!record.prepared or record.intent_revision == 0) return error.PreparedEffectsRequired;
+    if (record.intent_revision != expected.intent_revision) return error.PreparedEffectsMismatch;
+    if (record.preparation_requirement) |required| if (required.mode != expected.mode) return error.PreparationContractConflict;
+    const schema_raw: ?[]const u8 = txn.get(&makeSidecarKey(schema_leases_prefix, expected.txn_id)) catch |cause| if (cause == error.NotFound) null else return cause;
+    const binding = if (schema_raw) |raw| try decodeSchemaBinding(raw) else null;
+    if ((if (binding) |value| value.version else null) != expected.schema_version) return error.PreparedEffectsMismatch;
+    var hash = preparedInputHasher(expected.txn_id, record);
+    var writes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (writes.items) |key| a.free(key);
+        writes.deinit(a);
+    }
+    var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (deletes.items) |key| a.free(key);
+        deletes.deinit(a);
+    }
+    {
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        var prefix: [intents_prefix.len + 17]u8 = undefined;
+        @memcpy(prefix[0 .. prefix.len - 1], &makeSidecarKey(intents_prefix, expected.txn_id));
+        prefix[prefix.len - 1] = ':';
+        var end = prefix;
+        end[end.len - 1] += 1;
+        cursor.setUpperBound(&end);
+        var next = if (control) |owner| try cursor.seekAtOrAfterWithAdmission(&prefix, owner) else try cursor.seekAtOrAfter(&prefix);
+        const admission = @import("transaction_intent_admission.zig");
+        while (next) |row| : (next = if (control) |owner| try cursor.nextWithAdmission(owner) else try cursor.next()) {
+            if (!try admission.hasPrefix(row.key, &prefix, control)) break;
+            try TxnManager.hashPreparedInput(&hash, row.key, control);
+            try TxnManager.hashPreparedInput(&hash, row.value, control);
+            const intent = try IntentValue.decode(row.value);
+            const logical = row.key[prefix.len..];
+            // Read/consume the cursor's borrowed payload before another get
+            // can rotate a provider buffer. Own every retained key separately.
+            const is_write = intent.value != null;
+            const metadata = isRawMetadataIntentKey(logical);
+            const key = try admission.concatKey(a, &.{logical}, control);
+            defer a.free(key);
+            const lock = try admission.concatKey(a, &.{ intent_locks_prefix, key }, control);
+            defer a.free(lock);
+            const held = txn.get(lock) catch |cause| return if (cause == error.NotFound) error.PreparedEffectsMismatch else cause;
+            if (!try admission.equalBytes(held, &expected.txn_id, control)) return error.PreparedEffectsMismatch;
+            if (!metadata) {
+                if (writes.items.len + deletes.items.len == publication_backlog.default_max_records) return error.Backpressured;
+                const owned = try admission.concatKey(a, &.{key}, control);
+                const list = if (is_write) &writes else &deletes;
+                list.append(a, owned) catch |cause| {
+                    a.free(owned);
+                    return cause;
+                };
+            }
+        }
+    }
+    var actual: [32]u8 = undefined;
+    hash.final(&actual);
+    if (!std.meta.eql(actual, expected.intent_digest)) return error.PreparedEffectsMismatch;
+    return @import("prepared_replay_plan.zig").deriveWithPrimaryKeys(a, .{ .writes = writes.items, .deletes = deletes.items }, request, accepted, control);
+}
+fn preparedInputHasher(id: TxnId, record: TxnRecord) std.crypto.hash.Blake3 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("antfly-prepared-intents-v1");
+    hash.update(&id);
+    var identity: [24]u8 = undefined;
+    std.mem.writeInt(u64, identity[0..8], record.begin_timestamp, .little);
+    std.mem.writeInt(u64, identity[8..16], record.created_at, .little);
+    std.mem.writeInt(u64, identity[16..24], record.intent_revision, .little);
+    hash.update(&identity);
+    return hash;
+}
+fn decodeSchemaBinding(raw: []const u8) !SchemaBinding {
+    if (raw.len != 5 or raw[0] > 1) return error.InvalidTxnRecord;
+    if (raw[0] == 0 and std.mem.readInt(u32, raw[1..5], .little) != 0) return error.InvalidTxnRecord;
+    return .{ .version = if (raw[0] == 1) std.mem.readInt(u32, raw[1..5], .little) else null };
 }
 
 /// Rebuild the accepted contract from actual retained inputs during restart.

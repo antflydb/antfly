@@ -22318,3 +22318,46 @@ executable recovery resources, derived-log quota, DB/execution lifetimes, normal
 required PREPARE orchestration and broader scheduler/session/tenant/whole-node/
 remote rollout remain open. The full goal remains active and strong required
 providers remain disabled. Full Linux qualification remains waived.
+
+
+### Writer-view replay reservation input authority (2026-10-21)
+
+DocStore transactions, batches and batch adapters now derive the minimum primary
+replay lanes and roots from their actual physical intent prefix. They check the
+prepared record, birth identity, revision, schema binding, complete intent digest
+and every lock owner before publishing credit. A manifest cannot hide an orphan
+physical intent, and an incomplete caller request cannot omit primary write,
+delete or possible-overwrite lanes. Recognized private metadata participates in
+input validation without becoming a primary document root; arbitrary binary IDs
+retain their document meaning. The canonical v1 digest framing is unchanged.
+
+The writer retains a fixed-size original contract and accepted-frame fingerprint
+through final inventory validation. It rejects input changes staged after the
+reservation, including changes after replay materialization in that same writer.
+Final validation rehashes the retained inputs without loading the accepted frame
+again or retaining borrowed request controls. Ignored reservation failures poison
+the writer. Failed final validation publishes neither data nor credit. Native ABI
+61 and storage-owner ABI 119 fence the expanded transient writer state; stored
+formats, reader floors and activation defaults are unchanged.
+
+The final replay-plan run passes 21 cases plus 51 ABI companions and 60/60 build
+steps. The separate final regression run passes 61 required-preparation DB,
+109 prepared-effects, 11 replay-credit and 51 ABI companion cases, with 79/79
+steps. Five native descriptor/layout cases also pass: 309 successful executions
+in total, including repeated ABI companions. Both green runs bind the same 5,493
+native/schema input hashes, independently reverified against final source, with
+zero skips, failures or leaks. See prepared-writer-input-plan-verified.json,
+prepared-writer-input-plan-v6.json/log and prepared-writer-input-regressions-v1.json/log
+in the cumulative receipts. Earlier failed runs preserve compiler and fixture
+corrections; none supplies qualification for the final result. Pinned format,
+generated-error and whitespace checks pass.
+
+This closes the reservation writer's primary-input floor and final-view check.
+Complete auxiliary physical/replay assembly before the vote, authoritative live
+catalog/route and lifetime ownership, progress-safe counters or commit-owned
+deltas, executable recovery resources and derived-log quota, durable guard
+installation, raw/import/restore/migration/peer eligibility and normal required
+PREPARE orchestration remain required. Broader scheduler/session/tenant/whole-node
+and remote rollout remains open. Strong required providers stay disabled; the
+full goal remains active. Full Linux qualification remains waived, and Linux
+builds still require pinned Nix/glibc Zig. Cross-engine performance is unproven.

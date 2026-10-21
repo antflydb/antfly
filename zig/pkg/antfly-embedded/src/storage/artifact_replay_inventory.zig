@@ -159,6 +159,11 @@ pub fn isMetadataKey(candidate: []const u8) bool {
     return std.mem.eql(u8, candidate, marker_key) or std.mem.startsWith(u8, candidate, state_prefix) or std.mem.startsWith(u8, candidate, progress_prefix);
 }
 
+const PreparedInputs = struct {
+    contract: @import("db/prepared_transaction_effects.zig").Contract,
+    frame: [32]u8,
+};
+
 pub const Capture = struct {
     checked: bool = false,
     marker: ?Marker = null,
@@ -166,10 +171,23 @@ pub const Capture = struct {
     staged: bool = false,
     poisoned: bool = false,
     touched: std.StringHashMapUnmanaged(void) = .empty,
+    prepared_inputs: std.AutoHashMapUnmanaged([16]u8, PreparedInputs) = .empty,
     pub fn deinit(self: *Capture, a: std.mem.Allocator) void {
         var iter = self.touched.keyIterator();
         while (iter.next()) |key| a.free(key.*);
         self.touched.deinit(a);
+        self.prepared_inputs.deinit(a);
+    }
+    /// Retain fixed-size input authority until the writer's final validation.
+    /// No borrowed request controls, frame payloads or producer buffers escape.
+    pub fn retainPreparedInputs(self: *Capture, a: std.mem.Allocator, expected: @import("db/prepared_transaction_effects.zig").Contract, frame: [32]u8) !void {
+        errdefer self.poisoned = true;
+        if (self.staged or self.poisoned) return error.InvalidArtifactReplayInventory;
+        const entry = try self.prepared_inputs.getOrPut(a, expected.txn_id);
+        const selected: PreparedInputs = .{ .contract = expected, .frame = frame };
+        if (entry.found_existing) {
+            if (!std.meta.eql(entry.value_ptr.*, selected)) return error.PreparedEffectsConflict;
+        } else entry.value_ptr.* = selected;
     }
     pub fn touch(self: *Capture, a: std.mem.Allocator, txn: anytype, debt: anytype, gate: ?*std.atomic.Mutex, candidate: []const u8, present: bool, value: ?[]const u8) !void {
         if (self.staging) return;
@@ -248,7 +266,7 @@ pub const Capture = struct {
     }
     pub fn stage(self: *Capture, txn: anytype, base: ?*backend.Store) !void {
         if (self.poisoned) return error.InvalidArtifactReplayInventory;
-        if (self.staged or self.touched.count() == 0) return;
+        if (self.staged or (self.touched.count() == 0 and self.prepared_inputs.count() == 0)) return;
         errdefer self.poisoned = true;
         var physical_keys: usize = 0;
         var selected_keys = self.touched.keyIterator();
@@ -300,6 +318,23 @@ pub const Capture = struct {
         while (validations.next()) |key| {
             if (replay_credit.isGrant(key.*)) try replay_credit.validateGrant(txn, try replay_credit.idFromKey(key.*, replay_credit.grant_prefix));
             if (replay_credit.isOwner(key.*)) try replay_credit.validateOwner(txn, key.*);
+        }
+        // Reservation-time validation alone cannot exclude later mutations
+        // staged by this same writer. Recheck its original authority without
+        // rereading the accepted frame or retaining a caller's borrowed controls.
+        var inputs = self.prepared_inputs.iterator();
+        while (inputs.next()) |input| {
+            const grant = (try replay_credit.load(txn, input.key_ptr.*)) orelse continue;
+            if (!std.meta.eql(grant.frame, input.value_ptr.frame)) return error.PreparedEffectsMismatch;
+            const T = switch (@typeInfo(@TypeOf(txn))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(txn),
+            };
+            if (comptime @hasDecl(T, "openPhysicalCursorAdapter") and @hasField(T, "alloc")) {
+                var plan = try @import("transactions.zig").derivePreparedReplayPlanFromTxn(txn.alloc, txn, input.value_ptr.contract, .{}, .{}, null);
+                defer plan.deinit();
+                if (grant.phase == .prepared) try replay_credit.validateMutationPlan(txn, input.key_ptr.*, plan, null);
+            } else return error.InvalidArtifactReplayInventory;
         }
         self.staged = true;
     }
