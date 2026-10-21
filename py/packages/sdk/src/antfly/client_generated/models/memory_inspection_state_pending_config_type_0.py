@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.memory_inspection_state_pending_config_type_0_ontology_pack import (
+    MemoryInspectionStatePendingConfigType0OntologyPack,
+)
 from ..models.memory_inspection_state_pending_config_type_0_processing import (
     MemoryInspectionStatePendingConfigType0Processing,
 )
@@ -41,6 +44,8 @@ class MemoryInspectionStatePendingConfigType0:
         policy_version (str | Unset):
         features (MemoryInspectionStatePendingConfigType0Features | Unset):
         models (MemoryInspectionStatePendingConfigType0Models | Unset):
+        ontology_pack (MemoryInspectionStatePendingConfigType0OntologyPack | Unset):  Default:
+            MemoryInspectionStatePendingConfigType0OntologyPack.NONE.
         predicates (list[MemoryInspectionStatePendingConfigType0PredicatesItem] | Unset):
         source_rules (list[MemoryInspectionStatePendingConfigType0SourceRulesItem] | Unset):
         max_input_bytes (int | Unset):  Default: 262144.
@@ -60,6 +65,9 @@ class MemoryInspectionStatePendingConfigType0:
     policy_version: str | Unset = UNSET
     features: MemoryInspectionStatePendingConfigType0Features | Unset = UNSET
     models: MemoryInspectionStatePendingConfigType0Models | Unset = UNSET
+    ontology_pack: MemoryInspectionStatePendingConfigType0OntologyPack | Unset = (
+        MemoryInspectionStatePendingConfigType0OntologyPack.NONE
+    )
     predicates: list[MemoryInspectionStatePendingConfigType0PredicatesItem] | Unset = UNSET
     source_rules: list[MemoryInspectionStatePendingConfigType0SourceRulesItem] | Unset = UNSET
     max_input_bytes: int | Unset = 262144
@@ -90,6 +98,10 @@ class MemoryInspectionStatePendingConfigType0:
         models: dict[str, Any] | Unset = UNSET
         if not isinstance(self.models, Unset):
             models = self.models.to_dict()
+
+        ontology_pack: str | Unset = UNSET
+        if not isinstance(self.ontology_pack, Unset):
+            ontology_pack = self.ontology_pack.value
 
         predicates: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.predicates, Unset):
@@ -138,6 +150,8 @@ class MemoryInspectionStatePendingConfigType0:
             field_dict["features"] = features
         if models is not UNSET:
             field_dict["models"] = models
+        if ontology_pack is not UNSET:
+            field_dict["ontology_pack"] = ontology_pack
         if predicates is not UNSET:
             field_dict["predicates"] = predicates
         if source_rules is not UNSET:
@@ -202,6 +216,13 @@ class MemoryInspectionStatePendingConfigType0:
         else:
             models = MemoryInspectionStatePendingConfigType0Models.from_dict(_models)
 
+        _ontology_pack = d.pop("ontology_pack", UNSET)
+        ontology_pack: MemoryInspectionStatePendingConfigType0OntologyPack | Unset
+        if isinstance(_ontology_pack, Unset):
+            ontology_pack = UNSET
+        else:
+            ontology_pack = MemoryInspectionStatePendingConfigType0OntologyPack(_ontology_pack)
+
         _predicates = d.pop("predicates", UNSET)
         predicates: list[MemoryInspectionStatePendingConfigType0PredicatesItem] | Unset = UNSET
         if _predicates is not UNSET:
@@ -248,6 +269,7 @@ class MemoryInspectionStatePendingConfigType0:
             policy_version=policy_version,
             features=features,
             models=models,
+            ontology_pack=ontology_pack,
             predicates=predicates,
             source_rules=source_rules,
             max_input_bytes=max_input_bytes,

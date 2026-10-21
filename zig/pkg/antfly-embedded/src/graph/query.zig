@@ -1082,6 +1082,7 @@ pub const GraphQueryEngine = struct {
     /// See ExecutionScope; defaults keep the historical terminal behavior at
     /// cross-table tagged nodes.
     scope: ExecutionScope = .{},
+    start_identities: []const NodeIdentity = &.{},
 
     /// Execute a graph query. For result_ref node selectors, the caller must
     /// resolve refs to keys and pass them as resolved_keys.
@@ -1091,6 +1092,17 @@ pub const GraphQueryEngine = struct {
         gq: GraphQuery,
         resolved_keys: []const []const u8,
     ) !GraphQueryResult {
+        const previous_starts = self.start_identities;
+        defer self.start_identities = previous_starts;
+        self.start_identities = &.{};
+        if (gq.start_nodes == .identities) {
+            const identities = gq.start_nodes.identities;
+            for (identities) |identity| if (identity.table != null and
+                (!self.scope.expand_cross_table_local or (gq.query_type != .traverse and gq.query_type != .neighbors))) return error.UnsupportedQueryRequest;
+            if (identities.len != resolved_keys.len) return error.InvalidQueryRequest;
+            for (identities, resolved_keys) |identity, key| if (!std.mem.eql(u8, identity.key, key)) return error.InvalidQueryRequest;
+            self.start_identities = identities;
+        }
         const supplied_time = self.ttl_now_ns;
         if (supplied_time == null) self.ttl_now_ns = self.scope.ttl_now_ns orelse graph_index.clock.nowRealtimeNs();
         defer self.ttl_now_ns = supplied_time;
@@ -2692,7 +2704,7 @@ pub const GraphQueryEngine = struct {
         start_keys: []const []const u8,
         target_keys: []const []const u8,
     ) !GraphQueryResult {
-        if (algebraicTraversalConsidered(graph_index, params)) {
+        if (self.start_identities.len == 0 and algebraicTraversalConsidered(graph_index, params)) {
             graph_index.noteAlgebraicTraversalAttempt();
             const proof = algebraicTraversalProof(graph_index, params);
             if (proof.safe()) {
@@ -2752,6 +2764,10 @@ pub const GraphQueryEngine = struct {
             if (params.max_results > 0) {
                 rules.max_results = params.max_results - @as(u32, @intCast(all_results.items.len));
             }
+            rules.start_table = if (self.start_identities.len > 0) self.start_identities[start_index].table else null;
+            if (rules.start_table) |table| if (std.mem.eql(u8, table, self.scope.owning_table)) {
+                rules.start_table = null;
+            };
             const trav_results = try traversal_mod.traverse(self.alloc, graph_index, key, rules);
             defer traversal_mod.freeOwnedResults(self.alloc, trav_results);
 
@@ -3090,6 +3106,15 @@ pub const GraphQueryEngine = struct {
         direction: graph_mod.EdgeDirection,
     ) !?[]bool {
         const admission = self.node_admission orelse return null;
+        if (self.start_identities.len > 0) {
+            const nodes = try self.alloc.alloc(NodeRef, self.start_identities.len);
+            defer self.alloc.free(nodes);
+            for (self.start_identities, nodes) |identity, *node| {
+                const table = if (identity.table) |name| if (std.mem.eql(u8, name, self.scope.owning_table)) null else name else null;
+                node.* = .{ .key = identity.key, .table = table, .external = table != null };
+            }
+            return try admission.filterAlloc(self.alloc, nodes);
+        }
         // A document-model graph may still contain resolver-produced
         // cross-table targets identified only by edge metadata. Let the graph
         // algorithm classify reverse and bidirectional starts in that case.
@@ -3215,10 +3240,11 @@ fn takeTraversalResultNode(result: *traversal_mod.TraversalResult, work_budget: 
         if (previous > bytes) budget.releaseStateBytes(previous - bytes);
     }
     if (!same_budget) if (result.retained_budget) |budget| budget.releaseStateBytes(result.retained_state_bytes);
-    const node = GraphResultNode{ .key = result.key, .table = result.target_table, .depth = result.depth, .distance = result.distance, .path = result.path, .path_edges = result.path_edges };
+    const node = GraphResultNode{ .key = result.key, .table = result.target_table, .depth = result.depth, .distance = result.distance, .path = result.path, .path_tables = result.path_tables, .path_edges = result.path_edges };
     result.key = &.{};
     result.target_table = null;
     result.path = null;
+    result.path_tables = null;
     result.path_edges = null;
     result.retained_budget = null;
     result.retained_state_bytes = 0;
@@ -3231,6 +3257,12 @@ fn traversalGraphResultNodeOwnedBytes(result: traversal_mod.TraversalResult) !us
     if (result.path) |items| {
         total = try std.math.add(usize, total, try std.math.mul(usize, items.len, @sizeOf([]const u8)));
         for (items) |item| total = try std.math.add(usize, total, item.len);
+    }
+    if (result.path_tables) |tables| {
+        total = try std.math.add(usize, total, try std.math.mul(usize, tables.len, @sizeOf(?[]const u8)));
+        for (tables) |table| if (table) |value| {
+            total = try std.math.add(usize, total, value.len);
+        };
     }
     if (result.path_edges) |edges| for (edges) |edge| {
         total = try std.math.add(usize, total, paths_mod.pathEdgeOwnedBytes(edge));
@@ -7188,4 +7220,30 @@ test "graph metric native response adoption lazy all pass temporary rows" {
     try std.testing.expectEqual(@as(usize, 0), counter.alloc_calls - allocs);
     work.deinit();
     try std.testing.expectEqual(@as(usize, 0), counter.live);
+}
+
+test "engine qualified incoming seeds retain namespace across local key collisions and paths" {
+    const a = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(a, "qualified-seed-s", "qualified-seed-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        a.destroy(ctx);
+    }
+    try ctx.graph.addEdge("doc", "shared", "about", 1, 0, 0, "{\"target_table\":\"concepts\"}");
+    try ctx.graph.addEdge("wrong", "shared", "about", 1, 0, 0, "{\"target_table\":\"other\"}");
+    try ctx.graph.addEdge("local", "shared", "about", 1, 0, 0, "{}");
+    var engine: GraphQueryEngine = .{ .alloc = a, .scope = .{ .owning_table = "docs", .expand_cross_table_local = true } };
+    const query: GraphQuery = .{ .query_type = .traverse, .index_name = "test", .start_nodes = .{ .identities = &.{.{ .key = "shared", .table = "concepts" }} }, .params = .{ .direction = .in, .max_depth = 1, .include_paths = true } };
+    var result = try engine.execute(&ctx.graph, query, &.{"shared"});
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+    try std.testing.expectEqualStrings("doc", result.nodes[0].key);
+    try std.testing.expect(result.nodes[0].table == null);
+    try std.testing.expectEqualStrings("concepts", result.nodes[0].path_tables.?[0].?);
+    try std.testing.expect(result.nodes[0].path_tables.?[1] == null);
+    try std.testing.expect(isCanonicalResultNode(result.nodes[0]));
+    var terminal: GraphQueryEngine = .{ .alloc = a };
+    try std.testing.expectError(error.UnsupportedQueryRequest, terminal.execute(&ctx.graph, query, &.{"shared"}));
 }

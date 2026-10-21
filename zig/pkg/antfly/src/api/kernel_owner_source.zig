@@ -3189,6 +3189,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .ok;
     }
 
+    fn entitySupportsCuration(ptr: ?*anyopaque, supported: *u8) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const sink = self.entity_sink orelse return .invalid_argument;
+        supported.* = @intFromBool(sink.supportsCuration() catch |err| return kernel_error_identity.statusFromError(err));
+        return .ok;
+    }
+
     fn entityUpsertBatch(
         ptr: ?*anyopaque,
         entries_ptr: ?[*]const abi.EntityUpsert,
@@ -3252,6 +3259,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .callback_ctx = self,
                 .upsert_fn = entityUpsert,
                 .upsert_batch_fn = entityUpsertBatch,
+                .supports_curation_fn = entitySupportsCuration,
             } else .{},
             .promotion_owner_ctx = if (self.promotion_leadership_source != null) self else null,
             .promotion_owner_fn = if (self.promotion_leadership_source != null) promotionOwner else null,

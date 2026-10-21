@@ -16034,6 +16034,1100 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/MemoryOutcome'
+  /memory/v1/spaces/{space}/entities/{id}/view:
+    post:
+      operationId: getMemoryEntityView
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryEntityView'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryEntityViewRequest'
+  /memory/v1/spaces/{space}/episodes:
+    get:
+      operationId: listMemoryEpisodes
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 64
+            x-go-type-skip-optional-pointer: false
+        - name: known_at
+          in: query
+          schema:
+            type: integer
+            format: int64
+            x-go-type: int64
+            x-go-type-skip-optional-pointer: false
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryEpisodePage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/episodes/{id}:
+    get:
+      operationId: getMemoryEpisode
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 64
+            x-go-type-skip-optional-pointer: false
+        - name: known_at
+          in: query
+          schema:
+            type: integer
+            format: int64
+            x-go-type: int64
+            x-go-type-skip-optional-pointer: false
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryEpisode'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/relationship-proposals:
+    post:
+      operationId: proposeMemoryRelationship
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryRelationshipProposalRequest'
+  /memory/v1/spaces/{space}/relationship-proposals/{id}:
+    get:
+      operationId: getMemoryRelationshipProposal
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryRelationshipProposal'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/relationship-proposals/{id}/verdict:
+    post:
+      operationId: reviewMemoryRelationshipProposal
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryEntityVerdict'
+  /memory/v1/spaces/{space}/entities/{id}/candidates:
+    post:
+      operationId: getMemoryEntityCandidates
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryEntityCandidateRequest'
+  /memory/v1/spaces/{space}/entity-proposals:
+    post:
+      operationId: proposeMemoryEntity
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryEntityProposalRequest'
+    get:
+      operationId: listMemoryEntityProposals
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 256
+            x-go-type-skip-optional-pointer: false
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/entity-proposals/{id}:
+    get:
+      operationId: getMemoryEntityProposal
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/entity-proposals/{id}/verdict:
+    post:
+      operationId: reviewMemoryEntityProposal
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryEntityVerdict'
   /memory/v1/spaces/{space}/explain:
     post:
       operationId: explainMemoryResource
@@ -49587,6 +50681,13 @@ components:
               default: null
               nullable: true
           additionalProperties: false
+        ontology_pack:
+          type: string
+          enum:
+            - none
+            - software_team_v1
+          default: none
+          x-go-type-skip-optional-pointer: false
         predicates:
           type: array
           items:
@@ -50363,6 +51464,58 @@ components:
               - id
               - name
             additionalProperties: false
+        mentions:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              entity_id:
+                type: string
+              evidence:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    span:
+                      type: object
+                      properties:
+                        start:
+                          type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                        end:
+                          type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                      required:
+                        - start
+                        - end
+                      additionalProperties: false
+                      default: null
+                      nullable: true
+                  required:
+                    - id
+                  additionalProperties: false
+              visibility:
+                type: string
+                enum:
+                  - private
+                  - team
+                default: private
+                x-go-type-skip-optional-pointer: false
+            required:
+              - id
+              - entity_id
+              - evidence
+            additionalProperties: false
       required:
         - evidence
       additionalProperties: false
@@ -50485,6 +51638,64 @@ components:
     MemoryRecallRequest:
       type: object
       properties:
+        graph:
+          type: object
+          properties:
+            entity_seeds:
+              type: array
+              items:
+                type: string
+            max_hops:
+              type: integer
+              minimum: 0
+              maximum: 255
+              format: uint32
+              default: 2
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+            max_nodes:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              format: uint32
+              default: 256
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+            max_edges:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              format: uint32
+              default: 1024
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+            iterations:
+              type: integer
+              minimum: 0
+              maximum: 255
+              format: uint32
+              default: 24
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+            restart_probability:
+              type: number
+              default: 0.15
+              x-go-type-skip-optional-pointer: false
+            relation_weight:
+              type: number
+              default: 0.5
+              x-go-type-skip-optional-pointer: false
+            provisional_weight:
+              type: number
+              default: 0.5
+              x-go-type-skip-optional-pointer: false
+            include_episodes:
+              type: boolean
+              default: true
+              x-go-type-skip-optional-pointer: false
+          additionalProperties: false
+          default: null
+          nullable: true
         query:
           type: string
         relationship:
@@ -50636,6 +51847,11 @@ components:
     MemoryOperation:
       type: object
       properties:
+        proposal_id:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
         id:
           type: string
         action:
@@ -51231,6 +52447,7 @@ components:
             - unmerge
             - suppress
             - unsuppress
+            - distinct
         from:
           type: string
         to:
@@ -51256,6 +52473,1600 @@ components:
         - action
         - from
         - expected_revision
+      additionalProperties: false
+    MemoryEntityCandidateRequest:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+            - identity
+            - relationship
+          default: identity
+          x-go-type-skip-optional-pointer: false
+        cursor:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        limit:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          format: uint32
+          default: 16
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+      additionalProperties: false
+    MemoryEntityProposalRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+            - merge
+            - unmerge
+            - suppress
+            - unsuppress
+            - distinct
+        from:
+          type: string
+        to:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        replace:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
+        pin_distinct:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
+        absorbed:
+          type: string
+          enum:
+            - reject
+            - release
+            - suppress
+          default: reject
+          x-go-type-skip-optional-pointer: false
+        actor:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              span:
+                type: object
+                properties:
+                  start:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                  end:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                required:
+                  - start
+                  - end
+                additionalProperties: false
+                default: null
+                nullable: true
+            required:
+              - id
+            additionalProperties: false
+      required:
+        - action
+        - from
+        - expected_revision
+      additionalProperties: false
+    MemoryEntityVerdict:
+      type: object
+      properties:
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        accept:
+          type: boolean
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        pin_distinct:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
+        actor:
+          type: string
+        reason:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              span:
+                type: object
+                properties:
+                  start:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                  end:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                required:
+                  - start
+                  - end
+                additionalProperties: false
+                default: null
+                nullable: true
+            required:
+              - id
+            additionalProperties: false
+        model:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+          default: null
+          nullable: true
+      required:
+        - expected_revision
+      additionalProperties: false
+    MemoryEntityViewRequest:
+      type: object
+      properties:
+        limit:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          format: uint32
+          default: 16
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        known_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        valid_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    MemoryEntityView:
+      type: object
+      properties:
+        entity:
+          type: object
+          properties:
+            visibility:
+              type: string
+              enum:
+                - private
+                - team
+              default: private
+              x-go-type-skip-optional-pointer: false
+            evidence:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  span:
+                    type: object
+                    properties:
+                      start:
+                        type: integer
+                        minimum: 0
+                        maximum: 4294967295
+                        format: uint32
+                        x-go-type: uint32
+                      end:
+                        type: integer
+                        minimum: 0
+                        maximum: 4294967295
+                        format: uint32
+                        x-go-type: uint32
+                    required:
+                      - start
+                      - end
+                    additionalProperties: false
+                    default: null
+                    nullable: true
+                required:
+                  - id
+                additionalProperties: false
+            id:
+              type: string
+            name:
+              type: string
+            type:
+              type: string
+            aliases:
+              type: array
+              items:
+                type: string
+            distinct_from:
+              type: array
+              items:
+                type: string
+          required:
+            - id
+            - name
+          additionalProperties: false
+        canonical_id:
+          type: string
+        description:
+          type: string
+        dependencies:
+          type: array
+          items:
+            type: object
+            properties:
+              resource:
+                type: object
+                properties:
+                  database:
+                    type: string
+                  namespace:
+                    type: string
+                  table:
+                    type: string
+                  table_id:
+                    type: integer
+                    minimum: 1
+                    maximum: 18446744073709551615
+                    format: uint64
+                    x-go-type: uint64
+                  storage_name:
+                    type: string
+                    default: null
+                    nullable: true
+                    x-go-type-skip-optional-pointer: false
+                  kind:
+                    type: string
+                    enum:
+                      - table
+                      - record
+                      - relationship
+                      - trace
+                      - evidence
+                      - assertion
+                      - entity
+                      - outcome
+                      - decision
+                      - operation
+                      - configuration
+                  id:
+                    type: string
+                  revision:
+                    type: integer
+                    minimum: 1
+                    maximum: 18446744073709551615
+                    format: uint64
+                    x-go-type: uint64
+                  digest:
+                    type: string
+                    default: null
+                    nullable: true
+                    x-go-type-skip-optional-pointer: false
+                required:
+                  - table
+                  - table_id
+                  - kind
+                  - id
+                  - revision
+                additionalProperties: false
+              evidence:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    span:
+                      type: object
+                      properties:
+                        start:
+                          type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                        end:
+                          type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                      required:
+                        - start
+                        - end
+                      additionalProperties: false
+                      default: null
+                      nullable: true
+                  required:
+                    - id
+                  additionalProperties: false
+            required:
+              - resource
+              - evidence
+            additionalProperties: false
+        fingerprint:
+          type: string
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        config_generation:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        complete:
+          type: boolean
+        scanned:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+      required:
+        - entity
+        - canonical_id
+        - description
+        - dependencies
+        - fingerprint
+        - revision
+        - config_generation
+        - complete
+        - scanned
+      additionalProperties: false
+    MemoryEntityMention:
+      type: object
+      properties:
+        id:
+          type: string
+        entity_id:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              span:
+                type: object
+                properties:
+                  start:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                  end:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                required:
+                  - start
+                  - end
+                additionalProperties: false
+                default: null
+                nullable: true
+            required:
+              - id
+            additionalProperties: false
+        visibility:
+          type: string
+          enum:
+            - private
+            - team
+          default: private
+          x-go-type-skip-optional-pointer: false
+      required:
+        - id
+        - entity_id
+        - evidence
+      additionalProperties: false
+    MemoryEpisodeRequest:
+      type: object
+      properties:
+        cursor:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        limit:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          format: uint32
+          default: 32
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        known_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    MemoryEpisode:
+      type: object
+      properties:
+        thread_id:
+          type: string
+        turns:
+          type: array
+          items:
+            type: object
+            properties:
+              evidence:
+                type: object
+                properties:
+                  context_only:
+                    type: boolean
+                    default: false
+                    x-go-type-skip-optional-pointer: false
+                  evidence:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      source_id:
+                        type: string
+                      source_version:
+                        type: string
+                      text:
+                        type: string
+                      resource:
+                        type: object
+                        properties:
+                          database:
+                            type: string
+                          namespace:
+                            type: string
+                          table:
+                            type: string
+                          table_id:
+                            type: integer
+                            minimum: 1
+                            maximum: 18446744073709551615
+                            format: uint64
+                            x-go-type: uint64
+                          storage_name:
+                            type: string
+                            default: null
+                            nullable: true
+                            x-go-type-skip-optional-pointer: false
+                          kind:
+                            type: string
+                            enum:
+                              - table
+                              - record
+                              - relationship
+                              - trace
+                              - evidence
+                              - assertion
+                              - entity
+                              - outcome
+                              - decision
+                              - operation
+                              - configuration
+                          id:
+                            type: string
+                          revision:
+                            type: integer
+                            minimum: 1
+                            maximum: 18446744073709551615
+                            format: uint64
+                            x-go-type: uint64
+                          digest:
+                            type: string
+                            default: null
+                            nullable: true
+                            x-go-type-skip-optional-pointer: false
+                        required:
+                          - table
+                          - table_id
+                          - kind
+                          - id
+                          - revision
+                        additionalProperties: false
+                        default: null
+                        nullable: true
+                      resource_selector:
+                        type: object
+                        properties:
+                          database:
+                            type: string
+                          namespace:
+                            type: string
+                          table:
+                            type: string
+                          id:
+                            type: string
+                          kind:
+                            type: string
+                            enum:
+                              - record
+                              - relationship
+                              - trace
+                            default: record
+                            x-go-type-skip-optional-pointer: false
+                          expected_revision:
+                            type: integer
+                            minimum: 0
+                            maximum: 18446744073709551615
+                            format: uint64
+                            x-go-type: uint64
+                            default: null
+                            nullable: true
+                            x-go-type-skip-optional-pointer: false
+                        required:
+                          - table
+                          - id
+                        additionalProperties: false
+                        default: null
+                        nullable: true
+                      source_url:
+                        type: string
+                        default: null
+                        nullable: true
+                        x-go-type-skip-optional-pointer: false
+                      author:
+                        type: string
+                        default: null
+                        nullable: true
+                        x-go-type-skip-optional-pointer: false
+                      event_time:
+                        type: integer
+                        minimum: -9223372036854775808
+                        maximum: 9223372036854775807
+                        format: int64
+                        x-go-type: int64
+                        default: null
+                        nullable: true
+                        x-go-type-skip-optional-pointer: false
+                      timezone:
+                        type: string
+                        default: null
+                        nullable: true
+                        x-go-type-skip-optional-pointer: false
+                      thread_id:
+                        type: string
+                        default: null
+                        nullable: true
+                        x-go-type-skip-optional-pointer: false
+                      turn_id:
+                        type: string
+                        default: null
+                        nullable: true
+                        x-go-type-skip-optional-pointer: false
+                      ordinal:
+                        type: integer
+                        minimum: -9223372036854775808
+                        maximum: 9223372036854775807
+                        format: int64
+                        x-go-type: int64
+                        default: null
+                        nullable: true
+                        x-go-type-skip-optional-pointer: false
+                      producer:
+                        type: string
+                      managed:
+                        type: boolean
+                        default: false
+                        x-go-type-skip-optional-pointer: false
+                      visibility:
+                        type: string
+                        enum:
+                          - private
+                          - team
+                        default: private
+                        x-go-type-skip-optional-pointer: false
+                      expires_at:
+                        type: integer
+                        minimum: -9223372036854775808
+                        maximum: 9223372036854775807
+                        format: int64
+                        x-go-type: int64
+                        default: null
+                        nullable: true
+                        x-go-type-skip-optional-pointer: false
+                    required:
+                      - id
+                    additionalProperties: false
+                  owner:
+                    type: string
+                  recorded_at:
+                    type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    x-go-type: int64
+                  revision:
+                    type: integer
+                    minimum: 0
+                    maximum: 18446744073709551615
+                    format: uint64
+                    x-go-type: uint64
+                  forgotten:
+                    type: boolean
+                    default: false
+                    x-go-type-skip-optional-pointer: false
+                required:
+                  - evidence
+                  - owner
+                  - recorded_at
+                  - revision
+                additionalProperties: false
+              entities:
+                type: array
+                items:
+                  type: string
+            required:
+              - evidence
+              - entities
+            additionalProperties: false
+        next_cursor:
+          type: string
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        complete:
+          type: boolean
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+      required:
+        - thread_id
+        - turns
+        - next_cursor
+        - complete
+        - revision
+      additionalProperties: false
+    MemoryEpisodePage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              thread_id:
+                type: string
+              turns:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    evidence:
+                      type: object
+                      properties:
+                        context_only:
+                          type: boolean
+                          default: false
+                          x-go-type-skip-optional-pointer: false
+                        evidence:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                            source_id:
+                              type: string
+                            source_version:
+                              type: string
+                            text:
+                              type: string
+                            resource:
+                              type: object
+                              properties:
+                                database:
+                                  type: string
+                                namespace:
+                                  type: string
+                                table:
+                                  type: string
+                                table_id:
+                                  type: integer
+                                  minimum: 1
+                                  maximum: 18446744073709551615
+                                  format: uint64
+                                  x-go-type: uint64
+                                storage_name:
+                                  type: string
+                                  default: null
+                                  nullable: true
+                                  x-go-type-skip-optional-pointer: false
+                                kind:
+                                  type: string
+                                  enum:
+                                    - table
+                                    - record
+                                    - relationship
+                                    - trace
+                                    - evidence
+                                    - assertion
+                                    - entity
+                                    - outcome
+                                    - decision
+                                    - operation
+                                    - configuration
+                                id:
+                                  type: string
+                                revision:
+                                  type: integer
+                                  minimum: 1
+                                  maximum: 18446744073709551615
+                                  format: uint64
+                                  x-go-type: uint64
+                                digest:
+                                  type: string
+                                  default: null
+                                  nullable: true
+                                  x-go-type-skip-optional-pointer: false
+                              required:
+                                - table
+                                - table_id
+                                - kind
+                                - id
+                                - revision
+                              additionalProperties: false
+                              default: null
+                              nullable: true
+                            resource_selector:
+                              type: object
+                              properties:
+                                database:
+                                  type: string
+                                namespace:
+                                  type: string
+                                table:
+                                  type: string
+                                id:
+                                  type: string
+                                kind:
+                                  type: string
+                                  enum:
+                                    - record
+                                    - relationship
+                                    - trace
+                                  default: record
+                                  x-go-type-skip-optional-pointer: false
+                                expected_revision:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 18446744073709551615
+                                  format: uint64
+                                  x-go-type: uint64
+                                  default: null
+                                  nullable: true
+                                  x-go-type-skip-optional-pointer: false
+                              required:
+                                - table
+                                - id
+                              additionalProperties: false
+                              default: null
+                              nullable: true
+                            source_url:
+                              type: string
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            author:
+                              type: string
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            event_time:
+                              type: integer
+                              minimum: -9223372036854775808
+                              maximum: 9223372036854775807
+                              format: int64
+                              x-go-type: int64
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            timezone:
+                              type: string
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            thread_id:
+                              type: string
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            turn_id:
+                              type: string
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            ordinal:
+                              type: integer
+                              minimum: -9223372036854775808
+                              maximum: 9223372036854775807
+                              format: int64
+                              x-go-type: int64
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            producer:
+                              type: string
+                            managed:
+                              type: boolean
+                              default: false
+                              x-go-type-skip-optional-pointer: false
+                            visibility:
+                              type: string
+                              enum:
+                                - private
+                                - team
+                              default: private
+                              x-go-type-skip-optional-pointer: false
+                            expires_at:
+                              type: integer
+                              minimum: -9223372036854775808
+                              maximum: 9223372036854775807
+                              format: int64
+                              x-go-type: int64
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                          required:
+                            - id
+                          additionalProperties: false
+                        owner:
+                          type: string
+                        recorded_at:
+                          type: integer
+                          minimum: -9223372036854775808
+                          maximum: 9223372036854775807
+                          format: int64
+                          x-go-type: int64
+                        revision:
+                          type: integer
+                          minimum: 0
+                          maximum: 18446744073709551615
+                          format: uint64
+                          x-go-type: uint64
+                        forgotten:
+                          type: boolean
+                          default: false
+                          x-go-type-skip-optional-pointer: false
+                      required:
+                        - evidence
+                        - owner
+                        - recorded_at
+                        - revision
+                      additionalProperties: false
+                    entities:
+                      type: array
+                      items:
+                        type: string
+                  required:
+                    - evidence
+                    - entities
+                  additionalProperties: false
+              next_cursor:
+                type: string
+                nullable: true
+                x-go-type-skip-optional-pointer: false
+              complete:
+                type: boolean
+              revision:
+                type: integer
+                minimum: 0
+                maximum: 18446744073709551615
+                format: uint64
+                x-go-type: uint64
+            required:
+              - thread_id
+              - turns
+              - next_cursor
+              - complete
+              - revision
+            additionalProperties: false
+        next_cursor:
+          type: string
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        complete:
+          type: boolean
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+      required:
+        - items
+        - next_cursor
+        - complete
+        - revision
+      additionalProperties: false
+    MemoryRelationshipProposalRequest:
+      type: object
+      properties:
+        id:
+          type: string
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        assertion:
+          type: object
+          properties:
+            id:
+              type: string
+            subject:
+              type: string
+            predicate:
+              type: string
+            value:
+              type: string
+            statement:
+              type: string
+            kind:
+              type: string
+              enum:
+                - semantic
+                - episodic
+                - procedural
+                - decision
+                - rationale
+                - preference
+                - lesson
+                - constraint
+                - open_question
+                - alternative
+                - summary
+              default: semantic
+              x-go-type-skip-optional-pointer: false
+            scope:
+              type: string
+            task:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            environment:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            role:
+              type: string
+              enum:
+                - reported
+                - observed
+                - inferred
+                - hypothesized
+              default: reported
+              x-go-type-skip-optional-pointer: false
+            modality:
+              type: string
+              enum:
+                - actual
+                - planned
+                - desired
+                - conditional
+                - hypothetical
+              default: actual
+              x-go-type-skip-optional-pointer: false
+            stability:
+              type: string
+              enum:
+                - provisional
+                - settled
+              default: settled
+              x-go-type-skip-optional-pointer: false
+            valid_from:
+              type: integer
+              minimum: -9223372036854775808
+              maximum: 9223372036854775807
+              format: int64
+              x-go-type: int64
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            valid_to:
+              type: integer
+              minimum: -9223372036854775808
+              maximum: 9223372036854775807
+              format: int64
+              x-go-type: int64
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            evidence:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  span:
+                    type: object
+                    properties:
+                      start:
+                        type: integer
+                        minimum: 0
+                        maximum: 4294967295
+                        format: uint32
+                        x-go-type: uint32
+                      end:
+                        type: integer
+                        minimum: 0
+                        maximum: 4294967295
+                        format: uint32
+                        x-go-type: uint32
+                    required:
+                      - start
+                      - end
+                    additionalProperties: false
+                    default: null
+                    nullable: true
+                required:
+                  - id
+                additionalProperties: false
+            depends_on:
+              type: array
+              items:
+                type: string
+            support_sets:
+              type: array
+              items:
+                type: object
+                properties:
+                  evidence:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        span:
+                          type: object
+                          properties:
+                            start:
+                              type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
+                            end:
+                              type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
+                          required:
+                            - start
+                            - end
+                          additionalProperties: false
+                          default: null
+                          nullable: true
+                      required:
+                        - id
+                      additionalProperties: false
+                  depends_on:
+                    type: array
+                    items:
+                      type: string
+                required:
+                  - evidence
+                additionalProperties: false
+            supersedes:
+              type: array
+              items:
+                type: string
+            motivates:
+              type: array
+              items:
+                type: string
+            rejected_in_favor_of:
+              type: array
+              items:
+                type: string
+            preconditions:
+              type: array
+              items:
+                type: string
+            steps:
+              type: array
+              items:
+                type: string
+            expected_outcome:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            producer:
+              type: string
+            visibility:
+              type: string
+              enum:
+                - private
+                - team
+              default: private
+              x-go-type-skip-optional-pointer: false
+            embedding:
+              type: array
+              items:
+                type: number
+              default: null
+              nullable: true
+            embedding_model:
+              type: object
+              properties:
+                provider:
+                  type: string
+                model:
+                  type: string
+                revision:
+                  type: string
+                dimensions:
+                  type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  x-go-type: uint32
+                  default: null
+                  nullable: true
+                  x-go-type-skip-optional-pointer: false
+              required:
+                - provider
+                - model
+                - revision
+              additionalProperties: false
+              default: null
+              nullable: true
+            reconciliation_reason:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - id
+            - subject
+            - predicate
+            - value
+            - statement
+            - evidence
+          additionalProperties: false
+        actor:
+          type: string
+      required:
+        - id
+        - expected_revision
+        - assertion
+      additionalProperties: false
+    MemoryRelationshipProposal:
+      type: object
+      properties:
+        id:
+          type: string
+        assertion:
+          type: object
+          properties:
+            id:
+              type: string
+            subject:
+              type: string
+            predicate:
+              type: string
+            value:
+              type: string
+            statement:
+              type: string
+            kind:
+              type: string
+              enum:
+                - semantic
+                - episodic
+                - procedural
+                - decision
+                - rationale
+                - preference
+                - lesson
+                - constraint
+                - open_question
+                - alternative
+                - summary
+              default: semantic
+              x-go-type-skip-optional-pointer: false
+            scope:
+              type: string
+            task:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            environment:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            role:
+              type: string
+              enum:
+                - reported
+                - observed
+                - inferred
+                - hypothesized
+              default: reported
+              x-go-type-skip-optional-pointer: false
+            modality:
+              type: string
+              enum:
+                - actual
+                - planned
+                - desired
+                - conditional
+                - hypothetical
+              default: actual
+              x-go-type-skip-optional-pointer: false
+            stability:
+              type: string
+              enum:
+                - provisional
+                - settled
+              default: settled
+              x-go-type-skip-optional-pointer: false
+            valid_from:
+              type: integer
+              minimum: -9223372036854775808
+              maximum: 9223372036854775807
+              format: int64
+              x-go-type: int64
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            valid_to:
+              type: integer
+              minimum: -9223372036854775808
+              maximum: 9223372036854775807
+              format: int64
+              x-go-type: int64
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            evidence:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  span:
+                    type: object
+                    properties:
+                      start:
+                        type: integer
+                        minimum: 0
+                        maximum: 4294967295
+                        format: uint32
+                        x-go-type: uint32
+                      end:
+                        type: integer
+                        minimum: 0
+                        maximum: 4294967295
+                        format: uint32
+                        x-go-type: uint32
+                    required:
+                      - start
+                      - end
+                    additionalProperties: false
+                    default: null
+                    nullable: true
+                required:
+                  - id
+                additionalProperties: false
+            depends_on:
+              type: array
+              items:
+                type: string
+            support_sets:
+              type: array
+              items:
+                type: object
+                properties:
+                  evidence:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        span:
+                          type: object
+                          properties:
+                            start:
+                              type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
+                            end:
+                              type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
+                          required:
+                            - start
+                            - end
+                          additionalProperties: false
+                          default: null
+                          nullable: true
+                      required:
+                        - id
+                      additionalProperties: false
+                  depends_on:
+                    type: array
+                    items:
+                      type: string
+                required:
+                  - evidence
+                additionalProperties: false
+            supersedes:
+              type: array
+              items:
+                type: string
+            motivates:
+              type: array
+              items:
+                type: string
+            rejected_in_favor_of:
+              type: array
+              items:
+                type: string
+            preconditions:
+              type: array
+              items:
+                type: string
+            steps:
+              type: array
+              items:
+                type: string
+            expected_outcome:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            producer:
+              type: string
+            visibility:
+              type: string
+              enum:
+                - private
+                - team
+              default: private
+              x-go-type-skip-optional-pointer: false
+            embedding:
+              type: array
+              items:
+                type: number
+              default: null
+              nullable: true
+            embedding_model:
+              type: object
+              properties:
+                provider:
+                  type: string
+                model:
+                  type: string
+                revision:
+                  type: string
+                dimensions:
+                  type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  x-go-type: uint32
+                  default: null
+                  nullable: true
+                  x-go-type-skip-optional-pointer: false
+              required:
+                - provider
+                - model
+                - revision
+              additionalProperties: false
+              default: null
+              nullable: true
+            reconciliation_reason:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - id
+            - subject
+            - predicate
+            - value
+            - statement
+            - evidence
+          additionalProperties: false
+        owner:
+          type: string
+        actor:
+          type: string
+        config_generation:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        recorded_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+        state:
+          type: string
+          enum:
+            - open
+            - accepted
+            - rejected
+          default: open
+          x-go-type-skip-optional-pointer: false
+        verdict_actor:
+          type: string
+        verdict_principal:
+          type: string
+        verdict_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        model:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+          default: null
+          nullable: true
+        verdict_evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              span:
+                type: object
+                properties:
+                  start:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                  end:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                required:
+                  - start
+                  - end
+                additionalProperties: false
+                default: null
+                nullable: true
+            required:
+              - id
+            additionalProperties: false
+        reason:
+          type: string
+      required:
+        - id
+        - assertion
+        - owner
+        - actor
+        - config_generation
+        - revision
+        - recorded_at
       additionalProperties: false
     MemoryEmbeddingBatch:
       type: object
@@ -51846,6 +54657,481 @@ components:
           enum:
             - lexical
             - lexical_vector
+            - graph
+        entities:
+          type: array
+          items:
+            type: object
+            properties:
+              entity:
+                type: object
+                properties:
+                  visibility:
+                    type: string
+                    enum:
+                      - private
+                      - team
+                    default: private
+                    x-go-type-skip-optional-pointer: false
+                  evidence:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        span:
+                          type: object
+                          properties:
+                            start:
+                              type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
+                            end:
+                              type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
+                          required:
+                            - start
+                            - end
+                          additionalProperties: false
+                          default: null
+                          nullable: true
+                      required:
+                        - id
+                      additionalProperties: false
+                  id:
+                    type: string
+                  name:
+                    type: string
+                  type:
+                    type: string
+                  aliases:
+                    type: array
+                    items:
+                      type: string
+                  distinct_from:
+                    type: array
+                    items:
+                      type: string
+                required:
+                  - id
+                  - name
+                additionalProperties: false
+              canonical_id:
+                type: string
+              description:
+                type: string
+              dependencies:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    resource:
+                      type: object
+                      properties:
+                        database:
+                          type: string
+                        namespace:
+                          type: string
+                        table:
+                          type: string
+                        table_id:
+                          type: integer
+                          minimum: 1
+                          maximum: 18446744073709551615
+                          format: uint64
+                          x-go-type: uint64
+                        storage_name:
+                          type: string
+                          default: null
+                          nullable: true
+                          x-go-type-skip-optional-pointer: false
+                        kind:
+                          type: string
+                          enum:
+                            - table
+                            - record
+                            - relationship
+                            - trace
+                            - evidence
+                            - assertion
+                            - entity
+                            - outcome
+                            - decision
+                            - operation
+                            - configuration
+                        id:
+                          type: string
+                        revision:
+                          type: integer
+                          minimum: 1
+                          maximum: 18446744073709551615
+                          format: uint64
+                          x-go-type: uint64
+                        digest:
+                          type: string
+                          default: null
+                          nullable: true
+                          x-go-type-skip-optional-pointer: false
+                      required:
+                        - table
+                        - table_id
+                        - kind
+                        - id
+                        - revision
+                      additionalProperties: false
+                    evidence:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          span:
+                            type: object
+                            properties:
+                              start:
+                                type: integer
+                                minimum: 0
+                                maximum: 4294967295
+                                format: uint32
+                                x-go-type: uint32
+                              end:
+                                type: integer
+                                minimum: 0
+                                maximum: 4294967295
+                                format: uint32
+                                x-go-type: uint32
+                            required:
+                              - start
+                              - end
+                            additionalProperties: false
+                            default: null
+                            nullable: true
+                        required:
+                          - id
+                        additionalProperties: false
+                  required:
+                    - resource
+                    - evidence
+                  additionalProperties: false
+              fingerprint:
+                type: string
+              revision:
+                type: integer
+                minimum: 0
+                maximum: 18446744073709551615
+                format: uint64
+                x-go-type: uint64
+              config_generation:
+                type: integer
+                minimum: 0
+                maximum: 18446744073709551615
+                format: uint64
+                x-go-type: uint64
+              complete:
+                type: boolean
+              scanned:
+                type: integer
+                minimum: 0
+                maximum: 18446744073709551615
+                format: uint64
+                x-go-type: uint64
+            required:
+              - entity
+              - canonical_id
+              - description
+              - dependencies
+              - fingerprint
+              - revision
+              - config_generation
+              - complete
+              - scanned
+            additionalProperties: false
+        episodes:
+          type: array
+          items:
+            type: object
+            properties:
+              thread_id:
+                type: string
+              turns:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    evidence:
+                      type: object
+                      properties:
+                        context_only:
+                          type: boolean
+                          default: false
+                          x-go-type-skip-optional-pointer: false
+                        evidence:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                            source_id:
+                              type: string
+                            source_version:
+                              type: string
+                            text:
+                              type: string
+                            resource:
+                              type: object
+                              properties:
+                                database:
+                                  type: string
+                                namespace:
+                                  type: string
+                                table:
+                                  type: string
+                                table_id:
+                                  type: integer
+                                  minimum: 1
+                                  maximum: 18446744073709551615
+                                  format: uint64
+                                  x-go-type: uint64
+                                storage_name:
+                                  type: string
+                                  default: null
+                                  nullable: true
+                                  x-go-type-skip-optional-pointer: false
+                                kind:
+                                  type: string
+                                  enum:
+                                    - table
+                                    - record
+                                    - relationship
+                                    - trace
+                                    - evidence
+                                    - assertion
+                                    - entity
+                                    - outcome
+                                    - decision
+                                    - operation
+                                    - configuration
+                                id:
+                                  type: string
+                                revision:
+                                  type: integer
+                                  minimum: 1
+                                  maximum: 18446744073709551615
+                                  format: uint64
+                                  x-go-type: uint64
+                                digest:
+                                  type: string
+                                  default: null
+                                  nullable: true
+                                  x-go-type-skip-optional-pointer: false
+                              required:
+                                - table
+                                - table_id
+                                - kind
+                                - id
+                                - revision
+                              additionalProperties: false
+                              default: null
+                              nullable: true
+                            resource_selector:
+                              type: object
+                              properties:
+                                database:
+                                  type: string
+                                namespace:
+                                  type: string
+                                table:
+                                  type: string
+                                id:
+                                  type: string
+                                kind:
+                                  type: string
+                                  enum:
+                                    - record
+                                    - relationship
+                                    - trace
+                                  default: record
+                                  x-go-type-skip-optional-pointer: false
+                                expected_revision:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 18446744073709551615
+                                  format: uint64
+                                  x-go-type: uint64
+                                  default: null
+                                  nullable: true
+                                  x-go-type-skip-optional-pointer: false
+                              required:
+                                - table
+                                - id
+                              additionalProperties: false
+                              default: null
+                              nullable: true
+                            source_url:
+                              type: string
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            author:
+                              type: string
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            event_time:
+                              type: integer
+                              minimum: -9223372036854775808
+                              maximum: 9223372036854775807
+                              format: int64
+                              x-go-type: int64
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            timezone:
+                              type: string
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            thread_id:
+                              type: string
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            turn_id:
+                              type: string
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            ordinal:
+                              type: integer
+                              minimum: -9223372036854775808
+                              maximum: 9223372036854775807
+                              format: int64
+                              x-go-type: int64
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                            producer:
+                              type: string
+                            managed:
+                              type: boolean
+                              default: false
+                              x-go-type-skip-optional-pointer: false
+                            visibility:
+                              type: string
+                              enum:
+                                - private
+                                - team
+                              default: private
+                              x-go-type-skip-optional-pointer: false
+                            expires_at:
+                              type: integer
+                              minimum: -9223372036854775808
+                              maximum: 9223372036854775807
+                              format: int64
+                              x-go-type: int64
+                              default: null
+                              nullable: true
+                              x-go-type-skip-optional-pointer: false
+                          required:
+                            - id
+                          additionalProperties: false
+                        owner:
+                          type: string
+                        recorded_at:
+                          type: integer
+                          minimum: -9223372036854775808
+                          maximum: 9223372036854775807
+                          format: int64
+                          x-go-type: int64
+                        revision:
+                          type: integer
+                          minimum: 0
+                          maximum: 18446744073709551615
+                          format: uint64
+                          x-go-type: uint64
+                        forgotten:
+                          type: boolean
+                          default: false
+                          x-go-type-skip-optional-pointer: false
+                      required:
+                        - evidence
+                        - owner
+                        - recorded_at
+                        - revision
+                      additionalProperties: false
+                    entities:
+                      type: array
+                      items:
+                        type: string
+                  required:
+                    - evidence
+                    - entities
+                  additionalProperties: false
+              next_cursor:
+                type: string
+                nullable: true
+                x-go-type-skip-optional-pointer: false
+              complete:
+                type: boolean
+              revision:
+                type: integer
+                minimum: 0
+                maximum: 18446744073709551615
+                format: uint64
+                x-go-type: uint64
+            required:
+              - thread_id
+              - turns
+              - next_cursor
+              - complete
+              - revision
+            additionalProperties: false
+        graph:
+          type: object
+          properties:
+            nodes:
+              type: integer
+              minimum: 0
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            edges:
+              type: integer
+              minimum: 0
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            iterations:
+              type: integer
+              minimum: 0
+              maximum: 255
+              format: uint32
+              x-go-type: uint32
+            complete:
+              type: boolean
+            omitted:
+              type: integer
+              minimum: 0
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            algorithm:
+              type: string
+          required:
+            - nodes
+            - edges
+            - iterations
+            - complete
+            - omitted
+          additionalProperties: false
+          default: null
+          nullable: true
       required:
         - items
         - next_cursor
@@ -52618,6 +55904,13 @@ components:
                       default: null
                       nullable: true
                   additionalProperties: false
+                ontology_pack:
+                  type: string
+                  enum:
+                    - none
+                    - software_team_v1
+                  default: none
+                  x-go-type-skip-optional-pointer: false
                 predicates:
                   type: array
                   items:
@@ -52886,6 +56179,13 @@ components:
                       default: null
                       nullable: true
                   additionalProperties: false
+                ontology_pack:
+                  type: string
+                  enum:
+                    - none
+                    - software_team_v1
+                  default: none
+                  x-go-type-skip-optional-pointer: false
                 predicates:
                   type: array
                   items:

@@ -1924,7 +1924,20 @@ pub fn executeSearchGraphWithSets(
     named_sets: []const NamedResultSet,
     executor: SearchGraphExecutor,
 ) !types.SearchResult {
-    var start_keys = try resolveGraphSelectorFromSets(alloc, graph_query.start_nodes, named_sets, .{
+    const start_selector = if (graph_query.start_nodes == .identities and executor.scope.expand_cross_table_local and
+        (graph_query.query_type == .traverse or graph_query.query_type == .neighbors))
+    blk: {
+        const identities = graph_query.start_nodes.identities;
+        const keys = try alloc.alloc([]const u8, identities.len);
+        defer alloc.free(keys);
+        for (identities, keys) |identity, *key| key.* = identity.key;
+        // The engine receives the original selector below and retains every
+        // table-qualified seed. This temporary key projection only resolves
+        // the existing search/result-set handoff; it is never node identity.
+        const resolved = try resolveGraphSelector(alloc, .{ .keys = keys }, null);
+        break :blk resolved;
+    } else null;
+    var start_keys = if (start_selector) |keys| keys else try resolveGraphSelectorFromSets(alloc, graph_query.start_nodes, named_sets, .{
         .ctx = executor.ctx,
         .func = executor.resolve_doc_set_doc_ids,
         .identity_read_generation = req.identity_read_generation,

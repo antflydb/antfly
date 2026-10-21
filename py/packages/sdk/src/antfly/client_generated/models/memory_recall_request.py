@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.memory_recall_request_embedding_model_type_0 import MemoryRecallRequestEmbeddingModelType0
+    from ..models.memory_recall_request_graph_type_0 import MemoryRecallRequestGraphType0
 
 
 T = TypeVar("T", bound="MemoryRecallRequest")
@@ -21,6 +22,7 @@ T = TypeVar("T", bound="MemoryRecallRequest")
 class MemoryRecallRequest:
     """
     Attributes:
+        graph (MemoryRecallRequestGraphType0 | None | Unset):
         query (str | Unset):
         relationship (MemoryRecallRequestRelationship | Unset):
         target_id (None | str | Unset):
@@ -42,6 +44,7 @@ class MemoryRecallRequest:
         embedding_model (MemoryRecallRequestEmbeddingModelType0 | None | Unset):
     """
 
+    graph: MemoryRecallRequestGraphType0 | None | Unset = UNSET
     query: str | Unset = UNSET
     relationship: MemoryRecallRequestRelationship | Unset = UNSET
     target_id: None | str | Unset = UNSET
@@ -64,6 +67,15 @@ class MemoryRecallRequest:
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.memory_recall_request_embedding_model_type_0 import MemoryRecallRequestEmbeddingModelType0
+        from ..models.memory_recall_request_graph_type_0 import MemoryRecallRequestGraphType0
+
+        graph: dict[str, Any] | None | Unset
+        if isinstance(self.graph, Unset):
+            graph = UNSET
+        elif isinstance(self.graph, MemoryRecallRequestGraphType0):
+            graph = self.graph.to_dict()
+        else:
+            graph = self.graph
 
         query = self.query
 
@@ -161,6 +173,8 @@ class MemoryRecallRequest:
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
+        if graph is not UNSET:
+            field_dict["graph"] = graph
         if query is not UNSET:
             field_dict["query"] = query
         if relationship is not UNSET:
@@ -205,8 +219,27 @@ class MemoryRecallRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.memory_recall_request_embedding_model_type_0 import MemoryRecallRequestEmbeddingModelType0
+        from ..models.memory_recall_request_graph_type_0 import MemoryRecallRequestGraphType0
 
         d = dict(src_dict)
+
+        def _parse_graph(data: object) -> MemoryRecallRequestGraphType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                graph_type_0 = MemoryRecallRequestGraphType0.from_dict(data)
+
+                return graph_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(MemoryRecallRequestGraphType0 | None | Unset, data)
+
+        graph = _parse_graph(d.pop("graph", UNSET))
+
         query = d.pop("query", UNSET)
 
         _relationship = d.pop("relationship", UNSET)
@@ -354,6 +387,7 @@ class MemoryRecallRequest:
         embedding_model = _parse_embedding_model(d.pop("embedding_model", UNSET))
 
         memory_recall_request = cls(
+            graph=graph,
             query=query,
             relationship=relationship,
             target_id=target_id,

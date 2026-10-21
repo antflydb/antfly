@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.memory_space_config_ontology_pack import MemorySpaceConfigOntologyPack
 from ..models.memory_space_config_processing import MemorySpaceConfigProcessing
 from ..types import UNSET, Unset
 
@@ -30,6 +31,7 @@ class MemorySpaceConfig:
         policy_version (str | Unset):
         features (MemorySpaceConfigFeatures | Unset):
         models (MemorySpaceConfigModels | Unset):
+        ontology_pack (MemorySpaceConfigOntologyPack | Unset):  Default: MemorySpaceConfigOntologyPack.NONE.
         predicates (list[MemorySpaceConfigPredicatesItem] | Unset):
         source_rules (list[MemorySpaceConfigSourceRulesItem] | Unset):
         max_input_bytes (int | Unset):  Default: 262144.
@@ -47,6 +49,7 @@ class MemorySpaceConfig:
     policy_version: str | Unset = UNSET
     features: MemorySpaceConfigFeatures | Unset = UNSET
     models: MemorySpaceConfigModels | Unset = UNSET
+    ontology_pack: MemorySpaceConfigOntologyPack | Unset = MemorySpaceConfigOntologyPack.NONE
     predicates: list[MemorySpaceConfigPredicatesItem] | Unset = UNSET
     source_rules: list[MemorySpaceConfigSourceRulesItem] | Unset = UNSET
     max_input_bytes: int | Unset = 262144
@@ -77,6 +80,10 @@ class MemorySpaceConfig:
         models: dict[str, Any] | Unset = UNSET
         if not isinstance(self.models, Unset):
             models = self.models.to_dict()
+
+        ontology_pack: str | Unset = UNSET
+        if not isinstance(self.ontology_pack, Unset):
+            ontology_pack = self.ontology_pack.value
 
         predicates: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.predicates, Unset):
@@ -125,6 +132,8 @@ class MemorySpaceConfig:
             field_dict["features"] = features
         if models is not UNSET:
             field_dict["models"] = models
+        if ontology_pack is not UNSET:
+            field_dict["ontology_pack"] = ontology_pack
         if predicates is not UNSET:
             field_dict["predicates"] = predicates
         if source_rules is not UNSET:
@@ -181,6 +190,13 @@ class MemorySpaceConfig:
         else:
             models = MemorySpaceConfigModels.from_dict(_models)
 
+        _ontology_pack = d.pop("ontology_pack", UNSET)
+        ontology_pack: MemorySpaceConfigOntologyPack | Unset
+        if isinstance(_ontology_pack, Unset):
+            ontology_pack = UNSET
+        else:
+            ontology_pack = MemorySpaceConfigOntologyPack(_ontology_pack)
+
         _predicates = d.pop("predicates", UNSET)
         predicates: list[MemorySpaceConfigPredicatesItem] | Unset = UNSET
         if _predicates is not UNSET:
@@ -225,6 +241,7 @@ class MemorySpaceConfig:
             policy_version=policy_version,
             features=features,
             models=models,
+            ontology_pack=ontology_pack,
             predicates=predicates,
             source_rules=source_rules,
             max_input_bytes=max_input_bytes,

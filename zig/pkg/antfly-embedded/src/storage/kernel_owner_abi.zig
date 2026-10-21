@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 81;
+pub const abi_version: u32 = 82;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -268,6 +268,8 @@ pub const LocalQueryExecutionOptions = extern struct {
     /// Presentation only; never used for storage lookup or authorization.
     /// Borrowed through this synchronous call and response serialization.
     response_table_name: BorrowedBytes = .{},
+    graph_owning_table: BorrowedBytes = .{},
+    graph_index_complete_snapshot: u8 = 0,
 };
 
 /// One complete local query against a DB owned by the storage archive. The DB
@@ -1027,6 +1029,12 @@ pub const EntitySinkConfig = extern struct {
     callback_ctx: ?*anyopaque = null,
     upsert_fn: ?EntityUpsertFn = null,
     upsert_batch_fn: ?EntityUpsertBatchFn = null,
+    supports_curation_fn: ?*const fn (?*anyopaque, *u8) callconv(.c) Status = null,
+    pub fn curationCapability(self: EntitySinkConfig, supported: *u8) Status {
+        supported.* = 0;
+        const callback = self.supports_curation_fn orelse return .ok;
+        return callback(self.callback_ctx, supported);
+    }
 };
 
 pub const PromotionOwnerFn = *const fn (?*anyopaque, u64) callconv(.c) u8;

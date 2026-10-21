@@ -65,6 +65,17 @@ class MemoryOperations:
             "operation": ("GET", "/operations/" + quote(id, safe="")),
             "advance": ("POST", "/operations/" + quote(id, safe="") if id else "/maintenance"),
             "entities": ("GET", "/entities"),
+            "entity_view": ("POST", "/entities/" + quote(id, safe="") + "/view"),
+            "episodes": ("GET", "/episodes"),
+            "episode": ("GET", "/episodes/" + quote(id, safe="")),
+            "propose_relationship": ("POST", "/relationship-proposals"),
+            "relationship_proposal": ("GET", "/relationship-proposals/" + quote(id, safe="")),
+            "review_relationship": ("POST", "/relationship-proposals/" + quote(id, safe="") + "/verdict"),
+            "entity_candidates": ("POST", "/entities/" + quote(id, safe="") + "/candidates"),
+            "propose_entity": ("POST", "/entity-proposals"),
+            "entity_proposals": ("GET", "/entity-proposals"),
+            "entity_proposal": ("GET", "/entity-proposals/" + quote(id, safe="")),
+            "review_entity": ("POST", "/entity-proposals/" + quote(id, safe="") + "/verdict"),
             "resolve_entity": ("GET", "/entities/" + quote(id, safe="")),
             "curate_entity": ("POST", "/entity-corrections"),
             "configuration": ("GET", "/configurations/" + quote(id, safe="")),
@@ -74,7 +85,11 @@ class MemoryOperations:
         if action not in routes:
             raise ValueError("unknown native memory action")
         method, suffix = routes[action]
-        if method != "GET" and action not in ("recall", "explain") and not idempotency_key:
+        if (
+            method != "GET"
+            and action not in ("recall", "explain", "entity_candidates", "entity_view")
+            and not idempotency_key
+        ):
             raise ValueError("memory mutations require idempotency_key")
         headers = {"X-Antfly-Database": database, "X-Antfly-Namespace": namespace}
         if idempotency_key:

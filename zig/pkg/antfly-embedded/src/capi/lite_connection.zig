@@ -461,6 +461,7 @@ pub const Owner = struct {
     const MaintenanceSchedule = struct {
         shadow_next: bool = true,
         source_recovery_next: bool = true,
+        group_next: bool = true,
         next_source_recovery_ns: i96 = 0,
         live: bool = true,
         ttl: h.db_mod.types.TTLCleanupStats = .{},
@@ -938,6 +939,16 @@ pub const Owner = struct {
         if (!schedule_entry.found_existing) schedule_entry.value_ptr.* = .{};
         const schedule = schedule_entry.value_ptr;
         self.maintenance_table_cursor = (ordinal + 1) % count;
+        // Group controls are bounded metadata publications on the live owner,
+        // under this connection's writer/path lease. Providers run later on
+        // the detached snapshot. Alternate lanes so continuous grouped input
+        // cannot starve the downstream enrichment/resolver replay it creates.
+        const group_next = schedule.group_next;
+        schedule.group_next = !group_next;
+        if (self.options.open_mode == .writer and group_next and try database.runGroupedSourceMaintenanceSlice()) {
+            self.notifyMutation();
+            return true;
+        }
         // TTL is a short publication for the selected table, never a drain of
         // every namespace under one file lease.
         const now = std.Io.Clock.awake.now(io).nanoseconds;

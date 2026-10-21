@@ -18,13 +18,13 @@ const std = @import("std");
 const t = @import("types.zig");
 const schema = @import("schema.zig");
 
-pub const Action = enum { create, inspect, configure, observe, assertions, recall, get, history, correct, forget, outcome, operation, advance, list, entities, curate_entity, resolve_entity, evidence, stage_embeddings, configuration, explain };
+pub const Action = enum { create, inspect, configure, observe, assertions, recall, get, history, correct, forget, outcome, operation, advance, list, entities, curate_entity, resolve_entity, evidence, stage_embeddings, configuration, explain, entity_candidates, propose_entity, entity_proposals, entity_proposal, review_entity, entity_view, episodes, episode, propose_relationship, relationship_proposal, review_relationship };
 pub const Configure = struct { expected_revision: u64, config: t.Config };
 pub const Page = struct { cursor: ?[]const u8 = null, limit: u16 = 64 };
 
 pub fn mutates(action: Action) bool {
     return switch (action) {
-        .inspect, .recall, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain => false,
+        .inspect, .recall, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal => false,
         else => true,
     };
 }
@@ -34,8 +34,8 @@ pub fn mutates(action: Action) bool {
 /// small ingestion budget never locks out inspection, erasure or recovery.
 pub fn usesInputBudget(action: Action) bool {
     return switch (action) {
-        .observe, .assertions, .correct, .outcome, .curate_entity, .stage_embeddings, .recall => true,
-        .create, .configure, .forget, .advance, .inspect, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain => false,
+        .observe, .assertions, .correct, .outcome, .curate_entity, .stage_embeddings, .recall, .propose_entity, .review_entity, .propose_relationship, .review_relationship => true,
+        .create, .configure, .forget, .advance, .inspect, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal => false,
     };
 }
 
@@ -53,19 +53,38 @@ pub fn Body(comptime action: Action) type {
         .stage_embeddings => t.EmbeddingBatch,
         .curate_entity => t.EntityCorrection,
         .explain => t.provenance.ExplainRequest,
+        .propose_relationship => t.RelationshipProposalRequest,
+        .review_relationship => t.EntityVerdict,
+        .entity_view => t.EntityViewRequest,
+        .episodes, .episode => t.EpisodeRequest,
+        .entity_candidates => t.EntityCandidateRequest,
+        .propose_entity => t.EntityProposalRequest,
+        .review_entity => t.EntityVerdict,
+        .entity_proposals => Page,
         else => struct {},
     };
 }
 
 pub fn idRequired(action: Action) bool {
     return switch (action) {
-        .get, .history, .operation, .resolve_entity, .evidence, .configuration => true,
+        .get, .history, .operation, .resolve_entity, .evidence, .configuration, .entity_candidates, .entity_proposal, .review_entity, .entity_view, .episode, .relationship_proposal, .review_relationship => true,
         else => false,
     };
 }
 
 pub fn description(action: Action) []const u8 {
     return switch (action) {
+        .propose_relationship => "Propose an evidence-grounded typed entity relationship for external review; does not publish an assertion.",
+        .relationship_proposal => "Get an authorized retained relationship proposal and its verdict attribution.",
+        .review_relationship => "Accept, reject or defer an external relationship judgment through native assertion policy with revision and configuration fences.",
+        .entity_view => "Derive a canonical entity description from authorized current assertions, with exact dependency references and a content fingerprint.",
+        .episodes => "Page through authorized evidence episodes grouped by thread, ordered by turn ordinal.",
+        .episode => "Read an ordered evidence episode with grounded entity mentions and explicit pagination.",
+        .entity_candidates => "Discover bounded lexical identity candidates with immutable entity revisions; similarity is a proposal, never authority to merge.",
+        .propose_entity => "Queue an attributed external entity proposal with grounded evidence and a space revision fence. Requires administrator access.",
+        .entity_proposals => "Page through retained entity review proposals. Requires administrator access.",
+        .entity_proposal => "Get an entity proposal and its retained external verdict attribution. Requires administrator access.",
+        .review_entity => "Submit an external accept/reject/defer verdict; apply through native curation policy atomically. Rejecting a merge may pin distinct identities. Requires administrator access.",
         .create => "Create a native memory space. Omit body for model-free defaults. Requires administrator access.",
         .inspect => "Inspect a space's effective configuration, capabilities, revision and pending configuration.",
         .configure => "Configure a space with an expected_revision fence. Requires administrator access; a rebuild may return a pending operation.",

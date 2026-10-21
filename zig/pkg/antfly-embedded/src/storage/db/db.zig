@@ -7150,6 +7150,12 @@ pub const DB = struct {
 
     pub const maintenanceRequiresOrderedApply = local_mutation.maintenanceRequiresOrderedApply;
 
+    /// One bounded group-control turn. The caller owns writer admission;
+    /// connection-based Lite calls this before releasing its path lease.
+    pub fn runGroupedSourceMaintenanceSlice(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runGroupedSourceMaintenanceSlice", .{self});
+        return self.runGroupSourceSlice();
+    }
     fn runLocalGroupSourceSlice(ptr: *anyopaque) !bool {
         const self: *DB = @ptrCast(@alignCast(ptr));
         if (!self.stable_address or self.closed or self.open_mode != .writer or !self.local_execution.optional_runtime_workers_enabled or self.core.index_manager.minimum_reader_version.load(.acquire) < 8) return false;

@@ -121,16 +121,18 @@ pub const Bridge = struct {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
         var claims: std.ArrayList(t.Assertion) = .empty;
         var entities: std.ArrayList(t.Entity) = .empty;
+        var mentions: std.ArrayList(t.EntityMention) = .empty;
         const plan: service.generation_policy.Plan = .{ .config = config, .sources = inputs };
-        const input = .{ .evidence = inputs, .ontology = config.predicates, .policy_version = config.policy_version, .ontology_version = config.ontology_version };
+        const input = .{ .evidence = inputs, .ontology = config.predicates, .ontology_pack = config.ontology_pack, .policy_version = config.policy_version, .ontology_version = config.ontology_version };
         if (config.features.entity_extraction) {
-            const output = try self.produce(a, config, config.models.extractor orelse config.models.generator.?, t.Generated, "Extract canonical entities and explicitly supported aliases only. Preserve distinct homonyms using source/scope qualified IDs. Leave assertions empty.", input, boundary);
+            const output = try self.produce(a, config, config.models.extractor orelse config.models.generator.?, t.Generated, "Extract canonical entities, explicitly supported aliases and grounded repeated entity mentions. Preserve distinct homonyms using source/scope qualified IDs. Leave assertions empty.", input, boundary);
             try plan.validateOutput(.entities, output);
             try entities.appendSlice(a, output.entities);
+            try mentions.appendSlice(a, output.mentions);
         }
         if (plan.enabled(.distillation) and plan.hasCurrent(.distillation)) {
             const stage_inputs = try plan.inputs(a, .distillation);
-            const output = try self.produce(a, config, config.models.generator.?, t.Generated, "Extract atomic durable, source-grounded memory assertions. Leave entities empty; entity extraction is a separate stage. Use canonical IDs from supplied entities when present.", .{ .evidence = stage_inputs, .entities = entities.items, .ontology = config.predicates, .policy_version = config.policy_version }, boundary);
+            const output = try self.produce(a, config, config.models.generator.?, t.Generated, "Extract atomic durable, source-grounded memory assertions. Leave entities empty; entity extraction is a separate stage. Use canonical IDs from supplied entities when present.", .{ .evidence = stage_inputs, .entities = entities.items, .ontology = config.predicates, .ontology_pack = config.ontology_pack, .policy_version = config.policy_version }, boundary);
             try plan.validateOutput(.distillation, output);
             try claims.appendSlice(a, output.assertions);
         }
@@ -139,14 +141,14 @@ pub const Bridge = struct {
             try plan.validateOutput(.summaries, output);
             try claims.appendSlice(a, output.assertions);
         }
-        if (claims.items.len + entities.items.len > config.max_output_items) return error.MemoryInputTooLarge;
-        const output: t.Generated = .{ .assertions = claims.items, .entities = entities.items };
+        if (claims.items.len + entities.items.len + mentions.items.len > config.max_output_items) return error.MemoryInputTooLarge;
+        const output: t.Generated = .{ .assertions = claims.items, .entities = entities.items, .mentions = mentions.items };
         try plan.validatePublication(output);
         return output;
     }
     fn decide(ptr: *anyopaque, a: A, config: t.Config, incoming: t.Assertion, candidates: []const t.StoredAssertion) !t.ReconciliationDecision {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
-        return self.produce(a, config, config.models.decider orelse config.models.generator.?, t.ReconciliationDecision, "Decide whether incoming evidence explicitly replaces any listed assertion. Return only candidate IDs in supersedes, or an empty list when uncertain, simultaneously applicable, hypothetical, or unsupported. Ingestion order and similar wording are never replacement evidence. Explain the evidence-based decision in reason.", .{ .incoming = incoming, .candidates = candidates, .ontology = config.predicates, .policy_version = config.policy_version }, null);
+        return self.produce(a, config, config.models.decider orelse config.models.generator.?, t.ReconciliationDecision, "Decide whether incoming evidence explicitly replaces any listed assertion. Return only candidate IDs in supersedes, or an empty list when uncertain, simultaneously applicable, hypothetical, or unsupported. Ingestion order and similar wording are never replacement evidence. Explain the evidence-based decision in reason.", .{ .incoming = incoming, .candidates = candidates, .ontology = config.predicates, .ontology_pack = config.ontology_pack, .policy_version = config.policy_version }, null);
     }
     fn embedder(self: *Bridge, a: A, model: t.Model) !managed.ManagedEmbedder {
         const indexes = try std.json.Stringify.valueAlloc(a, .{ .memory = .{ .type = "embeddings", .field = "statement", .dimension = model.dimensions, .embedder = .{ .provider = model.provider, .model = model.model } } }, .{});

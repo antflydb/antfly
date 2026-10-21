@@ -3697,3 +3697,215 @@ test "memory snapshot lookup exhaustion reports an incomplete root instead of ab
         try std.testing.expect(record.object.get("payload_truncated").?.bool);
     }
 }
+
+fn externalReviewSetup(store: *Store) !void {
+    try discard(store, .create, "", "{}", "create", 1);
+    try discard(store, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"fixture\",\"source_version\":\"1\",\"text\":\"Antfly is the Antfly database\"}],\"entities\":[{\"id\":\"a\",\"name\":\"Antfly\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"b\",\"name\":\"Antfly database\",\"evidence\":[{\"id\":\"e\"}]}]}", "source", 2);
+}
+fn externalProposal(store: *Store) !m.types.OperationStatus {
+    const a = store.arena.allocator();
+    return std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try store.service("alice", true, 3).execute(a, .propose_entity, "", "{\"action\":\"merge\",\"from\":\"a\",\"to\":\"b\",\"actor\":\"codex/consolidation\",\"expected_revision\":3}", "proposal"), .{});
+}
+test "memory external entity verdicts defer accept and reject through native curation with authenticated provenance" {
+    for ([_]bool{ true, false }) |accept| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try externalReviewSetup(&store);
+        const candidates = try store.service("alice", true, 3).execute(a, .entity_candidates, "a", "{}", "");
+        const listed = try std.json.parseFromSliceLeaky(std.json.Value, a, candidates, .{});
+        try std.testing.expectEqual(@as(usize, 1), listed.object.get("items").?.array.items.len);
+        const proposal = try externalProposal(&store);
+        const id = proposal.proposal_id.?;
+        try std.testing.expectEqualStrings("a", (try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", true, 4).execute(a, .resolve_entity, "a", "{}", ""), .{})).object.get("canonical_id").?.string);
+        try std.testing.expectError(error.Forbidden, store.service("reader", false, 4).execute(a, .entity_proposal, id, "{}", ""));
+        _ = try store.service("alice", true, 5).execute(a, .review_entity, id, "{\"expected_revision\":4,\"actor\":\"codex/consolidation\",\"reason\":\"Unsure; preserve for review\"}", "defer");
+        const request: m.types.EntityVerdict = .{ .expected_revision = 5, .accept = accept, .pin_distinct = !accept, .actor = "codex/user", .reason = "External labelled verdict", .model = .{ .provider = "external", .model = "hosted-judge", .revision = "fixture-v1" } };
+        const encoded = try std.json.Stringify.valueAlloc(a, request, .{});
+        const first = try store.service("alice", true, 6).execute(a, .review_entity, id, encoded, "verdict");
+        try std.testing.expectEqualStrings(first, try store.service("alice", true, 7).execute(a, .review_entity, id, encoded, "verdict"));
+        const inspected = try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", true, 7).execute(a, .entity_proposal, id, "{}", ""), .{});
+        const reviewed = inspected.object.get("proposal").?;
+        try std.testing.expectEqualStrings(if (accept) "accepted" else "rejected", reviewed.object.get("state").?.string);
+        try std.testing.expectEqualStrings("alice", reviewed.object.get("decided").?.object.get("actor").?.string);
+        try std.testing.expectEqualStrings("codex/user", inspected.object.get("inputs").?.object.get("verdict_actor").?.string);
+        try std.testing.expectEqualStrings("External labelled verdict", inspected.object.get("reason").?.string);
+        const resolved = try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", true, 7).execute(a, .resolve_entity, "a", "{}", ""), .{});
+        try std.testing.expectEqualStrings(if (accept) "b" else "a", resolved.object.get("canonical_id").?.string);
+        try std.testing.expectError(error.MemoryEntityConflict, store.service("alice", true, 8).execute(a, .review_entity, id, "{\"expected_revision\":6,\"accept\":true}", "terminal-retry"));
+        const after = try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", true, 8).execute(a, .entity_candidates, "a", "{}", ""), .{});
+        try std.testing.expectEqual(@as(usize, 0), after.object.get("items").?.array.items.len);
+    }
+}
+
+test "memory external verdicts fence configuration changes and scrub forgotten review evidence" {
+    for ([_]bool{ true, false }) |configure| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try externalReviewSetup(&store);
+        const proposal = try externalProposal(&store);
+        const id = proposal.proposal_id.?;
+        if (configure) {
+            try discard(&store, .configure, "", "{\"expected_revision\":4,\"config\":{\"policy_version\":\"new-policy\"}}", "configure", 5);
+            try std.testing.expectError(error.MemoryConfigurationChanged, store.service("alice", true, 6).execute(a, .review_entity, id, "{\"expected_revision\":5,\"accept\":true}", "verdict"));
+        } else {
+            try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"review-e\",\"source_id\":\"review\",\"source_version\":\"1\",\"text\":\"Review proof\"}]}", "proof", 5);
+            _ = try store.service("alice", true, 6).execute(a, .review_entity, id, "{\"expected_revision\":5,\"accept\":true,\"reason\":\"PRIVATE_REVIEW_REASON\",\"evidence\":[{\"id\":\"review-e\"}]}", "verdict");
+            try discard(&store, .forget, "", "{\"evidence_ids\":[\"review-e\"]}", "forget-review", 7);
+            const raw = try store.service("alice", true, 8).execute(a, .entity_proposal, id, "{}", "");
+            try std.testing.expect(std.mem.indexOf(u8, raw, "PRIVATE_REVIEW_REASON") == null);
+            for (0..20) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-review-{d}", .{i}), @intCast(9 + i));
+            var values = store.values.valueIterator();
+            while (values.next()) |value| try std.testing.expect(std.mem.indexOf(u8, value.*, "PRIVATE_REVIEW_REASON") == null);
+        }
+    }
+}
+
+test "memory replays pinned Codex concept merge verdicts without hosted credentials" {
+    for ([_][]const u8{ @embedFile("fixtures/codex-a2d59cfb01/concept_pairs.jsonl"), @embedFile("fixtures/codex-a2d59cfb01/concept_merge.jsonl") }) |fixture| {
+        var lines = std.mem.tokenizeScalar(u8, fixture, '\n');
+        while (lines.next()) |line| {
+            var store = Store.init();
+            defer store.deinit();
+            const a = store.arena.allocator();
+            const row = try std.json.parseFromSliceLeaky(struct { a: []const u8, b: []const u8, same: bool }, a, line, .{ .ignore_unknown_fields = true });
+            try discard(&store, .create, "", "{}", "create", 1);
+            const evidence = m.types.Evidence{ .id = "e", .source_id = "codex-fixture", .source_version = "a2d59cfb01", .text = line };
+            const entities = [_]m.types.Entity{ .{ .id = "a", .name = row.a, .evidence = &.{.{ .id = "e" }} }, .{ .id = "b", .name = row.b, .evidence = &.{.{ .id = "e" }} } };
+            try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence}, .entities = entities }, .{}), "fixture", 2);
+            const proposal = try externalProposal(&store);
+            _ = try store.service("alice", true, 4).execute(a, .review_entity, proposal.proposal_id.?, try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = 4, .accept = row.same, .pin_distinct = !row.same, .actor = "codex/labelled-fixture" }, .{}), "labelled-verdict");
+            const result = try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", true, 5).execute(a, .resolve_entity, "a", "{}", ""), .{});
+            try std.testing.expectEqualStrings(if (row.same) "b" else "a", result.object.get("canonical_id").?.string);
+        }
+    }
+}
+
+test "memory replays pinned Codex supersession and typed relationship verdicts" {
+    var cases = std.mem.tokenizeScalar(u8, @embedFile("fixtures/codex-a2d59cfb01/supersession.jsonl"), '\n');
+    while (cases.next()) |line| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const item = try std.json.parseFromSliceLeaky(struct { earlier: []const u8, later: []const u8, replaces: bool }, a, line, .{});
+        try discard(&store, .create, "", "{}", "create", 1);
+        const evidence: m.types.Evidence = .{ .id = "e", .source_id = "codex", .source_version = "a2d59cfb01", .text = line };
+        try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence} }, .{}), "source", 2);
+        const old: m.types.Assertion = .{ .id = "old", .subject = "codex", .predicate = "guidance", .value = item.earlier, .statement = item.earlier, .evidence = &.{.{ .id = "e" }} };
+        var next = old;
+        next.id = "new";
+        next.value = item.later;
+        next.statement = item.later;
+        next.supersedes = if (item.replaces) &.{"old"} else &.{};
+        try discard(&store, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{old} }, .{}), "old", 3);
+        try discard(&store, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{next} }, .{}), "new", 4);
+        try std.testing.expectEqual(@as(usize, if (item.replaces) 1 else 2), try recallTestCount(&store, 5));
+    }
+    var relations = std.mem.tokenizeScalar(u8, @embedFile("fixtures/codex-a2d59cfb01/concept_relations.jsonl"), '\n');
+    while (relations.next()) |line| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const item = try std.json.parseFromSliceLeaky(struct { a: []const u8, b: []const u8, relation: []const u8 }, a, line, .{ .ignore_unknown_fields = true });
+        const predicates = [_]m.types.Predicate{ .{ .name = "is_a", .subject_type = "concept", .object_type = "concept" }, .{ .name = "part_of", .subject_type = "concept", .object_type = "concept" }, .{ .name = "alternative_to", .subject_type = "concept", .object_type = "concept" } };
+        try discard(&store, .create, "", try std.json.Stringify.valueAlloc(a, m.types.Config{ .predicates = &predicates }, .{}), "create", 1);
+        const evidence: m.types.Evidence = .{ .id = "e", .source_id = "codex", .source_version = "a2d59cfb01", .text = line };
+        const entities = [_]m.types.Entity{ .{ .id = "a", .name = item.a, .type = "concept", .evidence = &.{.{ .id = "e" }} }, .{ .id = "b", .name = item.b, .type = "concept", .evidence = &.{.{ .id = "e" }} } };
+        try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence}, .entities = entities }, .{}), "source", 2);
+        const positive = !std.mem.eql(u8, item.relation, "none");
+        if (positive) {
+            const claim: m.types.Assertion = .{ .id = "relation", .subject = "a", .predicate = item.relation, .value = "b", .statement = line, .producer = "codex/external-relation-judge", .role = .inferred, .evidence = &.{.{ .id = "e" }} };
+            try discard(&store, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{claim} }, .{}), "verdict", 3);
+        }
+        try std.testing.expectEqual(@as(usize, if (positive) 1 else 0), try recallTestCount(&store, 4));
+    }
+}
+
+test "memory native software ontology derives descriptions and retrieves linked concepts and ordered episodes" {
+    var store = Store.init();
+    defer store.deinit();
+    try discard(&store, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create", 1);
+    try discard(&store, .observe, "",
+        \\{"evidence":[{"id":"later","source_id":"history","source_version":"2","text":"The storage engine uses a WAL","thread_id":"thread-1","turn_id":"turn-2","ordinal":2},{"id":"earlier","source_id":"history","source_version":"1","text":"Antfly is our database","thread_id":"thread-1","turn_id":"turn-1","ordinal":-1}],"entities":[{"id":"antfly","name":"Antfly","evidence":[{"id":"earlier"}]},{"id":"storage","name":"storage engine","evidence":[{"id":"later"}]}],"assertions":[{"id":"relation","subject":"storage","predicate":"part_of","value":"antfly","statement":"The storage engine is part of Antfly","evidence":[{"id":"later"}]},{"id":"wal","subject":"storage","predicate":"uses","value":"WAL","statement":"Storage uses a write-ahead log","evidence":[{"id":"later"}]}],"mentions":[{"id":"again","entity_id":"antfly","evidence":[{"id":"later"}]}]}
+    , "observe", 2);
+    const episode_json = try store.run(.episode, "thread-1", "{\"limit\":1}", "", 3);
+    defer std.testing.allocator.free(episode_json);
+    const episode = try std.json.parseFromSlice(m.types.Episode, std.testing.allocator, episode_json, .{});
+    defer episode.deinit();
+    try std.testing.expectEqualStrings("earlier", episode.value.turns[0].evidence.evidence.id);
+    try std.testing.expect(!episode.value.complete);
+    const next_body = try std.json.Stringify.valueAlloc(std.testing.allocator, m.types.EpisodeRequest{ .cursor = episode.value.next_cursor, .limit = 1 }, .{});
+    defer std.testing.allocator.free(next_body);
+    const next = try store.run(.episode, "thread-1", next_body, "", 3);
+    defer std.testing.allocator.free(next);
+    try std.testing.expect(std.mem.indexOf(u8, next, "later") != null);
+    const view_json = try store.run(.entity_view, "storage", "{}", "", 3);
+    defer std.testing.allocator.free(view_json);
+    const view = try std.json.parseFromSlice(m.types.EntityView, std.testing.allocator, view_json, .{});
+    defer view.deinit();
+    try std.testing.expectEqual(@as(usize, 3), view.value.dependencies.len);
+    try std.testing.expect(std.mem.indexOf(u8, view.value.description, "write-ahead") != null);
+    const recall_json = try store.run(.recall, "", "{\"graph\":{\"entity_seeds\":[\"antfly\"],\"max_hops\":3},\"token_budget\":8192}", "", 3);
+    defer std.testing.allocator.free(recall_json);
+    const recalled = try std.json.parseFromSlice(m.types.RecallResult, std.testing.allocator, recall_json, .{});
+    defer recalled.deinit();
+    try std.testing.expectEqual(.graph, recalled.value.retrieval);
+    try std.testing.expectEqual(@as(usize, 2), recalled.value.items.len);
+    try std.testing.expectEqual(@as(usize, 2), recalled.value.entities.len);
+    try std.testing.expectEqual(@as(usize, 1), recalled.value.episodes.len);
+    try std.testing.expectEqual(@as(usize, 0), recalled.value.scanned); // Indexed adjacency, no global assertion scan.
+    try std.testing.expectEqual(recall_json.len, recalled.value.token_upper_bound);
+    try std.testing.expect(recall_json.len <= 8192);
+    try discard(&store, .correct, "", "{\"id\":\"wal\",\"expected_revision\":3,\"lifecycle\":\"retracted\",\"reason\":\"Correction\"}", "retract", 4);
+    const revised = try store.run(.entity_view, "storage", "{}", "", 5);
+    defer std.testing.allocator.free(revised);
+    try std.testing.expect(std.mem.indexOf(u8, revised, "write-ahead") == null);
+    const revised_view = try std.json.parseFromSlice(m.types.EntityView, std.testing.allocator, revised, .{});
+    defer revised_view.deinit();
+    try std.testing.expect(!std.mem.eql(u8, view.value.fingerprint, revised_view.value.fingerprint));
+    try discard(&store, .forget, "", "{\"evidence_ids\":[\"later\"]}", "forget", 6);
+    try std.testing.expectError(error.MemoryNotFound, store.run(.entity_view, "storage", "{}", "", 7));
+    const after = try store.run(.episode, "thread-1", "{}", "", 7);
+    defer std.testing.allocator.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "WAL") == null);
+    const bob = try store.service("bob", false, 7).execute(std.testing.allocator, .recall, "", "{\"graph\":{\"entity_seeds\":[\"antfly\"]},\"token_budget\":2048}", "");
+    defer std.testing.allocator.free(bob);
+    try std.testing.expect(std.mem.indexOf(u8, bob, "Antfly") == null);
+    try std.testing.expectError(error.InvalidMemoryRequest, store.run(.recall, "", "{\"graph\":{\"max_nodes\":65535}}", "", 7));
+}
+
+test "memory native graph budgets include views episodes and metadata and ontology rejects untyped objects" {
+    var store = Store.init();
+    defer store.deinit();
+    try externalReviewSetup(&store);
+    const result = try store.run(.recall, "", "{\"graph\":{\"entity_seeds\":[\"a\"]},\"token_budget\":600}", "", 5);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(result.len <= 600);
+    const known = try store.run(.episodes, "", "{\"known_at\":0}", "", 5);
+    defer std.testing.allocator.free(known);
+    try std.testing.expect(std.mem.indexOf(u8, known, "thread_id") == null);
+    try discard(&store, .configure, "", "{\"expected_revision\":3,\"config\":{\"ontology_pack\":\"software_team_v1\"}}", "pack", 6);
+    try std.testing.expectError(error.MemoryEntityRequired, store.run(.assertions, "", "{\"assertions\":[{\"id\":\"invalid-relation\",\"subject\":\"a\",\"predicate\":\"is_a\",\"value\":\"missing\",\"statement\":\"Invalid\",\"evidence\":[{\"id\":\"e\"}]}]}", "bad", 7));
+}
+
+test "memory native relationship proposals defer and apply external verdicts under policy and causal retention" {
+    var store = Store.init();
+    defer store.deinit();
+    try externalReviewSetup(&store);
+    try discard(&store, .configure, "", "{\"expected_revision\":3,\"config\":{\"ontology_pack\":\"software_team_v1\"}}", "pack", 3);
+    try discard(&store, .propose_relationship, "", "{\"id\":\"relation-review\",\"expected_revision\":4,\"actor\":\"codex/relations\",\"assertion\":{\"id\":\"link\",\"subject\":\"a\",\"predicate\":\"is_a\",\"value\":\"b\",\"statement\":\"Antfly is an Antfly database\",\"evidence\":[{\"id\":\"e\"}]}}", "propose", 4);
+    try std.testing.expectError(error.MemoryNotFound, store.run(.get, "link", "{}", "", 5));
+    try discard(&store, .review_relationship, "relation-review", "{\"expected_revision\":5,\"accept\":null,\"actor\":\"codex/judge\",\"reason\":\"Unsure\"}", "defer", 5);
+    const deferred = try store.run(.relationship_proposal, "relation-review", "{}", "", 6);
+    defer std.testing.allocator.free(deferred);
+    try std.testing.expect(std.mem.indexOf(u8, deferred, "\"state\":\"open\"") != null);
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"review\",\"source_id\":\"judge\",\"source_version\":\"1\",\"text\":\"External judge inputs\"}]}", "review-evidence", 6);
+    try discard(&store, .review_relationship, "relation-review", "{\"expected_revision\":7,\"accept\":true,\"actor\":\"codex/judge\",\"model\":{\"provider\":\"external\",\"model\":\"fixture\",\"revision\":\"pinned\"},\"evidence\":[{\"id\":\"review\"}]}", "accept", 7);
+    const assertion = try store.run(.get, "link", "{}", "", 8);
+    defer std.testing.allocator.free(assertion);
+    try std.testing.expect(std.mem.indexOf(u8, assertion, "is_a") != null);
+    try std.testing.expectError(error.MemoryEntityConflict, store.run(.review_relationship, "relation-review", "{\"expected_revision\":8,\"accept\":false}", "repeat", 8));
+    try discard(&store, .forget, "", "{\"evidence_ids\":[\"review\"]}", "forget-review", 9);
+    try std.testing.expectError(error.MemoryNotFound, store.run(.get, "link", "{}", "", 10));
+}

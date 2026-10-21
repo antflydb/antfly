@@ -67,12 +67,13 @@ pub const Plan = struct {
     }
     pub fn validateOutput(self: Plan, stage: Stage, output: t.Generated) !void {
         if (!self.enabled(stage)) return error.MemoryUngroundedOutput;
-        if (output.assertions.len + output.entities.len > self.config.max_output_items) return error.MemoryInputTooLarge;
+        if (output.assertions.len + output.entities.len + output.mentions.len > self.config.max_output_items) return error.MemoryInputTooLarge;
         if (stage == .entities) {
             if (output.assertions.len != 0) return error.MemoryUngroundedOutput;
             for (output.entities) |entity| try self.support(stage, entity.evidence);
+            for (output.mentions) |mention| try self.support(stage, mention.evidence);
         } else {
-            if (output.entities.len != 0) return error.MemoryUngroundedOutput;
+            if (output.entities.len != 0 or output.mentions.len != 0) return error.MemoryUngroundedOutput;
             for (output.assertions) |claim| {
                 if (claim.embedding != null) return error.MemoryUngroundedOutput;
                 try self.validateAssertion(stage, claim);
@@ -80,8 +81,8 @@ pub const Plan = struct {
         }
     }
     pub fn validatePublication(self: Plan, output: t.Generated) !void {
-        if (output.assertions.len + output.entities.len > self.config.max_output_items) return error.MemoryInputTooLarge;
-        if (output.entities.len > 0) try self.validateOutput(.entities, .{ .entities = output.entities });
+        if (output.assertions.len + output.entities.len + output.mentions.len > self.config.max_output_items) return error.MemoryInputTooLarge;
+        if (output.entities.len + output.mentions.len > 0) try self.validateOutput(.entities, .{ .entities = output.entities, .mentions = output.mentions });
         for (output.assertions) |claim| {
             if (claim.embedding != null) return error.MemoryUngroundedOutput;
             try self.validateAssertion(assertionStage(claim), claim);

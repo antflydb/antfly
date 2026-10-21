@@ -63,6 +63,7 @@ pub const Config = struct {
     policy_version: []const u8 = "memory/v1",
     features: Features = .{},
     models: Models = .{},
+    ontology_pack: enum { none, software_team_v1 } = .none,
     predicates: []const Predicate = &.{},
     source_rules: []const SourceRule = &.{},
     max_input_bytes: u32 = 256 * 1024,
@@ -152,7 +153,7 @@ pub const Assertion = struct {
     embedding_model: ?Model = null,
     reconciliation_reason: ?[]const u8 = null,
 };
-pub const ObservationRequest = struct { origin: ?provenance.Origin = null, context_evidence_ids: []const []const u8 = &.{}, evidence: []const Evidence, assertions: []const Assertion = &.{}, entities: []const Entity = &.{} };
+pub const ObservationRequest = struct { origin: ?provenance.Origin = null, context_evidence_ids: []const []const u8 = &.{}, evidence: []const Evidence, assertions: []const Assertion = &.{}, entities: []const Entity = &.{}, mentions: []const EntityMention = &.{} };
 pub const AssertionRequest = struct { assertions: []const Assertion };
 pub const Correction = struct {
     id: []const u8,
@@ -177,6 +178,7 @@ pub const Outcome = struct {
 };
 pub const Relationship = enum { depends_on, supersedes, motivates, rejected_in_favor_of };
 pub const Recall = struct {
+    graph: ?GraphRecall = null,
     query: []const u8 = "",
     relationship: ?Relationship = null,
     target_id: ?[]const u8 = null,
@@ -257,6 +259,7 @@ pub const StoredAssertion = struct {
 pub const Stage = enum { pending, running, succeeded, failed, cancelled };
 pub const RequiredGrant = enum { write, admin };
 pub const Operation = struct {
+    proposal_id: ?[]const u8 = null,
     origin: ?provenance.Origin = null,
     required_grant: ?RequiredGrant = null,
     execution_principal: []const u8 = "",
@@ -280,7 +283,7 @@ pub const Operation = struct {
 };
 pub const Entity = struct { visibility: Visibility = .private, evidence: []const EvidenceRef = &.{}, id: []const u8, name: []const u8, type: []const u8 = "concept", aliases: []const []const u8 = &.{}, distinct_from: []const []const u8 = &.{} };
 pub const ReconciliationDecision = struct { supersedes: []const []const u8 = &.{}, reason: []const u8 };
-pub const Generated = struct { assertions: []const Assertion = &.{}, entities: []const Entity = &.{} };
+pub const Generated = struct { assertions: []const Assertion = &.{}, entities: []const Entity = &.{}, mentions: []const EntityMention = &.{} };
 
 pub fn validateId(value: []const u8) !void {
     if (value.len == 0 or value.len > 256) return error.InvalidMemoryId;
@@ -298,7 +301,7 @@ test "memory model-free defaults and feature admission" {
 pub const EntityCorrection = struct {
     absorbed: enum { reject, release, suppress } = .reject,
     reason: []const u8 = "",
-    action: enum { merge, unmerge, suppress, unsuppress },
+    action: enum { merge, unmerge, suppress, unsuppress, distinct },
     from: []const u8,
     to: ?[]const u8 = null,
     expected_revision: u64,
@@ -314,6 +317,7 @@ pub const EmbeddingBatch = struct {
 
 /// Public receipts contain no durable execution grants or worker cursors.
 pub const OperationStatus = struct {
+    proposal_id: ?[]const u8 = null,
     id: []const u8,
     action: []const u8,
     request_hash: []const u8,
@@ -339,7 +343,10 @@ pub const RecallResult = struct {
     token_upper_bound: usize,
     revision: u64,
     config_generation: u64,
-    retrieval: enum { lexical, lexical_vector },
+    retrieval: enum { lexical, lexical_vector, graph },
+    entities: []const EntityView = &.{},
+    episodes: []const Episode = &.{},
+    graph: ?GraphRecallStatus = null,
 };
 pub const RecordPage = struct { items: []const StoredAssertion, next_cursor: ?[]const u8, complete: bool, revision: u64 };
 pub const EntityRecord = struct { entity: Entity, owner: []const u8, revision: u64 = 0, recorded_at: ?i64 = null };
@@ -358,4 +365,80 @@ pub const SpaceInfo = struct {
 pub const Inspection = struct {
     state: SpaceInfo,
     capabilities: struct { native: bool, model_free: bool, generator_available: bool, embedder_available: bool },
+};
+
+/// External judges carry attribution and evidence, never executable provider
+/// configuration or credentials. The authenticated principal is server-owned.
+pub const EntityCandidateRequest = struct { kind: enum { identity, relationship } = .identity, cursor: ?[]const u8 = null, limit: u16 = 16 };
+pub const EntityProposalRequest = struct {
+    action: enum { merge, unmerge, suppress, unsuppress, distinct },
+    from: []const u8,
+    to: ?[]const u8 = null,
+    expected_revision: u64,
+    replace: bool = false,
+    pin_distinct: bool = false,
+    absorbed: enum { reject, release, suppress } = .reject,
+    actor: []const u8 = "",
+    evidence: []const EvidenceRef = &.{},
+};
+pub const EntityVerdict = struct {
+    expected_revision: u64,
+    /// null keeps the proposal open for another reviewer.
+    accept: ?bool = null,
+    pin_distinct: bool = false,
+    actor: []const u8 = "",
+    reason: []const u8 = "",
+    evidence: []const EvidenceRef = &.{},
+    model: ?Model = null,
+};
+
+/// Immutable repeated mentions, separate from immutable entity identity.
+pub const EntityMention = struct { id: []const u8, entity_id: []const u8, evidence: []const EvidenceRef, visibility: Visibility = .private };
+pub const StoredMention = struct { mention: EntityMention, owner: []const u8, revision: u64, recorded_at: i64 };
+pub const DerivedDependency = struct { resource: provenance.Resource, evidence: []const EvidenceRef };
+pub const EntityView = struct {
+    entity: Entity,
+    canonical_id: []const u8,
+    description: []const u8,
+    dependencies: []const DerivedDependency,
+    fingerprint: []const u8,
+    revision: u64,
+    config_generation: u64,
+    complete: bool,
+    scanned: usize,
+};
+pub const EntityViewRequest = struct { limit: u16 = 16, known_at: ?i64 = null, valid_at: ?i64 = null };
+pub const EpisodeTurn = struct { evidence: StoredEvidence, entities: []const []const u8 };
+pub const Episode = struct { thread_id: []const u8, turns: []const EpisodeTurn, next_cursor: ?[]const u8, complete: bool, revision: u64 };
+pub const EpisodeRequest = struct { cursor: ?[]const u8 = null, limit: u16 = 32, known_at: ?i64 = null };
+pub const EpisodePage = struct { items: []const Episode, next_cursor: ?[]const u8, complete: bool, revision: u64 };
+pub const GraphRecall = struct {
+    entity_seeds: []const []const u8 = &.{},
+    max_hops: u8 = 2,
+    max_nodes: u16 = 256,
+    max_edges: u16 = 1024,
+    iterations: u8 = 24,
+    restart_probability: f64 = 0.15,
+    relation_weight: f64 = 0.5,
+    provisional_weight: f64 = 0.5,
+    include_episodes: bool = true,
+};
+pub const GraphRecallStatus = struct { nodes: usize, edges: usize, iterations: u8, complete: bool, omitted: usize, algorithm: []const u8 = "personalized_pagerank" };
+
+pub const RelationshipProposalRequest = struct { id: []const u8, expected_revision: u64, assertion: Assertion, actor: []const u8 = "" };
+pub const RelationshipProposal = struct {
+    id: []const u8,
+    assertion: Assertion,
+    owner: []const u8,
+    actor: []const u8,
+    config_generation: u64,
+    revision: u64,
+    recorded_at: i64,
+    state: enum { open, accepted, rejected } = .open,
+    verdict_actor: []const u8 = "",
+    verdict_principal: []const u8 = "",
+    verdict_revision: ?u64 = null,
+    model: ?Model = null,
+    verdict_evidence: []const EvidenceRef = &.{},
+    reason: []const u8 = "",
 };

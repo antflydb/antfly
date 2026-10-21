@@ -19,6 +19,8 @@ const types = @import("db/types.zig");
 pub fn executionOptions(req: types.SearchRequest) abi.LocalQueryExecutionOptions {
     return .{
         .enabled = 1,
+        .graph_owning_table = .fromSlice(req.graph_owning_table),
+        .graph_index_complete_snapshot = @intFromBool(req.graph_index_complete_snapshot),
         .include_stored = @intFromBool(req.include_stored),
         .return_mode = switch (req.return_mode) {
             .parent => .parent,
@@ -35,6 +37,8 @@ pub fn executionOptions(req: types.SearchRequest) abi.LocalQueryExecutionOptions
 
 pub fn applyExecutionOptions(req: *types.SearchRequest, options: abi.LocalQueryExecutionOptions) void {
     if (options.enabled != 0) {
+        req.graph_owning_table = options.graph_owning_table.slice();
+        req.graph_index_complete_snapshot = options.graph_index_complete_snapshot != 0;
         req.include_stored = options.include_stored != 0;
         req.return_mode = switch (options.return_mode) {
             .parent => .parent,

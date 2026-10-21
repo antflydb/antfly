@@ -25,6 +25,7 @@ const prov = t.provenance;
 const A = std.mem.Allocator;
 const eql = std.mem.eql;
 const curation = @import("antfly_resolver").curation;
+const graph_recall = @import("graph_recall.zig");
 const max_dependency_depth: u8 = 32;
 const max_support_work = 65536;
 const resource_check_interval_ms: i64 = 30000;
@@ -48,7 +49,10 @@ const EntityCurationProvenance = struct {
     revision: u64,
     entity_ids: []const []const u8,
     reason: []const u8,
+    evidence: []const t.EvidenceRef = &.{},
 };
+
+const ProposalBinding = struct { owner: []const u8, actor: []const u8 = "", verdict_actor: []const u8 = "", config_generation: u64, entities: []const struct { id: []const u8, revision: u64 }, evidence: []const t.EvidenceRef, verdict_revision: ?u64 = null, model: ?t.Model = null };
 
 pub const Row = struct { key: []const u8, json: []const u8, version: u64 = 0, digest: ?[32]u8 = null };
 pub const Change = struct { key: []const u8, json: ?[]const u8 };
@@ -261,6 +265,17 @@ pub const Service = struct {
             .list => output = try run.enumerate(try parse(t.Recall, a, body)),
             .stage_embeddings => try run.stageEmbeddings(try parse(t.EmbeddingBatch, a, body)),
             .curate_entity => try run.curateEntity(try parse(t.EntityCorrection, a, body)),
+            .propose_relationship => try run.proposeRelationship(try parse(t.RelationshipProposalRequest, a, body), &op),
+            .relationship_proposal => output = try run.encode(try run.relationshipProposal(id)),
+            .review_relationship => try run.reviewRelationship(id, try parse(t.EntityVerdict, a, body), &op),
+            .entity_view => output = try run.encode(try run.entityView(id, try parse(t.EntityViewRequest, a, body))),
+            .episodes => output = try run.episodes(try parse(t.EpisodeRequest, a, body)),
+            .episode => output = try run.encode(try run.episode(id, try parse(t.EpisodeRequest, a, body))),
+            .entity_candidates => output = try run.entityCandidates(id, try parse(t.EntityCandidateRequest, a, body)),
+            .propose_entity => try run.proposeEntity(try parse(t.EntityProposalRequest, a, body), &op),
+            .entity_proposals => output = try run.entityProposals(try parse(operations.Page, a, body)),
+            .entity_proposal => output = try run.entityProposal(id),
+            .review_entity => try run.reviewEntity(id, try parse(t.EntityVerdict, a, body), &op),
             .resolve_entity => output = try run.resolveEntity(id),
             .entities => output = try run.entityList(try parse(operations.Page, a, body)),
         }
@@ -650,6 +665,11 @@ const Run = struct {
     fn curationProvenanceRetained(self: *Run, value: EntityCurationProvenance) !bool {
         if (value.entity_ids.len == 0 or value.entity_ids.len > 2) return error.MemoryCorruptState;
         if (try self.read(bool, "forgotten-all") != null) return false;
+        for (value.evidence) |ref| {
+            const source = (try self.evidence(ref.id)) orelse return false;
+            self.authorize(source.owner, source.evidence.visibility) catch return false;
+            if (!try self.evidenceRetained(source) or (!self.retention_maintenance and !try self.resourceCurrent(source))) return false;
+        }
         for (value.entity_ids) |id| {
             const record = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return false;
             if (!try self.entityRetained(record)) return false;
@@ -895,6 +915,7 @@ const Run = struct {
                 // use a fresh evidence ID, preserving historical provenance.
                 if (!eql(u8, try self.encode(old.evidence), try self.encode(source))) return error.MemoryEvidenceConflict;
             } else try self.put(path, t.StoredEvidence{ .evidence = source, .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision });
+            try self.indexEpisode(source);
             const expires = self.evidenceExpiry((try self.evidence(source.id)).?);
             if (expires) |time| if (self.state.next_expiry_at == null or time < self.state.next_expiry_at.?) {
                 self.state.next_expiry_at = time;
@@ -912,6 +933,8 @@ const Run = struct {
         }
         op.context_inputs = request.context_evidence_ids;
         for (request.entities) |value| try self.entity(value);
+        if (request.mentions.len > self.state.config.max_output_items) return error.MemoryInputTooLarge;
+        for (request.mentions) |value| try self.mention(value);
         try self.assertions(request.assertions, false);
         if (inputs.items.len > 0) {
             op.phase = .pending;
@@ -934,6 +957,10 @@ const Run = struct {
     }
     fn validateOntology(self: *Run, claim: t.Assertion) !void {
         try self.validateEntityReference(claim.subject, null, claim.visibility);
+        if (self.state.config.ontology_pack == .software_team_v1 and isConceptRelation(claim.predicate)) {
+            try self.validateEntityReference(claim.subject, "concept", claim.visibility);
+            try self.validateEntityReference(claim.value, "concept", claim.visibility);
+        }
         for (self.state.config.predicates) |predicate| if (eql(u8, predicate.name, claim.predicate)) {
             if (predicate.subject_type) |expected| try self.validateEntityReference(claim.subject, expected, claim.visibility);
             if (predicate.object_type) |expected| try self.validateEntityReference(claim.value, expected, claim.visibility);
@@ -1169,6 +1196,7 @@ const Run = struct {
         return result.items;
     }
     fn objectTyped(self: *Run, predicate: []const u8) bool {
+        if (self.state.config.ontology_pack == .software_team_v1 and isConceptRelation(predicate)) return true;
         for (self.state.config.predicates) |definition| if (eql(u8, definition.name, predicate)) return definition.object_type != null;
         return false;
     }
@@ -1297,6 +1325,9 @@ const Run = struct {
     }
     fn identityVisible(self: *Run, claim: t.Assertion) anyerror!bool {
         if (try self.canonical(claim.subject) == null) return false;
+        if (self.objectTyped(claim.predicate)) {
+            if (try self.read(t.EntityRecord, try key(self.a, "entity", claim.value)) == null or try self.canonical(claim.value) == null) return false;
+        }
         for (self.state.config.predicates) |predicate| if (eql(u8, predicate.name, claim.predicate)) {
             if (predicate.subject_type != null and try self.read(t.EntityRecord, try key(self.a, "entity", claim.subject)) == null) return false;
             if (predicate.object_type != null) {
@@ -1309,7 +1340,7 @@ const Run = struct {
     // vector backfills. A rejection leaves the old ontology and beliefs intact.
     fn configurationTransition(self: *Run, replacement: t.Config, publish: bool) !void {
         const previous = self.state.config;
-        if (eql(u8, try self.encode(.{ previous.predicates, previous.source_rules, previous.features.reconciliation, previous.ontology_version, previous.policy_version }), try self.encode(.{ replacement.predicates, replacement.source_rules, replacement.features.reconciliation, replacement.ontology_version, replacement.policy_version }))) return;
+        if (eql(u8, try self.encode(.{ previous.ontology_pack, previous.predicates, previous.source_rules, previous.features.reconciliation, previous.ontology_version, previous.policy_version }), try self.encode(.{ replacement.ontology_pack, replacement.predicates, replacement.source_rules, replacement.features.reconciliation, replacement.ontology_version, replacement.policy_version }))) return;
         self.state.config = replacement;
         defer self.state.config = previous;
         var affected: std.StringHashMapUnmanaged(t.StoredAssertion) = .empty;
@@ -1363,6 +1394,426 @@ const Run = struct {
             for (record.entity.distinct_from) |distinct| if (eql(u8, redirects.canonical(id.*), redirects.canonical(distinct))) return error.MemoryEntityConflict;
         }
     }
+    fn proposalInputsRetained(self: *Run, binding: ProposalBinding) !bool {
+        for (binding.entities) |ref| {
+            const record = (try self.read(t.EntityRecord, try key(self.a, "entity", ref.id))) orelse return false;
+            try self.authorize(record.owner, record.entity.visibility);
+            if (record.revision != ref.revision or !(if (self.retention_maintenance) try self.entityRetained(record) else try self.entityVisible(record))) return false;
+        }
+        for (binding.evidence) |ref| {
+            const source = (try self.evidence(ref.id)) orelse return false;
+            try self.authorize(source.owner, source.evidence.visibility);
+            if (!try self.evidenceRetained(source)) return false;
+        }
+        return true;
+    }
+    fn reviewEvidence(self: *Run, refs: []const t.EvidenceRef) !void {
+        if (refs.len > t.max_items) return error.MemoryInputTooLarge;
+        for (refs) |ref| {
+            const source = (try self.evidence(ref.id)) orelse return error.MemoryEvidenceRequired;
+            try self.authorize(source.owner, source.evidence.visibility);
+            if (!try self.evidenceRetained(source) or !try self.resourceCurrent(source)) return error.MemoryForgotten;
+            if (ref.span) |span| if (span.start >= span.end or span.end > source.evidence.text.len or !std.unicode.utf8ValidateSlice(source.evidence.text[span.start..span.end])) return error.InvalidMemorySpan;
+        }
+    }
+    fn indexEpisode(self: *Run, source: t.Evidence) !void {
+        const thread = source.thread_id orelse return;
+        const ordinal = source.ordinal orelse return;
+        try t.validateId(thread);
+        if (source.turn_id) |turn| try t.validateId(turn);
+        try self.put(try key(self.a, "episode", thread), .{ .thread_id = thread });
+        // Sign-bit rotation makes lexicographic order agree with signed ordinals.
+        const ordered = @as(u64, @bitCast(ordinal)) ^ (@as(u64, 1) << 63);
+        try self.put(try std.fmt.allocPrint(self.a, "episode-turn/{s}/{d:0>20}/{s}", .{ try hash(self.a, thread), ordered, try hash(self.a, source.id) }), .{ .id = source.id });
+    }
+    fn mention(self: *Run, value: t.EntityMention) !void {
+        try t.validateId(value.id);
+        try t.validateId(value.entity_id);
+        if (value.evidence.len == 0 or value.evidence.len > t.max_items) return error.MemoryEvidenceRequired;
+        if (try self.read(bool, try key(self.a, "forgotten-mention", value.id)) != null) return error.MemoryForgotten;
+        if (try self.read(t.EntityRecord, try key(self.a, "entity", value.entity_id)) == null) return error.MemoryEntityRequired;
+        try self.validateEntityReference(value.entity_id, null, value.visibility);
+        if (!try self.supportVisible(value.evidence, &.{}, 0)) return error.MemoryEvidenceRequired;
+        for (value.evidence) |ref| {
+            const source = (try self.evidence(ref.id)).?;
+            if (value.visibility == .team and source.evidence.visibility == .private) return error.MemoryVisibilityConflict;
+            if (ref.span) |span| if (span.start >= span.end or span.end > source.evidence.text.len or !std.unicode.utf8ValidateSlice(source.evidence.text[span.start..span.end])) return error.InvalidMemorySpan;
+        }
+        const path = try key(self.a, "mention", value.id);
+        if (try self.read(t.StoredMention, path)) |prior| {
+            try self.authorize(prior.owner, .private);
+            if (!eql(u8, try self.encode(prior.mention), try self.encode(value))) return error.MemoryEntityConflict;
+            return;
+        }
+        try self.put(path, t.StoredMention{ .mention = value, .owner = self.service.context.principal, .revision = self.state.revision, .recorded_at = self.service.context.now_ms });
+        for (value.evidence) |ref| try self.put(try dependencyKey(self.a, "mention-evidence", ref.id, value.id), .{ .child = value.id });
+        try self.put(try dependencyKey(self.a, "mention-entity", value.entity_id, value.id), .{ .child = value.id });
+    }
+    fn mentionVisible(self: *Run, record: t.StoredMention, known: ?i64) !bool {
+        self.authorize(record.owner, record.mention.visibility) catch return false;
+        if (known) |time| if (record.recorded_at > time) return false;
+        if (!try self.supportVisibleTime(record.mention.evidence, &.{}, known, null, 0) or !try self.generationVisible("mention", record.mention.id)) return false;
+        const entity_record = (try self.read(t.EntityRecord, try key(self.a, "entity", record.mention.entity_id))) orelse return false;
+        self.authorize(entity_record.owner, entity_record.entity.visibility) catch return false;
+        if (known) |time| if ((entity_record.recorded_at orelse 0) > time) return false;
+        return try self.entityVisible(entity_record) and try self.canonical(record.mention.entity_id) != null;
+    }
+    fn evidenceEntities(self: *Run, source: t.StoredEvidence, known: ?i64) !struct { ids: []const []const u8, complete: bool } {
+        var ids: std.StringHashMapUnmanaged(void) = .empty;
+        const prefix = try std.fmt.allocPrint(self.a, "dependency/mention-evidence/{s}/", .{try hash(self.a, source.evidence.id)});
+        const page = try self.scanOverlay(prefix, null, 64);
+        for (page.rows) |row| {
+            const binding = try parse(struct { child: []const u8 }, self.a, row.json);
+            const stored = (try self.read(t.StoredMention, try key(self.a, "mention", binding.child))) orelse continue;
+            if (!try self.mentionVisible(stored, known)) continue;
+            const canonical_id = (try self.canonical(stored.mention.entity_id)) orelse continue;
+            try ids.put(self.a, canonical_id, {});
+        }
+        const result = try self.a.alloc([]const u8, ids.count());
+        var keys = ids.keyIterator();
+        var i: usize = 0;
+        while (keys.next()) |id| : (i += 1) result[i] = id.*;
+        std.mem.sort([]const u8, result, {}, stringLess);
+        return .{ .ids = result, .complete = page.next == null };
+    }
+    fn episode(self: *Run, id: []const u8, request: t.EpisodeRequest) !t.Episode {
+        try t.validateId(id);
+        if (request.limit == 0 or request.limit > 64) return error.InvalidMemoryRequest;
+        self.historical_resource_reads = request.known_at != null;
+        const prefix = try std.fmt.allocPrint(self.a, "episode-turn/{s}/", .{try hash(self.a, id)});
+        const page = try self.scanOverlay(prefix, try self.decodeCursor(prefix, request.cursor), request.limit);
+        var turns: std.ArrayList(t.EpisodeTurn) = .empty;
+        var complete = page.next == null;
+        for (page.rows) |row| {
+            const binding = try parse(struct { id: []const u8 }, self.a, row.json);
+            const source = (try self.evidence(binding.id)) orelse continue;
+            self.authorize(source.owner, source.evidence.visibility) catch continue;
+            if (request.known_at) |known| if (source.recorded_at > known) continue;
+            if (!try self.evidenceRetained(source) or !try self.resourceCurrent(source)) continue;
+            const entities = try self.evidenceEntities(source, request.known_at);
+            complete = complete and entities.complete;
+            try turns.append(self.a, .{ .evidence = source, .entities = entities.ids });
+        }
+        // An empty filtered page may still have a continuation; it must not
+        // reveal the existence of a private episode to a point lookup.
+        if (turns.items.len == 0 and request.cursor == null and page.next == null) return error.MemoryNotFound;
+        return .{ .thread_id = id, .turns = turns.items, .next_cursor = try self.encodeCursor(prefix, page.next), .complete = complete, .revision = self.state.revision };
+    }
+    fn episodes(self: *Run, request: t.EpisodeRequest) ![]const u8 {
+        if (request.limit == 0 or request.limit > 64) return error.InvalidMemoryRequest;
+        const page = try self.scanOverlay("episode/", try self.decodeCursor("episode/", request.cursor), request.limit);
+        var items: std.ArrayList(t.Episode) = .empty;
+        var complete = page.next == null;
+        for (page.rows) |row| {
+            const binding = try parse(struct { thread_id: []const u8 }, self.a, row.json);
+            const item = self.episode(binding.thread_id, .{ .limit = 1, .known_at = request.known_at }) catch |err| switch (err) {
+                error.MemoryNotFound => continue,
+                else => return err,
+            };
+            // A catalog entry carries no text. Do not return it unless this
+            // bounded page actually proves an authorized retained member.
+            if (item.turns.len == 0) {
+                complete = false;
+                continue;
+            }
+            try items.append(self.a, item);
+        }
+        return self.encode(t.EpisodePage{ .items = items.items, .next_cursor = try self.encodeCursor("episode/", page.next), .complete = complete, .revision = self.state.revision });
+    }
+    fn relatedAssertions(self: *Run, id: []const u8, limit: usize) !struct { items: []const t.StoredAssertion, scanned: usize, complete: bool } {
+        var records: std.StringHashMapUnmanaged(t.StoredAssertion) = .empty;
+        var scanned: usize = 0;
+        var complete = true;
+        const names = try self.identityMembers(id);
+        std.mem.sort([]const u8, @constCast(names), {}, stringLess);
+        for (names) |name| {
+            if (scanned + 1 >= limit) {
+                complete = false;
+                break;
+            }
+            const prefix = try std.fmt.allocPrint(self.a, "dependency/identity/{s}/", .{try hash(self.a, name)});
+            const page = try self.scanOverlay(prefix, null, @intCast(limit - scanned - 1));
+            scanned += page.rows.len + 1;
+            complete = complete and page.next == null;
+            for (page.rows) |row| {
+                const entry = try parse(struct { child: []const u8 }, self.a, row.json);
+                const record = (try self.assertion(entry.child)) orelse continue;
+                if (!eql(u8, name, record.assertion.subject) and !(self.objectTyped(record.assertion.predicate) and eql(u8, name, record.assertion.value))) continue;
+                try records.put(self.a, record.assertion.id, record);
+            }
+        }
+        const result = try self.a.alloc(t.StoredAssertion, records.count());
+        var values = records.valueIterator();
+        var i: usize = 0;
+        while (values.next()) |record| : (i += 1) result[i] = record.*;
+        std.mem.sort(t.StoredAssertion, result, {}, struct {
+            fn less(_: void, lhs: t.StoredAssertion, rhs: t.StoredAssertion) bool {
+                if (lhs.assertion.stability != rhs.assertion.stability) return lhs.assertion.stability == .settled;
+                return if (lhs.recorded_at == rhs.recorded_at) std.mem.lessThan(u8, lhs.assertion.id, rhs.assertion.id) else lhs.recorded_at > rhs.recorded_at;
+            }
+        }.less);
+        return .{ .items = result, .scanned = scanned, .complete = complete };
+    }
+    fn entityView(self: *Run, id: []const u8, request: t.EntityViewRequest) !t.EntityView {
+        if (request.limit == 0 or request.limit > 32) return error.InvalidMemoryRequest;
+        self.historical_resource_reads = request.known_at != null;
+        const requested = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
+        try self.authorize(requested.owner, requested.entity.visibility);
+        if (!try self.entityVisible(requested)) return error.MemoryNotFound;
+        const selected = (try self.canonical(id)) orelse return error.MemoryEntitySuppressed;
+        const record = (try self.read(t.EntityRecord, try key(self.a, "entity", selected))) orelse return error.MemoryNotFound;
+        try self.authorize(record.owner, record.entity.visibility);
+        if (!try self.entityVisible(record)) return error.MemoryNotFound;
+        if (request.known_at) |known| if ((requested.recorded_at orelse 0) > known or (record.recorded_at orelse 0) > known) return error.MemoryNotFound;
+        const related = try self.relatedAssertions(selected, 256);
+        var dependencies: std.ArrayList(t.DerivedDependency) = .empty;
+        try dependencies.append(self.a, .{ .resource = try self.resourceRef(.entity, selected, record.revision), .evidence = record.entity.evidence });
+        var text: std.ArrayList(u8) = .empty;
+        try text.appendSlice(self.a, record.entity.name);
+        var complete = related.complete;
+        for (related.items) |original| {
+            const hit = (try self.recallHit(original, .{ .known_at = request.known_at, .valid_at = request.valid_at }, null, false)) orelse continue;
+            if (dependencies.items.len > request.limit or text.items.len + hit.memory.assertion.statement.len + 2 > 8192) {
+                complete = false;
+                continue;
+            }
+            try text.appendSlice(self.a, "\n");
+            try text.appendSlice(self.a, hit.memory.assertion.statement);
+            try dependencies.append(self.a, .{ .resource = try self.resourceRef(.assertion, hit.memory.assertion.id, hit.memory.revision), .evidence = hit.citations });
+        }
+        return .{ .entity = record.entity, .canonical_id = selected, .description = text.items, .dependencies = dependencies.items, .fingerprint = try hash(self.a, .{ selected, record.revision, self.state.config.generation, dependencies.items, text.items }), .revision = self.state.revision, .config_generation = self.state.config.generation, .complete = complete, .scanned = related.scanned };
+    }
+    fn relationshipRetained(self: *Run, proposal: t.RelationshipProposal) !bool {
+        if (try self.read(bool, "forgotten-all") != null) return false;
+        if (!try self.retainedSupport(proposal.assertion.evidence, proposal.assertion.depends_on, 0)) return false;
+        for ([_][]const u8{ proposal.assertion.subject, proposal.assertion.value }) |id| {
+            const record = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return false;
+            if (!try self.entityRetained(record)) return false;
+        }
+        return true;
+    }
+    fn relationshipProposal(self: *Run, id: []const u8) !t.RelationshipProposal {
+        var proposal = (try self.read(t.RelationshipProposal, try key(self.a, "relationship-proposal", id))) orelse return error.MemoryNotFound;
+        try self.authorize(proposal.owner, .private);
+        if (!try self.relationshipRetained(proposal)) return error.MemoryNotFound;
+        if (!try self.supportVisible(proposal.assertion.evidence, proposal.assertion.depends_on, 0)) return error.MemoryNotFound;
+        for ([_][]const u8{ proposal.assertion.subject, proposal.assertion.value }) |entity_id| {
+            const record = (try self.read(t.EntityRecord, try key(self.a, "entity", entity_id))) orelse return error.MemoryNotFound;
+            try self.authorize(record.owner, record.entity.visibility);
+            if (!try self.entityVisible(record)) return error.MemoryNotFound;
+        }
+        if (!try self.supportVisible(proposal.verdict_evidence, &.{}, 0)) {
+            proposal.reason = "";
+            proposal.verdict_evidence = &.{};
+        }
+        return proposal;
+    }
+    fn proposeRelationship(self: *Run, request: t.RelationshipProposalRequest, receipt: *t.Operation) !void {
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        try t.validateId(request.id);
+        if (request.actor.len > 0) try t.validateId(request.actor);
+        if (try self.read(bool, try key(self.a, "forgotten-relationship-proposal", request.id)) != null) return error.MemoryForgotten;
+        if (try self.read(t.RelationshipProposal, try key(self.a, "relationship-proposal", request.id)) != null) return error.MemoryEntityConflict;
+        if (!self.objectTyped(request.assertion.predicate)) return error.MemoryOntologyMismatch;
+        // A proposal is an immutable candidate, not a second truth store.
+        // Multiple support branches complicate the retention of the candidate
+        // text itself; external judges submit one independently grounded pair.
+        if (request.assertion.support_sets.len != 0 or request.assertion.embedding != null) return error.InvalidMemoryRequest;
+        try self.validateAssertion(request.assertion, false);
+        if (try self.assertion(request.assertion.id) != null) return error.MemoryAssertionConflict;
+        const proposal: t.RelationshipProposal = .{ .id = request.id, .assertion = request.assertion, .owner = self.service.context.principal, .actor = request.actor, .config_generation = self.state.config.generation, .revision = self.state.revision, .recorded_at = self.service.context.now_ms };
+        if (!try self.relationshipRetained(proposal)) return error.MemoryEvidenceRequired;
+        try self.put(try key(self.a, "relationship-proposal", request.id), proposal);
+        if (request.actor.len > 0) receipt.origin = .{ .agent = .{ .id = request.actor, .kind = .agent } };
+        receipt.proposal_id = request.id;
+    }
+    fn reviewRelationship(self: *Run, id: []const u8, request: t.EntityVerdict, receipt: *t.Operation) !void {
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        if (request.pin_distinct or request.reason.len > t.max_text_bytes or !std.unicode.utf8ValidateSlice(request.reason)) return error.InvalidMemoryRequest;
+        if (request.actor.len > 0) try t.validateId(request.actor);
+        if (request.model) |model| {
+            try t.validateId(model.provider);
+            try t.validateId(model.model);
+            try t.validateId(model.revision);
+        }
+        var proposal = try self.relationshipProposal(id);
+        if (proposal.state != .open) return error.MemoryEntityConflict;
+        if (proposal.config_generation != self.state.config.generation) return error.MemoryConfigurationChanged;
+        try self.reviewEvidence(request.evidence);
+        if (request.accept) |accept| {
+            if (accept) {
+                for (request.evidence) |ref| {
+                    const source = (try self.evidence(ref.id)).?;
+                    if (proposal.assertion.visibility == .team and source.evidence.visibility == .private) return error.MemoryVisibilityConflict;
+                }
+                // All external review context is a conjunctive causal input
+                // of the accepted assertion, independent of factual support.
+                const evidence_ids = try self.a.alloc([]const u8, request.evidence.len);
+                for (request.evidence, evidence_ids) |ref, *input| input.* = ref.id;
+                if (try self.assertion(proposal.assertion.id) != null) return error.MemoryAssertionConflict;
+                try self.put(try self.generationKey("assertion", proposal.assertion.id), GenerationProvenance{ .operation_id = receipt.id, .config_generation = self.state.config.generation, .evidence_ids = evidence_ids });
+                try self.assertions(&.{proposal.assertion}, false);
+                for (evidence_ids) |input| try self.put(try dependencyKey(self.a, "evidence", input, proposal.assertion.id), .{ .child = proposal.assertion.id });
+            }
+            proposal.state = if (accept) .accepted else .rejected;
+        }
+        proposal.verdict_actor = request.actor;
+        proposal.verdict_principal = self.service.context.principal;
+        proposal.verdict_revision = self.state.revision;
+        const verdict_evidence = try self.a.alloc(t.EvidenceRef, proposal.assertion.evidence.len + request.evidence.len);
+        if (verdict_evidence.len > t.max_items) return error.MemoryInputTooLarge;
+        @memcpy(verdict_evidence[0..proposal.assertion.evidence.len], proposal.assertion.evidence);
+        @memcpy(verdict_evidence[proposal.assertion.evidence.len..], request.evidence);
+        proposal.verdict_evidence = verdict_evidence;
+        proposal.reason = request.reason;
+        proposal.model = request.model;
+        try self.put(try key(self.a, "relationship-proposal", id), proposal);
+        if (request.actor.len > 0) receipt.origin = .{ .agent = .{ .id = request.actor, .kind = .agent } };
+        receipt.proposal_id = id;
+    }
+    fn entityCandidates(self: *Run, id: []const u8, request: t.EntityCandidateRequest) ![]const u8 {
+        if (request.limit == 0 or request.limit > 64) return error.InvalidMemoryRequest;
+        const seed = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
+        try self.authorize(seed.owner, seed.entity.visibility);
+        if (!try self.entityVisible(seed)) return error.MemoryNotFound;
+        const canonical_seed = (try self.canonical(id)) orelse return error.MemoryEntitySuppressed;
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "entity/", try self.decodeCursor("entity/", request.cursor), 64);
+        const seed_view = try self.entityView(id, .{ .limit = 4 });
+        var views_complete = seed_view.complete;
+        const Candidate = struct { entity: t.EntityRecord, view: t.EntityView, match_score: f64 };
+        var matches: std.ArrayList(Candidate) = .empty;
+        for (page.rows) |row| {
+            try self.service.context.check();
+            const candidate = try parse(t.EntityRecord, self.a, row.json);
+            self.authorize(candidate.owner, candidate.entity.visibility) catch continue;
+            if (!try self.entityVisible(candidate)) continue;
+            const canonical_id = (try self.canonical(candidate.entity.id)) orelse continue;
+            if (eql(u8, canonical_id, canonical_seed) or !eql(u8, candidate.entity.type, seed.entity.type)) continue;
+            if (candidate.entity.visibility != seed.entity.visibility or (candidate.entity.visibility == .private and !eql(u8, candidate.owner, seed.owner))) continue;
+            var distinct = false;
+            for (seed.entity.distinct_from) |other| if (eql(u8, other, candidate.entity.id)) {
+                distinct = true;
+            };
+            for (candidate.entity.distinct_from) |other| if (eql(u8, other, id)) {
+                distinct = true;
+            };
+            if (request.kind == .identity and (distinct or try self.suppression_index.?.pinnedDistinct(self.a, id, candidate.entity.id))) continue;
+            if (request.kind == .identity and !eql(u8, try nameNumbers(self.a, seed.entity.name), try nameNumbers(self.a, candidate.entity.name))) continue;
+            var score = lexical(seed.entity.name, candidate.entity.name);
+            for (candidate.entity.aliases) |alias| score = @max(score, lexical(seed.entity.name, alias));
+            for (seed.entity.aliases) |alias| score = @max(score, lexical(alias, candidate.entity.name));
+            if (eql(u8, try compactName(self.a, seed.entity.name), try compactName(self.a, candidate.entity.name))) score += 1;
+            const candidate_view = try self.entityView(candidate.entity.id, .{ .limit = 4 });
+            views_complete = views_complete and candidate_view.complete;
+            score = @max(score, lexical(seed_view.description, candidate_view.description));
+            if (score > 0) try matches.append(self.a, .{ .entity = candidate, .view = candidate_view, .match_score = score });
+        }
+        std.mem.sort(Candidate, matches.items, {}, struct {
+            fn less(_: void, lhs: Candidate, rhs: Candidate) bool {
+                return if (lhs.match_score == rhs.match_score) std.mem.lessThan(u8, lhs.entity.entity.id, rhs.entity.entity.id) else lhs.match_score > rhs.match_score;
+            }
+        }.less);
+        const count = @min(matches.items.len, request.limit);
+        return self.encode(.{ .seed = seed, .seed_view = seed_view, .kind = request.kind, .relationship_predicates = if (self.state.config.ontology_pack == .software_team_v1) &[_][]const u8{ "is_a", "part_of", "alternative_to" } else &[_][]const u8{}, .items = matches.items[0..count], .revision = self.state.revision, .config_generation = self.state.config.generation, .next_cursor = try self.encodeCursor("entity/", page.next), .complete = views_complete and page.next == null and count == matches.items.len, .omitted = matches.items.len - count, .basis = "name_and_grounded_description_matches_not_identity_or_calibrated_confidence" });
+    }
+    fn proposeEntity(self: *Run, request: t.EntityProposalRequest, receipt: *t.Operation) !void {
+        try self.requireAdmin();
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        if (try self.read(bool, "forgotten-all") != null) return error.MemoryForgotten;
+        if (request.actor.len > 0) try t.validateId(request.actor);
+        try self.reviewEvidence(request.evidence);
+        if (request.actor.len > 0) receipt.origin = .{ .agent = .{ .id = request.actor, .kind = .agent } };
+        const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+        const ids = if (request.to) |target| &[_][]const u8{ request.from, target } else &[_][]const u8{request.from};
+        var entities: std.ArrayList(std.meta.Child(@FieldType(ProposalBinding, "entities"))) = .empty;
+        for (ids) |id| {
+            const entity_record = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
+            try self.authorize(entity_record.owner, .private);
+            if (!try self.entityVisible(entity_record)) return error.MemoryForgotten;
+            try entities.append(self.a, .{ .id = id, .revision = entity_record.revision });
+        }
+        const input: curation.ProposalRequest = .{ .action = std.meta.stringToEnum(curation.EntityAction, @tagName(request.action)).?, .key = request.from, .into = request.to, .options = .{ .replace = request.replace, .pin_distinct = request.pin_distinct, .absorbed = std.meta.stringToEnum(curation.Absorbed, @tagName(request.absorbed)).? } };
+        const proposal_id = try curation.proposalId(self.a, input);
+        if (try self.read(ProposalBinding, try key(self.a, "proposal-input", proposal_id))) |_| {
+            // Stable engine proposal IDs retain terminal outcomes; a new
+            // idempotency token cannot reopen an accepted/rejected judgment.
+            receipt.proposal_id = proposal_id;
+            return;
+        }
+        for (stored.state.proposals) |prior| if (eql(u8, prior.id, proposal_id)) return error.MemoryForgotten;
+        const plan = try curation.propose(self.a, stored.state, stored.redirects, input, .{ .actor = self.service.context.principal, .created_at_ms = @intCast(@max(0, self.service.context.now_ms)), .revision = self.state.revision });
+        try self.put("entity-policy", EntityPolicy{ .state = plan.state, .redirects = plan.merges });
+        try self.put(try key(self.a, "proposal-input", proposal_id), ProposalBinding{ .owner = self.service.context.principal, .actor = request.actor, .config_generation = self.state.config.generation, .entities = entities.items, .evidence = request.evidence });
+        for (entities.items) |entity_ref| try self.decision_targets.append(self.a, try self.resourceRef(.entity, entity_ref.id, entity_ref.revision));
+        receipt.proposal_id = proposal_id;
+    }
+    fn entityProposals(self: *Run, request: operations.Page) ![]const u8 {
+        try self.requireAdmin();
+        if (request.limit == 0 or request.limit > t.max_items) return error.InvalidMemoryRequest;
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "proposal-input/", try self.decodeCursor("proposal-input/", request.cursor), request.limit);
+        const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+        var available: std.StringHashMapUnmanaged(void) = .empty;
+        for (page.rows) |row| if (try self.proposalInputsRetained(try parse(ProposalBinding, self.a, row.json))) try available.put(self.a, row.key, {});
+        var proposals: std.ArrayList(curation.Proposal) = .empty;
+        for (stored.state.proposals) |proposal| if (available.contains(try key(self.a, "proposal-input", proposal.id))) try proposals.append(self.a, proposal);
+        return self.encode(.{ .items = proposals.items, .next_cursor = try self.encodeCursor("proposal-input/", page.next), .complete = page.next == null, .revision = self.state.revision });
+    }
+    fn entityProposal(self: *Run, id: []const u8) ![]const u8 {
+        try self.requireAdmin();
+        const binding = (try self.read(ProposalBinding, try key(self.a, "proposal-input", id))) orelse return error.MemoryNotFound;
+        if (!try self.proposalInputsRetained(binding)) return error.MemoryNotFound;
+        const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+        const proposal = for (stored.state.proposals) |proposal| {
+            if (eql(u8, proposal.id, id)) break proposal;
+        } else return error.MemoryNotFound;
+        const reason = if (binding.verdict_revision) |revision| blk: {
+            const provenance = (try self.read(EntityCurationProvenance, try std.fmt.allocPrint(self.a, "entity-curation/{d:0>20}", .{revision}))) orelse break :blk @as(?[]const u8, null);
+            break :blk if (try self.curationProvenanceRetained(provenance)) provenance.reason else null;
+        } else null;
+        return self.encode(.{ .proposal = proposal, .inputs = binding, .reason = reason, .stale_configuration = binding.config_generation != self.state.config.generation, .revision = self.state.revision });
+    }
+    fn reviewEntity(self: *Run, id: []const u8, request: t.EntityVerdict, receipt: *t.Operation) !void {
+        try self.requireAdmin();
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        if (request.actor.len > 0) try t.validateId(request.actor);
+        if (request.reason.len > t.max_text_bytes or request.pin_distinct and request.accept != false) return error.InvalidMemoryRequest;
+        if (request.model) |model| {
+            try t.validateId(model.provider);
+            try t.validateId(model.model);
+            try t.validateId(model.revision);
+        }
+        try self.reviewEvidence(request.evidence);
+        if (request.actor.len > 0) receipt.origin = .{ .agent = .{ .id = request.actor, .kind = .agent } };
+        var binding = (try self.read(ProposalBinding, try key(self.a, "proposal-input", id))) orelse return error.MemoryNotFound;
+        if (!try self.proposalInputsRetained(binding)) return error.MemoryForgotten;
+        if (binding.config_generation != self.state.config.generation) return error.MemoryConfigurationChanged;
+        const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+        const proposal = for (stored.state.proposals) |proposal| {
+            if (eql(u8, proposal.id, id)) break proposal;
+        } else return error.MemoryNotFound;
+        if (proposal.state != .open) return error.MemoryEntityConflict;
+        const inputs = try self.a.alloc(t.EvidenceRef, binding.evidence.len + request.evidence.len);
+        if (inputs.len > t.max_items) return error.MemoryInputTooLarge;
+        @memcpy(inputs[0..binding.evidence.len], binding.evidence);
+        @memcpy(inputs[binding.evidence.len..], request.evidence);
+        if (request.accept) |accept| {
+            const plan = try curation.decide(self.a, stored.state, stored.redirects, stored.redirects, id, .{ .accept = accept, .pin_distinct = request.pin_distinct }, .{ .actor = self.service.context.principal, .created_at_ms = @intCast(@max(0, self.service.context.now_ms)), .revision = self.state.revision });
+            if (accept or request.pin_distinct) try self.curateEntity(.{ .action = if (!accept) .distinct else std.meta.stringToEnum(@FieldType(t.EntityCorrection, "action"), @tagName(proposal.action)).?, .from = proposal.key, .to = proposal.into, .expected_revision = request.expected_revision, .replace = if (accept) proposal.options.replace else false, .pin_distinct = if (accept) proposal.options.pin_distinct else false, .absorbed = if (accept) std.meta.stringToEnum(@FieldType(t.EntityCorrection, "absorbed"), @tagName(proposal.options.absorbed)).? else .reject });
+            try self.put("entity-policy", EntityPolicy{ .state = plan.state, .redirects = plan.merges });
+            self.identity_policy = null;
+            self.identity_index = null;
+            self.suppression_index = null;
+        }
+        const ids = if (proposal.into) |target| &[_][]const u8{ proposal.key, target } else &[_][]const u8{proposal.key};
+        if (request.reason.len > 0) try self.put(try std.fmt.allocPrint(self.a, "entity-curation/{d:0>20}", .{self.state.revision}), EntityCurationProvenance{ .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision, .entity_ids = ids, .reason = request.reason, .evidence = inputs });
+        binding.verdict_revision = self.state.revision;
+        binding.model = request.model;
+        binding.verdict_actor = request.actor;
+        try self.put(try key(self.a, "proposal-input", id), binding);
+        for (binding.entities) |entity_ref| try self.decision_targets.append(self.a, try self.resourceRef(.entity, entity_ref.id, entity_ref.revision));
+        receipt.proposal_id = id;
+    }
+
     fn curateEntity(self: *Run, request: t.EntityCorrection) !void {
         try self.requireAdmin();
         if (try self.read(bool, "forgotten-all") != null) return error.MemoryForgotten;
@@ -1375,6 +1826,7 @@ const Run = struct {
             const to = (try self.read(t.EntityRecord, try key(self.a, "entity", target))) orelse return error.MemoryNotFound;
             try self.authorize(to.owner, .private);
             if (!try self.entityVisible(to)) return error.MemoryForgotten;
+            if (request.action == .distinct and eql(u8, (try self.canonical(request.from)) orelse return error.MemoryEntitySuppressed, (try self.canonical(target)) orelse return error.MemoryEntitySuppressed)) return error.MemoryEntityConflict;
             if (request.action == .merge) {
                 if (from.entity.visibility != to.entity.visibility or (from.entity.visibility == .private and !eql(u8, from.owner, to.owner))) return error.MemoryVisibilityConflict;
             }
@@ -1394,10 +1846,11 @@ const Run = struct {
             .action = switch (request.action) {
                 .merge => .merge,
                 .unmerge => .unmerge,
+                .distinct => .distinct,
                 .suppress => .suppress,
                 .unsuppress => .unsuppress,
             },
-            .from = if (request.action == .merge or request.action == .unmerge) request.from else null,
+            .from = if (request.action == .merge or request.action == .unmerge or request.action == .distinct) request.from else null,
             .to = request.to,
             .keys = if (request.action == .suppress or request.action == .unsuppress) &.{request.from} else &.{},
             .absorbed = switch (request.absorbed) {
@@ -1434,8 +1887,10 @@ const Run = struct {
         self.suppression_index = null;
         // Reconcile affected belief groups in the redirect transaction.
         // A work-limit rejection publishes neither identity nor partial facts.
-        try self.rebuildIdentityGroups(&affected_names);
-        try self.invalidate("entity", request.from);
+        if (request.action != .distinct) {
+            try self.rebuildIdentityGroups(&affected_names);
+            try self.invalidate("entity", request.from);
+        }
     }
     fn resolveEntity(self: *Run, id: []const u8) ![]const u8 {
         const requested = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
@@ -1473,6 +1928,7 @@ const Run = struct {
         // Identity is explicit. Names/aliases are discoverable candidates and
         // never constitute authority to merge two canonical IDs.
         try self.put(path, t.EntityRecord{ .entity = value, .owner = self.service.context.principal, .revision = self.state.revision, .recorded_at = self.service.context.now_ms });
+        if (value.evidence.len > 0) try self.mention(.{ .id = try std.fmt.allocPrint(self.a, "entity/{s}", .{try hash(self.a, value.id)}), .entity_id = value.id, .evidence = value.evidence, .visibility = value.visibility });
     }
     fn putAssertion(self: *Run, value: t.StoredAssertion) !void {
         return self.putAssertionWithReasons(value, null);
@@ -1856,6 +2312,7 @@ const Run = struct {
         if (private_input) {
             for (generated.assertions) |claim| if (claim.visibility == .team) return error.MemoryVisibilityConflict;
             for (generated.entities) |generated_entity| if (generated_entity.visibility == .team) return error.MemoryVisibilityConflict;
+            for (generated.mentions) |generated_mention| if (generated_mention.visibility == .team) return error.MemoryVisibilityConflict;
         }
         const input_count = pending.inputs.len + pending.context_inputs.len;
         const inputs = try self.a.alloc([]const u8, input_count);
@@ -1865,6 +2322,10 @@ const Run = struct {
         for (generated.entities) |value| {
             if (try self.read(t.EntityRecord, try key(self.a, "entity", value.id)) == null) try self.put(try self.generationKey("entity", value.id), provenance);
             try self.entity(value);
+        }
+        for (generated.mentions) |value| {
+            if (try self.read(t.StoredMention, try key(self.a, "mention", value.id)) == null) try self.put(try self.generationKey("mention", value.id), provenance);
+            try self.mention(value);
         }
         for (generated.assertions) |claim| if (try self.assertion(claim.id) == null) {
             try self.put(try self.generationKey("assertion", claim.id), provenance);
@@ -1941,6 +2402,13 @@ const Run = struct {
     fn retireEvidence(self: *Run, source: t.StoredEvidence) !void {
         try self.remove(try key(self.a, "evidence", source.evidence.id));
         try self.put(try key(self.a, "forgotten-evidence", source.evidence.id), true);
+        if (source.evidence.thread_id) |thread| if (source.evidence.ordinal) |ordinal| {
+            const prefix = try std.fmt.allocPrint(self.a, "episode-turn/{s}/", .{try hash(self.a, thread)});
+            const ordered = @as(u64, @bitCast(ordinal)) ^ (@as(u64, 1) << 63);
+            try self.remove(try std.fmt.allocPrint(self.a, "{s}{d:0>20}/{s}", .{ prefix, ordered, try hash(self.a, source.evidence.id) }));
+            const remaining = try self.scanOverlay(prefix, null, 1);
+            if (remaining.rows.len == 0) try self.remove(try key(self.a, "episode", thread));
+        };
         if (source.evidence.resource) |reference| {
             try self.remove(try std.fmt.allocPrint(self.a, "resource-evidence/{s}/{s}", .{ try hash(self.a, reference.identity()), try hash(self.a, source.evidence.id) }));
             try self.remove(try key(self.a, "resource-watch", source.evidence.id));
@@ -2075,6 +2543,32 @@ const Run = struct {
             const binding = try parse(struct { evidence_id: []const u8 }, self.a, row.json);
             const source = try self.evidence(binding.evidence_id);
             if (source == null or !try self.evidenceRetained(source.?)) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "mention/")) {
+            const stored = try parse(t.StoredMention, self.a, row.json);
+            const entity_record = try self.read(t.EntityRecord, try key(self.a, "entity", stored.mention.entity_id));
+            if (entity_record == null or !try self.entityRetained(entity_record.?) or !try self.retainedSupport(stored.mention.evidence, &.{}, 0) or !try self.generationRetained("mention", stored.mention.id)) {
+                try self.put(try key(self.a, "forgotten-mention", stored.mention.id), true);
+                try self.remove(try self.generationKey("mention", stored.mention.id));
+                try self.remove(row.key);
+            }
+        } else if (std.mem.startsWith(u8, row.key, "dependency/mention-")) {
+            const binding = try parse(struct { child: []const u8 }, self.a, row.json);
+            if (try self.read(t.StoredMention, try key(self.a, "mention", binding.child)) == null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "episode-turn/")) {
+            const binding = try parse(struct { id: []const u8 }, self.a, row.json);
+            if (try self.evidence(binding.id) == null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "relationship-proposal/")) {
+            var proposal = try parse(t.RelationshipProposal, self.a, row.json);
+            if (!try self.relationshipRetained(proposal)) {
+                try self.put(try key(self.a, "forgotten-relationship-proposal", proposal.id), true);
+                try self.remove(row.key);
+            } else if (!try self.retainedSupport(proposal.verdict_evidence, &.{}, 0)) {
+                proposal.reason = "";
+                proposal.verdict_evidence = &.{};
+                try self.put(row.key, proposal);
+            }
+        } else if (std.mem.startsWith(u8, row.key, "proposal-input/")) {
+            if (!try self.proposalInputsRetained(try parse(ProposalBinding, self.a, row.json))) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "entity-curation/")) {
             const provenance = try parse(EntityCurationProvenance, self.a, row.json);
             if (!try self.curationProvenanceRetained(provenance)) try self.remove(row.key);
@@ -2152,21 +2646,43 @@ const Run = struct {
         }
         const ref = try self.resourceRef(.decision, operation.id, operation.revision);
         const governed_config = (try self.read(t.Config, try configKey(self.a, operation.config_generation))) orelse self.state.config;
+        var status: @FieldType(prov.Decision, "status") = switch (operation.phase) {
+            .pending, .running => .proposed,
+            .failed => .rejected,
+            .cancelled => .cancelled,
+            else => .applied,
+        };
+        if (operation.proposal_id) |proposal_id| {
+            if (eql(u8, operation.action, "propose_relationship") or eql(u8, operation.action, "review_relationship")) {
+                const proposal = (try self.read(t.RelationshipProposal, try key(self.a, "relationship-proposal", proposal_id))) orelse return error.MemoryCorruptState;
+                status = switch (proposal.state) {
+                    .open => .proposed,
+                    .accepted => .applied,
+                    .rejected => .rejected,
+                };
+            } else {
+                const policy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+                for (policy.state.proposals) |proposal| if (eql(u8, proposal.id, proposal_id)) {
+                    status = switch (proposal.state) {
+                        .open => .proposed,
+                        .accepted => .applied,
+                        .rejected => .rejected,
+                        .superseded => .cancelled,
+                    };
+                    break;
+                };
+            }
+        }
         const decision: prov.Decision = .{
             .resource = ref,
             .operation = try self.resourceRef(.operation, operation.id, operation.revision),
             .action = operation.action,
-            .status = switch (operation.phase) {
-                .pending, .running => .proposed,
-                .failed => .rejected,
-                .cancelled => .cancelled,
-                else => .applied,
-            },
+            .status = status,
             .initiator = .{ .id = self.service.context.principal, .assurance = .authenticated },
             .executor = .{ .id = if (self.service.context.execution_principal.len > 0) self.service.context.execution_principal else self.service.context.principal, .kind = .service, .assurance = .authenticated },
             .origin = operation.origin,
             .decided_at = self.service.context.now_ms,
-            .applied_at = if (operation.phase == .succeeded) self.service.context.now_ms else null,
+            .applied_at = if (status == .applied) self.service.context.now_ms else null,
             .recorded_at = self.service.context.now_ms,
             .configuration = try self.resourceRef(.configuration, try std.fmt.allocPrint(self.a, "{d}", .{operation.config_generation}), operation.config_generation),
             .ontology_version = governed_config.ontology_version,
@@ -2649,6 +3165,223 @@ const Run = struct {
         }
         return self.encode(.{ .items = items.items, .next_cursor = if (more) try self.encodeCursor("assertion/", after) else null, .complete = !more, .revision = self.state.revision });
     }
+    const RecallGraph = struct {
+        const Node = struct { kind: enum { entity, assertion, episode }, id: []const u8, depth: u8, seed: f64 = 0, hit: ?t.RecallHit = null };
+        a: A,
+        options: t.GraphRecall,
+        nodes: std.ArrayList(Node) = .empty,
+        edges: std.ArrayList(graph_recall.Edge) = .empty,
+        index: std.StringHashMapUnmanaged(usize) = .empty,
+        edge_index: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        complete: bool = true,
+        omitted: usize = 0,
+        work: usize = 0,
+        fn add(self: *RecallGraph, node: Node) !?usize {
+            const identity = try std.fmt.allocPrint(self.a, "{s}/{s}", .{ @tagName(node.kind), node.id });
+            if (self.index.get(identity)) |i| {
+                self.nodes.items[i].seed += node.seed;
+                return i;
+            }
+            if (self.nodes.items.len >= self.options.max_nodes) {
+                self.complete = false;
+                self.omitted += 1;
+                return null;
+            }
+            const i = self.nodes.items.len;
+            try self.nodes.append(self.a, node);
+            try self.index.put(self.a, identity, i);
+            return i;
+        }
+        fn connect(self: *RecallGraph, from: usize, to: usize, weight: f64) !void {
+            if (from == to) return;
+            const identity = (@as(u64, @intCast(@min(from, to))) << 32) | @as(u64, @intCast(@max(from, to)));
+            if (self.edge_index.contains(identity)) return;
+            if (self.edges.items.len >= self.options.max_edges) {
+                self.complete = false;
+                self.omitted += 1;
+                return;
+            }
+            try self.edge_index.put(self.a, identity, {});
+            try self.edges.append(self.a, .{ .from = from, .to = to, .weight = weight });
+        }
+    };
+    fn graphEntity(self: *Run, graph: *RecallGraph, id: []const u8, depth: u8, seed: f64, known: ?i64) !?usize {
+        const original = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return null;
+        self.authorize(original.owner, original.entity.visibility) catch return null;
+        if (known) |time| if ((original.recorded_at orelse 0) > time) return null;
+        if (!try self.entityVisible(original)) return null;
+        const canonical_id = (try self.canonical(id)) orelse return null;
+        const selected = (try self.read(t.EntityRecord, try key(self.a, "entity", canonical_id))) orelse return null;
+        self.authorize(selected.owner, selected.entity.visibility) catch return null;
+        if (known) |time| if ((selected.recorded_at orelse 0) > time) return null;
+        if (!try self.entityVisible(selected)) return null;
+        return graph.add(.{ .kind = .entity, .id = canonical_id, .depth = depth, .seed = seed });
+    }
+    fn graphRecall(self: *Run, request: t.Recall, vector: ?[]const f32, hits: *std.ArrayList(t.RecallHit)) !struct { status: t.GraphRecallStatus, entities: []const t.EntityView, episodes: []const t.Episode } {
+        const options = request.graph.?;
+        try graph_recall.validate(options);
+        var graph: RecallGraph = .{ .a = self.a, .options = options };
+        for (options.entity_seeds) |id| _ = try self.graphEntity(&graph, id, 0, 1, request.known_at);
+        // Flat retrieval seeds are deterministic and bounded. Explicit seeds
+        // bypass the global assertion scan and use indexed graph adjacency.
+        if (options.entity_seeds.len == 0) for (hits.items[0..@min(hits.items.len, 16)]) |hit| {
+            const node = (try graph.add(.{ .kind = .assertion, .id = hit.memory.assertion.id, .depth = 0, .seed = @max(0.001, hit.score), .hit = hit })) orelse break;
+            _ = node;
+        };
+        var current: usize = 0;
+        while (current < graph.nodes.items.len) : (current += 1) {
+            try self.service.context.check();
+            const node = graph.nodes.items[current];
+            if (node.depth >= options.max_hops) continue;
+            if (graph.work >= 4096) {
+                graph.complete = false;
+                break;
+            }
+            switch (node.kind) {
+                .entity => {
+                    const related = try self.relatedAssertions(node.id, @min(128, 4096 - graph.work));
+                    graph.work += related.scanned;
+                    graph.complete = graph.complete and related.complete;
+                    for (related.items) |record| {
+                        const hit = (try self.recallHit(record, request, vector, false)) orelse continue;
+                        const target = (try graph.add(.{ .kind = .assertion, .id = hit.memory.assertion.id, .depth = node.depth + 1, .hit = hit })) orelse continue;
+                        const weight = if (record.assertion.stability == .provisional) options.provisional_weight else 1.0;
+                        try graph.connect(current, target, weight);
+                        // Typed entity edges are one conceptual hop, even
+                        // though the assertion node retains their provenance.
+                        if (self.objectTyped(record.assertion.predicate)) {
+                            for ([_][]const u8{ record.assertion.subject, record.assertion.value }) |id| if (try self.graphEntity(&graph, id, node.depth + 1, 0, request.known_at)) |entity_node| {
+                                try graph.connect(current, entity_node, weight * options.relation_weight);
+                                try graph.connect(target, entity_node, weight);
+                            };
+                        }
+                    }
+                    for (try self.identityMembers(node.id)) |name| {
+                        if (graph.work + 1 >= 4096) {
+                            graph.complete = false;
+                            break;
+                        }
+                        const prefix = try std.fmt.allocPrint(self.a, "dependency/mention-entity/{s}/", .{try hash(self.a, name)});
+                        const page = try self.scanOverlay(prefix, null, @intCast(@min(64, 4095 - graph.work)));
+                        graph.work += page.rows.len + 1;
+                        graph.complete = graph.complete and page.next == null;
+                        for (page.rows) |row| {
+                            const binding = try parse(struct { child: []const u8 }, self.a, row.json);
+                            const mention_record = (try self.read(t.StoredMention, try key(self.a, "mention", binding.child))) orelse continue;
+                            if (!try self.mentionVisible(mention_record, request.known_at)) continue;
+                            if (options.include_episodes) for (mention_record.mention.evidence) |ref| {
+                                const source = (try self.evidence(ref.id)) orelse continue;
+                                if (source.evidence.thread_id) |thread| {
+                                    if (source.evidence.ordinal == null) continue;
+                                    if (try graph.add(.{ .kind = .episode, .id = thread, .depth = node.depth + 1 })) |episode_node| try graph.connect(current, episode_node, 1);
+                                }
+                            };
+                        }
+                    }
+                },
+                .assertion => {
+                    const hit = node.hit.?;
+                    const weight = if (hit.memory.assertion.stability == .provisional) options.provisional_weight else 1.0;
+                    if (try self.graphEntity(&graph, hit.memory.assertion.subject, node.depth + 1, 0, request.known_at)) |target| try graph.connect(current, target, weight);
+                    if (self.objectTyped(hit.memory.assertion.predicate)) if (try self.graphEntity(&graph, hit.memory.assertion.value, node.depth + 1, 0, request.known_at)) |target| try graph.connect(current, target, weight * options.relation_weight);
+                    if (options.include_episodes) for (hit.citations) |ref| {
+                        const source = (try self.evidence(ref.id)) orelse continue;
+                        if (source.evidence.thread_id) |thread| {
+                            if (source.evidence.ordinal == null) continue;
+                            if (try graph.add(.{ .kind = .episode, .id = thread, .depth = node.depth + 1 })) |target| try graph.connect(current, target, weight);
+                        }
+                    };
+                },
+                .episode => {}, // Thread results do not fan out into unrelated turns.
+            }
+        }
+        const seeds = try self.a.alloc(f64, graph.nodes.items.len);
+        for (graph.nodes.items, seeds) |node, *seed| seed.* = node.seed;
+        const scores = try graph_recall.rank(self.a, seeds, graph.edges.items, options);
+        const order = try self.a.alloc(usize, scores.len);
+        for (order, 0..) |*index, i| index.* = i;
+        std.mem.sort(usize, order, scores, struct {
+            fn less(ranks: []const f64, lhs: usize, rhs: usize) bool {
+                return if (ranks[lhs] == ranks[rhs]) lhs < rhs else ranks[lhs] > ranks[rhs];
+            }
+        }.less);
+        var entities: std.ArrayList(t.EntityView) = .empty;
+        var episodes_out: std.ArrayList(t.Episode) = .empty;
+        // In graph mode the ranked, authorized induced subgraph is the result
+        // domain. Lexical matches seed it; they do not crowd out linked facts.
+        hits.clearRetainingCapacity();
+        for (order) |i| {
+            if (scores[i] <= 0) {
+                graph.omitted += 1;
+                graph.complete = false;
+                continue;
+            }
+            switch (graph.nodes.items[i].kind) {
+                .assertion => {
+                    var hit = graph.nodes.items[i].hit.?;
+                    hit.score = scores[i];
+                    try hits.append(self.a, hit);
+                },
+                .entity => if (entities.items.len < 8) {
+                    const view = try self.entityView(graph.nodes.items[i].id, .{ .limit = 4, .known_at = request.known_at, .valid_at = request.valid_at });
+                    graph.complete = graph.complete and view.complete;
+                    try entities.append(self.a, view);
+                } else {
+                    graph.omitted += 1;
+                    graph.complete = false;
+                },
+                .episode => if (episodes_out.items.len < 8) {
+                    const item = self.episode(graph.nodes.items[i].id, .{ .limit = 4, .known_at = request.known_at }) catch |err| switch (err) {
+                        error.MemoryNotFound => continue,
+                        else => return err,
+                    };
+                    if (item.turns.len > 0) try episodes_out.append(self.a, item);
+                    graph.complete = graph.complete and item.complete;
+                } else {
+                    graph.omitted += 1;
+                    graph.complete = false;
+                },
+            }
+        }
+        return .{ .status = .{ .nodes = graph.nodes.items.len, .edges = graph.edges.items.len, .iterations = options.iterations, .complete = graph.complete, .omitted = graph.omitted }, .entities = entities.items, .episodes = episodes_out.items };
+    }
+    fn recallHit(self: *Run, original: t.StoredAssertion, request: t.Recall, vector: ?[]const f32, require_match: bool) !?t.RecallHit {
+        var record = original;
+        self.authorize(record.owner, record.assertion.visibility) catch return null;
+        if (request.known_at) |known| record = (try self.asOf(record.assertion.id, known)) orelse return null;
+        const valid = request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null;
+        if (!try self.evidenceVisibleTime(record, request.known_at, valid, 0)) return null;
+        const claim = record.assertion;
+        if (!relationsMatch(request, claim)) return null;
+        const historical = record.lifecycle == .superseded or record.lifecycle == .retracted or (claim.valid_to != null and claim.valid_to.? <= self.service.context.now_ms);
+        if (!matchesTime(request, record, self.service.context.now_ms)) return null;
+        if (!request.include_provisional and claim.stability == .provisional) return null;
+        const canonical_subject = (try self.canonical(claim.subject)) orelse return null;
+        if (self.objectTyped(claim.predicate) and try self.canonical(claim.value) == null) return null;
+        if (request.subject) |value| {
+            const wanted = (try self.canonical(value)) orelse return null;
+            if (!eql(u8, wanted, canonical_subject)) return null;
+        }
+        if (request.predicate) |value| if (!eql(u8, value, claim.predicate)) return null;
+        if (request.scope) |value| if (!eql(u8, value, claim.scope)) return null;
+        if (request.environment) |value| if (claim.environment != null and !eql(u8, value, claim.environment.?)) return null;
+        if (request.task) |value| if (claim.task != null and !eql(u8, value, claim.task.?)) return null;
+        if (request.kind) |value| if (value != claim.kind) return null;
+        var score = lexical(request.query, claim.statement);
+        const compatible_embedding = if (vector != null) try self.vectorFor(self.state.config, claim) else null;
+        if (vector) |query_vector| if (compatible_embedding) |embedding| {
+            score += try cosine(query_vector, embedding);
+        };
+        if (require_match and request.query.len > 0 and score <= 0) return null;
+        if (claim.stability == .provisional) score *= 0.5;
+        const support = try self.visibleSupport(claim, request.known_at, valid);
+        record.assertion.evidence = support.evidence;
+        record.assertion.depends_on = support.depends_on;
+        record.assertion.support_sets = &.{};
+        record.assertion.embedding = null;
+        record = try self.publicRecord(record);
+        return .{ .memory = record, .score = score, .historical = historical, .citations = support.evidence };
+    }
     fn recall(self: *Run, request: t.Recall) ![]const u8 {
         self.historical_resource_reads = request.known_at != null;
         if (request.limit == 0 or request.limit > t.max_items or request.token_budget == 0 or request.token_budget > self.state.config.max_recall_tokens) return error.InvalidMemoryRequest;
@@ -2665,46 +3398,16 @@ const Run = struct {
         }
         if (self.state.config.features.semantic_recall and vector == null and request.query.len > 0) vector = try self.embed(self.state.config.models.embedder.?, request.query, .empty);
         var more = false;
-        while (true) {
+        if (request.graph) |options| try graph_recall.validate(options);
+        const explicit_seeds = if (request.graph) |options| options.entity_seeds.len > 0 else false;
+        if (explicit_seeds and request.cursor != null) return error.InvalidMemoryRequest;
+        while (!explicit_seeds) {
             try self.service.context.check();
             const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", after, 128);
             for (page.rows) |row| {
                 scanned += 1;
-                var record = try parse(t.StoredAssertion, self.a, row.json);
-                self.authorize(record.owner, record.assertion.visibility) catch continue;
-                if (request.known_at) |known| record = (try self.asOf(record.assertion.id, known)) orelse continue;
-                const valid = request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null;
-                if (!try self.evidenceVisibleTime(record, request.known_at, valid, 0)) continue;
-                const claim = record.assertion;
-                if (!relationsMatch(request, claim)) continue;
-                const historical = record.lifecycle == .superseded or record.lifecycle == .retracted or (claim.valid_to != null and claim.valid_to.? <= self.service.context.now_ms);
-                if (!matchesTime(request, record, self.service.context.now_ms)) continue;
-                if (!request.include_provisional and claim.stability == .provisional) continue;
-                const canonical_subject = (try self.canonical(claim.subject)) orelse continue;
-                if (self.objectTyped(claim.predicate) and try self.canonical(claim.value) == null) continue;
-                if (request.subject) |value| {
-                    const wanted = (try self.canonical(value)) orelse continue;
-                    if (!eql(u8, wanted, canonical_subject)) continue;
-                }
-                if (request.predicate) |value| if (!eql(u8, value, claim.predicate)) continue;
-                if (request.scope) |value| if (!eql(u8, value, claim.scope)) continue;
-                if (request.environment) |value| if (claim.environment != null and !eql(u8, value, claim.environment.?)) continue;
-                if (request.task) |value| if (claim.task != null and !eql(u8, value, claim.task.?)) continue;
-                if (request.kind) |value| if (value != claim.kind) continue;
-                var score = lexical(request.query, claim.statement);
-                const compatible_embedding = if (vector != null) try self.vectorFor(self.state.config, claim) else null;
-                if (vector) |query_vector| if (compatible_embedding) |embedding| {
-                    score += try cosine(query_vector, embedding);
-                };
-                if (request.query.len > 0 and score <= 0) continue;
-                if (claim.stability == .provisional) score *= 0.5;
-                const support = try self.visibleSupport(claim, request.known_at, valid);
-                record.assertion.evidence = support.evidence;
-                record.assertion.depends_on = support.depends_on;
-                record.assertion.support_sets = &.{};
-                record.assertion.embedding = null;
-                record = try self.publicRecord(record);
-                try hits.append(self.a, .{ .memory = record, .score = score, .historical = historical, .citations = support.evidence });
+                const record = try parse(t.StoredAssertion, self.a, row.json);
+                if (try self.recallHit(record, request, vector, true)) |hit| try hits.append(self.a, hit);
             }
             after = page.next;
             if (after == null) break;
@@ -2718,6 +3421,7 @@ const Run = struct {
                 return if (left.score == right.score) std.mem.lessThan(u8, left.memory.assertion.id, right.memory.assertion.id) else left.score > right.score;
             }
         }.less);
+        const graph_result = if (request.graph != null) try self.graphRecall(request, vector, &hits) else null;
         var selected: std.ArrayList(Hit) = .empty;
         var bytes: usize = 0;
         var omitted: usize = 0;
@@ -2746,14 +3450,27 @@ const Run = struct {
             try selected.append(self.a, hit);
         }
         var result: t.RecallResult = .{ .items = selected.items, .next_cursor = try self.encodeCursor("assertion/", after), .complete = !more and omitted == 0, .truncated = more or omitted > 0, .scanned = scanned, .omitted = omitted, .token_upper_bound = 0, .revision = self.state.revision, .config_generation = self.state.config.generation, .retrieval = if (vector != null) .lexical_vector else .lexical };
+        if (graph_result) |result_graph| {
+            result.retrieval = .graph;
+            result.graph = result_graph.status;
+            result.entities = result_graph.entities;
+            result.episodes = result_graph.episodes;
+            result.complete = result.complete and result_graph.status.complete;
+            result.truncated = result.truncated or !result_graph.status.complete;
+        }
         while (true) {
             // Bound the complete rendered response, including framing,
             // readiness, citations and the bound's own decimal digits.
             const rendered = try self.encode(result);
             if (rendered.len == result.token_upper_bound) {
                 if (rendered.len <= request.token_budget) return rendered;
-                if (selected.items.len == 0) return error.InvalidMemoryRequest;
-                _ = selected.pop();
+                if (result.episodes.len > 0) {
+                    result.episodes = result.episodes[0 .. result.episodes.len - 1];
+                } else if (result.entities.len > 0) {
+                    result.entities = result.entities[0 .. result.entities.len - 1];
+                } else if (selected.items.len > 0) {
+                    _ = selected.pop();
+                } else return error.InvalidMemoryRequest;
                 result.items = selected.items;
                 result.omitted += 1;
                 result.complete = false;
@@ -2813,7 +3530,7 @@ fn relationsMatch(request: t.Recall, claim: t.Assertion) bool {
 }
 pub fn actionGrant(action: Action) t.RequiredGrant {
     return switch (action) {
-        .create, .configure, .curate_entity, .stage_embeddings => .admin,
+        .create, .configure, .curate_entity, .stage_embeddings, .propose_entity, .review_entity, .entity_proposals, .entity_proposal => .admin,
         else => .write,
     };
 }
@@ -2901,4 +3618,34 @@ fn encodedSize(value: anytype) !usize {
     var size: std.Io.Writer.Discarding = .init(&.{});
     try std.json.Stringify.value(value, .{}, &size.writer);
     return @intCast(size.fullCount());
+}
+
+fn stringLess(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
+}
+fn isConceptRelation(name: []const u8) bool {
+    return eql(u8, name, "is_a") or eql(u8, name, "part_of") or eql(u8, name, "alternative_to");
+}
+
+fn compactName(a: A, value: []const u8) ![]const u8 {
+    var result: std.ArrayList(u8) = .empty;
+    for (value) |byte| if (std.ascii.isAlphanumeric(byte) or byte >= 128) {
+        try result.append(a, std.ascii.toLower(byte));
+    };
+    return result.items;
+}
+fn nameNumbers(a: A, value: []const u8) ![]const u8 {
+    var result: std.ArrayList(u8) = .empty;
+    var in_number = false;
+    for (value) |byte| {
+        if (std.ascii.isDigit(byte)) {
+            try result.append(a, byte);
+            in_number = true;
+        } else if (in_number) {
+            try result.append(a, '/');
+            in_number = false;
+        }
+    }
+    if (in_number) try result.append(a, '/');
+    return result.items;
 }

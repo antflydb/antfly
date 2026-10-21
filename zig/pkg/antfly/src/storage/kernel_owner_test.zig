@@ -4393,3 +4393,26 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
     for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
     return result;
 }
+
+test "opaque owner entity curation capability crosses its checked callback contract" {
+    const Fixture = struct {
+        supported: u8 = 1,
+        fn call(ptr: ?*anyopaque, out: *u8) callconv(.c) abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            out.* = self.supported;
+            return .ok;
+        }
+    };
+    var fixture: Fixture = .{};
+    var config: abi.EntitySinkConfig = .{ .callback_ctx = &fixture, .supports_curation_fn = Fixture.call };
+    var supported: u8 = 0;
+    try std.testing.expectEqual(abi.Status.ok, config.curationCapability(&supported));
+    try std.testing.expectEqual(@as(u8, 1), supported);
+    fixture.supported = 0;
+    try std.testing.expectEqual(abi.Status.ok, config.curationCapability(&supported));
+    try std.testing.expectEqual(@as(u8, 0), supported);
+    config.supports_curation_fn = null;
+    supported = 1;
+    try std.testing.expectEqual(abi.Status.ok, config.curationCapability(&supported));
+    try std.testing.expectEqual(@as(u8, 0), supported);
+}

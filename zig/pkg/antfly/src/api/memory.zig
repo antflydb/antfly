@@ -42,13 +42,49 @@ pub fn route(method: []const u8, path: []const u8) !Route {
         if (!std.mem.eql(u8, method, "GET")) return error.MethodNotAllowed;
         return .{ .space = space, .id = id.?, .action = .get };
     }
+    if (std.mem.eql(u8, resource, "episodes")) {
+        if (parts.next() != null or !std.mem.eql(u8, method, "GET")) return error.MemoryRouteNotFound;
+        return .{ .space = space, .id = id orelse "", .action = if (id == null) .episodes else .episode };
+    }
+    if (std.mem.eql(u8, resource, "relationship-proposals")) {
+        if (id) |proposal_id| {
+            if (parts.next()) |suffix| {
+                if (parts.next() != null or !std.mem.eql(u8, suffix, "verdict") or !std.mem.eql(u8, method, "POST")) return error.MemoryRouteNotFound;
+                return .{ .space = space, .id = proposal_id, .action = .review_relationship };
+            }
+            if (!std.mem.eql(u8, method, "GET")) return error.MethodNotAllowed;
+            return .{ .space = space, .id = proposal_id, .action = .relationship_proposal };
+        }
+        if (!std.mem.eql(u8, method, "POST")) return error.MethodNotAllowed;
+        return .{ .space = space, .action = .propose_relationship };
+    }
+    if (std.mem.eql(u8, resource, "entity-proposals")) {
+        if (id) |proposal_id| {
+            if (parts.next()) |suffix| {
+                if (parts.next() != null or !std.mem.eql(u8, suffix, "verdict") or !std.mem.eql(u8, method, "POST")) return error.MemoryRouteNotFound;
+                return .{ .space = space, .id = proposal_id, .action = .review_entity };
+            }
+            if (!std.mem.eql(u8, method, "GET")) return error.MethodNotAllowed;
+            return .{ .space = space, .id = proposal_id, .action = .entity_proposal };
+        }
+        return .{ .space = space, .action = if (std.mem.eql(u8, method, "GET")) .entity_proposals else if (std.mem.eql(u8, method, "POST")) .propose_entity else return error.MethodNotAllowed };
+    }
+    if (std.mem.eql(u8, resource, "entities") and id != null) {
+        if (parts.next()) |suffix| {
+            if (parts.next() != null) return error.MemoryRouteNotFound;
+            if (std.mem.eql(u8, suffix, "view") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .id = id.?, .action = .entity_view };
+            if (std.mem.eql(u8, suffix, "candidates") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .id = id.?, .action = .entity_candidates };
+            return error.MemoryRouteNotFound;
+        }
+        if (!std.mem.eql(u8, method, "GET")) return error.MethodNotAllowed;
+        return .{ .space = space, .id = id.?, .action = .resolve_entity };
+    }
     if (std.mem.eql(u8, resource, "operations")) {
         if (id == null or parts.next() != null) return error.MemoryRouteNotFound;
         return .{ .space = space, .id = id.?, .action = if (std.mem.eql(u8, method, "GET")) .operation else if (std.mem.eql(u8, method, "POST")) .advance else return error.MethodNotAllowed };
     }
     if (std.mem.eql(u8, resource, "configurations") and id != null and parts.next() == null and std.mem.eql(u8, method, "GET")) return .{ .space = space, .action = .configuration, .id = id.? };
     if (std.mem.eql(u8, resource, "evidence") and id != null and parts.next() == null and std.mem.eql(u8, method, "GET")) return .{ .space = space, .action = .evidence, .id = id.? };
-    if (std.mem.eql(u8, resource, "entities") and id != null and parts.next() == null and std.mem.eql(u8, method, "GET")) return .{ .space = space, .action = .resolve_entity, .id = id.? };
     if (id != null) return error.MemoryRouteNotFound;
     if (std.mem.eql(u8, resource, "entity-corrections") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .action = .curate_entity };
     if (std.mem.eql(u8, resource, "entities") and std.mem.eql(u8, method, "GET")) return .{ .space = space, .action = .entities };
@@ -65,8 +101,8 @@ pub fn status(err: anyerror) u16 {
         error.Unauthorized => 401,
         error.MemorySourceAccessDenied, error.Forbidden, error.MemoryVisibilityConflict, error.MemoryRowPolicyUnsupported => 403,
         error.MethodNotAllowed => 405,
-        error.MemoryRevisionConflict, error.MemorySpaceBindingChanged, error.MemoryCursorStale, error.MemorySpaceExists, error.MemoryIdempotencyConflict, error.MemoryEvidenceConflict, error.MemoryAssertionConflict, error.MemoryOutcomeConflict, error.MemoryProducerConflict, error.MemoryEntityConflict, error.MemoryConfigurationTransition, error.MemoryForgotten, error.MemoryConfigurationChanged, error.MemoryResourceChanged => 409,
-        error.MemoryInputTooLarge, error.MemoryWorkLimit => 413,
+        error.MemoryRevisionConflict, error.MemorySpaceBindingChanged, error.MemoryCursorStale, error.MemorySpaceExists, error.MemoryIdempotencyConflict, error.MemoryEvidenceConflict, error.MemoryAssertionConflict, error.MemoryOutcomeConflict, error.MemoryProducerConflict, error.MemoryEntityConflict, error.MemoryConfigurationTransition, error.MemoryForgotten, error.MemoryConfigurationChanged, error.MemoryResourceChanged, error.ResolverCurationConflict => 409,
+        error.MemoryInputTooLarge, error.MemoryWorkLimit, error.ResolverCurationLimitExceeded => 413,
         error.MemoryModelRequired, error.MemoryCapabilityUnavailable, error.MemoryExecutionIdentityRequired, error.MemoryModelRevisionUnavailable, error.MemoryModelRevisionMismatch => 422,
         error.MemoryRetryNotReady, error.MemoryRetryExhausted, error.MemoryOverloaded => 429,
         error.MemoryCommitPending, error.NotLeader, error.Unavailable, error.StorageUnavailable, error.GroupLeaderUnavailable => 503,

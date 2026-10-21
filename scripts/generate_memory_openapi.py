@@ -182,11 +182,21 @@ def main():
             "listMemories",
             "getMemoryHistory",
             "listMemoryEntities",
+            "listMemoryEntityProposals",
+            "listMemoryEpisodes",
+            "getMemoryEpisode",
         ):
             fields = {
                 "cursor": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 256},
             }
+            if name in ("listMemoryEpisodes", "getMemoryEpisode"):
+                fields["limit"]["maximum"] = 64
+                fields["known_at"] = {
+                    "type": "integer",
+                    "format": "int64",
+                    "x-go-type": "int64",
+                }
             if name == "listMemories":
                 fields.update(
                     {
@@ -277,6 +287,69 @@ def main():
         ("outcomes", "recordMemoryOutcome", "MemoryOutcome"),
     ):
         operation(prefix + "/{space}/" + suffix, "post", name, request, mutation=True)
+    operation(
+        prefix + "/{space}/entities/{id}/view",
+        "post",
+        "getMemoryEntityView",
+        "MemoryEntityViewRequest",
+        "MemoryEntityView",
+    )
+    operation(
+        prefix + "/{space}/episodes",
+        "get",
+        "listMemoryEpisodes",
+        response="MemoryEpisodePage",
+    )
+    operation(
+        prefix + "/{space}/episodes/{id}",
+        "get",
+        "getMemoryEpisode",
+        response="MemoryEpisode",
+    )
+    operation(
+        prefix + "/{space}/relationship-proposals",
+        "post",
+        "proposeMemoryRelationship",
+        "MemoryRelationshipProposalRequest",
+        mutation=True,
+    )
+    operation(
+        prefix + "/{space}/relationship-proposals/{id}",
+        "get",
+        "getMemoryRelationshipProposal",
+        response="MemoryRelationshipProposal",
+    )
+    operation(
+        prefix + "/{space}/relationship-proposals/{id}/verdict",
+        "post",
+        "reviewMemoryRelationshipProposal",
+        "MemoryEntityVerdict",
+        mutation=True,
+    )
+    operation(
+        prefix + "/{space}/entities/{id}/candidates",
+        "post",
+        "getMemoryEntityCandidates",
+        "MemoryEntityCandidateRequest",
+    )
+    operation(
+        prefix + "/{space}/entity-proposals",
+        "post",
+        "proposeMemoryEntity",
+        "MemoryEntityProposalRequest",
+        mutation=True,
+    )
+    operation(prefix + "/{space}/entity-proposals", "get", "listMemoryEntityProposals")
+    operation(
+        prefix + "/{space}/entity-proposals/{id}", "get", "getMemoryEntityProposal"
+    )
+    operation(
+        prefix + "/{space}/entity-proposals/{id}/verdict",
+        "post",
+        "reviewMemoryEntityProposal",
+        "MemoryEntityVerdict",
+        mutation=True,
+    )
     operation(
         prefix + "/{space}/explain",
         "post",

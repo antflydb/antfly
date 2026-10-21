@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..models.memory_assertion import MemoryAssertion
     from ..models.memory_evidence import MemoryEvidence
     from ..models.memory_observation_request_entities_item import MemoryObservationRequestEntitiesItem
+    from ..models.memory_observation_request_mentions_item import MemoryObservationRequestMentionsItem
     from ..models.memory_observation_request_origin_type_0 import MemoryObservationRequestOriginType0
 
 
@@ -26,6 +27,7 @@ class MemoryObservationRequest:
         context_evidence_ids (list[str] | Unset):
         assertions (list[MemoryAssertion] | Unset):
         entities (list[MemoryObservationRequestEntitiesItem] | Unset):
+        mentions (list[MemoryObservationRequestMentionsItem] | Unset):
     """
 
     evidence: list[MemoryEvidence]
@@ -33,6 +35,7 @@ class MemoryObservationRequest:
     context_evidence_ids: list[str] | Unset = UNSET
     assertions: list[MemoryAssertion] | Unset = UNSET
     entities: list[MemoryObservationRequestEntitiesItem] | Unset = UNSET
+    mentions: list[MemoryObservationRequestMentionsItem] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.memory_observation_request_origin_type_0 import MemoryObservationRequestOriginType0
@@ -68,6 +71,13 @@ class MemoryObservationRequest:
                 entities_item = entities_item_data.to_dict()
                 entities.append(entities_item)
 
+        mentions: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.mentions, Unset):
+            mentions = []
+            for mentions_item_data in self.mentions:
+                mentions_item = mentions_item_data.to_dict()
+                mentions.append(mentions_item)
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -83,6 +93,8 @@ class MemoryObservationRequest:
             field_dict["assertions"] = assertions
         if entities is not UNSET:
             field_dict["entities"] = entities
+        if mentions is not UNSET:
+            field_dict["mentions"] = mentions
 
         return field_dict
 
@@ -91,6 +103,7 @@ class MemoryObservationRequest:
         from ..models.memory_assertion import MemoryAssertion
         from ..models.memory_evidence import MemoryEvidence
         from ..models.memory_observation_request_entities_item import MemoryObservationRequestEntitiesItem
+        from ..models.memory_observation_request_mentions_item import MemoryObservationRequestMentionsItem
         from ..models.memory_observation_request_origin_type_0 import MemoryObservationRequestOriginType0
 
         d = dict(src_dict)
@@ -138,12 +151,22 @@ class MemoryObservationRequest:
 
                 entities.append(entities_item)
 
+        _mentions = d.pop("mentions", UNSET)
+        mentions: list[MemoryObservationRequestMentionsItem] | Unset = UNSET
+        if _mentions is not UNSET:
+            mentions = []
+            for mentions_item_data in _mentions:
+                mentions_item = MemoryObservationRequestMentionsItem.from_dict(mentions_item_data)
+
+                mentions.append(mentions_item)
+
         memory_observation_request = cls(
             evidence=evidence,
             origin=origin,
             context_evidence_ids=context_evidence_ids,
             assertions=assertions,
             entities=entities,
+            mentions=mentions,
         )
 
         return memory_observation_request

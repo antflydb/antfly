@@ -1433,18 +1433,19 @@ fn canonicalGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUn
         if (fallback == null) fallback = .{ .operation = operation_name, .feature = mode };
         const params = value.get(mode) orelse continue;
         if (params != .object) continue;
-        if (jsonString(params.object, "direction")) |direction| {
-            if (!std.mem.eql(u8, direction, "out")) return .{
-                .operation = operation_name,
-                .feature = mode,
-                .reason = "direction_must_be_out",
-            };
-        }
+
         if (std.mem.eql(u8, mode, "traverse") and jsonBool(params.object, "deduplicate_nodes") == false) {
             return .{
                 .operation = operation_name,
                 .feature = mode,
                 .reason = "deduplicate_nodes_must_be_true",
+            };
+        }
+        if (jsonString(params.object, "direction")) |direction| {
+            if (!std.mem.eql(u8, direction, "out")) return .{
+                .operation = operation_name,
+                .feature = mode,
+                .reason = "direction_must_be_out",
             };
         }
         if (params.object.get("start")) |selector| {
@@ -1469,6 +1470,11 @@ fn legacyGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUnsup
         if (fallback == null) fallback = .{ .operation = operation_name, .feature = mode };
         if (value.get("params")) |params| {
             if (params == .object) {
+                if (jsonBool(params.object, "deduplicate_nodes") == false) return .{
+                    .operation = operation_name,
+                    .feature = mode,
+                    .reason = "deduplicate_nodes_must_be_true",
+                };
                 if (jsonString(params.object, "direction")) |direction| {
                     if (!std.mem.eql(u8, direction, "out")) return .{
                         .operation = operation_name,
@@ -1476,11 +1482,6 @@ fn legacyGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUnsup
                         .reason = "direction_must_be_out",
                     };
                 }
-                if (jsonBool(params.object, "deduplicate_nodes") == false) return .{
-                    .operation = operation_name,
-                    .feature = mode,
-                    .reason = "deduplicate_nodes_must_be_true",
-                };
             }
         }
         if (value.get("start_nodes")) |selector| {
@@ -5204,6 +5205,12 @@ test "unsupported graph diagnostics identify the rejected operation feature" {
             .feature = "expand_strategy",
             .reason = "expand_strategy_not_supported",
             .message = "expand_strategy is a legacy graph_searches result-merging control; remove it when using graph_queries and consume the named typed graph_results directly",
+        },
+        .{
+            .body = "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"direction\":\"in\",\"deduplicate_nodes\":false}}}}",
+            .operation = "walk",
+            .feature = "traverse",
+            .reason = "deduplicate_nodes_must_be_true",
         },
         .{
             .body = "{\"graph_searches\":{\"walk\":{\"type\":\"traverse\",\"params\":{\"deduplicate_nodes\":false}}}}",

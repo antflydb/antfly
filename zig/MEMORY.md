@@ -171,6 +171,167 @@ be widened by a team-visible derived assertion. Forgetting erects durable
 non-resurrection fences immediately in every source-backed view, including entity
 lookup, identity resolution and enumeration; bounded physical cleanup is separate.
 
+## Codex migration contracts (a2d59cfb01)
+
+The implementation follows the [integration review on #1227](https://github.com/antflydb/antfly/pull/1227#issuecomment-6327590919)
+and the [pinned Codex integration](https://github.com/antflydb/codex/blob/a2d59cfb01/ANTFLY_INTEGRATION.md).
+The native service now owns the migration features below. Moving Codex's CLI,
+writers and `knowledge.search` to these contracts remains a consumer cutover in
+that repository; application thread storage and approval authority stay there.
+There is one native policy implementation for server HTTP, dedicated
+`/memory/v1/mcp`, and direct embedded calls.
+
+| Integration behavior | Native contract |
+| --- | --- |
+| Concept identity screening and external judges | `entity_candidates`, `propose_entity`, `entity_proposals`, `entity_proposal`, `review_entity` |
+| Claim-backed concept descriptions | `entity_view`; `POST /spaces/{space}/entities/{id}/view` |
+| Repeated concepts in history turns | `observations.mentions`, independent of immutable entity identity |
+| Ordered history and related threads | `episodes`, `episode`; `GET /spaces/{space}/episodes[/{id}]` |
+| Typed concept links | `ontology_pack: software_team_v1`, external assertions, relationship proposals/verdicts |
+| Graph retrieval / related concepts | `recall.graph`, indexed adjacency and personalized PageRank |
+
+All paths in the table are under `/memory/v1`. Model-free defaults remain valid.
+The optional `software_team_v1` pack types `is_a`, `part_of` and `alternative_to`
+as concept-to-concept predicates. Assertions retain their existing kind,
+`motivates` and `rejected_in_favor_of` fields, validity, scope and stability.
+Pack changes participate in the same atomic ontology validation and belief
+rebuild as explicit predicate changes. The pack's concept relationship typing
+cannot be relaxed by an explicit predicate override.
+
+### Derived descriptions and evidence dependencies
+
+An entity view resolves explicit curation, traverses the raw-identity reverse
+indexes for every alias component, and derives a deterministic description from
+current authorized assertion statements. Settled and newer support comes first;
+existing generated summary assertions are eligible grounded inputs. The view
+returns exact entity/assertion resource revisions, selected evidence references,
+a content fingerprint, configuration generation and completeness. It reads at
+most 256 reverse-index entries, renders at most 32 statements and 8 KiB of text,
+and never treats an omitted dependency as proof that the view is exhaustive.
+
+The description is a read projection, not a separately persisted ungrounded
+summary. Consequently ingestion, correction, unmerge, suppression, expiry,
+source change and forgetting immediately regenerate the applicable view under
+the requesting principal. No cache of old description text survives erasure.
+`known_at` and `valid_at` select assertion revisions; current retention and
+curation still fence disclosure. A fingerprint identifies the derived content;
+it is not an independently revision-pinned historical resource. Dependencies
+can be followed through the ordinary native `explain` contract. Clients wanting
+a model-written description submit a grounded summary assertion or enable the
+existing optional managed summary stage. No generator is required to read views.
+
+### Episodes and repeated mentions
+
+Evidence carrying `thread_id` and `ordinal` is indexed by signed ordinal and
+immutable evidence ID, with `turn_id`, author and event time preserved. Equal
+ordinals have a deterministic ID order. Pagination binds the space revision,
+principal and episode. A repeated mention has its own immutable `id`,
+`entity_id`, evidence references and visibility. It does not rewrite the entity's
+original immutable identity evidence. Entity admission also creates a grounded
+initial mention. Managed mentions inherit every causal generation input, just
+as managed assertions do; external mentions use the ordinary evidence gate.
+
+An episode read filters each source and mention before returning text or entity
+IDs. Losing any conjunctive mention input removes that mention; independent
+surviving turns remain readable. Reads perform no whole-thread rebuild and do
+not invoke a model. One episode page examines at most 64 turns and 64 mention
+bindings per turn and reports incomplete member scans. Episode catalogs return
+only entries with a proven accessible member in the bounded preview. Foreground
+forgetting/expiry fences all views immediately; maintenance removes retired
+payload and orphaned indexes, retaining ID tombstones. Temporary resource denial
+is not authority for background global deletion.
+
+### External judgments and candidate policy
+
+Identity candidate pages contain immutable entity revisions and grounded views.
+Names/aliases, compact spelling and description overlap are recall signals,
+never calibrated merge confidence. Identity candidates require matching types,
+visibility/owner partitions and version-number signatures, respect explicit
+and shared pinned distinctions, and exclude existing canonical aliases.
+`kind: relationship` permits distinct/versioned concepts and advertises the
+pack's relation vocabulary. Paging examines 64 entities at a time and returns
+an explicit cursor/completeness; this bounded lexical/description discovery
+does not claim exhaustive semantic nearest-neighbor search.
+
+Entity proposals use the engine's [shared curation queue (#1233)](https://github.com/antflydb/antfly/pull/1233),
+including stable proposal IDs, irreversible terminal review outcomes, reversible
+merge/unmerge/suppression and reject-with-distinction. Separate service bindings
+pin input entity revisions, configuration and evidence without duplicating
+free-text prompts into the engine queue. Proposal/list/review require admin
+access. An external verdict carries `accept: true`, `false`, or `null` (defer),
+an expected space revision, declared actor, evidence and optional qualified
+model metadata. The authenticated principal remains the authoritative initiator;
+a supplied actor is declared agent attribution. Accept applies the same native
+curation and belief rebuild atomically; config/input changes fence stale review.
+Terminal queue entries cannot be reopened by changing an idempotency token.
+
+Typed relationship candidates use `propose_relationship`,
+`relationship_proposal`, and `review_relationship`, exposed at
+`/relationship-proposals[/{id}[/verdict]]`. A proposal contains one immutable,
+independently grounded typed assertion and does not participate in recall until
+accepted. Only the owner or an administrator may inspect/review it. Accept
+revalidates ontology and evidence and admits the assertion through ordinary
+native policy in the verdict transaction. Reject leaves the claim unpublished;
+defer leaves the proposal open. Additional judge-context evidence is conjunctive
+causal provenance of an accepted assertion; losing it prevents disclosure even
+if the original factual support survives. Rejection does not imply identity
+separation: typed relationship review rejects `pin_distinct`. Attribution and
+review reasons are retained only while their own evidence permits disclosure.
+None of these contracts accepts a hosted client, credential or prompt to execute.
+
+### Graph recall and bounded output
+
+`recall.graph` admits up to 32 explicit entity seeds, 4 hops, 512 nodes,
+4096 undirected edges and 64 fixed PageRank iterations. Defaults use relation
+weight 0.5, provisional weight 0.5 and restart probability 0.15. With explicit
+seeds, recall bypasses the global assertion scan and follows raw-identity and
+mention reverse indexes; it never needs a client to guess foreign table names.
+Without explicit seeds, deterministic lexical/vector hits personalize the graph.
+All structural/temporal filters, source authorization and retention checks run
+before graph admission. Typed relationship assertions remain nodes with their
+proof, while a discounted concept-to-concept edge permits one conceptual hop.
+Thread nodes are terminal results, preventing unrelated conversation fan-out.
+
+The adjacency walk examines at most 4096 bindings; per-concept assertion and
+mention scans are separately bounded and report incompleteness. PageRank
+redistributes dangling mass to the personalized seeds. Stable ordering resolves
+ties. The result carries ranked assertions, up to eight grounded entity views,
+up to eight ordered episode previews, and graph bounds/status. The same byte-based
+conservative token upper bound covers the **entire** response, including views,
+turn text, citations and diagnostics. Budget trimming removes episode previews,
+then descriptions, then lower-ranked assertions and reports omissions. Explicit
+seed recall has no scan cursor; an input cursor is rejected. Flat recall remains
+available and retains its existing lexical/vector pagination contract.
+
+### Shared engine fixes and qualification
+
+- [#1241](https://github.com/antflydb/antfly/issues/1241): Lite connection
+  maintenance executes bounded grouped-source controls under owner/writer
+  admission, alternating with detached enrichment replay. Legacy opened table
+  objects start resident optional workers at their stable heap address. Waiting
+  at `sync_level: enrichments` is not required to publish groups.
+- [#1244](https://github.com/antflydb/antfly/issues/1244): the private owner ABI
+  forwards the actual entity sink's curation capability. Missing capability
+  callbacks fail closed. Distributed atomic curation no longer loses support
+  while crossing the owner archive boundary. This changes private owner ABI 82
+  and storage engine linkage v29; rebuild all native runtime units together.
+- [#1245](https://github.com/antflydb/antfly/issues/1245): Lite accepts qualified
+  start identities for complete local snapshot traverse/neighbors and preserves
+  table identity through admission, visited sets and paths. Use
+  `start_nodes.identities: [{key, table}]` on both backends. Bare keys continue
+  to name the owning table; they are not a cross-table wildcard. Distributed
+  incoming traversal still requires node deduplication and now reports that
+  exact restriction before the generic direction fallback.
+
+The pinned [Codex fixture corpus](pkg/antfly-embedded/src/memory/fixtures/codex-a2d59cfb01/README.md)
+replays 154 labeled supersession, identity and typed-relation cases through native
+policy. Labels are supplied as external verdicts; this tests admission/lifecycle
+and does **not** reproduce or claim hosted/local model precision. Additional
+native cases cover descriptions, graph rank/budgets, ordered episodes, repeated
+mentions, correction and causal forgetting. Live Codex extraction/retrieval,
+note-file changes, fork/revert and product cutover remain consumer qualification
+work; no Antfly-only test claims to execute that separate application.
+
 ## Public operations and bounded execution
 
 All timestamps are signed milliseconds since Unix epoch. `valid_at` asks about
@@ -1009,7 +1170,7 @@ Deliver the native Zig memory module with a model-free space, idempotent externa
 
 ## Compatibility with the Codex Antfly integration
 
-Related implementation: [antflydb/codex ANTFLY_INTEGRATION.md](https://github.com/antflydb/codex/blob/antfly/integration/ANTFLY_INTEGRATION.md), inspected on October 19, 2026; [pinned revision a0793a7b](https://github.com/antflydb/codex/blob/a0793a7bf47254e0c29a95d0430d494b542a3da4/ANTFLY_INTEGRATION.md). This document contains both an original plan and subsequent as-built findings; prioritize the as-built contracts and verify actual code before migrating.
+Related implementation: [antflydb/codex ANTFLY_INTEGRATION.md](https://github.com/antflydb/codex/blob/antfly/integration/ANTFLY_INTEGRATION.md), updated against [pinned revision a2d59cfb01](https://github.com/antflydb/codex/blob/a2d59cfb01/ANTFLY_INTEGRATION.md) and the [October 21 integration review](https://github.com/antflydb/antfly/pull/1227#issuecomment-6327590919). The earlier design investigation used a0793a7b; it is not the current integration baseline. This document contains both an original plan and subsequent as-built findings; prioritize the as-built contracts and verify actual code before migrating.
 
 The Codex integration is a reference implementation and potential first consumer of this memoryaf work. It already implements much of the application-level behavior this issue aims to generalize:
 
@@ -1042,9 +1203,9 @@ Keep Codex session lifecycle, thread persistence, queue/goals, approval enforcem
 
 - The integration's grouped-history request (#1147) maps directly to #1186's ordered grouped sources. Reuse that processing instead of re-materializing complete turns in each consumer, while keeping the finite replay horizon explicit.
 - Its request for generator-backed resolver adjudication and description assets now has corresponding #1186 contracts. Port and rerun the actual concept fixtures before replacing the existing judge; the document reports local typed models near chance on those tasks.
-- Reversible curation can address the integration's inability to undo merges, subject to migration of existing corrections and qualification of native/Lite versus server namespace behavior.
+- The integration now has reversible curation, cascade suppression, attributed proposals and reject-with-distinction on #1233. The native external verdict contracts preserve those behaviors rather than replacing them with automatic similarity merges.
 - Suppression can help with generic concepts, but identity suppression is different from source-content deletion or forgetting.
-- Description regeneration remains a dependency problem: the integration stores descriptions in a separate table because its evidence edges live on claim/note tables. #1186 does not automatically turn that layout into managed cross-table description assets. Qualify a migration and invalidation path, including explicit re-resolution where needed.
+- Native derived entity views now follow canonical identity reverse indexes and regenerate from retained assertions. This removes the separate manual description-table rebuild from the service design; Codex must still switch its consumer and explicitly reconsider previously committed identities when appropriate.
 
 ### Remaining design gaps beyond the Codex implementation
 

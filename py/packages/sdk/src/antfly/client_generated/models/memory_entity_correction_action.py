@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class MemoryEntityCorrectionAction(StrEnum):
+    DISTINCT = "distinct"
     MERGE = "merge"
     SUPPRESS = "suppress"
     UNMERGE = "unmerge"

@@ -746,7 +746,7 @@ pub fn executeMemoryMcpRequest(server_ptr: anytype, request: McpRequest, authent
     inline for (tools, 0..) |tool, i| {
         const action = comptime @field(memory_api.memory.Action, tool.action);
         contexts[i] = .{ .server = server_ptr, .identity = authenticated_identity, .request = request.context, .action = action };
-        const permission: McpToolPermission = if (!memory_api.memory.mutates(action)) .read else if (memory_api.memory.actionGrant(action) == .admin) .admin else .write;
+        const permission: McpToolPermission = if (memory_api.memory.actionGrant(action) == .admin) .admin else if (!memory_api.memory.mutates(action)) .read else .write;
         if (mcpPermissionVisibleForIdentity(permission, authenticated_identity)) {
             try protocol_server.addTool(server_ptr.alloc, .{ .name = tool.name, .description = tool.description, .input_schema_json = tool.input_schema_json, .handler = .{ .ptr = &contexts[i], .call_fn = Context.call } });
         }

@@ -61,3 +61,40 @@ def test_memory_explanation_is_read_only_post_with_resource_scope() -> None:
     assert "idempotency-key" not in seen[0].headers
     assert seen[1].url.path == "/memory/v1/spaces/team/explain"
     assert seen[1].headers["x-antfly-database"] == "business"
+
+
+def test_native_views_episodes_and_external_verdict_routes() -> None:
+    client = AntflyClient("http://memory.test", token="reviewer")
+    seen = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    with httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(respond)) as http:
+        client._client.set_httpx_client(http)
+        client.memory.execute("team", "entity_view", id="concept/a", body={"known_at": 0})
+        client.memory.execute("team", "entity_candidates", id="concept/a", body={"kind": "relationship"})
+        client.memory.execute("team", "episode", id="thread/a", body={"limit": 1, "known_at": 0})
+        client.memory.execute(
+            "team",
+            "review_entity",
+            id="proposal/a",
+            body={"expected_revision": 2**64 - 1, "accept": None},
+            idempotency_key="defer",
+        )
+        client.memory.execute(
+            "team",
+            "review_relationship",
+            id="proposal/b",
+            body={"expected_revision": 7, "accept": True},
+            idempotency_key="accept",
+        )
+    assert seen[0].url.raw_path == b"/memory/v1/spaces/team/entities/concept%2Fa/view"
+    assert "idempotency-key" not in seen[0].headers
+    assert "idempotency-key" not in seen[1].headers
+    assert seen[2].url.raw_path.startswith(b"/memory/v1/spaces/team/episodes/thread%2Fa?")
+    assert seen[2].url.params["known_at"] == "0"
+    assert seen[3].url.raw_path == b"/memory/v1/spaces/team/entity-proposals/proposal%2Fa/verdict"
+    assert b"18446744073709551615" in seen[3].content
+    assert seen[4].url.raw_path == b"/memory/v1/spaces/team/relationship-proposals/proposal%2Fb/verdict"

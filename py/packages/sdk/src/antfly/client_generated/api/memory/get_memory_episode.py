@@ -1,0 +1,295 @@
+from http import HTTPStatus
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+
+from ... import errors
+from ...client import AuthenticatedClient, Client
+from ...models.memory_episode import MemoryEpisode
+from ...models.memory_error import MemoryError_
+from ...types import UNSET, Response, Unset
+
+
+def _get_kwargs(
+    space: str,
+    id: str,
+    *,
+    cursor: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
+    known_at: int | Unset = UNSET,
+    x_antfly_database: str | Unset = "default",
+    x_antfly_namespace: str | Unset = "public",
+) -> dict[str, Any]:
+    headers: dict[str, Any] = {}
+    if not isinstance(x_antfly_database, Unset):
+        headers["X-Antfly-Database"] = x_antfly_database
+
+    if not isinstance(x_antfly_namespace, Unset):
+        headers["X-Antfly-Namespace"] = x_antfly_namespace
+
+    params: dict[str, Any] = {}
+
+    params["cursor"] = cursor
+
+    params["limit"] = limit
+
+    params["known_at"] = known_at
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
+
+    _kwargs: dict[str, Any] = {
+        "method": "get",
+        "url": "/memory/v1/spaces/{space}/episodes/{id}".format(
+            space=quote(str(space), safe=""),
+            id=quote(str(id), safe=""),
+        ),
+        "params": params,
+    }
+
+    _kwargs["headers"] = headers
+    return _kwargs
+
+
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> MemoryEpisode | MemoryError_ | None:
+    if response.status_code == 200:
+        response_200 = MemoryEpisode.from_dict(response.json())
+
+        return response_200
+
+    if response.status_code == 400:
+        response_400 = MemoryError_.from_dict(response.json())
+
+        return response_400
+
+    if response.status_code == 401:
+        response_401 = MemoryError_.from_dict(response.json())
+
+        return response_401
+
+    if response.status_code == 403:
+        response_403 = MemoryError_.from_dict(response.json())
+
+        return response_403
+
+    if response.status_code == 404:
+        response_404 = MemoryError_.from_dict(response.json())
+
+        return response_404
+
+    if response.status_code == 409:
+        response_409 = MemoryError_.from_dict(response.json())
+
+        return response_409
+
+    if response.status_code == 413:
+        response_413 = MemoryError_.from_dict(response.json())
+
+        return response_413
+
+    if response.status_code == 422:
+        response_422 = MemoryError_.from_dict(response.json())
+
+        return response_422
+
+    if response.status_code == 429:
+        response_429 = MemoryError_.from_dict(response.json())
+
+        return response_429
+
+    if response.status_code == 503:
+        response_503 = MemoryError_.from_dict(response.json())
+
+        return response_503
+
+    if client.raise_on_unexpected_status:
+        raise errors.UnexpectedStatus(response.status_code, response.content)
+    else:
+        return None
+
+
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[MemoryEpisode | MemoryError_]:
+    return Response(
+        status_code=HTTPStatus(response.status_code),
+        content=response.content,
+        headers=response.headers,
+        parsed=_parse_response(client=client, response=response),
+    )
+
+
+def sync_detailed(
+    space: str,
+    id: str,
+    *,
+    client: AuthenticatedClient | Client,
+    cursor: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
+    known_at: int | Unset = UNSET,
+    x_antfly_database: str | Unset = "default",
+    x_antfly_namespace: str | Unset = "public",
+) -> Response[MemoryEpisode | MemoryError_]:
+    """
+    Args:
+        space (str):
+        id (str):
+        cursor (str | Unset):
+        limit (int | Unset):
+        known_at (int | Unset):
+        x_antfly_database (str | Unset):  Default: 'default'.
+        x_antfly_namespace (str | Unset):  Default: 'public'.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[MemoryEpisode | MemoryError_]
+    """
+
+    kwargs = _get_kwargs(
+        space=space,
+        id=id,
+        cursor=cursor,
+        limit=limit,
+        known_at=known_at,
+        x_antfly_database=x_antfly_database,
+        x_antfly_namespace=x_antfly_namespace,
+    )
+
+    response = client.get_httpx_client().request(
+        **kwargs,
+    )
+
+    return _build_response(client=client, response=response)
+
+
+def sync(
+    space: str,
+    id: str,
+    *,
+    client: AuthenticatedClient | Client,
+    cursor: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
+    known_at: int | Unset = UNSET,
+    x_antfly_database: str | Unset = "default",
+    x_antfly_namespace: str | Unset = "public",
+) -> MemoryEpisode | MemoryError_ | None:
+    """
+    Args:
+        space (str):
+        id (str):
+        cursor (str | Unset):
+        limit (int | Unset):
+        known_at (int | Unset):
+        x_antfly_database (str | Unset):  Default: 'default'.
+        x_antfly_namespace (str | Unset):  Default: 'public'.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        MemoryEpisode | MemoryError_
+    """
+
+    return sync_detailed(
+        space=space,
+        id=id,
+        client=client,
+        cursor=cursor,
+        limit=limit,
+        known_at=known_at,
+        x_antfly_database=x_antfly_database,
+        x_antfly_namespace=x_antfly_namespace,
+    ).parsed
+
+
+async def asyncio_detailed(
+    space: str,
+    id: str,
+    *,
+    client: AuthenticatedClient | Client,
+    cursor: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
+    known_at: int | Unset = UNSET,
+    x_antfly_database: str | Unset = "default",
+    x_antfly_namespace: str | Unset = "public",
+) -> Response[MemoryEpisode | MemoryError_]:
+    """
+    Args:
+        space (str):
+        id (str):
+        cursor (str | Unset):
+        limit (int | Unset):
+        known_at (int | Unset):
+        x_antfly_database (str | Unset):  Default: 'default'.
+        x_antfly_namespace (str | Unset):  Default: 'public'.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[MemoryEpisode | MemoryError_]
+    """
+
+    kwargs = _get_kwargs(
+        space=space,
+        id=id,
+        cursor=cursor,
+        limit=limit,
+        known_at=known_at,
+        x_antfly_database=x_antfly_database,
+        x_antfly_namespace=x_antfly_namespace,
+    )
+
+    response = await client.get_async_httpx_client().request(**kwargs)
+
+    return _build_response(client=client, response=response)
+
+
+async def asyncio(
+    space: str,
+    id: str,
+    *,
+    client: AuthenticatedClient | Client,
+    cursor: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
+    known_at: int | Unset = UNSET,
+    x_antfly_database: str | Unset = "default",
+    x_antfly_namespace: str | Unset = "public",
+) -> MemoryEpisode | MemoryError_ | None:
+    """
+    Args:
+        space (str):
+        id (str):
+        cursor (str | Unset):
+        limit (int | Unset):
+        known_at (int | Unset):
+        x_antfly_database (str | Unset):  Default: 'default'.
+        x_antfly_namespace (str | Unset):  Default: 'public'.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        MemoryEpisode | MemoryError_
+    """
+
+    return (
+        await asyncio_detailed(
+            space=space,
+            id=id,
+            client=client,
+            cursor=cursor,
+            limit=limit,
+            known_at=known_at,
+            x_antfly_database=x_antfly_database,
+            x_antfly_namespace=x_antfly_namespace,
+        )
+    ).parsed

@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class MemoryRecallResultRetrieval(StrEnum):
+    GRAPH = "graph"
     LEXICAL = "lexical"
     LEXICAL_VECTOR = "lexical_vector"
 

@@ -6,6 +6,7 @@ from typing import Any, TypeVar, cast
 from attrs import define as _attrs_define
 
 from ..models.memory_operation_phase import MemoryOperationPhase
+from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="MemoryOperation")
 
@@ -27,6 +28,7 @@ class MemoryOperation:
         attempts (int):
         error_code (None | str):
         next_retry_at (int | None):
+        proposal_id (None | str | Unset):
     """
 
     id: str
@@ -42,6 +44,7 @@ class MemoryOperation:
     attempts: int
     error_code: None | str
     next_retry_at: int | None
+    proposal_id: None | str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         id = self.id
@@ -72,6 +75,12 @@ class MemoryOperation:
         next_retry_at: int | None
         next_retry_at = self.next_retry_at
 
+        proposal_id: None | str | Unset
+        if isinstance(self.proposal_id, Unset):
+            proposal_id = UNSET
+        else:
+            proposal_id = self.proposal_id
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -91,6 +100,8 @@ class MemoryOperation:
                 "next_retry_at": next_retry_at,
             }
         )
+        if proposal_id is not UNSET:
+            field_dict["proposal_id"] = proposal_id
 
         return field_dict
 
@@ -133,6 +144,15 @@ class MemoryOperation:
 
         next_retry_at = _parse_next_retry_at(d.pop("next_retry_at"))
 
+        def _parse_proposal_id(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        proposal_id = _parse_proposal_id(d.pop("proposal_id", UNSET))
+
         memory_operation = cls(
             id=id,
             action=action,
@@ -147,6 +167,7 @@ class MemoryOperation:
             attempts=attempts,
             error_code=error_code,
             next_retry_at=next_retry_at,
+            proposal_id=proposal_id,
         )
 
         return memory_operation

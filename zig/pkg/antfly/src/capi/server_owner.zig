@@ -667,7 +667,15 @@ pub const StorageOwnerRuntimeHooks = struct {
     const entity_sink_vtable = db_mod.EntitySink.VTable{
         .upsert = entityUpsert,
         .upsert_batch = entityUpsertBatch,
+        .supports_curation = entitySupportsCuration,
     };
+
+    fn entitySupportsCuration(ptr: *anyopaque) !bool {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        var supported: u8 = 0;
+        try kernel_error_identity.statusToError(self.config.entity_sink.curationCapability(&supported));
+        return supported != 0;
+    }
 
     pub fn entityUpsert(
         ptr: *anyopaque,

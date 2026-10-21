@@ -665,6 +665,10 @@ pub fn runAtStampedGenerationWithOptions(
         if (block_writers) handle.write_mutex.lockUncancelable(handleLockIo());
         defer if (block_writers) handle.write_mutex.unlock(handleLockIo());
         req.identity_read_generation = pinned;
+        if (handle.storage_owner_context == null and handle.storage_owner_path == null and handle.embedded_path != null) {
+            req.graph_owning_table = handle.selected_table_name orelse "docs";
+            req.graph_index_complete_snapshot = true;
+        }
         try stampSearchRequestIdentityGeneration(handle, req);
         if (options.prepare) try handle.prepareSearchRequest(req.*);
         return query.run(handle, req.*) catch |err| {
@@ -690,7 +694,7 @@ pub fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_
         const response = try local_query_client.executeJsonAlloc(
             handle.alloc,
             @ptrCast(handle.database()),
-            "docs",
+            if (req.graph_owning_table.len > 0) req.graph_owning_table else "docs",
             request_json,
             .internal,
             antfly.local_query_controls.executionOptions(req),
@@ -10075,4 +10079,99 @@ test "capi native memory explains ordinary row provenance across trace expiry so
     const ordinary_history = try nativeMemoryTestCall(id, alloc, "alice", .explain, memory.types.provenance.ExplainRequest{ .resource = business_ref, .known_at = pinned_source.recorded_at }, "", "");
     try std.testing.expect(std.mem.indexOf(u8, ordinary_history, "APPROVED_V1") != null);
     try std.testing.expect(std.mem.indexOf(u8, ordinary_history, "CHANGED_V2") == null);
+}
+
+test "capi native memory grouped episodes advance without a waiting write in root and table connections" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-group-background");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var root: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &root));
+    defer antfly_db_close(root);
+    try std.testing.expectEqual(capi.ErrorCode.ok, @import("tables.zig").antfly_db_create_table_json(root, .fromSlice("history"), .fromSlice("{}")));
+    var table: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, @import("tables.zig").antfly_db_open_table(root, .fromSlice("history"), &table));
+    defer antfly_db_close(table);
+    const work = @import("../storage/db/group_source_worker.zig");
+    const contract = @import("../storage/db/group_source_contract.zig");
+    for ([_]?*anyopaque{ root, table }) |id| {
+        {
+            const guard = enterHandle(id, .write) orelse return error.TestUnexpectedResult;
+            defer guard.leave();
+            const database = guard.handle.database();
+            try database.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" } });
+            try database.batch(.{ .writes = &.{.{ .key = "message", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"turn\",\"ordinal\":1,\"text\":\"History episode\"}" }}, .sync_level = .write });
+        }
+        var published = false;
+        for (0..300) |_| {
+            {
+                const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+                defer guard.leave();
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const temporary = arena.allocator();
+                const database = guard.handle.database();
+                const definitions = (try database.lookup(temporary, "", .{ .group_source_query_json = "{\"action\":\"definitions\"}" })).?;
+                const entries = try std.json.parseFromSliceLeaky([]work.Definition, temporary, definitions.json, .{});
+                if (entries.len > 0) {
+                    const query: contract.Query = .{ .action = .status, .artifact = "turns", .definition = entries[0].definition, .group = "thread", .segment = "turn", .cell = 0 };
+                    const response = (try database.lookup(temporary, "", .{ .group_source_query_json = try std.json.Stringify.valueAlloc(temporary, query, .{}) })).?;
+                    const status = try std.json.parseFromSliceLeaky(struct { snapshot: ?@import("../storage/db/group_source_state.zig").Snapshot = null }, temporary, response.json, .{ .ignore_unknown_fields = true });
+                    if (status.snapshot) |snapshot| if (snapshot.units.len > 0) {
+                        published = true;
+                        break;
+                    };
+                }
+            }
+            try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        try std.testing.expect(published);
+    }
+}
+
+test "capi native memory migration views episodes graph and external reviews survive reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-migration");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const memory = @import("../memory/service.zig");
+    const temporary = arena.allocator();
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .create, memory.types.Config{ .ontology_pack = .software_team_v1 }, "create", "");
+    const observation: memory.types.ObservationRequest = .{
+        .evidence = &.{.{ .id = "turn", .source_id = "history", .source_version = "1", .text = "Antfly storage uses WAL", .thread_id = "thread", .turn_id = "turn-1", .ordinal = 1 }},
+        .entities = &.{ .{ .id = "a", .name = "Antfly", .evidence = &.{.{ .id = "turn" }} }, .{ .id = "b", .name = "storage", .evidence = &.{.{ .id = "turn" }} } },
+        .assertions = &.{.{ .id = "relation", .subject = "b", .predicate = "part_of", .value = "a", .statement = "Storage is part of Antfly", .evidence = &.{.{ .id = "turn" }} }},
+    };
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .observe, observation, "observe", "");
+    const proposed_json = try nativeMemoryTestCall(id, temporary, "alice", .propose_entity, memory.types.EntityProposalRequest{ .action = .suppress, .from = "b", .expected_revision = 3, .actor = "codex/generic-screen" }, "propose", "");
+    const proposed = try std.json.parseFromSliceLeaky(memory.types.OperationStatus, temporary, proposed_json, .{});
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .review_entity, memory.types.EntityVerdict{ .expected_revision = 4, .accept = false, .actor = "codex/judge" }, "reject", proposed.proposal_id.?);
+    for (0..2) |attempt| {
+        const view = try nativeMemoryTestCall(id, temporary, "alice", .entity_view, memory.types.EntityViewRequest{}, "", "b");
+        try std.testing.expect(std.mem.indexOf(u8, view, "Storage is part of Antfly") != null);
+        const episode = try nativeMemoryTestCall(id, temporary, "alice", .episode, memory.types.EpisodeRequest{}, "", "thread");
+        try std.testing.expect(std.mem.indexOf(u8, episode, "Antfly storage uses WAL") != null);
+        const graph_json = try nativeMemoryTestCall(id, temporary, "alice", .recall, memory.types.Recall{ .graph = .{ .entity_seeds = &.{"a"}, .max_hops = 3 }, .token_budget = 8192 }, "", "");
+        const graph = try std.json.parseFromSliceLeaky(memory.types.RecallResult, temporary, graph_json, .{});
+        try std.testing.expectEqual(@as(usize, 1), graph.items.len);
+        try std.testing.expectEqual(@as(usize, 1), graph.episodes.len);
+        const review = try nativeMemoryTestCall(id, temporary, "alice", .entity_proposal, .{}, "", proposed.proposal_id.?);
+        try std.testing.expect(std.mem.indexOf(u8, review, "\"state\":\"rejected\"") != null);
+        if (attempt == 0) {
+            antfly_db_close(id);
+            id = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        }
+    }
 }
