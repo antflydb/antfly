@@ -145853,3 +145853,183 @@ test "db prepared transaction effects required native bulk writes use observed p
     const accepted = (try @import("artifact_authored_acceptance.zig").readCurrent(&read, db.root_incarnation, "third", artifact)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 21), accepted.source.timestamp);
 }
+
+test "db prepared transaction effects required speculative graph TTL retries artifact-only races before publication" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // Existing lifetime changes, absent input insertion, and deletion must all
+    // rebuild effects. The primary document row remains byte-identical.
+    for (0..3) |mode| {
+        var directory = try TestDirectory.init("speculative-graph-ttl-race");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+        defer db.close();
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "links", .path = "links", .column_type = .json, .is_json = true, .json_kind = .any, .allows_null = true }} });
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"},\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}" });
+        try db.batch(.{ .writes = &.{.{ .key = "source", .value = "{\"links\":[\"target\"]}" }}, .timestamp_ns = 100 });
+        const key = try internal_keys.graphEdgeArtifactKeyAlloc(a, "source", "g", "R", "target");
+        defer a.free(key);
+        const old = try db.core.store.get(a, key);
+        defer a.free(old);
+        var old_edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(a, old);
+        defer old_edge.deinit(a);
+        try std.testing.expectEqual(@as(u64, 100), old_edge.ttl_created_ns);
+        if (mode == 1) try db.core.store.delete(key);
+        const primary_key = try internal_keys.relationalRowKeyAlloc(a, "source");
+        defer a.free(primary_key);
+        const primary_before = try db.core.store.get(a, primary_key);
+        defer a.free(primary_before);
+        var hook: PortableRuntimeBatchPrelockTestHook = .{};
+        test_portable_runtime_batch_prelock_hook = &hook;
+        defer test_portable_runtime_batch_prelock_hook = null;
+        const Worker = struct {
+            db: *DB,
+            err: ?anyerror = null,
+            fn run(self: *@This()) void {
+                self.db.batch(.{ .writes = &.{.{ .key = "source", .value = "{\"links\":[\"target\"]}" }}, .timestamp_ns = 999 }) catch |err| {
+                    self.err = err;
+                };
+            }
+        };
+        var worker: Worker = .{ .db = &db };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        var joined = false;
+        defer if (!joined) {
+            hook.release.store(true, .release);
+            thread.join();
+        };
+        const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+        while (!hook.entered.load(.acquire) and monotonicTimeNs() < deadline) @import("antfly_platform").time.yieldNow();
+        try std.testing.expect(hook.entered.load(.acquire));
+        test_portable_runtime_batch_prelock_hook = null;
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            if (mode == 2) {
+                try db.core.store.delete(key);
+            } else {
+                const changed = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(a, null, old_edge.generation, 1, 0, 0, 456, "{}");
+                defer a.free(changed);
+                try db.core.store.put(key, changed);
+            }
+            const primary_after = try db.core.store.get(a, primary_key);
+            defer a.free(primary_after);
+            try std.testing.expectEqualSlices(u8, primary_before, primary_after);
+        }
+        hook.release.store(true, .release);
+        thread.join();
+        joined = true;
+        try std.testing.expectEqual(@as(?anyerror, null), worker.err);
+        const actual = try db.core.store.get(a, key);
+        defer a.free(actual);
+        var edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(a, actual);
+        defer edge.deinit(a);
+        try std.testing.expectEqual(@as(u64, if (mode == 2) 999 else 456), edge.ttl_created_ns);
+    }
+}
+
+test "db prepared transaction effects required immutable graph lifetime policy survives catalog retirement" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("immutable-graph-ttl-policy");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"},\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}" });
+    var first = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer first.release();
+    const original = first.plan().graphField("g").?;
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_hour), original.ttl_duration_ns);
+    try std.testing.expect(try db.deleteIndex("g"));
+    try db.addIndex(.{ .name = "next", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"2h\"},\"edge_types\":[{\"name\":\"R\",\"field\":\"other\"}]}" });
+    var next = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer next.release();
+    try std.testing.expect(first.generation() != next.generation());
+    try std.testing.expect(next.plan().graphField("g") == null);
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_hour), next.plan().graphField("next").?.ttl_duration_ns);
+    try std.testing.expectEqualStrings("other", next.plan().graphField("next").?.edges[0].field_name);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_hour), original.ttl_duration_ns);
+    try std.testing.expectEqualStrings("links", original.edges[0].field_name);
+    try std.testing.expectEqual(first.plan().graphCoverageGeneration("g"), @as(?u64, original.coverage_generation));
+    try std.testing.expect(first.plan().graphField("missing") == null);
+}
+
+test "db prepared transaction effects required sealed preapply graph reads survive scratch retirement and validate with dependencies" {
+    const a = std.testing.allocator;
+    const reads = @import("prepared_read_set.zig");
+    const H = PreparedDependencyTest;
+    var directory = try TestDirectory.init("retained-preapply-graph-reads");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    var dependencies = try H.capture(&db, &.{}, &.{});
+    defer dependencies.deinit();
+    var captured = reads.Owned.init(a, null);
+    defer captured.deinit();
+    {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const key = try internal_keys.graphEdgeArtifactKeyAlloc(scratch.allocator(), "source", "g", "R", "target");
+        const encoded = try encodeGraphEdgeArtifactWithTtlAlloc(scratch.allocator(), reads.observe(db.core.store, &captured), key, 1, 1000, 999, .{ .index_name = "g", .source = "source", .target = "target", .edge_type = "R" });
+        var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(scratch.allocator(), encoded);
+        defer decoded.deinit(scratch.allocator());
+        try std.testing.expectEqual(@as(u64, 999), decoded.ttl_created_ns);
+        try captured.finish();
+        dependencies.preapply_reads = try captured.take();
+    }
+    try H.validate(&db, &dependencies);
+    const key = try internal_keys.graphEdgeArtifactKeyAlloc(a, "source", "g", "R", "target");
+    defer a.free(key);
+    const changed = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(a, null, 1, 1, 0, 0, 123, "{}");
+    defer a.free(changed);
+    try db.core.store.put(key, changed);
+    try std.testing.expectError(error.PreparedReadSetChanged, H.validate(&db, &dependencies));
+    try db.core.store.delete(key);
+    try H.validate(&db, &dependencies);
+}
+
+test "db prepared transaction effects required speculative graph TTL captures unwind allocations and original controls" {
+    const a = std.testing.allocator;
+    const reads = @import("prepared_read_set.zig");
+    const admission = @import("../../common/read_admission.zig");
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(allocator: Allocator, store: *docstore_mod.DocStore, key: []const u8, checks: ?*@This()) !void {
+            var payload: admission.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            const control = if (checks != null) admission.Port.init(&payload) else null;
+            var captured = reads.Owned.init(allocator, control);
+            defer captured.deinit();
+            const encoded = encodeGraphEdgeArtifactWithTtlAlloc(allocator, reads.observe(store, &captured), key, 1, 1000, 999, .{ .index_name = "g", .source = "source", .target = "target", .edge_type = "R", .metadata_json = "{}" }) catch |err| return captured.failure orelse err;
+            defer allocator.free(encoded);
+            var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(allocator, encoded);
+            defer decoded.deinit(allocator);
+            try std.testing.expectEqual(@as(u64, 123), decoded.ttl_created_ns);
+            captured.finish() catch |err| return captured.failure orelse err;
+            var sealed = try captured.take();
+            defer sealed.deinit();
+            try sealed.validate(store, control);
+        }
+    };
+    var directory = try TestDirectory.init("speculative-graph-ttl-controls");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    const key = try internal_keys.graphEdgeArtifactKeyAlloc(a, "source", "g", "R", "target");
+    defer a.free(key);
+    const old = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(a, null, 1, 1, 0, 0, 123, "{}");
+    defer a.free(old);
+    try db.core.store.put(key, old);
+    try std.testing.checkAllAllocationFailures(a, Checks.run, .{ db.core.store, key, @as(?*Checks, null) });
+    var baseline: Checks = .{};
+    try Checks.run(a, db.core.store, key, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(a, db.core.store, key, &checks));
+    };
+}

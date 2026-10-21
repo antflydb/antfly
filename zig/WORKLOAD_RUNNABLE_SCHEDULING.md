@@ -6372,3 +6372,50 @@ full assembly before vote, DB/execution lifetimes, executable recovery resources
 and derived-log quota, migration/peer eligibility, normal required PREPARE
 orchestration and the broader scheduler/default/session scope remain incomplete.
 Strong defaults remain off; the full objective remains active.
+
+
+### Speculative graph lifetime inputs before apply (2026-10-20)
+
+Relational graph preparation now takes both coverage generation and TTL duration
+from its owned immutable write-plan snapshot. It no longer borrows a live graph
+index entry to build speculative artifacts. Snapshot policy survives retirement
+of the underlying catalog entry and is fenced by the existing plan generation.
+
+Primary graph-edge reads used to preserve an existing TTL now feed an observed
+preparation stage under the original lifetime. This stage is sealed before
+snapshot/apply admission; its copied keys/fingerprints retain no source cursor
+or borrowed control. After coalescer reentry under apply, validation rejects a
+changed, newly inserted or deleted edge and the ordinary bounded retry rebuilds
+its effects. The check also applies to ordinary graph-only writes that do not
+create an authored-vector physical plan. When a physical plan is retained, its
+dependencies own the sealed pre-apply stage alongside the later metadata stage
+and revalidate both at publication. Each stage has explicit cleanup ownership.
+
+Final receipt `observed-preapply-graph-v4`: actual native exit zero, unchanged
+inputs, 106/106 build steps and 166 test executions (prepared66, DB42, grouped7,
+graph4, identity33, cleanup/manifest14), with no skips/failures/leaks. Four added
+cases cover artifact-only changes/insertions/deletions while real relational
+preparation is parked, immutable TTL/field policy after catalog retirement,
+retained pre-apply absence after scratch retirement, and exhaustive allocations
+plus original NotFound/OOM/deadline rejections. The concurrency fixture changes
+no primary document row bytes; artifact writes can still advance owner mutation
+revisions. Removing the new validation call in negative receipt
+`observed-preapply-graph-negative-v1` produces the intended regression: expected
+TTL456, found100 (41 pass/1 fail, no leaks). The final source restores validation
+and explicitly asserts primary-row equality while the writer is parked. An
+intermediate final run was stopped after review caught the assertion using the
+document-mode key; the fixture now uses the relational-row key. The
+first run's catalog test incorrectly attempted immediate reuse of
+a deleted index name before artifact cleanup; the corrected test publishes a
+separate index and proves the retired snapshot remains intact.
+
+This is optimistic validation under apply, not writer-enforced authority across
+the global decision. Live core/cache/table-catalog and opaque route-policy inputs,
+complete pure assembly before vote, central writer coverage with mandatory
+control progress, DB/execution lifetimes, funded executable recovery resources
+and derived-log quota, restart/migration/peer eligibility and normal required
+PREPARE orchestration remain open, as does the broader scheduler/default/session
+scope. Strong defaults remain off. No ABI/wire/reader/durable-format change;
+public-consumer/full-archive qualification was not rerun, and full Linux
+qualification remains waived. The existing branch already includes origin/main
+`dd49f55102f81a430491a36a9932f46e697ef15a`; no additional fetch was needed.

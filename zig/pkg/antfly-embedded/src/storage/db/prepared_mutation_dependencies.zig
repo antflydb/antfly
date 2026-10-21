@@ -62,6 +62,7 @@ pub const Owned = struct {
     generated_reads: []GeneratedRead = &.{},
     transform_reads: []TransformPredicate = &.{},
     metadata_reads: ?@import("prepared_read_set.zig").Owned = null,
+    preapply_reads: ?@import("prepared_read_set.zig").Owned = null,
 
     pub fn capture(alloc: std.mem.Allocator, core: anytype, source: Sources, original: ?admission.Port) !Owned {
         var trace: admission.RejectionTrace = .{};
@@ -166,11 +167,13 @@ pub const Owned = struct {
         if (!core.relational_indexes.isCurrent(self.relational_indexes)) return error.PreparedGenerationChanged;
         if (self.policy_lease) |*lease| try lease.checkAt(nowSeconds());
         try validateExplicitReads(core, self.generated_reads, self.transform_reads, control);
+        if (self.preapply_reads) |*reads| try reads.validate(core.store, control);
         if (self.metadata_reads) |*reads| try reads.validate(core.store, control);
         if (control) |original| try original.checkpoint();
     }
 
     pub fn deinit(self: *Owned) void {
+        if (self.preapply_reads) |*reads| reads.deinit();
         if (self.metadata_reads) |*reads| reads.deinit();
         for (self.transform_reads) |read| self.alloc.free(read.key);
         self.alloc.free(self.transform_reads);

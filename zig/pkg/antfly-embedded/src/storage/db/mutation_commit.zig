@@ -366,6 +366,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const preparation_timestamp_ns = if (req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
             const preparation_alloc = prepared_row_allocator.allocator();
+            // Relational graph TTL effects read primary artifacts before apply.
+            // Retain those observations under the original lifetime, then seal
+            // this stage before under-apply capture installs its own controls.
+            var preparation_admission: mutation_admission.IntentCollection = .{};
+            metadata_reads.control = preparation_admission.bind(initial_controls, S.ownerField(self, "core").*.apply_mutex.io);
+            const preparation_store = @import("prepared_read_set.zig").observe(S.ownerField(self, "core").*.store, metadata_reads);
 
             // Resolve request ordering and transforms before row preparation. A
             // transform that reads durable state carries an optimistic version
@@ -676,9 +682,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     );
                                 }
                                 for (row.extracted.graph_writes) |graph_write| {
-                                    const generation = write_plan_snapshot.?.plan().graphCoverageGeneration(graph_write.index_name) orelse return error.IndexNotFound;
-                                    const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
-                                    try appendPreparedGraphEdgeArtifactWrite(effects_alloc, S.ownerField(self, "core").*.store, &effect.graph_writes, graph_write, generation, graph_entry.ttl_duration_ns, preparation_timestamp_ns);
+                                    const graph_plan = write_plan_snapshot.?.plan().graphField(graph_write.index_name) orelse return error.IndexNotFound;
+                                    try appendPreparedGraphEdgeArtifactWrite(effects_alloc, preparation_store, &effect.graph_writes, graph_write, graph_plan.coverage_generation, graph_plan.ttl_duration_ns, preparation_timestamp_ns);
                                 }
                                 for (row.extracted.mentioned_graph_indexes) |index_name| {
                                     const clear = try GraphArtifactClear.initAlloc(effects_alloc, write.key, index_name);
@@ -899,6 +904,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     std.math.cast(u32, effective_req.writes.len) orelse return error.InvalidBatchRequest,
                 );
             }
+
+            try metadata_reads.finish();
+            var preapply_reads = try metadata_reads.take();
+            defer preapply_reads.deinit();
 
             const snapshot_controls = if (replication_mutation != null)
                 mutation_admission.retainedLeaseControls(initial_controls)
@@ -1351,6 +1360,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
             }
             try self.validateTransformReadSnapshotWithAdmission(transform_snapshot, publication_control);
+            // Coalescer draining can release apply. Validate speculative TTL
+            // inputs only after reentry, immediately before consuming effects.
+            try preapply_reads.validate(S.ownerField(self, "core").*.store, publication_control);
             // Catches a concurrent commit to one of this batch's own write keys
             // between the pre-lock precompute read and this lock acquisition --
             // the race the catalog-generation check above cannot see, since it
@@ -3200,7 +3212,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // retained physical plan. Never publish after a swallowed capture
             // failure, and retire borrowed controls/cursors on either path.
             try metadata_reads.finish();
-            if (prepared_physical) |*plan| plan.dependencies.?.metadata_reads = try metadata_reads.take();
+            if (prepared_physical) |*plan| {
+                plan.dependencies.?.metadata_reads = try metadata_reads.take();
+                plan.dependencies.?.preapply_reads = try preapply_reads.take();
+            }
             const commit_writes = if (prepared_physical) |plan| plan.bytes.writes else store_writes.items;
             const commit_deletes = if (prepared_physical) |plan| plan.bytes.deletes else delete_keys.items;
             const commit_replay: ?docstore_mod.DocStore.ReplayAppend = if (prepared_physical) |plan|

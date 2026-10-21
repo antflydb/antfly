@@ -5866,6 +5866,7 @@ pub const IndexManager = struct {
     pub const GraphFieldWritePlan = struct {
         index_name: []u8,
         coverage_generation: u64,
+        ttl_duration_ns: u64 = 0,
         edges: []GraphFieldEdgeWritePlan,
     };
 
@@ -5931,10 +5932,15 @@ pub const IndexManager = struct {
             self.* = undefined;
         }
 
-        pub fn graphCoverageGeneration(self: WritePlanSnapshot, index_name: []const u8) ?u64 {
-            for (self.graph_fields) |graph|
-                if (std.mem.eql(u8, graph.index_name, index_name)) return graph.coverage_generation;
+        /// Borrowed from this immutable snapshot, never the live catalog.
+        pub fn graphField(self: *const WritePlanSnapshot, index_name: []const u8) ?*const GraphFieldWritePlan {
+            for (self.graph_fields) |*graph|
+                if (std.mem.eql(u8, graph.index_name, index_name)) return graph;
             return null;
+        }
+
+        pub fn graphCoverageGeneration(self: WritePlanSnapshot, index_name: []const u8) ?u64 {
+            return if (self.graphField(index_name)) |graph| graph.coverage_generation else null;
         }
 
         pub fn coverageGeneration(self: WritePlanSnapshot, index_name: []const u8) ?u64 {
@@ -6012,6 +6018,7 @@ pub const IndexManager = struct {
             return .{
                 .index_name = try alloc.dupe(u8, entry.config.name),
                 .coverage_generation = entry.config.coverage_generation,
+                .ttl_duration_ns = entry.ttl_duration_ns,
                 .edges = edges,
             };
         }
