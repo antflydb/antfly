@@ -300,13 +300,14 @@ const SourceInput = enum {
     text,
     literal,
     locator,
+    reader,
     model_chunk,
     prior_context,
 
     fn interpretsTemplateOutput(self: @This()) bool {
         return switch (self) {
             .literal, .model_chunk, .prior_context => false,
-            .text, .locator => true,
+            .text, .locator, .reader => true,
         };
     }
 };
@@ -644,7 +645,7 @@ pub const Inspector = struct {
             const parsed_type = ProducerType.parse(producer_type) orelse .copy;
             const literal_output = (eq(kind, "asset") and known and !parsed_type.usesTemplateParts(template)) or
                 (eq(kind, "chunk") and !model_chunk) or (is_embedding and template.len == 0);
-            try self.selector(field, template, artifact, if (model_chunk) .model_chunk else if (locator_mode) .locator else if (literal_output) .literal else .text, !known, group != null);
+            try self.selector(field, template, artifact, if (model_chunk) .model_chunk else if (eq(producer_type, "reader")) .reader else if (locator_mode) .locator else if (literal_output) .literal else .text, !known, group != null);
         }
         if (is_embedding) {
             const name = if (str(get(value, "name")).len > 0) str(get(value, "name")) else catalog_name;
@@ -828,6 +829,15 @@ pub const Inspector = struct {
         switch (input) {
             .literal, .prior_context => {},
             .model_chunk => try self.modelChunkSource(value, doc, field),
+            .reader => {
+                if (value == .null) return;
+                if (value == .string) return self.readerText(value.string, doc, field);
+                if (value == .array) {
+                    var source = try @import("../../reader_source.zig").parseArray(self.allocator, value.array.items);
+                    defer source.deinit(self.allocator);
+                    for (source.images) |image| try self.locator(image, doc, field);
+                } else try self.report.add(self.options, .source_unresolved, "structured_locator", doc, field, 0);
+            },
             .locator => try self.consumeValue(value, doc, field, true, 0),
             .text => try self.consumeValue(value, doc, field, false, 0),
         }
@@ -1050,7 +1060,9 @@ pub const Inspector = struct {
             try output.appendSlice(self.allocator, fragment);
             strip_next = strip.close;
         }
-        if (locator_mode and has_helper) {
+        if (input == .reader) {
+            try self.readerTemplate(output.items, doc, field, definition);
+        } else if (locator_mode and has_helper) {
             if (program.program.body.len != 1) try self.report.add(self.options, .dynamic_loader, "composed_locator", doc, field, 0);
         } else if (locator_mode) {
             try self.templateLocator(output.items, doc, field, definition);
@@ -1059,6 +1071,48 @@ pub const Inspector = struct {
             // several literals/references, with no producer or helper execution.
             try self.directivesKnown(output.items, doc, field, definition);
         }
+    }
+
+    fn readerText(self: *@This(), text: []const u8, doc: []const u8, field: []const u8) !void {
+        var source = try @import("../../reader_source.zig").parseText(self.allocator, text);
+        defer source.deinit(self.allocator);
+        for (source.images) |image| try self.locator(image, doc, field);
+    }
+
+    fn readerTemplate(self: *@This(), text: []const u8, doc: []const u8, field: []const u8, definition: bool) !void {
+        const cleaned = try template_runtime.stripErrorDirectives(self.allocator, text);
+        defer self.allocator.free(cleaned);
+        var parts: template_runtime.TextPartIterator = .{ .text = cleaned };
+        var has_media = false;
+        while (parts.next()) |part| switch (part) {
+            .media_url => |url| {
+                has_media = true;
+                if (!definition and std.mem.indexOfScalar(u8, url, 0) != null) {
+                    try self.report.add(self.options, .dynamic_loader, "composed_media", doc, field, 0);
+                } else try self.templateLocator(url, doc, field, definition);
+            },
+            else => {},
+        };
+        // Readers select media parts before falling back to source_text. The
+        // surrounding prompt must not be treated as another source locator.
+        if (has_media) return;
+        if (std.mem.indexOfScalar(u8, text, 0) != null) {
+            if (!definition) {
+                try self.report.add(self.options, .dynamic_loader, "reader_output", doc, field, 0);
+                return;
+            }
+            if (std.mem.indexOf(u8, cleaned, "<<<dotprompt:media:url ")) |start| {
+                // An unknown substitution can supply the closing delimiter.
+                try self.directivesKnown(cleaned[start..], doc, field, true);
+                return;
+            }
+            const trimmed = std.mem.trimStart(u8, text, &std.ascii.whitespace);
+            // An open JSON list/string must not be completed with invented
+            // values or misclassified as a local filename.
+            if (trimmed.len > 0 and (trimmed[0] == '[' or trimmed[0] == '"')) return;
+            return self.templateLocator(text, doc, field, true);
+        }
+        try self.readerText(text, doc, field);
     }
 
     /// Unknown substitutions can extend the current URI component or introduce
@@ -2803,4 +2857,45 @@ test "backup preflight known media origins survive an unknown closing delimiter"
     try inspector.document("doc", "{\"tail\":\"file.pdf>>>\"}", "");
     try std.testing.expectEqual(@as(u64, 2), count(report, .source_external));
     try std.testing.expect(report.analysis_complete);
+}
+
+test "backup preflight reader selection follows media precedence and JSON locator fallback" {
+    const a = std.testing.allocator;
+    const Case = struct {
+        template: []const u8 = "",
+        document: []const u8 = "{}",
+        local: u64 = 0,
+        external: u64 = 0,
+        embedded: u64 = 0,
+    };
+    for ([_]Case{
+        .{ .template = "https://example.org/prompt <<<dotprompt:media:url file:///private/page.png>>>", .local = 2 },
+        .{ .template = "file:///prompt <<<dotprompt:media:url https://example.org/page.png>>>", .external = 2 },
+        .{ .template = "{{media url=uri}}", .document = "{\"uri\":\"https://example.org/page.png\"}", .external = 1 },
+        .{ .template = "{{media url=\"https://example.org/page.png\"}}", .external = 2 },
+        .{ .template = "[\"https://example.org/page.png\",\"file:///private/page.png\"]", .local = 2, .external = 2 },
+        .{ .template = "\"https://example.org/page.png\"", .external = 2 },
+        .{ .template = "[\"https://{{host}}/page.png\"]", .document = "{\"host\":\"example.org\"}", .external = 1 },
+        .{ .template = "<<<dotprompt:media:url https://example.org/{{{tail}}}", .document = "{\"tail\":\"page.png>>>\"}", .external = 2 },
+        .{ .template = "<<<dotprompt:media:url data:image/png;base64,AQID>>>", .embedded = 2 },
+        .{ .template = "<<<error:message=<<<dotprompt:media:url file:///private/ignored>>> <<<dotprompt:media:url https://example.org/page.png>>>", .external = 2 },
+        .{ .document = "{\"body\":[\"https://example.org/page.png\",\"file:///private/page.png\"]}", .local = 1, .external = 1 },
+        .{ .document = "{\"body\":\"[\\\"https://example.org/page.png\\\",\\\"file:///private/page.png\\\"]\"}", .local = 1, .external = 1 },
+        .{ .document = "{\"body\":\"\\\"https://example.org/page.png\\\"\"}", .external = 1 },
+        .{ .document = "{\"body\":[null,123,{\"uri\":\"file:///ignored\"},[\"file:///ignored\"],\"https://example.org/page.png\"]}", .external = 1 },
+        .{ .document = "{\"body\":[]}" },
+    }) |case| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "reader", .kind = "asset", .source_field = "body", .source_template = case.template, .producer = .{ .type = "reader" } }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", case.document, "");
+        try std.testing.expectEqual(case.local, count(report, .source_local));
+        try std.testing.expectEqual(case.external, count(report, .source_external));
+        try std.testing.expectEqual(case.embedded, count(report, .embedded));
+        try std.testing.expect(report.analysis_complete);
+    }
 }

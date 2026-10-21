@@ -35974,3 +35974,33 @@ test "backup preflight prior context output remains an appended text part" {
     for (report.requirements.items) |requirement| try std.testing.expect(requirement.kind != .source_local);
     try std.testing.expect(report.analysis_complete);
 }
+
+test "backup preflight reader media parts match execution" {
+    const a = std.testing.allocator;
+    const producer = "{\"type\":\"reader\",\"config\":{\"provider\":\"antfly\",\"model\":\"mock\"}}";
+    const source_template = "https://example.org/notes <<<dotprompt:media:url file:///private/page.png>>>";
+    try @import("config_validation.zig").validatePublicConfig(a, .{ .name = "reader", .kind = .asset, .template = source_template, .producer_json = producer });
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "reader", .artifact_name = "reader", .doc_key = "doc", .source_field = "", .source_template = source_template, .producer_json = producer };
+    const parts = (try renderSourceParts(a, .{}, "{}", request, null)).?;
+    defer template.freeContentParts(a, parts);
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("file:///private/page.png", parts[1].media_url);
+    const preflight = @import("../../lite/backup_preflight.zig");
+    var report: preflight.Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: preflight.Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const catalog = try @import("../catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "reader", .kind = .asset, .source_field = "", .source_template = source_template, .producer_json = producer }});
+    defer a.free(catalog);
+    try inspector.metadataJson(catalog);
+    try inspector.document("doc", "{}", "");
+    const caps = try a.alloc(preflight.Capability, report.requirements.items.len);
+    defer a.free(caps);
+    for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .query_embedding = true, .future_ingestion = true, .model_revision_verified = true, .preprocessing_verified = true, .vector_space_verified = true, .dimensions = r.dimensions };
+    const evidence = try std.json.Stringify.valueAlloc(a, preflight.Destination{ .version = 1, .configuration_id = "all-evidence", .requirements = caps }, .{});
+    defer a.free(evidence);
+    const json = try report.jsonAlloc(evidence);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"source_local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
+}

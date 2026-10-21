@@ -108,7 +108,10 @@ Only fields selected by executable index/enrichment definitions are source
 inputs. Ordinary document paths and URLs are not dependencies. Reader,
 transcriber, document-extraction and PDF-page embedding inputs are media
 locators; text producers inspect media directives rather than treating every
-URL in prose as a fetch. Copy producers preserve literal text, including
+URL in prose as a fetch. Reader templates select rendered media parts before
+falling back to their rendered locator text, so surrounding prompt text does
+not become a source. Reader locator fallback shares execution's parser for
+plain URLs, JSON strings and JSON URL lists; non-string list elements are inert. Copy producers preserve literal text, including
 media-looking markers. Their template helper fetches are inventoried independently of the
 copied output. Configured artifact consumers inspect their stored
 asset/chunk input stream. Core validation also covers artifact envelopes and
