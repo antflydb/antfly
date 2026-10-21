@@ -262,14 +262,15 @@ not implemented by the coordinate-map changes above.
 - Accept independently authenticated, snapshot-bound writer mapping proofs.
 - Extend per-index reuse across added/deleted logical IDs with explicit native
   membership and delta state; never retain stale aggregates or deleted postings.
-  This remains unimplemented. The required persisted shape is an index-local
-  stable address space, a publication-bound live membership/version tree, and
-  immutable delta runs. Stable addresses cannot be inferred from the current
-  source's file offsets. New, changed and removed inputs must update text DF and
-  collection statistics, ordered/covering tuples, dense/sparse membership and
-  algebraic reductions under one commit. Reader protocol, resolver views, GC,
-  cloud closure proofs and restart must adopt the same membership epoch before
-  enabling reuse; the current whole-index rebase remains the execution path.
+  This remains unimplemented. The logical-fragment path above persists an
+  index-local address space and publication-bound live membership/version census
+  alongside native immutable mutation/contribution state. Stable addresses
+  cannot be inferred from the current source's file offsets. New, changed and
+  removed inputs must update text DF and collection statistics, ordered/covering
+  tuples, dense/sparse membership and algebraic reductions under one commit.
+  Reader protocol, resolver views, GC, cloud closure proofs and restart must
+  adopt the same membership epoch before enabling reuse; the current whole-index
+  rebase remains the execution path.
 - Enable stable logical public IDs only with complete lookup, overlay, cursor,
   filtering and compatibility coverage.
 
