@@ -1219,6 +1219,26 @@ pub const ManagedEmbedder = struct {
         return self.entries.len > 0;
     }
 
+    /// Native task adapters retain the runtime's complete envelope while using
+    /// the same credential source and embedding quota as typed vector calls.
+    /// The observer borrows this embedder and must not outlive it.
+    pub const NativeRequestControls = struct {
+        endpoint: []const u8,
+        authorization: ?[]u8,
+        attempt_observer: ?httpx.AttemptObserver,
+    };
+
+    pub fn nativeRequestControls(self: *ManagedEmbedder, alloc: std.mem.Allocator, name: []const u8) !NativeRequestControls {
+        const entry = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (entry.provider != .antfly) return error.UnsupportedEmbeddingProvider;
+        const authorization = if (entry.api_key) |*key| try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, key) else null;
+        return .{
+            .endpoint = entry.base_url,
+            .authorization = authorization,
+            .attempt_observer = embeddingAttemptObserver(entry),
+        };
+    }
+
     pub fn hasDenseEntries(self: ManagedEmbedder) bool {
         for (self.entries) |entry| {
             if (!entry.sparse) return true;

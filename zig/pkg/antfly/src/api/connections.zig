@@ -247,6 +247,7 @@ pub fn invokeInferenceConnection(
 
 /// Request transport metadata is separate from operation identity and JSON.
 pub const InvocationRequest = struct {
+    attempt_observer: ?httpx.AttemptObserver = null,
     content_type: []const u8 = "application/json",
     query: ?[]const u8 = null,
     body_source: runtime_http_abi.RequestBodySource = .{},
@@ -367,6 +368,7 @@ pub fn invokeInferenceConnectionWithRequest(
             .patch => .PATCH,
         }, url, .{
             .headers = headers,
+            .attempt_observer = request.attempt_observer,
             .borrowed_body = if (request.body_source.read == null) body else null,
             .body_stream = if (request.body_source.read != null) .{ .context = @constCast(&request.body_source), .read = readInvocationBody } else null,
             .timeout_ms = timeout_ms,
@@ -387,6 +389,7 @@ pub fn invokeInferenceConnectionWithRequest(
         .patch => .PATCH,
     }, url, .{
         .headers = headers,
+        .attempt_observer = request.attempt_observer,
         .body = body,
         .timeout_ms = timeout_ms,
         .cancellation = cancellation,

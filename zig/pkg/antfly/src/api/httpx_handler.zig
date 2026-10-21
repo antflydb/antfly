@@ -4318,6 +4318,7 @@ pub const AntflyApiHandler = struct {
             error.InferenceUpstreamUnavailable => 503,
             error.DecisionRefused => 422,
             error.Timeout => 504,
+            error.EmbeddingIdentityMismatch => 409,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.UnknownField, error.MissingField, error.InvalidGeneratorConfig, error.InvalidDecisionSpecification, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature, error.SyntaxError, error.UnexpectedToken => 400,
             else => 502,
@@ -18957,4 +18958,260 @@ test "httpx inference gateway remote generated and framed requests retain creden
     try group.await(io_impl.io());
     if (failure) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+}
+
+test "httpx inference gateway named native embeddings preserve items groups pins and metadata" {
+    const State = struct {
+        const pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        calls: usize = 0,
+        input: []const u8 = "",
+        count: usize = 0,
+        expected_pin: []const u8 = pin,
+        response_pin: ?[]const u8 = pin,
+        framed: bool = false,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            check(context) catch |err| return inference_connection_abi.statusFromError(err);
+            return .ok;
+        }
+        fn check(context: *const inference_connection_abi.InvokeContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            const alloc = context.allocator.asStd();
+            self.calls += 1;
+            try std.testing.expectEqualStrings("embeddings", context.operation.slice());
+            try std.testing.expect(context.stream.start == null);
+            var envelope: ?httpx.attachment_envelope.Envelope = null;
+            defer if (envelope) |*value| value.deinit();
+            const metadata = if (self.framed) blk: {
+                try std.testing.expectEqualStrings(httpx.attachment_envelope.content_type, context.content_type.slice().?);
+                envelope = try httpx.attachment_envelope.parseAlloc(alloc, context.body.slice(), .{});
+                try std.testing.expectEqualStrings("image", envelope.?.attachments[0].data);
+                break :blk envelope.?.metadata;
+            } else context.body.slice();
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("backend", parsed.value.object.get("model").?.string);
+            try std.testing.expectEqualStrings(self.expected_pin, parsed.value.object.get("model_identity").?.string);
+            const input_json = try std.json.Stringify.valueAlloc(alloc, parsed.value.object.get("input").?, .{});
+            defer alloc.free(input_json);
+            try std.testing.expectEqualStrings(self.input, input_json);
+            const Item = struct { object: []const u8 = "embedding", index: usize, embedding: []const f32 = &.{ 1, 2 } };
+            const data = try alloc.alloc(Item, self.count);
+            defer alloc.free(data);
+            for (data, 0..) |*item, index| item.* = .{ .index = index };
+            const response = try std.json.Stringify.valueAlloc(alloc, .{ .object = "list", .model = "backend", .model_identity = self.response_pin, .backend = "cuda", .data = data, .usage = .{ .prompt_tokens = 3, .total_tokens = 3 } }, .{});
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = response.ptr, .len = response.len } };
+        }
+    };
+    const a = std.testing.allocator;
+    const config_json = try std.fmt.allocPrint(a, "{{\"public_inference\":{{\"enabled\":true}},\"embedders\":{{\"pinned\":{{\"provider\":\"antfly\",\"model\":\"backend\",\"dimensions\":2,\"model_identity\":\"{s}\"}},\"unpinned\":{{\"provider\":\"antfly\",\"model\":\"backend\",\"dimensions\":2}}}}}}", .{State.pin});
+    defer a.free(config_json);
+    var config = try common_config.Config.parseFromSlice(a, config_json);
+    defer config.deinit();
+    var state: State = .{};
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &state, .invoke = State.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const Case = struct { input: []const u8, count: usize, framed: bool = false, encoded: bool = false };
+    for ([_]Case{
+        .{ .input = "\"text\"", .count = 1, .encoded = true },
+        .{ .input = "[{\"type\":\"text\",\"text\":\"a\"},{\"type\":\"text\",\"text\":\"b\"}]", .count = 2 },
+        .{ .input = "{\"content\":[{\"type\":\"text\",\"text\":\"a\"},{\"type\":\"text\",\"text\":\"b\"}]}", .count = 1 },
+        .{ .input = "[{\"content\":[{\"type\":\"text\",\"text\":\"a\"}]},{\"content\":[{\"type\":\"text\",\"text\":\"b\"}]}]", .count = 2 },
+        .{ .input = "{\"content\":[{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"attachment:0\"}]}", .count = 1, .framed = true },
+    }) |case| {
+        state.input = case.input;
+        state.count = case.count;
+        state.framed = case.framed;
+        const body = try std.fmt.allocPrint(a, "{{\"model\":\"embedders/pinned\",\"input\":{s},\"model_identity\":\"{s}\",\"encoding_format\":\"{s}\"}}", .{ case.input, State.pin, if (case.encoded) "base64" else "float" });
+        defer a.free(body);
+        const encoded = if (case.framed) try httpx.attachment_envelope.encodeAlloc(a, body, &.{.{ .mime_type = "image/png", .data = "image" }}) else body;
+        defer if (case.framed) a.free(encoded);
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/embeddings");
+        defer request.deinit();
+        request.body = encoded;
+        try request.headers.set("content-type", if (case.framed) httpx.attachment_envelope.content_type else "application/json");
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.gatewayRequest(&ctx, .embed);
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("native embedding response: {s}\n", .{response.body orelse ""});
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(response.headers.contains("x-request-id"));
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.count, parsed.value.object.get("data").?.array.items.len);
+        if (case.encoded) try std.testing.expectEqualStrings("AACAPwAAAEA=", parsed.value.object.get("data").?.array.items[0].object.get("embedding").?.string);
+        try std.testing.expectEqualStrings(State.pin, parsed.value.object.get("model_identity").?.string);
+        try std.testing.expectEqualStrings("cuda", parsed.value.object.get("backend").?.string);
+        try std.testing.expectEqualStrings("embedders/pinned", parsed.value.object.get("model").?.string);
+        try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("usage").?.object.get("prompt_tokens").?.integer);
+    }
+    state.framed = false;
+    state.input = "\"text\"";
+    state.count = 1;
+    const calls_before_mismatch = state.calls;
+    for ([_][]const u8{ State.other, "invalid" }) |pin| {
+        const body = try std.fmt.allocPrint(a, "{{\"model\":\"embedders/pinned\",\"input\":\"text\",\"model_identity\":\"{s}\"}}", .{pin});
+        defer a.free(body);
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/embeddings");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.gatewayRequest(&ctx, .embed);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, if (pin.len == 64) 409 else 400), response.status.code);
+        try std.testing.expectEqual(calls_before_mismatch, state.calls);
+    }
+    for ([_]?[]const u8{ State.other, null, State.pin }) |pin| {
+        state.response_pin = pin;
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/embeddings");
+        defer request.deinit();
+        // Omitting the caller pin still enforces the configured identity.
+        request.body = "{\"model\":\"embedders/pinned\",\"input\":\"text\",\"stream\":true}";
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.gatewayRequest(&ctx, .embed);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, if (pin != null and std.mem.eql(u8, pin.?, State.pin)) 200 else 502), response.status.code);
+        try std.testing.expect(!ctx.h1_stream_sent and !ctx.h2_stream_sent);
+    }
+    state.expected_pin = State.other;
+    state.response_pin = State.other;
+    const unpinned_body = try std.fmt.allocPrint(a, "{{\"model\":\"embedders/unpinned\",\"input\":\"text\",\"model_identity\":\"{s}\"}}", .{State.other});
+    defer a.free(unpinned_body);
+    var unpinned_request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/embeddings");
+    defer unpinned_request.deinit();
+    unpinned_request.body = unpinned_body;
+    var unpinned_ctx = httpx.Context.init(a, std.testing.io, &unpinned_request);
+    defer unpinned_ctx.deinit();
+    var unpinned_response = try handler.gatewayRequest(&unpinned_ctx, .embed);
+    defer unpinned_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), unpinned_response.status.code);
+    try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+}
+
+test "httpx inference gateway remote native embedding retains shared quota credentials and identity" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer native-key", req.header("Authorization").?);
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("backend", parsed.value.object.get("model").?.string);
+            try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", parsed.value.object.get("model_identity").?.string);
+            try std.testing.expect(parsed.value.object.get("input").?.object.contains("content"));
+        }
+    };
+    const upstream_body = try std.fmt.allocPrint(a, "{{\"object\":\"list\",\"model\":\"backend\",\"model_identity\":\"{s}\",\"data\":[{{\"object\":\"embedding\",\"index\":0,\"embedding\":[1,2]}}],\"usage\":{{\"prompt_tokens\":3,\"total_tokens\":3}}}}", .{pin});
+    defer a.free(upstream_body);
+    var upstream = try httpx.TestServer.start(a, io_impl.io(), &.{.{ .method = .POST, .path = "/ai/v1/embeddings", .assert_request = Check.request, .respond = .{ .body = upstream_body } }});
+    defer upstream.deinit();
+    const config_json = try std.fmt.allocPrint(a, "{{\"public_inference\":{{\"enabled\":true}},\"embedders\":{{\"native\":{{\"provider\":\"antfly\",\"model\":\"backend\",\"model_identity\":\"{s}\",\"dimensions\":2,\"api_key\":\"native-key\",\"rate_limit\":{{\"requests_per_minute\":1}}}}}}}}", .{pin});
+    defer a.free(config_json);
+    var config = try common_config.Config.parseFromSlice(a, config_json);
+    defer config.deinit();
+    config.inference.api_url = try a.dupe(u8, upstream.baseUrl());
+    config.inference.api_key = try a.dupe(u8, "default-key");
+    var limits = @import("antfly_local_sources").common_provider_limits.Registry.init(a);
+    defer limits.deinit();
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .imported_runtime_io = .{ .api = io_impl.io(), .api_network = io_impl.io() } }, source.iface(), null, null);
+    defer server.deinit();
+    server.embedding_provider_runtime.limits = &limits;
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const Fiber = struct {
+        fn run(alloc: std.mem.Allocator, test_io: std.Io, h: *AntflyApiHandler, failure: *?anyerror) void {
+            execute(alloc, test_io, h) catch |err| {
+                failure.* = err;
+            };
+        }
+        fn execute(alloc: std.mem.Allocator, test_io: std.Io, h: *AntflyApiHandler) !void {
+            for (0..2) |index| {
+                var request = try httpx.Request.init(alloc, .POST, "http://localhost/ai/v1/embeddings");
+                defer request.deinit();
+                request.body = "{\"model\":\"embedders/native\",\"input\":{\"content\":[{\"type\":\"text\",\"text\":\"a\"}]},\"stream\":true}";
+                if (index == 1) try request.headers.set("x-antfly-inference-timeout-ms", "10");
+                var ctx = httpx.Context.init(alloc, test_io, &request);
+                defer ctx.deinit();
+                var response = try h.gatewayRequest(&ctx, .embed);
+                defer response.deinit();
+                if (response.status.code != (if (index == 0) @as(u16, 200) else 504)) std.debug.print("native quota response: {s}\n", .{response.body orelse ""});
+                try std.testing.expectEqual(@as(u16, if (index == 0) 200 else 504), response.status.code);
+                if (index == 0) {
+                    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body.?, .{});
+                    defer parsed.deinit();
+                    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", parsed.value.object.get("model_identity").?.string);
+                    try std.testing.expectEqualStrings("embedders/native", parsed.value.object.get("model").?.string);
+                }
+            }
+        }
+    };
+    var group = std.Io.Group.init;
+    var failure: ?anyerror = null;
+    try group.concurrent(io_impl.io(), Fiber.run, .{ a, io_impl.io(), &handler, &failure });
+    defer group.cancel(io_impl.io());
+    try upstream.handleOne();
+    try group.await(io_impl.io());
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+}
+
+test "httpx inference gateway hosted legacy embedding parts produce one result per input" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const input = parsed.value.object.get("input").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), input.len);
+            try std.testing.expect(std.mem.eql(u8, input[0].string, "a") or std.mem.eql(u8, input[0].string, "b"));
+        }
+    };
+    var upstream = try httpx.TestServer.start(a, io_impl.io(), &.{.{ .method = .POST, .path = "/v1/embeddings", .assert_request = Check.request, .respond = .{ .body = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.1,0.2]}]}" } }});
+    defer upstream.deinit();
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    try config.registry.registerEmbedderConfig("hosted", .{ .provider = .openai, .model = "backend", .url = upstream.baseUrl(), .api_key = "test-key", .dimensions = 2 });
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .imported_runtime_io = .{ .api = io_impl.io(), .api_network = io_impl.io() } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const Fiber = struct {
+        fn run(alloc: std.mem.Allocator, test_io: std.Io, h: *AntflyApiHandler, failure: *?anyerror) void {
+            execute(alloc, test_io, h) catch |err| {
+                failure.* = err;
+            };
+        }
+        fn execute(alloc: std.mem.Allocator, test_io: std.Io, h: *AntflyApiHandler) !void {
+            var request = try httpx.Request.init(alloc, .POST, "http://localhost/ai/v1/embeddings");
+            defer request.deinit();
+            request.body = "{\"model\":\"embedders/hosted\",\"input\":[{\"type\":\"text\",\"text\":\"a\"},{\"type\":\"text\",\"text\":\"b\"}]}";
+            var ctx = httpx.Context.init(alloc, test_io, &request);
+            defer ctx.deinit();
+            var response = try h.gatewayRequest(&ctx, .embed);
+            defer response.deinit();
+            if (response.status.code != 200) std.debug.print("hosted embedding response: {s}\n", .{response.body orelse ""});
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body.?, .{});
+            defer parsed.deinit();
+            const data = parsed.value.object.get("data").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), data.len);
+            for (data, 0..) |item, index| try std.testing.expectEqual(@as(i64, @intCast(index)), item.object.get("index").?.integer);
+        }
+    };
+    var group = std.Io.Group.init;
+    var failure: ?anyerror = null;
+    try group.concurrent(io_impl.io(), Fiber.run, .{ a, io_impl.io(), &handler, &failure });
+    defer group.cancel(io_impl.io());
+    for (0..2) |_| try upstream.handleOne();
+    try group.await(io_impl.io());
+    if (failure) |err| return err;
 }

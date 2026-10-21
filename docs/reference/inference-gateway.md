@@ -95,7 +95,9 @@ Generated decision and extraction requests select their generator through
 Antfly generator aliases use the same generator resolution as generation requests;
 the native runtime retains responsibility for constrained-output admission. The
 proxy places these requests using generator inventory and forwards the original
-task URL and envelope.
+task URL and envelope. Route matching, rejection, rate limits, and capability-lease
+authorization continue to use the logical `decide` or `extract` operation, including
+on retries; generator placement does not select generation route policy.
 
 For chunking, a top-level `model` takes precedence over `config.model`; omitting
 both selects `fixed`. The proxy and gateway use the same precedence.
@@ -115,6 +117,15 @@ content and arbitrary provider-specific options are outside this subset.
 Sparse named embedders declare `sparse: true` in the existing embedder config.
 Sparse output cannot request dense dimensions or base64 encoding. Multimodal
 requests retain ordered parts and groups; unsupported modalities fail explicitly.
+Native Antfly embedding aliases preserve the runtime input contract: legacy
+content-part arrays produce one vector per part, while ordered `{content: [...]}`
+objects produce one vector per object. They retain runtime usage, backend, and
+`model_identity` metadata. A caller pin that conflicts with the configured pin
+returns 409 before inference. Matching pins are enforced at the runtime, and a
+successful response with a missing or different identity fails before publication.
+Native remote calls use the same embedding credential source and shared quota
+identity as typed embedding calls. Hosted adapters preserve legacy item count;
+ordered native groups and native identity pins require an Antfly executor.
 Embedding-space/artifact pins and decision method/calibration metadata retain
 meaning. There is no cross-model embedding or decision fallback.
 

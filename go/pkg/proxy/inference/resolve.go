@@ -51,11 +51,20 @@ type ResolveRequest struct {
 // fallback when no configured route matches; route policy takes precedence in
 // both paths.
 type RoutingContext struct {
-	Headers        map[string]string
-	Source         VerifiedSource
-	ExplicitPool   string
-	Timestamp      time.Time
-	pinnedEndpoint *endpointRef
+	Headers           map[string]string
+	Source            VerifiedSource
+	ExplicitPool      string
+	Timestamp         time.Time
+	pinnedEndpoint    *endpointRef
+	endpointOperation OperationType
+}
+
+// placementOperation is internal transport evidence, never a policy selector.
+func (c RoutingContext) placementOperation(logical OperationType) OperationType {
+	if c.endpointOperation != "" {
+		return c.endpointOperation
+	}
+	return logical
 }
 
 func (c RoutingContext) routeRequest(operation OperationType, model string) *RouteRequest {
@@ -98,6 +107,7 @@ type ResolutionLease struct {
 	proxy                         *Proxy
 	model                         string
 	operation                     OperationType
+	endpointOperation             OperationType
 	capabilityToken               string
 	capabilityRevision            string
 	capabilityAuthorizationDigest [sha256.Size]byte
@@ -215,10 +225,11 @@ func (p *Proxy) acquireRequestResolution(ctx context.Context, operation Operatio
 		proxy:                         p,
 		model:                         model,
 		operation:                     operation,
+		endpointOperation:             routing.placementOperation(operation),
 		capabilityToken:               headerValue(routing.Headers, capabilityTokenHeader),
 		capabilityRevision:            headerValue(routing.Headers, capabilityRevisionHeader),
 		capabilityAuthorizationDigest: sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(routing.Headers))),
-		workloadType:                  resolveWorkloadType(operation, routing.Headers),
+		workloadType:                  resolveWorkloadType(routing.placementOperation(operation), routing.Headers),
 		reservation:                   reservation,
 		admission:                     &leaseAdmission{},
 		attempts:                      newLeaseAttempts(),
@@ -274,7 +285,7 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 	if l.Resolution.Route != nil {
 		namespace = l.Resolution.Route.Namespace
 	}
-	reservation, err := l.proxy.router.routeRequestInNamespaceWithin(ctx, l.model, namespace, l.Resolution.Pool, l.workloadType, excluded, allowed, l.operation)
+	reservation, err := l.proxy.router.routeRequestInNamespaceWithin(ctx, l.model, namespace, l.Resolution.Pool, l.workloadType, excluded, allowed, l.endpointOperation)
 	if err != nil {
 		return nil, err
 	}
@@ -289,6 +300,7 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 		proxy:                         l.proxy,
 		model:                         l.model,
 		operation:                     l.operation,
+		endpointOperation:             l.endpointOperation,
 		capabilityToken:               l.capabilityToken,
 		capabilityRevision:            l.capabilityRevision,
 		capabilityAuthorizationDigest: l.capabilityAuthorizationDigest,
@@ -441,7 +453,8 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 	} else {
 		matchedRoute = p.router.RouteManager().matchInstalled(routeReq)
 	}
-	workloadType := resolveWorkloadType(routeReq.Operation, routing.Headers)
+	endpointOperation := routing.placementOperation(routeReq.Operation)
+	workloadType := resolveWorkloadType(endpointOperation, routing.Headers)
 	if matchedRoute != nil {
 		dest, err := p.router.RouteManager().selectDestinationWithin(matchedRoute, routeReq, p.registry, allowed)
 		if err != nil {
@@ -456,7 +469,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 		if dest != nil {
 			endpoint, reservation, resolveErr := p.resolvePoolTarget(
 				ctx, matchedRoute.Namespace, dest.Pool, routeReq, workloadType,
-				routeReq.Operation, reserve, dest, allowed,
+				endpointOperation, reserve, dest, allowed,
 			)
 			if resolveErr == nil {
 				return &Resolution{
@@ -480,7 +493,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 			}
 			endpoint, reservation, resolveErr := p.resolvePoolTarget(
 				ctx, matchedRoute.Namespace, fallbackPool, routeReq, workloadType,
-				routeReq.Operation, reserve, nil, allowed,
+				endpointOperation, reserve, nil, allowed,
 			)
 			if resolveErr != nil {
 				return nil, endpointReservation{}, resolutionError(resolveErr)
@@ -495,7 +508,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 		pool = p.defaultPool.Pool
 	}
 	endpoint, reservation, err := p.resolvePoolTarget(
-		ctx, p.defaultPool.Namespace, pool, routeReq, workloadType, routeReq.Operation, reserve, nil, allowed,
+		ctx, p.defaultPool.Namespace, pool, routeReq, workloadType, endpointOperation, reserve, nil, allowed,
 	)
 	if err != nil {
 		return nil, endpointReservation{}, resolutionError(err)

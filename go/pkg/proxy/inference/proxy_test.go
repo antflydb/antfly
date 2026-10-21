@@ -6242,3 +6242,92 @@ func TestGatewaySelectorsRouteBySelectedModelAndPreserveEnvelope(t *testing.T) {
 		})
 	}
 }
+
+func TestGeneratedTasksRespectLogicalRejectRoute(t *testing.T) {
+	for _, operation := range []string{"decide", "extract"} {
+		t.Run(operation, func(t *testing.T) {
+			p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "default"}, Logger: zap.NewNop()})
+			p.RegisterEndpoint("http://default-runtime", "default", WorkloadTypeGeneral)
+			advertiseModelOperation(p.registry, "http://default-runtime", "generate", "native")
+			_, err := p.Router().RouteManager().UpsertRoute(&Route{Name: "reject-tasks", Operations: map[OperationType]bool{"decide": true, "extract": true}, Fallback: &Fallback{Action: "reject", StatusCode: 403}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			p.registry.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+			})}
+			field := "decision_method"
+			path := "/ai/v1/decisions"
+			if operation == "extract" {
+				field = "method"
+				path = "/ai/v1/extract"
+			}
+			send := func(body string) *httptest.ResponseRecorder {
+				r := httptest.NewRequest("POST", path, strings.NewReader(body))
+				r.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				p.proxyRequest(w, r, operation)
+				return w
+			}
+			control := send(`{"model":"native"}`)
+			if control.Code != 403 {
+				t.Fatalf("control status=%d body=%s", control.Code, control.Body)
+			}
+			generated := send(`{"` + field + `":"generated","generator":{"provider":"antfly","model":"native"}}`)
+			if generated.Code != 403 || calls != 0 {
+				t.Fatalf("task reject bypassed: generated status=%d upstream calls=%d body=%s", generated.Code, calls, generated.Body)
+			}
+		})
+	}
+}
+
+func TestGeneratedTasksKeepRouteAdmissionAndGeneratorPlacementAcrossRetries(t *testing.T) {
+	for _, operation := range []string{"decide", "extract"} {
+		t.Run(operation, func(t *testing.T) {
+			p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "default"}, Logger: zap.NewNop()})
+			for _, address := range []string{"http://selected-a", "http://selected-b"} {
+				p.RegisterEndpoint(address, "task-pool", WorkloadTypeGeneral)
+				advertiseModelOperation(p.registry, address, "generate", "native")
+			}
+			p.RegisterEndpoint("http://default-runtime", "default", WorkloadTypeGeneral)
+			advertiseModelOperation(p.registry, "http://default-runtime", "generate", "native")
+			_, err := p.Router().RouteManager().UpsertRoute(&Route{Name: "task-policy", Operations: map[OperationType]bool{OperationType(operation): true}, Destinations: []Destination{{Pool: "task-pool", Weight: 100}}, RateLimiter: NewRateLimiter(1, 1, false), RetryAttempts: 2, RetryOnStatuses: map[int]bool{503: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			p.registry.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if !strings.HasPrefix(r.URL.Host, "selected-") {
+					t.Fatalf("logical route bypassed: %s", r.URL)
+				}
+				status := 200
+				if calls == 1 {
+					status = 503
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+			})}
+			field, path := "decision_method", "/ai/v1/decisions"
+			if operation == "extract" {
+				field, path = "method", "/ai/v1/extract"
+			}
+			send := func() *httptest.ResponseRecorder {
+				r := httptest.NewRequest("POST", path, strings.NewReader(`{"`+field+`":"generated","generator":{"provider":"antfly","model":"native"}}`))
+				r.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				p.proxyRequest(w, r, operation)
+				return w
+			}
+			first := send()
+			if first.Code != 200 || calls != 2 {
+				t.Fatalf("retry failed: status=%d calls=%d body=%s", first.Code, calls, first.Body)
+			}
+			second := send()
+			if second.Code != 429 || calls != 2 {
+				t.Fatalf("logical rate limit bypassed: status=%d calls=%d body=%s", second.Code, calls, second.Body)
+			}
+		})
+	}
+}

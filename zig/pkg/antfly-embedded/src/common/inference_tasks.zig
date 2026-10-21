@@ -151,6 +151,28 @@ pub const Executor = struct {
         return embedder.denseInterface().embedDenseBatchWithContext(a, "gateway", texts, dims, self.context);
     }
 
+    pub const NativeEmbedding = struct {
+        allocator: std.mem.Allocator,
+        embedder: managed.ManagedEmbedder,
+        controls: managed.ManagedEmbedder.NativeRequestControls,
+
+        pub fn deinit(self: *NativeEmbedding) void {
+            if (self.controls.authorization) |value| self.allocator.free(value);
+            self.embedder.deinit();
+        }
+    };
+
+    pub fn nativeEmbedding(self: Executor, a: std.mem.Allocator, name: []const u8, identity: ?[]const u8) !NativeEmbedding {
+        try self.context.check();
+        var cfg = try self.view.providers.getEmbedderConfig(name);
+        if (cfg.provider != .antfly) return error.UnsupportedEmbeddingProvider;
+        if (identity) |pin| cfg.model_identity = pin;
+        var embedder = try self.initEmbedder(a, cfg);
+        errdefer embedder.deinit();
+        const controls = try embedder.nativeRequestControls(a, "gateway");
+        return .{ .allocator = a, .embedder = embedder, .controls = controls };
+    }
+
     fn initEmbedder(self: Executor, a: std.mem.Allocator, cfg: embeddings.Config) !managed.ManagedEmbedder {
         const config_json = try embeddings.stringifyAlloc(a, cfg);
         defer a.free(config_json);
@@ -454,10 +476,15 @@ pub fn chatMessages(a: std.mem.Allocator, request: Json) ![]generating.ChatMessa
 }
 
 pub fn embeddingParts(a: std.mem.Allocator, input: Json) ![]@import("antfly_template_content").ContentPart {
-    if (input != .array or input.array.items.len == 0) return error.InvalidInferenceRequest;
+    const values: []const Json = switch (input) {
+        .array => input.array.items,
+        .object => &.{input},
+        else => return error.InvalidInferenceRequest,
+    };
+    if (values.len == 0) return error.InvalidInferenceRequest;
     const Part = @import("antfly_template_content").ContentPart;
-    const parts = try a.alloc(Part, input.array.items.len);
-    for (input.array.items, parts) |value, *part| {
+    const parts = try a.alloc(Part, values.len);
+    for (values, parts) |value, *part| {
         if (value != .object) return error.InvalidInferenceRequest;
         const kind = value.object.get("type") orelse return error.InvalidInferenceRequest;
         if (kind != .string) return error.InvalidInferenceRequest;

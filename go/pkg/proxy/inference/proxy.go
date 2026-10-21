@@ -4820,13 +4820,12 @@ func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	selectionOperation := OperationType(operation)
 	if generatedProxyRequest(routingPayload, operation) {
-		// Placement follows the generator inventory; the original task URL and
-		// body remain unchanged during forwarding.
-		selectionOperation = "generate"
+		// Endpoint capability differs from the logical task. Route policy and
+		// admission must still see decide/extract.
+		routing.endpointOperation = "generate"
 	}
-	lease, err := p.acquireRequestResolution(r.Context(), selectionOperation, model, routing)
+	lease, err := p.acquireRequestResolution(r.Context(), OperationType(operation), model, routing)
 	if err != nil {
 		if writeResolutionError(w, err) {
 			return

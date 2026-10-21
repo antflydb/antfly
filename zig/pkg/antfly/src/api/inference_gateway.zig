@@ -69,6 +69,8 @@ const ExecutionOptions = struct {
     attempt_limit: u8 = 8,
     operation: ?[]const u8 = null,
     attachments: ?[]const httpx.attachment_envelope.Attachment = null,
+    authorization: ?[]const u8 = null,
+    attempt_observer: ?httpx.AttemptObserver = null,
 };
 
 pub fn session(server: anytype, ctx: *httpx.Context, principal: []const u8, method: @import("antfly_runtime_abi").http_abi.HttpMethod, action: []const u8) !httpx.Response {
@@ -497,6 +499,10 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             return forward(server, ctx, try std.fmt.allocPrint(a, "transcribers/{s}", .{target.configured.name}), operation, encoded, false, observation, execution_options);
         }
     }
+    if (task == .embed) {
+        const cfg = try named.providers.getEmbedderConfig(target.configured.name);
+        if (cfg.provider == .antfly) return executeNativeEmbedding(server, ctx, a, request, named, target.configured.name, observation, execution_options);
+    }
     if (task == .generate and execution_options.attachments != null) {
         var cfg = generator_override orelse try named.providers.getGeneratorConfig(target.configured.name);
         if (cfg.provider == .antfly) {
@@ -518,26 +524,9 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
     const caller_owns_admission = if (generator_override) |cfg| !(cfg.provider == .antfly and cfg.url.len == 0 and server.antfly_provider != null and server.antfly_provider.?.owns_invocation_admission) else !try ownsLocalAdmission(server, named, target.configured.task, target.configured.name);
     if (caller_owns_admission and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
     defer if (caller_owns_admission) server.releaseInference();
-    const cancellation = httpx.CancellationToken.fromCallback(ctx, struct {
-        fn cancelled(raw: *const anyopaque) bool {
-            const context: *const httpx.Context = @ptrCast(@alignCast(raw));
-            return context.isCancellationRequested();
-        }
-    }.cancelled);
-    const deadline = @min(@import("connections.zig").inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64));
     var client = httpx.Client.initWithConfig(a, server.inferenceIo(), .{ .keep_alive = false });
     defer client.deinit();
-    const executor = tasks.Executor{
-        .view = named,
-        .generator_override = generator_override,
-        .http = &client,
-        .context = .{ .io = server.inferenceIo(), .deadline_ns = deadline, .cancellation = if (cancellation) |v| @as(@import("antfly_cancellation").CancellationToken, .{ .ptr = v.ptr, .is_cancelled_fn = v.is_cancelled_fn }) else null },
-        .antfly_provider = server.antfly_provider,
-        .inference_api_url = server.cfg.node_config.?.inference.api_url,
-        .inference_api_key = server.cfg.inference_api_key orelse server.cfg.node_config.?.inference.api_key,
-        .secret_store = server.cfg.secret_store,
-        .provider_runtime = &server.embedding_provider_runtime,
-    };
+    const executor = executorFor(server, ctx, &client, named, generator_override);
     const name = target.configured.name;
     switch (task) {
         .generate => {
@@ -603,7 +592,8 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             return ctx.json(result);
         },
         .embed => {
-            try only(request, &.{ "model", "input", "dimensions", "encoding_format" });
+            try only(request, &.{ "model", "input", "dimensions", "encoding_format", "model_identity" });
+            if (request.object.contains("model_identity")) return error.UnsupportedInferenceFeature;
             const encoding = if (request.object.get("encoding_format")) |v| try string(v) else "float";
             if (!std.mem.eql(u8, encoding, "float") and !std.mem.eql(u8, encoding, "base64")) return error.UnsupportedInferenceFeature;
             const input = request.object.get("input") orelse return error.InvalidInferenceRequest;
@@ -611,11 +601,10 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             const cfg = try named.providers.getEmbedderConfig(name);
             if (input == .array and input.array.items.len > 0 and input.array.items[0] != .string) {
                 if (!std.mem.eql(u8, encoding, "float")) return error.UnsupportedInferenceFeature;
-                const grouped = input.array.items[0] == .array;
-                const count: usize = if (grouped) input.array.items.len else 1;
+                const count = input.array.items.len;
                 const Item = struct { object: []const u8 = "embedding", index: usize, embedding: []const f32 };
                 const data = try a.alloc(Item, count);
-                for (data, 0..) |*item, index| item.* = .{ .index = index, .embedding = try executor.embedParts(a, name, try tasks.embeddingParts(a, if (grouped) input.array.items[index] else input), dimensions) };
+                for (data, 0..) |*item, index| item.* = .{ .index = index, .embedding = try executor.embedParts(a, name, try tasks.embeddingParts(a, input.array.items[index]), dimensions) };
                 return ctx.json(.{ .object = "list", .model = model, .data = data });
             }
             const texts: []const []const u8 = switch (input) {
@@ -772,6 +761,99 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         },
         else => return error.UnsupportedInferenceFeature,
     }
+}
+
+fn executorFor(server: anytype, ctx: *httpx.Context, client: *httpx.Client, named: gateway.View, generator_override: ?generating.GeneratorConfig) tasks.Executor {
+    const cancellation = httpx.CancellationToken.fromCallback(ctx, struct {
+        fn cancelled(raw: *const anyopaque) bool {
+            const context: *const httpx.Context = @ptrCast(@alignCast(raw));
+            return context.isCancellationRequested();
+        }
+    }.cancelled);
+    const deadline = @min(@import("connections.zig").inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64));
+    return .{
+        .view = named,
+        .generator_override = generator_override,
+        .http = client,
+        .context = .{ .io = server.inferenceIo(), .deadline_ns = deadline, .cancellation = if (cancellation) |v| @as(@import("antfly_cancellation").CancellationToken, .{ .ptr = v.ptr, .is_cancelled_fn = v.is_cancelled_fn }) else null },
+        .antfly_provider = server.antfly_provider,
+        .inference_api_url = server.cfg.node_config.?.inference.api_url,
+        .inference_api_key = server.cfg.inference_api_key orelse server.cfg.node_config.?.inference.api_key,
+        .secret_store = server.cfg.secret_store,
+        .provider_runtime = &server.embedding_provider_runtime,
+    };
+}
+
+fn embeddingIdentity(cfg: @import("antfly_embeddings").Config, request: Json) !?[]const u8 {
+    const supplied = request.object.get("model_identity");
+    const pin = if (supplied) |value| try string(value) else if (cfg.model_identity.len > 0) cfg.model_identity else return null;
+    if (pin.len != 64) return error.InvalidModelIdentity;
+    for (pin) |byte| if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return error.InvalidModelIdentity;
+    if (cfg.model_identity.len > 0 and !std.mem.eql(u8, cfg.model_identity, pin)) return error.EmbeddingIdentityMismatch;
+    return pin;
+}
+
+fn executeNativeEmbedding(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, request: Json, named: gateway.View, name: []const u8, observation: *tasks.Observation, options: ExecutionOptions) !httpx.Response {
+    const cfg = try named.providers.getEmbedderConfig(name);
+    const requested = try string(request.object.get("model").?);
+    const identity = try embeddingIdentity(cfg, request);
+    const encoding = if (request.object.get("encoding_format")) |value| try string(value) else "float";
+    const encoded_vectors = std.mem.eql(u8, encoding, "base64");
+    if ((!encoded_vectors and !std.mem.eql(u8, encoding, "float")) or (encoded_vectors and (cfg.sparse orelse false))) return error.UnsupportedInferenceFeature;
+    var adapted = request;
+    if (encoded_vectors) try adapted.object.put(a, "encoding_format", .{ .string = "float" });
+    try adapted.object.put(a, "model", .{ .string = cfg.model });
+    if (identity) |pin| try adapted.object.put(a, "model_identity", .{ .string = pin });
+    if (!adapted.object.contains("dimensions")) if (cfg.dimensions orelse cfg.dimension) |dimensions| {
+        try adapted.object.put(a, "dimensions", .{ .integer = dimensions });
+    };
+    if (!adapted.object.contains("task_type") and cfg.input_type.len > 0) try adapted.object.put(a, "task_type", .{ .string = cfg.input_type });
+    const body = try std.json.Stringify.valueAlloc(a, adapted, .{});
+    // Embeddings are completed responses. Verify pins and retain native
+    // metadata before publishing anything to the caller.
+    var execution = options;
+    execution.response_delivery = .buffered;
+    var response: httpx.Response = undefined;
+    if (cfg.url.len == 0 and server.cfg.local_inference_connection_target != null) {
+        if ((try sources.common_provider_limits.Policy.fromConfig(cfg.rate_limit)).enabled()) return error.UnsupportedLocalRateLimit;
+        response = try forward(server, ctx, sources.common_config.local_inference_connection_id, options.operation orelse "embeddings", body, false, observation, execution);
+    } else {
+        var client = httpx.Client.initWithConfig(a, server.inferenceIo(), .{ .keep_alive = false });
+        defer client.deinit();
+        const executor = executorFor(server, ctx, &client, named, null);
+        var binding = try executor.nativeEmbedding(a, name, identity);
+        defer binding.deinit();
+        execution.authorization = binding.controls.authorization;
+        execution.attempt_observer = binding.controls.attempt_observer;
+        response = try forwardEndpoint(server, ctx, binding.controls.endpoint, null, options.operation orelse "embeddings", body, false, observation, execution);
+    }
+    if (response.status.code < 200 or response.status.code >= 300) return response;
+    defer response.deinit();
+    ctx.response.headers.deinit();
+    ctx.response.headers = response.headers;
+    response.headers = httpx.Headers.init(ctx.allocator);
+    var value = std.json.parseFromSliceLeaky(Json, a, response.body orelse return error.InvalidInferenceResponse, .{}) catch return error.InvalidInferenceResponse;
+    if (value != .object) return error.InvalidInferenceResponse;
+    const data = value.object.get("data") orelse return error.InvalidInferenceResponse;
+    if (data != .array) return error.InvalidInferenceResponse;
+    if (identity) |pin| {
+        const actual = value.object.get("model_identity") orelse return error.InvalidInferenceResponse;
+        if (actual != .string or !std.mem.eql(u8, actual.string, pin)) return error.InvalidInferenceResponse;
+    }
+    if (encoded_vectors) for (data.array.items) |*item| {
+        if (item.* != .object) return error.InvalidInferenceResponse;
+        const vector = item.object.getPtr("embedding") orelse return error.InvalidInferenceResponse;
+        if (vector.* != .array) return error.UnsupportedInferenceFeature;
+        const bytes = try a.alloc(u8, vector.array.items.len * @sizeOf(f32));
+        for (vector.array.items, 0..) |element, index| {
+            const scalar: f32 = @floatCast(number(element) catch return error.InvalidInferenceResponse);
+            if (!std.math.isFinite(scalar)) return error.InvalidInferenceResponse;
+            std.mem.writeInt(u32, bytes[index * 4 ..][0..4], @bitCast(scalar), .little);
+        }
+        vector.* = .{ .string = try payloads.base64(a, bytes) };
+    };
+    try value.object.put(a, "model", .{ .string = requested });
+    return ctx.json(value);
 }
 
 fn executeVendorConnection(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, request: Json, original: gateway.View, target: gateway.Target, connection: sources.common_config.Config.ConnectionConfig, fallback: bool, observation: *tasks.Observation, execution_options: ExecutionOptions) !httpx.Response {
@@ -1316,7 +1398,7 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     defer if (options.attachments != null) ctx.allocator.free(encoded);
     var client = httpx.Client.initWithConfig(ctx.allocator, server.inferenceIo(), .{ .keep_alive = false });
     defer client.deinit();
-    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, @min(connections.inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64)), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json" }) catch |err| {
+    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, @min(connections.inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64)), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json", .attempt_observer = options.attempt_observer }) catch |err| {
         if (transport.started or guard.committed) return error.InferenceResponseCommitted;
         return guard.failure orelse err;
     };
@@ -1344,8 +1426,9 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
     defer a.free(url);
     const resolved = if (api_key) |value| try sources.common_secrets.resolveReferenceOwned(a, server.cfg.secret_store, value) else null;
     defer if (resolved) |value| a.free(value);
-    const authorization = if (resolved) |value| try std.fmt.allocPrint(a, "Bearer {s}", .{value}) else null;
-    defer if (authorization) |value| a.free(value);
+    const owned_authorization = if (resolved) |value| try std.fmt.allocPrint(a, "Bearer {s}", .{value}) else null;
+    defer if (owned_authorization) |value| a.free(value);
+    const authorization = execution_options.authorization orelse owned_authorization;
     const cancellation = httpx.CancellationToken.fromCallback(ctx, struct {
         fn cancelled(raw: *const anyopaque) bool {
             const context: *const httpx.Context = @ptrCast(@alignCast(raw));
@@ -1365,6 +1448,7 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
     try headers.append(a, .{ "Content-Type", if (execution_options.attachments != null) httpx.attachment_envelope.content_type else "application/json" });
     const options = httpx.RequestOptions{
         .body = encoded,
+        .attempt_observer = execution_options.attempt_observer,
         .headers = headers.items,
         .timeout_ms = timeout_ms,
         .cancellation = cancellation,
@@ -1374,7 +1458,7 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
     };
     const parsed = try std.json.parseFromSlice(Json, a, body, .{});
     defer parsed.deinit();
-    const streaming = if (parsed.value.object.get("stream")) |value| value == .bool and value.bool else false;
+    const streaming = execution_options.response_delivery != .buffered and (if (parsed.value.object.get("stream")) |value| value == .bool and value.bool else false);
     if (streaming) {
         var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = ctx };
         var guard = tasks.FallbackSink{ .downstream = observation.stream(transport.stream()) };
