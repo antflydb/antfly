@@ -352,6 +352,10 @@ class DecisionHandler(BaseHTTPRequestHandler):
             (self.path, self.headers.get("Authorization"), body)
         )
         self.server.client_ports.append(self.client_address[1])
+        single = "input" in body
+        if single:
+            assert "inputs" not in body and "context_version" not in body
+            body = {**body, "inputs": [{"id": "single", "input": body["input"]}]}
         if body.get("context_version") == 1:
             body = json.loads(json.dumps(body))
             for item in body["inputs"]:
@@ -375,23 +379,6 @@ class DecisionHandler(BaseHTTPRequestHandler):
                 return
         if self.server.mode == "prefetch" and len(self.server.requests) == 1:
             self.server.prefetch_seen = self.server.index_next.wait(2)
-        if "state" in body:
-            encoded = json.dumps(
-                {
-                    "answers": {
-                        key: {
-                            "type": "noul",
-                            "noul": 0.9 if "STOP" in body["state"] else 0.1,
-                        }
-                        for key in body["questions"]
-                    }
-                }
-            ).encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(encoded)))
-            self.end_headers()
-            self.wfile.write(encoded)
-            return
         if getattr(self.server, "hold_directory", False) and any(
             item["id"] == "directory" and "blocked" in item["input"]
             for item in body.get("inputs", [])
@@ -490,12 +477,27 @@ class DecisionHandler(BaseHTTPRequestHandler):
             data[0]["answers"][0]["probability"] = 1.1
         if getattr(self.server, "after_decision", None):
             self.server.after_decision()
-        encoded = json.dumps(
-            {
-                "data": list(reversed(data)),
-                "usage": {"input_tokens": 10, "output_tokens": 2},
+        if single:
+            for answer in data[0]["answers"]:
+                if answer.get("decision_method") == "typed":
+                    answer.pop("decision_method", None)
+        if self.server.mode == "refusal":
+            data[0]["answers"][0] = {
+                "name": "relevant",
+                "type": "refusal",
+                "refusal": "fixture",
             }
-        ).encode()
+        if self.server.mode == "abstained":
+            data[0]["answers"][0]["abstained"] = True
+        if self.server.mode == "duplicate_question":
+            data[0]["answers"].append(data[0]["answers"][0])
+        response = (
+            {"answers": data[0]["answers"]}
+            if single
+            else {"data": list(reversed(data))}
+        )
+        response["usage"] = {"input_tokens": 10, "output_tokens": 2}
+        encoded = json.dumps(response).encode()
         if getattr(self.server, "measure_provider_work", False):
             # Account decision work before exposing the completed response.
             # Otherwise a client can read the body and release its lane before
@@ -3188,10 +3190,9 @@ class CliTests(unittest.TestCase):
             "fixture",
             "--base-url",
             f"http://127.0.0.1:{self.server.server_port}/decisions",
-            "--stdin",
-            input=b"owned-secret\n",
         )
         self.assertNotIn(b"owned-secret", result.stdout + result.stderr)
+        self.env["ANTFLY_API_KEY"] = "owned-secret"
         result = self.raw_cli("doctor")
         self.assertIn(b"valid response", result.stdout)
         self.assertEqual(self.server.requests[-1][1], "Bearer owned-secret")
@@ -3208,7 +3209,6 @@ class CliTests(unittest.TestCase):
             "fixture",
             "--endpoint",
             f"http://127.0.0.1:{self.server.server_port}/decisions",
-            "--stdin",
             "--decision-context",
             "shared-v1",
             "--decision-concurrency",
@@ -3258,7 +3258,6 @@ class CliTests(unittest.TestCase):
                 "auth",
                 "--provider",
                 "antfly",
-                "--stdin",
                 flag,
                 value,
                 input=b"fixture\n",
@@ -3266,43 +3265,23 @@ class CliTests(unittest.TestCase):
             )
 
     def test_provider_presets_custom_routes_and_credentials(self):
-        presets = {
-            "typesafe": ("https://api.typesafe.ai/v1/systemone", "jev-1.13.0"),
-            "vercel": (
-                "https://ai-gateway.vercel.sh/typesafe/v1/systemone",
-                "typesafe-ai/jev",
-            ),
-            "openrouter": (
-                "https://openrouter.ai/api/v1/systemone",
-                "typesafe/jev-1.13",
-            ),
-            "opencode": ("https://opencode.ai/zen/v1/systemone", "jev-1.13"),
-        }
         credentials = self.root / "config/antfly-grep/credentials.json"
-        for provider, (endpoint, model) in presets.items():
-            with self.subTest(provider=provider):
-                result = self.raw_cli(
-                    "auth", "--provider", provider, "--stdin", input=b"fixture-secret\n"
-                )
-                self.assertNotIn(b"fixture-secret", result.stdout + result.stderr)
-                data = json.loads(credentials.read_text())
-                self.assertEqual((data["endpoint"], data["model"]), (endpoint, model))
-                if os.name != "nt":
-                    self.assertEqual(credentials.stat().st_mode & 0o777, 0o600)
+        self.raw_cli("auth", "--provider", "openai")
+        data = json.loads(credentials.read_text())
+        self.assertEqual(data["endpoint"], "https://api.openai.com/v1/decisions")
+        self.assertEqual(data["model"], "gpt-6-luna")
+        self.assertNotIn("token", data)
+        if os.name != "nt":
+            self.assertEqual(credentials.stat().st_mode & 0o777, 0o600)
         endpoint = f"http://127.0.0.1:{self.server.server_port}/v1"
         self.raw_cli(
-            "auth",
-            "--provider",
-            "custom",
-            "--base-url",
-            endpoint,
-            "--model",
-            "fixture",
-            "--stdin",
-            input=b"fixture-secret\n",
+            "auth", "--provider", "custom", "--base-url", endpoint, "--model", "fixture"
         )
+        self.env["OPENAI_API_KEY"] = "wrong-provider-secret"
+        self.env["ANTFLY_API_KEY"] = "wrong-antfly-secret"
         self.raw_cli("doctor")
-        self.assertEqual(self.server.requests[-1][0], "/v1/systemone")
+        self.assertEqual(self.server.requests[-1][:2], ("/v1/decisions", None))
+        self.assertIn("input", self.server.requests[-1][2])
         for endpoint in [
             "http://example.com/v1",
             "https://user:secret@example.com",
@@ -3316,54 +3295,41 @@ class CliTests(unittest.TestCase):
                 endpoint,
                 "--model",
                 "fixture",
-                "--stdin",
-                input=b"fixture-secret\n",
                 code=2,
             )
+        for provider in ["typesafe", "vercel", "openrouter", "opencode"]:
+            result = self.raw_cli("auth", "--provider", provider, code=2)
+            self.assertIn(b"JevRequiresAntflyGateway", result.stderr)
+        result = self.raw_cli(
+            "auth",
+            "--provider",
+            "openai",
+            "--stdin",
+            input=b"never-persist-this",
+            code=2,
+        )
+        self.assertIn(b"UseEnvironmentCredential", result.stderr)
+        self.assertNotIn("never-persist-this", credentials.read_text())
 
-    @unittest.skipIf(os.name == "nt", "POSIX terminal echo contract")
-    def test_interactive_auth_restores_echo_on_success_and_signal(self):
-        import pty
-        import signal
-        import termios
-
-        for interrupt in [False, True]:
-            with self.subTest(interrupt=interrupt):
-                master, slave = pty.openpty()
-                original = termios.tcgetattr(slave)
-                proc = subprocess.Popen(
-                    [BINARY, "auth", "--provider", "typesafe"],
-                    cwd=self.root,
-                    env=self.env,
-                    stdin=slave,
-                    stdout=slave,
-                    stderr=slave,
-                )
-                transcript = b""
-                try:
-                    deadline = time.monotonic() + 10
-                    while (
-                        b"(hidden): " not in transcript and time.monotonic() < deadline
-                    ):
-                        if select.select([master], [], [], 0.1)[0]:
-                            transcript += os.read(master, 4096)
-                    self.assertIn(b"(hidden): ", transcript)
-                    self.assertFalse(termios.tcgetattr(slave)[3] & termios.ECHO)
-                    if interrupt:
-                        proc.send_signal(signal.SIGINT)
-                    else:
-                        os.write(master, b"never-echo-this-secret\n")
-                    self.assertEqual(proc.wait(timeout=10), 130 if interrupt else 0)
-                    while select.select([master], [], [], 0)[0]:
-                        transcript += os.read(master, 4096)
-                    self.assertNotIn(b"never-echo-this-secret", transcript)
-                    self.assertEqual(termios.tcgetattr(slave), original)
-                finally:
-                    if proc.poll() is None:
-                        proc.kill()
-                        proc.wait()
-                    os.close(master)
-                    os.close(slave)
+    def test_destination_override_clears_legacy_saved_credentials(self):
+        credentials = self.root / "config/antfly-grep/credentials.json"
+        credentials.parent.mkdir(parents=True)
+        credentials.write_text(
+            json.dumps(
+                {
+                    "provider": "antfly",
+                    "endpoint": "https://old.example/decisions",
+                    "model": "fixture",
+                    "token": "old-secret",
+                }
+            )
+        )
+        self.raw_cli(
+            "doctor",
+            "--endpoint",
+            f"http://127.0.0.1:{self.server.server_port}/decisions",
+        )
+        self.assertIsNone(self.server.requests[-1][1])
 
     @unittest.skipUnless(shutil.which("rg"), "optional ripgrep differential oracle")
     def test_buffered_regex_proof_preserves_boundaries_and_late_binary(self):
@@ -3477,12 +3443,12 @@ class CliTests(unittest.TestCase):
         ]
         self.assertEqual(sum(len(b["inputs"]) for b in refined), 3)
 
-    def test_typesafe_refinement_shares_context_and_retains_all_targets(self):
+    def test_shared_refinement_retains_all_targets(self):
         self.write("a.txt", "STOP one\nnoise\nSTOP two\nnoise\n")
         self.raw_cli(
             *self.decision_args(),
-            "--backend",
-            "typesafe",
+            "--decision-context",
+            "shared-v1",
             "--no-cache",
             "--refine",
             "--chunk-lines",
@@ -3495,21 +3461,18 @@ class CliTests(unittest.TestCase):
         refined = [
             body
             for _, _, body in self.server.requests
-            if "BEGIN SHARED CONTEXT" in body.get("state", "")
+            if "contexts" in body and len(body["inputs"]) == 4
         ]
         self.assertEqual(len(refined), 1)
-        state = refined[0]["state"]
-        self.assertEqual(state.count("BEGIN SHARED CONTEXT"), 2)
-        self.assertEqual(state.count("CONTEXT region lines"), 2)
-        self.assertEqual(state.count("BEGIN TARGET INPUT"), 4)
-        self.assertEqual(len(refined[0]["questions"]), 4)
+        self.assertEqual(len(refined[0]["contexts"]), 2)
+        self.assertEqual(len(refined[0]["questions"]), 1)
 
-    def test_typesafe_protocol_shares_multiquery_source(self):
+    def test_decisions_single_shares_multiquery_source(self):
         self.write("a", "STOP\n")
         self.raw_cli(
             *self.decision_args(),
-            "--backend",
-            "typesafe",
+            "--decision-transport",
+            "single",
             "--query",
             "second question",
             "--no-cache",
@@ -3519,9 +3482,126 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(len(self.server.requests), 1)
         body = self.server.requests[0][2]
-        self.assertIn("state", body)
+        self.assertIn("input", body)
         self.assertEqual(len(body["questions"]), 2)
-        self.assertEqual(body["state"].count("TARGET 1: STOP"), 1)
+        self.assertEqual(body["input"].count("TARGET 1: STOP"), 1)
+
+    def test_decisions_single_bounded_concurrency_and_cache(self):
+        self.write("a", "STOP\n" * 16)
+        self.server.delay = 0.02
+        args = [
+            *self.decision_args(),
+            "--decision-transport",
+            "single",
+            "--unit",
+            "line",
+            "--decision-concurrency",
+            "2",
+            "-j4",
+            "a",
+        ]
+        self.raw_cli(*args)
+        self.assertEqual(len(self.server.requests), 16)
+        self.assertLessEqual(self.server.peak, 2)
+        self.assertTrue(
+            all("inputs" not in body for _, _, body in self.server.requests)
+        )
+        self.server.requests.clear()
+        self.raw_cli(*args)
+        self.assertEqual(self.server.requests, [])
+
+    def test_common_decisions_retries_respect_actual_request_budget(self):
+        self.write("a", "STOP\n")
+        for budget, expected in [(1, 2), (2, 0)]:
+            with self.subTest(budget=budget):
+                self.server.requests.clear()
+                self.server.mode = "transient"
+                self.raw_cli(
+                    *self.decision_args(),
+                    "--decision-transport",
+                    "single",
+                    "--no-cache",
+                    "--max-requests",
+                    str(budget),
+                    "a",
+                    code=expected,
+                )
+                self.assertEqual(len(self.server.requests), budget)
+
+    def test_provider_defaults_do_not_depend_on_option_order(self):
+        self.write("a", "STOP\n")
+        endpoint = f"http://127.0.0.1:{self.server.server_port}/decisions"
+        flags = [
+            "--endpoint",
+            endpoint,
+            "--model",
+            "fixture",
+            "--decision-transport",
+            "antfly-batch",
+            "--decision-context",
+            "shared-v1",
+        ]
+        for before in [True, False]:
+            self.raw_cli(
+                "--ask",
+                "retry",
+                "--no-cache",
+                *(
+                    ["--provider", "custom", *flags]
+                    if before
+                    else [*flags, "--provider", "custom"]
+                ),
+                "a",
+            )
+            body = self.server.requests[-1][2]
+            self.assertEqual(body["model"], "fixture")
+            self.assertEqual(body["context_version"], 1)
+
+    def test_common_decisions_question_limit_is_explicit(self):
+        self.write("a", "STOP\n")
+        questions = [arg for i in range(63) for arg in ["--query", f"question-{i}"]]
+        args = [
+            *self.decision_args(),
+            "--decision-transport",
+            "single",
+            "--no-cache",
+            *questions,
+        ]
+        self.raw_cli(*args, "a")
+        self.assertEqual(len(self.server.requests[-1][2]["questions"]), 64)
+        before = len(self.server.requests)
+        result = self.raw_cli(*args, "--query", "one-too-many", "a", code=2)
+        self.assertIn(b"TooManyDecisionQuestions", result.stderr)
+        self.assertEqual(len(self.server.requests), before)
+
+    def test_decisions_incomplete_evidence_is_never_cached_as_negative(self):
+        self.write("a", "STOP\n")
+        for transport in ["single", "antfly-batch"]:
+            for mode in [
+                "refusal",
+                "abstained",
+                "similarity",
+                "out_of_range",
+                "duplicate_question",
+            ]:
+                with self.subTest(transport=transport, mode=mode):
+                    args = [
+                        *self.decision_args(),
+                        "--model",
+                        f"fixture-{mode}-{transport}",
+                        "--decision-transport",
+                        transport,
+                        "a",
+                    ]
+                    self.server.mode = mode
+                    self.raw_cli(*args, code=2)
+                    self.server.mode = "normal"
+                    before = len(self.server.requests)
+                    self.raw_cli(*args)
+                    self.assertGreater(len(self.server.requests), before)
+                    self.server.requests.clear()
+                    self.raw_cli(*args)
+                    self.assertEqual(self.server.requests, [])
 
     @unittest.skipUnless(shutil.which("rg"), "optional byte-folding oracle")
     def test_byte_mode_folds_ascii_only(self):
@@ -5731,17 +5811,19 @@ class CliTests(unittest.TestCase):
         directory = self.root / "scores"
         for path in directory.iterdir():
             path.unlink()
-        # Published v5 key framing and scalar format remain readable by v6.
+        # Legacy scalar storage remains readable under the current transport-bound
+        # transcript. The separate incomplete-subdivision test rejects v5 keys.
         legacy = []
         for _, _, body in requests:
             for item in body["inputs"]:
                 digest = hashlib.sha256()
                 parts = [
-                    b"antfly-grep-decisions-v5",
+                    b"antfly-grep-decisions-v6",
                     self.decision_args()[-1].encode(),
                     b"fixture",
                     b"",
                     b"http",
+                    b"antfly_batch",
                     b"",
                     b"",
                     b"find retry enforcement",

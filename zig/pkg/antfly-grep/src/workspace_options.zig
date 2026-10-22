@@ -20,7 +20,7 @@ pub fn prepare(a: std.mem.Allocator, base: *const Options, args: []const []const
     errdefer o.deinit(a);
     // Provider identity and credentials remain process-owned. Requests may
     // choose a query/model but never mutate the captured discovery contract.
-    inline for (.{ "typesafe_api_key", "endpoint", "model", "token", "backend", "decision_context", "models_dir", "library_path", "provider_name", "cache_dir", "cache_ttl_seconds", "model_revision", "jobs", "jobs_auto", "decision_concurrency", "batch_size", "decision_batch_wait_ms", "no_cache", "retries", "retry_base_ms", "timeout_ms", "home", "global_ignore", "git_config", "temporary_dir", "hostname" }) |name| @field(o, name) = @field(base.*, name);
+    inline for (.{ "openai_api_key", "antfly_api_key", "explicit_token", "decision_transport", "endpoint", "model", "token", "backend", "decision_context", "models_dir", "library_path", "provider_name", "cache_dir", "cache_ttl_seconds", "model_revision", "jobs", "jobs_auto", "decision_concurrency", "batch_size", "decision_batch_wait_ms", "no_cache", "retries", "retry_base_ms", "timeout_ms", "home", "global_ignore", "git_config", "temporary_dir", "hostname" }) |name| @field(o, name) = @field(base.*, name);
     if (base.jobs_auto) {
         o.jobs = 0;
         o.jobs_auto = false;

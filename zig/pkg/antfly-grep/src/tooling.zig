@@ -19,8 +19,9 @@ const values = [_]ValueSpec{
     .{ .name = "--max-requests", .choices = "unlimited" },
     .{ .name = "--engine", .choices = "default auto pcre2" },
     .{ .name = "--decision-context", .choices = "legacy shared-v1" },
-    .{ .name = "--backend", .choices = "http antfly typesafe local" },
-    .{ .name = "--provider", .choices = "antfly typesafe vercel openrouter opencode local custom" },
+    .{ .name = "--decision-transport", .choices = "single antfly-batch" },
+    .{ .name = "--backend", .choices = "http antfly local" },
+    .{ .name = "--provider", .choices = "antfly openai local custom" },
     .{ .name = "--agent", .choices = "codex claude-code opencode" },
     .{ .name = "--color", .choices = "auto always never ansi" },
     .{ .name = "--sort", .choices = "none path modified accessed created" },
@@ -89,7 +90,7 @@ pub fn generate(a: std.mem.Allocator, kind: []const u8, help: []const u8) ![]u8 
         };
         if (!duplicate) try names.append(a, name);
     }
-    for ([_][]const u8{ "--provider", "--agent", "--stdin", "--global", "--yes" }) |extra| try names.append(a, extra);
+    for ([_][]const u8{ "--agent", "--stdin", "--global", "--yes" }) |extra| try names.append(a, extra);
     std.mem.sort([]const u8, names.items, {}, struct {
         fn less(_: void, x: []const u8, y: []const u8) bool {
             return std.mem.order(u8, x, y) == .lt;

@@ -254,26 +254,59 @@ pipes terminate work. JSON emits per-file `begin`, `match`/`context`, `end`, and
 final `summary` records, with ripgrep-shaped `data` and Antfly extensions for
 probabilities and completion/request statistics. Invalid UTF-8 uses base64.
 
-Configure an Antfly decision endpoint or the TypeSafe provider explicitly:
+Decision search uses the OpenAI Decisions named-question contract, without a
+provider SDK or private Jev wire adapter:
 
 ```sh
-printf '%s' "$ANTFLY_GREP_TOKEN" | antfly-grep auth --provider antfly \
-  --endpoint http://127.0.0.1:8090/decisions --model MODEL --stdin
-printf '%s' "$TYPESAFE_API_KEY" | antfly-grep auth --provider typesafe --stdin
+export OPENAI_API_KEY=...  # inherited only by the canonical OpenAI destination
+antfly-grep ask 'Where are retries bounded?' --provider openai ./src
+# Antfly gateway routes to a configured decider (including provider: jev).
+export ANTFLY_API_KEY=...
+antfly-grep auth --provider antfly --base-url http://localhost:8080/ai/v1 \
+  --model deciders/triage
 antfly-grep doctor
 antfly-grep skill --agent codex
 ```
 
-Running `antfly-grep auth` in a terminal prompts for a provider, any required
-endpoint/model, and a hidden token. Presets include Antfly, TypeSafe, Vercel AI
-Gateway, OpenRouter, OpenCode Zen, local inference, and custom TypeSafe gateways.
-Custom gateways require HTTPS or loopback HTTP. Configuration is written atomically
-with owner-only permissions on POSIX. Terminal echo is restored after entry and
-on POSIX SIGINT/SIGTERM. Shell completions include value choices, file types,
-option arity, paths, and setup commands.
-`doctor` uses a synthetic request. Agent installation supports Codex, Claude,
-and OpenCode; `--global` chooses the home directory. Model inference can also
-use the monorepo native library described above. No model is downloaded implicitly.
+`--provider openai` defaults to `https://api.openai.com/v1/decisions` and
+`gpt-6-luna`; pass `--model` to choose a supported Decisions model explicitly.
+`ANTFLY_GREP_PROVIDER`, `ANTFLY_GREP_ENDPOINT`, and `ANTFLY_GREP_MODEL` configure
+nonsecret defaults. Explicit endpoint, model, and transport options override
+provider defaults regardless of argument order. A custom Decisions service uses `--provider custom --endpoint
+URL --model MODEL`; its key comes from `ANTFLY_GREP_TOKEN`. That explicitly
+supplied key is bound to the selected destination. OpenAI environment keys are
+never sent to custom endpoints; Antfly keys apply only to the Antfly profile.
+Changing a saved endpoint or provider clears its saved token. Redirects are
+not followed. HTTPS or loopback HTTP is required.
+
+The baseline sends one `input` with multiple questions. Requests share a persistent
+HTTP client and use bounded provider concurrency; `--decision-concurrency` controls
+lanes independently of file workers. `--batch-size` affects Antfly batches only.
+Antfly and local profiles retain the native batch capability. A custom service may
+explicitly opt into `--decision-transport antfly-batch`; `--decision-context
+shared-v1` additionally interns repeated contexts. Neither extension is probed by
+sending unsupported requests. Single-input mode rejects shared-v1. Successful
+cache hits require no provider request; request budgets count actual attempts,
+including retries and splits. Refusal, abstention, similarity/generated answers,
+and malformed/missing responses remain incomplete evidence (exit 2), never cached
+negative results. Typed predicates may omit Antfly's `decision_method` metadata.
+
+Antfly's public gateway requires `public_inference.enabled: true`; authenticated
+execution requires `inference:write`. Use its canonical `deciders/NAME` model ID.
+An unauthenticated local gateway needs only its URL and configured model. Direct
+TypeSafe/Vercel/OpenRouter/OpenCode presets were removed: configure Jev on the
+Antfly gateway and select its decider instead. No chat/Structured Outputs fallback
+manufactures probability scores. See [the gateway contract](../../../docs/reference/inference-gateway.md).
+
+`auth` saves nonsecret provider configuration atomically with owner-only permissions
+on POSIX. Keys come from the environment; `--stdin` returns
+`UseEnvironmentCredential` instead of persisting a new token. Old credential
+profiles can be read during migration; remove their `token` after exporting an
+appropriate environment key. `doctor` uses a synthetic request. Agent installation
+supports Codex, Claude, and OpenCode; `--global` chooses the home directory.
+Shell completions include provider/transport choices, file types, option arity,
+paths, and setup commands. Local inference needs the explicit model/library setup
+above. No model is downloaded implicitly.
 
 Table-backed searches use the same matcher, decision pipeline and renderers as
 local files. Configure an endpoint and tables using
@@ -840,8 +873,8 @@ Fixture request bytes are recorded
 separately from provider token usage; fixture results do not establish model
 quality or actual provider cost.
 
-`bench/decision_transport.py` compares a saved baseline with the current binary
-using synthetic source and a local constant-score Typesafe fixture. The recorded
+The historical TypeSafe transport qualification used synthetic source and a
+local constant-score fixture. The recorded
 512-line case sends the same 513 questions in 65 requests and produces identical
 output, while request-body bytes fall from 10,719,928 to 1,609,144 (85% less).
 See the archived `followup-typesafe-transport.json` report in the [historical results archive](bench/results/README.md). The labeled repository
@@ -4386,3 +4419,27 @@ that fixture. Identity lookup is only 30–51 μs; directory reads take 6.3–6.
 These component medians are diagnostic observations, not additive attribution
 of every workload. Batched revision/source validation and maintained binding
 certificates are better next targets than enlarging an identity cache.
+
+
+### Decisions transport qualification
+
+`bench/decision_transport.py` now compares the public single-input Decisions
+contract, native Antfly batches, and versioned shared contexts. It uses local
+constant-score fixtures, alternating trial order, binary/source hashes, and
+output equivalence; it never contacts a model. Use `--transport single` or
+`--transport shared-v1`, with `--baseline-transport antfly-batch`. To isolate
+transport from code changes, pass the same binary as candidate and baseline.
+`--cache` measures warmed decision caches; `--keep-alive` enables persistent
+fixture connections. Write raw JSON under ignored `output/`, not this directory.
+Protocol compatibility, fewer bytes or requests, and cache hits do not establish
+model quality, provider token charges, or a universal latency advantage.
+
+
+The [Decisions client qualification](bench/results/grep-decisions-client-summary.json)
+records artifact hashes, conformance checks, and three alternating trials per
+transport on macOS and the ARM64 Linux VM. In the 512-line constant-score fixture,
+all modes preserve 513 evaluations and identical output. Shared contexts reduce
+request bodies from 10,548,999 to 1,412,265 bytes (86.6%) with 65 requests;
+common single-input Decisions needs 513 requests. Warmed caches require zero
+provider requests in both protocols. These are protocol byte/request measurements,
+not provider token costs or a claim that complete searches are free.

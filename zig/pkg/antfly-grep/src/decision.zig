@@ -19,7 +19,7 @@ const Options = @import("options.zig").Options;
 const Allocator = std.mem.Allocator;
 
 /// Context is borrowed once per region, rather than copied for each target.
-/// The legacy decision wire format is preserved; Typesafe shares context in state.
+/// Common Decisions inputs and Antfly batch inputs share the same text encoding.
 const empty_context_hash: [32]u8 = blk: {
     @setEvalBranchQuota(10000);
     var digest: [32]u8 = undefined;
@@ -57,6 +57,10 @@ pub const Input = struct {
         try json.objectField("id");
         try json.write(self.id);
         try json.objectField("input");
+        try self.writeText(json);
+        try json.endObject();
+    }
+    fn writeText(self: Input, json: *std.json.Stringify) !void {
         try json.beginWriteRaw();
         try json.writer.writeByte('"');
         if (self.context.len != 0) {
@@ -66,7 +70,6 @@ pub const Input = struct {
         try std.json.Stringify.encodeJsonStringChars(self.input, json.options, json.writer);
         try json.writer.writeByte('"');
         json.endWriteRaw();
-        try json.endObject();
     }
 };
 pub const Client = struct {
@@ -103,7 +106,7 @@ pub const Client = struct {
     score_store: @import("score_store.zig").Store = .{},
     // Options/query bytes are immutable for an invocation. Retain SHA state
     // before per-target bytes; preserve every existing on-disk key exactly.
-    key_prefix: ?struct { parts: [10][]const u8, hash: std.crypto.hash.sha2.Sha256 } = null,
+    key_prefix: ?struct { parts: [11][]const u8, hash: std.crypto.hash.sha2.Sha256 } = null,
     pub fn init(a: Allocator, io: std.Io, options: *const Options) Client {
         return .{ .a = a, .http = httpx.Client.init(a, io), .options = options, .io = io };
     }
@@ -149,10 +152,10 @@ pub const Client = struct {
 
     pub fn decideBatches(self: *Client, inputs: []const Input, scores: []f64) !void {
         @memset(scores, std.math.nan(f64));
-        if (!self.allow_parallel or self.options.providerJobs() <= 1 or inputs.len <= self.options.batch_size) {
+        if (!self.allow_parallel or self.options.providerJobs() <= 1 or inputs.len <= self.options.decisionBatchSize()) {
             var offset: usize = 0;
             while (offset < inputs.len) {
-                const n = @min(self.options.batch_size, inputs.len - offset);
+                const n = @min(self.options.decisionBatchSize(), inputs.len - offset);
                 try self.decide(inputs[offset..][0..n], scores[offset..][0..n]);
                 offset += n;
             }
@@ -168,7 +171,7 @@ pub const Client = struct {
         defer for (written) |time| {
             if (time) |t| self.evidence_times.add(t);
         };
-        const repairs = try a.alloc(bool, if (caching) std.math.divCeil(usize, inputs.len, self.options.batch_size) catch unreachable else 0);
+        const repairs = try a.alloc(bool, if (caching) std.math.divCeil(usize, inputs.len, self.options.decisionBatchSize()) catch unreachable else 0);
         @memset(repairs, false);
         if (caching) try self.cachedWave(a, inputs, scores, keys, written, repairs);
         var missing: std.ArrayList(Input) = .empty;
@@ -190,9 +193,9 @@ pub const Client = struct {
         if (caching) {
             var offset: usize = 0;
             while (offset < indices.items.len) {
-                const n = @min(self.options.batch_size, indices.items.len - offset);
+                const n = @min(self.options.decisionBatchSize(), indices.items.len - offset);
                 const first = indices.items[offset];
-                if (first % self.options.batch_size == 0 and indices.items[offset + n - 1] == first + n - 1 and n == @min(self.options.batch_size, inputs.len - first)) repairs[first / self.options.batch_size] = false;
+                if (first % self.options.decisionBatchSize() == 0 and indices.items[offset + n - 1] == first + n - 1 and n == @min(self.options.decisionBatchSize(), inputs.len - first)) repairs[first / self.options.decisionBatchSize()] = false;
                 offset += n;
             }
         }
@@ -222,9 +225,9 @@ pub const Client = struct {
         for (inputs, keys) |input, *key_hex| key_hex.* = self.key(input);
         var offset: usize = 0;
         while (offset < inputs.len) {
-            const n = @min(self.options.batch_size, inputs.len - offset);
+            const n = @min(self.options.decisionBatchSize(), inputs.len - offset);
             _ = try self.cachedBatch(a, &batchKey(keys[offset..][0..n]), scores[offset..][0..n], written[offset..][0..n]);
-            repairs[offset / self.options.batch_size] = for (scores[offset..][0..n]) |score| {
+            repairs[offset / self.options.decisionBatchSize()] = for (scores[offset..][0..n]) |score| {
                 if (!std.math.isFinite(score)) break true;
             } else false;
             offset += n;
@@ -244,8 +247,8 @@ pub const Client = struct {
     fn repairBatches(self: *Client, a: Allocator, scores: []const f64, keys: []const [64]u8, written: []const ?i64, repairs: []const bool) void {
         for (repairs, 0..) |dirty, batch| {
             if (!dirty) continue;
-            const offset = batch * self.options.batch_size;
-            const n = @min(self.options.batch_size, scores.len - offset);
+            const offset = batch * self.options.decisionBatchSize();
+            const n = @min(self.options.decisionBatchSize(), scores.len - offset);
             self.storeBatch(a, &batchKey(keys[offset..][0..n]), scores[offset..][0..n], written[offset..][0..n]) catch {};
         }
     }
@@ -286,7 +289,7 @@ pub const Client = struct {
         }
         fn run(self: *Pool, parent: *Client, inputs: []const Input, scores: []f64, written: []?i64) !void {
             parent.prepareCache();
-            const wanted = @min(self.workers.len, (inputs.len + parent.options.batch_size - 1) / parent.options.batch_size);
+            const wanted = @min(self.workers.len, (inputs.len + parent.options.decisionBatchSize() - 1) / parent.options.decisionBatchSize());
             // The caller owns dispatch and waits for the previous wave. Spawn
             // outside the mutex; new workers start at the previous generation.
             while (self.started < wanted) {
@@ -301,7 +304,7 @@ pub const Client = struct {
             if (self.started == 0) {
                 var offset: usize = 0;
                 while (offset < inputs.len) {
-                    const n = @min(parent.options.batch_size, inputs.len - offset);
+                    const n = @min(parent.options.decisionBatchSize(), inputs.len - offset);
                     try parent.decideTimed(inputs[offset..][0..n], scores[offset..][0..n], written[offset..][0..n]);
                     offset += n;
                 }
@@ -371,9 +374,9 @@ pub const Client = struct {
             local.cache_checked = parent.cache_checked;
             local.shared_local = parent.shared_local orelse if (parent.local) |provider| provider else null;
             while (true) {
-                const start = ctx.index.fetchAdd(parent.options.batch_size, .monotonic);
+                const start = ctx.index.fetchAdd(parent.options.decisionBatchSize(), .monotonic);
                 if (start >= ctx.inputs.len) break;
-                const n = @min(parent.options.batch_size, ctx.inputs.len - start);
+                const n = @min(parent.options.decisionBatchSize(), ctx.inputs.len - start);
                 local.decideTimed(ctx.inputs[start..][0..n], ctx.scores[start..][0..n], ctx.written[start..][0..n]) catch |err| {
                     ctx.mutex.lockUncancelable(parent.io);
                     if (ctx.failure == null) ctx.failure = err;
@@ -467,7 +470,7 @@ pub const Client = struct {
             std.crypto.hash.sha2.Sha256.hash(input.context, &digest, .{});
             break :blk digest;
         };
-        const parts = [_][]const u8{ "antfly-grep-decisions-v5", self.options.endpoint, self.options.model.?, self.options.token orelse "", @tagName(self.options.backend), self.options.models_dir orelse "", self.options.library_path orelse "", self.query orelse self.options.ask.?, @tagName(self.stage), if (self.options.broad) "broad" else "direct" };
+        const parts = [_][]const u8{ "antfly-grep-decisions-v6", self.options.endpoint, self.options.model.?, self.options.token orelse "", @tagName(self.options.backend), @tagName(self.options.decision_transport), self.options.models_dir orelse "", self.options.library_path orelse "", self.query orelse self.options.ask.?, @tagName(self.stage), if (self.options.broad) "broad" else "direct" };
         const reusable = if (self.key_prefix) |prefix| for (prefix.parts, parts) |old, part| {
             if (old.ptr != part.ptr or old.len != part.len) break false;
         } else true else false;
@@ -661,7 +664,7 @@ pub const Client = struct {
     }
     fn request(self: *Client, inputs: []const Input, probabilities: []f64) anyerror!void {
         if (self.coalescer) |coalescer| {
-            if (inputs.len > 0 and inputs.len < self.options.batch_size and self.options.decision_batch_wait_ms > 0 and
+            if (inputs.len > 0 and inputs.len < self.options.decisionBatchSize() and self.options.decision_batch_wait_ms > 0 and
                 // The shared request counter reserves one slot per actual
                 // provider attempt, after merging and before dispatch. Never
                 // merge independently budgeted clients without that counter.
@@ -686,7 +689,7 @@ pub const Client = struct {
         // Raw input bytes are a lower bound on serialized size. Split
         // guaranteed-oversized batches before allocating/escaping their body.
         // Shared transport counts each context once, just like its encoder.
-        if (inputs.len > 1 and rawRequestBytes(inputs, self.options.decision_context == .shared_v1 or self.options.backend == .typesafe) > 16 * 1024 * 1024) {
+        if (inputs.len > 1 and rawRequestBytes(inputs, self.options.decision_context == .shared_v1) > 16 * 1024 * 1024) {
             const half = inputs.len / 2;
             try self.requestDirect(inputs[0..half], probabilities[0..half]);
             try self.requestDirect(inputs[half..], probabilities[half..]);
@@ -696,6 +699,7 @@ pub const Client = struct {
         while (true) {
             self.last_status = 0;
             self.retry_after_ms = 0;
+            const requests_before = self.requests;
             self.requestOnce(inputs, probabilities) catch |err| {
                 if (self.last_status == 413 or self.last_status == 422 or err == error.DecisionRequestTooLarge) {
                     if (inputs.len == 1) {
@@ -718,7 +722,7 @@ pub const Client = struct {
                     try self.requestDirect(inputs[half..], probabilities[half..]);
                     return;
                 }
-                const transient = self.last_status == 429 or self.last_status == 408 or self.last_status >= 500 or (self.last_status == 0 and self.options.backend != .local and err != error.RequestBudgetExceeded and err != error.Canceled and err != error.OutOfMemory);
+                const transient = self.last_status == 429 or self.last_status == 408 or self.last_status >= 500 or (self.last_status == 0 and self.requests > requests_before and self.options.backend != .local and err != error.RequestBudgetExceeded and err != error.Canceled and err != error.OutOfMemory);
                 if (!transient or attempt >= self.options.retries) {
                     if (self.last_status != 0 and !self.options.no_messages) std.debug.print("antfly-grep: decision endpoint returned HTTP {d}\n", .{self.last_status});
                     return err;
@@ -747,6 +751,7 @@ pub const Client = struct {
         const query_count = 1 + (if (self.query == null) self.options.queries.items.len else @as(usize, 0));
         const policy_count = if (self.query == null and self.stage != .directory) self.options.filters.items.len + self.options.only.items.len + self.options.not.items.len else 0;
         const count = query_count + policy_count;
+        if (count > @import("antfly_predicate_client").max_questions) return error.TooManyDecisionQuestions;
         const Question = struct { name: []const u8, type: []const u8 = "predicate", instructions: []const u8 };
         const questions = try a.alloc(Question, count);
         const names = try a.alloc([]const u8, count);
@@ -776,7 +781,7 @@ pub const Client = struct {
         // entire expanded request (including JSON escaping and shared state).
         var body_budget = @import("antfly_regex").Budget{ .backing = self.a, .limit = 32 * 1024 * 1024 };
         const body_a = body_budget.allocator();
-        const body = (if (self.options.backend == .typesafe) typesafeBody(body_a, inputs, questions, self.options.model.?) else if (self.options.decision_context == .shared_v1) sharedBody(body_a, inputs, questions, self.options.model.?) else std.json.Stringify.valueAlloc(body_a, .{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{})) catch |err| {
+        const body = (if (self.options.backend != .local and self.options.decision_transport == .single) singleBody(body_a, inputs, questions, self.options.model.?) else if (self.options.decision_context == .shared_v1) sharedBody(body_a, inputs, questions, self.options.model.?) else std.json.Stringify.valueAlloc(body_a, .{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{})) catch |err| {
             return if (body_budget.denied) error.DecisionRequestTooLarge else err;
         };
         defer body_a.free(body);
@@ -794,9 +799,9 @@ pub const Client = struct {
             self.recordRequest(body.len, inputs.len);
             const response = try provider.decide(self.a, body);
             defer self.a.free(response);
-            const parsed = try std.json.parseFromSlice(std.json.Value, self.a, response, .{});
+            const parsed = try std.json.parseFromSlice(std.json.Value, self.a, response, .{ .duplicate_field_behavior = .@"error" });
             defer parsed.deinit();
-            if (self.options.backend == .typesafe) try typesafeAnswers(parsed.value, inputs, probabilities, names) else try parseQuestions(parsed.value, inputs, probabilities, names);
+            try parseQuestions(parsed.value, inputs, probabilities, names);
             self.recordUsage(parsed.value);
             return;
         }
@@ -819,9 +824,9 @@ pub const Client = struct {
         if (!response.ok()) {
             return error.DecisionRequestFailed;
         }
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.a, response.body orelse return error.EmptyDecisionResponse, .{});
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.a, response.body orelse return error.EmptyDecisionResponse, .{ .duplicate_field_behavior = .@"error" });
         defer parsed.deinit();
-        if (self.options.backend == .typesafe) try typesafeAnswers(parsed.value, inputs, probabilities, names) else try parseQuestions(parsed.value, inputs, probabilities, names);
+        try parseQuestions(parsed.value, inputs, probabilities, names);
         self.recordUsage(parsed.value);
     }
     fn recordRequest(self: *Client, bytes: usize, inputs: usize) void {
@@ -878,7 +883,7 @@ pub const Coalescer = struct {
         var count: usize = 0;
         var cursor = self.head;
         while (cursor) |job| : (cursor = job.next) {
-            if (compatible(first.client, job.client) and count + job.inputs.len <= first.client.options.batch_size) count += job.inputs.len;
+            if (compatible(first.client, job.client) and count + job.inputs.len <= first.client.options.decisionBatchSize()) count += job.inputs.len;
         }
         return count;
     }
@@ -895,7 +900,7 @@ pub const Coalescer = struct {
                 continue;
             }
             const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMilliseconds(@intCast(client.options.decision_batch_wait_ms)), .clock = .awake });
-            while (self.ready(&job) < client.options.batch_size) {
+            while (self.ready(&job) < client.options.decisionBatchSize()) {
                 if (client.limits) |limits| if (limits.cancel.load(.monotonic)) break;
                 self.changed.waitTimeout(io, &self.mutex, .{ .deadline = deadline }) catch break;
             }
@@ -905,7 +910,7 @@ pub const Coalescer = struct {
             var link = &self.head;
             var previous: ?*Job = null;
             while (link.*) |item| {
-                if (compatible(client, item.client) and total + item.inputs.len <= client.options.batch_size) {
+                if (compatible(client, item.client) and total + item.inputs.len <= client.options.decisionBatchSize()) {
                     selected[count] = item;
                     count += 1;
                     total += item.inputs.len;
@@ -984,62 +989,25 @@ fn sharedBody(a: Allocator, inputs: []const Input, questions: anytype, model: []
     }
     return std.json.Stringify.valueAlloc(a, .{ .model = model, .context_version = 1, .contexts = contexts.items, .inputs = wire, .questions = questions }, .{ .emit_null_optional_fields = false });
 }
-fn typesafeBody(a: Allocator, inputs: []const Input, questions: anytype, model: []const u8) ![]u8 {
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const scratch = arena.allocator();
-    var state: std.Io.Writer.Allocating = .init(scratch);
-    var map: std.json.ObjectMap = .empty;
-    // Context slices are immutable and borrowed for the request lifetime.
-    // Intern by identity so a large declaration is not rehashed per target.
-    const ContextKey = struct { address: usize, len: usize };
-    var contexts: std.AutoHashMap(ContextKey, usize) = .init(scratch);
-    for (inputs, 0..) |input, i| {
-        if (input.context.len != 0) {
-            const entry = try contexts.getOrPut(.{ .address = @intFromPtr(input.context.ptr), .len = input.context.len });
-            if (!entry.found_existing) {
-                entry.value_ptr.* = contexts.count() - 1;
-                try state.writer.print("\nBEGIN SHARED CONTEXT {d}\n{s}\nEND SHARED CONTEXT {d}\n", .{ entry.value_ptr.*, input.context, entry.value_ptr.* });
-            }
-            try state.writer.print("TARGET INPUT {d} uses SHARED CONTEXT {d} for interpretation only.\n", .{ i, entry.value_ptr.* });
+fn singleBody(a: Allocator, inputs: []const Input, questions: anytype, model: []const u8) ![]u8 {
+    if (inputs.len != 1) return error.InvalidDecisionBatch;
+    // Reuse Input's streaming JSON string encoder, avoiding a copy of context.
+    const Wire = struct {
+        model: []const u8,
+        input: Input,
+        questions: @TypeOf(questions),
+        pub fn jsonStringify(self: @This(), json: *std.json.Stringify) !void {
+            try json.beginObject();
+            try json.objectField("model");
+            try json.write(self.model);
+            try json.objectField("input");
+            try self.input.writeText(json);
+            try json.objectField("questions");
+            try json.write(self.questions);
+            try json.endObject();
         }
-        try state.writer.print("\nBEGIN TARGET INPUT {d} ({s})\n{s}\nEND TARGET INPUT {d}\n", .{ i, input.id, input.input, i });
-        for (questions) |question| {
-            const id = try std.fmt.allocPrint(scratch, "input_{d}_{s}", .{ i, question.name });
-            var value: std.json.ObjectMap = .empty;
-            try value.put(scratch, "type", .{ .string = "noul" });
-            try value.put(scratch, "instructions", .{ .string = try std.fmt.allocPrint(scratch, "For TARGET INPUT {d} only: {s}", .{ i, question.instructions }) });
-            try map.put(scratch, id, .{ .object = value });
-        }
-    }
-    return std.json.Stringify.valueAlloc(a, .{ .model = model, .state = state.written(), .questions = std.json.Value{ .object = map } }, .{});
-}
-fn typesafeAnswers(value: std.json.Value, inputs: []const Input, scores: []f64, names: []const []const u8) !void {
-    const answers = field(value, "answers") orelse return error.InvalidDecisionResponse;
-    if (answers != .object or answers.object.count() != inputs.len * names.len) return error.InvalidDecisionResponse;
-    for (scores, 0..) |*score, i| {
-        score.* = 0;
-        var eligible = true;
-        for (names) |name| {
-            var buffer: [128]u8 = undefined;
-            const id = try std.fmt.bufPrint(&buffer, "input_{d}_{s}", .{ i, name });
-            const answer = answers.object.get(id) orelse return error.InvalidDecisionResponse;
-            if (!string(field(answer, "type"), "noul")) return error.InvalidDecisionResponse;
-            const number = field(answer, "noul") orelse return error.InvalidDecisionResponse;
-            const p: f64 = switch (number) {
-                .float => number.float,
-                .integer => @floatFromInt(number.integer),
-                else => return error.InvalidDecisionResponse,
-            };
-            if (!std.math.isFinite(p) or p < 0 or p > 1) return error.InvalidDecisionResponse;
-            if (std.mem.startsWith(u8, name, "include_")) {
-                eligible = eligible and p >= 0.5;
-            } else if (std.mem.startsWith(u8, name, "exclude_")) {
-                eligible = eligible and p < 0.5;
-            } else score.* = @max(score.*, p);
-        }
-        if (!eligible) score.* = -1;
-    }
+    };
+    return std.json.Stringify.valueAlloc(a, Wire{ .model = model, .input = inputs[0], .questions = questions }, .{});
 }
 
 fn integer(value: ?std.json.Value) usize {
@@ -1061,6 +1029,11 @@ pub fn parseProbabilities(value: std.json.Value, inputs: []const Input, probabil
 fn parseQuestions(value: std.json.Value, inputs: []const Input, probabilities: []f64, names: []const []const u8) !void {
     if (inputs.len != probabilities.len) return error.InvalidDecisionResponse;
     @memset(probabilities, std.math.nan(f64));
+    if (field(value, "answers") != null) {
+        if (inputs.len != 1 or field(value, "data") != null) return error.InvalidDecisionResponse;
+        probabilities[0] = try aggregate(value, names);
+        return;
+    }
     const data = field(value, "data") orelse return error.InvalidDecisionResponse;
     if (data != .array or data.array.items.len != inputs.len) return error.InvalidDecisionResponse;
     for (data.array.items) |row| {
@@ -1069,34 +1042,23 @@ fn parseQuestions(value: std.json.Value, inputs: []const Input, probabilities: [
         const i: usize = @intCast(index.integer);
         if (!std.math.isNan(probabilities[i])) return error.InvalidDecisionResponse;
         if (field(row, "id")) |id| if (!string(id, inputs[i].id)) return error.InvalidDecisionResponse;
-        const answers = field(row, "answers") orelse return error.InvalidDecisionResponse;
-        if (answers != .array or answers.array.items.len != names.len) return error.InvalidDecisionResponse;
-        var best: f64 = 0;
-        var eligible = true;
-        for (names) |name| {
-            var found = false;
-            for (answers.array.items) |answer| {
-                if (!string(field(answer, "name"), name)) continue;
-                if (found) return error.InvalidDecisionResponse;
-                found = true;
-                if (!string(field(answer, "type"), "predicate") or !string(field(answer, "decision_method"), "typed")) return error.InvalidDecisionResponse;
-                const probability = field(answer, "probability") orelse return error.InvalidDecisionResponse;
-                const p: f64 = switch (probability) {
-                    .integer => @floatFromInt(probability.integer),
-                    .float => probability.float,
-                    else => return error.InvalidDecisionResponse,
-                };
-                if (!std.math.isFinite(p) or p < 0 or p > 1) return error.InvalidDecisionResponse;
-                if (std.mem.startsWith(u8, name, "include_")) {
-                    eligible = eligible and p >= 0.5;
-                } else if (std.mem.startsWith(u8, name, "exclude_")) {
-                    eligible = eligible and p < 0.5;
-                } else best = @max(best, p);
-            }
-            if (!found) return error.InvalidDecisionResponse;
-        }
-        probabilities[i] = if (eligible) best else -1;
+        probabilities[i] = try aggregate(row, names);
     }
+}
+fn aggregate(row: std.json.Value, names: []const []const u8) !f64 {
+    var values: [@import("antfly_predicate_client").max_questions]f64 = undefined;
+    if (names.len > values.len) return error.InvalidDecisionResponse;
+    try @import("antfly_predicate_client").probabilities(row, names, values[0..names.len]);
+    var best: f64 = 0;
+    var eligible = true;
+    for (names, values[0..names.len]) |name, p| {
+        if (std.mem.startsWith(u8, name, "include_")) {
+            eligible = eligible and p >= 0.5;
+        } else if (std.mem.startsWith(u8, name, "exclude_")) {
+            eligible = eligible and p < 0.5;
+        } else best = @max(best, p);
+    }
+    return if (eligible) best else -1;
 }
 
 test "decision answers are identity checked and can arrive reordered" {
@@ -1127,7 +1089,7 @@ test "prehashed shared contexts preserve cache identity and credential scope" {
     try std.testing.expect(!std.mem.eql(u8, &expected, &client.key(input)));
 }
 
-test "prefix reuse preserves the v5 key transcript across stages and scopes" {
+test "prefix reuse preserves the v6 key transcript across stages and scopes" {
     const a = std.testing.allocator;
     var o: Options = .{ .ask = "retry", .model = "fixture", .token = "scope" };
     var c: Client = .{ .a = a, .io = undefined, .http = undefined, .options = &o };
@@ -1137,7 +1099,7 @@ test "prefix reuse preserves the v5 key transcript across stages and scopes" {
         var reference = std.crypto.hash.sha2.Sha256.init(.{});
         var context_hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(input.context, &context_hash, .{});
-        for ([_][]const u8{ "antfly-grep-decisions-v5", o.endpoint, o.model.?, o.token.?, "http", "", "", o.ask.?, @tagName(stage), "direct", &context_hash, input.input }) |part| {
+        for ([_][]const u8{ "antfly-grep-decisions-v6", o.endpoint, o.model.?, o.token.?, "http", "antfly_batch", "", "", o.ask.?, @tagName(stage), "direct", &context_hash, input.input }) |part| {
             var len: [8]u8 = undefined;
             std.mem.writeInt(u64, &len, part.len, .little);
             reference.update(&len);

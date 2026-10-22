@@ -33,6 +33,7 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     const hash = b.createModule(.{ .root_source_file = b.path("lib/hash/src/mod.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const compress = b.createModule(.{ .root_source_file = b.path("lib/compress/src/mod.zig"), .target = target, .optimize = optimize });
     compress.addImport("antfly_hash", hash);
+    lib.addImport("antfly_predicate_client", b.createModule(.{ .root_source_file = b.path("lib/decisions/predicate_client.zig"), .target = target, .optimize = optimize }));
     lib.addImport("antfly_hash", hash);
     lib.addImport("antfly_compress", compress);
     const syntax = b.createModule(.{ .root_source_file = b.path("lib/syntax/src/root.zig"), .target = target, .optimize = optimize });
@@ -111,6 +112,8 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     const unit_step = b.step("grep-unit", "Run native grep, regex, grammar and dictionary unit tests");
     test_step.dependOn(unit_step);
     unit_step.dependOn(&test_run.step);
+    const predicate_tests = b.addTest(.{ .root_module = lib.import_table.get("antfly_predicate_client").? });
+    unit_step.dependOn(&b.addRunArtifact(predicate_tests).step);
     const search_mod = b.createModule(.{ .root_source_file = b.path("lib/regex/src/search.zig"), .target = target, .optimize = optimize, .link_libc = true });
     search_mod.addImport("antfly_grapheme", grapheme);
     const regex_search_tests = b.addTest(.{ .root_module = search_mod });
@@ -150,6 +153,7 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     integration.addArtifactArg(exe);
     const fixture_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-grep/tests/local_inference_fixture.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const fixture = b.addLibrary(.{ .name = "antfly-grep-inference-fixture", .linkage = .dynamic, .root_module = fixture_mod });
+    b.step("grep-fixture-build", "Build the portable local inference fixture without executing it").dependOn(&b.addInstallArtifact(fixture, .{}).step);
     integration.addArtifactArg(fixture);
     test_step.dependOn(&integration.step);
     const differential_tools = b.addSystemCommand(&.{"python3"});

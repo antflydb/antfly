@@ -5,7 +5,7 @@ _arguments -s \
  '--agent[agent]:value:(codex claude-code opencode)' \
  '--ask[ask]:value:' \
  '--auto-hybrid-regex[auto-hybrid-regex]' \
- '--backend[backend]:value:(http antfly typesafe local)' \
+ '--backend[backend]:value:(http antfly local)' \
  '--base-url[base-url]:value:' \
  '--batch-size[batch-size]:value:' \
  '--before-context[before-context]:value:' \
@@ -32,6 +32,7 @@ _arguments -s \
  '--decision-batch-wait-ms[decision-batch-wait-ms]:value:' \
  '--decision-concurrency[decision-concurrency]:value:' \
  '--decision-context[decision-context]:value:(legacy shared-v1)' \
+ '--decision-transport[decision-transport]:value:(single antfly-batch)' \
  '--dfa-size-limit[dfa-size-limit]:value:' \
  '--dictionary[dictionary]:value:_files' \
  '--dictionary-format[dictionary-format]:value:(auto raw brotli brotli-google)' \
@@ -146,7 +147,7 @@ _arguments -s \
  '--pre[pre]:value:_files' \
  '--pre-glob[pre-glob]:value:' \
  '--pretty[pretty]' \
- '--provider[provider]:value:(antfly typesafe vercel openrouter opencode local custom)' \
+ '--provider[provider]:value:(antfly openai local custom)' \
  '--query[query]:value:' \
  '--quiet[quiet]' \
  '--refine[refine]' \

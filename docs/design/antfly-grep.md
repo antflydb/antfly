@@ -108,3 +108,43 @@ avoiding materialized suffix arrays. Source verification starts with a bounded
 two-document sample and avoids per-row timing for buffered data. These changes
 require ordered analyzer and postings differentials, allocation-failure coverage,
 and paired HTTP profiles; they do not imply a local CLI speedup over ripgrep.
+
+## Common Decisions client and gateway ownership (2026-10-21)
+
+Grep speaks the public named-question Decisions contract. The common denominator
+is one textual `input`, a model, and predicate questions; multiple questions share
+one source serialization. The OpenAI profile uses its canonical `/v1/decisions`
+endpoint. Antfly's `/ai/v1/decisions` gateway owns provider routing, including Jev's
+private state/question protocol. Grep no longer carries provider-specific Jev
+serialization or guessed third-party gateway routes.
+
+Antfly batching (`inputs`) and versioned shared contexts are capabilities selected
+explicitly by the Antfly/local profile or transport option, not assumed of a generic
+OpenAI-compatible service. The scheduler uses an effective batch size of one for
+the common contract, preserving bounded concurrent requests, cancellation, request
+budgets, retry/split limits, persistent connections, and warm cache hits. Common
+inputs reuse the existing streaming JSON string encoder so context is not copied
+into a temporary concatenated source. Shared-context batching remains available
+where supported; it reduces repeated serialization without dropping targets.
+
+The lightweight shared predicate decoder lives in `zig/lib/decisions` and uses
+bounded stack state with no per-answer allocation. It checks names, duplicates,
+finite probabilities, and optional typed metadata. Refusal, abstention, missing
+answers, and non-typed decision methods are incomplete evidence rather than
+negative relevance. The cache transcript includes transport identity and a new
+version; old semantic results are not silently reused across this transition.
+
+Credentials are destination-bound. OpenAI's environment key is eligible only for
+the canonical OpenAI endpoint; Antfly's key is eligible only for its profile.
+An explicit `ANTFLY_GREP_TOKEN` configures a custom destination. Endpoint/provider
+overrides invalidate saved credentials, and HTTP redirects cannot forward keys.
+New auth profiles contain no secrets. Legacy token profiles are read for migration;
+new `--stdin` persistence is rejected with environment-key guidance. Table access
+continues to use its separate token. Local model hosting remains an explicit
+backend and does not require a gateway.
+
+Fixture conformance covers both wire shapes, shared-context retention, multiple
+questions, bounded concurrency, warm-cache request elimination, refusal/abstention,
+malformed answers, and credential routing. These checks establish protocol and
+orchestration behavior, not live-provider relevance or token cost. The CLI's
+compatibility baseline is Decisions, not Chat Completions or Structured Outputs.
