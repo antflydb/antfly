@@ -3239,7 +3239,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 publication_control,
             ) else null;
             defer if (prepared_physical) |*plan| plan.deinit();
+            const commit_state_mod = @import("prepared_commit_state.zig");
             if (prepared_physical) |*plan| {
+                plan.commit_state = try commit_state_mod.State.capture(plan.bytes.writes, pending_identity_visibility_summary, next_table_catalog, publication_control);
                 plan.counter_deltas = counter_deltas;
                 counter_deltas = counter_program.Program.init(counter_deltas.allocator);
                 plan.coverage_outcomes = coverage_outcomes;
@@ -3277,13 +3279,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 prepared_physical.?.replay_bindings = bindings;
                 try prepared_physical.?.validateCoverageSequence(replay_bindings.symbolic, publication_control);
                 prepared_physical.?.replay_bindings.?.bindValidated(&prepared_physical.?.bytes, assembly_replay_next);
-                prepared_physical.?.bindCoverageSequence(assembly_replay_next);
+                prepared_physical.?.bindReplayPrograms(replay_bindings.symbolic, assembly_replay_next);
                 try prepared_physical.?.validateDependencies(S.ownerField(self, "core").*, publication_control);
                 output.plan = prepared_physical;
                 prepared_physical = null;
                 unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
                 return;
             }
+            const commit_state: commit_state_mod.State = if (prepared_physical) |plan| plan.commit_state else .{ .visibility = pending_identity_visibility_summary, .table_catalog = next_table_catalog };
             const commit_writes = if (prepared_physical) |plan| plan.bytes.writes else store_writes.items;
             const commit_deletes = if (prepared_physical) |plan| plan.bytes.deletes else delete_keys.items;
             const commit_replay: ?docstore_mod.DocStore.ReplayAppend = if (prepared_physical) |plan|
@@ -3363,6 +3366,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
+            if (opts.primary_commit_observed) |observed| observed.* = true;
             // Counter scratch belongs to preparation, including the path with
             // no authored physical owner. Retire it before any visibility wait.
             counter_deltas.deinit();
@@ -3398,12 +3402,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try self.waitForResolvedTransactionSync(effective_req.sync_level, transaction_applied.replay_sequence);
                 return;
             }
+            // Preparation readers have retired. Adopt the durable primary
+            // facts and its reserved replay credit before fallible completion.
             if (review_plan) |review| if (review.accepted) S.ownerField(self, "core").*.index_manager.minimum_reader_version.store(review.minimum_reader, .release);
-            if (next_table_catalog) |catalog| S.ownerField(self, "core").*.table_catalog = catalog;
+            commit_state.adopt(S.ownerField(self, "core").*);
             if (persisted_range != null) {
                 S.ownerField(self, "core").*.adoptPersistedRangeOwned(persisted_range_start_owned.?, persisted_range_end_owned.?);
                 persisted_range_start_owned = null;
                 persisted_range_end_owned = null;
+            }
+            if (append_derived_replay) {
+                const append_replay_journal_start_ns = monotonicTimeNs();
+                S.ownerField(self, "executor").*.commitBacklogAdmission(sequence, &backlog_admission);
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
             }
             var deferred_replication_gates = ReplicationDeferredCommitGates{};
             defer deferred_replication_gates.releaseTransition();
@@ -3432,11 +3443,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.committed_batch_effects_observer) |observer| {
                 try observer.observe(if (append_derived_replay) replay_payload else "");
             }
-            if (pending_identity_visibility_summary) |summary| {
-                S.ownerField(self, "core").*.identity_visibility.summary = summary;
-                self.clearLiveDocSetCache();
-                self.clearNonVisibleDocSetCache();
-            }
             if (profile) |active_profile| {
                 recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
                 active_profile.store_write_count += @intCast(store_writes.items.len);
@@ -3452,11 +3458,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.split_delta_ns, split_delta_start_ns);
             }
 
-            if (append_derived_replay) {
-                const append_replay_journal_start_ns = monotonicTimeNs();
-                S.ownerField(self, "executor").*.commitBacklogAdmission(sequence, &backlog_admission);
-                if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
-            }
             if (materialized_derived_batch != null) {
                 split_shadow_ticket = reserveSplitShadowApplyTicket(self);
             }
@@ -3615,6 +3616,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try types.validateMergeArtifacts(req);
             const max_prepared_generation_retries = 2;
             var retry_count: usize = 0;
+            var primary_commit_observed = false;
+            var attempt_options = opts;
+            attempt_options.primary_commit_observed = &primary_commit_observed;
+            defer if (primary_commit_observed) {
+                if (opts.primary_commit_observed) |parent| parent.* = true;
+            };
             // Provider results are semantic request data, not schema/index-plan
             // data. Keep them across optimistic publication retries so catalog
             // churn cannot multiply expensive external work.
@@ -3624,13 +3631,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             generated_memo.reuse_stored_artifacts = if (opts.restore_staging) |admission| !admission.rewrite else false;
             defer generated_memo.deinit();
             while (true) {
-                self.batchInternalPrepared(req, profile, opts, &generated_memo, allocator_guard) catch |err| switch (err) {
-                    error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
-                        if (retry_count >= max_prepared_generation_retries) return err;
-                        retry_count += 1;
-                        continue;
-                    },
-                    else => return err,
+                self.batchInternalPrepared(req, profile, attempt_options, &generated_memo, allocator_guard) catch |err| {
+                    // A completion callback can return a preparation retry
+                    // name after acceptance. Never replay a committed batch.
+                    if (primary_commit_observed) return err;
+                    switch (err) {
+                        error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
+                            if (retry_count >= max_prepared_generation_retries) return err;
+                            retry_count += 1;
+                            continue;
+                        },
+                        else => return err,
+                    }
                 };
                 // Completion errors happen after commit. Keep this outside the
                 // preparation retry handler so they cannot replay the user batch.
@@ -5937,7 +5949,7 @@ test "mutation batch root production retry wrapper preserves receiver identity m
     const admission = @import("mutation_admission.zig");
     const Barrier = execution_resources.MutationBarrier;
     const Pipeline = ImplementationFor(struct {}, struct {});
-    const Mode = enum { retry_success, preparation_failure, retry_exhaustion, completion_failure, inherited_success, conflict };
+    const Mode = enum { retry_success, preparation_failure, retry_exhaustion, completion_failure, accepted_failure, inherited_success, conflict };
     const Receiver = struct {
         mutation_root: ?*Barrier.RootSharedLease = null,
         expected_root: *Barrier.RootSharedLease,
@@ -5981,9 +5993,11 @@ test "mutation batch root production retry wrapper preserves receiver identity m
                 },
                 .preparation_failure => return error.Canceled,
                 .retry_exhaustion => return error.PreparedGenerationChanged,
-                .completion_failure, .inherited_success, .conflict => {},
+                .completion_failure, .accepted_failure, .inherited_success, .conflict => {},
             }
             self.accepted += 1;
+            options.primary_commit_observed.?.* = true;
+            if (self.mode == .accepted_failure) return error.PreparedGenerationChanged;
         }
         pub fn finishBatchGraphEndpointCleanup(self: *@This(), _: types.BatchRequest, _: execution_resources.BatchExecutionOptions) !void {
             self.completions += 1;
@@ -6000,7 +6014,7 @@ test "mutation batch root production retry wrapper preserves receiver identity m
             return null;
         }
     };
-    for ([_]Mode{ .retry_success, .preparation_failure, .retry_exhaustion, .completion_failure, .inherited_success, .conflict }) |mode| {
+    for ([_]Mode{ .retry_success, .preparation_failure, .retry_exhaustion, .completion_failure, .accepted_failure, .inherited_success, .conflict }) |mode| {
         var barrier: Barrier = .{};
         var check: Check = .{};
         var root = try barrier.acquireSharedRootControlled(std.testing.io, &check);
@@ -6018,7 +6032,8 @@ test "mutation batch root production retry wrapper preserves receiver identity m
         var guard: execution_resources.PreparedRowAllocator = .{ .child = std.testing.allocator, .io = std.testing.io };
         try std.testing.expect(barrier.reader_gate.tryLock());
         defer barrier.reader_gate.unlock();
-        const result = Pipeline.batchInternalWithPreparationAllocator(&receiver, .{ .sync_level = .propose }, null, .{ .mutation_root = if (mode == .inherited_success) null else &root }, &guard);
+        var observed = false;
+        const result = Pipeline.batchInternalWithPreparationAllocator(&receiver, .{ .sync_level = .propose }, null, .{ .mutation_root = if (mode == .inherited_success) null else &root, .primary_commit_observed = &observed }, &guard);
         switch (mode) {
             .inherited_success => {
                 try result;
@@ -6051,6 +6066,12 @@ test "mutation batch root production retry wrapper preserves receiver identity m
                 try std.testing.expectEqual(@as(usize, 0), receiver.accepted);
                 try std.testing.expectEqual(@as(usize, 0), receiver.completions);
             },
+            .accepted_failure => {
+                try std.testing.expectError(error.PreparedGenerationChanged, result);
+                try std.testing.expectEqual(@as(usize, 1), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 1), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 0), receiver.completions);
+            },
             .completion_failure => {
                 try std.testing.expectError(error.PreparedGenerationChanged, result);
                 try std.testing.expectEqual(@as(usize, 1), receiver.attempts);
@@ -6058,6 +6079,7 @@ test "mutation batch root production retry wrapper preserves receiver identity m
                 try std.testing.expectEqual(@as(usize, 1), receiver.completions);
             },
         }
+        try std.testing.expectEqual(receiver.accepted != 0, observed);
         try std.testing.expect(receiver.mutation_root == previous);
         try std.testing.expect(root.held and root.borrowers.load(.acquire) == 0);
     }

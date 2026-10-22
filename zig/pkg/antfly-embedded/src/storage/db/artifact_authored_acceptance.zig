@@ -218,6 +218,7 @@ pub const OwnedPhysicalPlan = struct {
     counter_deltas: ?@import("dense_artifact_counter_deltas.zig").Program = null,
     coverage_outcomes: ?@import("prepared_coverage_outcomes.zig").Program = null,
     replay_bindings: ?@import("prepared_replay_bindings.zig").Bindings = null,
+    commit_state: @import("prepared_commit_state.zig").State = .{},
     /// This candidate cannot authorize a vote or a direct commit. Its current
     /// sequence is optimistic until refreshed under the owning apply fence.
     preparation: ?struct {
@@ -248,6 +249,7 @@ pub const OwnedPhysicalPlan = struct {
         if (trace.failure) |cause| return cause;
     }
     fn validateDependenciesInner(self: *const OwnedPhysicalPlan, core: anytype, control: ?admission.Port, refreshing: bool) !void {
+        try self.commit_state.validate(self.bytes.writes, control);
         const owned = if (self.dependencies) |*value| value else return error.PreparedEffectsRequired;
         try owned.validate(core, control);
         if (self.preparation) |expected| {
@@ -271,7 +273,8 @@ pub const OwnedPhysicalPlan = struct {
             if (entry.sequence != expected) return error.InvalidDerivedSequence;
         };
     }
-    pub fn bindCoverageSequence(self: *OwnedPhysicalPlan, next: u64) void {
+    pub fn bindReplayPrograms(self: *OwnedPhysicalPlan, previous: u64, next: u64) void {
+        self.commit_state.bindReplaySequence(previous, next);
         if (self.coverage_outcomes) |*program| for (program.groups.items) |*group| for (group.desired.items) |*entry| {
             entry.sequence = next;
         };
@@ -292,7 +295,7 @@ pub const OwnedPhysicalPlan = struct {
         try self.validateCoverageSequence(expected.replay_next, control);
         if (control) |owner| try owner.checkpoint();
         bindings.bindValidated(&self.bytes, next);
-        self.bindCoverageSequence(next);
+        self.bindReplayPrograms(expected.replay_next, next);
         self.preparation.?.replay_next = next;
     }
 

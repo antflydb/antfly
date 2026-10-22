@@ -148398,3 +148398,185 @@ test "db prepared transaction effects required replay claim follows every origin
         }
     }
 }
+
+test "db prepared transaction effects required commit memory adoption precedes observer failure and preserves later counts" {
+    const a = std.testing.allocator;
+    const Observer = struct {
+        db: *DB,
+        calls: usize = 0,
+        fn apply(ptr: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u64, 0), self.db.core.identity_visibility.summary.?.live_ordinals);
+            try std.testing.expectEqual(@as(u64, 0), self.db.core.table_catalog.row_count);
+            try std.testing.expect(self.db.core.identity_visibility.live_set == null);
+            try std.testing.expect(self.db.core.identity_visibility.nonvisible_set == null);
+            try std.testing.expect(self.db.core.identity_visibility.live_generation == null);
+            try std.testing.expect(self.db.core.identity_visibility.nonvisible_generation == null);
+            return error.PreparedGenerationChanged;
+        }
+    };
+    for ([_]bool{ false, true }) |relational| {
+        var directory = try TestDirectory.init("commit-memory-observer");
+        defer directory.cleanup();
+        {
+            var db = try DB.open(a, directory.path(), PreparedAssemblyFixture.options);
+            defer db.close();
+            if (relational) try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "text", .path = "text", .column_type = .string }} });
+            try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"text\":\"before\"}" }}, .sync_level = .propose });
+            const generation = db.core.nextDerivedSequence();
+            var live = try db.broadLiveDocSetCachedAlloc(a, generation);
+            defer live.deinit(a);
+            var hidden = (try db.nonVisibleDocSetCachedAlloc(a, generation)).?;
+            defer hidden.deinit(a);
+            try std.testing.expect(db.core.identity_visibility.live_set != null);
+            try std.testing.expect(db.core.identity_visibility.nonvisible_set != null);
+            const candidate_sequence = db.core.nextDerivedAppendSequence();
+            var observer: Observer = .{ .db = &db };
+            try std.testing.expectError(error.PreparedGenerationChanged, db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(.{ .deletes = &.{"row"}, .sync_level = .propose }, null, .{ .ptr = &observer, .apply = Observer.apply }));
+            try std.testing.expectEqual(@as(usize, 1), observer.calls);
+            try std.testing.expectEqual(candidate_sequence + 1, db.core.nextDerivedAppendSequence());
+            try std.testing.expect((try db.get(a, "row")) == null);
+            try std.testing.expectEqual(@as(u64, 0), try db.primaryDocCount(a));
+            try db.batch(.{ .writes = &.{.{ .key = "next", .value = "{\"text\":\"after\"}" }}, .sync_level = .propose });
+            try std.testing.expectEqual(@as(u64, 1), db.core.identity_visibility.summary.?.live_ordinals);
+            try std.testing.expectEqual(@as(u64, 1), try db.primaryDocCount(a));
+        }
+        var reopened = try DB.open(a, directory.path(), PreparedAssemblyFixture.options);
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 1), reopened.core.identity_visibility.summary.?.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 1), reopened.core.table_catalog.row_count);
+        try std.testing.expectEqual(@as(u64, 1), try reopened.primaryDocCount(a));
+    }
+}
+
+test "db prepared transaction effects required assembly commit memory owns first-row facts through replay refresh" {
+    const a = std.testing.allocator;
+    const id: types.TxnId = @splat(211);
+    var directory = try TestDirectory.init("commit-memory-first-row");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), PreparedAssemblyFixture.options);
+    defer db.close();
+    try db.enablePreparedTransactionProtocol();
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        _ = try db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+    }
+    try db.writeTransaction(id, .{ .writes = &.{.{ .key = "first", .value = "{}" }} });
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var captured = try db.core.capturePreparedTransactionInputs(a, id, .deferred, null);
+        defer captured.deinit();
+        const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = captured.contract, .effects = .{} }, null);
+        defer a.free(frame);
+        try db.core.sealPreparedTransactionEffects(id, frame, .deferred, null);
+    }
+    var plan = try db.prepareTransactionAssembly(a, id, 19, null);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(u64, 1), plan.commit_state.visibility.?.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 1), plan.commit_state.table_catalog.?.row_count);
+    const old = db.core.identity_visibility.summary;
+    while (db.core.nextDerivedAppendSequence() < 10001) _ = db.core.reserveDerivedAppendSequence();
+    try db.refreshTransactionAssembly(&plan, null);
+    try std.testing.expectEqual(@as(u64, 10001), plan.commit_state.visibility.?.max_created_generation);
+    try std.testing.expectEqualDeep(old, db.core.identity_visibility.summary);
+    try plan.commit_state.validate(plan.bytes.writes, null);
+    const expected = plan.commit_state.visibility.?;
+    plan.commit_state.visibility.?.live_ordinals += 1;
+    try std.testing.expectError(error.PreparedEffectsMismatch, db.refreshTransactionAssembly(&plan, null));
+    plan.commit_state.visibility = expected;
+    try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 19, .propose);
+    try std.testing.expectEqualDeep(plan.commit_state.visibility, db.core.identity_visibility.summary);
+    try std.testing.expectEqualDeep(plan.commit_state.table_catalog.?, db.core.table_catalog);
+    try std.testing.expectEqual(@as(u64, 1), try db.primaryDocCount(a));
+}
+
+test "db prepared transaction effects required commit memory retirement never repeats a committed transform" {
+    const a = std.testing.allocator;
+    const Observer = struct {
+        cause: anyerror,
+        calls: usize = 0,
+        fn apply(ptr: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self.cause;
+        }
+    };
+    for ([_]bool{ false, true }) |relational| for ([_]anyerror{ error.PreparedGenerationChanged, error.PreparedReadSetChanged }) |cause| {
+        var directory = try TestDirectory.init("commit-memory-transform");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), PreparedAssemblyFixture.options);
+        defer db.close();
+        if (relational) try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "count", .path = "count", .column_type = .integer }} });
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"count\":1}" }}, .sync_level = .propose });
+        var observer: Observer = .{ .cause = cause };
+        try std.testing.expectError(cause, db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(.{
+            .transforms = &.{.{ .key = "row", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }},
+            .sync_level = .propose,
+        }, null, .{ .ptr = &observer, .apply = Observer.apply }));
+        try std.testing.expectEqual(@as(usize, 1), observer.calls);
+        const row = (try db.get(a, "row")).?;
+        defer a.free(row);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, row, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("count").?.integer);
+        try std.testing.expectEqual(@as(u64, 1), try db.primaryDocCount(a));
+    };
+}
+
+test "db prepared transaction effects required commit memory retains committed backlog quota after completion errors" {
+    const a = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{ .soft_limit_bytes = 1024, .hard_limit_bytes = 4096 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    var directory = try TestDirectory.init("commit-memory-backlog");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .resource_manager = &manager, .start_optional_runtimes = false, .start_independent_maintenance = false, .executor = .{ .backend = .io_threaded } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const Runtime = @import("derived/io_threaded_runtime.zig").DerivedRuntime;
+    const runtime: *Runtime = @ptrCast(@alignCast(db.executor.ptr));
+    const io = runtime.threaded.io();
+    runtime.mutex.lockUncancelable(io);
+    runtime.last_error_name = "InjectedPermanentFailure";
+    runtime.mutex.unlock(io);
+    const Observer = struct {
+        calls: usize = 0,
+        fn apply(ptr: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.Canceled;
+        }
+    };
+    var observer: Observer = .{};
+    var committed: usize = 0;
+    while (committed < 200) : (committed += 1) {
+        var buffer: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buffer, "committed-{d}", .{committed});
+        const sequence = db.core.nextDerivedAppendSequence();
+        db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(.{ .writes = &.{.{ .key = key, .value = "{\"search_text\":\"durable\"}" }}, .sync_level = .write }, null, .{ .ptr = &observer, .apply = Observer.apply }) catch |cause| switch (cause) {
+            error.Canceled => {
+                const row = (try db.get(a, key)).?;
+                defer a.free(row);
+                try std.testing.expectEqual(sequence + 1, db.core.nextDerivedAppendSequence());
+                try std.testing.expect(manager.sliceStats(.derived_backlog).used_bytes > 0);
+                continue;
+            },
+            error.ResourceBudgetExceeded => {
+                try std.testing.expect(committed > 0);
+                try std.testing.expectEqual(committed, observer.calls);
+                try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+                try std.testing.expect((try db.get(a, key)) == null);
+                try std.testing.expect(manager.sliceStats(.derived_backlog).used_bytes <= 4096);
+                try std.testing.expectEqual(@as(u64, @intCast(committed)), try db.primaryDocCount(a));
+                return;
+            },
+            else => return cause,
+        };
+        return error.TestUnexpectedResult;
+    }
+    return error.TestUnexpectedResult;
+}

@@ -617,7 +617,7 @@ fn decodeNamespace(raw: []const u8) !Namespace {
     };
 }
 
-fn encodeVisibilitySummary(summary: VisibilitySummary) [40]u8 {
+pub fn encodeVisibilitySummary(summary: VisibilitySummary) [40]u8 {
     var buf: [40]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], summary.live_ordinals, .big);
     std.mem.writeInt(u64, buf[8..16], summary.tombstone_ordinals, .big);

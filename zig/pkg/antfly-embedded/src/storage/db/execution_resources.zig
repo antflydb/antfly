@@ -1048,6 +1048,9 @@ pub const BatchExecutionOptions = struct {
     /// Native preparation-only exit before replay reservation or publication.
     /// Selected only for authoritative accepted transaction inputs.
     assembly: ?*@import("artifact_authored_acceptance.zig").Assembly = null,
+    /// Borrowed synchronous outcome marker, never retained by an assembly.
+    /// A reported commit/terminal resolution prohibits preparation retries.
+    primary_commit_observed: ?*bool = null,
     /// Pre-decision only. Never used to veto accepted durability or visibility.
     provider_context: ?@import("antfly_inference_execution_context").RequestContext = null,
     /// Used only after owned service holders retire, never passed to providers.

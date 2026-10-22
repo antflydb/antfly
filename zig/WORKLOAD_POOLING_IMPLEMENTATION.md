@@ -22698,3 +22698,71 @@ is retained in replay-claim-verified.json and replay-claim-v4.json/log in the
 cumulative receipts. Earlier diagnostic runs are retained and provide no final-
 source qualification. Full linked owner-image, object-engine, crash and cross-
 engine performance qualification remain open.
+
+### Owned commit-memory state and completion retirement
+
+Prepared assemblies now own scalar visibility-summary and table-catalog
+postimages. Capture checks the native producer's values against their last
+physical writes and retains indices into the owned batch. Dependency validation
+checks those witnesses before commit. Replay refresh updates the summary's native
+sequence fields alongside the physical bytes and coverage programs; historical
+generations and independent catalog generations remain unchanged. The state
+contains no borrowed request buffers or controls.
+
+After a successful primary outcome and retirement of preparation readers, the
+normal mutation path adopts these facts and clears obsolete visibility caches
+before fallible replication publication or committed-effects observers. A failed
+completion can therefore leave the caller with an error while queries and later
+writes still use the committed cardinality and visibility state. Range and reader
+floor adoption retain their existing position relative to preparation retirement.
+
+The same boundary transfers the admitted derived-backlog reservation to the
+executor's committed tracker. Completion failure can no longer cancel the quota
+for replay bytes already committed. The transfer uses the capacity reserved before
+commit and performs no allocation. A degraded producer still reaches the hard
+backlog limit even if every accepted write's observer fails.
+
+A synchronous per-invocation marker records an observed primary commit or terminal
+resolution. It propagates to an enclosing synchronous caller but is never retained
+by an assembly. The preparation retry wrapper preserves a completion error's
+identity while refusing to rerun an accepted batch, including when the error has a
+preparation-conflict name. Precommit conflicts retain their existing retry bound.
+This prevents internal replay of non-idempotent transforms after completion fails;
+it does not change public error or durability protocols.
+
+Native ABI 66 and storage-owner ABI 124 fence the expanded plan and private
+execution options. Durable encodings, reader floors and default activation are
+unchanged. This does not yet make a retained candidate directly executable or
+eligible for a PREPARE vote. Materialized derived/shadow effects and sync targets,
+complete live execution/route/DB ownership, minimum executable recovery resources,
+derived-log quota before voting, remaining counters/backend metadata, durable read
+guards, required-PREPARE drivers and broader scheduler qualification remain open.
+Strong required providers stay disabled and the full goal remains active. Full
+Linux qualification remains waived; Linux requires pinned Nix/glibc Zig.
+
+Pinned Debug qualification passes seven focused memory/retirement cases, 77
+required-PREPARE DB cases, four replay-binding cases, 51 runtime error/identity
+companions and five native ABI cases: 144 executions with no failures, skips or
+leaks. Document and relational tests populate both visibility caches, fail a
+post-commit observer, verify that it sees the committed empty state, then check
+later writes and reopen cardinality. Both preparation-conflict error names from
+a completion observer leave an increment applied once within the invocation.
+The production retry-wrapper fixture checks the observed-commit marker's parent
+handoff, memo/root ownership and refusal to retry an accepted error.
+
+Held first-row assemblies own table presence and visibility facts without changing
+live memory; sequence refresh rebinds their memory and physical generations, and
+mismatched scalar state rejects before publication. The helper tests check last-
+write witnesses, opaque non-native metadata, missing/mismatched postimages and
+every original construction/validation rejection. Existing allocation/checkpoint
+sweeps pass. A degraded-worker test repeatedly commits through observer errors
+until the 4 KiB backlog quota rejects another write before publication or sequence
+claim, proving that accepted replay retains its reservation.
+
+All 5,499 native/schema inputs are independently reverified against final source.
+Formatting, generated errors, the control catalog, whitespace and source-boundary
+checks pass. Evidence is retained in commit-memory-verified.json and
+commit-memory-v4.json/log in the cumulative receipts. Earlier diagnostic and
+intermediate runs are retained and supply no final-source qualification. Full
+linked owner-image, object-engine, crash and cross-engine performance
+qualification remain open.
