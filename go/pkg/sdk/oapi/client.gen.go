@@ -62263,7 +62263,7 @@ func (c *Client) ExecuteSQLWithBody(ctx context.Context, contentType string, bod
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // ExecuteSQL Execute a SQL statement
@@ -62290,7 +62290,7 @@ func (c *Client) ExecuteSQL(ctx context.Context, body ExecuteSQLJSONRequestBody,
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // OpenSQLConnectionWithBody Open a durable idle HTTP SQL connection
@@ -62364,7 +62364,7 @@ func (c *Client) PrepareSQLWithBody(ctx context.Context, contentType string, bod
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // PrepareSQL Create a durable prepared SQL resource
@@ -62383,7 +62383,7 @@ func (c *Client) PrepareSQL(ctx context.Context, body PrepareSQLJSONRequestBody,
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // ClosePreparedSQL Release a durable prepared SQL resource
@@ -62398,7 +62398,7 @@ func (c *Client) ClosePreparedSQL(ctx context.Context, preparedId string, params
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // ExecutePreparedSQLWithBody Execute a durable prepared SQL resource
@@ -62417,7 +62417,7 @@ func (c *Client) ExecutePreparedSQLWithBody(ctx context.Context, preparedId stri
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // ExecutePreparedSQL Execute a durable prepared SQL resource
@@ -62436,7 +62436,7 @@ func (c *Client) ExecutePreparedSQL(ctx context.Context, preparedId string, body
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeSQLRequest(c.Client, req)
 }
 
 // GetStatus Get cluster status
@@ -74213,7 +74213,7 @@ func NewCreateQuerySourceRequestWithBody(server string, sourceName string, conte
 // NewExecuteSQLRequest calls the generic ExecuteSQL builder with application/json body
 func NewExecuteSQLRequest(server string, body ExecuteSQLJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalSQLRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -74327,7 +74327,7 @@ func NewCloseSQLConnectionRequest(server string, connectionId string) (*http.Req
 // NewPrepareSQLRequest calls the generic PrepareSQL builder with application/json body
 func NewPrepareSQLRequest(server string, body PrepareSQLJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalSQLRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -74414,7 +74414,7 @@ func NewClosePreparedSQLRequest(server string, preparedId string, params *CloseP
 // NewExecutePreparedSQLRequest calls the generic ExecutePreparedSQL builder with application/json body
 func NewExecutePreparedSQLRequest(server string, preparedId string, body ExecutePreparedSQLJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalSQLRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -125037,7 +125037,7 @@ func ParseCreateQuerySourceResponse(rsp *http.Response) (*CreateQuerySourceRespo
 
 // ParseExecuteSQLResponse parses an HTTP response from a ExecuteSQLWithResponse call
 func ParseExecuteSQLResponse(rsp *http.Response) (*ExecuteSQLResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readSQLResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -125193,7 +125193,7 @@ func ParseCloseSQLConnectionResponse(rsp *http.Response) (*CloseSQLConnectionRes
 
 // ParsePrepareSQLResponse parses an HTTP response from a PrepareSQLWithResponse call
 func ParsePrepareSQLResponse(rsp *http.Response) (*PrepareSQLResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readSQLResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -125226,7 +125226,7 @@ func ParsePrepareSQLResponse(rsp *http.Response) (*PrepareSQLResponse, error) {
 
 // ParseClosePreparedSQLResponse parses an HTTP response from a ClosePreparedSQLWithResponse call
 func ParseClosePreparedSQLResponse(rsp *http.Response) (*ClosePreparedSQLResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readSQLResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -125259,7 +125259,7 @@ func ParseClosePreparedSQLResponse(rsp *http.Response) (*ClosePreparedSQLRespons
 
 // ParseExecutePreparedSQLResponse parses an HTTP response from a ExecutePreparedSQLWithResponse call
 func ParseExecutePreparedSQLResponse(rsp *http.Response) (*ExecutePreparedSQLResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readSQLResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
