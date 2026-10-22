@@ -190,7 +190,7 @@ func (fs *FilesystemSource) Traverse(ctx context.Context) (<-chan ContentItem, <
 // can match the include pattern, so the walk only prunes directories that
 // cannot lead to a match.
 func couldContainIncludeMatch(pattern, relDir string) bool {
-	if relDir == "." || strings.Contains(pattern, "**") {
+	if relDir == "." || strings.Contains(pattern, "**") || braceSpansSlash(pattern) {
 		return true
 	}
 	patternParts := strings.Split(pattern, "/")
@@ -200,4 +200,28 @@ func couldContainIncludeMatch(pattern, relDir string) bool {
 	}
 	matched, err := doublestar.Match(strings.Join(patternParts[:len(dirParts)], "/"), strings.Join(dirParts, "/"))
 	return err != nil || matched
+}
+
+// braceSpansSlash reports whether a brace alternative in pattern contains a
+// slash. Alternatives can then have different depths, so splitting the pattern
+// on "/" no longer lines up with directory levels.
+func braceSpansSlash(pattern string) bool {
+	depth := 0
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '\\':
+			i++
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		case '/':
+			if depth > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }

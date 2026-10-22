@@ -31,6 +31,7 @@ func TestFilesystemSourceIncludePatterns(t *testing.T) {
 		"docs/guide.md",
 		"docs/api/reference.md",
 		"other/skip.md",
+		"other/guide/file.md",
 	} {
 		fullPath := filepath.Join(baseDir, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
@@ -65,6 +66,11 @@ func TestFilesystemSourceIncludePatterns(t *testing.T) {
 			name:     "recursive wildcard",
 			patterns: []string{"docs/**/*.md"},
 			want:     []string{"docs/api/reference.md", "docs/guide.md"},
+		},
+		{
+			name:     "brace alternatives with different depths",
+			patterns: []string{"{docs/api,other}/guide/*.md"},
+			want:     []string{"other/guide/file.md"},
 		},
 	}
 
