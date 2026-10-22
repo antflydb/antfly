@@ -3155,6 +3155,8 @@ pub const DB = struct {
     graph_metric_idle_auto_options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions,
     graph_metric_idle_degree_canary_options: index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions,
     resolver_workers_enabled: bool,
+    propagation_initialization_mutex: std.atomic.Mutex = .unlocked,
+    propagation_closing: std.atomic.Value(bool) = .init(false),
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_owner: EnrichmentOwner = .{},
@@ -5830,6 +5832,11 @@ pub const DB = struct {
 
     pub fn initResolutionRuntime(self: *DB) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("initResolutionRuntime", .{self});
+        if (self.propagation_closing.load(.acquire)) return error.Canceled;
+        lockAtomic(&self.propagation_initialization_mutex);
+        defer self.propagation_initialization_mutex.unlock();
+        if (self.propagation_closing.load(.acquire)) return error.Canceled;
+        if (self.resolution_runtime != null) return;
         // Always constructed so catalog/status/runUntilIdle APIs can observe
         // and drain replay. The background worker is started lazily only while
         // the resolver catalog is non-empty.
@@ -5873,6 +5880,11 @@ pub const DB = struct {
 
     pub fn initPromotionRuntime(self: *DB) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("initPromotionRuntime", .{self});
+        if (self.propagation_closing.load(.acquire)) return error.Canceled;
+        lockAtomic(&self.propagation_initialization_mutex);
+        defer self.propagation_initialization_mutex.unlock();
+        if (self.propagation_closing.load(.acquire)) return error.Canceled;
+        if (self.promotion_runtime != null) return;
         // Always constructed (like the resolution runtime) so synchronous
         // drains and status APIs remain available. The background worker is
         // started lazily only while resolver replay can produce promotion work.
@@ -6229,6 +6241,13 @@ pub const DB = struct {
         try self.local_execution.schema_reconcile.stopWithAdmission(self.backend_runtime, self.schema_reconcile_owner_id, original);
         try self.group_source_owner.stopWithAdmission(self.backend_runtime.io(), original);
         if (self.transaction_runtime) |runtime| try runtime.stopWithAdmission(original);
+        self.propagation_closing.store(true, .release);
+        try @import("../../common/cleanup_wait.zig").lockAtomic(&self.propagation_initialization_mutex, self.backend_runtime.io(), original);
+        const resolution = self.resolution_runtime;
+        const promotion = self.promotion_runtime;
+        self.propagation_initialization_mutex.unlock();
+        if (resolution) |runtime| try runtime.stopWithAdmission(original);
+        if (promotion) |runtime| try runtime.stopWithAdmission(original);
         try self.local_execution.source_publication.stopWithAdmission(self.backend_runtime, original);
         try self.local_execution.online_merge_reader.closeWithAdmission(self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io, original);
     }
@@ -6243,6 +6262,9 @@ pub const DB = struct {
     }
 
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
+        self.propagation_closing.store(true, .release);
+        lockAtomic(&self.propagation_initialization_mutex);
+        self.propagation_initialization_mutex.unlock();
         self.stopRetainedPreparations();
         if (self.last_run_until_idle_no_progress) |*diagnostic| diagnostic.deinit(self.alloc);
         self.last_run_until_idle_no_progress = null;

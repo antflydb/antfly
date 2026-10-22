@@ -2624,6 +2624,7 @@ pub const ResolutionRuntime = struct {
     target_sequence: @import("antfly_platform").atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
+    lifecycle: @import("propagation_lifecycle.zig").State = .{},
     replay_progress: ?ReplayProgress = null,
     // Retain one decoded record across quanta: repeated small waits must not
     // reparse an archive-sized batch for every source artifact.
@@ -2678,6 +2679,7 @@ pub const ResolutionRuntime = struct {
 
     pub fn deinit(self: *ResolutionRuntime) void {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionDeinit", .{self}) catch @panic("incompatible storage owner");
+        self.lifecycle.closing.store(true, .release);
         self.stop();
         self.clearPendingReplayRecord();
         self.store_handle.deinit();
@@ -2722,8 +2724,10 @@ pub const ResolutionRuntime = struct {
     /// under `catch_up_mutex` so it cannot tear against an in-flight catch-up;
     /// the next catch-up window then blocks against the new source.
     pub fn setCandidateSource(self: *ResolutionRuntime, src: ?CandidateSource) void {
+        if (self.lifecycle.closing.load(.acquire)) return;
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return;
         self.candidate_source = src;
         self.wakeWorker();
     }
@@ -2732,6 +2736,9 @@ pub const ResolutionRuntime = struct {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionStart", .{self});
         // Without io there is no background thread; the stage is then driven
         // synchronously via catchUp (e.g. from runUntilIdle).
+        self.lifecycle.lock();
+        defer self.lifecycle.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         const io = self.io orelse return;
         self.worker_mutex.lockUncancelable(io);
         defer self.worker_mutex.unlock(io);
@@ -2744,6 +2751,13 @@ pub const ResolutionRuntime = struct {
 
     pub fn stop(self: *ResolutionRuntime) void {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionStop", .{self}) catch @panic("incompatible storage owner");
+        self.lifecycle.lock();
+        if (self.lifecycle.closing.load(.acquire)) {
+            self.lifecycle.unlock();
+            self.lifecycle.finish(&self.future, self.io, &self.shutdown_flag, &self.catch_up_mutex, &self.worker_started);
+            return;
+        }
+        defer self.lifecycle.unlock();
         self.shutdown_flag.store(true, .release);
         if (self.io) |io| {
             self.worker_mutex.lockUncancelable(io);
@@ -2757,6 +2771,19 @@ pub const ResolutionRuntime = struct {
             self.future = null;
         }
         self.worker_started.store(false, .release);
+    }
+
+    pub fn stopWithAdmission(self: *ResolutionRuntime, original: @import("../../common/read_admission.zig").Port) !void {
+        if (comptime @import("../engine_selection.zig").enabled) {
+            var relay: @import("../../common/read_admission.zig").ExecutionErrorRelay = .{};
+            const borrowed = try relay.bind(original);
+            @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionStopWithAdmission", .{ self, borrowed }) catch |cause| return relay.errors.rejection orelse cause;
+            if (relay.errors.rejection) |cause| return cause;
+            return;
+        }
+        self.lifecycle.closing.store(true, .release);
+        self.shutdown_flag.store(true, .release);
+        try self.lifecycle.stopWithAdmission(&self.future, self.io, &self.shutdown_flag, &self.catch_up_mutex, &self.worker_started, original);
     }
 
     fn wakeWorker(self: *ResolutionRuntime) void {
@@ -2775,8 +2802,10 @@ pub const ResolutionRuntime = struct {
     /// advances only after those durable writes.
     pub fn catchUp(self: *ResolutionRuntime) !void {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUp", .{self});
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         return self.catchUpLocked(false, default_max_records_per_window);
     }
 
@@ -2784,8 +2813,10 @@ pub const ResolutionRuntime = struct {
     /// artifacts, preserving all sibling resolver decisions for each source.
     pub fn catchUpOnce(self: *ResolutionRuntime, deadline_ns: u64) !void {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUpOnce", .{ self, deadline_ns });
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         if (!self.catch_up_mutex.tryLock()) return;
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         if (replayNowNs() >= deadline_ns) return;
         const applied = self.applied_sequence.load(.acquire);
         if (applied >= self.target_sequence.load(.acquire)) {
@@ -2959,8 +2990,10 @@ pub const ResolutionRuntime = struct {
     /// extraction artifacts in bounded windows into the normal replay pipeline.
     pub fn requestReresolveBacklog(self: *ResolutionRuntime) !void {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionRequestReresolveBacklog", .{self});
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         defer self.notifyBackfill();
         const existing = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_resume_key);
         defer if (existing) |key| self.alloc.free(key);
@@ -2978,8 +3011,10 @@ pub const ResolutionRuntime = struct {
     /// backfill dirty but the bounded reresolve backlog has not fully drained.
     pub fn hasReresolveBacklog(self: *ResolutionRuntime) !bool {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionHasReresolveBacklog", .{self});
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         return try hasDurableReresolveBacklog(&self.store_handle.store);
     }
 
@@ -2988,8 +3023,10 @@ pub const ResolutionRuntime = struct {
     /// record and lets `catchUp` process it through the normal stage.
     pub fn runReresolveBacklogWindow(self: *ResolutionRuntime) !ReresolveEnqueueResult {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionRunReresolveBacklogWindow", .{self});
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         return self.runReresolveBacklogWindowLocked(null);
     }
 
@@ -3063,8 +3100,10 @@ pub const ResolutionRuntime = struct {
     /// Caller owns the result (`freePendingReviews`).
     pub fn pendingReviews(self: *ResolutionRuntime, alloc: std.mem.Allocator) ![]PendingReview {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionPendingReviews", .{ self, alloc });
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         const resolvers = try self.index_manager.listResolvers(self.alloc);
         defer {
             for (resolvers) |*cfg| cfg.deinit(self.alloc);
@@ -3078,11 +3117,12 @@ pub const ResolutionRuntime = struct {
     }
 
     fn workerStep(self: *ResolutionRuntime) ?u64 {
-        if (self.shutdown_flag.load(.acquire)) return null;
+        if (self.lifecycle.closing.load(.acquire) or self.shutdown_flag.load(.acquire)) return null;
         if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire) and
             !self.backfill_pending.load(.acquire)) return null;
         if (!self.catch_up_mutex.tryLock()) return 25;
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return null;
         self.catchUpLocked(true, default_max_records_per_window) catch |err| {
             std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
             return 50;

@@ -2197,3 +2197,11 @@ fn writeReplicatedTransactionWithBindingAtOrderedReceipt(self: *DB, txn_id: type
 fn sealReplicatedTransactionEffectsWithBindingAtOrderedReceipt(self: *DB, txn_id: types.TxnId, frame: []const u8, mode: @import("db/prepared_transaction_effects.zig").Mode, identity: db.OrderedApplyReceipt, scope: ?[32]u8, binding: ?@import("db/prepared_transaction_effects.zig").Binding) engine.Outcome(void) {
     return .{ .value = self.sealReplicatedTransactionEffectsWithBindingAtOrderedReceipt(txn_id, frame, mode, identity, scope, binding) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+
+fn resolutionStopWithAdmission(self: *@import("db/resolution_runtime.zig").ResolutionRuntime, original: @import("../common/read_admission.zig").Port) engine.Outcome(void) {
+    return .{ .value = self.stopWithAdmission(original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
+}
+
+fn promotionStopWithAdmission(self: *@import("db/promotion_runtime.zig").PromotionRuntime, original: @import("../common/read_admission.zig").Port) engine.Outcome(void) {
+    return .{ .value = self.stopWithAdmission(original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
+}

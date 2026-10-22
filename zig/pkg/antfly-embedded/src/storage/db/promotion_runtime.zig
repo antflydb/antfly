@@ -646,6 +646,7 @@ pub const PromotionRuntime = struct {
     error_count: @import("antfly_platform").atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
+    lifecycle: @import("propagation_lifecycle.zig").State = .{},
     worker_started: std.atomic.Value(bool) = .init(false),
     // A 32-bit generation doubles as the std.Io futex word. Advancing it before
     // every wake makes the predicate check + wait sequence race-free: a wake
@@ -697,6 +698,7 @@ pub const PromotionRuntime = struct {
 
     pub fn deinit(self: *PromotionRuntime) void {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionDeinit", .{self}) catch @panic("incompatible storage owner");
+        self.lifecycle.closing.store(true, .release);
         self.stop();
         self.store_handle.deinit();
         self.* = undefined;
@@ -749,8 +751,10 @@ pub const PromotionRuntime = struct {
     /// Inject (or clear) the source-shard promotion owner. Serialized with
     /// catch-up so ownership cannot change midway through a promotion window.
     pub fn setOwner(self: *PromotionRuntime, owner: ?PromotionOwner) void {
+        if (self.lifecycle.closing.load(.acquire)) return;
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return;
         self.owner = owner;
         self.wakeWorker();
     }
@@ -758,8 +762,10 @@ pub const PromotionRuntime = struct {
     /// Inject (or clear) the entity sink after construction, taken under
     /// `catch_up_mutex` so it cannot tear against an in-flight catch-up.
     pub fn setSink(self: *PromotionRuntime, sink: ?EntitySink) void {
+        if (self.lifecycle.closing.load(.acquire)) return;
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return;
         self.sink = sink;
         self.sink_available.store(sink != null, .release);
         if (sink != null) self.missing_sink_blocked.store(false, .release);
@@ -768,6 +774,9 @@ pub const PromotionRuntime = struct {
 
     pub fn start(self: *PromotionRuntime) !void {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionStart", .{self});
+        self.lifecycle.lock();
+        defer self.lifecycle.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         const io = self.io orelse return;
         self.worker_mutex.lockUncancelable(io);
         defer self.worker_mutex.unlock(io);
@@ -780,6 +789,13 @@ pub const PromotionRuntime = struct {
 
     pub fn stop(self: *PromotionRuntime) void {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionStop", .{self}) catch @panic("incompatible storage owner");
+        self.lifecycle.lock();
+        if (self.lifecycle.closing.load(.acquire)) {
+            self.lifecycle.unlock();
+            self.lifecycle.finish(&self.future, self.io, &self.shutdown_flag, &self.catch_up_mutex, &self.worker_started);
+            return;
+        }
+        defer self.lifecycle.unlock();
         self.shutdown_flag.store(true, .release);
         if (self.io) |io| {
             self.signalWorker(io);
@@ -791,6 +807,20 @@ pub const PromotionRuntime = struct {
             self.future = null;
         }
         self.worker_started.store(false, .release);
+    }
+
+    pub fn stopWithAdmission(self: *PromotionRuntime, original: @import("../../common/read_admission.zig").Port) !void {
+        if (comptime @import("../engine_selection.zig").enabled) {
+            var relay: @import("../../common/read_admission.zig").ExecutionErrorRelay = .{};
+            const borrowed = try relay.bind(original);
+            @import("antfly_source_root").antfly_sources.storage_engine.call("promotionStopWithAdmission", .{ self, borrowed }) catch |cause| return relay.errors.rejection orelse cause;
+            if (relay.errors.rejection) |cause| return cause;
+            return;
+        }
+        self.lifecycle.closing.store(true, .release);
+        self.shutdown_flag.store(true, .release);
+        if (self.io) |io| self.signalWorker(io);
+        try self.lifecycle.stopWithAdmission(&self.future, self.io, &self.shutdown_flag, &self.catch_up_mutex, &self.worker_started, original);
     }
 
     fn wakeWorker(self: *PromotionRuntime) void {
@@ -839,8 +869,10 @@ pub const PromotionRuntime = struct {
     /// durable upserts.
     pub fn catchUp(self: *PromotionRuntime) !void {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionCatchUp", .{self});
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return error.Canceled;
         return self.catchUpLocked(false);
     }
 
@@ -914,10 +946,11 @@ pub const PromotionRuntime = struct {
     }
 
     fn workerStep(self: *PromotionRuntime) ?u64 {
-        if (self.shutdown_flag.load(.acquire)) return null;
+        if (self.lifecycle.closing.load(.acquire) or self.shutdown_flag.load(.acquire)) return null;
         if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire)) return null;
         if (!self.catch_up_mutex.tryLock()) return 25;
         defer self.catch_up_mutex.unlock();
+        if (self.lifecycle.closing.load(.acquire)) return null;
         const generation = self.worker_wake_generation.load(.acquire);
         if (generation != self.scheduled_retry_generation) {
             self.scheduled_retry_generation = generation;
