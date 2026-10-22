@@ -7214,3 +7214,67 @@ def test_cohort_stages_and_symbolic_support_keep_million_row_queries_bounded(gra
     assert result["rows"] == expected["rows"]
     assert result["stats"]["intermediate_states"] < 2000
     assert result["stats"]["memory_bytes"] < 1 << 20
+
+
+@pytest.mark.parametrize(
+    ("query", "control"),
+    [
+        (
+            "UNWIND range(1,1000000) AS x WITH x%10 AS g ORDER BY g LIMIT 5 RETURN count(*),avg(g)",
+            "UNWIND [0,0,0,0,0] AS g RETURN count(*),avg(g)",
+        ),
+        (
+            "UNWIND range(1,1000000) AS x WITH x%10 AS g LIMIT 5 RETURN count(*),avg(g)",
+            "UNWIND range(1,5) AS g RETURN count(*),avg(g)",
+        ),
+        (
+            "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y RETURN min(y),max(y)",
+            "UNWIND range(1,1000000) AS y RETURN min(y),max(y)",
+        ),
+        (
+            "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y RETURN sum(y)",
+            "UNWIND range(1,1000000) AS y RETURN sum(y)",
+        ),
+        (
+            "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y ORDER BY y LIMIT 5 RETURN avg(y)",
+            "UNWIND range(1,5) AS y RETURN avg(y)",
+        ),
+        (
+            "UNWIND range(1,1000000) AS x RETURN collect(DISTINCT x%10)",
+            "UNWIND range(1,9)+range(0,0) AS x RETURN collect(DISTINCT x)",
+        ),
+        ("UNWIND range(1,1000000) AS x RETURN sum(DISTINCT x%10)", "UNWIND range(0,9) AS x RETURN sum(x)"),
+        (
+            "UNWIND range(1,1000000,2)+range(2,1000000,2) AS x WITH x ORDER BY x LIMIT 129 RETURN avg(x)",
+            "UNWIND range(1,129) AS x RETURN avg(x)",
+        ),
+        (
+            "WITH reverse(range(7,8)) AS zs UNWIND zs AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5",
+            "UNWIND [8,7] AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5",
+        ),
+        (
+            "WITH 10 AS m UNWIND range(1,1000000) AS x WITH m,x RETURN x%m AS g,count(*) ORDER BY g",
+            "UNWIND range(1,1000000) AS x RETURN x%10 AS g,count(*) ORDER BY g",
+        ),
+        (
+            "UNWIND range(1,1000000) AS x WITH x%10 AS g ORDER BY g SKIP 999995 LIMIT 5 RETURN count(*),avg(g)",
+            "UNWIND [9,9,9,9,9] AS g RETURN count(*),avg(g)",
+        ),
+        (
+            "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y ORDER BY y DESC SKIP 500000 LIMIT 129 RETURN avg(y)",
+            "UNWIND range(500000,499872,-1) AS y RETURN avg(y)",
+        ),
+        (
+            "WITH reverse(range(7,8)) AS zs UNWIND zs AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY avg(x),i LIMIT 5",
+            "UNWIND range(1,5) AS i UNWIND [0,1,0,0,1,0] AS x RETURN i,avg(x) ORDER BY i",
+        ),
+    ],
+)
+def test_symbolic_set_reducers_and_weighted_cohort_windows_stay_bounded(graph_db, query, control):
+    result = graph_db.cypher_json(
+        "g", {"query": query, "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20}}
+    )
+    expected = graph_db.cypher_json("g", {"query": control})
+    assert result["rows"] == expected["rows"]
+    assert result["stats"]["intermediate_states"] < 2000
+    assert result["stats"]["memory_bytes"] < 1 << 20

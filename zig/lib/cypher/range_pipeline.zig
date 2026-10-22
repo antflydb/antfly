@@ -159,10 +159,9 @@ pub const Context = struct {
     pub const Page = struct { skip: u128 = 0, limit: ?u128 = null };
     /// Select the page's first value by exact bag rank, then merge only the
     /// bounded retained rows. Duplicate values retain segment encounter order.
-    fn sortedPage(self: *Context, ascending: bool, page: Page) !bool {
+    pub fn orderedPage(self: *Context, ascending: bool, page: Page, distinct: bool) !bool {
         const limit = page.limit orelse return false;
-        if (limit > 128) return false;
-        const length = self.domainLength();
+        const length = if (distinct) (try @import("range.zig").distinctCardinalityWork(self.a, self.ranges(), self.ptr, self.charge)) orelse return false else self.domainLength();
         if (page.skip >= length or limit == 0) {
             self.setRanges(&.{});
             return true;
@@ -178,9 +177,19 @@ pub const Context = struct {
         while (low < high) {
             const middle = low + @divTrunc(high - low, 2);
             var count: u128 = 0;
-            for (self.ranges()) |part| {
-                try self.charge(self.ptr, 1);
-                count += countBelow(part, middle);
+            if (distinct) {
+                var clipped: std.ArrayList(Range) = .empty;
+                for (self.ranges()) |part| {
+                    try self.charge(self.ptr, 1);
+                    const size = countBelow(part, middle);
+                    if (size != 0) try clipped.append(self.a, subrange(part, if (part.step > 0) 0 else part.length - size, size));
+                }
+                count = (try @import("range.zig").distinctCardinalityWork(self.a, clipped.items, self.ptr, self.charge)) orelse return false;
+            } else {
+                for (self.ranges()) |part| {
+                    try self.charge(self.ptr, 1);
+                    count += countBelow(part, middle);
+                }
             }
             if (count < rank) low = middle + 1 else high = middle;
         }
@@ -198,7 +207,7 @@ pub const Context = struct {
             preceding += before;
             try cursors.append(self.a, .{ .part = part, .position = before });
         }
-        var tie_skip = page.skip - preceding;
+        var tie_skip = if (distinct) 0 else page.skip - preceding;
         var output: std.ArrayList(Range) = .empty;
         const keep = @min(limit, length - page.skip);
         while (output.items.len < keep) {
@@ -211,7 +220,11 @@ pub const Context = struct {
             }
             const slot = choice orelse return false;
             const value = cursors.items[slot].part.at(cursors.items[slot].position).integer;
-            cursors.items[slot].position += 1;
+            if (distinct) {
+                for (cursors.items) |*cursor| if (cursor.position < cursor.part.length and cursor.part.at(cursor.position).integer == value) {
+                    cursor.position += 1;
+                };
+            } else cursors.items[slot].position += 1;
             if (tie_skip != 0) {
                 tie_skip -= 1;
                 continue;
@@ -423,6 +436,7 @@ pub const Context = struct {
         }
         var order_scope = self.*;
         try self.setBindings(output.items);
+        var symbolic_distinct = false;
         if (projection.distinct and self.domainLength() != 0) {
             var varying = false;
             for (output.items) |entry| {
@@ -436,7 +450,7 @@ pub const Context = struct {
             }
             if (varying) {
                 if (self.periodic) return false;
-                if (!try self.deduplicate()) return false;
+                if (projection.order.len != 0 and page != null and page.?.limit != null) symbolic_distinct = true else if (!try self.deduplicate()) return false;
             } else {
                 const selected = try self.a.alloc(Range, 1);
                 selected[0] = .{ .start = self.firstValue().?.integer, .step = 1, .length = 1 };
@@ -452,11 +466,15 @@ pub const Context = struct {
                     if (direction == null and key.integer.scale != 0) direction = (key.integer.scale > 0) != order.descending;
                 } else if (key.scalar == .number and !std.math.isFinite(key.scalar.number)) return false;
             }
-            if (direction) |ascending| if (!try self.orderRanges(ascending)) {
-                if (page) |window_page| return self.sortedPage(ascending, window_page);
-                return false;
-            };
+            if (direction) |ascending| {
+                if (symbolic_distinct) return self.orderedPage(ascending, page.?, true);
+                if (!try self.orderRanges(ascending)) {
+                    if (page) |window_page| return self.orderedPage(ascending, window_page, false);
+                    return false;
+                }
+            }
         }
+        if (symbolic_distinct and !try self.deduplicate()) return false;
         if (page) |window_page| try self.paginate(window_page.skip, window_page.limit);
         return true;
     }

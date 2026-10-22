@@ -7346,6 +7346,10 @@ test "ordered lineage records logical DISTINCT CALL filter and singleton prefix 
         .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT x%10 AS g ORDER BY g LIMIT 5 RETURN avg(g)", .counts = &.{ 1000000, 5 } },
         .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT (x%10)%2 AS g WITH g ORDER BY g LIMIT 1 RETURN avg(g)", .counts = &.{ 1000000, 2, 1 } },
         .{ .text = "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y RETURN count(*)", .counts = &.{ 1333334, 1000000 } },
+        .{ .text = "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y RETURN sum(y),min(y)", .counts = &.{ 1333334, 1000000 } },
+        .{ .text = "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y ORDER BY y LIMIT 5 RETURN avg(y)", .counts = &.{ 1333334, 5 } },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x%10 AS g ORDER BY g LIMIT 5 RETURN avg(g)", .counts = &.{ 1000000, 5 } },
+        .{ .text = "WITH reverse(range(7,8)) AS zs UNWIND zs AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5", .counts = &.{ 2, 2, 2000000, 6000000 } },
         .{ .text = "UNWIND range(1,1000000,2)+range(2,1000000,2) AS x WITH x ORDER BY x LIMIT 5 RETURN avg(x)", .counts = &.{ 1000000, 5 } },
         .{ .text = "UNWIND range(7,8) AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY avg(x),i LIMIT 5", .counts = &.{ 2, 2000000, 6000000 } },
         .{ .text = "UNWIND range(1,1000000) AS x WITH x SKIP 999995 LIMIT 5 RETURN avg(x)", .counts = &.{ 1000000, 5 } },
@@ -7395,6 +7399,10 @@ test "ordered lineage programs release allocations after proof and packet failur
         "UNWIND range(1,20) AS x WITH DISTINCT x%3 AS g RETURN g,count(*) ORDER BY g LIMIT 2",
         "UNWIND [7,8] AS z UNWIND range(20,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) AS a ORDER BY a,i LIMIT 2",
         "UNWIND range(1,20) AS x WITH DISTINCT x+1 AS y CALL {RETURN 7 AS z} RETURN avg(y)",
+        "UNWIND range(1,140) AS x WITH x%3 AS g ORDER BY g SKIP 40 LIMIT 3 RETURN avg(g),collect(g)",
+        "UNWIND range(1,450,3)+range(1,450) AS x WITH DISTINCT x AS y RETURN sum(y),min(y),max(y)",
+        "UNWIND range(1,450,3)+range(1,450) AS x WITH DISTINCT x AS y ORDER BY y SKIP 40 LIMIT 3 RETURN avg(y)",
+        "WITH reverse(range(7,8)) AS zs UNWIND zs AS z UNWIND range(5,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 2",
         "UNWIND range(-20,0)+range(1,20) AS x WITH x WHERE x<3 OR x>17 RETURN count(*),sum(x),avg(x)",
         "UNWIND range(1,20) AS x WITH x+1 AS y RETURN y,count(*) ORDER BY y LIMIT 2",
         "UNWIND [7] AS z UNWIND range(20,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 2",
@@ -7420,4 +7428,96 @@ test "ordered lineage singleton probes preserve nested CALL recursion limits" {
         defer result.deinit();
         try std.testing.expectEqual(@as(f64, 11.5), result.rows[0][0].number);
     }
+}
+
+test "symbolic set reducers and weighted cohort windows stay bounded" {
+    const a = std.testing.allocator;
+    for ([_]struct { text: []const u8, control: []const u8 }{
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x%10 AS g ORDER BY g LIMIT 5 RETURN count(*),avg(g)", .control = "UNWIND [0,0,0,0,0] AS g RETURN count(*),avg(g)" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x%10 AS g LIMIT 5 RETURN count(*),avg(g)", .control = "UNWIND range(1,5) AS g RETURN count(*),avg(g)" },
+        .{ .text = "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y RETURN min(y),max(y)", .control = "UNWIND range(1,1000000) AS y RETURN min(y),max(y)" },
+        .{ .text = "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y RETURN sum(y)", .control = "UNWIND range(1,1000000) AS y RETURN sum(y)" },
+        .{ .text = "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y ORDER BY y LIMIT 5 RETURN avg(y)", .control = "UNWIND range(1,5) AS y RETURN avg(y)" },
+        .{ .text = "UNWIND range(1,1000000) AS x RETURN collect(DISTINCT x%10)", .control = "UNWIND range(1,9)+range(0,0) AS x RETURN collect(DISTINCT x)" },
+        .{ .text = "UNWIND range(1,1000000) AS x RETURN sum(DISTINCT x%10)", .control = "UNWIND range(0,9) AS x RETURN sum(x)" },
+        .{ .text = "UNWIND range(1,1000000,2)+range(2,1000000,2) AS x WITH x ORDER BY x LIMIT 129 RETURN avg(x)", .control = "UNWIND range(1,129) AS x RETURN avg(x)" },
+        .{ .text = "WITH reverse(range(7,8)) AS zs UNWIND zs AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5", .control = "UNWIND [8,7] AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5" },
+        .{ .text = "WITH 10 AS m UNWIND range(1,1000000) AS x WITH m,x RETURN x%m AS g,count(*) ORDER BY g", .control = "UNWIND range(1,1000000) AS x RETURN x%10 AS g,count(*) ORDER BY g" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x%10 AS g ORDER BY g SKIP 999995 LIMIT 5 RETURN count(*),avg(g)", .control = "UNWIND [9,9,9,9,9] AS g RETURN count(*),avg(g)" },
+        .{ .text = "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y ORDER BY y DESC SKIP 500000 LIMIT 129 RETURN avg(y)", .control = "UNWIND range(500000,499872,-1) AS y RETURN avg(y)" },
+        .{ .text = "WITH reverse(range(7,8)) AS zs UNWIND zs AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY avg(x),i LIMIT 5", .control = "UNWIND range(1,5) AS i UNWIND [0,1,0,0,1,0] AS x RETURN i,avg(x) ORDER BY i" },
+    }) |item| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, item.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var reference = try c.compile(a, item.control, .{}, &diagnostic);
+        defer reference.deinit();
+        var fixture: Fixture = .{};
+        var result = runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 }) catch |err| {
+            std.debug.print("\n{s}\n", .{item.text});
+            return err;
+        };
+        defer result.deinit();
+        var expected = try runtime.execute(a, fixture.backend(), graph, &reference, &.{}, .{});
+        defer expected.deinit();
+        try std.testing.expectEqualDeep(expected.rows, result.rows);
+    }
+}
+
+test "set summaries and weighted ranks preserve encounters scopes and failures" {
+    const a = std.testing.allocator;
+    for ([_]struct { source: []const u8, first: i64, step: i64 }{
+        .{ .source = "range(1,450)", .first = 1, .step = 1 },
+        .{ .source = "range(450,1,-1)", .first = 450, .step = -1 },
+        .{ .source = "range(-225,224)", .first = -225, .step = 1 },
+    }) |source| {
+        var values: [450]i64 = undefined;
+        for (&values, 0..) |*value, index| value.* = source.first + @as(i64, @intCast(index)) * source.step;
+        const literal = try std.json.Stringify.valueAlloc(a, values, .{});
+        defer a.free(literal);
+        for ([_][]const u8{
+            "WITH x%3 AS g ORDER BY g SKIP 140 LIMIT 9 RETURN count(*),sum(g),avg(g),collect(g)",
+            "WITH x%3 AS g ORDER BY g DESC LIMIT 5 RETURN collect(g)",
+            "WITH x%3 AS g ORDER BY 0 SKIP 440 LIMIT 20 RETURN collect(g)",
+            "WITH x%3 AS g ORDER BY g SKIP 1000 LIMIT 1 RETURN count(*),collect(g)",
+            "RETURN collect(DISTINCT x%3),count(*),sum(x)",
+            "RETURN x%2 AS g,collect(DISTINCT x%3),count(*) ORDER BY g",
+            "WITH x%3 AS g ORDER BY 1/0 LIMIT 1 RETURN count(*)",
+            "WITH x%3 AS g ORDER BY g LIMIT -1 RETURN count(*)",
+        }) |tail| {
+            const query = try std.fmt.allocPrint(a, "UNWIND {s}+{s} AS x {s}", .{ source.source, source.source, tail });
+            defer a.free(query);
+            const control = try std.fmt.allocPrint(a, "UNWIND {s}+{s} AS x {s}", .{ literal, literal, tail });
+            defer a.free(control);
+            try compareReductionPlans(query, control);
+        }
+        for ([_][]const u8{
+            "WITH DISTINCT x AS y RETURN count(*),sum(y),min(y),max(y),sum(7),sum(DISTINCT 7)",
+            "WITH DISTINCT x AS y WITH 2*y+7 AS z RETURN sum(z),min(z),max(z),count(z)",
+            "WITH DISTINCT x AS y ORDER BY y SKIP 220 LIMIT 129 RETURN avg(y),collect(y)",
+            "WITH DISTINCT x AS y ORDER BY y DESC SKIP 220 LIMIT 129 RETURN avg(y),collect(y)",
+        }) |tail| {
+            const query = try std.fmt.allocPrint(a, "UNWIND range({d},{d},{d})+{s} AS x {s}", .{ source.first, source.first + 449 * source.step, 3 * source.step, source.source, tail });
+            defer a.free(query);
+            const sparse = try a.alloc(i64, 150);
+            defer a.free(sparse);
+            for (sparse, 0..) |*value, index| value.* = values[index * 3];
+            const sparse_literal = try std.json.Stringify.valueAlloc(a, sparse, .{});
+            defer a.free(sparse_literal);
+            const control = try std.fmt.allocPrint(a, "UNWIND {s}+{s} AS x {s}", .{ sparse_literal, literal, tail });
+            defer a.free(control);
+            try compareReductionPlans(query, control);
+        }
+    }
+    for ([_][]const u8{
+        "WITH reverse(range(7,8)) AS zs",
+        "WITH reverse(range(7,8)) AS ys,3 AS k WITH ys AS zs,k+1 AS k",
+    }) |prefix| {
+        const query = try std.fmt.allocPrint(a, "{s} UNWIND zs AS z UNWIND range(5,1,-1) AS i UNWIND [z,1,z] AS x RETURN i,avg(x) ORDER BY avg(x),i LIMIT 2", .{prefix});
+        defer a.free(query);
+        const control = try std.fmt.allocPrint(a, "{s} UNWIND zs AS z UNWIND [5,4,3,2,1] AS i UNWIND [z,1,z] AS x RETURN i,avg(x) ORDER BY avg(x),i LIMIT 2", .{prefix});
+        defer a.free(control);
+        try compareReductionPlans(query, control);
+    }
+    try compareReductionPlans("UNWIND range(9223372036854775807,9223372036854775807)+range(1,1)+range(-1,-1) AS x WITH DISTINCT x AS y RETURN sum(y)", "UNWIND [9223372036854775807,1,-1] AS x WITH DISTINCT x AS y RETURN sum(y)");
 }

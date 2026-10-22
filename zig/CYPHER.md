@@ -2072,11 +2072,16 @@ work and segment count are bounded, with ordinary replay on a decline. Arithmeti
 WITH DISTINCT keeps affine tuples as stable novel support, subtracting prior
 ordered runs without materializing members. Overlapping progressions use checked
 lattice intersections and bounded segment subtraction; constant tuples retain
-the first encounter. Cardinality-only observers can retain symbolic union
-support through affine WITH projections and filters when stable subtraction
-would exceed its segment cap. They compute exact set cardinalities and retain
-COUNT DISTINCT argument support without enumerating lattice gaps. Ordered
-consumers still require an encounter-order proof. This requires a certified
+the first encounter. COUNT, SUM and extrema can retain symbolic union support
+through affine WITH projections and filters when stable subtraction would
+exceed its segment cap. COUNT uses exact set cardinality; extrema use checked
+bounds. SUM proves the novel signed moments and exact prefix bounds of each
+monotone leaf in original source order, preserving intermediate overflow even
+when the final total fits. Constant SUM arguments use the unique row count.
+DISTINCT argument support remains separate from DISTINCT row identity.
+AVG and other order-sensitive consumers still require an encounter-order proof.
+A DISTINCT ordered page can select directly from union ranks without expanding
+the lattice difference. This requires a certified
 unit producer invocation,
 so repeated outer rows cannot bypass shared DISTINCT membership. Independent
 zero-or-one-row CALLs and singleton UNWINDs extend the program after their values,
@@ -2089,9 +2094,11 @@ Ordinal slicing and sorting disjoint monotone runs happen before downstream
 observers, without enumerating the omitted values. Pagination bounds and every
 reached pre-window expression must be checked before publication; unsupported
 scopes and fallible expressions retain ordinary execution. For interleaving
-lattices, exact bag-rank searches locate a bounded page (at most 128 output
-rows), followed by a stable merge of just those retained values. Duplicate
-occurrences remain in source order. Invariant integer AVG arguments use the
+lattices, exact bag-rank searches locate a finite page, followed by a stable
+merge of just the retained values. DISTINCT pages use exact union cardinalities
+for the rank search and advance duplicate cursors together. Retained output and
+merge work use the query budgets rather than a fixed 128-row page cutoff.
+Duplicate bag occurrences remain in source order. Invariant integer AVG arguments use the
 same zero-stride observer certificate.
 
 Small constant modulo periods (bounded at 64) partition an arithmetic producer
@@ -2099,14 +2106,20 @@ into signed remainder cohorts. Divisors resolve through checked lexical stage
 bindings, including parameters and projected scalar aliases. Unknown outputs
 never become fabricated constants. Cohort stages advance in lockstep: DISTINCT
 shares membership across cohorts and selects the first surviving source ordinal.
-Global ORDER BY/SKIP/LIMIT barriers operate on a compact combined intermediate
-bag of at most 128 rows and apply once to that whole bag. Repeated raw values retain distinct source
-occurrences when reconstructing stable encounter order.
+Global ORDER BY/SKIP/LIMIT barriers apply once to the combined bag. Small bags
+use point ranking. Large bags with checked constant cohort order keys form
+weighted rank buckets, skipping complete buckets arithmetically. Within ties,
+selection follows the original source runs and preserves repeated occurrences.
+The reconstructed multiplicity must match the certified bag before publication;
+a previous reorder or unsupported varying order key keeps ordinary execution.
 
 All cohort programs and observer packets are checked before publishing groups.
 Colliding group keys require a per-observer merge certificate: COUNT and extrema
 commute, SUM also needs one sign across the colliding domains, and AVG requires
-ordered point contributions or an identical constant sample. Mixed-sign SUM
+ordered point contributions or an identical constant sample. DISTINCT collection
+arguments certified constant within a cohort consume one value at its first
+source encounter; their shared membership and order use ordinary COLLECT
+semantics. Point cohorts also support ordinary collection after a global window. Mixed-sign SUM
 and unproved floating recurrence keep ordinary replay. Shared DISTINCT, global
 windows, and filters retain each original logical stage cardinality. Proof work
 is bounded independently of source cardinality.
@@ -2115,10 +2128,13 @@ Ranked group windows may ignore an aggregate rank only when the independent
 suffix packet proves identical contributions for every candidate key. Both
 aggregate aliases and structurally equal aggregate ORDER BY expressions use
 this certificate. A finite independent outer list or range can move inside an
-adjacent injective key axis while preserving each group's exact contribution
-sequence. The complete suffix proof validates every outer value before pruning
-keys. Key dependencies, unsupported scope stages, and failed proofs keep
-ordinary execution.
+injective key axis while preserving each group's exact contribution sequence.
+Checked scope-restoring projections may separate the axes: the outer identity
+and independent bindings cross with the key retained explicitly. Sources keep
+their captured lexical frame, and WITH siblings evaluate in the same input
+scope. The complete suffix proof validates every outer value before pruning
+keys. Dependent projections, scope barriers, and failed proofs keep ordinary
+execution. Logical stage counts continue to describe the original pipeline.
 
 Total, invariant affine grouping keys can also collapse an unobserved producer
 axis through independent fanout. The grouping key is retained and evaluated on a
