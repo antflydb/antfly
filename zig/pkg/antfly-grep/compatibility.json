@@ -49,7 +49,7 @@
         "tests/relevance-repository.json",
         "bench/decision_transport.py"
       ],
-      "limits": "Labeled pinned production-source and synthetic fixture evaluations verify pipeline precision/recall and independent-line discovery, not live-model quality. Request/token/cost accounting supports explicit provider evaluations. Shared Typesafe and opt-in versioned Decision API contexts, per-region cache digests, and bounded cross-region line batches reduce transport/request overhead without skipping independent targets; fixture byte savings are not provider token-cost measurements. Completed negative line refinements do not fall back to coarse scores.",
+      "limits": "Labeled pinned production-source and synthetic fixture evaluations verify pipeline precision/recall and independent-line discovery, not live-model quality. Request/token/cost accounting supports explicit provider evaluations. Common single-input Decisions and opt-in versioned Antfly contexts, per-region cache digests, and bounded cross-region line batches reduce transport/request overhead without skipping independent targets; fixture byte savings are not provider token-cost measurements. Completed negative line refinements do not fall back to coarse scores.",
       "archived_evidence": [
         "review-repository-relevance-fixture.json",
         "followup-relevance-fixture.json",
@@ -223,6 +223,16 @@
         "tests/test_retained_tools.py"
       ],
       "limits": "Conditional acknowledgements stage before publication and fall back under finite output budgets. Complete tokens remain stable for the same registered query and snapshot. Typed per-file replay preserves spans and regenerates provenance under the existing 8 MiB shared/256 KiB staging bounds. Opt-in workspace_lexical_delta adds a separate 16 MiB maximum summary index per registration, with changed-path work, complete-result logical counts and conservative full-delivery fallback. Clients apply patches transactionally and overlay the new snapshot on retained rows; see README protocol contract. Workspace entries are 120 bytes on 64-bit targets (previously 168); external revisions remain canonical. These are bounded RAM structures, not durable source indexes or zero-resource guarantees. Finite global source-input budgets disable file/delta reuse to preserve cold/warm exhaustion behavior. Oversized lexical indexes use negative admission with footprint hysteresis; a real-budget fixture verifies skip/recovery. Opt-in minimal lexical acknowledgements are terminal single frames; default framing remains unchanged. The reference retained client validates deltas and omits pinned-revision requests, with explicit freshness and bounded serialized payload retention. Emitted-file visibility is tracked independently of match counts, including context-only passthrough files. Incremental table-growth peaks retry one cold reservation before persistent rejection. Streaming view staging retains validated original frames; malformed or interrupted streams invalidate reuse."
+    },
+    {
+      "area": "Visual decision evidence",
+      "status": "fixture-tested subset",
+      "evidence": [
+        "tests/test_cli.py",
+        "schema/document-v2.json",
+        "README.md"
+      ],
+      "limits": "Explicit --media images evaluates local images and indexed same-parent page/slide/image units through common Decisions messages. Fresh authorized asset reads, revision/digest/MIME/size checks precede score reuse. Bounded header inspection, bounded Antfly multimodal batches/shared contexts and shared named questions; ranked/partial output, valid siblings, rejected partitions, adaptive field splitting, bounded cross-parent projections/coalescing, later-wave authorization, file-size admission and quiet selection have fixtures. Local PDF rendering, audio/video, workspace media and Cloud connectors/materializers are not implemented. Fixtures do not establish live visual-model relevance or token cost."
     }
   ]
 }

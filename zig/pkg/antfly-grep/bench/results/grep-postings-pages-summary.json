@@ -1,0 +1,2379 @@
+{
+ "protocol": 1,
+ "merged_pr": 1237,
+ "merged_main": "318e6a2e7be825178a0ab3a4eba9b9c1114dbed8",
+ "original_pr": 1164,
+ "qualification_head": "1a609a7ebef531bbe41eea2db0eb84c134924e9f",
+ "host": "macOS-27.0.1-arm64-arm-64bit",
+ "scope": "Shared Apple Silicon host; native macOS and ARM64 Linux VM. Both reference and candidate are ReleaseFast, stripped, same compiler. Warm filesystem; process restarts and fixture-file cache advice do not establish cold-device performance. Retrieval/concurrency/pages use Linux two CPUs/1 GiB, paired ingestion two CPUs/8 GiB, separate candidate ingestion two CPUs/1 GiB; swap disabled. Instrumented phase trials are diagnostics, separate from normal latency trials.",
+ "artifacts": {
+  "macos": {
+   "candidate": {
+    "source_head": "1a609a7ebef531bbe41eea2db0eb84c134924e9f",
+    "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sha256": "3d466c7a7697e284e3dff095b7ff5fdb3f2387e3f0f3f57725305bc24d959cf2",
+    "bytes": 209078088,
+    "command": [
+     "/Users/ajroetker/bin/zig-0.17.0/zig",
+     "build",
+     "--build-file",
+     "zig/build.zig",
+     "antfly",
+     "-Doptimize=ReleaseFast",
+     "-Dstrip=true",
+     "-Dantfly-bin-name=antfly-grep-postings-macos",
+     "-j1"
+    ],
+    "compiler": "0.17.0",
+    "source_manifest_sha256": "f6e2fc1fb2fed3c9d00cac7dc05b6681208bf6a9743de688d139b5031dd5ab20",
+    "source_file_count": 5959
+   },
+   "reference": {
+    "source_head": "fe2c053443bf23f73f746abbda6bbd57646e9176",
+    "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sha256": "50bffaba024fc79a8ac1b1b13fa4f1fb2730e7b42abb631db98bd1bc09311473",
+    "bytes": 209029096,
+    "command": [
+     "/Users/ajroetker/bin/zig-0.17.0/zig",
+     "build",
+     "--build-file",
+     "zig/build.zig",
+     "antfly",
+     "-Doptimize=ReleaseFast",
+     "-Dstrip=true",
+     "-Dantfly-bin-name=antfly-grep-review-current",
+     "-j1"
+    ],
+    "compiler": "0.17.0"
+   },
+   "reused_cli": {
+    "source_head": "29fdd70084f47a2ab32bbc487a09190a489342a9",
+    "compiler": "0.17.0",
+    "command": [
+     "/Users/ajroetker/bin/zig-0.17.0/zig",
+     "build",
+     "grep",
+     "-Doptimize=ReleaseFast",
+     "-j1"
+    ],
+    "sha256": "4e7c8eadda2650340b1ab6179dc54df7e4824c0e696fd185727cf6d66e599ae0",
+    "bytes": 8065240
+   }
+  },
+  "linux": {
+   "candidate": {
+    "source_head": "1a609a7ebef531bbe41eea2db0eb84c134924e9f",
+    "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sha256": "3810b36ddb16cf62867fae3e7d06ae5c7f920924694a4042784068dd6b0e3cba",
+    "bytes": 204140480,
+    "command": [
+     "/Users/ajroetker/bin/zig-0.17.0/zig",
+     "build",
+     "--build-file",
+     "zig/build.zig",
+     "antfly",
+     "-Doptimize=ReleaseFast",
+     "-Dstrip=true",
+     "-Dantfly-bin-name=antfly-grep-postings-linux",
+     "-j1",
+     "-Dtarget=aarch64-linux-musl",
+     "-Dmetal=false",
+     "-Dsystem-blas=false"
+    ],
+    "compiler": "0.17.0",
+    "source_manifest_sha256": "f6e2fc1fb2fed3c9d00cac7dc05b6681208bf6a9743de688d139b5031dd5ab20",
+    "source_file_count": 5959
+   },
+   "reference": {
+    "source_head": "fe2c053443bf23f73f746abbda6bbd57646e9176",
+    "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sha256": "3e0dd801d6ece53ef596e3a8518f330bb3b4335edf260a5b74c775b3e9bad86b",
+    "bytes": 204090112,
+    "command": [
+     "/Users/ajroetker/bin/zig-0.17.0/zig",
+     "build",
+     "--build-file",
+     "zig/build.zig",
+     "antfly",
+     "-Doptimize=ReleaseFast",
+     "-Dstrip=true",
+     "-Dantfly-bin-name=antfly-grep-review-linux",
+     "-j1",
+     "-Dtarget=aarch64-linux-musl",
+     "-Dmetal=false",
+     "-Dsystem-blas=false"
+    ],
+    "compiler": "0.17.0"
+   },
+   "reused_cli": {
+    "source_head": "29fdd70084f47a2ab32bbc487a09190a489342a9",
+    "compiler": "0.17.0",
+    "command": [
+     "/Users/ajroetker/bin/zig-0.17.0/zig",
+     "build",
+     "grep",
+     "-Doptimize=ReleaseFast",
+     "-j1",
+     "-Dtarget=aarch64-linux-musl",
+     "-Dmetal=false",
+     "-Dsystem-blas=false"
+    ],
+    "sha256": "78e5ede86abec0b77a0c6b0600f162c0d1b01a6675db7b9eaf37fcbbdaa18982",
+    "bytes": 31975976
+   }
+  }
+ },
+ "validation": {
+  "exit_code": 0,
+  "records": [
+   {
+    "mode": "macos",
+    "name": "http",
+    "command": [
+     "$WORKTREE/zig/e2e/antfly/.venv/bin/python",
+     "-m",
+     "pytest",
+     "-q",
+     "zig/e2e/antfly/test_grep_indexed.py",
+     "zig/e2e/antfly/test_logical_source_upgrade.py",
+     "zig/e2e/antfly/test_logical_analyzer_upgrade.py"
+    ],
+    "exit_code": 0,
+    "log_sha256": "8f6dc3aa6e74ceed7739f369fcb7f1477d36279863ed310d80d41e02fb80ab49"
+   },
+   {
+    "mode": "macos",
+    "name": "bench-all",
+    "command": [
+     "$WORKTREE/zig/e2e/antfly/.venv/bin/python",
+     "zig/pkg/antfly-grep/bench/logical_sources.py",
+     "--baseline",
+     "output/grep-followup/review-final/macos/antfly",
+     "--candidate",
+     "output/grep-postings-pages/macos/antfly",
+     "--grep",
+     "output/grep-followup/candidate/macos-cli/antfly-grep",
+     "--output",
+     "output/grep-postings-pages/qualification-v1/macos/bench-all",
+     "--rounds",
+     "2",
+     "--suite",
+     "all"
+    ],
+    "exit_code": 0,
+    "log_sha256": "56cc8bbe7219760c16a28c4a01e48339294dae5ff3ddff77b97e11c1c28b4be3"
+   },
+   {
+    "mode": "macos",
+    "name": "diagnostic-phases-hints",
+    "command": [
+     "$WORKTREE/zig/e2e/antfly/.venv/bin/python",
+     "zig/pkg/antfly-grep/bench/logical_sources.py",
+     "--baseline",
+     "output/grep-followup/review-final/macos/antfly",
+     "--candidate",
+     "output/grep-postings-pages/macos/antfly",
+     "--grep",
+     "output/grep-followup/candidate/macos-cli/antfly-grep",
+     "--output",
+     "output/grep-postings-pages/qualification-v1/macos/diagnostic-phases-hints",
+     "--rounds",
+     "1",
+     "--suite",
+     "hints",
+     "--source-phases"
+    ],
+    "exit_code": 0,
+    "log_sha256": "25aa9f15394cc5408e40936ed226442a6b161b78efdd3c3d8b58ae47f9851231"
+   },
+   {
+    "mode": "macos",
+    "name": "diagnostic-phases-pages",
+    "command": [
+     "$WORKTREE/zig/e2e/antfly/.venv/bin/python",
+     "zig/pkg/antfly-grep/bench/logical_sources.py",
+     "--baseline",
+     "output/grep-followup/review-final/macos/antfly",
+     "--candidate",
+     "output/grep-postings-pages/macos/antfly",
+     "--grep",
+     "output/grep-followup/candidate/macos-cli/antfly-grep",
+     "--output",
+     "output/grep-postings-pages/qualification-v1/macos/diagnostic-phases-pages",
+     "--rounds",
+     "1",
+     "--suite",
+     "pages",
+     "--source-phases"
+    ],
+    "exit_code": 0,
+    "log_sha256": "a68dc82928241c55339932442df0a6680ed9e488904d93302e41dabfb3ced850"
+   },
+   {
+    "mode": "linux",
+    "name": "http",
+    "command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "2",
+     "--memory",
+     "1g",
+     "--memory-swap",
+     "1g",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "-e",
+     "ANTFLY_BIN=/work/output/grep-postings-pages/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+     "-e",
+     "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+     "antfly-grep-query-arm64:review-1164",
+     "python3",
+     "-m",
+     "pytest",
+     "-q",
+     "zig/e2e/antfly/test_grep_indexed.py",
+     "zig/e2e/antfly/test_logical_source_upgrade.py",
+     "zig/e2e/antfly/test_logical_analyzer_upgrade.py"
+    ],
+    "exit_code": 0,
+    "log_sha256": "2e2fdadca1570cb4eebc4405fe8c9811da46a337e82b5d6e0d1be12a3ab2fdf8"
+   },
+   {
+    "mode": "linux",
+    "name": "bench-both",
+    "command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "2",
+     "--memory",
+     "1g",
+     "--memory-swap",
+     "1g",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "-e",
+     "ANTFLY_BIN=/work/output/grep-postings-pages/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+     "-e",
+     "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+     "antfly-grep-query-arm64:review-1164",
+     "python3",
+     "zig/pkg/antfly-grep/bench/logical_sources.py",
+     "--baseline",
+     "output/grep-followup/review-final/linux/antfly",
+     "--candidate",
+     "output/grep-postings-pages/linux/antfly",
+     "--grep",
+     "output/grep-followup/candidate/linux-cli/antfly-grep",
+     "--output",
+     "output/grep-postings-pages/qualification-v1/linux/bench-both",
+     "--rounds",
+     "2",
+     "--suite",
+     "both"
+    ],
+    "exit_code": 0,
+    "log_sha256": "a8a025951cdab0e3914c7f6237420fc0bbcb4f1cc864d398c0e56861b42740d1"
+   },
+   {
+    "mode": "linux",
+    "name": "bench-hints",
+    "command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "2",
+     "--memory",
+     "1g",
+     "--memory-swap",
+     "1g",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "-e",
+     "ANTFLY_BIN=/work/output/grep-postings-pages/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+     "-e",
+     "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+     "antfly-grep-query-arm64:review-1164",
+     "python3",
+     "zig/pkg/antfly-grep/bench/logical_sources.py",
+     "--baseline",
+     "output/grep-followup/review-final/linux/antfly",
+     "--candidate",
+     "output/grep-postings-pages/linux/antfly",
+     "--grep",
+     "output/grep-followup/candidate/linux-cli/antfly-grep",
+     "--output",
+     "output/grep-postings-pages/qualification-v1/linux/bench-hints",
+     "--rounds",
+     "2",
+     "--suite",
+     "hints"
+    ],
+    "exit_code": 0,
+    "log_sha256": "1a7ee1c3cce3ac058189c42aa5afb391822b1f6c320a46731828ca45d0128ad9"
+   },
+   {
+    "mode": "linux",
+    "name": "bench-pages",
+    "command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "2",
+     "--memory",
+     "1g",
+     "--memory-swap",
+     "1g",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "-e",
+     "ANTFLY_BIN=/work/output/grep-postings-pages/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+     "-e",
+     "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+     "antfly-grep-query-arm64:review-1164",
+     "python3",
+     "zig/pkg/antfly-grep/bench/logical_sources.py",
+     "--baseline",
+     "output/grep-followup/review-final/linux/antfly",
+     "--candidate",
+     "output/grep-postings-pages/linux/antfly",
+     "--grep",
+     "output/grep-followup/candidate/linux-cli/antfly-grep",
+     "--output",
+     "output/grep-postings-pages/qualification-v1/linux/bench-pages",
+     "--rounds",
+     "2",
+     "--suite",
+     "pages"
+    ],
+    "exit_code": 0,
+    "log_sha256": "3d8d891d24808f272ca6fa170afe6a76975fdc30e48c52fddd19b5cfcddf20e7"
+   },
+   {
+    "mode": "linux",
+    "name": "bench-ingestion",
+    "command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "2",
+     "--memory",
+     "8g",
+     "--memory-swap",
+     "8g",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "-e",
+     "ANTFLY_BIN=/work/output/grep-postings-pages/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+     "-e",
+     "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+     "antfly-grep-query-arm64:review-1164",
+     "python3",
+     "zig/pkg/antfly-grep/bench/logical_sources.py",
+     "--baseline",
+     "output/grep-followup/review-final/linux/antfly",
+     "--candidate",
+     "output/grep-postings-pages/linux/antfly",
+     "--grep",
+     "output/grep-followup/candidate/linux-cli/antfly-grep",
+     "--output",
+     "output/grep-postings-pages/qualification-v1/linux/bench-ingestion",
+     "--rounds",
+     "2",
+     "--suite",
+     "ingestion"
+    ],
+    "exit_code": 0,
+    "log_sha256": "da8847772593759b28979768b266958a27dc079014e34eca0665431a36c08b64"
+   },
+   {
+    "mode": "linux",
+    "name": "ingestion-1g",
+    "command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "2",
+     "--memory",
+     "1g",
+     "--memory-swap",
+     "1g",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "-e",
+     "ANTFLY_BIN=/work/output/grep-postings-pages/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+     "-e",
+     "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+     "-e",
+     "ANTFLY_LOGICAL_INGESTION_REPORT=/work/output/grep-postings-pages/qualification-v1/linux/ingestion-1g.json",
+     "antfly-grep-query-arm64:review-1164",
+     "python3",
+     "-m",
+     "pytest",
+     "-q",
+     "zig/e2e/antfly/test_grep_indexed.py",
+     "-k",
+     "logical_substring_ingestion_profile"
+    ],
+    "exit_code": 0,
+    "log_sha256": "fe34ede0b4d5bf7a193473103b87fcb902dc182ab1b380d5692bf64ff9f406c8"
+   },
+   {
+    "mode": "linux",
+    "name": "control-one-cpu",
+    "command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "1",
+     "--memory",
+     "1g",
+     "--memory-swap",
+     "1g",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "-e",
+     "ANTFLY_BIN=/work/output/grep-postings-pages/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+     "-e",
+     "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+     "antfly-grep-query-arm64:review-1164",
+     "python3",
+     "zig/pkg/antfly-grep/bench/logical_sources.py",
+     "--baseline",
+     "output/grep-followup/review-final/linux/antfly",
+     "--candidate",
+     "output/grep-postings-pages/linux/antfly",
+     "--grep",
+     "output/grep-followup/candidate/linux-cli/antfly-grep",
+     "--output",
+     "output/grep-postings-pages/qualification-v1/linux/control-one-cpu",
+     "--rounds",
+     "2",
+     "--suite",
+     "concurrency"
+    ],
+    "exit_code": 0,
+    "log_sha256": "6cbac1cb083c80fc77c7932878125062f07507b4f952266913899c2086f9daba"
+   },
+   {
+    "mode": "linux",
+    "name": "control-file-cache-advice",
+    "command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "2",
+     "--memory",
+     "1g",
+     "--memory-swap",
+     "1g",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "-e",
+     "ANTFLY_BIN=/work/output/grep-postings-pages/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+     "-e",
+     "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+     "antfly-grep-query-arm64:review-1164",
+     "python3",
+     "zig/pkg/antfly-grep/bench/logical_sources.py",
+     "--baseline",
+     "output/grep-followup/review-final/linux/antfly",
+     "--candidate",
+     "output/grep-postings-pages/linux/antfly",
+     "--grep",
+     "output/grep-followup/candidate/linux-cli/antfly-grep",
+     "--output",
+     "output/grep-postings-pages/qualification-v1/linux/control-file-cache-advice",
+     "--rounds",
+     "2",
+     "--suite",
+     "concurrency",
+     "--advise-file-cache"
+    ],
+    "exit_code": 0,
+    "log_sha256": "6cbac1cb083c80fc77c7932878125062f07507b4f952266913899c2086f9daba"
+   },
+   {
+    "mode": "linux",
+    "name": "diagnostic-phases-hints",
+    "command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "2",
+     "--memory",
+     "1g",
+     "--memory-swap",
+     "1g",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "-e",
+     "ANTFLY_BIN=/work/output/grep-postings-pages/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+     "-e",
+     "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+     "antfly-grep-query-arm64:review-1164",
+     "python3",
+     "zig/pkg/antfly-grep/bench/logical_sources.py",
+     "--baseline",
+     "output/grep-followup/review-final/linux/antfly",
+     "--candidate",
+     "output/grep-postings-pages/linux/antfly",
+     "--grep",
+     "output/grep-followup/candidate/linux-cli/antfly-grep",
+     "--output",
+     "output/grep-postings-pages/qualification-v1/linux/diagnostic-phases-hints",
+     "--rounds",
+     "1",
+     "--suite",
+     "hints",
+     "--source-phases"
+    ],
+    "exit_code": 0,
+    "log_sha256": "25aa9f15394cc5408e40936ed226442a6b161b78efdd3c3d8b58ae47f9851231"
+   },
+   {
+    "mode": "linux",
+    "name": "diagnostic-phases-pages",
+    "command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "2",
+     "--memory",
+     "1g",
+     "--memory-swap",
+     "1g",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "-e",
+     "ANTFLY_BIN=/work/output/grep-postings-pages/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+     "-e",
+     "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+     "-e",
+     "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+     "antfly-grep-query-arm64:review-1164",
+     "python3",
+     "zig/pkg/antfly-grep/bench/logical_sources.py",
+     "--baseline",
+     "output/grep-followup/review-final/linux/antfly",
+     "--candidate",
+     "output/grep-postings-pages/linux/antfly",
+     "--grep",
+     "output/grep-followup/candidate/linux-cli/antfly-grep",
+     "--output",
+     "output/grep-postings-pages/qualification-v1/linux/diagnostic-phases-pages",
+     "--rounds",
+     "1",
+     "--suite",
+     "pages",
+     "--source-phases"
+    ],
+    "exit_code": 0,
+    "log_sha256": "a68dc82928241c55339932442df0a6680ed9e488904d93302e41dabfb3ced850"
+   }
+  ]
+ },
+ "unit_validation": {
+  "exit_code": 0,
+  "source_head": "1a609a7ebef531bbe41eea2db0eb84c134924e9f",
+  "scope": "Final deletion-mask/search tests pass in Debug and ReleaseFast; final logical and query-contract tests pass in Debug. Unchanged introducer and tooling qualifications retain their original source witness. Test process exit statuses were checked separately. Full logs remain local.",
+  "records": [
+   {
+    "name": "introducer-debug.log",
+    "sha256": "1e97853a3c0fd992ccfd0903476cf5863641fdabf279779361909ec1f4d70476",
+    "outcomes": [
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "46 passed; 1 skipped; 0 failed; 0 leaked."
+    ],
+    "source_head": "2fa4ccb58e1184b81c56e11e6bad801746e87c22",
+    "scope": "Relevant implementation unchanged by the later deletion-mask fix."
+   },
+   {
+    "name": "introducer-release.log",
+    "sha256": "238aec8af6322760fe681df6de65063331aa2d6ed2d72be99f742d48d9cc4d12",
+    "outcomes": [
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "46 passed; 1 skipped; 0 failed; 0 leaked."
+    ],
+    "source_head": "2fa4ccb58e1184b81c56e11e6bad801746e87c22",
+    "scope": "Relevant implementation unchanged by the later deletion-mask fix."
+   },
+   {
+    "name": "sdk-roundtrip.log",
+    "sha256": "09022e7f15c1704f616737ee4e748021e8351bf6c00b303ba2fa633bae6bf5c2",
+    "outcomes": [
+     "351 passed in 2.38s"
+    ],
+    "source_head": "2fa4ccb58e1184b81c56e11e6bad801746e87c22",
+    "scope": "Relevant implementation unchanged by the later deletion-mask fix."
+   },
+   {
+    "name": "benchmark-tools.log",
+    "sha256": "e333cce67674573f8ead12e9806b609492306c884fc4b243dc5551cf409b49bf",
+    "outcomes": [
+     "Ran 26 tests in 0.112s",
+     "OK (skipped=1)"
+    ],
+    "source_head": "2fa4ccb58e1184b81c56e11e6bad801746e87c22",
+    "scope": "Relevant implementation unchanged by the later deletion-mask fix."
+   },
+   {
+    "name": "search-masked-debug.log",
+    "sha256": "5c0d691ff121c6ee78061617dda95a593d5e02415631668a2e59c9da6babac7c",
+    "source_head": "1a609a7ebef531bbe41eea2db0eb84c134924e9f",
+    "outcomes": [
+     "215 passed; 1 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   {
+    "name": "search-masked-release.log",
+    "sha256": "ac50c0978d486f74ed005269eca319be069b30e236709ee5ce7aa2c358364ccd",
+    "source_head": "1a609a7ebef531bbe41eea2db0eb84c134924e9f",
+    "outcomes": [
+     "215 passed; 1 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   {
+    "name": "contracts-masked-debug.log",
+    "sha256": "dfe3f618382d55d489522234bfd4f0281aac52cfabb4a11e73e0c8d9b0dbcc27",
+    "source_head": "1a609a7ebef531bbe41eea2db0eb84c134924e9f",
+    "outcomes": [
+     "144 passed; 0 skipped; 0 failed; 0 leaked.",
+     "89 passed; 1 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   {
+    "name": "apache-boundary-final.log",
+    "sha256": "67af5d68c290cba08d75c663aa5a622884c0004b908d7aa695edc533940c1455",
+    "source_head": "1a609a7ebef531bbe41eea2db0eb84c134924e9f",
+    "outcomes": [
+     "Apache product boundary verified: 2416 source files; server entry points remain ELv2"
+    ]
+   },
+   {
+    "name": "license-headers-final.log",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_head": "1a609a7ebef531bbe41eea2db0eb84c134924e9f",
+    "outcomes": []
+   },
+   {
+    "name": "compatibility-final.log",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_head": "1a609a7ebef531bbe41eea2db0eb84c134924e9f",
+    "outcomes": []
+   }
+  ],
+  "reused_cli": {
+   "scope": "CLI and all declared direct dependency source directories unchanged from qualified build 29fdd70084f47a2ab32bbc487a09190a489342a9.",
+   "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+ },
+ "limits": [
+  "Whole-generation membership proofs still invalidate across writes; maintained segment/source certificates are not implemented.",
+  "Verification budgets remain per shard request.",
+  "Borrowed hit membership accelerates complete supported producers; misses and general Boolean shapes retain owned fallback.",
+  "Pins and captured deletion masks remain live until their consumer completes; result/output allocation is not eliminated.",
+  "The run read cache increases its lazy maximum from 64 KiB to 512 KiB. Adaptive spill can retain more postings on larger managed envelopes; actual admission still governs.",
+  "Ordinary benchmark requests enable the public query profile, including top-level ownership/lookup counters. Additional physical-source phase clocks and diagnostic log capture are opt-in; these diagnostic trials stay separate.",
+  "No additional regex JIT or local CLI throughput improvement is claimed.",
+  "Linux process CPU uses /proc tick granularity; medians for short requests may round to zero."
+ ],
+ "corpus_witnesses": [
+  {
+   "platform": "linux",
+   "suite": "concurrency",
+   "case": "1",
+   "sha256": "9b919cb71281375dfc9f004e29c89470c6ce8372474bab25932f7978b12dea6d"
+  },
+  {
+   "platform": "linux",
+   "suite": "concurrency",
+   "case": "4",
+   "sha256": "9b919cb71281375dfc9f004e29c89470c6ce8372474bab25932f7978b12dea6d"
+  },
+  {
+   "platform": "linux",
+   "suite": "hints",
+   "case": "retained_distinct_predicates",
+   "sha256": "eadbadb8334fa8e1a4e649110a60dde653a16956b102687625df6c611616616f"
+  },
+  {
+   "platform": "linux",
+   "suite": "ingestion",
+   "case": "distinct_word",
+   "sha256": "3eb977afe371f5ca925718c4ffbb3cfc56b0b73c2bf4f855c776fa88b70485fb"
+  },
+  {
+   "platform": "linux",
+   "suite": "ingestion",
+   "case": "repetitive",
+   "sha256": "366180430233b7436a883405927ac788a3c202860c10386186e816e147098476"
+  },
+  {
+   "platform": "linux",
+   "suite": "ingestion",
+   "case": "source_code",
+   "sha256": "f2b658f09621a169b0eaf439d77e6ed98f5fb9154e1114075f56a0fd95fbff87"
+  },
+  {
+   "platform": "linux",
+   "suite": "pages",
+   "case": "retained_pages_dense",
+   "sha256": "34541ba79e16803781d012d2fca3e154870777a12f4c9c973356e3bbc0075064"
+  },
+  {
+   "platform": "linux",
+   "suite": "pages",
+   "case": "retained_pages_sparse",
+   "sha256": "34541ba79e16803781d012d2fca3e154870777a12f4c9c973356e3bbc0075064"
+  },
+  {
+   "platform": "linux",
+   "suite": "scalable",
+   "case": "nested_source",
+   "sha256": "cf9aded2f9ee86420321ff3293a5595bb10015bae1ac764d57fff0075fdde54e"
+  },
+  {
+   "platform": "linux",
+   "suite": "scalable",
+   "case": "selected_dominant",
+   "sha256": "a5d078c992245592bf9256b2fe3b9c6f7c0e2dc3dbdaad4483fb8e71746eccef"
+  },
+  {
+   "platform": "linux",
+   "suite": "scalable",
+   "case": "selected_large",
+   "sha256": "8a496bbc4eecaa071f490d3ffbad8b4ce9cb2f3c98c04eaae426df912b1d7c10"
+  },
+  {
+   "platform": "linux",
+   "suite": "scalable",
+   "case": "tiny",
+   "sha256": "94889cd0b7acbd1efe3905a563fa649da72347e7cbccd9a3a4a1ecaf3335b598"
+  },
+  {
+   "platform": "linux",
+   "suite": "scalable",
+   "case": "unselected_arrays",
+   "sha256": "9df84029d251b1d42567a088e840b45c2b8e5aeac6670901248b772df09afa3c"
+  },
+  {
+   "platform": "macos",
+   "suite": "concurrency",
+   "case": "1",
+   "sha256": "9b919cb71281375dfc9f004e29c89470c6ce8372474bab25932f7978b12dea6d"
+  },
+  {
+   "platform": "macos",
+   "suite": "concurrency",
+   "case": "4",
+   "sha256": "9b919cb71281375dfc9f004e29c89470c6ce8372474bab25932f7978b12dea6d"
+  },
+  {
+   "platform": "macos",
+   "suite": "hints",
+   "case": "retained_distinct_predicates",
+   "sha256": "eadbadb8334fa8e1a4e649110a60dde653a16956b102687625df6c611616616f"
+  },
+  {
+   "platform": "macos",
+   "suite": "ingestion",
+   "case": "distinct_word",
+   "sha256": "3eb977afe371f5ca925718c4ffbb3cfc56b0b73c2bf4f855c776fa88b70485fb"
+  },
+  {
+   "platform": "macos",
+   "suite": "ingestion",
+   "case": "repetitive",
+   "sha256": "366180430233b7436a883405927ac788a3c202860c10386186e816e147098476"
+  },
+  {
+   "platform": "macos",
+   "suite": "ingestion",
+   "case": "source_code",
+   "sha256": "f2b658f09621a169b0eaf439d77e6ed98f5fb9154e1114075f56a0fd95fbff87"
+  },
+  {
+   "platform": "macos",
+   "suite": "pages",
+   "case": "retained_pages_dense",
+   "sha256": "34541ba79e16803781d012d2fca3e154870777a12f4c9c973356e3bbc0075064"
+  },
+  {
+   "platform": "macos",
+   "suite": "pages",
+   "case": "retained_pages_sparse",
+   "sha256": "34541ba79e16803781d012d2fca3e154870777a12f4c9c973356e3bbc0075064"
+  },
+  {
+   "platform": "macos",
+   "suite": "scalable",
+   "case": "nested_source",
+   "sha256": "cf9aded2f9ee86420321ff3293a5595bb10015bae1ac764d57fff0075fdde54e"
+  },
+  {
+   "platform": "macos",
+   "suite": "scalable",
+   "case": "selected_dominant",
+   "sha256": "a5d078c992245592bf9256b2fe3b9c6f7c0e2dc3dbdaad4483fb8e71746eccef"
+  },
+  {
+   "platform": "macos",
+   "suite": "scalable",
+   "case": "selected_large",
+   "sha256": "8a496bbc4eecaa071f490d3ffbad8b4ce9cb2f3c98c04eaae426df912b1d7c10"
+  },
+  {
+   "platform": "macos",
+   "suite": "scalable",
+   "case": "tiny",
+   "sha256": "94889cd0b7acbd1efe3905a563fa649da72347e7cbccd9a3a4a1ecaf3335b598"
+  },
+  {
+   "platform": "macos",
+   "suite": "scalable",
+   "case": "unselected_arrays",
+   "sha256": "9df84029d251b1d42567a088e840b45c2b8e5aeac6670901248b772df09afa3c"
+  }
+ ],
+ "phase_medians": [
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "hints",
+   "phase": "logical_source_lookup",
+   "samples": 12,
+   "key_lookup_us": 50.5,
+   "membership_borrows": 0.0,
+   "membership_copies": 0.0,
+   "provider_us": 56292.5
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "hints",
+   "phase": "logical_sources",
+   "samples": 12,
+   "calls": 62.0,
+   "directory_plan_us": 150.0,
+   "directory_read_us": 6657.0,
+   "fallback_us": 5.0,
+   "range_read_us": 18132.5,
+   "reconstruct_us": 2124.0,
+   "revision_us": 27525.5,
+   "total_us": 54677.0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "pages",
+   "phase": "logical_source_lookup",
+   "samples": 18,
+   "key_lookup_us": 0.0,
+   "membership_borrows": 5.0,
+   "membership_copies": 0.0,
+   "provider_us": 0.0
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "hints",
+   "phase": "logical_source_lookup",
+   "samples": 12,
+   "key_lookup_us": 30.0,
+   "membership_borrows": 0.0,
+   "membership_copies": 0.0,
+   "provider_us": 51024.0
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "hints",
+   "phase": "logical_sources",
+   "samples": 12,
+   "calls": 17.5,
+   "directory_plan_us": 90.5,
+   "directory_read_us": 6274.5,
+   "fallback_us": 2.0,
+   "range_read_us": 15817.0,
+   "reconstruct_us": 401.5,
+   "revision_us": 27303.0,
+   "total_us": 50516.0
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "pages",
+   "phase": "logical_source_lookup",
+   "samples": 18,
+   "key_lookup_us": 0.0,
+   "membership_borrows": 5.0,
+   "membership_copies": 0.0,
+   "provider_us": 0.0
+  }
+ ],
+ "controls": [
+  {
+   "platform": "linux",
+   "control": "control-file-cache-advice",
+   "experiment": "r0-baseline-concurrency",
+   "clients": 1,
+   "median_http_ms": 17.458792,
+   "cache_advice": {
+    "mode": "process_restart_with_file_cache_advice",
+    "advised_files": 110,
+    "advised_file_bytes": 1348879,
+    "errors": []
+   },
+   "restart_first_http_ms": 55.061792
+  },
+  {
+   "platform": "linux",
+   "control": "control-file-cache-advice",
+   "experiment": "r0-baseline-concurrency",
+   "clients": 4,
+   "median_http_ms": 75.46339599999999,
+   "cache_advice": {
+    "mode": "process_restart_with_file_cache_advice",
+    "advised_files": 138,
+    "advised_file_bytes": 2634722,
+    "errors": []
+   },
+   "restart_first_http_ms": 59.374375
+  },
+  {
+   "platform": "linux",
+   "control": "control-file-cache-advice",
+   "experiment": "r0-candidate-concurrency",
+   "clients": 1,
+   "median_http_ms": 19.555667,
+   "cache_advice": {
+    "mode": "process_restart_with_file_cache_advice",
+    "advised_files": 110,
+    "advised_file_bytes": 1348796,
+    "errors": []
+   },
+   "restart_first_http_ms": 54.585667
+  },
+  {
+   "platform": "linux",
+   "control": "control-file-cache-advice",
+   "experiment": "r0-candidate-concurrency",
+   "clients": 4,
+   "median_http_ms": 89.7246045,
+   "cache_advice": {
+    "mode": "process_restart_with_file_cache_advice",
+    "advised_files": 138,
+    "advised_file_bytes": 2634385,
+    "errors": []
+   },
+   "restart_first_http_ms": 73.041125
+  },
+  {
+   "platform": "linux",
+   "control": "control-file-cache-advice",
+   "experiment": "r1-candidate-concurrency",
+   "clients": 1,
+   "median_http_ms": 17.108667,
+   "cache_advice": {
+    "mode": "process_restart_with_file_cache_advice",
+    "advised_files": 110,
+    "advised_file_bytes": 1348677,
+    "errors": []
+   },
+   "restart_first_http_ms": 54.274375
+  },
+  {
+   "platform": "linux",
+   "control": "control-file-cache-advice",
+   "experiment": "r1-candidate-concurrency",
+   "clients": 4,
+   "median_http_ms": 77.883167,
+   "cache_advice": {
+    "mode": "process_restart_with_file_cache_advice",
+    "advised_files": 136,
+    "advised_file_bytes": 2632164,
+    "errors": []
+   },
+   "restart_first_http_ms": 66.429792
+  },
+  {
+   "platform": "linux",
+   "control": "control-file-cache-advice",
+   "experiment": "r1-baseline-concurrency",
+   "clients": 1,
+   "median_http_ms": 16.253083,
+   "cache_advice": {
+    "mode": "process_restart_with_file_cache_advice",
+    "advised_files": 110,
+    "advised_file_bytes": 1348586,
+    "errors": []
+   },
+   "restart_first_http_ms": 54.634291
+  },
+  {
+   "platform": "linux",
+   "control": "control-file-cache-advice",
+   "experiment": "r1-baseline-concurrency",
+   "clients": 4,
+   "median_http_ms": 69.6115835,
+   "cache_advice": {
+    "mode": "process_restart_with_file_cache_advice",
+    "advised_files": 138,
+    "advised_file_bytes": 2634037,
+    "errors": []
+   },
+   "restart_first_http_ms": 60.809291
+  },
+  {
+   "platform": "linux",
+   "control": "control-one-cpu",
+   "experiment": "r0-baseline-concurrency",
+   "clients": 1,
+   "median_http_ms": 17.107083,
+   "cache_advice": {
+    "mode": "process_restart"
+   },
+   "restart_first_http_ms": 64.042917
+  },
+  {
+   "platform": "linux",
+   "control": "control-one-cpu",
+   "experiment": "r0-baseline-concurrency",
+   "clients": 4,
+   "median_http_ms": 114.5987085,
+   "cache_advice": {
+    "mode": "process_restart"
+   },
+   "restart_first_http_ms": 44.615958
+  },
+  {
+   "platform": "linux",
+   "control": "control-one-cpu",
+   "experiment": "r0-candidate-concurrency",
+   "clients": 1,
+   "median_http_ms": 22.934375,
+   "cache_advice": {
+    "mode": "process_restart"
+   },
+   "restart_first_http_ms": 148.098958
+  },
+  {
+   "platform": "linux",
+   "control": "control-one-cpu",
+   "experiment": "r0-candidate-concurrency",
+   "clients": 4,
+   "median_http_ms": 138.703354,
+   "cache_advice": {
+    "mode": "process_restart"
+   },
+   "restart_first_http_ms": 81.00375
+  },
+  {
+   "platform": "linux",
+   "control": "control-one-cpu",
+   "experiment": "r1-candidate-concurrency",
+   "clients": 1,
+   "median_http_ms": 20.462208,
+   "cache_advice": {
+    "mode": "process_restart"
+   },
+   "restart_first_http_ms": 78.453042
+  },
+  {
+   "platform": "linux",
+   "control": "control-one-cpu",
+   "experiment": "r1-candidate-concurrency",
+   "clients": 4,
+   "median_http_ms": 108.8167495,
+   "cache_advice": {
+    "mode": "process_restart"
+   },
+   "restart_first_http_ms": 70.551792
+  },
+  {
+   "platform": "linux",
+   "control": "control-one-cpu",
+   "experiment": "r1-baseline-concurrency",
+   "clients": 1,
+   "median_http_ms": 17.10475,
+   "cache_advice": {
+    "mode": "process_restart"
+   },
+   "restart_first_http_ms": 65.234208
+  },
+  {
+   "platform": "linux",
+   "control": "control-one-cpu",
+   "experiment": "r1-baseline-concurrency",
+   "clients": 4,
+   "median_http_ms": 125.4019375,
+   "cache_advice": {
+    "mode": "process_restart"
+   },
+   "restart_first_http_ms": 56.605333
+  }
+ ],
+ "measurements": [
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "concurrency",
+   "case": "1",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 15.3369585
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "concurrency",
+   "case": "4",
+   "records": 2,
+   "trials": 72,
+   "median_http_ms": 69.9127915
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "hints",
+   "case": "retained_distinct_predicates",
+   "records": 2,
+   "trials": 24,
+   "median_http_ms": 85.4530415,
+   "median_cpu_ms": 90.0,
+   "median_verified_documents": 512.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 60260.0,
+   "median_source_parse_us": 220.0,
+   "batch_peak_bytes_max": 2044686
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "distinct_word",
+   "records": 2,
+   "median_http_ms": 7344.8259195,
+   "median_cpu_ms": 3705.0,
+   "median_process_rchar": 205907295.0,
+   "median_process_wchar": 95683108.5,
+   "median_process_read_bytes": 65536.0,
+   "median_process_write_bytes": 96595968.0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "repetitive",
+   "records": 2,
+   "median_http_ms": 1093.694625,
+   "median_cpu_ms": 380.0,
+   "median_process_rchar": 1522847.0,
+   "median_process_wchar": 1970843.0,
+   "median_process_read_bytes": 83968.0,
+   "median_process_write_bytes": 2787328.0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "source_code",
+   "records": 2,
+   "median_http_ms": 1561.5048550000001,
+   "median_cpu_ms": 485.0,
+   "median_process_rchar": 1552712.5,
+   "median_process_wchar": 2932504.5,
+   "median_process_read_bytes": 83968.0,
+   "median_process_write_bytes": 3770368.0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_dense:0",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 304.7992925,
+   "median_cpu_ms": 330.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_dense:16320",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 276.887833,
+   "median_cpu_ms": 290.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_dense:8192",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 304.332896,
+   "median_cpu_ms": 330.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_sparse:0",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 21.2863125,
+   "median_cpu_ms": 20.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_sparse:512",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 22.7852085,
+   "median_cpu_ms": 25.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_sparse:960",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 24.014083,
+   "median_cpu_ms": 20.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "nested_source",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 15.897375,
+   "median_cpu_ms": 20.0,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 5.0,
+   "median_source_read_us": 7987.5,
+   "median_source_parse_us": 597.5,
+   "batch_peak_bytes_max": 271002
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "selected_dominant",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 10.407458,
+   "median_cpu_ms": 10.0,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 6.0,
+   "median_source_read_us": 2604.5,
+   "median_source_parse_us": 969.0,
+   "batch_peak_bytes_max": 595802
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "selected_large",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 24.132688,
+   "median_cpu_ms": 30.0,
+   "median_verified_documents": 4096.0,
+   "median_scalar_reads": 6.0,
+   "median_source_read_us": 7099.5,
+   "median_source_parse_us": 1838.5,
+   "batch_peak_bytes_max": 777514
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "tiny",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 12.7259165,
+   "median_cpu_ms": 10.0,
+   "median_verified_documents": 4096.0,
+   "median_scalar_reads": 4.0,
+   "median_source_read_us": 1973.5,
+   "median_source_parse_us": 740.5,
+   "batch_peak_bytes_max": 28716
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "unselected_arrays",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 14.7,
+   "median_cpu_ms": 15.0,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 6.0,
+   "median_source_read_us": 6872.5,
+   "median_source_parse_us": 259.0,
+   "batch_peak_bytes_max": 130112
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "concurrency",
+   "case": "1",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 15.250792
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "concurrency",
+   "case": "4",
+   "records": 2,
+   "trials": 72,
+   "median_http_ms": 67.854479
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "hints",
+   "case": "retained_distinct_predicates",
+   "records": 2,
+   "trials": 24,
+   "median_http_ms": 78.848583,
+   "median_cpu_ms": 80.0,
+   "median_verified_documents": 512.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 53562.0,
+   "median_source_parse_us": 193.5,
+   "batch_peak_bytes_max": 2073230
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "distinct_word",
+   "records": 2,
+   "median_http_ms": 3470.9472305,
+   "median_cpu_ms": 2950.0,
+   "median_process_rchar": 128407118.5,
+   "median_process_wchar": 74389245.5,
+   "median_process_read_bytes": 71680.0,
+   "median_process_write_bytes": 75343872.0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "repetitive",
+   "records": 2,
+   "median_http_ms": 728.9177295,
+   "median_cpu_ms": 300.0,
+   "median_process_rchar": 1521321.5,
+   "median_process_wchar": 1969605.0,
+   "median_process_read_bytes": 83968.0,
+   "median_process_write_bytes": 2709504.0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "source_code",
+   "records": 2,
+   "median_http_ms": 846.2786675000001,
+   "median_cpu_ms": 360.0,
+   "median_process_rchar": 1527015.0,
+   "median_process_wchar": 2927807.0,
+   "median_process_read_bytes": 49152.0,
+   "median_process_write_bytes": 3694592.0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_dense:0",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 275.4745835,
+   "median_cpu_ms": 290.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_dense:16320",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 283.15706250000005,
+   "median_cpu_ms": 310.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_dense:8192",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 283.1255,
+   "median_cpu_ms": 295.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_sparse:0",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 25.2496455,
+   "median_cpu_ms": 30.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_sparse:512",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 26.600875000000002,
+   "median_cpu_ms": 30.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_sparse:960",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 24.805854,
+   "median_cpu_ms": 20.0,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "nested_source",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 15.242,
+   "median_cpu_ms": 15.0,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 5.0,
+   "median_source_read_us": 7016.0,
+   "median_source_parse_us": 525.0,
+   "batch_peak_bytes_max": 271002
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "selected_dominant",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 14.589209,
+   "median_cpu_ms": 10.0,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 6.0,
+   "median_source_read_us": 3967.5,
+   "median_source_parse_us": 1351.0,
+   "batch_peak_bytes_max": 600116
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "selected_large",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 23.8582915,
+   "median_cpu_ms": 20.0,
+   "median_verified_documents": 4096.0,
+   "median_scalar_reads": 6.0,
+   "median_source_read_us": 6352.0,
+   "median_source_parse_us": 1607.0,
+   "batch_peak_bytes_max": 777514
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "tiny",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 13.6304375,
+   "median_cpu_ms": 10.0,
+   "median_verified_documents": 4096.0,
+   "median_scalar_reads": 4.0,
+   "median_source_read_us": 2024.0,
+   "median_source_parse_us": 792.5,
+   "batch_peak_bytes_max": 28148
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "unselected_arrays",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 12.0512085,
+   "median_cpu_ms": 10.0,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 6.0,
+   "median_source_read_us": 6233.0,
+   "median_source_parse_us": 236.0,
+   "batch_peak_bytes_max": 130112
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "concurrency",
+   "case": "1",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 8.354062500000001
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "concurrency",
+   "case": "4",
+   "records": 2,
+   "trials": 72,
+   "median_http_ms": 18.134917
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "hints",
+   "case": "retained_distinct_predicates",
+   "records": 2,
+   "trials": 24,
+   "median_http_ms": 82.1171875,
+   "median_cpu_ms": 65.318521,
+   "median_verified_documents": 512.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 48596.0,
+   "median_source_parse_us": 153.5,
+   "batch_peak_bytes_max": 1943846
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "distinct_word",
+   "records": 2,
+   "median_http_ms": 2522.3818334999996,
+   "median_cpu_ms": 2262.2572920000002
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "repetitive",
+   "records": 2,
+   "median_http_ms": 259.28923,
+   "median_cpu_ms": 217.5623125
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "source_code",
+   "records": 2,
+   "median_http_ms": 213.83162499999997,
+   "median_cpu_ms": 206.041833
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_dense:0",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 196.3698755,
+   "median_cpu_ms": 152.0679585,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_dense:16320",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 171.1056875,
+   "median_cpu_ms": 144.31912499999999,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_dense:8192",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 169.83443749999998,
+   "median_cpu_ms": 149.1009795,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_sparse:0",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 23.3427495,
+   "median_cpu_ms": 18.031084,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_sparse:512",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 20.372,
+   "median_cpu_ms": 16.4729165,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "pages",
+   "case": "retained_pages_sparse:960",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 22.295291499999998,
+   "median_cpu_ms": 17.9909795,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "nested_source",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 11.780249999999999,
+   "median_cpu_ms": 9.2068335,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 4.0,
+   "median_source_read_us": 5483.0,
+   "median_source_parse_us": 561.0,
+   "batch_peak_bytes_max": 302566
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "selected_dominant",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 8.938895500000001,
+   "median_cpu_ms": 6.2096875,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 4.0,
+   "median_source_read_us": 1652.0,
+   "median_source_parse_us": 956.0,
+   "batch_peak_bytes_max": 737692
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "selected_large",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 14.7064795,
+   "median_cpu_ms": 10.869561999999998,
+   "median_verified_documents": 4096.0,
+   "median_scalar_reads": 4.0,
+   "median_source_read_us": 3110.0,
+   "median_source_parse_us": 1368.5,
+   "batch_peak_bytes_max": 679332
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "tiny",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 11.740354499999999,
+   "median_cpu_ms": 7.041812500000001,
+   "median_verified_documents": 4096.0,
+   "median_scalar_reads": 4.0,
+   "median_source_read_us": 1423.0,
+   "median_source_parse_us": 595.5,
+   "batch_peak_bytes_max": 28148
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "unselected_arrays",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 11.468646,
+   "median_cpu_ms": 7.6719375,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 6.0,
+   "median_source_read_us": 4371.5,
+   "median_source_parse_us": 200.0,
+   "batch_peak_bytes_max": 132576
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "concurrency",
+   "case": "1",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 8.2307085
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "concurrency",
+   "case": "4",
+   "records": 2,
+   "trials": 72,
+   "median_http_ms": 16.297208
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "hints",
+   "case": "retained_distinct_predicates",
+   "records": 2,
+   "trials": 24,
+   "median_http_ms": 68.99729199999999,
+   "median_cpu_ms": 63.993145999999996,
+   "median_verified_documents": 512.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 44446.0,
+   "median_source_parse_us": 129.5,
+   "batch_peak_bytes_max": 1563548
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "distinct_word",
+   "records": 2,
+   "median_http_ms": 2118.9374375,
+   "median_cpu_ms": 2001.1677085000001
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "repetitive",
+   "records": 2,
+   "median_http_ms": 184.7990415,
+   "median_cpu_ms": 191.167979
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "source_code",
+   "records": 2,
+   "median_http_ms": 197.7933745,
+   "median_cpu_ms": 189.62537500000002
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_dense:0",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 178.23539599999998,
+   "median_cpu_ms": 141.517646,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_dense:16320",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 261.42781249999996,
+   "median_cpu_ms": 153.88039550000002,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_dense:8192",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 226.156688,
+   "median_cpu_ms": 150.2767085,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_sparse:0",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 28.389000000000003,
+   "median_cpu_ms": 18.8535415,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_sparse:512",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 31.7918955,
+   "median_cpu_ms": 18.744708000000003,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "pages",
+   "case": "retained_pages_sparse:960",
+   "records": 6,
+   "trials": 6,
+   "median_http_ms": 30.267625,
+   "median_cpu_ms": 18.351104,
+   "median_verified_documents": 0.0,
+   "median_scalar_reads": 0.0,
+   "median_source_read_us": 0.0,
+   "median_source_parse_us": 0.0,
+   "batch_peak_bytes_max": 0
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "nested_source",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 12.643833,
+   "median_cpu_ms": 9.4684165,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 4.0,
+   "median_source_read_us": 5139.0,
+   "median_source_parse_us": 501.0,
+   "batch_peak_bytes_max": 302566
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "selected_dominant",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 10.356791000000001,
+   "median_cpu_ms": 7.0103335,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 4.5,
+   "median_source_read_us": 2123.0,
+   "median_source_parse_us": 1201.0,
+   "batch_peak_bytes_max": 772370
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "selected_large",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 19.683021,
+   "median_cpu_ms": 11.991958,
+   "median_verified_documents": 4096.0,
+   "median_scalar_reads": 4.0,
+   "median_source_read_us": 3682.5,
+   "median_source_parse_us": 1519.5,
+   "batch_peak_bytes_max": 679332
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "tiny",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 12.489374999999999,
+   "median_cpu_ms": 7.4571665,
+   "median_verified_documents": 4096.0,
+   "median_scalar_reads": 4.0,
+   "median_source_read_us": 1630.5,
+   "median_source_parse_us": 647.5,
+   "batch_peak_bytes_max": 28148
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "unselected_arrays",
+   "records": 2,
+   "trials": 18,
+   "median_http_ms": 11.244666500000001,
+   "median_cpu_ms": 7.5575205,
+   "median_verified_documents": 1024.0,
+   "median_scalar_reads": 6.0,
+   "median_source_read_us": 4558.0,
+   "median_source_parse_us": 212.5,
+   "batch_peak_bytes_max": 132576
+  }
+ ],
+ "source_witnesses": {
+  "docs/design/logical-field-queries.md": "8359d0b4d16ee8367d145be55c4066c52534390bece2ed21c8e1fe6f06c1d633",
+  "zig/e2e/antfly/test_grep_indexed.py": "6f1b6ac037cfaae6d848cd6818454a99e61d9d75ab8a52ac19bf64348e3b0949",
+  "zig/pkg/antfly-embedded/src/encoding/roaring.zig": "628a7909397814f3b2b1e10ebd1297e3091f445641035d8b535f6dc18a9cf674",
+  "zig/pkg/antfly-embedded/src/introducer.zig": "411e9b6c86b779a10f9820901f12c31510c75e9ddf059a0c1418d772284eb691",
+  "zig/pkg/antfly-embedded/src/postings_run.zig": "5c054e34d205187cc369a93b1e68fd007fa327a48065a23580aad163faeb62ec",
+  "zig/pkg/antfly-embedded/src/search/query.zig": "bfe65d6cc93b1c7a2b18ad6220cc05cf5cb1985047146aa389014d721df0a417",
+  "zig/pkg/antfly-embedded/src/search/search.zig": "bbe3567b06694a054e780d61784f248b38ad3798f25e41dea00e25c3eb155767",
+  "zig/pkg/antfly-embedded/src/storage/db/db.zig": "c3a08b075ffd9df4dcb982c25803b72547485fbb9377d1ae8e8c520ecab9545f",
+  "zig/pkg/antfly-embedded/src/storage/db/query/search_exec.zig": "8893cbc452db2ae18f768c3325835e451f5cf4cdafa937e3084458e8120bbefb",
+  "zig/pkg/antfly-embedded/src/storage/logical_source.zig": "d6c5c1ea6ca4e89a5799392f1ac670ebe833640c496a93918b1e3ca8019c297e",
+  "zig/pkg/antfly-grep/bench/logical_sources.py": "20521ce3c07388fb7fdc90ac5b930271c1c53a166fe5952a0bd46ecc72d97098"
+ },
+ "scripts": {
+  "freeze-build.py": "b055f5c87de42e66a6b65d6a4e45e01d0a248befff47cd6a94c7cc0c1f230fd8",
+  "qualify.py": "469bbe612d1f88fd143606dd9858c5c460de4d3c93675791795bff359dc1d0c3",
+  "page-sensitivity.py": "adcd10c4d4025d8716a2330903110168464b08e2129c9c90331286c65822eae4",
+  "collect.py": "34bc58c97c83ad1e8e44a0a1bb1513d1c484124ccf0cfe4d2b20e0bc968ee85f"
+ },
+ "page_sensitivity": {
+  "scope": "Post-hoc fixed four alternating rounds per platform after mixed primary page timings; kept separate from the prespecified two-round trials. Every page requires zero source re-verification.",
+  "measurements": [
+   {
+    "platform": "linux",
+    "case": "retained_pages_dense:0",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 216.30456249999997,
+     "cpu_ms": 225.0
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 218.5519585,
+     "cpu_ms": 230.0
+    }
+   },
+   {
+    "platform": "linux",
+    "case": "retained_pages_dense:16320",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 218.2037085,
+     "cpu_ms": 235.0
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 222.348834,
+     "cpu_ms": 240.0
+    }
+   },
+   {
+    "platform": "linux",
+    "case": "retained_pages_dense:8192",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 225.5797705,
+     "cpu_ms": 235.0
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 219.738854,
+     "cpu_ms": 235.0
+    }
+   },
+   {
+    "platform": "linux",
+    "case": "retained_pages_sparse:0",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 20.2003335,
+     "cpu_ms": 20.0
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 19.3060415,
+     "cpu_ms": 20.0
+    }
+   },
+   {
+    "platform": "linux",
+    "case": "retained_pages_sparse:512",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 20.3263335,
+     "cpu_ms": 20.0
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 20.4139165,
+     "cpu_ms": 25.0
+    }
+   },
+   {
+    "platform": "linux",
+    "case": "retained_pages_sparse:960",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 19.136499999999998,
+     "cpu_ms": 20.0
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 20.241125,
+     "cpu_ms": 20.0
+    }
+   },
+   {
+    "platform": "macos",
+    "case": "retained_pages_dense:0",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 153.85920850000002,
+     "cpu_ms": 136.1054995
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 169.16529200000002,
+     "cpu_ms": 144.78449999999998
+    }
+   },
+   {
+    "platform": "macos",
+    "case": "retained_pages_dense:16320",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 154.9768335,
+     "cpu_ms": 137.08974999999998
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 152.30506250000002,
+     "cpu_ms": 136.749146
+    }
+   },
+   {
+    "platform": "macos",
+    "case": "retained_pages_dense:8192",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 162.53664600000002,
+     "cpu_ms": 136.768979
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 162.55347949999998,
+     "cpu_ms": 137.25602049999998
+    }
+   },
+   {
+    "platform": "macos",
+    "case": "retained_pages_sparse:0",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 23.5142915,
+     "cpu_ms": 17.084542
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 27.3653125,
+     "cpu_ms": 17.439688
+    }
+   },
+   {
+    "platform": "macos",
+    "case": "retained_pages_sparse:512",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 24.15175,
+     "cpu_ms": 18.028750000000002
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 22.863563,
+     "cpu_ms": 16.6033125
+    }
+   },
+   {
+    "platform": "macos",
+    "case": "retained_pages_sparse:960",
+    "baseline": {
+     "trials": 12,
+     "http_ms": 24.632312,
+     "cpu_ms": 18.792375
+    },
+    "candidate": {
+     "trials": 12,
+     "http_ms": 25.8219165,
+     "cpu_ms": 16.7779585
+    }
+   }
+  ],
+  "validation": [
+   {
+    "mode": "macos",
+    "exit_code": 0,
+    "log_sha256": "7ce1448bfd864aa842bff9e9dfdd0b5c547cbde497c555edc45d2a259e85c389",
+    "command_sha256": "8bc4f3d27afdaae699703f228a377d27c635abc04193cf4add6c732ee4c19269"
+   },
+   {
+    "mode": "linux",
+    "exit_code": 0,
+    "log_sha256": "7ce1448bfd864aa842bff9e9dfdd0b5c547cbde497c555edc45d2a259e85c389",
+    "command_sha256": "cc682bf6a2dd9d5af9377a0625534f8d3752ad1c7b7c3aee3a6b14b6df74f80d"
+   }
+  ]
+ },
+ "raw_artifact": {
+  "availability": "local workspace only; not published",
+  "path": "output/grep-postings-pages/qualification-raw.json",
+  "sha256": "7f63e02423ea3db4bb933437f64f6482e52d43aefb48eea113e725d12586474d",
+  "bytes": 2218172
+ },
+ "ingestion_1g": {
+  "path": "output/grep-postings-pages/qualification-v1/linux/ingestion-1g.json",
+  "sha256": "1ded3c1642e1057285169f2677753d737e397830c6089e1cdf085187624174da",
+  "scope": "Successful candidate admission check, not an 8-GiB paired timing trial."
+ }
+}

@@ -750,3 +750,125 @@ constants, the input, or its complement and reuse the publication-time
 cardinality, with compressed deletion intersections when needed. General nested
 negations retain sparse word execution. Regressions cover the maximum u32
 document domain, clipped final words and deletion IDs outside the domain.
+
+### Spill and page ownership follow-up
+
+Postings spill uses the configured fixed target for non-default targets. The
+native default retains an 8 MiB trigger on nodes whose full-text/aggregate hard
+limit is at most 128 MiB. Larger envelopes may grow the trigger to at most
+64 MiB, using one quarter of current pending bytes plus advisory admission
+headroom. Allocations still use the resource manager; this estimate grants no
+memory and concurrent pressure can cause normal admission refusal. When spilling
+is required, the queued fields are ordered by retained size and the largest
+fields spill until pending payload falls below half the target. Small companion
+fields remain queued. A spill never splits a repeated physical field's document
+posting. The private run's lazy 512 KiB, four-way page cache accommodates sixteen
+interleaved dictionary/postings cursors with constant lookup work. Compaction and
+in-place patches invalidate cached physical pages.
+
+Read-only result consumers use `SegmentMembership`: either an independently
+owned bitmap or a complete immutable producer lease. Mutating filter APIs retain
+their ownership contract. Constant-score collection counts a leased segment and
+seeks only the requested prefix; ranked producer gates retain include/exclude
+pins for one segment. Native sorted candidates retain a directory of local
+memberships and captured tombstone masks, with global containment and iteration
+without rebasing into a copied corpus bitmap. Enumeration subtracts captured
+tombstones word by word, seeks across unrelated sparse mask ranges, and checks
+cancellation while skipping fully deleted words. Dense deletion runs therefore
+do not require visiting every deleted document. Each failure path releases pins,
+captured masks and initialized directory entries. General Boolean/scoring shapes
+continue to use owned execution when no complete borrowed view is available.
+A single exact doc-number query has a constant score; native page selection can
+recover that score without evaluating the producer a second time.
+
+Source windows already hold their segment lease. Identity reads use that leased
+reader directly, instead of resolving and leasing the same segment per row.
+`ANTFLY_BENCH_LOGICAL_SOURCE_PHASES=1` enables diagnostic source-phase probes:
+key lookup, provider work, revision lookup, directory reads/planning, selected
+ranges, reconstruction and full-body fallback. They log aggregate timings and
+membership borrow/copy counts without document identifiers, bytes or capabilities.
+Ordinary profiled requests collect the top-level lookup/ownership counters.
+Extra physical-source phase clocks and diagnostic log capture are opt-in; those
+trials remain separate from normal latency qualification. Public
+query semantics, verification controls and freshness options are unchanged.
+
+### Remaining source-certificate ownership
+
+Segment predicate reuse across writes still requires implementation of the
+segment/source binding certificates described above. A maintained implementation must register complete
+source identities at a publication fence, invalidate affected registrations from
+both transaction and batch source-mutation paths (including unindexed updates),
+and capture immutable certificates with the retained cut. The existing
+`document_mutation_revision` staging boundary is a candidate for mutation
+notification; global `query_generation_revision` remains the conservative fence.
+Registration from an old retained cut cannot attest current source state unless
+the live owner revalidates the captured source revision under the same fences.
+
+Certificate ownership must have bounded admission, owner-lifetime nonces and
+explicit retirement. Exhausted registration capacity, excessive invalidation
+fan-out, missing source coverage, repair, schema changes and unsupported storage
+modes fall back to the whole-generation proof. Restart and compaction cannot
+inherit a certificate merely because segment IDs or analyzed terms match.
+Validation needs concurrent unindexed updates, registration/publication races,
+failed and ambiguous commits, deletion/recreation, repair, compaction, restart,
+expiry and allocation-failure cases. The scalar source registry below does not establish these segment membership
+certificates or make complete requests zero cost.
+
+
+### Bounded original-value certificate registry
+
+Original-value metadata now has an owner-local proof registry, distinct from
+segment predicate membership reuse. Each native DocStore admits at most 4,096
+scalar facts keyed by the complete document mutation identity: content revision,
+length, kind, digest and stored timestamp. No JSON bodies, selected values, ACLs
+or predicate answers are cached here. The registry is lazy, ephemeral and uses
+the store allocator; pressure, allocation failure and missing coverage are misses.
+It is retired on store close and never restored from segment IDs or disk files.
+
+Read admission captures an owner-lifetime nonce and stable mutation epoch around
+primary snapshot creation. Proof hits and new registrations require that exact
+owner/epoch with no active mutation attempts. A retained old cut may continue
+reading its pinned storage snapshot after writes, but cannot certify facts in a
+new live epoch. Transaction and batch commits invalidate the actual document
+mutation set immediately before backend commit, including unindexed-field/TTL
+changes and delete/reinsert. Fences remain active until the backend attempt
+returns, including ambiguous failure. Unrelated mutations preserve registered
+facts for fresh readers. Large invalidation sets clear the registry instead of
+creating unbounded fan-out. Imports and bulk publication fence/clear all facts;
+bulk sessions remain fenced until finish or abort. Epoch/nonce exhaustion fails
+closed.
+
+The shared logical source reader consults these facts before reading revision,
+content-authority and timestamp keys, then continues directory and selected-range
+verification against the same primary snapshot. Every selected range still
+checks its digest. Original-byte budgets and authenticated row policy remain
+unchanged. Optional `ANTFLY_BENCH_LOGICAL_SOURCE_PHASES=1` output includes
+`proof_cache_hits` and `proof_cache_misses`, permitting qualification of eliminated
+metadata reads separately from range I/O and end-to-end latency.
+
+This implements bounded original-value proof reuse across unrelated writes.
+It does not make whole predicate/segment membership reusable across writes:
+complete segment-to-source coverage certificates and coordinator-owned work
+grants described above remain separate ownership work. Current conservative
+whole-generation predicate proofs remain authoritative. Registry tests cover old
+cuts, unrelated writes, rejected registration, overlapping writers, ambiguous
+attempt retirement, allocation failure, capacity and epoch exhaustion; native
+DocStore/DB tests cover transaction/batch invalidation, delete/recreate, pinned
+readers and the actual original-value loading path.
+
+
+### Proof-cache admission under pressure (2026-10-22)
+
+The original-value registry uses lazy bounded CLOCK admission instead of clearing
+all facts on the first cold insertion at capacity. One insertion into a full
+4,096-entry registry evicts one entry; unrelated warm proofs remain available.
+Reads mark their slot referenced, mutation invalidation frees its slot, and
+subsequent admission reuses holes without evicting an unrelated fact. Whole-owner
+replacement and excessive mutation fan-out still clear all entries deliberately.
+Ring and directory storage are lazy and bounded; allocation failure remains a
+miss and cannot discard unrelated entries before admission capacity is available.
+A logical-source window checks up to 64 proof identities under one lock and
+registers fetched proofs under one lock, with epoch validity rechecked after I/O.
+Owner/nonce/epoch/publication rules are unchanged. This cache stores scalar source
+facts; it does not establish complete cross-write predicate membership or bypass
+current authorization, selected-range digests or original-byte work budgets.
