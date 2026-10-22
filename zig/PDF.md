@@ -170,13 +170,15 @@ and OCR text pass the configured quality checks, retain the embedded text;
 sampled-ratio differences and a longer OCR result do not establish an improvement.
 Forced OCR still guarantees an attempt, with selection subject to these checks.
 
-Numeric recovery rejects broken-prose rows rather than appending their split
-digits to a better OCR transcription. Row fragmentation uses alphabetic tokens
-and requires at least four consecutive letter fragments including lowercase text. Interleaved
-class labels, letter/value pairs, and uppercase column labels remain eligible;
-numeric cells neither dilute broken labels nor count as fragmented prose.
-Reliable numeric rows retain their labels, signed values,
-and duplicate occurrences. These policies do not depend on a particular OCR
+Numeric recovery rejects bare digit fragments in broken prose rather than
+appending them to a better OCR transcription. Alphabetic fragmentation requires
+at least four consecutive letter fragments including lowercase text. It does
+not disqualify intact values: multi-character tokens and attached signs,
+currency, and percentages remain eligible even beside lowercase variable labels.
+Rows with intact values retain their source labels and duplicate occurrences;
+mixed rows contribute only trusted values and cannot become broken headers.
+Numeric cells neither dilute broken labels nor count as fragmented prose.
+These policies do not depend on a particular OCR
 model, and their existing thresholds and work limits remain in force.
 
 Florence's persistent decoder cross-attention cache owns borrowed Metal
