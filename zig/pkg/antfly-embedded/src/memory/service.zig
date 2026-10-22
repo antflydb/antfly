@@ -53,7 +53,7 @@ const EntityCurationProvenance = struct {
     evidence: []const t.EvidenceRef = &.{},
 };
 
-const ProposalBinding = struct { revision: u64 = 0, operation: ?prov.Resource = null, owner: []const u8, actor: []const u8 = "", verdict_actor: []const u8 = "", config_generation: u64, entities: []const struct { id: []const u8, revision: u64 }, evidence: []const t.EvidenceRef, verdict_revision: ?u64 = null, model: ?t.Model = null };
+const ProposalBinding = t.EntityProposalInputs;
 const ProposalAttempt = struct { proposal: curation.Proposal, inputs: ProposalBinding, previous: ?prov.Resource = null };
 const EpisodeCatalog = struct { thread_id: []const u8, members: u64 = 0 };
 const EpisodeListPosition = struct {
@@ -148,8 +148,9 @@ pub const Service = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        var run: Run = .{ .service = self, .a = a, .explanation_snapshot_scratch = .init(a), .processing_failure = execution.processing_failure, .defer_timeouts = execution.defer_timeouts };
+        var run: Run = .{ .service = self, .a = a, .explanation_snapshot_scratch = .init(a), .lexical_allocator = alloc, .processing_failure = execution.processing_failure, .defer_timeouts = execution.defer_timeouts };
         defer run.explanation_snapshot_scratch.deinit();
+        defer if (run.lexical_query) |*query| query.deinit();
         const state_row = try self.backend.get(self.backend.ptr, a, "control");
         run.state_row = state_row;
         if (action == .create and state_row == null) {
@@ -326,6 +327,8 @@ const Run = struct {
     const ResourceSet = std.StringHashMapUnmanaged(void);
     service: Service,
     a: A,
+    lexical_allocator: A,
+    lexical_query: ?lexical.PreparedQuery = null,
     state: t.State = undefined,
     state_row: ?Row = null,
     changes: std.ArrayList(Change) = .empty,
@@ -1975,7 +1978,9 @@ const Run = struct {
         const seed_view = try self.entityView(id, .{});
         const seed_terms = try self.candidateTerms(seed.entity);
         var views_complete = seed_view.complete;
-        const Candidate = struct { entity: t.EntityRecord, view: t.EntityView, match_score: f64, description_score: f64, predicates: []const []const u8 };
+        const Candidate = t.EntityCandidate;
+        var description_query = try lexical.PreparedQuery.init(self.lexical_allocator, seed_view.description);
+        defer description_query.deinit();
         var matches: std.ArrayList(Candidate) = .empty;
         for (page.rows) |row| {
             try self.service.context.check();
@@ -2005,7 +2010,7 @@ const Run = struct {
             if (score <= 0) continue;
             const candidate_view = try self.entityView(candidate.entity.id, .{});
             views_complete = views_complete and candidate_view.complete;
-            try matches.append(self.a, .{ .entity = candidate, .view = candidate_view, .match_score = score, .description_score = try lexical.overlap(self.a, seed_view.description, candidate_view.description), .predicates = predicates });
+            try matches.append(self.a, .{ .entity = candidate, .view = candidate_view, .match_score = score, .description_score = try description_query.overlap(candidate_view.description), .predicates = predicates });
         }
         std.mem.sort(Candidate, matches.items, {}, struct {
             fn less(_: void, lhs: Candidate, rhs: Candidate) bool {
@@ -2015,7 +2020,7 @@ const Run = struct {
             }
         }.less);
         const count = @min(matches.items.len, request.limit);
-        return self.encode(.{ .seed = seed, .seed_view = seed_view, .kind = request.kind, .relationship_predicates = if (self.state.config.ontology_pack == .software_team_v1) &[_][]const u8{ "is_a", "part_of", "alternative_to" } else &[_][]const u8{}, .items = matches.items[0..count], .revision = self.state.revision, .config_generation = self.state.config.generation, .next_cursor = try self.encodeCursor(try self.candidateScope(id, request), page.next), .complete = views_complete and page.next == null and count == matches.items.len, .omitted = matches.items.len - count, .retrieval = if (!((try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{}).complete) "bounded_primary_fallback" else if (seed_terms.len > 128) "bounded_audience_fallback" else "indexed_lexical", .semantic_discovery = "not_indexed", .basis = "name_matches_description_tiebreaker_not_identity_or_calibrated_confidence" });
+        return self.encode(t.EntityCandidatePage{ .seed = seed, .seed_view = seed_view, .kind = request.kind, .relationship_predicates = if (self.state.config.ontology_pack == .software_team_v1) &[_][]const u8{ "is_a", "part_of", "alternative_to" } else &[_][]const u8{}, .items = matches.items[0..count], .revision = self.state.revision, .config_generation = self.state.config.generation, .next_cursor = try self.encodeCursor(try self.candidateScope(id, request), page.next), .complete = views_complete and page.next == null and count == matches.items.len, .omitted = matches.items.len - count, .retrieval = if (!((try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{}).complete) .bounded_primary_fallback else if (seed_terms.len > 128) .bounded_audience_fallback else .indexed_lexical });
     }
     fn proposalOperation(self: *Run, proposal: curation.Proposal, binding: ?ProposalBinding) !prov.Resource {
         if (binding) |value| if (value.operation) |operation| return operation;
@@ -2101,7 +2106,7 @@ const Run = struct {
         for (page.rows) |row| if (try self.proposalInputsRetained(try parse(ProposalBinding, self.a, row.json))) try available.put(self.a, row.key, {});
         var proposals: std.ArrayList(curation.Proposal) = .empty;
         for (stored.state.proposals) |proposal| if (available.contains(try key(self.a, "proposal-input", proposal.id))) try proposals.append(self.a, proposal);
-        return self.encode(.{ .items = proposals.items, .next_cursor = try self.encodeCursor("proposal-input/", page.next), .complete = page.next == null, .revision = self.state.revision });
+        return self.encode(t.EntityProposalPage{ .items = proposals.items, .next_cursor = try self.encodeCursor("proposal-input/", page.next), .complete = page.next == null, .revision = self.state.revision });
     }
     fn entityProposal(self: *Run, id: []const u8) ![]const u8 {
         try self.requireAdmin();
@@ -2115,7 +2120,7 @@ const Run = struct {
             const provenance = (try self.read(EntityCurationProvenance, try std.fmt.allocPrint(self.a, "entity-curation/{d:0>20}", .{revision}))) orelse break :blk @as(?[]const u8, null);
             break :blk if (try self.curationProvenanceRetained(provenance)) provenance.reason else null;
         } else null;
-        return self.encode(.{ .proposal = proposal, .inputs = binding, .reason = reason, .stale_configuration = binding.config_generation != self.state.config.generation, .revision = self.state.revision });
+        return self.encode(t.EntityProposalDetail{ .proposal = proposal, .inputs = binding, .reason = reason, .stale_configuration = binding.config_generation != self.state.config.generation, .revision = self.state.revision });
     }
     fn reviewEntity(self: *Run, id: []const u8, request: t.EntityVerdict, receipt: *t.Operation) !void {
         try self.requireAdmin();
@@ -3738,7 +3743,12 @@ const Run = struct {
         if (request.environment) |value| if (claim.environment != null and !eql(u8, value, claim.environment.?)) return null;
         if (request.task) |value| if (claim.task != null and !eql(u8, value, claim.task.?)) return null;
         if (request.kind) |value| if (value != claim.kind) return null;
-        var score = try lexical.coverage(self.a, request.query, claim.statement);
+        if (request.query.len > 0 and (self.lexical_query == null or !eql(u8, self.lexical_query.?.input, request.query))) {
+            if (self.lexical_query) |*query| query.deinit();
+            self.lexical_query = null;
+            self.lexical_query = try lexical.PreparedQuery.init(self.lexical_allocator, request.query);
+        }
+        var score: f64 = if (request.query.len == 0) 1 else self.lexical_query.?.coverage(claim.statement);
         const compatible_embedding = if (vector != null) try self.vectorFor(self.state.config, claim) else null;
         if (vector) |query_vector| if (compatible_embedding) |embedding| {
             score += try cosine(query_vector, embedding);

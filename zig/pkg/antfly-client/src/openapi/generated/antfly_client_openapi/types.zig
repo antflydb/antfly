@@ -32741,7 +32741,7 @@ pub const MemoryAssertion = struct {
     expected_outcome: OpenApiOptionalNullable([]const u8) = .absent,
     producer: ?[]const u8 = null,
     visibility: ?[]const u8 = null,
-    embedding: OpenApiOptionalNullable([]const f64) = .absent,
+    embedding: OpenApiOptionalNullable([]const f32) = .absent,
     embedding_model: OpenApiOptionalNullable(std.json.Value) = .absent,
     reconciliation_reason: OpenApiOptionalNullable([]const u8) = .absent,
 
@@ -33105,6 +33105,90 @@ pub const MemoryEntity = struct {
     }
 };
 
+pub const MemoryEntityCandidate = struct {
+    entity: MemoryEntityRecord,
+    view: MemoryEntityView,
+    match_score: f64,
+    description_score: f64,
+    predicates: []const []const u8,
+};
+
+pub const MemoryEntityCandidatePage = struct {
+    seed: MemoryEntityRecord,
+    seed_view: MemoryEntityView,
+    kind: []const u8,
+    relationship_predicates: []const []const u8,
+    items: []const MemoryEntityCandidate,
+    revision: u64,
+    config_generation: u64,
+    next_cursor: ?[]const u8,
+    complete: bool,
+    omitted: u64,
+    retrieval: []const u8,
+    semantic_discovery: ?[]const u8 = null,
+    basis: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "seed", "seed", false },
+        .{ "seed_view", "seed_view", false },
+        .{ "kind", "kind", false },
+        .{ "relationship_predicates", "relationship_predicates", false },
+        .{ "items", "items", false },
+        .{ "revision", "revision", false },
+        .{ "config_generation", "config_generation", false },
+        .{ "next_cursor", "next_cursor", false },
+        .{ "complete", "complete", false },
+        .{ "omitted", "omitted", false },
+        .{ "retrieval", "retrieval", false },
+        .{ "semantic_discovery", "semantic_discovery", true },
+        .{ "basis", "basis", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("seed");
+        try jw.write(self.seed);
+        try jw.objectField("seed_view");
+        try jw.write(self.seed_view);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("relationship_predicates");
+        try jw.write(self.relationship_predicates);
+        try jw.objectField("items");
+        try jw.write(self.items);
+        try jw.objectField("revision");
+        try jw.write(self.revision);
+        try jw.objectField("config_generation");
+        try jw.write(self.config_generation);
+        try jw.objectField("next_cursor");
+        try jw.write(self.next_cursor);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        try jw.objectField("omitted");
+        try jw.write(self.omitted);
+        try jw.objectField("retrieval");
+        try jw.write(self.retrieval);
+        if (self.semantic_discovery) |value| {
+            try jw.objectField("semantic_discovery");
+            try jw.write(value);
+        }
+        if (self.basis) |value| {
+            try jw.objectField("basis");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const MemoryEntityCandidateRequest = struct {
     kind: ?[]const u8 = null,
     cursor: OpenApiOptionalNullable([]const u8) = .absent,
@@ -33289,6 +33373,275 @@ pub const MemoryEntityPage = struct {
     }
 };
 
+pub const MemoryEntityProposal = struct {
+    id: []const u8,
+    action: []const u8,
+    key: []const u8,
+    into: OpenApiOptionalNullable([]const u8) = .absent,
+    options: ?std.json.Value = null,
+    confidence: OpenApiOptionalNullable(f64) = .absent,
+    evidence: OpenApiOptionalNullable(std.json.Value) = .absent,
+    origin: std.json.Value,
+    state: ?[]const u8 = null,
+    decided: OpenApiOptionalNullable(std.json.Value) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "action", "action", false },
+        .{ "key", "key", false },
+        .{ "into", "into", false },
+        .{ "options", "options", true },
+        .{ "confidence", "confidence", false },
+        .{ "evidence", "evidence", false },
+        .{ "origin", "origin", false },
+        .{ "state", "state", true },
+        .{ "decided", "decided", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        switch (self.into) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("into");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("into");
+                try jw.write(value);
+            },
+        }
+        if (self.options) |value| {
+            try jw.objectField("options");
+            try jw.write(value);
+        }
+        switch (self.confidence) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("confidence");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("confidence");
+                try jw.write(value);
+            },
+        }
+        switch (self.evidence) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("evidence");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("evidence");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("origin");
+        try jw.write(self.origin);
+        if (self.state) |value| {
+            try jw.objectField("state");
+            try jw.write(value);
+        }
+        switch (self.decided) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("decided");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("decided");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const MemoryEntityProposalDetail = struct {
+    proposal: MemoryEntityProposal,
+    inputs: MemoryEntityProposalInputs,
+    reason: ?[]const u8,
+    stale_configuration: bool,
+    revision: u64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "proposal", "proposal", false },
+        .{ "inputs", "inputs", false },
+        .{ "reason", "reason", false },
+        .{ "stale_configuration", "stale_configuration", false },
+        .{ "revision", "revision", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("proposal");
+        try jw.write(self.proposal);
+        try jw.objectField("inputs");
+        try jw.write(self.inputs);
+        try jw.objectField("reason");
+        try jw.write(self.reason);
+        try jw.objectField("stale_configuration");
+        try jw.write(self.stale_configuration);
+        try jw.objectField("revision");
+        try jw.write(self.revision);
+        try jw.endObject();
+    }
+};
+
+pub const MemoryEntityProposalInputs = struct {
+    revision: ?u64 = null,
+    operation: OpenApiOptionalNullable(std.json.Value) = .absent,
+    owner: []const u8,
+    actor: ?[]const u8 = null,
+    verdict_actor: ?[]const u8 = null,
+    config_generation: u64,
+    entities: []const std.json.Value,
+    evidence: []const std.json.Value,
+    verdict_revision: OpenApiOptionalNullable(u64) = .absent,
+    model: OpenApiOptionalNullable(std.json.Value) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "revision", "revision", true },
+        .{ "operation", "operation", false },
+        .{ "owner", "owner", false },
+        .{ "actor", "actor", true },
+        .{ "verdict_actor", "verdict_actor", true },
+        .{ "config_generation", "config_generation", false },
+        .{ "entities", "entities", false },
+        .{ "evidence", "evidence", false },
+        .{ "verdict_revision", "verdict_revision", false },
+        .{ "model", "model", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.revision) |value| {
+            try jw.objectField("revision");
+            try jw.write(value);
+        }
+        switch (self.operation) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("operation");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("operation");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        if (self.actor) |value| {
+            try jw.objectField("actor");
+            try jw.write(value);
+        }
+        if (self.verdict_actor) |value| {
+            try jw.objectField("verdict_actor");
+            try jw.write(value);
+        }
+        try jw.objectField("config_generation");
+        try jw.write(self.config_generation);
+        try jw.objectField("entities");
+        try jw.write(self.entities);
+        try jw.objectField("evidence");
+        try jw.write(self.evidence);
+        switch (self.verdict_revision) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("verdict_revision");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("verdict_revision");
+                try jw.write(value);
+            },
+        }
+        switch (self.model) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("model");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("model");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const MemoryEntityProposalPage = struct {
+    items: []const MemoryEntityProposal,
+    next_cursor: ?[]const u8,
+    complete: bool,
+    revision: u64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "items", "items", false },
+        .{ "next_cursor", "next_cursor", false },
+        .{ "complete", "complete", false },
+        .{ "revision", "revision", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("items");
+        try jw.write(self.items);
+        try jw.objectField("next_cursor");
+        try jw.write(self.next_cursor);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        try jw.objectField("revision");
+        try jw.write(self.revision);
+        try jw.endObject();
+    }
+};
+
 pub const MemoryEntityProposalRequest = struct {
     action: []const u8,
     from: []const u8,
@@ -33359,6 +33712,53 @@ pub const MemoryEntityProposalRequest = struct {
         if (self.evidence) |value| {
             try jw.objectField("evidence");
             try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const MemoryEntityRecord = struct {
+    entity: MemoryEntity,
+    owner: []const u8,
+    revision: ?u64 = null,
+    recorded_at: OpenApiOptionalNullable(i64) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "entity", "entity", false },
+        .{ "owner", "owner", false },
+        .{ "revision", "revision", true },
+        .{ "recorded_at", "recorded_at", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("entity");
+        try jw.write(self.entity);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        if (self.revision) |value| {
+            try jw.objectField("revision");
+            try jw.write(value);
+        }
+        switch (self.recorded_at) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("recorded_at");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("recorded_at");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -34226,7 +34626,7 @@ pub const MemoryRecallRequest = struct {
     limit: ?u32 = null,
     token_budget: ?u32 = null,
     cursor: OpenApiOptionalNullable([]const u8) = .absent,
-    embedding: OpenApiOptionalNullable([]const f64) = .absent,
+    embedding: OpenApiOptionalNullable([]const f32) = .absent,
     embedding_model: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

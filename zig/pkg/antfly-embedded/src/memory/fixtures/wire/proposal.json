@@ -1,0 +1,60 @@
+{
+  "proposal": {
+    "id": "de5d6fb72a856b5d9ca755d0670b2ca6def8b08fde480b3774fb1fb3866419f9",
+    "action": "merge",
+    "key": "a",
+    "into": "b",
+    "options": {
+      "replace": false,
+      "pin_distinct": false,
+      "absorbed": "reject"
+    },
+    "confidence": null,
+    "evidence": null,
+    "origin": {
+      "origin": "manual",
+      "actor": "alice",
+      "reason": "",
+      "created_at_ms": 3,
+      "revision": 4,
+      "proposal_id": null,
+      "cascade_from": null
+    },
+    "state": "open",
+    "decided": null
+  },
+  "inputs": {
+    "revision": 4,
+    "operation": {
+      "database": "default",
+      "namespace": "public",
+      "table": "memory_wire",
+      "table_id": 7,
+      "storage_name": null,
+      "kind": "operation",
+      "id": "03447d7d5133a255242009a158e418d7e7d9e3f0f03e8e861ceb69112263b359",
+      "revision": 4,
+      "digest": null
+    },
+    "owner": "alice",
+    "actor": "codex/consolidation",
+    "verdict_actor": "",
+    "config_generation": 1,
+    "entities": [
+      {
+        "id": "a",
+        "revision": 3
+      },
+      {
+        "id": "b",
+        "revision": 3
+      }
+    ],
+    "evidence": [],
+    "verdict_revision": null,
+    "model": null
+  },
+  "reason": null,
+  "stale_configuration": false,
+  "revision": 4
+}

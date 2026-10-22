@@ -74,7 +74,10 @@ def main():
             "run",
             "--cache-dir",
             str(ROOT / "zig/.zig-cache"),
-            "pkg/antfly-embedded/src/memory_schema_export.zig",
+            "--dep",
+            "antfly_resolver",
+            "-Mroot=pkg/antfly-embedded/src/memory_schema_export.zig",
+            "-Mantfly_resolver=pkg/antfly-embedded/resolver/src/memory_contract.zig",
         ],
         cwd=ROOT / "zig",
     )
@@ -147,11 +150,38 @@ def main():
             "retryable": {"type": "boolean"},
         },
     }
+    schemas["MemoryEntityRecord"]["properties"]["entity"] = ref("MemoryEntity")
+    schemas["MemoryEntityCandidate"]["properties"]["entity"] = ref("MemoryEntityRecord")
+    schemas["MemoryEntityCandidate"]["properties"]["view"] = ref("MemoryEntityView")
+    schemas["MemoryEntityCandidatePage"]["properties"]["seed"] = ref(
+        "MemoryEntityRecord"
+    )
+    schemas["MemoryEntityCandidatePage"]["properties"]["seed_view"] = ref(
+        "MemoryEntityView"
+    )
+    schemas["MemoryEntityCandidatePage"]["properties"]["items"]["items"] = ref(
+        "MemoryEntityCandidate"
+    )
+    schemas["MemoryEntityProposalPage"]["properties"]["items"]["items"] = ref(
+        "MemoryEntityProposal"
+    )
+    schemas["MemoryEntityProposalDetail"]["properties"]["proposal"] = ref(
+        "MemoryEntityProposal"
+    )
+    schemas["MemoryEntityProposalDetail"]["properties"]["inputs"] = ref(
+        "MemoryEntityProposalInputs"
+    )
     paths = {}
 
-    def operation(
-        path, method, name, request=None, response="MemoryOperation", mutation=False
-    ):
+    def operation(path, method, name, request=None, response=None, mutation=False):
+        if response is None:
+            if not mutation:
+                raise ValueError(
+                    f"read operation {name} must declare its response schema"
+                )
+            response = "MemoryOperation"
+        if response not in schemas:
+            raise ValueError(f"unknown response schema {response} for {name}")
         params = [
             {
                 "name": field,
@@ -331,6 +361,7 @@ def main():
         "post",
         "getMemoryEntityCandidates",
         "MemoryEntityCandidateRequest",
+        "MemoryEntityCandidatePage",
     )
     operation(
         prefix + "/{space}/entity-proposals",
@@ -339,9 +370,17 @@ def main():
         "MemoryEntityProposalRequest",
         mutation=True,
     )
-    operation(prefix + "/{space}/entity-proposals", "get", "listMemoryEntityProposals")
     operation(
-        prefix + "/{space}/entity-proposals/{id}", "get", "getMemoryEntityProposal"
+        prefix + "/{space}/entity-proposals",
+        "get",
+        "listMemoryEntityProposals",
+        response="MemoryEntityProposalPage",
+    )
+    operation(
+        prefix + "/{space}/entity-proposals/{id}",
+        "get",
+        "getMemoryEntityProposal",
+        response="MemoryEntityProposalDetail",
     )
     operation(
         prefix + "/{space}/entity-proposals/{id}/verdict",
@@ -383,7 +422,12 @@ def main():
         "getMemoryHistory",
         response="MemoryRecordPage",
     )
-    operation(prefix + "/{space}/operations/{id}", "get", "getMemoryOperation")
+    operation(
+        prefix + "/{space}/operations/{id}",
+        "get",
+        "getMemoryOperation",
+        response="MemoryOperation",
+    )
     operation(
         prefix + "/{space}/operations/{id}",
         "post",

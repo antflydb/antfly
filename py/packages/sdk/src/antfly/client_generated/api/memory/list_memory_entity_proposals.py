@@ -6,8 +6,8 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.memory_entity_proposal_page import MemoryEntityProposalPage
 from ...models.memory_error import MemoryError_
-from ...models.memory_operation import MemoryOperation
 from ...types import UNSET, Response, Unset
 
 
@@ -48,9 +48,9 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> MemoryError_ | MemoryOperation | None:
+) -> MemoryEntityProposalPage | MemoryError_ | None:
     if response.status_code == 200:
-        response_200 = MemoryOperation.from_dict(response.json())
+        response_200 = MemoryEntityProposalPage.from_dict(response.json())
 
         return response_200
 
@@ -107,7 +107,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[MemoryError_ | MemoryOperation]:
+) -> Response[MemoryEntityProposalPage | MemoryError_]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -124,7 +124,7 @@ def sync_detailed(
     limit: int | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
-) -> Response[MemoryError_ | MemoryOperation]:
+) -> Response[MemoryEntityProposalPage | MemoryError_]:
     """
     Args:
         space (str):
@@ -138,7 +138,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[MemoryError_ | MemoryOperation]
+        Response[MemoryEntityProposalPage | MemoryError_]
     """
 
     kwargs = _get_kwargs(
@@ -164,7 +164,7 @@ def sync(
     limit: int | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
-) -> MemoryError_ | MemoryOperation | None:
+) -> MemoryEntityProposalPage | MemoryError_ | None:
     """
     Args:
         space (str):
@@ -178,7 +178,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        MemoryError_ | MemoryOperation
+        MemoryEntityProposalPage | MemoryError_
     """
 
     return sync_detailed(
@@ -199,7 +199,7 @@ async def asyncio_detailed(
     limit: int | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
-) -> Response[MemoryError_ | MemoryOperation]:
+) -> Response[MemoryEntityProposalPage | MemoryError_]:
     """
     Args:
         space (str):
@@ -213,7 +213,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[MemoryError_ | MemoryOperation]
+        Response[MemoryEntityProposalPage | MemoryError_]
     """
 
     kwargs = _get_kwargs(
@@ -237,7 +237,7 @@ async def asyncio(
     limit: int | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
-) -> MemoryError_ | MemoryOperation | None:
+) -> MemoryEntityProposalPage | MemoryError_ | None:
     """
     Args:
         space (str):
@@ -251,7 +251,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        MemoryError_ | MemoryOperation
+        MemoryEntityProposalPage | MemoryError_
     """
 
     return (

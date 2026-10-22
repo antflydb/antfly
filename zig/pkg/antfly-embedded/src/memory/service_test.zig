@@ -21,6 +21,8 @@ const Store = struct {
     arena: std.heap.ArenaAllocator,
     values: std.StringHashMapUnmanaged([]const u8) = .empty,
     revision: u64 = 0,
+    table_id: u64 = 0,
+    space: []const u8 = "",
     resource_state: m.types.provenance.ResourceState = .current,
     resource_revision: u64 = 7,
     resource_digest: ?[32]u8 = null,
@@ -42,7 +44,7 @@ const Store = struct {
         self.arena.deinit();
     }
     fn service(self: *Store, principal: []const u8, admin: bool, now: i64) m.Service {
-        return .{ .backend = .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = resource }, .context = .{ .principal = principal, .admin = admin, .now_ms = now } };
+        return .{ .backend = .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = resource }, .context = .{ .principal = principal, .admin = admin, .now_ms = now, .table_id = self.table_id, .space = self.space } };
     }
     fn resource(ptr: *anyopaque, a: A, reference: m.types.provenance.Resource) !m.types.provenance.Snapshot {
         const self: *Store = @ptrCast(@alignCast(ptr));
@@ -4453,5 +4455,53 @@ test "memory indexed spelling neighbors preserve compound names without substrin
         const items = result.object.get("items").?.array.items;
         try std.testing.expectEqual(@as(usize, if (expected != null) 1 else 0), items.len);
         if (expected) |id| try std.testing.expectEqualStrings(id, items[0].object.get("entity").?.object.get("entity").?.object.get("id").?.string);
+    }
+}
+
+test "memory recall prepares a large query once within a bounded request allocator" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    try discard(&store, .observe, "", source, "source", 2);
+    const claims = try a.alloc(m.types.Assertion, 128);
+    for (claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = try std.fmt.allocPrint(a, "subject-{d}", .{i}), .predicate = "fact", .value = "term0", .statement = "term0 TERM0", .evidence = &.{.{ .id = "e1" }} };
+    _ = try store.service("alice", true, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "claims");
+    var query: std.ArrayList(u8) = .empty;
+    for (0..4096) |i| try query.appendSlice(a, try std.fmt.allocPrint(a, "term{d} ", .{i}));
+    const body = try std.json.Stringify.valueAlloc(a, m.types.Recall{ .query = query.items, .limit = 1, .token_budget = 2048 }, .{});
+    const buffer = try a.alloc(u8, 16 * 1024 * 1024);
+    var fixed = std.heap.FixedBufferAllocator.init(buffer);
+    const result = try store.service("alice", false, 4).execute(fixed.allocator(), .recall, "", body, "");
+    const decoded = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, result, .{});
+    try std.testing.expectEqual(@as(usize, 1), decoded.items.len);
+    try std.testing.expectEqual(@as(usize, 128), decoded.scanned);
+    try std.testing.expectEqual(@as(usize, 127), decoded.omitted);
+    try std.testing.expectEqual(@as(f64, 1.0 / 4096.0), decoded.items[0].score);
+    try std.testing.expect(result.len <= 2048);
+}
+
+test "memory discovery and proposal wire fixtures are actual typed service responses" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    store.table_id = 7;
+    store.space = "wire";
+    try externalReviewSetup(&store);
+    const candidates = try store.service("alice", true, 3).execute(a, .entity_candidates, "a", "{}", "");
+    _ = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, candidates, .{});
+    const proposal = try externalProposal(&store);
+    const details = try store.service("alice", true, 4).execute(a, .entity_proposal, proposal.proposal_id.?, "{}", "");
+    _ = try std.json.parseFromSliceLeaky(m.types.EntityProposalDetail, a, details, .{});
+    const proposals = try store.service("alice", true, 4).execute(a, .entity_proposals, "", "{}", "");
+    _ = try std.json.parseFromSliceLeaky(m.types.EntityProposalPage, a, proposals, .{});
+    inline for (.{
+        .{ m.types.EntityCandidatePage, candidates, @embedFile("fixtures/wire/candidates.json") },
+        .{ m.types.EntityProposalDetail, details, @embedFile("fixtures/wire/proposal.json") },
+        .{ m.types.EntityProposalPage, proposals, @embedFile("fixtures/wire/proposals.json") },
+    }) |fixture| {
+        const expected = try std.json.parseFromSliceLeaky(fixture[0], a, fixture[2], .{});
+        const actual = try std.json.parseFromSliceLeaky(fixture[0], a, fixture[1], .{});
+        try std.testing.expectEqualDeep(expected, actual);
     }
 }

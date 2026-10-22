@@ -1,6 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+import { readFileSync } from "node:fs";
 import { afterEach, expect, it, vi } from "vitest";
 import { AntflyClient } from "../src/client.js";
 import { parseMemoryJSON, stringifyMemoryJSON } from "../src/memory.js";
@@ -73,4 +74,56 @@ it("keeps safe numeric values and numeric strings distinct and rejects rounded r
   expect(() => stringifyMemoryJSON({ revision: Number("9007199254740993") })).toThrow(
     /already lost precision/
   );
+});
+
+it("decodes native discovery and proposal fixtures through the typed memory transport", async () => {
+  const fixture = (name: string) =>
+    readFileSync(
+      new URL(
+        `../../../../zig/pkg/antfly-embedded/src/memory/fixtures/wire/${name}.json`,
+        import.meta.url
+      ),
+      "utf8"
+    );
+  vi.stubGlobal("fetch", async (request: Request) => {
+    const path = new URL(request.url).pathname;
+    const name = path.endsWith("/candidates")
+      ? "candidates"
+      : path.endsWith("/entity-proposals")
+        ? "proposals"
+        : "proposal";
+    return new Response(fixture(name), { headers: { "Content-Type": "application/json" } });
+  });
+  const client = new AntflyClient({ baseUrl: "http://memory.test" });
+  const { data: candidates } = await client.memoryApi.POST(
+    "/memory/v1/spaces/{space}/entities/{id}/candidates",
+    {
+      params: { path: { space: "wire", id: "a" } },
+      body: {},
+    }
+  );
+  expect(candidates?.seed.entity.id).toBe("a");
+  expect(candidates?.items[0]?.entity.entity.id).toBe("b");
+  expect(candidates?.items[0]?.view.canonical_id).toBe("b");
+  expect(candidates?.revision).toBe(3);
+  expect(candidates?.next_cursor).toBeNull();
+  const { data: proposals } = await client.memoryApi.GET(
+    "/memory/v1/spaces/{space}/entity-proposals",
+    {
+      params: { path: { space: "wire" } },
+    }
+  );
+  const proposalId = proposals?.items[0]?.id;
+  if (!proposalId) throw new Error("Missing native proposal");
+  const { data: details } = await client.memoryApi.GET(
+    "/memory/v1/spaces/{space}/entity-proposals/{id}",
+    {
+      params: { path: { space: "wire", id: proposalId } },
+    }
+  );
+  expect(details?.proposal.id).toBe(proposalId);
+  expect(details?.inputs.actor).toBe("codex/consolidation");
+  expect(details?.inputs.entities[0]?.revision).toBe(3);
+  expect(details?.reason).toBeNull();
+  expect(details?.stale_configuration).toBe(false);
 });

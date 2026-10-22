@@ -5094,7 +5094,7 @@ pub const Client = struct {
     }
 
     /// POST /memory/v1/spaces/{space}/entities/{id}/candidates
-    pub fn getMemoryEntityCandidates(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryEntityCandidateRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn getMemoryEntityCandidates(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryEntityCandidateRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryEntityCandidatePage) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5109,7 +5109,7 @@ pub const Client = struct {
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
-        return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.MemoryEntityCandidatePage).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/entities/{id}/view
@@ -5150,7 +5150,7 @@ pub const Client = struct {
     }
 
     /// GET /memory/v1/spaces/{space}/entity-proposals
-    pub fn listMemoryEntityProposals(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, params: ListMemoryEntityProposalsParams) !ApiResponse(types.MemoryOperation) {
+    pub fn listMemoryEntityProposals(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, params: ListMemoryEntityProposalsParams) !ApiResponse(types.MemoryEntityProposalPage) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         var url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/entity-proposals", .{ self.base_url, encoded_space });
@@ -5185,7 +5185,7 @@ pub const Client = struct {
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
-        return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.MemoryEntityProposalPage).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/entity-proposals
@@ -5207,7 +5207,7 @@ pub const Client = struct {
     }
 
     /// GET /memory/v1/spaces/{space}/entity-proposals/{id}
-    pub fn getMemoryEntityProposal(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn getMemoryEntityProposal(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryEntityProposalDetail) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5220,7 +5220,7 @@ pub const Client = struct {
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
-        return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.MemoryEntityProposalDetail).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/entity-proposals/{id}/verdict
