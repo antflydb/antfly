@@ -6929,3 +6929,83 @@ def test_singleton_children_preserve_arithmetic_average_certificates(graph_db, b
         assert row[1]["value"] == 500000.5
     else:
         assert row[1]["type"] == "null"
+
+
+@pytest.mark.parametrize(
+    "tail,control",
+    [
+        (
+            "WITH x+1 AS y RETURN count(*),sum(y),avg(y),avg(DISTINCT y)",
+            "RETURN count(*),sum(x+1),avg(x+1),avg(DISTINCT x+1)",
+        ),
+        (
+            "WITH -x AS y RETURN count(*),sum(y),avg(y),count(DISTINCT y)",
+            "RETURN count(*),sum(-x),avg(-x),count(DISTINCT -x)",
+        ),
+        ("WITH x WHERE x>=999991 RETURN count(*),sum(x),avg(x)", None),
+        ("WITH x WHERE x%2=0 RETURN count(*),sum(x),avg(x)", None),
+        ("WITH x+1 AS y WHERE y>=999992 WITH y*2 AS z WHERE z%4=0 RETURN count(*),sum(z),avg(z)", None),
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_checked_range_pipeline_keeps_million_value_reductions_bounded(graph_db, tail, control, reverse):
+    source = "reverse(range(1,1000000))" if reverse else "range(1,1000000)"
+    actual = graph_db.cypher_json(
+        "g",
+        {"query": f"UNWIND {source} AS x {tail}", "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20}},
+    )
+    if control is not None:
+        expected = graph_db.cypher_json("g", {"query": f"UNWIND {source} AS x {control}"})
+        assert actual["rows"] == expected["rows"]
+    else:
+        expected_values = (
+            [10, 9999955, 999995.5]
+            if "999991" in tail
+            else [500000, 250000500000, 500001]
+            if "x%2" in tail
+            else [5, 9999960, 1999992]
+        )
+        assert [float(cell["value"]) for cell in actual["rows"][0]] == expected_values
+    assert actual["plan"][0]["output_rows"] == 1000000
+    assert actual["stats"]["intermediate_states"] < 500
+    assert actual["stats"]["memory_bytes"] < 200000
+
+
+@pytest.mark.parametrize("key", ["i-i", "0*i", "(i+7)-(i+7)"])
+@pytest.mark.parametrize("source", ["range(1,1000000)", "reverse(range(1,1000000))"])
+def test_checked_invariant_affine_keys_keep_grouping_and_axis_multiplicity(graph_db, key, source):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND {source} AS i UNWIND [0,1,0] AS x RETURN {key} AS g,count(*)",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert [int(cell["value"]) for cell in result["rows"][0]] == [0, 3000000]
+    assert result["plan"][0]["output_rows"] == 1000000
+    assert result["plan"][1]["output_rows"] == 3000000
+    assert result["stats"]["intermediate_states"] < 200
+    empty = graph_db.cypher_json("g", {"query": f"UNWIND [] AS i UNWIND [0,1,0] AS x RETURN {key} AS g,count(*)"})
+    assert empty["rows"] == []
+
+
+@pytest.mark.parametrize("key,order,first", [("i+1", "g", 3), ("-i", "h DESC", 3), ("7", "h,g", 3), ("7", "h", 999998)])
+@pytest.mark.parametrize("child", ["", "CALL {RETURN 7 AS y} ", "CALL {CALL {RETURN 7 AS z} RETURN z AS y} "])
+def test_tuple_keys_and_singleton_calls_compose_monotone_windows(graph_db, key, order, first, child):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x "
+            f"{child}RETURN i AS g,{key} AS h,avg(x) AS a ORDER BY {order} SKIP 2 LIMIT 5",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert len(result["rows"]) == 5
+    assert int(result["rows"][0][0]["value"]) == first
+    assert all(row[2]["value"] == (1.0 - 2.0 / 3.0) for row in result["rows"])
+    assert result["plan"][0]["output_rows"] == 1000000
+    assert result["plan"][1]["output_rows"] == 3000000
+    if child:
+        assert result["plan"][2]["output_rows"] == 3000000
+    assert result["stats"]["intermediate_states"] < 1000
+    assert result["stats"]["memory_bytes"] < 200000

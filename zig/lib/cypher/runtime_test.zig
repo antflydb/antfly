@@ -6963,3 +6963,138 @@ test "composed arithmetic and reached-read certificates release failed allocatio
         "UNWIND range(1,10) AS x CALL {RETURN 7 AS y} RETURN count(x),avg(x)",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
 }
+
+test "range pipeline certificates compose affine aliases restrictions and invariant grouping" {
+    const a = std.testing.allocator;
+    for ([_]struct { text: []const u8, expected: []const u8 }{
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x+1 AS y RETURN count(*),sum(y),avg(y),count(DISTINCT y)", .expected = "[[1000000,500001500000,500001.5,1000000]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x WHERE x>=999991 RETURN count(*),sum(x),avg(x)", .expected = "[[10,9999955,999995.5]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x WHERE x%2=0 RETURN count(*),sum(x),avg(x)", .expected = "[[500000,250000500000,500001]]" },
+        .{ .text = "UNWIND reverse(range(1,1000000)) AS x WITH x+1 AS y WHERE y>=999992 WITH 2*y-1 AS z RETURN count(*),min(z),max(z),sum(z),avg(z),avg(DISTINCT z)", .expected = "[[10,1999983,2000001,19999920,1999992,1999992]]" },
+        .{ .text = "UNWIND range(1,1000000) AS i UNWIND [0,1,0] AS x RETURN i-i AS g,count(*)", .expected = "[[0,3000000]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x WHERE x<0 RETURN 0 AS g,count(*)", .expected = "[]" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x WHERE x<0 RETURN count(*)", .expected = "[[0]]" },
+    }) |item| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, item.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 });
+        defer result.deinit();
+        try std.testing.expect(result.stats.intermediate_states < 500);
+        const encoded = try std.json.Stringify.valueAlloc(a, result.rows, .{});
+        defer a.free(encoded);
+        try std.testing.expectEqualStrings(item.expected, encoded);
+    }
+}
+
+test "tuple and singleton window certificates preserve rank and source ties" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "RETURN i AS g,i+1 AS h,avg(x) AS a ORDER BY g LIMIT 5",
+        "RETURN i AS g,7 AS h,avg(x) AS a ORDER BY g LIMIT 5",
+        "RETURN i AS g,-i AS h,avg(x) AS a ORDER BY h DESC,g DESC SKIP 2 LIMIT 5",
+        "RETURN i AS g,7 AS h,avg(x) AS a ORDER BY h,g LIMIT 5",
+        "RETURN i AS g,7 AS h,avg(x) AS a ORDER BY h LIMIT 5",
+        "CALL {RETURN 7 AS y} RETURN i,avg(x) ORDER BY i LIMIT 5",
+        "CALL {CALL {RETURN 7 AS z} RETURN z AS y} RETURN i,avg(x) ORDER BY i LIMIT 5",
+        "CALL {WITH 7 AS z WHERE false RETURN count(*) AS y} RETURN i,avg(x) ORDER BY i LIMIT 5",
+        "CALL {RETURN 7 AS y LIMIT 0} RETURN i,avg(x) ORDER BY i LIMIT 5",
+    }) |tail| {
+        const text = try std.fmt.allocPrint(a, "UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x {s}", .{tail});
+        defer a.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 });
+        defer result.deinit();
+        try std.testing.expect(result.rows.len <= 5);
+        try std.testing.expect(result.stats.intermediate_states < 1000);
+        const small = try std.fmt.allocPrint(a, "UNWIND range(30,1,-1) AS i UNWIND [0,1,0] AS x {s}", .{tail});
+        defer a.free(small);
+        const control = try std.fmt.allocPrint(a, "UNWIND range(30,1,-1) AS i WITH i WHERE i IS NOT NULL UNWIND [0,1,0] AS x {s}", .{tail});
+        defer a.free(control);
+        try compareReductionPlans(small, control);
+    }
+}
+
+test "range pipeline restrictions retain eager errors rounding and stage scopes" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "range(-12,12)",                                    "range(12,-12,-2)",                               "reverse(range(-12,12,3))", "range(1,0)",
+        "range(-9223372036854775808,-9223372036854775798)", "range(9223372036854775797,9223372036854775807)",
+    }) |source| for ([_][]const u8{
+        "WITH x+1 AS y RETURN count(*),min(y),max(y),sum(y),avg(y),avg(DISTINCT y)",
+        "WITH -x AS y WHERE y>=-3 AND y<7 RETURN count(*),sum(y),avg(y),count(DISTINCT y)",
+        "WITH x AS y WHERE y%3=0 WITH y*2+1 AS z RETURN count(*),sum(z),avg(z),sum(DISTINCT z)",
+        "WITH x WHERE (3*x+1)%-5=-2 RETURN count(*),sum(x),avg(x)",
+        "WITH x WHERE x%4=1 RETURN count(*),sum(x),avg(x)",
+        "WITH x WHERE x%-4=-1 RETURN count(*),sum(x),avg(x)",
+        "WITH x WHERE x%0=0 RETURN count(*)",
+        "WITH x WHERE x%2=3 RETURN 0 AS g,count(*)",
+        "WITH x WHERE x!=0 RETURN count(*),sum(x),avg(x)",
+        "WITH x WHERE x>=0 WITH x+9223372036854775807 AS y RETURN sum(y)",
+        "WITH x WHERE x=0 WITH x+9223372036854775807 AS y RETURN count(*),sum(y),avg(y)",
+        "WITH 1/0 AS bad,x WHERE false RETURN count(*)",
+        "WITH x WHERE false AND 1/0=1 RETURN count(*)",
+        "WITH x WHERE null AND 1/0=1 RETURN count(*)",
+        "WITH x WHERE x>0 AND x+9223372036854775807>0 RETURN count(*)",
+        "WITH x+1 AS y WHERE x>=0 RETURN count(*),sum(y),avg(y)",
+        "WITH x AS y,x+1 AS x WHERE x<5 RETURN count(*),sum(y),avg(y)",
+        "WITH x WHERE false RETURN 1 AS g,count(*)",
+    }) |tail| {
+        const text = try std.fmt.allocPrint(a, "UNWIND {s} AS x {s}", .{ source, tail });
+        defer a.free(text);
+        const control = try std.fmt.allocPrint(a, "UNWIND {s} AS x WITH x WHERE x IS NOT NULL {s}", .{ source, tail });
+        defer a.free(control);
+        try compareReductionPlans(text, control);
+    };
+    for ([_][]const u8{ "RETURN i-i AS g,count(*)", "RETURN (i+9223372036854775807)-i AS g,count(*)", "RETURN i AS g,i+9223372036854775807 AS h,avg(x) ORDER BY g LIMIT 2", "CALL {RETURN 1/0 AS y} RETURN i AS g,7 AS h,avg(x) ORDER BY g LIMIT 2", "CALL {RETURN 7 AS i} RETURN i AS g,avg(x) ORDER BY g LIMIT 2" }) |tail| {
+        const text = try std.fmt.allocPrint(a, "UNWIND range(20,1,-1) AS i UNWIND [0,1,0] AS x {s}", .{tail});
+        defer a.free(text);
+        const control = try std.fmt.allocPrint(a, "UNWIND range(20,1,-1) AS i WITH i WHERE i IS NOT NULL UNWIND [0,1,0] AS x {s}", .{tail});
+        defer a.free(control);
+        try compareReductionPlans(text, control);
+    }
+}
+
+test "range pipeline and tuple CALL windows retain full logical stage counts" {
+    const a = std.testing.allocator;
+    for ([_]struct { text: []const u8, counts: []const usize }{
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x+1 AS y WHERE y>=999992 WITH y*2 AS z WHERE z%4=0 RETURN count(*),sum(z),avg(z)", .counts = &.{ 1000000, 10, 5 } },
+        .{ .text = "UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x CALL {RETURN 7 AS y} RETURN i AS g,7 AS h,avg(x) ORDER BY h,g LIMIT 5", .counts = &.{ 1000000, 3000000, 3000000 } },
+    }) |item| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, item.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 });
+        defer result.deinit();
+        for (item.counts, 0..) |count, index| try std.testing.expectEqual(count, result.stages[index].output_rows);
+    }
+}
+
+test "range pipeline certificates and tuple window proofs release failed allocations" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, text: []const u8) !void {
+            var callbacks = backing.vtable.*;
+            callbacks.resize = std.mem.Allocator.noResize;
+            callbacks.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &callbacks };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    for ([_][]const u8{
+        "UNWIND range(1,30) AS x WITH x+1 AS y WHERE y%3=1 WITH y*2 AS z RETURN count(*),sum(z),avg(z),avg(DISTINCT z)",
+        "UNWIND range(-30,30) AS x WITH x WHERE x<0 AND x%4=-1 RETURN count(*),sum(x),avg(x)",
+        "UNWIND range(1,30) AS x WITH x WHERE x<0 RETURN count(*)",
+        "UNWIND range(30,1,-1) AS i UNWIND [0,1,0] AS x CALL {RETURN 7 AS y} RETURN i AS g,-i AS h,avg(x) ORDER BY h,g LIMIT 1",
+        "UNWIND range(1,30) AS i UNWIND [0,1,0] AS x RETURN i-i AS g,count(*)",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
+}

@@ -2048,6 +2048,24 @@ concatenation compose those summaries in producer order, while constant affine
 images have one distinct value. A synchronous, charged proof cache shares source
 DAGs without retaining transient AST addresses across normalization frames.
 
+Reached row-local WITH pipelines carry checked integer affine lineage through
+renaming, arithmetic and predicates. Each intermediate expression is total over
+its own incoming domain, before any following filter narrows that domain.
+Comparison restrictions use bounded ordinal searches; modular equalities solve
+an exact integer congruence and preserve signed-remainder semantics and source
+encounter order. Eager AND operands are independently certified over their full
+incoming domain before intersection. WHERE overlays projected aliases on the
+input scope; later stages receive only the projected scope. Binding indexes
+preserve first-name lookup and avoid quadratic proof lookup on wide projections.
+The resulting ordered domain feeds the existing aggregate certificates, including
+checked SUM prefixes and exact-recurrence AVG; unsupported or rounded cases
+retain ordinary replay. Empty domains retain grouping slots and do not evaluate
+unreached consumers. Every original logical stage cardinality remains recorded.
+
+Total, invariant affine grouping keys can also collapse an unobserved producer
+axis through independent fanout. The grouping key is retained and evaluated on a
+representative, preserving empty-input grouping behavior and bag multiplicity.
+
 Arithmetic AVG has a separate exact-recurrence certificate. A single ordered
 arithmetic progression, including affine images, reversals and consecutive
 concatenations, can advance a group's mean without visiting its values. The
@@ -2151,11 +2169,17 @@ the ordinary symbolic reduction before publication. Unvalidated packets cannot b
 or downstream folds retain their ordinary execution paths.
 
 Monotone arithmetic group keys have an exact rank interval for key-ranked
-windows. A read-only single-seed domain with one preserved integer key and a
-complete independent suffix can allocate reducers only for its best SKIP+LIMIT
-keys. Checked nonzero integer affine keys share this rank certificate, with
-negative slopes reversing rank direction. Every intermediate key expression must
-be total over the full source interval; zero slopes and unknown forms decline.
+windows. A read-only single-seed domain with a preserved injective integer
+component and a complete independent suffix can allocate reducers only for its
+best SKIP+LIMIT keys. Grouping tuples may include further checked affine or
+primitive constant components. The first varying ORDER BY component determines
+rank direction; all-constant ordering retains source encounter order for ties.
+Independent zero-or-one-row CALLs compose with the same suffix packet proof,
+including nested calls and empty-input reducers. Checked nonzero integer affine
+keys share this rank certificate, with negative slopes reversing rank direction.
+Every intermediate key expression must
+be total over the full source interval; a tuple with no injective component or
+unknown forms declines.
 The suffix packet first certifies successful argument evaluation, all
 consumer bounds and all producer stages. Selected keys retain source encounter
 order; omitted logical rows still contribute to stage counters. Correlated
