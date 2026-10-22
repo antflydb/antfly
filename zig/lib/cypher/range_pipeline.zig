@@ -77,6 +77,10 @@ pub const Context = struct {
     sequence: Range,
     parts: ?[]const Range = null,
     periodic: bool = false,
+    /// A terminal consumer may request only the ranked bag, with a separate
+    /// proof that its reductions cannot observe contribution order.
+    allow_rank_bag: bool = false,
+    rank_bag: bool = false,
     bindings: []const Binding,
     positions: std.StringHashMapUnmanaged(usize) = .empty,
     parameters: []const v.Entry,
@@ -275,6 +279,16 @@ pub const Context = struct {
             result += if (ascending) countBelow(part, @as(i128, value) - 1) else part.length - countBelow(part, value);
         }
         return result;
+    }
+    /// Exact stable rank of one source occurrence, including equal values
+    /// from preceding source runs. This is also an order-contiguity proof.
+    pub fn rankOrdinal(self: *Context, value: i64, source: usize, ascending: bool) !u128 {
+        var ordinal = try self.rankBefore(value, ascending);
+        for (self.ranges()[0..source]) |part| {
+            try self.charge(self.ptr, 1);
+            if (part.contains(.{ .integer = value }).boolean) ordinal += 1;
+        }
+        return ordinal;
     }
     /// Stable DISTINCT pagination uses novel-prefix measures, retaining only
     /// requested cells when subtracting prior lattices would fragment a run.
@@ -654,6 +668,14 @@ pub const Context = struct {
             if (direction) |ascending| {
                 if (symbolic_distinct) return self.orderedPage(ascending, page.?, true);
                 if (!try self.orderRanges(ascending)) {
+                    if (self.allow_rank_bag and !projection.distinct) {
+                        const selected = (try self.rankedRanges(ascending, page orelse .{ .skip = 0, .limit = null })) orelse return false;
+                        const parts = try self.a.alloc(Range, selected.len);
+                        for (selected, parts) |selection, *part| part.* = selection.sequence;
+                        self.setRanges(parts);
+                        self.rank_bag = true;
+                        return true;
+                    }
                     if (page) |window_page| return self.orderedPage(ascending, window_page, false);
                     return false;
                 }

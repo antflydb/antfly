@@ -2568,3 +2568,31 @@ values, stable ties, distinct label predicates, batched endpoint multiplicity,
 and Lite fork/cursor lifetime after parent close. Native search regressions
 exercise predicate labels alongside row policies and a selective posting in a
 66,000-document table with a four-anchor budget.
+
+
+### Finite key domains and terminal ranked packets
+
+Document-key equality, finite `IN` domains, and unions of finite key predicates
+share point access planning. Domains deduplicate string keys before lookup;
+non-string members cannot match document keys, and residual Cypher predicates
+still run after authorized reads and graph membership checks. An unrestricted
+`OR` arm keeps ordinary scanning. Backends with aligned `get_many` support read
+at most 128 identities per batch, within the remaining anchor budget; singleton
+reads retain the normal lookup/cache path. The same backend visibility and policy
+contract applies to both forms.
+
+Range windows distinguish ordered sequences from ranked bags. A terminal
+COUNT/MIN/MAX reduction can consume rank-selected source runs directly, retaining
+duplicates without materializing the sorted page. SUM additionally proves one
+sign across the selected domain so reordering cannot hide intermediate integer
+overflow. AVG, collection order, grouped output windows, and later pagination
+keep the ordered path.
+
+Periodic cohorts partition lexicographic ordering by constant prefixes using a
+stable, charged merge sort, then select affine ranks within each prefix bucket.
+Global SKIP/LIMIT applies once across these buckets. Packet ordinals include
+stable ties from earlier source runs. A packet's first and last stable ranks
+certify whether its contributions are contiguous; bounded collection endpoints
+may consume constant weighted packets only when their merge preserves encounter
+order. Failed proofs retain ordinary execution, including eager errors and
+floating-point recurrence semantics.

@@ -7338,3 +7338,58 @@ def test_retained_ordered_domains_stay_compressed_through_reducers_and_ranking(g
     assert result["rows"] == expected["rows"]
     assert result["stats"]["intermediate_states"] < states
     assert result["stats"]["memory_bytes"] < 1 << 20
+
+
+@pytest.mark.parametrize(
+    "query,control",
+    [
+        (
+            "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY g,x LIMIT 5 RETURN avg(x)",
+            "UNWIND [10,20,30,40,50] AS x RETURN avg(x)",
+        ),
+        (
+            "UNWIND range(1,1300000) AS x WITH x%10 AS g ORDER BY g LIMIT 650000 RETURN head(collect(g)),last(collect(g))",
+            "UNWIND [0,4] AS g RETURN head(collect(g)),last(collect(g))",
+        ),
+        (
+            "UNWIND range(1,1300000)+range(1,1300000) AS x WITH x ORDER BY x LIMIT 1300000 RETURN count(*),sum(x)",
+            "UNWIND range(1,650000) AS x RETURN 1300000,sum(x)*2",
+        ),
+    ],
+)
+def test_terminal_rank_packets_avoid_row_expansion(graph_db, query, control):
+    result = graph_db.cypher_json(
+        "g", {"query": query, "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20}}
+    )
+    assert result["rows"] == graph_db.cypher_json("g", {"query": control})["rows"]
+    assert result["stats"]["intermediate_states"] < 2000
+    assert result["stats"]["memory_bytes"] < 1 << 20
+
+
+def test_document_key_membership_seeks_only_distinct_keys(graph_db):
+    populate(graph_db, 1000)
+    for predicate, parameters in (
+        ("antfly.documentKey(n) IN ['n1','n0','n1',null,42,'missing']", {}),
+        ("antfly.documentKey(n) IN $keys", {"keys": ["n1", "n0", "n1", None, 42, "missing"]}),
+        ("antfly.documentKey(n)='n0' OR antfly.documentKey(n) IN ['n1','missing']", {}),
+    ):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) WHERE {predicate} RETURN n.id ORDER BY n.id",
+                "parameters": parameters,
+                "limits": {"scanned_anchors": 3, "intermediate_states": 2000, "memory_bytes": 1 << 20},
+            },
+        )
+        assert result["rows"] == [[{"type": "string", "value": "n0"}], [{"type": "string", "value": "n1"}]]
+        assert result["stats"]["scanned_anchors"] == 3
+    written = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) WHERE antfly.documentKey(n) IN ['n0','n1','n0'] SET n.score=42 RETURN n.id ORDER BY n.id",
+            "limits": {"scanned_anchors": 2},
+        },
+    )
+    assert written["rows"] == [[{"type": "string", "value": "n0"}], [{"type": "string", "value": "n1"}]]
+    assert written["stats"]["mutations"] == 2
+    assert graph_db.sql("SELECT score FROM docs WHERE _id IN ('n0','n1') ORDER BY _id")["rows"] == [["42"], ["42"]]

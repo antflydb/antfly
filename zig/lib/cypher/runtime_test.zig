@@ -403,6 +403,33 @@ test "document-key anchors use authorized point reads and preserve qualified ide
     try check("MATCH (n:Document)-[:CITES]->(m) WHERE antfly.documentKey(n)='a' RETURN m.id", "[[\"b\"],[\"b\"]]");
 }
 
+test "finite document-key sets use distinct authorized point reads" {
+    for ([_][]const u8{
+        "antfly.documentKey(n) IN ['b','a','b',null,42,'missing']",
+        "antfly.documentKey(n)='b' OR antfly.documentKey(n) IN ['a','missing']",
+        "antfly.documentKey(n) IN $keys",
+        "antfly.documentKey(n) IN $keys AND n.rank>0",
+    }) |predicate| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "MATCH (n:Document) WHERE {s} RETURN n.id ORDER BY n.id", .{predicate});
+        defer std.testing.allocator.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        for ([_]bool{ false, true }) |denied| {
+            var fixture: Fixture = .{ .deny_b = denied };
+            var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "keys", .value = .{ .list = &.{ .{ .string = "b" }, .{ .string = "a" }, .{ .string = "b" }, .null, .{ .integer = 42 }, .{ .string = "missing" } } } }}, .{ .scanned_anchors = 3 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 3), result.stats.scanned_anchors);
+            try std.testing.expectEqual(@as(usize, if (denied) 1 else 2), result.rows.len);
+            try std.testing.expectEqualStrings("a", result.rows[0][0].string);
+        }
+    }
+    try check("MATCH (n) WHERE antfly.documentKey(n) IN ['a','a'] RETURN count(*)", "[[2]]");
+    try check("MATCH (n:Document) WHERE antfly.documentKey(n) IN [] RETURN count(*)", "[[0]]");
+    try check("MATCH (n:Document) WHERE antfly.documentKey(n) IN null RETURN count(*)", "[[0]]");
+    try check("MATCH (n:Document) WHERE antfly.documentKey(n) IN ['missing'] OR n.id='a' RETURN n.id", "[[\"a\"]]");
+}
+
 test "search resolves logical graph names and charges examined candidates" {
     var fixture: Fixture = .{};
     var mapped = graph;
@@ -729,6 +756,7 @@ test "paged expansion batches and caches endpoint lookups without dropping paral
         fn batch(ptr: *anyopaque, a: std.mem.Allocator, identities: []const v.Identity) ![]const ?*const v.Node {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
+            try std.testing.expect(identities.len <= 128);
             const nodes = try a.alloc(?*const v.Node, identities.len);
             for (identities, nodes) |identity, *node| node.* = try Fixture.get(&self.fixture, a, identity);
             return nodes;
@@ -761,6 +789,22 @@ test "paged expansion batches and caches endpoint lookups without dropping paral
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    var keys_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer keys_arena.deinit();
+    var keys: [130]v.Value = undefined;
+    for (&keys, 0..) |*key, index| key.* = .{ .string = if (index < 3) ([_][]const u8{ "a", "b", "c" })[index] else try std.fmt.allocPrint(keys_arena.allocator(), "missing-{d}", .{index}) };
+    var key_query = try c.compile(std.testing.allocator, "MATCH (n:Document) WHERE antfly.documentKey(n) IN $keys RETURN count(*)", .{}, &diagnostic);
+    defer key_query.deinit();
+    const parameters = &.{v.Entry{ .name = "keys", .value = .{ .list = &keys } }};
+    fixture.calls = 0;
+    var key_result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &table }, graph, &key_query, parameters, .{ .scanned_anchors = 130 });
+    defer key_result.deinit();
+    try std.testing.expectEqual(@as(i64, 3), key_result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(usize, 130), key_result.stats.scanned_anchors);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    fixture.calls = 0;
+    try std.testing.expectError(error.CypherAnchorBudgetExceeded, runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &table }, graph, &key_query, parameters, .{ .scanned_anchors = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
 }
 
 test "shortest paths preserve rebound route aliases and bound-target frontier limits" {
@@ -7390,11 +7434,23 @@ test "ordered lineage programs release allocations after proof and packet failur
             var compiled = try c.compile(a, text, .{}, &diagnostic);
             defer compiled.deinit();
             var fixture: Fixture = .{};
-            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            var table = fixture.backend().vtable.*;
+            table.get_many = struct {
+                fn getMany(ptr: *anyopaque, allocator: std.mem.Allocator, identities: []const v.Identity) ![]const ?*const v.Node {
+                    const nodes = try allocator.alloc(?*const v.Node, identities.len);
+                    for (identities, nodes) |identity, *node| node.* = try Fixture.get(ptr, allocator, identity);
+                    return nodes;
+                }
+            }.getMany;
+            var result = try runtime.execute(a, .{ .ptr = &fixture, .vtable = &table }, graph, &compiled, &.{}, .{});
             defer result.deinit();
         }
     };
     for ([_][]const u8{
+        "MATCH (n:Document) WHERE antfly.documentKey(n) IN ['a','b','a',null] RETURN n.id ORDER BY n.id",
+        "UNWIND range(1,150) AS x WITH x,x%3 AS g ORDER BY g,x SKIP 45 LIMIT 10 RETURN avg(x)",
+        "UNWIND range(1,150) AS x WITH x%3 AS g ORDER BY g LIMIT 120 RETURN head(collect(g)),last(collect(g))",
+        "UNWIND range(1,150)+range(1,150) AS x WITH x ORDER BY x LIMIT 150 RETURN count(*),sum(x)",
         "UNWIND range(1,20) AS x WITH DISTINCT (x%6)%2 AS g ORDER BY g LIMIT 1 RETURN avg(g)",
         "UNWIND range(1,20) AS x RETURN count(DISTINCT x%3)",
         "UNWIND range(1,20,3)+range(1,20) AS x WITH DISTINCT x AS y RETURN count(*),count(DISTINCT y+1)",
@@ -7564,6 +7620,9 @@ test "retained ordered domains stay compressed through reducers and ranking" {
         .{ .text = "UNWIND [7,8] AS z WITH z+1 AS k UNWIND range(1300000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5", .control = "UNWIND [8,9] AS k UNWIND range(1300000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5" },
         .{ .text = "UNWIND range(1,1300000) AS x RETURN x%65 AS g,count(*) ORDER BY g", .control = "UNWIND range(0,64) AS g RETURN g,20000", .states = 3000 },
         .{ .text = "UNWIND range(1,1300000) AS x WITH x,x%10 AS g RETURN g,count(*) ORDER BY g", .control = "UNWIND range(0,9) AS g RETURN g,130000" },
+        .{ .text = "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY g,x LIMIT 5 RETURN avg(x)", .control = "UNWIND [10,20,30,40,50] AS x RETURN avg(x)" },
+        .{ .text = "UNWIND range(1,1300000) AS x WITH x%10 AS g ORDER BY g LIMIT 650000 RETURN head(collect(g)),last(collect(g))", .control = "UNWIND [0,4] AS g RETURN head(collect(g)),last(collect(g))" },
+        .{ .text = "UNWIND range(1,1300000)+range(1,1300000) AS x WITH x ORDER BY x LIMIT 1300000 RETURN count(*),sum(x)", .control = "UNWIND range(1,650000) AS x RETURN 1300000,sum(x)*2" },
     }) |item| {
         var diagnostic: c.Diagnostic = .{};
         var compiled = try c.compile(a, item.text, .{}, &diagnostic);
@@ -7579,5 +7638,44 @@ test "retained ordered domains stay compressed through reducers and ranking" {
         var expected = try runtime.execute(a, fixture.backend(), graph, &reference, &.{}, .{});
         defer expected.deinit();
         try std.testing.expectEqualDeep(expected.rows, result.rows);
+    }
+}
+
+test "terminal rank packets preserve lexicographic ties multiplicity endpoints and failures" {
+    const a = std.testing.allocator;
+    for ([_]i64{ 1, -1 }) |step| {
+        var values: [180]i64 = undefined;
+        for (&values, 0..) |*value, index| value.* = if (step > 0) @as(i64, @intCast(index)) - 90 else 90 - @as(i64, @intCast(index));
+        const literal = try std.json.Stringify.valueAlloc(a, values, .{});
+        defer a.free(literal);
+        for ([_][]const u8{ "g,x", "g DESC,x DESC", "g,-x", "g%2,g,x DESC", "x,g", "0" }) |order| {
+            for ([_][]const u8{ "LIMIT 5", "SKIP 65 LIMIT 125", "SKIP 400 LIMIT 5", "LIMIT 0" }) |page| {
+                for ([_][]const u8{
+                    "RETURN count(*),sum(x),min(x),max(x)",
+                    "RETURN avg(x),collect(x)",
+                    "RETURN head(collect(g)),last(collect(g)),collect(g)[..3],collect(g)[-3..]",
+                    "RETURN g,head(collect(x)),last(collect(x)),count(*) ORDER BY g",
+                }) |tail| {
+                    const query = try std.fmt.allocPrint(a, "UNWIND range({d},{d},{d})+range({d},{d},{d}) AS x WITH x,x%3 AS g ORDER BY {s} {s} {s}", .{ values[0], values[179], step, values[0], values[179], step, order, page, tail });
+                    defer a.free(query);
+                    const control = try std.fmt.allocPrint(a, "UNWIND {s}+{s} AS x WITH x,x%3 AS g ORDER BY {s} {s} {s}", .{ literal, literal, order, page, tail });
+                    defer a.free(control);
+                    try compareReductionPlans(query, control);
+                }
+            }
+        }
+    }
+    for ([_][]const u8{
+        "WITH x ORDER BY x LIMIT 5 RETURN sum(x)",
+        "WITH x ORDER BY x DESC LIMIT 5 RETURN sum(x)",
+        "WITH x ORDER BY x RETURN head(collect(x)),last(collect(x))",
+        "WITH x ORDER BY x SKIP 1 LIMIT 3 RETURN avg(x)",
+        "WITH x ORDER BY x SKIP 1 LIMIT 3 WITH x LIMIT 2 RETURN sum(x)",
+    }) |tail| {
+        const query = try std.fmt.allocPrint(a, "UNWIND range(9223372036854775805,9223372036854775807)+range(-1,1) AS x {s}", .{tail});
+        defer a.free(query);
+        const control = try std.fmt.allocPrint(a, "UNWIND [9223372036854775805,9223372036854775806,9223372036854775807,-1,0,1] AS x {s}", .{tail});
+        defer a.free(control);
+        try compareReductionPlans(query, control);
     }
 }
