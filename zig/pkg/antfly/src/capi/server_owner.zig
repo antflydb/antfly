@@ -7017,6 +7017,25 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         try std.testing.expectEqual(server_owned, transaction.external != null);
         try transaction.runOnce();
         try std.testing.expect(transaction.stats().has_lease);
+        const DenseProbe = struct {
+            invocations: usize = 0,
+            destroys: usize = 0,
+            fn embed(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.invocations += 1;
+                return error.UnexpectedEmbedInvocation;
+            }
+            fn deinit(raw: *anyopaque, _: std.mem.Allocator) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.destroys += 1;
+            }
+        };
+        var dense_probe: DenseProbe = .{};
+        try handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = .{ .ptr = &dense_probe, .dense_embed_fn = DenseProbe.embed, .deinit_fn = DenseProbe.deinit } });
+        const enrichment = handle.db.enrichment_runtime.?;
+        const enrichment_context = handle.db.enrichment_append_context.?;
+        try enrichment.start();
+        try std.testing.expect(enrichment.future != null);
         const owner = state.port();
         const clock = rt.native_abi.IoBorrow.init(&io);
         const now: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds));
@@ -7029,6 +7048,14 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         const request: kernel_owner_abi.CloseDrainRequest = .{ .deadline_ns = deadline, .execution_runnable = &borrow, .clock_io = &clock };
         try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerDrainClose(id, &request));
         try std.testing.expect(!handle.db.isClosed());
+        try std.testing.expect(handle.db.enrichment_runtime.? == enrichment);
+        try std.testing.expect(handle.db.enrichment_append_context.? == enrichment_context);
+        try std.testing.expect(enrichment.closing.load(.acquire) and enrichment.close_joined.isSet());
+        try std.testing.expect(enrichment.future == null and !enrichment.replay_pass_active.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), dense_probe.invocations);
+        try std.testing.expectEqual(@as(usize, 0), dense_probe.destroys);
+        try std.testing.expectError(error.Canceled, enrichment.start());
+        try std.testing.expectError(error.Canceled, enrichment.resumeInlineAfterStop());
         try std.testing.expect(handle.db.transaction_runtime.? == transaction);
         try std.testing.expect(handle.db.transaction_owner.context.? == transaction_context);
         try std.testing.expect(handle.db.transaction_recovery_identity_context != null and handle.db.transaction_recovery_local_context != null);
@@ -7063,5 +7090,7 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         try std.testing.expect(try handle.db.backend_runtime.durable_jobs.quiesceOwner(handle.db.publication_recovery.owner_id));
         try std.testing.expect(handle.db.local_execution.retained_preparation_owner.?.closed.load(.acquire));
         try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().cleanup_operations);
+        closeHandleId(id);
+        try std.testing.expectEqual(@as(usize, 1), dense_probe.destroys);
     }
 }

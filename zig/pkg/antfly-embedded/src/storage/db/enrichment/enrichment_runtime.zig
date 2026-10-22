@@ -79,6 +79,9 @@ const types = @import("../types.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const background_runtime_mod = @import("../../background_runtime.zig");
+const close_admission = @import("../../../common/read_admission.zig");
+const cleanup_wait = @import("../../../common/cleanup_wait.zig");
+const maintenance_stop = @import("../maintenance_stop.zig");
 const template = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
 else
@@ -5155,6 +5158,16 @@ const UnsupportedEnrichmentRuntime = struct {
         self.progress_mailbox.invalidate();
     }
 
+    pub fn stopWithAdmission(self: *@This(), original: close_admission.Port) !void {
+        const Ready = struct {
+            fn get(_: *anyopaque) anyerror!bool {
+                return true;
+            }
+        };
+        try cleanup_wait.until(null, original, self, Ready.get, null);
+        self.stop();
+    }
+
     pub fn isStarted(_: *const @This()) bool {
         return false;
     }
@@ -5504,7 +5517,15 @@ const PlatformEnrichmentRuntime = struct {
     cond: Io.Condition = .init,
     sync_wait_epoch: std.atomic.Value(u32) = .init(0),
     sync_waiter_count: std.atomic.Value(u32) = .init(0),
-    replay_pass_active: bool = false,
+    replay_pass_active: std.atomic.Value(bool) = .init(false),
+    // Final close is distinct from restartable provider reconfiguration.
+    lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    closing: std.atomic.Value(bool) = .init(false),
+    close_started: bool = false,
+    close_joined: Io.Event = .unset,
+    close_changed: Io.Event = .unset,
+    close_generation: std.atomic.Value(u64) = .init(0),
+    close_waiters: std.atomic.Value(u32) = .init(0),
     /// Startup maintenance must run even with no pending replay documents.
     graph_stage_recovery_pending: bool = false,
     shutdown: bool = false,
@@ -5703,6 +5724,7 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     pub fn deinit(self: *EnrichmentRuntime) void {
+        self.closing.store(true, .release);
         self.stop();
         clearIndexEmbeddingActivity(self);
         clearPublishedGeneratedArtifacts(self);
@@ -5718,6 +5740,13 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     pub fn stop(self: *EnrichmentRuntime) void {
+        platform.sync.lockYielding(&self.lifecycle_mutex);
+        if (self.closing.load(.acquire)) {
+            self.lifecycle_mutex.unlock();
+            self.finishFinalTeardown();
+            return;
+        }
+        defer self.lifecycle_mutex.unlock();
         self.beginTeardown();
         if (self.io_impl) |io_impl| {
             const io = io_impl.io();
@@ -5733,7 +5762,7 @@ const PlatformEnrichmentRuntime = struct {
             // replay ownership fence. shutdown=true prevents new passes from
             // entering while the current owner exits.
             self.mutex.lockUncancelable(io);
-            while (self.replay_pass_active) {
+            while (self.replay_pass_active.load(.acquire)) {
                 self.cond.waitUncancelable(io, &self.mutex);
             }
             self.mutex.unlock(io);
@@ -5743,6 +5772,72 @@ const PlatformEnrichmentRuntime = struct {
         self.progress_mailbox.invalidate();
         self.future = null;
         self.shutdown = false;
+        self.ownership.release();
+    }
+
+    fn lifecycleIo(self: *EnrichmentRuntime) ?Io {
+        return if (self.io_impl) |implementation| implementation.io() else null;
+    }
+
+    fn closeHandle(self: *EnrichmentRuntime) maintenance_stop.Borrowed {
+        return .{
+            .mutex = &self.lifecycle_mutex,
+            .registration = &self.future,
+            .stopping = &self.closing,
+            .finisher = &self.close_started,
+            .joined = &self.close_joined,
+            .changed = &self.close_changed,
+            .generation = &self.close_generation,
+            .waiters = &self.close_waiters,
+        };
+    }
+
+    fn replayRetired(raw: *anyopaque) anyerror!bool {
+        const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(raw));
+        return !runtime.replay_pass_active.load(.acquire);
+    }
+
+    fn finishFinalTeardown(self: *EnrichmentRuntime) void {
+        self.beginTeardown();
+        const io = self.lifecycleIo();
+        self.closeHandle().stop(io, false);
+        while (self.replay_pass_active.load(.acquire)) {
+            if (io) |lane| lane.sleep(.fromMilliseconds(1), .awake) catch {} else platform.time.yieldNow();
+        }
+        if (io) |lane| self.mutex.lockUncancelable(lane);
+        defer if (io) |lane| self.mutex.unlock(lane);
+        self.progress_mailbox.invalidate();
+        self.ownership.release();
+    }
+
+    /// Retains providers, the store and lease until every scheduled and inline
+    /// replay owner has returned and the original caller has reentered CPU.
+    pub fn stopWithAdmission(self: *EnrichmentRuntime, original: close_admission.Port) !void {
+        if (comptime @import("../../engine_selection.zig").enabled) {
+            var relay: close_admission.ExecutionErrorRelay = .{};
+            const borrowed = try relay.bind(original);
+            @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentStopWithAdmission", .{ self, borrowed }) catch |cause| return relay.errors.rejection orelse cause;
+            if (relay.errors.rejection) |cause| return cause;
+            return;
+        }
+        const io = self.lifecycleIo();
+        try cleanup_wait.lockAtomic(&self.lifecycle_mutex, io, original);
+        self.closing.store(true, .release);
+        self.shutdown_requested.store(true, .release);
+        self.lifecycle_mutex.unlock();
+        // No lifecycle guard is retained while borrowing the caller's CPU.
+        if (io) |lane| {
+            try cleanup_wait.lockIo(&self.mutex, lane, original);
+            self.shutdown = true;
+            self.shutdown_event.set(lane);
+            broadcastRuntimeStateChanged(self, lane);
+            self.mutex.unlock(lane);
+        }
+        try self.closeHandle().stopWithAdmission(io, original);
+        try cleanup_wait.until(io, original, self, replayRetired, null);
+        if (io) |lane| try cleanup_wait.lockIo(&self.mutex, lane, original);
+        defer if (io) |lane| self.mutex.unlock(lane);
+        self.progress_mailbox.invalidate();
         self.ownership.release();
     }
 
@@ -5768,6 +5863,9 @@ const PlatformEnrichmentRuntime = struct {
     /// Resume provider admission after a joined stop while the caller owns
     /// synchronous replay. Restore drains must not launch a competing worker.
     pub fn resumeInlineAfterStop(self: *EnrichmentRuntime) !void {
+        platform.sync.lockYielding(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (self.future != null) return error.EnrichmentWorkerAlreadyRunning;
         try self.prepareExecution();
     }
@@ -5793,6 +5891,9 @@ const PlatformEnrichmentRuntime = struct {
 
     pub fn start(self: *EnrichmentRuntime) !void {
         if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentStart", .{self});
+        platform.sync.lockYielding(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (self.future != null) return;
         try self.prepareExecution();
         self.future = try (try self.backend_runtime.?.maintenanceScheduler()).registerClass(.producer, self, workerStep);
@@ -7782,13 +7883,13 @@ test "rejected chunk embedding publication records its request for stale cleanup
 fn workerStep(runtime: *EnrichmentRuntime) ?u64 {
     const io = runtime.io_impl.?.io();
     runtime.mutex.lockUncancelable(io);
-    if (runtime.shutdown or ((runtime.worker_failed or runtime.last_error_name != null) and !runtime.graph_stage_recovery_pending) or
+    if (runtime.closing.load(.acquire) or runtime.shutdown or ((runtime.worker_failed or runtime.last_error_name != null) and !runtime.graph_stage_recovery_pending) or
         (runtime.target_sequence <= runtime.applied_sequence and !runtime.retrying and !runtime.graph_stage_recovery_pending))
     {
         runtime.mutex.unlock(io);
         return null;
     }
-    if (runtime.replay_pass_active) {
+    if (runtime.replay_pass_active.load(.acquire)) {
         runtime.mutex.unlock(io);
         return 25;
     }
@@ -7807,7 +7908,7 @@ fn beginReplayPass(
     guard: ForegroundCatchUpGuard,
 ) !bool {
     runtime.mutex.lockUncancelable(io);
-    while (runtime.replay_pass_active and !runtime.shutdown) {
+    while (runtime.replay_pass_active.load(.acquire) and !runtime.shutdown and !runtime.closing.load(.acquire)) {
         if (guard.deadline_ns == null and guard.cancellation.ptr == null) {
             runtime.cond.waitUncancelable(io, &runtime.mutex);
             continue;
@@ -7821,7 +7922,7 @@ fn beginReplayPass(
         try guard.check();
         runtime.mutex.lockUncancelable(io);
     }
-    if (runtime.shutdown) {
+    if (runtime.shutdown or runtime.closing.load(.acquire)) {
         runtime.mutex.unlock(io);
         return error.EnrichmentRetryAborted;
     }
@@ -7842,15 +7943,15 @@ fn beginReplayPass(
         runtime.mutex.unlock(io);
         return RuntimeError.EnrichmentRetryInProgress;
     }
-    runtime.replay_pass_active = true;
+    runtime.replay_pass_active.store(true, .release);
     runtime.mutex.unlock(io);
     return true;
 }
 
 fn endReplayPass(runtime: *EnrichmentRuntime, io: Io) void {
     runtime.mutex.lockUncancelable(io);
-    std.debug.assert(runtime.replay_pass_active);
-    runtime.replay_pass_active = false;
+    std.debug.assert(runtime.replay_pass_active.load(.acquire));
+    runtime.replay_pass_active.store(false, .release);
     broadcastRuntimeStateChanged(runtime, io);
     runtime.mutex.unlock(io);
 }
@@ -7875,7 +7976,7 @@ test "enrichment replay passes are single flight" {
         .notify_fn = undefined,
         .config = .{},
         .ownership = undefined,
-        .replay_pass_active = true,
+        .replay_pass_active = .init(true),
     };
     const Waiter = struct {
         runtime: *EnrichmentRuntime,
@@ -7906,7 +8007,7 @@ test "enrichment replay passes are single flight" {
     endReplayPass(&runtime, io);
     waiter.acquired.waitUncancelable(io);
     try std.testing.expect(waiter.err == null);
-    try std.testing.expect(runtime.replay_pass_active);
+    try std.testing.expect(runtime.replay_pass_active.load(.acquire));
     endReplayPass(&runtime, io);
 
     runtime.applied_sequence = 1;
@@ -36341,7 +36442,7 @@ test "controlled enrichment visibility inline catch-up restores original rejecti
         try std.testing.expectError(cause, runtime.catchUpUntilWithVisibilityDeadline(1, .{ .ptr = &probe, .check_fn = Probe.check }, null));
         try std.testing.expectEqual(probe.fail_call, probe.calls);
         try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
-        try std.testing.expect(!runtime.worker_failed and !runtime.retrying and !runtime.replay_pass_active);
+        try std.testing.expect(!runtime.worker_failed and !runtime.retrying and !runtime.replay_pass_active.load(.acquire));
         try std.testing.expect(runtime.active_provider_guard.authority_rejection == null);
         try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
         try std.testing.expect(runtime.mutex.tryLock());
@@ -36647,4 +36748,215 @@ test "backup preflight reader media parts match execution" {
     defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"source_local\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
+}
+
+test "controlled enrichment shutdown retains scheduled and foreground provider borrows across original wait failures" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    const Mode = enum { background, foreground, foreground_with_idle_registration };
+    for (std.enums.values(Case)) |case| {
+        for (std.enums.values(Mode)) |mode| {
+            var background = try background_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+            defer background.deinit();
+            const io = background.ptr().io().?;
+            var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+            defer backend.close();
+            var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "enrichment-close" });
+            defer store.deinit();
+            var runtime: EnrichmentRuntime = .{
+                .alloc = std.testing.allocator,
+                .io_impl = .{ .borrowed = io },
+                .backend_runtime = background.ptr(),
+                .store = store,
+                .owns_store = false,
+                .change_journal = undefined,
+                .replay_source = undefined,
+                .index_manager = undefined,
+                .write_ctx = undefined,
+                .write_fn = undefined,
+                .notify_ctx = undefined,
+                .notify_fn = undefined,
+                .config = .{},
+                .ownership = try ownership_mod.State.init(std.testing.allocator, &store, "enrichment-close-lease", .{ .lease_owned = true, .owner_id = "enrichment-close", .lease_ttl_ms = 30_000 }),
+            };
+            defer runtime.ownership.deinit(std.testing.allocator);
+            try std.testing.expect(try runtime.ownership.ensureLease(1));
+            if (case == .success and mode == .background) {
+                try runtime.start();
+                runtime.stop();
+                try std.testing.expect(!runtime.closing.load(.acquire) and runtime.future == null);
+                try runtime.resumeInlineAfterStop();
+                try std.testing.expect(!runtime.shutdown_requested.load(.acquire));
+                try std.testing.expect(try runtime.ownership.ensureLease(2));
+            }
+            const F = struct {
+                runtime: *EnrichmentRuntime,
+                io: Io,
+                entered: Io.Event = .unset,
+                release: Io.Event = .unset,
+                provider_returned: std.atomic.Value(bool) = .init(false),
+                provider_destroyed: bool = false,
+                fn embed(raw: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.entered.set(self.io);
+                    // Native work deliberately ignores cooperative cancellation
+                    // until it returns its allocator-owned result.
+                    self.release.waitUncancelable(self.io);
+                    const result = try alloc.alloc(f32, dims);
+                    @memset(result, 0);
+                    self.provider_returned.store(true, .release);
+                    return result;
+                }
+                fn destroy(raw: *anyopaque, _: Allocator) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    std.debug.assert(!self.provider_destroyed);
+                    self.provider_destroyed = true;
+                }
+                fn run(self: *@This()) void {
+                    const owns_pass = beginReplayPass(self.runtime, self.io, 1, .{}) catch @panic("replay admission failed");
+                    std.debug.assert(owns_pass);
+                    const embedding = self.runtime.config.dense_embedder.?.embedDense(self.runtime.alloc, "dense", "text", 1) catch @panic("provider failed");
+                    self.runtime.alloc.free(embedding);
+                    endReplayPass(self.runtime, self.io);
+                }
+                fn step(self: *@This()) ?u64 {
+                    self.run();
+                    return null;
+                }
+                fn idle(_: *@This()) ?u64 {
+                    return null;
+                }
+            };
+            var fixture: F = .{ .runtime = &runtime, .io = io };
+            runtime.config.dense_embedder = .{ .ptr = &fixture, .dense_embed_fn = F.embed, .deinit_fn = F.destroy };
+            var direct: ?Io.Future(void) = null;
+            defer {
+                fixture.release.set(io);
+                if (direct) |*future| future.await(io);
+                runtime.closing.store(true, .release);
+                runtime.stop();
+            }
+            if (mode == .background) {
+                runtime.future = try (try background.ptr().maintenanceScheduler()).registerClass(.producer, &fixture, F.step);
+            } else {
+                if (mode == .foreground_with_idle_registration) runtime.future = try (try background.ptr().maintenanceScheduler()).registerClass(.producer, &fixture, F.idle);
+                direct = try io.concurrent(F.run, .{&fixture});
+            }
+            try fixture.entered.wait(io);
+            const Control = struct {
+                fixture: *F,
+                case: Case,
+                begins: usize = 0,
+                ends: usize = 0,
+                fn check(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+                }
+                fn deadline(_: *anyopaque) !?u64 {
+                    return 1000;
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.begins += 1;
+                    if (self.case == .begin_failure) return error.NotFound;
+                    if (self.case != .lifetime_in_wait) self.fixture.release.set(self.fixture.io);
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    self.fixture.release.set(self.fixture.io);
+                    if (self.case == .end_failure) return error.Canceled;
+                }
+            };
+            var control: Control = .{ .fixture = &fixture, .case = case };
+            var payload: close_admission.Payload = .{
+                .ptr = &control,
+                .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline },
+                .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end },
+            };
+            const result = runtime.stopWithAdmission(.init(&payload));
+            if (case == .success) try result else {
+                try std.testing.expectError(switch (case) {
+                    .begin_failure => error.NotFound,
+                    .end_failure => error.Canceled,
+                    .lifetime_in_wait => error.DeadlineExceeded,
+                    .success => unreachable,
+                }, result);
+                try std.testing.expect(runtime.closing.load(.acquire) and runtime.shutdown_requested.load(.acquire));
+                try std.testing.expect(runtime.ownership.stats().has_lease);
+                try std.testing.expect(!fixture.provider_destroyed);
+                if (mode == .background) try std.testing.expect(runtime.future != null);
+                try std.testing.expectError(error.Canceled, runtime.start());
+                try std.testing.expectError(error.Canceled, runtime.resumeInlineAfterStop());
+                fixture.release.set(io);
+                control.case = .success;
+                try runtime.stopWithAdmission(.init(&payload));
+            }
+            try std.testing.expect(fixture.provider_returned.load(.acquire));
+            try std.testing.expect(!fixture.provider_destroyed);
+            runtime.config.dense_embedder.?.deinit(runtime.alloc);
+            try std.testing.expect(fixture.provider_destroyed);
+            try std.testing.expect(!runtime.replay_pass_active.load(.acquire));
+            try std.testing.expect(!runtime.ownership.stats().has_lease and runtime.future == null);
+            try std.testing.expectError(error.EnrichmentRetryAborted, beginReplayPass(&runtime, io, 2, .{}));
+            try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_failure), control.ends);
+        }
+    }
+}
+
+test "controlled enrichment shutdown interrupted state publication still fences worker redispatch" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = std.testing.io;
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "interrupted-close" });
+    defer store.deinit();
+    var runtime: EnrichmentRuntime = .{
+        .alloc = std.testing.allocator,
+        .io_impl = .{ .borrowed = io },
+        .store = store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .target_sequence = 1,
+        .ownership = try ownership_mod.State.init(std.testing.allocator, &store, "interrupted-close-lease", .{}),
+    };
+    defer runtime.ownership.deinit(std.testing.allocator);
+    defer runtime.stop();
+    const Control = struct {
+        begins: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            return error.NotFound;
+        }
+        fn end(_: *anyopaque) !void {
+            @panic("failed begin cannot reenter");
+        }
+    };
+    var control: Control = .{};
+    var payload: close_admission.Payload = .{
+        .ptr = &control,
+        .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline },
+        .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end },
+    };
+    runtime.mutex.lockUncancelable(io);
+    const result = runtime.stopWithAdmission(.init(&payload));
+    runtime.mutex.unlock(io);
+    try std.testing.expectError(error.NotFound, result);
+    try std.testing.expectEqual(@as(usize, 1), control.begins);
+    try std.testing.expect(runtime.closing.load(.acquire) and runtime.shutdown_requested.load(.acquire));
+    try std.testing.expect(!runtime.shutdown);
+    try std.testing.expect(workerStep(&runtime) == null);
+    try std.testing.expectError(error.EnrichmentRetryAborted, beginReplayPass(&runtime, io, 1, .{}));
 }

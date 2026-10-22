@@ -6216,6 +6216,10 @@ pub const DB = struct {
         }.invoke);
         if (self.closed) return;
         try self.drainPreparedAssembliesWithAdmission(original);
+        {
+            defer self.async_context.enrichment_desired_running.store(false, .release);
+            try self.enrichment_owner.closeWithAdmission(self.backend_runtime.io(), original);
+        }
         try self.native_query_warming.stopWithAdmission(self.backend_runtime, original);
         try self.independent_maintenance.stopWithAdmission(self.backend_runtime, original);
         try self.quarantine_recovery.stopWithAdmission(self.backend_runtime, original);

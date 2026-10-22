@@ -17,6 +17,7 @@ pub const antfly_sources = struct {};
 pub const consumer_tests_only = true;
 test {
     _ = @import("storage/db/enrichment/enrichment_runtime.zig");
+    _ = @import("storage/db/enrichment_runtime_owner.zig");
     _ = @import("storage/db/derived/runtime_types.zig");
     _ = @import("storage/db/derived/io_threaded_runtime.zig");
 }

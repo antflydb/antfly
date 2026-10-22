@@ -577,6 +577,10 @@ fn enrichmentStart(self: *@import("db/enrichment/enrichment_runtime.zig").Enrich
     return .{ .value = self.start() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn enrichmentStopWithAdmission(self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, original: @import("../common/read_admission.zig").Port) engine.Outcome(void) {
+    return .{ .value = self.stopWithAdmission(original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
+}
+
 fn enrichmentReloadDurableState(self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime) engine.Outcome(void) {
     return .{ .value = self.reloadDurableState() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

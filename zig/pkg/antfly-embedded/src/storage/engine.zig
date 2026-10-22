@@ -408,6 +408,7 @@ pub const VTable = struct {
     waitForResolvedTransactionSyncWithCancellation: *const fn (self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken) Outcome(void),
     waitForResolvedTransactionSyncTargetWithCancellation: *const fn (self: *DB, sync_level: types.SyncLevel, sequence: *u64, phase: *u8, cancellation: types.CancellationToken) Outcome(void),
     enrichmentStart: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime) Outcome(void),
+    enrichmentStopWithAdmission: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, original: @import("../common/read_admission.zig").Port) Outcome(void),
     enrichmentReloadDurableState: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime) Outcome(void),
     enrichmentResumeFrom: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, sequence: u64, target_sequence: u64) Outcome(void),
     enrichmentWaitForAppliedWithVisibilityDeadline: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, sequence: u64, cancellation: types.CancellationToken, deadline_ns: ?u64) Outcome(void),

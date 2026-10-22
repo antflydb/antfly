@@ -50,6 +50,7 @@ fn ManagedOwner(comptime Context: type, comptime RuntimeType: type) type {
         const Self = @This();
         bundle: Bundle = .{},
         replacement_mutex: std.atomic.Mutex = .unlocked,
+        closing: std.atomic.Value(bool) = .init(false),
         pub const Bundle = struct {
             append_ctx: ?*Context = null,
             runtime: ?*RuntimeType = null,
@@ -116,7 +117,20 @@ fn ManagedOwner(comptime Context: type, comptime RuntimeType: type) type {
             while (!mutex.tryLock()) @import("antfly_platform").time.yieldNow();
         }
         pub fn deinit(self: *Self, alloc: Allocator) void {
+            self.closing.store(true, .release);
+            lock(&self.replacement_mutex);
+            self.replacement_mutex.unlock();
             self.bundle.deinit(alloc);
+        }
+        /// Fence new replacements before waiting for an already admitted
+        /// constructor. Once that constructor exits, the published bundle is
+        /// stable through final teardown. No guard spans the runtime's wait.
+        pub fn closeWithAdmission(self: *Self, io: ?std.Io, original: @import("../../common/read_admission.zig").Port) !void {
+            self.closing.store(true, .release);
+            try @import("../../common/cleanup_wait.zig").lockAtomic(&self.replacement_mutex, io, original);
+            const runtime = self.bundle.runtime;
+            self.replacement_mutex.unlock();
+            if (runtime) |value| try value.stopWithAdmission(original);
         }
         /// A private fence serializes replacement even without transaction
         /// recovery. The caller additionally fences recovery provider borrows.
@@ -124,10 +138,12 @@ fn ManagedOwner(comptime Context: type, comptime RuntimeType: type) type {
         /// is fully constructed before the previous worker is stopped; failure
         /// retains the previous bundle and restores its desired running state.
         pub fn replace(self: *Self, port: Port, cfg: enrichment_runtime_mod.Config, start_replacement: bool) !void {
-            lock(&self.replacement_mutex);
-            defer self.replacement_mutex.unlock();
             var owned_cfg = cfg;
             defer deinitConfig(port.alloc, &owned_cfg);
+            if (self.closing.load(.acquire)) return error.Canceled;
+            lock(&self.replacement_mutex);
+            defer self.replacement_mutex.unlock();
+            if (self.closing.load(.acquire)) return error.Canceled;
             var detached = try port.create(port.ptr, &owned_cfg);
             errdefer if (detached) |*bundle| bundle.deinit(port.alloc);
             try port.after_create(port.ptr);
@@ -173,7 +189,7 @@ test "uninstalled enrichment config releases owned chunk provider routing" {
     try std.testing.expect(cfg.chunk_provider == null);
 }
 
-test "enrichment owner restores running and pending demand and transfers paused replacement once" {
+test "enrichment owner restores replacement demand and retains its closed bundle after original rejection" {
     const F = struct {
         const Self = @This();
         const Fake = struct {
@@ -186,6 +202,15 @@ test "enrichment owner restores running and pending demand and transfers paused 
                 return self.started;
             }
             fn stop(self: *@This()) void {
+                self.started = false;
+            }
+            fn stopWithAdmission(self: *@This(), original: @import("../../common/read_admission.zig").Port) !void {
+                self.fixture.close_calls += 1;
+                // Runtime/provider callbacks must execute outside the owner
+                // replacement guard, including original checkpoint callbacks.
+                try std.testing.expect(self.fixture.owner.replacement_mutex.tryLock());
+                self.fixture.owner.replacement_mutex.unlock();
+                try original.checkpoint();
                 self.started = false;
             }
             fn start(self: *@This()) !void {
@@ -204,6 +229,7 @@ test "enrichment owner restores running and pending demand and transfers paused 
         destroyed: usize = 0,
         restored: usize = 0,
         published: usize = 0,
+        close_calls: usize = 0,
         fn f(ptr: *anyopaque) *Self {
             return @ptrCast(@alignCast(ptr));
         }
@@ -254,6 +280,85 @@ test "enrichment owner restores running and pending demand and transfers paused 
     try std.testing.expect(!f.desired.load(.acquire));
     try std.testing.expectEqual(@as(usize, 3), f.destroyed);
     try std.testing.expectEqual(@as(usize, 1), f.published);
+    const Control = struct {
+        fixture: *F,
+        release_fence: bool = true,
+        reject_after_delegate: bool = true,
+        begins: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject_after_delegate and self.fixture.close_calls != 0) return error.DeadlineExceeded;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            if (self.release_fence) {
+                self.fixture.owner.replacement_mutex.unlock();
+                self.release_fence = false;
+            }
+            return error.NotFound;
+        }
+        fn end(_: *anyopaque) !void {
+            @panic("failed wait entry cannot reenter");
+        }
+    };
+    const admission = @import("../../common/read_admission.zig");
+    var control: Control = .{ .fixture = &f };
+    var payload: admission.Payload = .{
+        .ptr = &control,
+        .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline },
+        .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end },
+    };
+    const retained = f.owner.bundle.runtime.?;
+    try std.testing.expect(f.owner.replacement_mutex.tryLock());
+    try std.testing.expectError(error.NotFound, f.owner.closeWithAdmission(std.testing.io, .init(&payload)));
+    try std.testing.expect(f.owner.closing.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), control.begins);
+    try std.testing.expectEqual(@as(usize, 0), f.close_calls);
+    try std.testing.expectEqual(retained, f.owner.bundle.runtime.?);
+    try std.testing.expectError(error.DeadlineExceeded, f.owner.closeWithAdmission(std.testing.io, .init(&payload)));
+    try std.testing.expectEqual(@as(usize, 1), f.close_calls);
+    // Incoming owned routing must be released even when close rejects the
+    // replacement before construction. Leak checking proves this ownership.
+    const incoming: enrichment_runtime_mod.Config = .{ .chunk_provider = try (enrichment_runtime_mod.ChunkProvider{
+        .execution = .{ .routing = .{ .source_table = "closed-owner" } },
+    }).ownExecutionStrings(std.testing.allocator) };
+    const RejectedReplacement = struct {
+        fixture: *F,
+        cfg: enrichment_runtime_mod.Config,
+        done: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.fixture.owner.replace(self.fixture.port(), self.cfg, true) catch |cause| {
+                self.failure = cause;
+            };
+            self.done.set(std.testing.io);
+        }
+    };
+    var rejected: RejectedReplacement = .{ .fixture = &f, .cfg = incoming };
+    try std.testing.expect(f.owner.replacement_mutex.tryLock());
+    var rejection = std.testing.io.concurrent(RejectedReplacement.run, .{&rejected}) catch |cause| {
+        f.owner.replacement_mutex.unlock();
+        return cause;
+    };
+    rejected.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch |cause| {
+        f.owner.replacement_mutex.unlock();
+        rejection.await(std.testing.io);
+        return cause;
+    };
+    f.owner.replacement_mutex.unlock();
+    rejection.await(std.testing.io);
+    try std.testing.expectEqual(error.Canceled, rejected.failure.?);
+    try std.testing.expectEqual(retained, f.owner.bundle.runtime.?);
+    try std.testing.expectEqual(@as(usize, 3), f.destroyed);
+    try std.testing.expectEqual(@as(usize, 1), f.published);
+    control.reject_after_delegate = false;
+    try f.owner.closeWithAdmission(std.testing.io, .init(&payload));
+    try std.testing.expectEqual(@as(usize, 2), f.close_calls);
+    try std.testing.expectEqual(retained, f.owner.bundle.runtime.?);
 }
 
 test "enrichment runtime construction unwinds allocation and durable state failures" {
