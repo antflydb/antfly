@@ -35,3 +35,31 @@ fn memory_provisional_filter_distinguishes_false_from_the_native_default() {
     assert_eq!(default_json["include_provisional"].as_bool(), Some(true));
     assert_eq!(excluded_json["include_provisional"].as_bool(), Some(false));
 }
+
+#[test]
+fn memory_generated_read_types_decode_native_service_fixtures() {
+    use antfly_sdk::types::{
+        MemoryEntityCandidatePage, MemoryEntityProposalDetail, MemoryEntityProposalPage,
+    };
+    let candidates: MemoryEntityCandidatePage = serde_json::from_str(include_str!(
+        "../../../../zig/pkg/antfly-embedded/src/memory/fixtures/wire/candidates.json"
+    ))
+    .unwrap();
+    let proposals: MemoryEntityProposalPage = serde_json::from_str(include_str!(
+        "../../../../zig/pkg/antfly-embedded/src/memory/fixtures/wire/proposals.json"
+    ))
+    .unwrap();
+    let details: MemoryEntityProposalDetail = serde_json::from_str(include_str!(
+        "../../../../zig/pkg/antfly-embedded/src/memory/fixtures/wire/proposal.json"
+    ))
+    .unwrap();
+    let candidates = serde_json::to_value(candidates).unwrap();
+    let proposals = serde_json::to_value(proposals).unwrap();
+    let details = serde_json::to_value(details).unwrap();
+    assert_eq!(candidates["seed"]["entity"]["id"], "a");
+    assert_eq!(candidates["items"][0]["view"]["canonical_id"], "b");
+    assert_eq!(details["proposal"]["id"], proposals["items"][0]["id"]);
+    assert_eq!(details["inputs"]["actor"], "codex/consolidation");
+    assert_eq!(details["inputs"]["entities"][0]["revision"], 3);
+    assert_eq!(details["stale_configuration"], false);
+}

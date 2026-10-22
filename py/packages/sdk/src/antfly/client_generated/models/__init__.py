@@ -1173,6 +1173,12 @@ from .memory_embedding_batch import MemoryEmbeddingBatch
 from .memory_embedding_batch_items_item import MemoryEmbeddingBatchItemsItem
 from .memory_embedding_batch_model import MemoryEmbeddingBatchModel
 from .memory_entity import MemoryEntity
+from .memory_entity_candidate import MemoryEntityCandidate
+from .memory_entity_candidate_page import MemoryEntityCandidatePage
+from .memory_entity_candidate_page_basis import MemoryEntityCandidatePageBasis
+from .memory_entity_candidate_page_kind import MemoryEntityCandidatePageKind
+from .memory_entity_candidate_page_retrieval import MemoryEntityCandidatePageRetrieval
+from .memory_entity_candidate_page_semantic_discovery import MemoryEntityCandidatePageSemanticDiscovery
 from .memory_entity_candidate_request import MemoryEntityCandidateRequest
 from .memory_entity_candidate_request_kind import MemoryEntityCandidateRequestKind
 from .memory_entity_correction import MemoryEntityCorrection
@@ -1192,11 +1198,30 @@ from .memory_entity_page_items_item_entity_evidence_item_span_type_0 import (
     MemoryEntityPageItemsItemEntityEvidenceItemSpanType0,
 )
 from .memory_entity_page_items_item_entity_visibility import MemoryEntityPageItemsItemEntityVisibility
+from .memory_entity_proposal import MemoryEntityProposal
+from .memory_entity_proposal_action import MemoryEntityProposalAction
+from .memory_entity_proposal_decided_type_0 import MemoryEntityProposalDecidedType0
+from .memory_entity_proposal_decided_type_0_origin import MemoryEntityProposalDecidedType0Origin
+from .memory_entity_proposal_detail import MemoryEntityProposalDetail
+from .memory_entity_proposal_inputs import MemoryEntityProposalInputs
+from .memory_entity_proposal_inputs_entities_item import MemoryEntityProposalInputsEntitiesItem
+from .memory_entity_proposal_inputs_evidence_item import MemoryEntityProposalInputsEvidenceItem
+from .memory_entity_proposal_inputs_evidence_item_span_type_0 import MemoryEntityProposalInputsEvidenceItemSpanType0
+from .memory_entity_proposal_inputs_model_type_0 import MemoryEntityProposalInputsModelType0
+from .memory_entity_proposal_inputs_operation_type_0 import MemoryEntityProposalInputsOperationType0
+from .memory_entity_proposal_inputs_operation_type_0_kind import MemoryEntityProposalInputsOperationType0Kind
+from .memory_entity_proposal_options import MemoryEntityProposalOptions
+from .memory_entity_proposal_options_absorbed import MemoryEntityProposalOptionsAbsorbed
+from .memory_entity_proposal_origin import MemoryEntityProposalOrigin
+from .memory_entity_proposal_origin_origin import MemoryEntityProposalOriginOrigin
+from .memory_entity_proposal_page import MemoryEntityProposalPage
 from .memory_entity_proposal_request import MemoryEntityProposalRequest
 from .memory_entity_proposal_request_absorbed import MemoryEntityProposalRequestAbsorbed
 from .memory_entity_proposal_request_action import MemoryEntityProposalRequestAction
 from .memory_entity_proposal_request_evidence_item import MemoryEntityProposalRequestEvidenceItem
 from .memory_entity_proposal_request_evidence_item_span_type_0 import MemoryEntityProposalRequestEvidenceItemSpanType0
+from .memory_entity_proposal_state import MemoryEntityProposalState
+from .memory_entity_record import MemoryEntityRecord
 from .memory_entity_verdict import MemoryEntityVerdict
 from .memory_entity_verdict_evidence_item import MemoryEntityVerdictEvidenceItem
 from .memory_entity_verdict_evidence_item_span_type_0 import MemoryEntityVerdictEvidenceItemSpanType0
@@ -3349,6 +3374,12 @@ __all__ = (
     "MemoryEmbeddingBatchItemsItem",
     "MemoryEmbeddingBatchModel",
     "MemoryEntity",
+    "MemoryEntityCandidate",
+    "MemoryEntityCandidatePage",
+    "MemoryEntityCandidatePageBasis",
+    "MemoryEntityCandidatePageKind",
+    "MemoryEntityCandidatePageRetrieval",
+    "MemoryEntityCandidatePageSemanticDiscovery",
     "MemoryEntityCandidateRequest",
     "MemoryEntityCandidateRequestKind",
     "MemoryEntityCorrection",
@@ -3366,11 +3397,30 @@ __all__ = (
     "MemoryEntityPageItemsItemEntityEvidenceItem",
     "MemoryEntityPageItemsItemEntityEvidenceItemSpanType0",
     "MemoryEntityPageItemsItemEntityVisibility",
+    "MemoryEntityProposal",
+    "MemoryEntityProposalAction",
+    "MemoryEntityProposalDecidedType0",
+    "MemoryEntityProposalDecidedType0Origin",
+    "MemoryEntityProposalDetail",
+    "MemoryEntityProposalInputs",
+    "MemoryEntityProposalInputsEntitiesItem",
+    "MemoryEntityProposalInputsEvidenceItem",
+    "MemoryEntityProposalInputsEvidenceItemSpanType0",
+    "MemoryEntityProposalInputsModelType0",
+    "MemoryEntityProposalInputsOperationType0",
+    "MemoryEntityProposalInputsOperationType0Kind",
+    "MemoryEntityProposalOptions",
+    "MemoryEntityProposalOptionsAbsorbed",
+    "MemoryEntityProposalOrigin",
+    "MemoryEntityProposalOriginOrigin",
+    "MemoryEntityProposalPage",
     "MemoryEntityProposalRequest",
     "MemoryEntityProposalRequestAbsorbed",
     "MemoryEntityProposalRequestAction",
     "MemoryEntityProposalRequestEvidenceItem",
     "MemoryEntityProposalRequestEvidenceItemSpanType0",
+    "MemoryEntityProposalState",
+    "MemoryEntityRecord",
     "MemoryEntityVerdict",
     "MemoryEntityVerdictEvidenceItem",
     "MemoryEntityVerdictEvidenceItemSpanType0",

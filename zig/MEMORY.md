@@ -476,6 +476,17 @@ revision; it is distinct from temporary or time-qualified support applicability.
 Queued identity invalidation is fenced to its originating revision, so processing
 an older event cannot invalidate an artifact regenerated after that change.
 
+Discovery and review reads use native typed response contracts:
+`EntityCandidatePage`, `EntityProposalPage` and `EntityProposalDetail`. The
+proposal payload is the shared resolver `curation.Proposal`; memory supplies
+its versioned causal-input envelope without maintaining another queue shape.
+Handlers serialize those exact types, and OpenAPI/SDK generation reads their
+schemas directly. Read operations must explicitly select a response schema;
+they cannot silently inherit a mutation receipt. Native wire schemas preserve
+integer domains and floating-point widths. Shared fixtures are captured from
+actual native service calls, checked against the typed handlers, and decoded
+by the generated Go/Python/Rust models and TypeScript memory transport.
+
 HTTP routes live under `/memory/v1/spaces/{space}`. Use
 `X-Antfly-Database` and `X-Antfly-Namespace` for catalog scope (defaults:
 `default` and `public`). These headers select resources, never identity or grants.
@@ -558,6 +569,16 @@ and budget omissions explicitly. Its native baseline reads primary rows and
 computes lexical/cosine scores under these bounds. It does not claim an indexed
 ANN/BM25 performance result. Antfly index-backed candidate production can replace
 this execution detail without changing policy, history or completeness contracts.
+Lexical recall prepares the query's case-insensitive whole-word vocabulary once
+per request. Per-assertion coverage uses reusable occurrence epochs without
+allocating token copies or another hash set for each hit. Candidate description
+comparisons prepare their seed vocabulary once and reuse a text-vocabulary map
+bounded by the largest compared view. These buffers use a reclaimable allocator
+and retire with the request; they do not accumulate in the policy arena across
+scan pages. Duplicate words, stopwords and whole-word matching retain the same
+retrieval semantics. A 35,754-byte query over 128 assertions is covered by a
+16 MiB request-allocation regression with a one-result, 2 KiB response budget.
+
 
 `context_evidence_ids` supplies an explicit bounded prior-conversation plan;
 source thread/turn/ordinal/time fields preserve ordering and attribution.

@@ -32,3 +32,34 @@ void client.memoryApi.POST("/memory/v1/spaces/{space}/recall", {
   params: { path: { space: "team" } },
   body: { graph: { entity_seeds: ["concept/a"], relation_weight: 0.5 }, token_budget: 8192 },
 });
+
+void client.memoryApi
+  .POST("/memory/v1/spaces/{space}/entities/{id}/candidates", {
+    params: { path: { space: "wire", id: "a" } },
+    body: {},
+  })
+  .then(({ data }) => {
+    if (!data) return;
+    const candidates: MemorySchemas["MemoryEntityCandidatePage"] = data;
+    void candidates.items[0]?.view.fingerprint;
+    // @ts-expect-error Discovery returns a candidate page, not an operation receipt.
+    void data.phase;
+  });
+void client.memoryApi
+  .GET("/memory/v1/spaces/{space}/entity-proposals", {
+    params: { path: { space: "wire" } },
+  })
+  .then(({ data }) => {
+    if (!data) return;
+    const proposals: MemorySchemas["MemoryEntityProposalPage"] = data;
+    void proposals.items[0]?.origin.actor;
+  });
+void client.memoryApi
+  .GET("/memory/v1/spaces/{space}/entity-proposals/{id}", {
+    params: { path: { space: "wire", id: "proposal" } },
+  })
+  .then(({ data }) => {
+    if (!data) return;
+    const detail: MemorySchemas["MemoryEntityProposalDetail"] = data;
+    void detail.inputs.entities[0]?.revision;
+  });

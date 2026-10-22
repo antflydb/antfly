@@ -16740,7 +16740,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MemoryOperation'
+                $ref: '#/components/schemas/MemoryEntityCandidatePage'
         '400':
           description: Memory validation, authorization, concurrency, capability, or execution error.
           content:
@@ -16942,7 +16942,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MemoryOperation'
+                $ref: '#/components/schemas/MemoryEntityProposalPage'
         '400':
           description: Memory validation, authorization, concurrency, capability, or execution error.
           content:
@@ -17033,7 +17033,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MemoryOperation'
+                $ref: '#/components/schemas/MemoryEntityProposalDetail'
         '400':
           description: Memory validation, authorization, concurrency, capability, or execution error.
           content:
@@ -51293,6 +51293,7 @@ components:
           type: array
           items:
             type: number
+            format: float
           default: null
           nullable: true
         embedding_model:
@@ -51802,14 +51803,17 @@ components:
               x-go-type: uint32
             restart_probability:
               type: number
+              format: double
               default: 0.15
               x-go-type-skip-optional-pointer: false
             relation_weight:
               type: number
+              format: double
               default: 0.5
               x-go-type-skip-optional-pointer: false
             provisional_weight:
               type: number
+              format: double
               default: 0.5
               x-go-type-skip-optional-pointer: false
             include_episodes:
@@ -51939,6 +51943,7 @@ components:
           type: array
           items:
             type: number
+            format: float
           default: null
           nullable: true
         embedding_model:
@@ -52250,6 +52255,7 @@ components:
               type: array
               items:
                 type: number
+                format: float
               default: null
               nullable: true
             embedding_model:
@@ -52620,6 +52626,505 @@ components:
           default: 16
           x-go-type-skip-optional-pointer: false
           x-go-type: uint32
+      additionalProperties: false
+    MemoryEntityRecord:
+      type: object
+      properties:
+        entity:
+          $ref: '#/components/schemas/MemoryEntity'
+        owner:
+          type: string
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        recorded_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+      required:
+        - entity
+        - owner
+      additionalProperties: false
+    MemoryEntityCandidate:
+      type: object
+      properties:
+        entity:
+          $ref: '#/components/schemas/MemoryEntityRecord'
+        view:
+          $ref: '#/components/schemas/MemoryEntityView'
+        match_score:
+          type: number
+          format: double
+        description_score:
+          type: number
+          format: double
+        predicates:
+          type: array
+          items:
+            type: string
+      required:
+        - entity
+        - view
+        - match_score
+        - description_score
+        - predicates
+      additionalProperties: false
+    MemoryEntityCandidatePage:
+      type: object
+      properties:
+        seed:
+          $ref: '#/components/schemas/MemoryEntityRecord'
+        seed_view:
+          $ref: '#/components/schemas/MemoryEntityView'
+        kind:
+          type: string
+          enum:
+            - identity
+            - relationship
+        relationship_predicates:
+          type: array
+          items:
+            type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryEntityCandidate'
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        config_generation:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        next_cursor:
+          type: string
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        complete:
+          type: boolean
+        omitted:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        retrieval:
+          type: string
+          enum:
+            - indexed_lexical
+            - bounded_audience_fallback
+            - bounded_primary_fallback
+        semantic_discovery:
+          type: string
+          enum:
+            - not_indexed
+          default: not_indexed
+          x-go-type-skip-optional-pointer: false
+        basis:
+          type: string
+          enum:
+            - name_matches_description_tiebreaker_not_identity_or_calibrated_confidence
+          default: name_matches_description_tiebreaker_not_identity_or_calibrated_confidence
+          x-go-type-skip-optional-pointer: false
+      required:
+        - seed
+        - seed_view
+        - kind
+        - relationship_predicates
+        - items
+        - revision
+        - config_generation
+        - next_cursor
+        - complete
+        - omitted
+        - retrieval
+      additionalProperties: false
+    MemoryEntityProposal:
+      type: object
+      properties:
+        id:
+          type: string
+        action:
+          type: string
+          enum:
+            - merge
+            - unmerge
+            - suppress
+            - unsuppress
+            - distinct
+        key:
+          type: string
+        into:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        options:
+          type: object
+          properties:
+            replace:
+              type: boolean
+              default: false
+              x-go-type-skip-optional-pointer: false
+            pin_distinct:
+              type: boolean
+              default: false
+              x-go-type-skip-optional-pointer: false
+            absorbed:
+              type: string
+              enum:
+                - reject
+                - release
+                - suppress
+              default: reject
+              x-go-type-skip-optional-pointer: false
+          additionalProperties: false
+        confidence:
+          type: number
+          format: double
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        evidence:
+          default: null
+          nullable: true
+        origin:
+          type: object
+          properties:
+            origin:
+              type: string
+              enum:
+                - manual
+                - adjudicator
+                - review
+                - cascade
+                - config
+              default: manual
+              x-go-type-skip-optional-pointer: false
+            actor:
+              type: string
+            reason:
+              type: string
+            created_at_ms:
+              type: integer
+              minimum: 0
+              maximum: 18446744073709551615
+              format: uint64
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint64
+            revision:
+              type: integer
+              minimum: 0
+              maximum: 18446744073709551615
+              format: uint64
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint64
+            proposal_id:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            cascade_from:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          additionalProperties: false
+        state:
+          type: string
+          enum:
+            - open
+            - accepted
+            - rejected
+            - superseded
+          default: open
+          x-go-type-skip-optional-pointer: false
+        decided:
+          type: object
+          properties:
+            origin:
+              type: string
+              enum:
+                - manual
+                - adjudicator
+                - review
+                - cascade
+                - config
+              default: manual
+              x-go-type-skip-optional-pointer: false
+            actor:
+              type: string
+            reason:
+              type: string
+            created_at_ms:
+              type: integer
+              minimum: 0
+              maximum: 18446744073709551615
+              format: uint64
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint64
+            revision:
+              type: integer
+              minimum: 0
+              maximum: 18446744073709551615
+              format: uint64
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint64
+            proposal_id:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            cascade_from:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          additionalProperties: false
+          default: null
+          nullable: true
+      required:
+        - id
+        - action
+        - key
+        - origin
+      additionalProperties: false
+    MemoryEntityProposalInputs:
+      type: object
+      properties:
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        operation:
+          type: object
+          properties:
+            database:
+              type: string
+            namespace:
+              type: string
+            table:
+              type: string
+            table_id:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            storage_name:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+            kind:
+              type: string
+              enum:
+                - table
+                - record
+                - relationship
+                - trace
+                - evidence
+                - assertion
+                - entity
+                - outcome
+                - decision
+                - operation
+                - configuration
+            id:
+              type: string
+            revision:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            digest:
+              type: string
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - table
+            - table_id
+            - kind
+            - id
+            - revision
+          additionalProperties: false
+          default: null
+          nullable: true
+        owner:
+          type: string
+        actor:
+          type: string
+        verdict_actor:
+          type: string
+        config_generation:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        entities:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              revision:
+                type: integer
+                minimum: 0
+                maximum: 18446744073709551615
+                format: uint64
+                x-go-type: uint64
+            required:
+              - id
+              - revision
+            additionalProperties: false
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              span:
+                type: object
+                properties:
+                  start:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                  end:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                required:
+                  - start
+                  - end
+                additionalProperties: false
+                default: null
+                nullable: true
+            required:
+              - id
+            additionalProperties: false
+        verdict_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        model:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+          default: null
+          nullable: true
+      required:
+        - owner
+        - config_generation
+        - entities
+        - evidence
+      additionalProperties: false
+    MemoryEntityProposalPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryEntityProposal'
+        next_cursor:
+          type: string
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        complete:
+          type: boolean
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+      required:
+        - items
+        - next_cursor
+        - complete
+        - revision
+      additionalProperties: false
+    MemoryEntityProposalDetail:
+      type: object
+      properties:
+        proposal:
+          $ref: '#/components/schemas/MemoryEntityProposal'
+        inputs:
+          $ref: '#/components/schemas/MemoryEntityProposalInputs'
+        reason:
+          type: string
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        stale_configuration:
+          type: boolean
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+      required:
+        - proposal
+        - inputs
+        - reason
+        - stale_configuration
+        - revision
       additionalProperties: false
     MemoryEntityProposalRequest:
       type: object
@@ -53788,6 +54293,7 @@ components:
               type: array
               items:
                 type: number
+                format: float
               default: null
               nullable: true
             embedding_model:
@@ -54041,6 +54547,7 @@ components:
               type: array
               items:
                 type: number
+                format: float
               default: null
               nullable: true
             embedding_model:
@@ -54234,6 +54741,7 @@ components:
                 type: array
                 items:
                   type: number
+                  format: float
             required:
               - id
               - embedding
@@ -54455,6 +54963,7 @@ components:
                         type: array
                         items:
                           type: number
+                          format: float
                         default: null
                         nullable: true
                       embedding_model:
@@ -54698,6 +55207,7 @@ components:
                 additionalProperties: false
               score:
                 type: number
+                format: double
               historical:
                 type: boolean
               citations:
@@ -55476,6 +55986,7 @@ components:
                     type: array
                     items:
                       type: number
+                      format: float
                     default: null
                     nullable: true
                   embedding_model:

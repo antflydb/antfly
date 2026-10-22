@@ -24450,11 +24450,20 @@ export interface components {
                  * @default 24
                  */
                 iterations?: number;
-                /** @default 0.15 */
+                /**
+                 * Format: double
+                 * @default 0.15
+                 */
                 restart_probability?: number;
-                /** @default 0.5 */
+                /**
+                 * Format: double
+                 * @default 0.5
+                 */
                 relation_weight?: number;
-                /** @default 0.5 */
+                /**
+                 * Format: double
+                 * @default 0.5
+                 */
                 provisional_weight?: number;
                 /** @default true */
                 include_episodes?: boolean;
@@ -24775,6 +24784,210 @@ export interface components {
              * @default 16
              */
             limit?: number;
+        };
+        MemoryEntityRecord: {
+            entity: components["schemas"]["MemoryEntity"];
+            owner: string;
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            revision?: number;
+            /**
+             * Format: int64
+             * @default null
+             */
+            recorded_at?: number | null;
+        };
+        MemoryEntityCandidate: {
+            entity: components["schemas"]["MemoryEntityRecord"];
+            view: components["schemas"]["MemoryEntityView"];
+            /** Format: double */
+            match_score: number;
+            /** Format: double */
+            description_score: number;
+            predicates: string[];
+        };
+        MemoryEntityCandidatePage: {
+            seed: components["schemas"]["MemoryEntityRecord"];
+            seed_view: components["schemas"]["MemoryEntityView"];
+            /** @enum {string} */
+            kind: "identity" | "relationship";
+            relationship_predicates: string[];
+            items: components["schemas"]["MemoryEntityCandidate"][];
+            /** Format: uint64 */
+            revision: number;
+            /** Format: uint64 */
+            config_generation: number;
+            next_cursor: string | null;
+            complete: boolean;
+            /** Format: uint64 */
+            omitted: number;
+            /** @enum {string} */
+            retrieval: "indexed_lexical" | "bounded_audience_fallback" | "bounded_primary_fallback";
+            /**
+             * @default not_indexed
+             * @enum {string}
+             */
+            semantic_discovery?: "not_indexed";
+            /**
+             * @default name_matches_description_tiebreaker_not_identity_or_calibrated_confidence
+             * @enum {string}
+             */
+            basis?: "name_matches_description_tiebreaker_not_identity_or_calibrated_confidence";
+        };
+        MemoryEntityProposal: {
+            id: string;
+            /** @enum {string} */
+            action: "merge" | "unmerge" | "suppress" | "unsuppress" | "distinct";
+            key: string;
+            /** @default null */
+            into?: string | null;
+            options?: {
+                /** @default false */
+                replace?: boolean;
+                /** @default false */
+                pin_distinct?: boolean;
+                /**
+                 * @default reject
+                 * @enum {string}
+                 */
+                absorbed?: "reject" | "release" | "suppress";
+            };
+            /**
+             * Format: double
+             * @default null
+             */
+            confidence?: number | null;
+            /** @default null */
+            evidence?: unknown;
+            origin: {
+                /**
+                 * @default manual
+                 * @enum {string}
+                 */
+                origin?: "manual" | "adjudicator" | "review" | "cascade" | "config";
+                actor?: string;
+                reason?: string;
+                /**
+                 * Format: uint64
+                 * @default 0
+                 */
+                created_at_ms?: number;
+                /**
+                 * Format: uint64
+                 * @default 0
+                 */
+                revision?: number;
+                /** @default null */
+                proposal_id?: string | null;
+                /** @default null */
+                cascade_from?: string | null;
+            };
+            /**
+             * @default open
+             * @enum {string}
+             */
+            state?: "open" | "accepted" | "rejected" | "superseded";
+            /** @default null */
+            decided?: {
+                /**
+                 * @default manual
+                 * @enum {string}
+                 */
+                origin?: "manual" | "adjudicator" | "review" | "cascade" | "config";
+                actor?: string;
+                reason?: string;
+                /**
+                 * Format: uint64
+                 * @default 0
+                 */
+                created_at_ms?: number;
+                /**
+                 * Format: uint64
+                 * @default 0
+                 */
+                revision?: number;
+                /** @default null */
+                proposal_id?: string | null;
+                /** @default null */
+                cascade_from?: string | null;
+            } | null;
+        };
+        MemoryEntityProposalInputs: {
+            /**
+             * Format: uint64
+             * @default 0
+             */
+            revision?: number;
+            /** @default null */
+            operation?: {
+                database?: string;
+                namespace?: string;
+                table: string;
+                /** Format: uint64 */
+                table_id: number;
+                /** @default null */
+                storage_name?: string | null;
+                /** @enum {string} */
+                kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                id: string;
+                /** Format: uint64 */
+                revision: number;
+                /** @default null */
+                digest?: string | null;
+            } | null;
+            owner: string;
+            actor?: string;
+            verdict_actor?: string;
+            /** Format: uint64 */
+            config_generation: number;
+            entities: {
+                id: string;
+                /** Format: uint64 */
+                revision: number;
+            }[];
+            evidence: {
+                id: string;
+                /** @default null */
+                span?: {
+                    /** Format: uint32 */
+                    start: number;
+                    /** Format: uint32 */
+                    end: number;
+                } | null;
+            }[];
+            /**
+             * Format: uint64
+             * @default null
+             */
+            verdict_revision?: number | null;
+            /** @default null */
+            model?: {
+                provider: string;
+                model: string;
+                revision: string;
+                /**
+                 * Format: uint32
+                 * @default null
+                 */
+                dimensions?: number | null;
+            } | null;
+        };
+        MemoryEntityProposalPage: {
+            items: components["schemas"]["MemoryEntityProposal"][];
+            next_cursor: string | null;
+            complete: boolean;
+            /** Format: uint64 */
+            revision: number;
+        };
+        MemoryEntityProposalDetail: {
+            proposal: components["schemas"]["MemoryEntityProposal"];
+            inputs: components["schemas"]["MemoryEntityProposalInputs"];
+            reason: string | null;
+            stale_configuration: boolean;
+            /** Format: uint64 */
+            revision: number;
         };
         MemoryEntityProposalRequest: {
             /** @enum {string} */
@@ -25572,6 +25785,7 @@ export interface components {
                     /** Format: uint64 */
                     config_generation: number;
                 };
+                /** Format: double */
                 score: number;
                 historical: boolean;
                 citations: {
@@ -41158,7 +41372,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["MemoryOperation"];
+                    "application/json": components["schemas"]["MemoryEntityCandidatePage"];
                 };
             };
             /** @description Memory validation, authorization, concurrency, capability, or execution error. */
@@ -41269,7 +41483,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["MemoryOperation"];
+                    "application/json": components["schemas"]["MemoryEntityProposalPage"];
                 };
             };
             /** @description Memory validation, authorization, concurrency, capability, or execution error. */
@@ -41492,7 +41706,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["MemoryOperation"];
+                    "application/json": components["schemas"]["MemoryEntityProposalDetail"];
                 };
             };
             /** @description Memory validation, authorization, concurrency, capability, or execution error. */

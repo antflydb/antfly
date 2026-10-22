@@ -70,7 +70,10 @@ fn build(comptime T: type, a: std.mem.Allocator, comptime strict: bool) anyerror
             try object.put(a, "maximum", .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{std.math.maxInt(T)}) });
             if (!strict) try object.put(a, "format", .{ .string = try std.fmt.allocPrint(a, "{s}int{d}", .{ if (info.signedness == .unsigned) "u" else "", if (info.bits <= 32) @as(u8, 32) else @as(u8, 64) }) });
         },
-        .float => try object.put(a, "type", .{ .string = "number" }),
+        .float => |info| {
+            try object.put(a, "type", .{ .string = "number" });
+            if (!strict) try object.put(a, "format", .{ .string = if (info.bits <= 32) "float" else "double" });
+        },
         .bool => try object.put(a, "type", .{ .string = "boolean" }),
         else => @compileError("unsupported memory schema type: " ++ @typeName(T)),
     }
@@ -87,19 +90,20 @@ test "memory wire schemas preserve scalar defaults and native integer domains" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const Contract = struct { revision: u64 = std.math.maxInt(u64), known: ?i64 = null, include_provisional: bool = true, limit: u16 = 20 };
+    const Contract = struct { revision: u64 = std.math.maxInt(u64), known: ?i64 = null, include_provisional: bool = true, limit: u16 = 20, weight: f64 = 0.5 };
     const props = (try wire(Contract, a)).object.get("properties").?.object;
     const revision = props.get("revision").?.object;
     try std.testing.expectEqualStrings("uint64", revision.get("format").?.string);
     try std.testing.expectEqualStrings("18446744073709551615", revision.get("maximum").?.number_string);
     try std.testing.expectEqualStrings("18446744073709551615", revision.get("default").?.number_string);
     try std.testing.expect(props.get("include_provisional").?.object.get("default").?.bool);
+    try std.testing.expectEqualStrings("double", props.get("weight").?.object.get("format").?.string);
     const known = props.get("known").?.object;
     try std.testing.expect(known.get("default").? == .null);
     const integer = known.get("anyOf").?.array.items[0].object;
     try std.testing.expectEqualStrings("int64", integer.get("format").?.string);
     try std.testing.expectEqualStrings("-9223372036854775808", integer.get("minimum").?.number_string);
     const strict = try value(Contract, a);
-    try std.testing.expectEqual(@as(usize, 4), strict.object.get("required").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 5), strict.object.get("required").?.array.items.len);
     try std.testing.expect(strict.object.get("properties").?.object.get("include_provisional").?.object.get("default") == null);
 }

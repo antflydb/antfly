@@ -374,6 +374,39 @@ pub const Inspection = struct {
 /// External judges carry attribution and evidence, never executable provider
 /// configuration or credentials. The authenticated principal is server-owned.
 pub const EntityCandidateRequest = struct { kind: enum { identity, relationship } = .identity, cursor: ?[]const u8 = null, limit: u16 = 16 };
+pub const EntityCandidate = struct { entity: EntityRecord, view: EntityView, match_score: f64, description_score: f64, predicates: []const []const u8 };
+pub const EntityCandidatePage = struct {
+    seed: EntityRecord,
+    seed_view: EntityView,
+    kind: @FieldType(EntityCandidateRequest, "kind"),
+    relationship_predicates: []const []const u8,
+    items: []const EntityCandidate,
+    revision: u64,
+    config_generation: u64,
+    next_cursor: ?[]const u8,
+    complete: bool,
+    omitted: usize,
+    retrieval: enum { indexed_lexical, bounded_audience_fallback, bounded_primary_fallback },
+    semantic_discovery: enum { not_indexed } = .not_indexed,
+    basis: enum { name_matches_description_tiebreaker_not_identity_or_calibrated_confidence } = .name_matches_description_tiebreaker_not_identity_or_calibrated_confidence,
+};
+// The resolver owns queue mechanics and their wire shape. Memory adds the
+// versioned causal inputs and read envelope, without a second queue model.
+pub const EntityProposal = @import("antfly_resolver").curation.Proposal;
+pub const EntityProposalInputs = struct {
+    revision: u64 = 0,
+    operation: ?provenance.Resource = null,
+    owner: []const u8,
+    actor: []const u8 = "",
+    verdict_actor: []const u8 = "",
+    config_generation: u64,
+    entities: []const struct { id: []const u8, revision: u64 },
+    evidence: []const EvidenceRef,
+    verdict_revision: ?u64 = null,
+    model: ?Model = null,
+};
+pub const EntityProposalPage = struct { items: []const EntityProposal, next_cursor: ?[]const u8, complete: bool, revision: u64 };
+pub const EntityProposalDetail = struct { proposal: EntityProposal, inputs: EntityProposalInputs, reason: ?[]const u8, stale_configuration: bool, revision: u64 };
 pub const EntityProposalRequest = struct {
     action: enum { merge, unmerge, suppress, unsuppress, distinct },
     from: []const u8,

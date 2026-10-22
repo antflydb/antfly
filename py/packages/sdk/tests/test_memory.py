@@ -98,3 +98,52 @@ def test_native_views_episodes_and_external_verdict_routes() -> None:
     assert seen[3].url.raw_path == b"/memory/v1/spaces/team/entity-proposals/proposal%2Fa/verdict"
     assert b"18446744073709551615" in seen[3].content
     assert seen[4].url.raw_path == b"/memory/v1/spaces/team/relationship-proposals/proposal%2Fb/verdict"
+
+
+def test_generated_memory_reads_decode_native_service_fixtures() -> None:
+    """Exercise generated HTTP parsers against responses pinned by native tests."""
+    from pathlib import Path
+
+    from antfly.client_generated.api.memory import (
+        get_memory_entity_candidates,
+        get_memory_entity_proposal,
+        list_memory_entity_proposals,
+    )
+    from antfly.client_generated.client import Client
+    from antfly.client_generated.models.memory_entity_candidate_page import MemoryEntityCandidatePage
+    from antfly.client_generated.models.memory_entity_candidate_request import MemoryEntityCandidateRequest
+    from antfly.client_generated.models.memory_entity_proposal_detail import MemoryEntityProposalDetail
+    from antfly.client_generated.models.memory_entity_proposal_page import MemoryEntityProposalPage
+
+    fixtures = Path(__file__).resolve().parents[4] / "zig/pkg/antfly-embedded/src/memory/fixtures/wire"
+    bodies = {name: (fixtures / f"{name}.json").read_bytes() for name in ("candidates", "proposal", "proposals")}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/candidates"):
+            name = "candidates"
+        elif request.url.path.endswith("/entity-proposals"):
+            name = "proposals"
+        else:
+            name = "proposal"
+        return httpx.Response(200, content=bodies[name], headers={"Content-Type": "application/json"})
+
+    client = Client(base_url="http://memory.test")
+    with httpx.Client(base_url="http://memory.test", transport=httpx.MockTransport(respond)) as http:
+        client.set_httpx_client(http)
+        candidates = get_memory_entity_candidates.sync("wire", "a", client=client, body=MemoryEntityCandidateRequest())
+        assert isinstance(candidates, MemoryEntityCandidatePage)
+        assert candidates.seed.entity.id == "a"
+        assert candidates.items[0].entity.entity.id == "b"
+        assert candidates.items[0].view.canonical_id == "b"
+        assert candidates.revision == 3
+        assert candidates.next_cursor is None
+        proposals = list_memory_entity_proposals.sync("wire", client=client)
+        assert isinstance(proposals, MemoryEntityProposalPage)
+        proposal_id = proposals.items[0].id
+        details = get_memory_entity_proposal.sync("wire", proposal_id, client=client)
+        assert isinstance(details, MemoryEntityProposalDetail)
+        assert details.proposal.id == proposal_id
+        assert details.inputs.actor == "codex/consolidation"
+        assert details.inputs.entities[0].revision == 3
+        assert details.reason is None
+        assert details.stale_configuration is False
