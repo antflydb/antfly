@@ -169,6 +169,10 @@ items contain `answers` and the reported `model`; provider failures contain empt
 deadline expiry, and request-wide resource failures end the request. Aggregate
 `usage` includes reported usage from failed items. The top-level batch `model`
 identifies the configured model, while successful items report resolved models.
+Image-header validation failures return HTTP 400 for single-item calls; inputs
+exceeding model media ceilings or constrained batch limits return HTTP 413.
+Batch responses keep these preflight failures on the affected items while valid
+siblings continue.
 
 Every item is validated and the complete batch's token budget is reserved before
 inference dispatch. Fan-out follows the decider's `batch_size` (at most 32 active
