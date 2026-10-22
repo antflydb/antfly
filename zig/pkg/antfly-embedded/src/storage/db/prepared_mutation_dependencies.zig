@@ -84,6 +84,9 @@ pub const Owned = struct {
     transform_reads: []TransformPredicate = &.{},
     metadata_reads: ?@import("prepared_read_set.zig").Owned = null,
     preapply_reads: ?@import("prepared_read_set.zig").Owned = null,
+    retiring: bool = false,
+    retirement_stage: u8 = 0,
+    retirement_offset: usize = 0,
 
     pub fn capture(alloc: std.mem.Allocator, core: anytype, source: Sources, original: ?admission.Port) !Owned {
         var trace: admission.RejectionTrace = .{};
@@ -163,6 +166,7 @@ pub const Owned = struct {
     /// Call while the same publication/apply fence is held. This validates the
     /// captured explicit read set, not group/backend reads which lack witnesses.
     pub fn validate(self: *const Owned, core: anytype, original: ?admission.Port) !void {
+        if (self.retiring) return error.Canceled;
         var trace: admission.RejectionTrace = .{};
         self.validateInner(core, trace.bind(original)) catch |err| return trace.failure orelse err;
         if (trace.failure) |cause| return cause;
@@ -199,19 +203,64 @@ pub const Owned = struct {
         if (control) |original| try original.checkpoint();
     }
 
+    /// One observation/key or one catalog/lease callback per turn. Allocator
+    /// calls and individual catalog releases retain their own cost contracts.
+    pub fn deinitStep(self: *Owned) bool {
+        self.retiring = true;
+        switch (self.retirement_stage) {
+            0 => {
+                if (self.preapply_reads) |*reads| {
+                    if (!reads.deinitStep()) return false;
+                    self.preapply_reads = null;
+                }
+                self.retirement_stage = 1;
+            },
+            1 => {
+                if (self.metadata_reads) |*reads| {
+                    if (!reads.deinitStep()) return false;
+                    self.metadata_reads = null;
+                }
+                self.retirement_stage = 2;
+            },
+            2 => {
+                if (self.retirement_offset < self.transform_reads.len) {
+                    self.alloc.free(self.transform_reads[self.retirement_offset].key);
+                    self.retirement_offset += 1;
+                } else self.retirement_stage = 3;
+            },
+            3 => {
+                self.alloc.free(self.transform_reads);
+                self.alloc.free(self.generated_reads);
+                self.alloc.free(self.range_start);
+                self.alloc.free(self.range_end);
+                self.retirement_stage = 4;
+            },
+            4 => {
+                if (self.policy_lease) |*lease| lease.release();
+                self.policy_lease = null;
+                self.retirement_stage = 5;
+            },
+            5 => {
+                if (self.relational_indexes) |*view| view.deinit();
+                self.relational_indexes = null;
+                self.retirement_stage = 6;
+            },
+            6 => {
+                if (self.write_plan) |*view| view.release();
+                self.write_plan = null;
+                self.retirement_stage = 7;
+            },
+            7 => {
+                if (self.schema_view) |*view| view.release();
+                self.* = undefined;
+                return true;
+            },
+            else => unreachable,
+        }
+        return false;
+    }
     pub fn deinit(self: *Owned) void {
-        if (self.preapply_reads) |*reads| reads.deinit();
-        if (self.metadata_reads) |*reads| reads.deinit();
-        for (self.transform_reads) |read| self.alloc.free(read.key);
-        self.alloc.free(self.transform_reads);
-        self.alloc.free(self.generated_reads);
-        self.alloc.free(self.range_start);
-        self.alloc.free(self.range_end);
-        if (self.policy_lease) |*lease| lease.release();
-        if (self.relational_indexes) |*view| view.deinit();
-        if (self.write_plan) |*view| view.release();
-        if (self.schema_view) |*view| view.release();
-        self.* = undefined;
+        while (!self.deinitStep()) {}
     }
 };
 

@@ -239,8 +239,13 @@ pub const OwnedPhysicalPlan = struct {
         node: ?*lifetime.Node = null,
         fn retire(ptr: *anyopaque) void {
             const self: *Live = @ptrCast(@alignCast(ptr));
+            while (!retireStep(self)) {}
+        }
+        fn retireStep(ptr: *anyopaque) bool {
+            const self: *Live = @ptrCast(@alignCast(ptr));
+            if (!self.dependencies.deinitStep()) return false;
             self.backlog.cancel();
-            self.dependencies.deinit();
+            return true;
         }
         fn deinit(self: *Live) void {
             if (self.node) |node| node.release() else retire(self);
@@ -250,7 +255,7 @@ pub const OwnedPhysicalPlan = struct {
     pub fn attachLifetime(self: *OwnedPhysicalPlan, owner: *lifetime.Owner) !void {
         const live = self.live orelse return error.PreparedEffectsRequired;
         if (live.node != null) return error.InvalidArgument;
-        live.node = try owner.register(live, Live.retire);
+        live.node = try owner.registerSteps(live, Live.retireStep);
     }
     pub fn enterLifetime(self: *const OwnedPhysicalPlan) !lifetime.Access {
         return .{ .guard = if (self.live) |live| if (live.node) |node| try node.enter() else null else null };

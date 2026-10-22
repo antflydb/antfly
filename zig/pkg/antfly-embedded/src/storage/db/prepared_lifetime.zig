@@ -58,6 +58,14 @@ pub const Owner = struct {
         return .{ .owner = self };
     }
     pub fn register(self: *Owner, ptr: *anyopaque, retire: *const fn (*anyopaque) void) !*Node {
+        return self.registerRetirement(ptr, .{ .whole = retire });
+    }
+    /// Each step owns at most one bounded metadata/lease retirement turn.
+    /// False keeps the fenced payload alive for a later original-owner turn.
+    pub fn registerSteps(self: *Owner, ptr: *anyopaque, step: *const fn (*anyopaque) bool) !*Node {
+        return self.registerRetirement(ptr, .{ .step = step });
+    }
+    fn registerRetirement(self: *Owner, ptr: *anyopaque, retirement: Node.Retirement) !*Node {
         // A detached registry reference can survive caller destruction and
         // its output allocator. Only the payload borrows that allocator.
         const node = try self.alloc.create(Node);
@@ -65,7 +73,7 @@ pub const Owner = struct {
         self.lock();
         defer self.mutex.unlock();
         if (self.closing.load(.acquire)) return error.Canceled;
-        node.* = .{ .alloc = self.alloc, .owner = self, .ptr = ptr, .retire_fn = retire, .next = self.first };
+        node.* = .{ .alloc = self.alloc, .owner = self, .ptr = ptr, .retirement = retirement, .next = self.first };
         if (self.first) |first| first.previous = node;
         self.first = node;
         self.ref();
@@ -112,7 +120,7 @@ pub const Owner = struct {
         // Closing fenced new guards before detaching; the registry reference
         // keeps this node alive through its callback and concurrent release.
         std.debug.assert(entry.active.load(.acquire) == 0);
-        entry.finishRetirement(winner);
+        if (!entry.retireOne(winner)) return .progress;
         self.pending = null;
         entry.unref();
         self.lock();
@@ -193,11 +201,12 @@ pub const Owner = struct {
 };
 
 pub const Node = struct {
-    const State = enum(u8) { live, retiring, retired };
+    const State = enum(u8) { live, retiring_ready, retiring, retired };
+    const Retirement = union(enum) { whole: *const fn (*anyopaque) void, step: *const fn (*anyopaque) bool };
     alloc: std.mem.Allocator,
     owner: *Owner,
     ptr: *anyopaque,
-    retire_fn: *const fn (*anyopaque) void,
+    retirement: Retirement,
     refs: std.atomic.Value(usize) = .init(2), // caller and registry list
     active: std.atomic.Value(usize) = .init(0),
     state: std.atomic.Value(State) = .init(.live),
@@ -217,14 +226,32 @@ pub const Node = struct {
         return .{ .owner = owner, .node = self };
     }
     fn beginRetirement(self: *Node) bool {
-        return self.state.cmpxchgStrong(.live, .retiring, .acq_rel, .acquire) == null;
+        if (self.state.cmpxchgStrong(.live, .retiring, .acq_rel, .acquire) == null) return true;
+        return self.state.cmpxchgStrong(.retiring_ready, .retiring, .acq_rel, .acquire) == null;
+    }
+    fn retireOne(self: *Node, winner: bool) bool {
+        if (!winner) return self.state.load(.acquire) == .retired;
+        std.debug.assert(self.active.load(.acquire) == 0);
+        const complete = switch (self.retirement) {
+            .whole => |retire| complete: {
+                retire(self.ptr);
+                break :complete true;
+            },
+            .step => |step| step(self.ptr),
+        };
+        // Never reopen a partially destroyed candidate to guards. Another
+        // original cleanup owner may claim the next step after this release.
+        self.state.store(if (complete) .retired else .retiring_ready, .release);
+        return complete;
     }
     fn finishRetirement(self: *Node, winner: bool) void {
-        if (winner) {
-            while (self.active.load(.acquire) != 0) time.yieldNow();
-            self.retire_fn(self.ptr);
-            self.state.store(.retired, .release);
-        } else while (self.state.load(.acquire) != .retired) time.yieldNow();
+        var owns = winner;
+        while (true) {
+            if (owns) while (self.active.load(.acquire) != 0) time.yieldNow();
+            if (self.retireOne(owns)) return;
+            owns = self.beginRetirement();
+            if (!owns) time.yieldNow();
+        }
     }
     fn unref(self: *Node) void {
         if (self.refs.fetchSub(1, .acq_rel) == 1) {
@@ -715,4 +742,64 @@ test "prepared lifetime detached metadata survives candidate allocator destructi
     owner.close();
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expect(owner.closed.load(.acquire) and owner.pending == null);
+}
+
+test "prepared lifetime stepped retirement preserves a rejected continuation and caller completion before arena destruction" {
+    const owner = try Owner.create(std.testing.allocator);
+    defer owner.release();
+    defer owner.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_live = true;
+    defer if (arena_live) arena.deinit();
+    const F = struct {
+        steps: *usize,
+        fn step(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.steps.* += 1;
+            return self.steps.* == 7;
+        }
+    };
+    const Control = struct {
+        steps: *usize,
+        checkpoints: usize = 0,
+        waits: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoints += 1;
+            if (self.steps.* == 3) return error.NotFound;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn unexpectedWait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waits += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+    var steps: usize = 0;
+    const payload = try arena.allocator().create(F);
+    payload.* = .{ .steps = &steps };
+    const node = try owner.registerSteps(payload, F.step);
+    var caller_live = true;
+    defer if (caller_live) node.release();
+    var original: Control = .{ .steps = &steps };
+    var borrowed: admission.Payload = .{ .ptr = &original, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &original, .begin = Control.unexpectedWait, .end = Control.unexpectedWait } };
+    try std.testing.expectError(error.NotFound, owner.closeWithAdmission(.init(&borrowed)));
+    try std.testing.expectEqual(@as(usize, 3), steps);
+    try std.testing.expectEqual(@as(usize, 4), original.checkpoints);
+    try std.testing.expectEqual(@as(usize, 0), original.waits);
+    try std.testing.expect(owner.pending == node and !owner.closed.load(.acquire));
+    try std.testing.expectEqual(Node.State.retiring_ready, node.state.load(.acquire));
+    try std.testing.expectError(error.Canceled, node.enter());
+    // An original quiesced caller completes the continuation. Its output
+    // allocator can disappear while the registry still holds metadata.
+    node.release();
+    caller_live = false;
+    try std.testing.expectEqual(@as(usize, 7), steps);
+    arena.deinit();
+    arena_live = false;
+    owner.close();
+    try std.testing.expectEqual(@as(usize, 7), steps);
 }

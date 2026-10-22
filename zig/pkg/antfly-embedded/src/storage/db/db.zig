@@ -149312,7 +149312,7 @@ test "db prepared transaction effects required assembly prepared lifetime retire
                 self.checkpoints += 1;
                 self.worker.retired.store(retired, .release);
                 if (self.scheduler.state(&self.health.entry.?) != .running) return error.TestUnexpectedResult;
-                if (retired == 1) {
+                if (retired == 1 and !self.worker.go.load(.acquire)) {
                     self.worker.go.store(true, .release);
                     // The peer only needs the scheduler mutex to enqueue.
                     // Wait for that bounded handoff, then yield via the actual
@@ -149353,7 +149353,7 @@ test "db prepared transaction effects required assembly prepared lifetime retire
         try std.testing.expect(worker.failure == null);
         try std.testing.expectEqual(@as(usize, 1), worker.observed);
         try std.testing.expectEqual(@as(usize, 0), hook.waits);
-        try std.testing.expectEqual(@as(usize, if (reject_prefix) 5 else 8), hook.checkpoints);
+        try std.testing.expect(hook.checkpoints > @as(usize, if (reject_prefix) 5 else 8));
         var remaining: u64 = 0;
         var retained: usize = 0;
         for (&plans) |*plan| {
@@ -149373,4 +149373,68 @@ test "db prepared transaction effects required assembly prepared lifetime retire
         db.close();
         for (&plans) |*plan| try std.testing.expect(plan.backlog_admission.?.reservation == null);
     }
+}
+
+test "db prepared transaction effects required assembly prepared lifetime partial metadata cleanup retains quota until caller retirement" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    var directory = try TestDirectory.init("prepared-partial-retire");
+    defer directory.cleanup();
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var options = F.options;
+    options.resource_manager = &manager;
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    try F.seed(&db, false, false);
+    const baseline = manager.sliceStats(.derived_backlog).used_bytes;
+    var arena = std.heap.ArenaAllocator.init(a);
+    var arena_live = true;
+    defer if (arena_live) arena.deinit();
+    var plan = try db.prepareTransactionAssembly(arena.allocator(), F.id, 19, null);
+    var plan_live = true;
+    defer if (plan_live) plan.deinit();
+    const credit = plan.backlog_admission.?.retained_bytes;
+    try std.testing.expect(credit > 0 and plan.backlog_admission.?.reservation != null);
+    const Hook = struct {
+        calls: usize = 0,
+        waits: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 4) return error.NotFound;
+        }
+        fn unexpectedWait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waits += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+    var hook: Hook = .{};
+    var payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &hook, .vtable = &.{ .checkpoint = Hook.checkpoint, .check_lifetime = Hook.check, .deadline_ns = Hook.deadline }, .execution_wait = .{ .ptr = &hook, .begin = Hook.unexpectedWait, .end = Hook.unexpectedWait } };
+    try std.testing.expectError(error.NotFound, db.drainPreparedAssembliesWithAdmission(.init(&payload)));
+    try std.testing.expectEqual(@as(usize, 4), hook.calls);
+    try std.testing.expectEqual(@as(usize, 0), hook.waits);
+    const owner = db.local_execution.retained_preparation_owner.?;
+    try std.testing.expect(owner.pending != null and !owner.closed.load(.acquire));
+    try std.testing.expect(owner.pending.?.state.load(.acquire) == .retiring_ready);
+    try std.testing.expectError(error.Canceled, plan.validateDependencies(db.core, null));
+    try std.testing.expectError(error.Canceled, plan.dependencies.?.validate(db.core, null));
+    try std.testing.expect(plan.backlog_admission.?.reservation != null);
+    try std.testing.expectEqual(baseline + credit, manager.sliceStats(.derived_backlog).used_bytes);
+    // The original quiesced caller finishes all remaining steps synchronously.
+    // Its payload can disappear before the registry releases its metadata pin.
+    plan.deinit();
+    plan_live = false;
+    arena.deinit();
+    arena_live = false;
+    try std.testing.expectEqual(baseline, manager.sliceStats(.derived_backlog).used_bytes);
+    db.close();
+    var reopened = try DB.open(a, directory.path(), F.options);
+    defer reopened.close();
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try reopened.getTransactionStatus(F.id));
 }

@@ -23111,3 +23111,57 @@ are diagnostic/pre-final evidence, including the corrected test error-handler
 syntax. The 1,034-source embedded boundary, generated errors, control catalog,
 formatting and whitespace checks pass. Full linked-owner, callback cleanup,
 physical shutdown, object/crash and cross-engine qualification remain open.
+
+### Resumable cleanup inside retained candidates
+
+Retirement registrations may now supply a step callback. A false result keeps
+the candidate fenced in a ready-to-retire state, with the detached registry
+reference and payload still owned. The controlled drainer checkpoints before
+claiming another step; it does not park for ready CPU work. An original caller
+performing synchronous destruction can claim and finish that continuation before
+its output allocator disappears. Atomic retirement claims serialize callback
+steps, and the final retired marker still precedes payload destruction. Legacy
+whole callbacks and quiesced eager cleanup remain supported.
+
+Prepared read observations release one point key, cursor operation/cursor or
+range per step, then release their container buffers. Partial destruction marks
+the observation set unusable for capture, take, validation and serialization.
+Owned mutation dependencies advance through observation sets, transform keys,
+container buffers and individual policy/catalog lease callbacks. Partial owners
+reject validation. The live candidate returns its replay reservation only after
+dependency cleanup finishes, keeping that credit owned across interruption.
+No borrowed request port, new execution root or renewed deadline is stored in a
+continuation.
+
+Native ABI 73 and storage-owner ABI 131 fence the expanded retirement and owned
+dependency layouts. Durable formats, reader floors and default activation are
+unchanged. This bounds observation/key counts per turn and separates catalog
+releases into individual turns. Allocator calls and individual catalog/backend
+release callbacks still need their own cost/funding contracts; synchronous caller
+destruction still requires valid cleanup ownership. Independent metadata parent
+charges, complete mandatory completion, general-admission fencing and physical
+worker/cache/IO joins, routes, executable recovery funding and the remaining
+scheduler design stay open. Strong required providers remain disabled. Full Linux
+qualification remains waived; Linux uses the pinned Nix/glibc Zig toolchain.
+
+Pinned Debug qualification passes 17 focused lifetime/retirement cases, 88
+required DB cases, 15 backlog cases, 51 error/identity companions and five native
+ABI cases: 176 executions with no failures, skips or leaks. The observation test
+retires nine point keys, seventeen cursor arguments and the cursor container
+over twenty-eight turns, rejecting capture/take of the partial object. A stepped registration
+rejects after three of seven turns; caller destruction finishes it before its
+arena disappears and registry cleanup does not repeat the callback.
+
+The DB integration rejects after three cleanup turns while preserving the real
+replay reservation and fencing both candidate and dependency validation. Caller
+destruction returns the credit, its arena is destroyed before registry retry,
+and reopen confirms that the durable transaction remains pending. Existing
+scheduler interleaving, competing retirement, original-error and failure-sweep
+coverage continues to pass with the stepped path.
+
+All 5,502 native/schema inputs match prepared-retirement-steps-v2. Source snapshots
+and hashes are retained in prepared-retirement-steps-verified.json in the
+cumulative receipts. The 1,034-source embedded boundary, generated errors,
+control catalog, formatting and whitespace checks pass. Full linked-owner,
+allocator/backend callback cost/funding, mandatory-completion, physical shutdown,
+object/crash and cross-engine qualification remain open.

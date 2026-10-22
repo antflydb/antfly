@@ -664,18 +664,44 @@ pub const Owned = struct {
         self.* = Owned.init(self.allocator, null);
         return result;
     }
-    pub fn deinit(self: *Owned) void {
+    /// Release one point, cursor operation/cursor, or range per turn. No
+    /// borrowed source cursor/control survives a finished capture. Partial
+    /// destruction invalidates every capture/validation/serialization entry.
+    pub fn deinitStep(self: *Owned) bool {
+        self.control = null;
+        self.failure = error.TransactionClosed;
+        self.sealed = false;
         self.positions.deinit(self.allocator);
-        for (self.points.items) |point| self.allocator.free(point.key);
-        self.points.deinit(self.allocator);
-        for (self.cursors.items) |cursor| {
-            cursor.deinit();
-            self.allocator.destroy(cursor);
+        self.positions = .empty;
+        if (self.points.pop()) |point| {
+            self.allocator.free(point.key);
+            return false;
         }
+        if (self.cursors.items.len != 0) {
+            const cursor = self.cursors.items[self.cursors.items.len - 1];
+            std.debug.assert(!cursor.active);
+            if (cursor.operations.pop()) |operation| {
+                self.allocator.free(operation.argument);
+                return false;
+            }
+            cursor.operations.deinit(self.allocator);
+            self.allocator.destroy(cursor);
+            _ = self.cursors.pop();
+            return false;
+        }
+        if (self.ranges.pop()) |range| {
+            var owned = range;
+            owned.deinit(self.allocator);
+            return false;
+        }
+        self.points.deinit(self.allocator);
         self.cursors.deinit(self.allocator);
-        for (self.ranges.items) |*range| range.deinit(self.allocator);
         self.ranges.deinit(self.allocator);
         self.* = undefined;
+        return true;
+    }
+    pub fn deinit(self: *Owned) void {
+        while (!self.deinitStep()) {}
     }
     /// Caller retains publication/apply exclusion. All observations are compared
     /// with one fresh immutable primary read. Raw cursor traces include stopping
@@ -1273,3 +1299,36 @@ pub const Footprint = struct {
         return .{ .arena = builder.arena, .spans = spans, .membership_spans = membership_spans };
     }
 };
+
+test "prepared lifetime read observations retire point and cursor metadata one item per turn" {
+    const a = std.testing.allocator;
+    var owned = Owned.init(a, null);
+    var complete = false;
+    defer if (!complete) owned.deinit();
+    for (0..9) |index| {
+        const key = try std.fmt.allocPrint(a, "point-{d}", .{index});
+        defer a.free(key);
+        try owned.recordPoint(key, "value");
+    }
+    const cursor = try owned.openCursor();
+    for (0..17) |_| try cursor.record(.next, "cursor-argument", null);
+    cursor.close();
+    try owned.finish();
+    var turns: usize = 0;
+    var previous: usize = 9 + 17 + 1;
+    while (true) {
+        const done = owned.deinitStep();
+        turns += 1;
+        if (done) {
+            complete = true;
+            break;
+        }
+        var remaining = owned.points.items.len + owned.cursors.items.len;
+        for (owned.cursors.items) |entry| remaining += entry.operations.items.len;
+        try std.testing.expectEqual(@as(usize, 1), previous - remaining);
+        previous = remaining;
+        try std.testing.expectError(error.ReadAdmissionRejected, owned.check());
+        try std.testing.expectError(error.InvalidArgument, owned.take());
+    }
+    try std.testing.expectEqual(@as(usize, 28), turns);
+}
