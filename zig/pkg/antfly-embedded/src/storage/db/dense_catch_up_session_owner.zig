@@ -123,6 +123,19 @@ pub const Owner = struct {
         if (token.isNone()) return error.DenseCatchUpSessionSuperseded;
         self.lock();
         defer self.mutex.unlock();
+        return self.takeLocked(index_name, token);
+    }
+
+    /// No wait while an index guard is held. A busy registry leaves both the
+    /// session and its leases owned here until the caller drops all guards.
+    pub fn tryTake(self: *Owner, index_name: []const u8, token: derived_executor_mod.CatchUpSessionToken) !?Session {
+        if (token.isNone()) return error.DenseCatchUpSessionSuperseded;
+        if (!self.mutex.tryLock()) return null;
+        defer self.mutex.unlock();
+        return try self.takeLocked(index_name, token);
+    }
+
+    fn takeLocked(self: *Owner, index_name: []const u8, token: derived_executor_mod.CatchUpSessionToken) !Session {
         const current = self.sessions.get(token.value) orelse return error.DenseCatchUpSessionSuperseded;
         if (!std.mem.eql(u8, current.index_name, index_name)) return error.DenseCatchUpSessionSuperseded;
         const removed = self.sessions.fetchRemove(token.value) orelse unreachable;

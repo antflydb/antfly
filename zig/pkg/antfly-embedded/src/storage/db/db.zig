@@ -5442,9 +5442,11 @@ pub const DB = struct {
             .text_merge_runtime = null,
         };
         self.core.index_manager.setRelationalBaseRows(self.async_context.relational_base_rows);
+        var controlled_executor_config = executor_config;
+        controlled_executor_config.finish_with_admission = finishDerivedCatchUpSessionAsyncWithAdmission;
         self.executor.* = try derived_executor_mod.init(
             self.runtime_alloc,
-            executor_config,
+            controlled_executor_config,
             self.core.replaySource(),
             self.async_context,
             applyDerivedBatchToIndexAsync,
@@ -59588,7 +59590,34 @@ fn finishDerivedCatchUpSessionAsync(
     applied_sequence: u64,
     success: bool,
 ) !derived_executor_mod.CatchUpFinishResult {
-    if (index_ref.kind != .dense_vector) return .{};
+    return finishDerivedCatchUpSessionAsyncImpl(ctx_ptr, index_ref, token, applied_sequence, success, null, null);
+}
+
+fn finishDerivedCatchUpSessionAsyncWithAdmission(
+    ctx_ptr: *anyopaque,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    token: derived_executor_mod.CatchUpSessionToken,
+    applied_sequence: u64,
+    original: @import("../../common/read_admission.zig").Port,
+    attempt: *@import("derived/runtime_types.zig").FinishAttempt,
+) !derived_executor_mod.CatchUpFinishResult {
+    return finishDerivedCatchUpSessionAsyncImpl(ctx_ptr, index_ref, token, applied_sequence, true, original, attempt);
+}
+
+fn finishDerivedCatchUpSessionAsyncImpl(
+    ctx_ptr: *anyopaque,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    token: derived_executor_mod.CatchUpSessionToken,
+    applied_sequence: u64,
+    success: bool,
+    original: ?@import("../../common/read_admission.zig").Port,
+    attempt: ?*@import("derived/runtime_types.zig").FinishAttempt,
+) !derived_executor_mod.CatchUpFinishResult {
+    if (index_ref.kind != .dense_vector) {
+        if (original) |control| try control.checkpoint();
+        if (attempt) |state| state.consumed = true;
+        return .{};
+    }
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
 
     if (!success) {
@@ -59627,7 +59656,15 @@ fn finishDerivedCatchUpSessionAsync(
         if (lifecycle_completed) DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
         return .{};
     }
-    var session = try takeAsyncDenseCatchUpSession(ctx, index_ref.name, token);
+    var admitted_guard: ?index_manager_mod.IndexManager.ManagedIndexApplyGuard = null;
+    var session = if (original) |control| blk: {
+        const prepared = try @import("dense_finalization_admission.zig").prepare(ctx.index_manager, &ctx.dense_admission.sessions, index_ref, token, control);
+        admitted_guard = prepared.apply_guard;
+        break :blk prepared.session;
+    } else try takeAsyncDenseCatchUpSession(ctx, index_ref.name, token);
+    // No fallible operation may precede this acceptance receipt after take.
+    if (attempt) |state| state.consumed = true;
+    defer if (admitted_guard) |*guard| guard.unlock();
     defer ctx.alloc.free(session.index_name);
     defer if (session.snapshot_replay) |*lease| lease.release();
     var catch_up_tracked = true;
@@ -59660,7 +59697,8 @@ fn finishDerivedCatchUpSessionAsync(
     var capture_finish_ns: u64 = 0;
     var apply_lock_wait_ns: u64 = 0;
     {
-        var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+        var index_apply_guard = if (admitted_guard) |guard| guard else try ctx.index_manager.lockManagedIndexApply(index_ref);
+        admitted_guard = null;
         defer index_apply_guard.unlock();
         apply_lock_wait_ns = elapsedSince(finalize_start_ns);
         try ctx.index_manager.validateDenseIndexIncarnationByName(index_ref.name, session.index_incarnation);
@@ -149514,4 +149552,79 @@ test "db prepared transaction effects required assembly prepared lifetime partia
     var reopened = try DB.open(a, directory.path(), F.options);
     defer reopened.close();
     try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try reopened.getTransactionStatus(F.id));
+}
+
+test "controlled dense finalization DB callback retains real capture through rejected registry admission" {
+    const admission = @import("../../common/read_admission.zig");
+    const Case = enum { begin_failure, end_failure, lifetime_in_wait };
+    for (std.enums.values(Case)) |case| {
+        var directory = try TestDirectory.init("db");
+        defer directory.cleanup();
+        var db = try DB.open(std.testing.allocator, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3}" });
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"embedding\":[1,0,0]}" }}, .sync_level = .write });
+        try db.runUntilIdle();
+        const ctx = db.async_context;
+        const ref: index_manager_mod.ManagedIndexRef = .{ .name = "dv_v1", .kind = .dense_vector };
+        const token = try beginDerivedCatchUpSessionAsync(ctx, ref);
+        const sequence = ctx.store.lastReplaySequence(0);
+        const before = ctx.index_manager.denseIndex(ref.name).?.index.experimentalPostingDurableAppliedSequence();
+        const Control = struct {
+            ctx: *AsyncContext,
+            case: Case,
+            held: bool = true,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn release(self: *@This()) void {
+                if (!self.held) return;
+                self.ctx.dense_admission.sessions.mutex.unlock();
+                self.held = false;
+            }
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                try std.testing.expect(self.ctx.index_manager.catalog_mutex.tryLockExclusive());
+                self.ctx.index_manager.catalog_mutex.unlockExclusive();
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case != .lifetime_in_wait) self.release();
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                self.release();
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        try std.testing.expect(ctx.dense_admission.sessions.mutex.tryLock());
+        var control: Control = .{ .ctx = ctx, .case = case };
+        defer control.release();
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        var attempt: @import("derived/runtime_types.zig").FinishAttempt = .{};
+        try std.testing.expectError(switch (case) {
+            .begin_failure => error.NotFound,
+            .end_failure => error.Canceled,
+            .lifetime_in_wait => error.DeadlineExceeded,
+        }, finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, .init(&payload), &attempt));
+        try std.testing.expect(!attempt.consumed);
+        control.release();
+        try std.testing.expect(ctx.dense_admission.sessions.sessions.contains(token.value));
+        try std.testing.expectEqual(before, ctx.index_manager.denseIndex(ref.name).?.index.experimentalPostingDurableAppliedSequence());
+        control.case = .begin_failure;
+        // The retry needs no waits: all guards are free and the original
+        // exact capture is still owned. No newly minted session is accepted.
+        _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, .init(&payload), &attempt);
+        try std.testing.expect(attempt.consumed);
+        try std.testing.expect(!ctx.dense_admission.sessions.sessions.contains(token.value));
+        try std.testing.expectEqual(@as(u32, 0), ctx.dense_admission.sessions.active.load(.acquire));
+        try std.testing.expectEqual(before, ctx.index_manager.denseIndex(ref.name).?.index.experimentalPostingDurableAppliedSequence());
+        try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_failure), control.ends);
+    }
 }

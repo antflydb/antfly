@@ -47,6 +47,7 @@ pub const Backend = runtime_backend.Backend;
 
 pub const Config = struct {
     backend: Backend = runtime_backend.defaultExecutorBackend(),
+    finish_with_admission: ?runtime_types.FinishWithAdmissionFn = null,
 };
 
 pub const Executor = struct {
@@ -231,10 +232,11 @@ pub fn init(
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
 ) !Executor {
+    if (config.finish_with_admission != null and finish_catch_up_fn == null) return error.InvalidArgument;
     try runtime_backend.ensureExecutorBackendAvailable(config.backend);
     return switch (config.backend) {
         .manual => try initManual(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager),
-        .io_threaded => try initIoThreaded(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, backend_runtime),
+        .io_threaded => try initIoThreaded(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, backend_runtime, config.finish_with_admission),
     };
 }
 
@@ -738,6 +740,7 @@ fn initIoThreaded(
     applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
+    finish_with_admission: ?runtime_types.FinishWithAdmissionFn,
 ) !Executor {
     if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
 
@@ -750,6 +753,7 @@ fn initIoThreaded(
     } else {
         runtime.* = try io_threaded_runtime_mod.DerivedRuntime.init(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
     }
+    runtime.finish_with_admission = finish_with_admission;
     return .{
         .ptr = runtime,
         .vtable = &io_threaded_vtable,
@@ -901,4 +905,14 @@ fn ioThreadedQuiesce(ptr: *anyopaque, original: @import("../../../common/read_ad
 fn ioThreadedFinalize(ptr: *anyopaque, original: @import("../../../common/read_admission.zig").Port) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     try runtime.finalizeWithAdmission(original);
+}
+
+test "controlled dense finalization config requires a physical close callback" {
+    const F = struct {
+        fn finish(_: *anyopaque, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken, _: u64, _: @import("../../../common/read_admission.zig").Port, _: *runtime_types.FinishAttempt) !CatchUpFinishResult {
+            return .{};
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(error.InvalidArgument, init(std.testing.allocator, .{ .backend = .manual, .finish_with_admission = F.finish }, undefined, &context, undefined, undefined, undefined, null, null, null, null, null, null));
 }

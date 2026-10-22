@@ -284,6 +284,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     truncate_fn: TruncateFn,
     begin_catch_up_fn: ?BeginCatchUpFn,
     finish_catch_up_fn: ?FinishCatchUpFn,
+    finish_with_admission: ?runtime_types.FinishWithAdmissionFn = null,
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
     applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     mutex: Io.Mutex = .init,
@@ -561,10 +562,19 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             try finalizationCheckpoint(original);
             if (final.had_session) {
                 if (self.finish_catch_up_fn) |finish| {
-                    const result = finish(self.ctx, worker.kind, final.token, worker.applied_sequence, true) catch |cause| failed: {
+                    var attempt: runtime_types.FinishAttempt = .{};
+                    const call = if (original != null and self.finish_with_admission != null)
+                        self.finish_with_admission.?(self.ctx, worker.kind, final.token, worker.applied_sequence, original.?, &attempt)
+                    else legacy: {
+                        attempt.consumed = true;
+                        break :legacy finish(self.ctx, worker.kind, final.token, worker.applied_sequence, true);
+                    };
+                    const result = call catch |cause| failed: {
+                        if (!attempt.consumed) return cause;
                         final.finish_failure = cause;
                         break :failed CatchUpFinishResult{};
                     };
+                    if (!attempt.consumed) final.finish_failure = RuntimeError.AsyncWorkerFailed;
                     // Record authoritative publication before any fallible
                     // reentry/guard step. Retrying cannot repeat the callback.
                     final.durable = result.applied_sequence_persisted;
@@ -3537,6 +3547,8 @@ const FinalizationProbe = struct {
     durable_finish: bool = false,
     fail_finish: bool = false,
     defer_persist_once: bool = false,
+    controlled_mode: enum { success, reject_before, fail_after, invalid_success } = .success,
+    controlled_calls: usize = 0,
     block_finish: bool = false,
     finish_entered: Io.Event = .unset,
     finish_release: Io.Event = .unset,
@@ -3566,6 +3578,16 @@ const FinalizationProbe = struct {
         if (self.hold == .finish) self.takeGuard();
         if (self.fail_finish) return error.OutOfMemory;
         return .{ .applied_sequence_persisted = self.durable_finish };
+    }
+    fn controlledFinish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, _: u64, original: @import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(token.value == 7);
+        self.controlled_calls += 1;
+        try original.checkpoint();
+        if (self.controlled_mode == .reject_before) return error.NotFound;
+        if (self.controlled_mode != .invalid_success) attempt.consumed = true;
+        if (self.controlled_mode == .fail_after) return error.OutOfMemory;
+        return .{ .applied_sequence_persisted = true };
     }
     fn persist(raw: *anyopaque, _: []const u8, _: u64, force: bool) !bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -3759,4 +3781,52 @@ test "controlled derived finalization serializes competing closers without lendi
     try runtime.finalizeWithAdmission(.init(&second_payload));
     try std.testing.expectEqual(@as(usize, 1), probe.finishes);
     try std.testing.expectEqual(@as(usize, 1), probe.persists);
+}
+
+test "controlled dense finalization callback consumption separates retry from committed failure" {
+    const admission = @import("../../../common/read_admission.zig");
+    for (std.enums.values(@FieldType(FinalizationProbe, "controlled_mode"))) |mode| {
+        var probe: FinalizationProbe = .{ .controlled_mode = mode };
+        var runtime = try DerivedRuntime.init(std.testing.allocator, undefined, &probe, FinalizationProbe.apply, FinalizationProbe.persist, FinalizationProbe.truncate, null, FinalizationProbe.finish, null, null, null);
+        var live = true;
+        defer if (live) runtime.deinit();
+        const worker = try probe.install(&runtime);
+        runtime.finish_with_admission = FinalizationProbe.controlledFinish;
+        const Control = struct {
+            fn check(raw: *anyopaque) !void {
+                const self: *FinalizationProbe = @ptrCast(@alignCast(raw));
+                if (self.controlled_calls != 0 and self.controlled_mode == .reject_before) return error.NotFound;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+        };
+        var payload: admission.Payload = .{ .ptr = &probe, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &probe, .begin = Control.check, .end = Control.check } };
+        const result = runtime.finalizeWithAdmission(.init(&payload));
+        switch (mode) {
+            .success => try result,
+            .reject_before => {
+                try std.testing.expectError(error.NotFound, result);
+                try std.testing.expect(!worker.finalization.finish_done and worker.finalization.finish_failure == null);
+                try std.testing.expect(worker.finalization.token.value == 7 and worker.finalization.had_session);
+                probe.controlled_mode = .success;
+                try runtime.finalizeWithAdmission(.init(&payload));
+            },
+            .fail_after, .invalid_success => {
+                const cause = if (mode == .fail_after) error.OutOfMemory else RuntimeError.AsyncWorkerFailed;
+                try std.testing.expectError(cause, result);
+                try std.testing.expect(worker.finalization.finish_done and worker.finalization.finish_failure != null);
+                try std.testing.expectError(cause, runtime.finalizeWithAdmission(.init(&payload)));
+                try std.testing.expectEqual(@as(u64, 0), worker.persisted_sequence);
+            },
+        }
+        if (mode == .success or mode == .reject_before) try std.testing.expectEqual(@as(u64, 1), worker.persisted_sequence);
+        try std.testing.expectEqual(@as(usize, if (mode == .reject_before) 2 else 1), probe.controlled_calls);
+        try std.testing.expectEqual(@as(usize, 0), probe.finishes);
+        try std.testing.expectEqual(@as(usize, 0), probe.persists);
+        runtime.deinit();
+        live = false;
+        try std.testing.expectEqual(@as(usize, 0), probe.finishes);
+        try std.testing.expectEqual(@as(usize, 0), probe.persists);
+    }
 }

@@ -36,6 +36,10 @@ pub const CatchUpFinishResult = struct {
 };
 pub const BeginCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!CatchUpSessionToken;
 pub const FinishCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, applied_sequence: u64, success: bool) anyerror!CatchUpFinishResult;
+/// Set immediately after the provider consumes its exact session. Rejections
+/// before consumption are retryable; failures afterward must not replay it.
+pub const FinishAttempt = struct { consumed: bool = false };
+pub const FinishWithAdmissionFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, applied_sequence: u64, original: @import("../../../common/read_admission.zig").Port, attempt: *FinishAttempt) anyerror!CatchUpFinishResult;
 pub const CanAdvanceToTargetFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
 pub const AppliedSequenceAdvancedFn = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
 

@@ -23511,3 +23511,49 @@ compatibility paths do not inherit a request deadline. Opaque callback I/O/cost
 contracts, mandatory completion, other stage/backend teardown and the broader
 qualification gates remain open. Strong required providers remain disabled.
 Full GNU/Linux qualification is waived; Linux requires pinned Nix/glibc Zig.
+
+
+### Controlled dense session consumption during finalization
+
+DB-owned threaded executors now supply a controlled finish callback. Its
+preparation acquires the current catalog/apply guard with the original finite
+close authority, then attempts a nonblocking session-registry transfer. A busy
+registry releases the guards before lending execution and retries by resolving
+the index again. Rejected catalog, apply or registry waits leave the exact token,
+posting capture and snapshot mutation lease owned by the session registry.
+No request-stack port escapes preparation or enters retained session state.
+
+The provider marks consumption immediately after removing its exact session,
+before any fallible publication work. The executor distinguishes an unconsumed
+rejection from a consumed failure: the former can retry the original token;
+the latter records the failure and never repeats the finish callback. A provider
+reporting success without consumption fails closed. Authoritative durability
+receipts continue to suppress redundant persistence. Controlled callback
+configuration requires a compatibility finish callback for physical close.
+
+The original durable finish implementation consumes the prepared guard rather
+than acquiring it a second time, and retains the original replay/snapshot lease
+through publication and lifecycle completion. Compatibility/manual catch-up
+continues to use its existing finish path. Native ABI 85 and storage-owner ABI
+143 fence the expanded callback/configuration layouts.
+
+This closes pre-consumption admission, not post-consumption funding. Remaining
+work must reserve completion capacity at capture creation, retain it across
+scheduled passes and shutdown, and bound the callback's I/O and CPU stages.
+Generic watermark persistence, cursor retirement, other maintenance/backend
+teardown, parent metadata charges, route coverage, executable recovery funding
+and broader linked-owner/cross-engine/performance gates also remain open.
+Strong required providers stay disabled. Full GNU/Linux qualification remains
+waived; Linux requires the pinned Nix/glibc Zig toolchain.
+
+Pinned Darwin Debug validation passes all 83 build steps across the real DB
+capture fixture, derived visibility, C-entry close preflight, maintenance
+shutdown, shared SQL and execution-service archive targets. The final build
+reports 133 passing tests plus the cached 60-case derived suite; the direct DB
+runner passes its 17 selected/imported cases, including real capture retries
+after begin, lifetime and reentry rejection. A separate current-source run
+passes 65 regressions without skips/leaks, with exactly three expected error
+logs. Separate error ABI (43), released status ABI (1), and failure identity (7)
+checks pass. All 5,508 native/schema inputs match the receipts under
+`controlled-dense-finish-final`, `controlled-dense-finish-db-v2` and
+`controlled-dense-finish-regressions` in the cumulative qualification directory.

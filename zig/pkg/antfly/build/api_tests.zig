@@ -3868,11 +3868,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const derived_visibility_wait_tests = b.addTest(.{
         .name = "derived-visibility-wait-tests",
         .root_module = derived_visibility_wait_root,
-        .filters = &.{ "controlled propagation shutdown", "incremental resolution replay atomically", "PromotionRuntime", "controlled enrichment shutdown", "enrichment owner", "uninstalled enrichment config", "enrichment runtime construction unwinds", "enrichment replay passes are single flight", "enrichment inline backoff wakes for teardown", "controlled enrichment visibility", "enrichment visibility wait observes borrowed request cancellation", "enrichment visibility wait has a hard liveness timeout", "enrichment visibility wait is cancelable", "controlled derived quiescence", "controlled derived finalization", "controlled managed index", "controlled text merge producer close", "controlled text merge shutdown", "controlled derived visibility", "derived visibility wait", "derived enrichment visibility guard", "issue1015 visibility" },
+        .filters = &.{ "controlled propagation shutdown", "incremental resolution replay atomically", "PromotionRuntime", "controlled enrichment shutdown", "enrichment owner", "uninstalled enrichment config", "enrichment runtime construction unwinds", "enrichment replay passes are single flight", "enrichment inline backoff wakes for teardown", "controlled enrichment visibility", "enrichment visibility wait observes borrowed request cancellation", "enrichment visibility wait has a hard liveness timeout", "enrichment visibility wait is cancelable", "controlled derived quiescence", "controlled derived finalization", "controlled managed index", "controlled dense finalization", "controlled text merge producer close", "controlled text merge shutdown", "controlled derived visibility", "derived visibility wait", "derived enrichment visibility guard", "issue1015 visibility" },
         .max_rss = 4 * 1024 * 1024 * 1024,
     });
     b.step("antfly-derived-visibility-wait-test", "Verify original derived visibility rejection and callbacks outside worker locks")
         .dependOn(&b.addRunArtifact(derived_visibility_wait_tests).step);
+
+    const dense_finalization_db_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/dense_finalization_db_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, dense_finalization_db_root, true, true);
+    dense_finalization_db_root.addImport("antfly_source_root", dense_finalization_db_root);
+    const dense_finalization_db_tests = b.addTest(.{
+        .name = "dense-finalization-db-tests",
+        .root_module = dense_finalization_db_root,
+        .filters = &.{"controlled dense finalization DB callback"},
+        .max_rss = 16 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-dense-finalization-test", "Verify controlled preparation retains a real dense capture until acceptance")
+        .dependOn(&b.addRunArtifact(dense_finalization_db_tests).step);
 
     const enrichment_progress_tests = b.addTest(.{
         .name = "enrichment-progress-mailbox-tests",
