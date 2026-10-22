@@ -226,6 +226,10 @@ binds the verified ID and captured input-value fingerprints, excluding physical
 coordinates. Native removal/addition and contribution paths replace only affected
 fragments, updating postings, collection statistics, dense/sparse membership,
 covering tuples and algebraic retractions in the same atomic publication.
+Fresh sparse fragment keys append native immutable posting segments, including
+incremental generations. Scalar insertion would repeatedly requantize retained
+chunks and accumulate score error. The v9 sparse writer binding migrates older
+checkpoints on their next rebuild; it does not change the reader's wire codec.
 
 Coordinates within a fragment are collision-free ordered ordinals, never truncated
 ID hashes. A changed fragment is replaced completely before its ordinals can be
@@ -243,6 +247,11 @@ existing decoder and native construction limits. It does not scan the archive fo
 verified census supplies COUNT metadata without interpreting internal fragment
 identifiers as source object paths. Invalid/missing identity evidence or exhausted
 optional construction admission selects ordinary complete physical rebuilding.
+
+Only retained aggregate declarations keep prior contribution roots live; replaced
+roots retire through counted ownership. Aggregate deltas require the seed's
+original authenticated fragment census. Older retained censuses reconcile file
+metadata and reuse matching contributions rather than assuming a deletion map.
 
 A new fragment space, its navigation, native mutations, contribution roots and
 coordinate maps enter the same publication certificate, reader lease, GC and restart
@@ -282,15 +291,18 @@ may infer identity from file layout or silently trust a user-declared key.
 `zig/e2e/antfly/test_lake_row_identity.py` runs independent PyArrow Parquet and
 PyIceberg rewrites against fresh-build oracle tables. It checks repeated
 relocation, per-index value changes, mixed original snapshot spaces, append with
-shifted file slots, restart, text scores,
-indexed filters, sorting, forward/backward paging, covering/highlight fields,
+shifted file slots, removal, restart, text scores, indexed filters, sorting, forward/backward paging, covering/highlight fields,
 dense/sparse membership and SQL aggregation. The Iceberg parameter participates
 in `e2e-full`. Native tests cover spill bounds, duplicate keys, proof tampering,
 flattening, reader-safe GC, certificate binding, cancellation, allocation failures,
 missing derived navigation, incremental coordinate swaps, zero-work map reuse,
 parallel cold-page reads, bounded optional read admission and relocated sparse
-predicate fallback. Sparse scores use the existing per-block 8-bit
-quantization tolerance; physical rebuilds need not choose identical block scales.
+predicate fallback. Fragment regressions cover isolated append/removal, radix
+splits, typed cross-page ordering, wide Parquet tile retries and artifact closure.
+Ten successive sparse replacement rounds verify original vector scores within
+one quantization bound; the old scalar writer fails that regression. Sparse E2E
+scores use the existing per-block 8-bit tolerance and deliberately separated top
+scores, retaining exact result-ID and ordering checks across different layouts.
 
 Further qualification should exercise Parquet and Iceberg rewrites that preserve rows, arbitrarily
 reorder rows, update indexed and unindexed values, remove rows and introduce null
@@ -298,6 +310,15 @@ or duplicate keys. Verify exact search scores, metadata filters, ordered/reverse
 paging, vectors, aggregates, covering fields, highlights and public IDs against a
 rebuild oracle. Check restart, old-reader leases, publication failure, mapping
 composition, reader-safe GC and bounded memory/spill with allocation failures.
+
+Qualification on the final implementation with main `10899c8e9b`: both real
+Parquet/Iceberg E2Es passed in 350.10 seconds, including append/removal and three
+restarts per format. Twelve targeted lake tests passed without leaks, including
+aggregate root retirement, census compatibility, key-namespace migration,
+wide Parquet gathers and sparse numerical stability. The shared ranking/filter
+suite passed 43 tests (one benchmark skipped), and the native dense callback
+regression passed. Archive-scale throughput and live-cloud retention remain
+unmeasured.
 
 ## Prior art
 

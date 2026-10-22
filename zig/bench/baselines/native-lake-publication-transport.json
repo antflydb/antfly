@@ -202,6 +202,8 @@
     "physical_gather_wide_test_rows": 65,
     "physical_gather_wide_test_field_bytes": 131072,
     "physical_gather_wide_test_maximum_rows_per_tile": 32,
-    "oversized_gather": "shrink before copying; single rows retain decoder/native construction limits"
+    "oversized_gather": "shrink before copying; single rows retain decoder/native construction limits",
+    "sparse_writer_binding": 9,
+    "sparse_fragment_mutations": "native immutable bulk posting segments; avoid cumulative quantization error"
   }
 }

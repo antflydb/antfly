@@ -55,6 +55,12 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: local.serverless_manifes
     if (!std.mem.eql(u8, &scope.domain, &root.generation.domain)) return error.InvalidNativeLakeSparseRoot;
     return root;
 }
+/// Changed immutable file/fragment digests produce fresh private keys. Keep
+/// fresh writes in native immutable posting segments: scalar insertion repeatedly
+/// dequantizes/re-encodes retained chunks and accumulates score error.
+fn appendFresh(index: *local.sparse_sparse.SparseIndex, writes: []const local.sparse_sparse.SparseWrite, initial: bool) !void {
+    try index.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true, .backend_batch_options = .{ .mode = if (initial) .bulk_ingest else .default } });
+}
 pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared) ![]const Declared {
     return buildIncremental(a, out, table, source, base, store, provider, cancellation, reusable, &.{});
 }
@@ -72,7 +78,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         if (wanted.kind != .sparse_segment) continue;
         try provider.context.ensureActive();
         var binding = wanted.binding;
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-sparse-checkpoint-v8:{s}", .{binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-sparse-checkpoint-v9:{s}", .{binding.index_config_hash});
         const public_config = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{});
         const recipe = state.recipe(table, public_config);
         var producer = try @import("lake_vector_enrichment.zig").Producer.init(a, wanted.name, wanted.build_spec.?.sparse.sparse_column, configs.object.get(wanted.name).?, provider.embedding_options);
@@ -205,7 +211,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 while (records.next()) |record| try transaction.put(try std.fmt.allocPrint(pa, "lake-unit:{s}", .{record.key_ptr.*}), record.value_ptr.*);
                 try transaction.commit();
             }
-            try index.batchWithOptions(writes.items, &.{}, .{ .prefer_bulk_build = seed == null, .assume_new_doc_ids = true, .backend_batch_options = .{ .mode = if (seed == null) .bulk_ingest else .default } });
+            try appendFresh(&index, writes.items, seed == null);
         }
         if (seed == null) try index.finishBulkIngestSessionWithOptions(.{});
         try tracker.finish();
@@ -232,4 +238,55 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         try result.append(out, try std.json.parseFromSliceLeaky(Declared, out, encoded, .{ .allocate = .alloc_always }));
     }
     return result.toOwnedSlice(out);
+}
+
+test "external lake fresh sparse fragment mutations keep quantization error bounded across updates" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-sparse-fresh-mutations");
+    defer directory.cleanup();
+    const path = try a.dupeSentinel(u8, directory.path(), 0);
+    defer a.free(path);
+    var index = try local.sparse_sparse.SparseIndex.open(a, path, .{ .backend = .lsm });
+    defer index.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var ids: [257][]const u8 = undefined;
+    var weights: [257][1]f32 = undefined;
+    var initial: [257]local.sparse_sparse.SparseWrite = undefined;
+    for (&ids, &weights, &initial, 0..) |*id, *weight, *write, row| {
+        id.* = try std.fmt.allocPrint(scratch, "row-{d:0>4}-0", .{row});
+        weight[0] = @floatFromInt(row + 1);
+        write.* = .{ .doc_id = id.*, .vec = .{ .indices = &.{1}, .values = weight } };
+    }
+    try appendFresh(&index, &initial, true);
+    for (0..10) |cycle| {
+        var removed: [16][]const u8 = undefined;
+        var next: [16]local.sparse_sparse.SparseWrite = undefined;
+        var values: [16][1]f32 = undefined;
+        for (&removed, &next, &values, 0..) |*old, *write, *weight, lane| {
+            const row = (cycle * 17 + lane * 13) % ids.len;
+            old.* = ids[row];
+            ids[row] = try std.fmt.allocPrint(scratch, "row-{d:0>4}-{d}", .{ row, cycle + 1 });
+            weight[0] = @floatFromInt(row + 1);
+            write.* = .{ .doc_id = ids[row], .vec = .{ .indices = &.{1}, .values = weight } };
+        }
+        try index.batchWithOptions(&.{}, &removed, .{});
+        try appendFresh(&index, &next, false);
+        const hits = try index.search(a, &.{ .indices = &.{1}, .values = &.{2} }, 257);
+        defer {
+            for (hits) |hit| a.free(hit.doc_id);
+            a.free(hits);
+        }
+        try std.testing.expectEqual(ids.len, hits.len);
+        var seen: [257]bool = @splat(false);
+        for (hits) |hit| {
+            const row = try std.fmt.parseInt(usize, hit.doc_id[4..8], 10);
+            try std.testing.expect(!seen[row]);
+            seen[row] = true;
+            try std.testing.expectEqualStrings(ids[row], hit.doc_id);
+            const expected: f32 = @floatFromInt(2 * (row + 1));
+            try std.testing.expectApproxEqAbs(expected, hit.score, 2 * 258.0 / 255.0 + 0.001);
+        }
+    }
 }

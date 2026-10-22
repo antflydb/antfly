@@ -38,6 +38,7 @@ pub const Build = struct {
     provider: Provider = undefined,
     root: identity.Root,
     space: identity.Space = undefined,
+    prior_navigation: ?navigation.Root = null,
     fragments: []const Fragment = &.{},
     store: stores.ArtifactStore,
     schemas: @import("sql_schema_cache.zig").Cache,
@@ -219,6 +220,7 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     self.provider.expected_delete_objects = null;
     self.provider.fragment_rows = .{ .ptr = self, .open = Build.open };
     const prior_navigation = if (prior) |space| try navigation.load(out, self.store, space.navigation orelse return error.InvalidLogicalRowIdentity, self.token, null) else null;
+    self.prior_navigation = prior_navigation;
     const nav = try navigation.build(a, out, &self.store, &self.provider, prior_navigation, self.token);
     self.provider.native_delta = nav.delta;
     self.provider.replay_recommended = true;

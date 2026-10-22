@@ -88,9 +88,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
             {
                 "id": base + i,
                 "body": (
-                    "changed word"
-                    if step in (3, 6) and i == 17
-                    else "needle same text"
+                    "changed word" if step in (3, 6) and i == 17 else "needle same text"
                 ),
                 "label": f"updated-{i}" if step == 5 else f"row-{i}",
                 "dense_native": json.dumps([1, i / count]),
@@ -309,7 +307,9 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
             revision = ready("logical", revision)
             candidates = states()
             current = candidates[-1]
-            reused = {entry["name"]: entry["space"] for entry in current.get("reused", [])}
+            reused = {
+                entry["name"]: entry["space"] for entry in current.get("reused", [])
+            }
             if step in (1, 2):
                 text_space = current.get("indexes") or reused.get("text")
                 assert text_space is not None, current
@@ -318,15 +318,23 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     "inputs": current["current"].get("input_recipes"),
                     "original_inputs": original["current"].get("input_recipes"),
                 }
-                assert text_space["snapshot"] == original["current"]["snapshot"], current
+                assert text_space["snapshot"] == original["current"]["snapshot"], (
+                    current
+                )
             elif step == 5:
                 assert "text" in reused, current
-                assert reused["all_text"]["by_id"] != original["native_space"]["by_id"], current
+                assert (
+                    reused["all_text"]["by_id"] != original["native_space"]["by_id"]
+                ), current
                 assert current["artifacts"] != original["artifacts"], current
                 assert reused["text"]["snapshot"] == original["current"]["snapshot"]
             elif step == 3:
-                assert reused["text"]["by_id"] != original["native_space"]["by_id"], current
-                assert reused["all_text"]["by_id"] != original["native_space"]["by_id"], current
+                assert reused["text"]["by_id"] != original["native_space"]["by_id"], (
+                    current
+                )
+                assert (
+                    reused["all_text"]["by_id"] != original["native_space"]["by_id"]
+                ), current
                 assert "dense_native" in reused and "sparse_native" in reused, current
             elif step == 6:
                 assert "text" in reused and "dense_native" in reused, current
@@ -335,7 +343,9 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                 ), current
             else:
                 assert current.get("native_space") is not None, current
-                assert current["native_space"]["rows"] == count + (1 if step == 4 else -1)
+                assert current["native_space"]["rows"] == count + (
+                    1 if step == 4 else -1
+                )
                 assert (
                     current["native_space"]["file_count"]
                     == original["native_space"]["file_count"]
@@ -377,9 +387,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     [
                         dict(
                             vector,
-                            filter_query={
-                                "term": {"path": "/id", "value": base + 17}
-                            },
+                            filter_query={"term": {"path": "/id", "value": base + 17}},
                         ),
                         dict(
                             vector,
@@ -400,8 +408,13 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                         for h in response["hits"]["hits"]
                     ]
 
-                assert normalize(actual) == normalize(expected), (
-                    step, request, actual, expected
+                assert normalize(actual) == normalize(expected), json.dumps(
+                    {
+                        "step": step,
+                        "request": request,
+                        "actual": actual,
+                        "expected": expected,
+                    }
                 )
                 # Sparse posting blocks quantize weights to 8 bits. Rebuilding
                 # a different physical layout can choose different scales;

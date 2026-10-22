@@ -450,7 +450,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
         native_provider.replay = &fragment_replay.?;
         // The retained native state owns logical contributions, so only a
         // predecessor carrying the same durable logical census is eligible.
-        if (previous_identity != null and previous_identity.?.native_space != null and current.value.published != null and std.mem.eql(u8, &previous_identity.?.values_recipe, &value.root.values_recipe)) {
+        if (value.prior_navigation != null and previous_identity != null and previous_identity.?.native_space != null and current.value.published != null and std.mem.eql(u8, &previous_identity.?.values_recipe, &value.root.values_recipe)) {
             published_candidates = current.value.published.?.declarations;
             contribution_index.deinit();
             const previous = current.value.published.?;
@@ -458,9 +458,34 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
             try contribution_index.init(a, scoped, root, cancellation);
             contribution_index.counted = true;
             contribution_index.prior_roots = previous.contribution_roots;
-            for (previous.contribution_roots) |key| try contribution_index.includeRoot(key);
             const prior = previous_identity.?.native_space.?;
-            contribution_index.predecessor = .{ .source = prior.source, .schema = source.inventory.schema_fingerprint, .snapshot = prior.snapshot, .count = @intCast(prior.liveFiles()) };
+            // An aggregate retained across unrelated input updates may still
+            // own an older fragment census. A delta against the table's latest
+            // census cannot delete that root's original leaf identities.
+            var same_census = true;
+            const latest_files = value.prior_navigation.?.files;
+            for (previous.declarations) |declaration| if (declaration.artifact.kind == .algebraic_segment) {
+                const view = previous_identity.?.spaceForIndex(declaration.name);
+                const ref = view.navigation orelse {
+                    same_census = false;
+                    break;
+                };
+                const bound = try navigation_api.load(na, scoped, ref, cancellation, null);
+                if (bound.files == null or latest_files == null) {
+                    if (bound.files != null or latest_files != null) {
+                        same_census = false;
+                        break;
+                    }
+                } else {
+                    const left = bound.files.?;
+                    const right = latest_files.?;
+                    if (left.bytes != right.bytes or left.height != right.height or left.records != right.records or !std.mem.eql(u8, &left.digest, &right.digest)) {
+                        same_census = false;
+                        break;
+                    }
+                }
+            };
+            if (same_census) contribution_index.predecessor = .{ .source = prior.source, .schema = source.inventory.schema_fingerprint, .snapshot = prior.snapshot, .count = @intCast(prior.liveFiles()) };
         }
     }
     const native_candidates = if (fragments != null) published_candidates else candidates;
@@ -521,6 +546,21 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
             }
         }
     };
+    if (fragments != null) {
+        // Prior roots seed incremental reductions; only retained declarations
+        // authorize keeping them live in the next generation. Keeping replaced
+        // roots creates duplicate recipe seeds after membership changes.
+        const retain_aggregate = for (retained_declarations) |declaration| {
+            if (declaration.artifact.kind == .algebraic_segment) break true;
+        } else false;
+        if (retain_aggregate) for (contribution_index.prior_roots) |key| {
+            const value = (try contribution_index.lookup(na, key)) orelse return error.InvalidLakeIndexCatalog;
+            for (retained_declarations) |declaration| if (declaration.artifact.kind == .algebraic_segment and std.mem.eql(u8, declaration.name, value.name)) {
+                try contribution_index.includeRoot(key);
+                break;
+            };
+        };
+    }
     var legacy_indexes = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{ .allocate = .alloc_always });
     if (legacy_indexes != .object) return error.InvalidTableIndexMetadata;
     var index_position: usize = 0;
@@ -1005,19 +1045,29 @@ test "external lake logical identity publishes native indexes once across reorde
     defer a.free(catalog_bytes);
     var original_directory: ?[]u8 = null;
     defer if (original_directory) |bytes_| a.free(bytes_);
+    var namespace_schema: ?[]u8 = null;
+    defer if (namespace_schema) |bytes_| a.free(bytes_);
+    var original_namespace: ?catalog.Digest = null;
     var original_snapshot: ?[]u8 = null;
     defer if (original_snapshot) |bytes_| a.free(bytes_);
     var original_location: ?local.storage_rowsource_types.RowRef = null;
     var saved = std.heap.ArenaAllocator.init(a);
     defer saved.deinit();
-    for (0..5) |step| {
+    const names: []const []const u8 = &.{ "old.parquet", "new.parquet", "third.parquet", "updated.parquet", "append.parquet", "removed.parquet", "namespace.parquet", "duplicate.parquet" };
+    for (0..8) |step| {
         marker.now = 101 + step * 100;
-        if (step != 0) try client.deleteObject("antfly", if (step == 1) "old.parquet" else if (step == 2) "new.parquet" else if (step == 3) "third.parquet" else "updated.parquet", .{});
-        const ids: []const i64 = if (step == 4) &.{ 3, 1, 1 } else if (step == 0 or step == 2) &.{ 1, 2, 3 } else &.{ 3, 1, 2 };
-        const bodies: []const []const u8 = if (step == 0 or step == 2) &.{ "same text", "same text", "last" } else if (step == 1) &.{ "last", "same text", "same text" } else &.{ "last", "updated text", "same text" };
+        if (step == 6) {
+            namespace_schema = try std.mem.replaceOwned(u8, a, schema_json, "\"key_columns\":[\"id\"]", "\"key_columns\":[\"body\"]");
+            table.schema_json = namespace_schema.?;
+            binding.deinit(a);
+            binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)).?;
+        }
+        if (step != 0) try client.deleteObject("antfly", names[step - 1], .{});
+        const ids: []const i64 = if (step == 7) &.{ 3, 1, 1 } else if (step == 5 or step == 6) &.{ 3, 2 } else if (step == 4) &.{ 3, 1, 2, 4 } else if (step == 0 or step == 2) &.{ 1, 2, 3 } else &.{ 3, 1, 2 };
+        const bodies: []const []const u8 = if (step == 7) &.{ "last", "updated text", "updated text" } else if (step == 5 or step == 6) &.{ "last", "same text" } else if (step == 4) &.{ "last", "updated text", "same text", "appended" } else if (step == 0 or step == 2) &.{ "same text", "same text", "last" } else if (step == 1) &.{ "last", "same text", "same text" } else &.{ "last", "updated text", "same text" };
         const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{.{ .column_id = "id", .field_id = 1, .values = ids }}, &.{.{ .column_id = "body", .field_id = 2, .converted_type = 0, .values = bodies }});
         defer a.free(data);
-        var put = try client.putObject("antfly", if (step == 0) "old.parquet" else if (step == 1) "new.parquet" else if (step == 2) "third.parquet" else if (step == 3) "updated.parquet" else "duplicate.parquet", data, .{});
+        var put = try client.putObject("antfly", names[step], data, .{});
         put.deinit(a);
         var source = try serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
         defer source.deinit();
@@ -1033,7 +1083,7 @@ test "external lake logical identity publishes native indexes once across reorde
         previous = try catalog.parse(a, completed);
         try @import("lake_index_directory.zig").hydrate(previous.?.arena.allocator(), artifact_store, &previous.?.value.published.?, .none, null);
         const publication = previous.?.value.published.?;
-        if (step == 4) {
+        if (step == 7) {
             // Optional identity evidence never turns a duplicate business key
             // into a table outage or authorizes stale logical reuse.
             try std.testing.expect(publication.row_identity == null);
@@ -1044,8 +1094,11 @@ test "external lake logical identity publishes native indexes once across reorde
         defer arena.deinit();
         const root = try @import("lake_row_identity.zig").load(arena.allocator(), artifact_store, publication.row_identity.?, .none, null);
         try @import("lake_row_identity_reader.zig").validate(arena.allocator(), root, publication, root.domain, &source);
-        try std.testing.expectEqual(@as(u64, 3), root.current.rows);
+        try std.testing.expectEqual(@as(u64, if (step == 4) 4 else if (step == 5 or step == 6) 2 else 3), root.current.rows);
+        try std.testing.expectEqual(@as(usize, 1), publication.contribution_roots.len);
+        if (step == 6) try std.testing.expect(!std.mem.eql(u8, &original_namespace.?, &root.namespace));
         if (step == 0) {
+            original_namespace = root.namespace;
             original_directory = try a.dupe(u8, publication.directory.?.artifact_id);
             original_snapshot = try a.dupe(u8, source.inventory.snapshot_id);
             var reads: u64 = 4 * 1024 * 1024;
@@ -1070,7 +1123,7 @@ test "external lake logical identity publishes native indexes once across reorde
             try std.testing.expect(!std.mem.eql(u8, original_directory.?, publication.directory.?.artifact_id));
             try std.testing.expectEqualStrings(root.current.snapshot, root.spaceForIndex("body_text").snapshot);
             const aggregate_name = try @import("lake_index_names.zig").materialization(arena.allocator(), "stats", "rows");
-            try std.testing.expectEqualStrings(original_snapshot.?, root.spaceForIndex(aggregate_name).snapshot);
+            try std.testing.expectEqualStrings(if (step == 3) original_snapshot.? else root.current.snapshot, root.spaceForIndex(aggregate_name).snapshot);
         }
     }
 }
