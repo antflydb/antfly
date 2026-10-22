@@ -273,7 +273,7 @@ fn sessionResponseId(value: Json) !?[]const u8 {
 
 pub fn view(server: anytype) !gateway.View {
     const config = server.cfg.node_config orelse return .{ .providers = &empty_registry };
-    return .{ .providers = &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
+    return .{ .providers = &config.registry, .connections = &config.connections, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
 }
 
 pub fn disabledResponse(ctx: *httpx.Context) !httpx.Response {
@@ -1340,7 +1340,7 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
                 }
                 try item.object.put(a, "availability", connection.object.get("status") orelse .{ .string = "unknown" });
                 try item.object.put(a, "freshness", listed.object.get("freshness") orelse .{ .string = "cached" });
-                try item.object.put(a, "gateway_capabilities", try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, named.capabilities(.{ .connection = .{ .task = .generate, .connection = id, .model = backend } }), .{}), .{}));
+                try item.object.put(a, "gateway_capabilities", try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, connectionCatalogCapabilities(named, group.key_ptr.*, id, backend), .{}), .{}));
                 try putCatalogItem(a, &seen, &data, item);
                 var catalog_group = root.object.get(group.key_ptr.*) orelse Json{ .object = .empty };
                 if (catalog_group != .object) continue;
@@ -1355,6 +1355,12 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
     try root.object.put(a, "object", .{ .string = "list" });
     try root.object.put(a, "data", data);
     return ctx.json(root);
+}
+
+fn connectionCatalogCapabilities(named: gateway.View, category: []const u8, connection: []const u8, model: []const u8) gateway.Capabilities {
+    // Opaque groups retain declarations without claiming a task. Known groups
+    // must use the same task-specific adapter contract as invocation.
+    return named.capabilities(.{ .connection = .{ .task = gateway.taskForCategory(category) orelse .generate, .connection = connection, .model = model } });
 }
 
 fn putCatalogItem(a: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(usize), data: *Json, item: Json) !void {
@@ -1731,4 +1737,19 @@ test "httpx inference gateway framed typed adapters inline only media references
     try std.testing.expectError(error.InvalidInferenceRequest, inlineTaskAttachments(a, .read, invalid, attachments));
     const unused = try std.json.parseFromSliceLeaky(Json, a, "{\"images\":[{\"url\":\"https://example.com/image\"}]}", .{});
     try std.testing.expectError(error.InvalidInferenceRequest, inlineTaskAttachments(a, .read, unused, attachments));
+}
+
+test "httpx inference gateway physical decision catalogs apply connection image budgets by task" {
+    const a = std.testing.allocator;
+    var config = try sources.common_config.Config.parseFromSlice(a,
+        \\{"connections":{"vendor":{"kind":"inference","capabilities":["models.decide","models.generate"],"inference":{"provider":"openai"}}},"inference_capabilities":{"connections/vendor/models/vision":{"images":"supported"}}}
+    );
+    defer config.deinit();
+    const Server = struct { cfg: struct { node_config: ?*sources.common_config.Config } };
+    var server = Server{ .cfg = .{ .node_config = &config } };
+    const named = try view(&server);
+    try std.testing.expectEqual(gateway.Support.unsupported, connectionCatalogCapabilities(named, "deciders", "vendor", "vision").images);
+    try std.testing.expectEqual(gateway.Support.supported, connectionCatalogCapabilities(named, "generators", "vendor", "vision").images);
+    config.connections.getPtr("vendor").?.inference.?.max_image_input_tokens = 8192;
+    try std.testing.expectEqual(gateway.Support.supported, connectionCatalogCapabilities(named, "deciders", "vendor", "vision").images);
 }

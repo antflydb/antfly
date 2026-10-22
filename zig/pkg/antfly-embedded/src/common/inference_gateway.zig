@@ -17,6 +17,7 @@
 //! model kernels, credentials or discovery I/O belongs in identity resolution.
 const std = @import("std");
 const providers = @import("provider_registry.zig");
+const decisions = @import("../functions/decisions.zig");
 const readers = @import("antfly_readers");
 const transcribing = @import("antfly_transcribing");
 const synthesizing = @import("antfly_synthesizing");
@@ -74,6 +75,10 @@ pub const Capabilities = struct {
         }
     }
 };
+fn typedDecisionCapabilities(images: bool) Capabilities {
+    return .{ .images = if (images) .supported else .unsupported, .audio = .unsupported, .streaming = .unsupported, .tools = .unsupported };
+}
+
 pub const Requirements = struct {
     streaming: bool = false,
     tools: bool = false,
@@ -116,6 +121,7 @@ pub const Descriptor = struct {
 
 pub const View = struct {
     providers: *const providers.Registry,
+    connections: ?*const @import("config.zig").Config.ConnectionsConfig = null,
     readers: ?*const readers.Registry = null,
     transcribers: ?*const transcribing.Registry = null,
     synthesizers: ?*const synthesizing.Registry = null,
@@ -227,9 +233,22 @@ pub const View = struct {
         };
         if (target == .configured and target.configured.task == .decide and !target.configured.chain) {
             const caps = self.providers.getDeciderCapabilities(target.configured.name) catch return .{};
-            return .{ .images = if (caps.images) .supported else .unsupported, .audio = .unsupported, .streaming = .unsupported, .tools = .unsupported };
+            return typedDecisionCapabilities(caps.images);
         }
-        return self.providers.inference_capabilities.get(id) orelse .{};
+        const declared = self.providers.inference_capabilities.get(id) orelse Capabilities{};
+        if (target == .connection and target.connection.task == .decide) {
+            const connections = self.connections orelse return .{};
+            const connection = connections.get(target.connection.connection) orelse return .{};
+            if (connection.kind != .inference) return .{};
+            const cfg = connection.inference orelse return .{};
+            // Antfly connections forward the request intact; the remote gateway
+            // owns its adapter and budgets. Hosted connections use our typed
+            // decision adapter and must meet its local image budget contract.
+            if (std.mem.eql(u8, cfg.provider, "antfly")) return declared;
+            const adapter_images = if (std.meta.stringToEnum(decisions.Provider, cfg.provider)) |provider| decisions.capabilities(provider).images else false;
+            return typedDecisionCapabilities(adapter_images and (cfg.max_image_input_tokens orelse 0) > 0 and declared.images == .supported);
+        }
+        return declared;
     }
 
     pub fn contains(self: View, task: Task, name: []const u8) bool {
@@ -790,4 +809,39 @@ test "provider registry gateway decisions intersect declarations with adapter su
     try registry.registerDeciderConfig("unbudgeted", .{ .provider = .jev });
     try std.testing.expect(!(try registry.getDeciderCapabilities("unbudgeted")).images);
     try std.testing.expect((try registry.getDeciderCapabilities("unbudgeted")).messages);
+}
+
+test "provider registry gateway hosted connection decisions require adapter support declarations and image budgets" {
+    const a = std.testing.allocator;
+    var config = try @import("config.zig").Config.parseFromSlice(a,
+        \\{"connections":{"vendor":{"kind":"inference","capabilities":["models.decide","models.generate"],"inference":{"provider":"openai"}}},"inference_capabilities":{"connections/vendor/models/vision":{"images":"supported","streaming":"supported"}}}
+    );
+    defer config.deinit();
+    const view = View{ .providers = &config.registry, .connections = &config.connections };
+    const target = Target{ .connection = .{ .task = .decide, .connection = "vendor", .model = "vision" } };
+    const declaration = config.registry.inference_capabilities.getPtr("connections/vendor/models/vision").?;
+    const cfg = &config.connections.getPtr("vendor").?.inference.?;
+    for ([_][]const u8{ "openai", "jev", "anthropic" }) |provider| {
+        a.free(cfg.provider);
+        cfg.provider = try a.dupe(u8, provider);
+        for ([_]?u64{ null, 0, 8192 }) |bound| {
+            cfg.max_image_input_tokens = bound;
+            for ([_]Support{ .supported, .unsupported, .unknown }) |support| {
+                declaration.images = support;
+                const caps = (try view.describe(a, target));
+                defer a.free(caps.id);
+                try std.testing.expectEqual(if (!std.mem.eql(u8, provider, "anthropic") and bound != null and bound.? > 0 and support == .supported) Support.supported else Support.unsupported, caps.gateway_capabilities.images);
+                try std.testing.expectEqual(Support.unsupported, caps.gateway_capabilities.streaming);
+                // Chat capability declarations are independent of decision budgets.
+                try std.testing.expectEqual(support, view.capabilities(.{ .connection = .{ .task = .generate, .connection = "vendor", .model = "vision" } }).images);
+            }
+        }
+    }
+    a.free(cfg.provider);
+    cfg.provider = try a.dupe(u8, "antfly");
+    cfg.max_image_input_tokens = null;
+    declaration.images = .supported;
+    try std.testing.expectEqual(Support.supported, view.capabilities(target).images);
+    // Missing connection metadata cannot qualify hosted decision media.
+    try std.testing.expectEqual(Support.unknown, (View{ .providers = &config.registry }).capabilities(target).images);
 }

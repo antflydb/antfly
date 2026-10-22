@@ -481,3 +481,22 @@ it("runs multimodal decision evidence for an image-capable decider", async () =>
     )
   );
 });
+
+it.each([
+  "generate",
+  undefined,
+])("does not offer decision images for a model with task %s", async (task) => {
+  const id = "connections/vendor/models/vision";
+  client.inference.models.mockResolvedValue({
+    data: [{ id, task, gateway_capabilities: { images: "supported" } }],
+  });
+  render(
+    <MemoryRouter>
+      <InferenceGatewayPage />
+    </MemoryRouter>
+  );
+  await waitFor(() => expect(document.querySelector(`option[value="${id}"]`)).not.toBeNull());
+  fireEvent.change(screen.getByLabelText("Model"), { target: { value: id } });
+  fireEvent.change(screen.getByLabelText("Operation"), { target: { value: "decisions" } });
+  expect(screen.queryByRole("button", { name: "Use image example" })).toBeNull();
+});

@@ -164,6 +164,11 @@ For connection-qualified hosted decisions, set `max_image_input_tokens` in the
 connection's `inference` configuration. The bound must cover every decision model
 admitted on that connection. Declare image support for the qualified model in
 `inference_capabilities`, just as for other connection capabilities.
+Connection discovery applies the decision adapter and image-token bound to
+models classified as deciders. Chat image declarations remain independent of
+decision budgets. Antfarm offers the decision image example only for models
+identified as image-capable deciders. Antfly runtime connections forward their
+requests intact; the remote gateway owns its adapter and image budgets.
 
 Configure `max_image_input_tokens` on each hosted decider used with images. Set
 it to the selected provider/model's upper bound on one image's input-token

@@ -305,7 +305,8 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
                 </select>
               </div>
               {operation === "decisions" &&
-                selected?.gateway_capabilities?.images === "supported" && (
+                selected?.task === "decide" &&
+                selected.gateway_capabilities?.images === "supported" && (
                   <Button
                     variant="outline"
                     disabled={running}
