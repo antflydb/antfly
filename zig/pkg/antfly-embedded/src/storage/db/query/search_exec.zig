@@ -12000,6 +12000,8 @@ const TextLiveVisibilityProducer = struct {
     control: @FieldType(search_mod.SearchRequest, "control"),
     materialize_after: u64,
     controlled_filter: ?ControlledLiveDocFilter = null,
+    resolved_filter: ?*const doc_set.ResolvedDocFilter = null,
+    skip_live_filter: bool = false,
     examined: std.atomic.Value(u64) = .init(0),
     building: std.atomic.Value(bool) = .init(false),
     complete: std.atomic.Value(?*roaring.RoaringBitmap) = .init(null),
@@ -12021,28 +12023,40 @@ const TextLiveVisibilityProducer = struct {
     }
 
     fn buildComplete(self: *@This()) !?*roaring.RoaringBitmap {
-        const controlled = self.controlled_filter orelse return null;
         const all: doc_set.ResolvedDocSet = .all;
-        var live = try controlled(self.ctx, self.alloc, &all, self.generation, self.control);
+        var live = if (self.skip_live_filter) doc_set.ResolvedDocSet.all else blk: {
+            const controlled = self.controlled_filter orelse return null;
+            break :blk try controlled(self.ctx, self.alloc, &all, self.generation, self.control);
+        };
         defer live.deinit(self.alloc);
         // Legacy bulk `.all` can mean inconclusive primary coverage, including
         // rows created after the read generation. Only the all-visible proof
         // at request setup may skip candidate checks; an unknown bulk result
         // must not widen already-refined membership during adaptation.
-        if (live == .all or live == .doc_keys) return null;
+        if ((!self.skip_live_filter and live == .all) or live == .doc_keys) return null;
         const Membership = struct {
             set: *const doc_set.ResolvedDocSet,
+            resolved: ?*const doc_set.ResolvedDocFilter,
             pub fn contains(self_: @This(), ordinal: u32) bool {
-                return self_.set.containsOrdinal(ordinal);
+                return self_.set.containsOrdinal(ordinal) and resolvedContains(self_.resolved, ordinal);
             }
         };
         const bitmap = try self.alloc.create(roaring.RoaringBitmap);
         errdefer self.alloc.destroy(bitmap);
-        bitmap.* = try self.snapshot.docNumBitmapForOrdinalMembershipAlloc(self.alloc, Membership{ .set = &live }, self.control);
+        bitmap.* = try self.snapshot.docNumBitmapForOrdinalMembershipAlloc(self.alloc, Membership{ .set = &live, .resolved = self.resolved_filter }, self.control);
         errdefer bitmap.deinit();
         try bitmap.prepareRead();
         try self.control.check();
         return bitmap;
+    }
+
+    fn resolvedContains(filter: ?*const doc_set.ResolvedDocFilter, ordinal: u32) bool {
+        const value = filter orelse return true;
+        return value.include.containsOrdinal(ordinal) and !value.exclude.containsOrdinal(ordinal);
+    }
+
+    fn identityFilter(_: ?*anyopaque, alloc: Allocator, set: *const doc_set.ResolvedDocSet, _: ?u64) !doc_set.ResolvedDocSet {
+        return doc_set.cloneAlloc(alloc, set);
     }
 
     fn fromComplete(self: *@This(), bitmap: *const roaring.RoaringBitmap, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
@@ -12095,6 +12109,11 @@ const TextLiveVisibilityProducer = struct {
                 if (doc >= count) return error.InvalidQueryRequest;
                 position = doc +| 1;
                 if (try ordinal_cursor.get(doc)) |ordinal| {
+                    if (!resolvedContains(self.resolved_filter, ordinal)) continue;
+                    if (self.skip_live_filter) {
+                        try result.add(doc);
+                        continue;
+                    }
                     docs[used] = doc;
                     ordinals[used] = ordinal;
                     used += 1;
@@ -12294,6 +12313,30 @@ pub fn searchTextQuery(
             }
         }
     }
+    // Wire-resolved ordinal constraints must refine posting candidates too.
+    // Projecting even a one-ordinal filter by scanning every segment restores
+    // the same population-sized floor that adaptive live visibility avoids.
+    var resolved_ordinal_filter_handled = false;
+    if (!suppress_native_resolved_doc_filter and resolvedTextDocNumFilterFromRequest(effective_req) == null) {
+        if (resolvedDocFilterFromRequest(effective_req)) |filter| {
+            if (filter.include != .doc_keys and filter.exclude != .doc_keys and try snapshot.hasDocOrdinalCoverage()) {
+                resolved_ordinal_filter_handled = true;
+                if (filter.include != .all or filter.exclude != .none) {
+                    if (live_visibility == null) live_visibility = .{
+                        .alloc = alloc,
+                        .snapshot = snapshot,
+                        .ctx = executor.ctx,
+                        .live_filter = TextLiveVisibilityProducer.identityFilter,
+                        .generation = effective_req.identity_read_generation,
+                        .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+                        .materialize_after = @max(1024, snapshot.liveDocCount() / 128),
+                        .skip_live_filter = true,
+                    };
+                    live_visibility.?.resolved_filter = filter;
+                }
+            }
+        }
+    }
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var indexed_include: ?IndexedTextPredicate = null;
     defer if (indexed_include) |*predicate| predicate.deinit();
@@ -12381,7 +12424,7 @@ pub fn searchTextQuery(
         // postprocess below via effective_req.resolved_doc_filter.
     } else if (resolvedTextDocNumFilterFromRequest(effective_req)) |filter| {
         try applyResolvedTextDocNumFilterAlloc(alloc, &native_constraints, filter);
-    } else if (resolvedDocFilterFromRequest(effective_req)) |filter| {
+    } else if (if (resolved_ordinal_filter_handled) null else resolvedDocFilterFromRequest(effective_req)) |filter| {
         try applyResolvedDocFilterToTextDocNumsAlloc(alloc, snapshot, &native_constraints, filter, .{
             .ctx = executor.ctx,
             .text_index_entry = executor.text_index_entry,
@@ -35344,6 +35387,28 @@ test "text live visibility refines posting candidates and skips an all-visible f
         try std.testing.expectEqual(@as(usize, 0), harness.broad_calls);
         try std.testing.expect(harness.seen <= 24);
         try std.testing.expect(harness.indexed_probes <= 24);
+    }
+    // Explicit wire filters use primary ordinals, not segment-local IDs.
+    // Even a full-population include must keep the rare-term path bounded.
+    var ordinal_include = try doc_set.fromOrdinalsAlloc(a, &.{ 18, 112, 7001 });
+    defer ordinal_include.deinit(a);
+    var population = roaring.RoaringBitmap.init(a);
+    defer population.deinit();
+    try population.addRange(1, 10001);
+    const explicit_filters = [_]doc_set.ResolvedDocFilter{
+        .{ .include = ordinal_include },
+        .{ .include = .{ .ordinal_bitmap = population }, .exclude = .{ .ordinals = &.{7001} } },
+    };
+    for (&explicit_filters) |*explicit| {
+        for ([_]types.SearchRequest{ req, count_req, sorted_req }) |original| {
+            harness.seen = 0;
+            var filtered_req = original;
+            filtered_req.resolved_doc_filter = @ptrCast(@constCast(explicit));
+            var filtered = try searchTextQuery(a, filtered_req, query, executor);
+            defer filtered.deinit();
+            try std.testing.expectEqual(@as(u64, 2), filtered.total_hits);
+            try std.testing.expect(harness.seen <= 4);
+        }
     }
     harness.all_visible = true;
     harness.calls = 0;

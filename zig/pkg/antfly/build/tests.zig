@@ -227,7 +227,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Parser/worker projection contracts need no HTTP server or linked kernel.
     // Reuse the lean source-discovery root so this boundary remains affordable
     // to check independently of the full API runtime harness.
-    const query_contract_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "api query contract", "local query contract", "decision functions worker transport" } });
+    const query_contract_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = selectTestFilters(b, &.{ "api query contract", "local query contract", "decision functions worker transport", "query string:" }) });
     b.step("query-contract-test", "Run query parsing, worker transport and projection contracts").dependOn(&b.addRunArtifact(query_contract_tests).step);
 
     const logical_field_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = selectTestFilters(b, &.{ "logical value", "logical query", "projection checkpoint external storage" }) });
