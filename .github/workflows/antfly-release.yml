@@ -537,8 +537,22 @@ jobs:
           shopt -u nullglob
           test "${#runtime_archives[@]}" -gt 0
           cp "${runtime_archives[@]}" dist/release-runtime/
-          cp dist/release-payload/*.tgz dist/release-payload/*.whl \
-            dist/release-payload/cli-snapshot.json dist/verified-cli-snapshot/
+          # Schema 2 snapshots contain npm packages only; legacy schema 1 also
+          # declares Python wheels. Copy the manifest's exact artifact set.
+          python - <<'PY'
+          import json
+          import shutil
+          from pathlib import Path
+
+          source = Path("dist/release-payload")
+          target = Path("dist/verified-cli-snapshot")
+          manifest = json.loads((source / "cli-snapshot.json").read_text())
+          names = ["cli-snapshot.json", *(entry["name"] for entry in manifest["artifacts"])]
+          for name in names:
+              if not isinstance(name, str) or not name or name in {".", ".."} or Path(name).name != name:
+                  raise SystemExit(f"invalid CLI snapshot artifact name: {name!r}")
+              shutil.copyfile(source / name, target / name)
+          PY
           python scripts/release/verify_release_ledger.py \
             --ledger dist/release-ledger/artifacts.json \
             --payload-dir dist/release-runtime \

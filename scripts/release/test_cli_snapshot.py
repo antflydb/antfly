@@ -18,13 +18,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import unittest
 import zipfile
 from pathlib import Path
@@ -68,6 +71,134 @@ def write_wheel(path: Path) -> None:
 
 
 class CLISnapshotTests(unittest.TestCase):
+    def test_promotion_materializes_and_verifies_declared_cli_artifacts(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/antfly-release.yml").read_text()
+        step = workflow.split(
+            "      - name: Materialize and verify typed bundle scopes\n", 1
+        )[1].split("\n      - ", 1)[0]
+        command = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        for legacy, damage in (
+            (False, None),
+            (True, None),
+            (False, "missing_npm"),
+            (True, "missing_wheel"),
+            (False, "tampered"),
+            (False, "unsafe_name"),
+        ):
+            with (
+                self.subTest(legacy=legacy, damage=damage),
+                tempfile.TemporaryDirectory() as raw,
+            ):
+                root = Path(raw)
+                payload = root / "dist/release-payload"
+                payload.mkdir(parents=True)
+                (root / "scripts").symlink_to(
+                    REPO_ROOT / "scripts", target_is_directory=True
+                )
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                (bin_dir / "python").symlink_to(sys.executable)
+                artifacts = []
+                for index, package in enumerate(NPM_PACKAGES.values()):
+                    name = f"cli-{index}.tgz"
+                    (payload / name).write_bytes(package.encode())
+                    artifacts.append({"name": name, "kind": "npm", "package": package})
+                if legacy:
+                    for index in range(3):
+                        name = f"cli-{index}.whl"
+                        (payload / name).write_bytes(f"wheel-{index}".encode())
+                        artifacts.append(
+                            {
+                                "name": name,
+                                "kind": "python",
+                                "package": "antfly-cli",
+                                "package_version": VERSION,
+                            }
+                        )
+                for artifact in artifacts:
+                    data = (payload / artifact["name"]).read_bytes()
+                    artifact.update(
+                        size=len(data), sha256=hashlib.sha256(data).hexdigest()
+                    )
+                manifest = {
+                    "schema_version": 1 if legacy else 2,
+                    "version": VERSION,
+                    "commit": COMMIT,
+                    "registry_versions": {
+                        "npm": VERSION,
+                        **({"python": VERSION} if legacy else {}),
+                    },
+                    "artifacts": artifacts,
+                }
+                if damage == "unsafe_name":
+                    artifacts[0]["name"] = "../outside.tgz"
+                    (payload.parent / "outside.tgz").write_bytes(b"outside")
+                (payload / "cli-snapshot.json").write_text(json.dumps(manifest))
+                runtime_name = f"antfly_{VERSION}_Linux_x86_64.tar.gz"
+                (payload / runtime_name).write_bytes(b"runtime")
+                entries = [
+                    {
+                        "name": p.name,
+                        "scope": "runtime" if p.name == runtime_name else "cli",
+                        "size": p.stat().st_size,
+                        "sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
+                    }
+                    for p in payload.iterdir()
+                ]
+                ledger = payload / "artifacts.json"
+                ledger.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 2,
+                            "tag": f"v{VERSION}",
+                            "commit": COMMIT,
+                            "artifacts": entries,
+                        }
+                    )
+                )
+                if damage in {"missing_npm", "missing_wheel"}:
+                    (payload / ("cli-0.whl" if legacy else "cli-0.tgz")).unlink()
+                elif damage == "tampered":
+                    path = payload / "cli-0.tgz"
+                    path.write_bytes(b"x" * path.stat().st_size)
+                result = subprocess.run(
+                    ["bash", "-e", "-c", command],
+                    cwd=root,
+                    env={
+                        **os.environ,
+                        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                        "RELEASE_TAG": f"v{VERSION}",
+                        "RELEASE_VERSION": VERSION,
+                        "RELEASE_COMMIT": COMMIT,
+                        "LEDGER_SHA256": hashlib.sha256(
+                            ledger.read_bytes()
+                        ).hexdigest(),
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if damage:
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    expected = {
+                        "missing_npm": "cli-0.tgz",
+                        "missing_wheel": "cli-0.whl",
+                        "tampered": "promoted artifact differs from release ledger",
+                        "unsafe_name": "invalid CLI snapshot artifact name",
+                    }[damage]
+                    self.assertIn(expected, result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("verified CLI snapshot", result.stdout)
+                    self.assertEqual(
+                        {
+                            p.name
+                            for p in (root / "dist/verified-cli-snapshot").iterdir()
+                        },
+                        {"cli-snapshot.json", *(a["name"] for a in artifacts)},
+                    )
+
     def test_npm_only_snapshot_is_strict_and_pypi_is_paused(self) -> None:
         policy = load_module(
             "paused_cli_channels", REPO_ROOT / "scripts/release/release_channels.py"
