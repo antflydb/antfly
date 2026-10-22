@@ -581,15 +581,21 @@ pub fn runUntilIdle(handle: *h.Handle) !void {
     try tables.loadAvailable(root);
     for (0..1024) |_| {
         const before = replaySequence(root);
-        try root.db.runUntilIdle();
+        try drainDatabase(root, &root.db);
         var iterator = root.embedded_tables.valueIterator();
-        while (iterator.next()) |table| try table.*.db.runUntilIdle();
+        while (iterator.next()) |table| try drainDatabase(root, &table.*.db);
         if (before == replaySequence(root)) {
             collectEmbeddingCache(root, false) catch {};
             return;
         }
     }
     return error.RunUntilIdleDidNotConverge;
+}
+
+fn drainDatabase(root: *h.Handle, database: *h.db_mod.DB) !void {
+    if (root.lite_connection_context) |connection|
+        return database.runUntilIdleWithGroupSourceState(try connection.owner.groupSourceState(database));
+    return database.runUntilIdle();
 }
 
 fn replaySequence(handle: *h.Handle) u128 {

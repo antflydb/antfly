@@ -154,6 +154,14 @@ fn finishBackgroundGraphReplacement(self: *DB, name: []const u8, generation: u64
     return .{ .value = self.finishBackgroundGraphReplacement(name, generation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn runUntilIdleWithGroupSourceState(self: *DB, state: *DB.GroupSourceMaintenanceState) engine.Outcome(void) {
+    return .{ .value = self.runUntilIdleWithGroupSourceState(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn runGroupSourceMaintenanceSlice(self: *DB, state: *DB.GroupSourceMaintenanceState) engine.Outcome(bool) {
+    return .{ .value = self.runGroupSourceMaintenanceSlice(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, shadow: bool) engine.Outcome(bool) {
     return .{ .value = self.runBackgroundTurnWithCancellation(cancellation, shadow) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

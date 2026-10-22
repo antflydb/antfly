@@ -461,6 +461,8 @@ pub const Owner = struct {
     const MaintenanceSchedule = struct {
         shadow_next: bool = true,
         source_recovery_next: bool = true,
+        group_source_next: bool = true,
+        group_sources: h.db_mod.DB.GroupSourceMaintenanceState = .{ .allocator = alloc },
         next_source_recovery_ns: i96 = 0,
         live: bool = true,
         ttl: h.db_mod.types.TTLCleanupStats = .{},
@@ -640,6 +642,17 @@ pub const Owner = struct {
                 h.closeHandle(retired);
             }
         }
+    }
+
+    /// Called under the connection gate by explicit maintenance as well as the
+    /// background scheduler. The state outlives every refreshed DB wrapper.
+    pub fn groupSourceState(self: *Owner, database: *h.db_mod.DB) !*h.db_mod.DB.GroupSourceMaintenanceState {
+        const entry = try self.maintenance_schedules.getOrPut(alloc, .{
+            .table_id = database.core.identity_namespace.table_id,
+            .incarnation = database.root_incarnation,
+        });
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        return &entry.value_ptr.group_sources;
     }
 
     pub fn notifyMutation(self: *Owner) void {
@@ -920,6 +933,7 @@ pub const Owner = struct {
         }
         var stale = self.maintenance_schedules.iterator();
         while (stale.next()) |entry| if (!entry.value_ptr.live) {
+            entry.value_ptr.group_sources.deinit();
             self.maintenance_schedules.removeByPtr(entry.key_ptr);
         };
         const count = foreground.embedded_tables.count() + 1;
@@ -962,6 +976,17 @@ pub const Owner = struct {
             schedule.next_source_recovery_ns = now + std.time.ns_per_s;
         }
         schedule.source_recovery_next = true;
+        // Group fan-in is bounded control work on the current coordinator.
+        // Alternate it with detached provider replay per namespace so a busy
+        // root or a long backfill cannot starve a child or its consumers.
+        if (self.options.open_mode == .writer and schedule.group_source_next) {
+            if (try database.runGroupSourceMaintenanceSlice(&schedule.group_sources)) {
+                schedule.group_source_next = false;
+                self.notifyMutation();
+                return true;
+            }
+        }
+        schedule.group_source_next = true;
         var ttl_more = false;
         if (now >= schedule.next_ttl_ns) {
             // Each namespace owns its cleanup cadence. Failure still consumes
@@ -1159,6 +1184,8 @@ pub const Owner = struct {
         }
         self.retired.deinit(alloc);
         self.connections.deinit(alloc);
+        var schedules = self.maintenance_schedules.valueIterator();
+        while (schedules.next()) |schedule| schedule.group_sources.deinit();
         self.maintenance_schedules.deinit(alloc);
         if (self.owned_ttl_owner_id) |id| alloc.free(id);
         if (self.owned_models_dir) |directory| alloc.free(directory);

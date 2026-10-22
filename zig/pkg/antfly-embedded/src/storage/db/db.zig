@@ -7155,13 +7155,31 @@ pub const DB = struct {
         if (!self.stable_address or self.closed or self.open_mode != .writer or !self.local_execution.optional_runtime_workers_enabled or self.core.index_manager.minimum_reader_version.load(.acquire) < 8) return false;
         return self.runGroupSourceSlice();
     }
+    pub const GroupSourceMaintenanceState = @import("group_source_owner.zig").State;
+
+    /// One bounded producer/control slice, without inference. Native Lite calls
+    /// this on the live coordinator under its short path lease, then replays
+    /// downstream providers in its separate detached turn.
+    pub fn runGroupSourceMaintenanceSlice(self: *DB, state: *GroupSourceMaintenanceState) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runGroupSourceMaintenanceSlice", .{ self, state });
+        const before = state.submitted;
+        _ = try self.runGroupSourceSliceWithState(state);
+        // Only a committed control mutation makes detached provider replay
+        // eligible. Visiting an idle sibling must not reopen provider state.
+        return state.submitted != before;
+    }
+
     fn runGroupSourceSlice(self: *DB) !bool {
+        return self.runGroupSourceSliceWithState(&self.group_source_owner.state);
+    }
+    const LocalGroupSourceContext = struct { db: *DB, state: *GroupSourceMaintenanceState };
+    fn runGroupSourceSliceWithState(self: *DB, state: *GroupSourceMaintenanceState) !bool {
         // A table-wide coordinator must drive partial owners. The native
         // worker can certify membership only for an unpartitioned Lite DB.
         if (self.core.byteRange().start.len != 0 or self.core.byteRange().end.len != 0) return false;
         if (self.open_mode != .writer or self.core.index_manager.minimum_reader_version.load(.acquire) < 8 or self.group_source_owner.stopping.load(.acquire)) return false;
-        if (!self.group_source_owner.slice_mutex.tryLock()) return false;
-        defer self.group_source_owner.slice_mutex.unlock();
+        if (!state.slice_mutex.tryLock()) return false;
+        defer state.slice_mutex.unlock();
         if (try self.maintenanceRequiresOrderedApply()) return false;
         try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
         var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, self.runtime_alloc, 1) else null;
@@ -7173,33 +7191,46 @@ pub const DB = struct {
         const raw = (try self.lookupGroupSource(a, "{\"action\":\"definitions\"}")) orelse return false;
         const definitions = try std.json.parseFromSliceLeaky([]work.Definition, a, raw.json, .{});
         if (definitions.len == 0) return false;
-        const definition = definitions[self.group_source_owner.next_definition % definitions.len];
-        self.group_source_owner.next_definition +%= 1;
+        const definition = definitions[state.next_definition % definitions.len];
+        state.next_definition +%= 1;
         const namespace = definition.namespace;
-        if (self.group_source_owner.worker == null) {
+        if (state.worker == null) {
             const identity = try std.json.Stringify.valueAlloc(a, .{ self.root_incarnation, platform_time.realtimeNs(), namespace }, .{});
-            self.group_source_owner.worker = .{ .allocator = self.runtime_alloc, .identity = @import("group_sources.zig").digest(identity) };
+            state.worker = .{ .allocator = state.allocator orelse self.runtime_alloc, .identity = @import("group_sources.zig").digest(identity) };
         }
-        const ports = work.Ports{ .ptr = self, .query_fn = localGroupSourceQuery, .submit_fn = localGroupSourceSubmit, .fan_in_fn = localGroupSourceFanIn, .settled_fn = localGroupSourceSettled };
-        const before = self.group_source_owner.submitted;
-        try self.group_source_owner.worker.?.sourceStep(a, ports, definition);
-        try self.group_source_owner.worker.?.groupStep(a, ports, definition, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_ms)));
-        return self.group_source_owner.submitted != before;
+        var context = LocalGroupSourceContext{ .db = self, .state = state };
+        const ports = work.Ports{ .ptr = &context, .query_fn = localGroupSourceQuery, .submit_fn = localGroupSourceSubmit, .fan_in_fn = localGroupSourceFanIn, .settled_fn = localGroupSourceSettled };
+        const before = state.submitted;
+        try state.worker.?.sourceStep(a, ports, definition);
+        try state.worker.?.groupStep(a, ports, definition, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_ms)));
+        const changed = state.submitted != before;
+        state.idle_definitions = if (changed) 0 else state.idle_definitions +| 1;
+        // A no-op GC/idle definition is not proof that its siblings are idle.
+        // Complete a fair round before allowing a manual or connection owner
+        // to sleep. Progress resets the round so downstream receipts can settle.
+        return changed or state.idle_definitions < definitions.len;
     }
     fn localGroupSourceQuery(ptr: *anyopaque, a: Allocator, route: []const u8, request: []const u8) ![]const u8 {
-        const self: *DB = @ptrCast(@alignCast(ptr));
+        const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
+        const self = context.db;
         if (!self.core.byteRange().contains(route)) return error.KeyOutOfRange;
         const result = (try self.lookupGroupSource(a, request)) orelse return error.NotFound;
         return result.json;
     }
     fn localGroupSourceSubmit(ptr: *anyopaque, command: @import("group_source_contract.zig").Command) !void {
-        const self: *DB = @ptrCast(@alignCast(ptr));
+        const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
+        const self = context.db;
         if (try self.maintenanceRequiresOrderedApply()) return error.ArtifactCatalogDrift;
         try self.batchInternal(.{ .group_source = command, .sync_level = .write }, null, .{});
-        self.group_source_owner.submitted +%= 1;
+        context.state.submitted +%= 1;
+        // Group publication appends private producer rows. Independent resident
+        // owners need the same downstream wake as an enrichments-level wait;
+        // connection-owned Lite observes the durable sequence on its next turn.
+        if (self.enrichment_runtime) |runtime| runtime.notifySequence(self.core.nextDerivedSequence());
     }
     fn localGroupSourceFanIn(ptr: *anyopaque, a: Allocator, definition: @import("group_source_worker.zig").Definition, partition: @import("group_source_index.zig").Partition, ordinal: i64) !@import("group_source_worker.zig").FanIn {
-        const self: *DB = @ptrCast(@alignCast(ptr));
+        const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
+        const self = context.db;
         // A partial local range cannot certify a table-wide fan-in. The
         // cluster adapter must enumerate all authoritative table owners.
         if (self.core.byteRange().start.len != 0 or self.core.byteRange().end.len != 0) return error.GroupedSourceTopologyUnavailable;
@@ -7212,7 +7243,7 @@ pub const DB = struct {
         var earlier_pending = false;
         while (true) {
             const request = try std.json.Stringify.valueAlloc(a, query, .{});
-            const response = try localGroupSourceQuery(self, a, definition.route.value, request);
+            const response = try localGroupSourceQuery(ptr, a, definition.route.value, request);
             const page = try std.json.parseFromSliceLeaky(reads.SourcePage, a, response, .{ .allocate = .alloc_always });
             earlier_pending = earlier_pending or page.earlier_pending;
             if (revision) |expected| {
@@ -7232,7 +7263,8 @@ pub const DB = struct {
         return .{ .earlier_pending = earlier_pending, .members = try members.toOwnedSlice(a), .sources = sources, .topology_epoch = 0 };
     }
     fn localGroupSourceSettled(ptr: *anyopaque, sequence: u64, units: []const []const u8) !bool {
-        const self: *DB = @ptrCast(@alignCast(ptr));
+        const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
+        const self = context.db;
         var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
         defer arena.deinit();
         var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = arena.allocator(), .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
@@ -31117,6 +31149,7 @@ pub const DB = struct {
         drain_relational_indexes: bool = true,
         drain_graph_replacements: bool = true,
         bounded_replay: bool = false,
+        group_source_state: ?*GroupSourceMaintenanceState = null,
         /// Run the foreground enrichment catch-up pass to full completion
         /// instead of bounding it at the request-visibility default
         /// (`sync_wait_timeout_ms`, 5 minutes). Only `runUntilIdle` sets
@@ -32798,7 +32831,26 @@ pub const DB = struct {
             if (self.resolution_runtime == null) try self.initResolutionRuntime();
             if (self.promotion_runtime == null) try self.initPromotionRuntime();
         }
-        try self.drainReplayStagesUntilStableWithOptions(options);
+        const group_state = options.group_source_state orelse &self.group_source_owner.state;
+        if (self.async_context.replay_publication == null) {
+            const state = group_state;
+            while (!state.slice_mutex.tryLock()) {
+                try ensureSnapshotActive(options.cancellation);
+                platform_time.yieldNow();
+            }
+            state.idle_definitions = 0;
+            state.slice_mutex.unlock();
+        }
+        while (true) {
+            try ensureSnapshotActive(options.cancellation);
+            if (options.deadline_ns) |deadline| if (monotonicTimeNs() >= deadline) return error.RunUntilIdleDidNotConverge;
+            // Detached snapshots may compute providers but cannot issue group
+            // control commands from their old checkpoint. Their connection
+            // owner drives that bounded work on the live coordinator instead.
+            const group_pending = if (self.async_context.replay_publication == null) try self.runGroupSourceSliceWithState(group_state) else false;
+            try self.drainReplayStagesUntilStableWithOptions(options);
+            if (!group_pending or options.bounded_replay) break;
+        }
         if (options.drain_graph_replacements) {
             const replacement_catalog_generation = self.core.index_manager.write_plan_generation.load(.acquire);
             if (options.drain_relational_indexes) {
@@ -33223,6 +33275,13 @@ pub const DB = struct {
 
     pub fn runUntilIdle(self: *DB) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdle", .{self});
+        return self.runUntilIdleWithGroupSourceState(&self.group_source_owner.state);
+    }
+
+    /// A connection's explicit drain borrows the same cursor/lease identity as
+    /// its background turns, rather than competing with an owner it has paused.
+    pub fn runUntilIdleWithGroupSourceState(self: *DB, state: *GroupSourceMaintenanceState) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdleWithGroupSourceState", .{ self, state });
         const started_ns = platform_time.monotonicNs();
         const before = self.enrichmentThroughputSnapshot();
         defer self.logRunUntilIdleSummary(started_ns, before);
@@ -33230,6 +33289,7 @@ pub const DB = struct {
             .wait_for_enrichment_retries = true,
             .unbounded_enrichment_wait = true,
             .no_progress_timeout_ns = self.run_until_idle_no_progress_timeout_ns,
+            .group_source_state = state,
         }) catch |err| {
             // Embedded callers only see the mapped C ABI code (most of these
             // collapse to ANTFLY_INTERNAL), so name the error here where the

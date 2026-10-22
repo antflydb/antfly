@@ -48,7 +48,7 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     errdefer table.db.close();
     @import("entity_sink.zig").attach(handle, &table.db);
     try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
-    if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startQuarantineRetryWorkerIfNeeded();
+    if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startResidentBackgroundWorkersIfNeeded();
     return table;
 }
 
