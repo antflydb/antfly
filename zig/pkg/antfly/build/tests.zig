@@ -5999,6 +5999,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-prepared-replay-plan-test", "Verify canonical prepared request and accepted-effect replay bounds")
         .dependOn(&addCuratedTestRunArtifact(b, replay_plan_tests, &.{"prepared replay plan"}).step);
+    const retained_backlog_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "derived backlog", "retained backlog" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-retained-backlog-test", "Verify bounded retained replay credits and allocation-free multi-candidate transfer")
+        .dependOn(&addCuratedTestRunArtifact(b, retained_backlog_tests, &.{ "derived backlog", "retained backlog" }).step);
     const prepared_completion_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"prepared completion"},

@@ -22847,3 +22847,53 @@ generated errors, control catalog, formatting and whitespace checks pass.
 Evidence remains in prepared-completion-verified.json in the cumulative receipts.
 Full linked owner-image, object-engine, crash and cross-engine performance
 qualification remain open.
+
+### Retained derived-log credits
+
+A retained assembly now admits its actual replay bytes against the same node-wide
+derived-backlog quota as an ordinary source commit. It owns that credit until
+cancellation or transfer after a successful primary outcome. The handoff occurs
+only after dependency and sequence validation; every earlier failure cancels the
+local credit. No storage mutation, sequence claim, provider invocation or wait is
+needed to retain or release it. Refresh keeps the same fixed-width replay payload
+and does not reacquire quota. A configured quota therefore bounds concurrently
+retained candidates that append replay as well as committed replay debt. Candidates
+without replay owe no derived-log credit and still need the separate preparation
+and recovery memory budget.
+
+Tracker admissions now reserve independent future entry slots. Recovery tracking
+preserves those slots while appending records; a later primary commit can transfer
+any retained credit without allocation. The runtime serializes admission, tracking
+and transfer. Cancellation outside its lock only decrements an atomic slot count
+and returns the memory reservation. Teardown requires all outstanding admissions
+to have retired. Empty admissions without a resource manager retain the existing
+behavior and are not evidence of a funded executable recovery bundle.
+
+Native ABI 68 and storage-owner ABI 126 fence the expanded plan and admission
+layout. Durable formats, reader floors and default scheduling activation remain
+unchanged. This funds derived-log retention, not executable recovery RAM, CPU, I/O
+or dependencies. Assemblies still require their caller to keep the DB/runtime
+alive; close-safe DB/route/execution ownership and mandatory completion must be
+implemented before direct consumption or a PREPARE vote can rely on the candidate.
+Required-PREPARE orchestration, remaining counters/backend metadata/read guards
+and broader scheduler/engine qualification remain open. Strong required providers
+remain disabled; full Linux qualification remains waived and Linux uses the
+pinned Nix/glibc Zig toolchain.
+
+Pinned Debug qualification passes 15 focused backlog cases, 82 required DB
+cases, 51 error/identity companions and five native ABI cases: 153 executions
+with no failures, skips or leaks. Tests exercise overlapping retained credits,
+recovery appends across tracker growth, reverse credit ownership transfer,
+concurrent cancellation and tracking, every tracker/output allocation failure,
+original cancellation after funding, quota rejection without publication,
+credit return and reacquisition, and refresh without another quota charge.
+The cancellation fixture observes an atomic slot counter so lifetime callbacks
+do not reenter a held resource-ledger lock, and supplies borrowed test I/O for
+controlled admission while optional workers remain disabled.
+
+All 5,501 native/schema source inputs match the frozen-source receipt
+retained-backlog-v4. Evidence is retained in retained-backlog-verified.json in
+the cumulative receipts. Earlier interrupted and failed fixture runs are diagnostic
+only. The 969-source production boundary, generated errors, control catalog,
+formatting and whitespace checks pass. Full linked owner-image, object-engine,
+crash and cross-engine performance qualification remain open.

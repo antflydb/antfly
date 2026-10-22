@@ -148785,3 +148785,101 @@ test "db prepared transaction effects required assembly prepared completion reta
         try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(F.id));
     }
 }
+
+test "db prepared transaction effects required assembly retained backlog credits bound candidates without publication" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    const Physical = @import("artifact_authored_acceptance.zig").OwnedPhysicalPlan;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{ .hard_limit_bytes = 8192 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    var directory = try TestDirectory.init("prepared-retained-backlog");
+    defer directory.cleanup();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    var options = F.options;
+    options.resource_manager = &manager;
+    options.backend_runtime = runtime.ptr();
+    options.executor = .{ .backend = .manual };
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    try F.seed(&db, false, false);
+    const baseline = manager.sliceStats(.derived_backlog).used_bytes;
+    var probe = try db.executor.admitBacklogBytes(0);
+    const slots = &probe.slot_owner.?.reserved_slots;
+    probe.cancel();
+    try std.testing.expectEqual(@as(usize, 0), slots.load(.acquire));
+    const Cleanup = struct {
+        slots: *std.atomic.Value(usize),
+        saw_funded: bool = false,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Lifetime callbacks may run under the resource ledger lock.
+            // Observe the independently atomic slot count without reentry.
+            if (self.slots.load(.acquire) > 0) {
+                self.saw_funded = true;
+                return error.DeadlineExceeded;
+            }
+        }
+        fn run(output: Allocator, owner: *DB, manager_ptr: *resource_manager_mod.ResourceManager, initial: u64) !void {
+            defer std.testing.expectEqual(initial, manager_ptr.sliceStats(.derived_backlog).used_bytes) catch @panic("assembly quota leaked on failure");
+            var plan = try owner.prepareTransactionAssembly(output, F.id, 19, null);
+            defer plan.deinit();
+            try std.testing.expect(plan.backlog_admission.reservation != null);
+        }
+    };
+    var workspace = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.testing.expectEqual(@as(usize, 0), workspace.deinit()) catch @panic("assembly quota sweep leaked output");
+    try std.testing.checkAllAllocationFailures(workspace.allocator(), Cleanup.run, .{ &db, &manager, baseline });
+    var cleanup: Cleanup = .{ .slots = slots };
+    var control: @import("../../common/read_admission.zig").Payload = .{ .ptr = &cleanup, .vtable = &.{ .checkpoint = Cleanup.check } };
+    try std.testing.expectError(error.DeadlineExceeded, db.prepareTransactionAssembly(a, F.id, 19, .init(&control)));
+    try std.testing.expect(cleanup.saw_funded);
+    try std.testing.expectEqual(baseline, manager.sliceStats(.derived_backlog).used_bytes);
+    const sequence = db.core.nextDerivedAppendSequence();
+    const before = try F.snapshot(&db);
+    defer F.free(before);
+    var plans: std.ArrayListUnmanaged(Physical) = .empty;
+    defer {
+        for (plans.items) |*plan| plan.deinit();
+        plans.deinit(a);
+    }
+    var retained: u64 = 0;
+    var rejected = false;
+    for (0..200) |_| {
+        var plan = db.prepareTransactionAssembly(a, F.id, 19, null) catch |cause| switch (cause) {
+            error.ResourceBudgetExceeded => {
+                rejected = true;
+                break;
+            },
+            else => return cause,
+        };
+        var transferred = false;
+        defer if (!transferred) plan.deinit();
+        try std.testing.expect(plan.backlog_admission.reservation != null);
+        retained += plan.backlog_admission.retained_bytes;
+        try plans.append(a, plan);
+        transferred = true;
+        try std.testing.expectEqual(baseline + retained, manager.sliceStats(.derived_backlog).used_bytes);
+        try std.testing.expect(manager.sliceStats(.derived_backlog).used_bytes <= 8192);
+    }
+    try std.testing.expect(rejected and plans.items.len > 1);
+    try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+    const last = plans.items.len - 1;
+    const released = plans.items[last].backlog_admission.retained_bytes;
+    plans.items[last].deinit();
+    plans.items.len = last;
+    retained -= released;
+    try std.testing.expectEqual(baseline + retained, manager.sliceStats(.derived_backlog).used_bytes);
+    var replacement = try db.prepareTransactionAssembly(a, F.id, 19, null);
+    defer replacement.deinit();
+    try std.testing.expectEqual(released, replacement.backlog_admission.retained_bytes);
+    _ = db.core.reserveDerivedAppendSequence();
+    try db.refreshTransactionAssembly(&replacement, null);
+    try std.testing.expectEqual(baseline + retained + released, manager.sliceStats(.derived_backlog).used_bytes);
+    const after = try F.snapshot(&db);
+    defer F.free(after);
+    try std.testing.expectEqualDeep(before, after);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(F.id));
+}

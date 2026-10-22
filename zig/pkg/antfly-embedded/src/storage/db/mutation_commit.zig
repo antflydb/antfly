@@ -3230,7 +3230,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // occurs while the apply fence is held. A hard-limit failure is
             // returned before the primary mutation and replay intent commit.
             const backlog_admission_start_ns = monotonicTimeNs();
-            var backlog_admission = if (opts.assembly == null and append_derived_replay)
+            var backlog_admission = if (append_derived_replay)
                 try S.ownerField(self, "executor").*.admitBacklogBytes(@intCast(replay_payload.len))
             else
                 derived_executor_mod.BacklogAdmission{};
@@ -3304,6 +3304,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 prepared_physical.?.replay_bindings.?.bindValidated(&prepared_physical.?.bytes, assembly_replay_next);
                 prepared_physical.?.bindReplayPrograms(replay_bindings.symbolic, assembly_replay_next);
                 try prepared_physical.?.validateDependencies(S.ownerField(self, "core").*, publication_control);
+                prepared_physical.?.backlog_admission = backlog_admission;
+                backlog_admission = .{};
                 output.plan = prepared_physical;
                 prepared_physical = null;
                 unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);

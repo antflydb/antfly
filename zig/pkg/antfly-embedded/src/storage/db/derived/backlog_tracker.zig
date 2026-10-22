@@ -38,15 +38,23 @@ pub const Tracker = struct {
     pub const Admission = struct {
         reservation: ?resource_manager_mod.Reservation = null,
         retained_bytes: u64 = 0,
+        // The runtime/tracker must outlive every outstanding admission. Cancel
+        // may run outside its mutex, so only the slot counter is touched here.
+        slot_owner: ?*Tracker = null,
 
         pub fn cancel(self: *Admission) void {
             if (self.reservation) |*reservation| reservation.release();
+            if (self.slot_owner) |owner| {
+                const previous = owner.reserved_slots.fetchSub(1, .acq_rel);
+                std.debug.assert(previous > 0);
+            }
             self.* = .{};
         }
     };
 
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    reserved_slots: std.atomic.Value(usize) = .init(0),
     retained_bytes: u64 = 0,
     accounted_bytes: u64 = 0,
     // Once entry allocation fails, retain exact aggregate accounting and force
@@ -62,6 +70,7 @@ pub const Tracker = struct {
     }
 
     pub fn deinit(self: *Tracker, alloc: Allocator) void {
+        std.debug.assert(self.reserved_slots.load(.acquire) == 0);
         for (self.entries.items) |*entry| {
             if (entry.reservation) |*reservation| reservation.release();
         }
@@ -80,10 +89,10 @@ pub const Tracker = struct {
             self.observe(self.accounted_bytes +| retained_bytes);
             return;
         }
-        self.entries.append(alloc, .{
-            .sequence = sequence,
-            .retained_bytes = retained_bytes,
-        }) catch {
+        // Recovered/non-admitted records must not consume storage promised to
+        // retained candidates. Cancellation only decreases this atomic count.
+        const capacity = std.math.add(usize, self.reserved_slots.load(.acquire), 1) catch return error.ResourceLimitExceeded;
+        self.entries.ensureUnusedCapacity(alloc, capacity) catch {
             self.overflow_first_sequence = sequence;
             self.overflow_last_sequence = sequence;
             self.overflow_bytes = retained_bytes;
@@ -91,22 +100,23 @@ pub const Tracker = struct {
             self.observe(self.accounted_bytes +| retained_bytes);
             return;
         };
+        self.entries.appendAssumeCapacity(.{ .sequence = sequence, .retained_bytes = retained_bytes });
         self.retained_bytes +|= retained_bytes;
         self.observe(self.accounted_bytes +| retained_bytes);
     }
 
     /// Reserves exact node-wide replay capacity at the last fallible boundary
-    /// before a source mutation becomes durable. Source mutations for one DB
-    /// are serialized, so reserving list capacity here guarantees the later
-    /// post-commit transfer is allocation-free.
+    /// before a source mutation becomes durable. The runtime serializes admit,
+    /// track and commit. Multiple retained candidates each own a future slot;
+    /// cancel may retire a slot from another thread without the runtime lock.
     pub fn admit(self: *Tracker, alloc: Allocator, bytes: u64) !Admission {
         const manager = self.resource_manager orelse return .{};
-        try self.entries.ensureUnusedCapacity(alloc, 1);
+        const capacity = std.math.add(usize, self.reserved_slots.load(.acquire), 1) catch return error.ResourceLimitExceeded;
+        try self.entries.ensureUnusedCapacity(alloc, capacity);
         const retained_bytes = retainedCharge(bytes);
-        return .{
-            .reservation = try manager.reserveImmediate(.derived_backlog, retained_bytes),
-            .retained_bytes = retained_bytes,
-        };
+        const reservation = try manager.reserveImmediate(.derived_backlog, retained_bytes);
+        _ = self.reserved_slots.fetchAdd(1, .acq_rel);
+        return .{ .reservation = reservation, .retained_bytes = retained_bytes, .slot_owner = self };
     }
 
     /// Transfers an admitted credit after the primary WAL and replay intent
@@ -117,14 +127,16 @@ pub const Tracker = struct {
             admission.* = .{};
             return;
         }
+        std.debug.assert(admission.slot_owner == self);
+        const previous = self.reserved_slots.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
         self.entries.appendAssumeCapacity(.{
             .sequence = sequence,
             .retained_bytes = admission.retained_bytes,
             .reservation = admission.reservation,
         });
         self.retained_bytes +|= admission.retained_bytes;
-        admission.reservation = null;
-        admission.retained_bytes = 0;
+        admission.* = .{};
     }
 
     pub fn releaseThrough(self: *Tracker, sequence: u64) void {
@@ -385,4 +397,70 @@ test "derived backlog tracker reacts to aggregate lsm state pressure" {
     try std.testing.expectEqual(@as(?u64, 7), tracker.throttleTargetSequence());
     manager.observeUsage(.lsm_in_memory_state, &lsm_bytes, 0);
     try std.testing.expectEqual(@as(?u64, null), tracker.throttleTargetSequence());
+}
+
+test "derived backlog admission retained backlog credits survive recovered records and reverse ownership transfer" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var tracker = Tracker.init(&manager);
+    defer tracker.deinit(std.testing.allocator);
+    var held: [64]Tracker.Admission = @splat(.{});
+    defer for (&held) |*credit| credit.cancel();
+    for (&held) |*credit| credit.* = try tracker.admit(std.testing.allocator, 9);
+    // Recovery can append while many candidates are retained. Its appends
+    // must preserve every future commit slot, including across reallocations.
+    for (1..257) |sequence| try tracker.track(std.testing.allocator, sequence, 3);
+    const backing = tracker.entries.items.ptr;
+    const capacity = tracker.entries.capacity;
+    for (0..held.len) |index| tracker.commitAdmission(257 + index, &held[held.len - index - 1]);
+    try std.testing.expectEqual(backing, tracker.entries.items.ptr);
+    try std.testing.expectEqual(capacity, tracker.entries.capacity);
+    try std.testing.expectEqual(@as(usize, 0), tracker.reserved_slots.load(.acquire));
+    tracker.releaseThrough(319);
+    try std.testing.expectEqual(Tracker.retainedCharge(9), manager.sliceStats(.derived_backlog).used_bytes);
+    tracker.releaseThrough(320);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_backlog).used_bytes);
+}
+
+test "derived backlog admission retained backlog allocation failures return every credit and slot" {
+    const F = struct {
+        fn run(a: Allocator) !void {
+            var manager = resource_manager_mod.ResourceManager.init(.{});
+            defer manager.deinit(std.testing.allocator);
+            defer std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_backlog).used_bytes) catch @panic("retained credit leaked");
+            var tracker = Tracker.init(&manager);
+            defer tracker.deinit(a);
+            var held: [64]Tracker.Admission = @splat(.{});
+            defer for (&held) |*credit| credit.cancel();
+            for (&held) |*credit| credit.* = try tracker.admit(a, 9);
+            for (0..32) |index| tracker.commitAdmission(index + 1, &held[index]);
+            for (held[32..]) |*credit| credit.cancel();
+            try std.testing.expectEqual(@as(usize, 0), tracker.reserved_slots.load(.acquire));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+}
+
+test "derived backlog admission retained backlog cancellation may race unrelated tracking and transfers" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var tracker = Tracker.init(&manager);
+    defer tracker.deinit(std.testing.allocator);
+    var held: [128]Tracker.Admission = @splat(.{});
+    defer for (&held) |*credit| credit.cancel();
+    for (&held) |*credit| credit.* = try tracker.admit(std.testing.allocator, 9);
+    const Cancel = struct {
+        fn run(credits: []Tracker.Admission) void {
+            for (credits) |*credit| credit.cancel();
+        }
+    };
+    {
+        const worker = try std.Thread.spawn(.{}, Cancel.run, .{held[0..64]});
+        defer worker.join();
+        for (1..513) |sequence| try tracker.track(std.testing.allocator, sequence, 3);
+        for (held[64..], 513..) |*credit, sequence| tracker.commitAdmission(sequence, credit);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.reserved_slots.load(.acquire));
+    tracker.releaseThrough(576);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_backlog).used_bytes);
 }

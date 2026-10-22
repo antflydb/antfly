@@ -220,6 +220,9 @@ pub const OwnedPhysicalPlan = struct {
     replay_bindings: ?@import("prepared_replay_bindings.zig").Bindings = null,
     commit_state: @import("prepared_commit_state.zig").State = .{},
     completion: ?@import("prepared_completion.zig").Owned = null,
+    /// Owns quota and one allocation-free tracker slot until cancellation or
+    /// primary-commit transfer. The DB/runtime must outlive this candidate.
+    backlog_admission: @import("derived/backlog_tracker.zig").Tracker.Admission = .{},
     /// This candidate cannot authorize a vote or a direct commit. Its current
     /// sequence is optimistic until refreshed under the owning apply fence.
     preparation: ?struct {
@@ -304,6 +307,7 @@ pub const OwnedPhysicalPlan = struct {
     }
 
     pub fn deinit(self: *OwnedPhysicalPlan) void {
+        self.backlog_admission.cancel();
         if (self.completion) |*owned| owned.deinit();
         if (self.replay_bindings) |*value| value.deinit();
         if (self.counter_deltas) |*program| program.deinit();
