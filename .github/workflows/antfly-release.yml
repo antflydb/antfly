@@ -534,11 +534,12 @@ jobs:
             dist/release-payload/antfly-embedded-source_*.tar.gz
             dist/release-payload/antfly-lite_*.tar.gz
             dist/release-payload/antfly-inference_*.tar.gz)
+          cli_archives=(dist/release-payload/*.tgz dist/release-payload/*.whl)
           shopt -u nullglob
           test "${#runtime_archives[@]}" -gt 0
           cp "${runtime_archives[@]}" dist/release-runtime/
-          cp dist/release-payload/*.tgz dist/release-payload/*.whl \
-            dist/release-payload/cli-snapshot.json dist/verified-cli-snapshot/
+          cp dist/release-payload/cli-snapshot.json "${cli_archives[@]}" \
+            dist/verified-cli-snapshot/
           python scripts/release/verify_release_ledger.py \
             --ledger dist/release-ledger/artifacts.json \
             --payload-dir dist/release-runtime \
