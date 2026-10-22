@@ -611,3 +611,10 @@ enclosing build and host quota, in addition to its scheduler reservation. A
 point-in-time headroom observation never authorizes allocation outside that
 chain. Concurrent required work can decline speculation; joining it releases all
 state before retrying the required read.
+
+Filesystem retention inheritance and sealing share a blocking mutex per store
+handle. Parallel native families cannot race pending-root replacement, queue
+reallocation or arena destruction; sealing observes a complete batch. Durable
+certificate writes remain atomic and namespace epochs still invalidate changed
+payloads. An optional prefetch quota decline cannot override a later explicit
+source, integrity or lease failure in publication diagnostics.

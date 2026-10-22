@@ -106,10 +106,14 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
         var admitted = try catalog.parse(a, lease.record.lake_index_catalog_json);
         defer admitted.deinit();
         const retry_at = std.math.add(u64, failure_time, options.retry_ms) catch std.math.maxInt(u64);
-        const failed_bytes = try catalog.encode(a, try admitted.value.fail(admitted.value.pending.?.token, if (working.limit_exceeded) "LakeSidecarBuildLimitExceeded" else @errorName(build_error), retry_at));
+        // Optional prefetch may have declined an earlier allocation. That
+        // historical quota flag cannot replace an explicit source, integrity,
+        // cancellation or lease error from the required construction path.
+        const working_limit = build_error == error.OutOfMemory and working.limit_exceeded;
+        const failed_bytes = try catalog.encode(a, try admitted.value.fail(admitted.value.pending.?.token, if (working_limit) "LakeSidecarBuildLimitExceeded" else @errorName(build_error), retry_at));
         defer a.free(failed_bytes);
         try lease.replaceCatalog(failed_bytes);
-        if (working.limit_exceeded) return error.LakeSidecarBuildLimitExceeded;
+        if (working_limit) return error.LakeSidecarBuildLimitExceeded;
         return build_error;
     };
     defer build_alloc.free(published_bytes);
