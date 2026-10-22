@@ -23,15 +23,14 @@ import sys
 from pathlib import Path
 
 import yaml
-from openapi_spec_validator import validate_spec
-
 from openapi_inputs import load_yaml, record_dependencies
+from openapi_spec_validator import validate_spec
 from public_openapi_overlays import add_unified_auth_responses
-
 
 ROOT = Path(__file__).resolve().parent.parent
 JOIN_OPENAPI = ROOT / "scripts/join_openapi.py"
 INFERENCE_SPEC = ROOT / "specs/openapi/inference/api.yaml"
+GATEWAY_SPEC = ROOT / "specs/openapi/inference/gateway.yaml"
 EXTENSIONS_SPEC = ROOT / "specs/openapi/extensions/api.yaml"
 OUTPUT = ROOT / "openapi.yaml"
 
@@ -80,6 +79,8 @@ def prefixed_path(prefix: str, path: str) -> str:
 
 
 def inference_public_path(path: str) -> str:
+    if path.startswith("/ml/v1/"):
+        return path
     if path == "/predict":
         return prefixed_path("/ml/v1", path)
     if path == "/predictors":
@@ -257,7 +258,27 @@ def merge_components(
 def join_specs() -> dict:
     antfly = join_antfly_spec()
     inference = load_yaml(INFERENCE_SPEC)
+    gateway = load_yaml(GATEWAY_SPEC)
+    inference["paths"].update(gateway.get("paths", {}))
+    inference["components"] = merge_component_sections(
+        inference.get("components", {}), gateway.get("components", {})
+    )
     extensions = load_yaml(EXTENSIONS_SPEC)
+    # Vendor adapters preserve actual usage when available. The native runtime
+    # keeps its own stronger usage contract; the public gateway may omit it.
+    for name in (
+        "RerankResponse",
+        "TranscribeResponse",
+        "DictateResponse",
+        "ReadResponse",
+        "EmbedResponse",
+        "GenerateResponse",
+    ):
+        schema = inference.get("components", {}).get("schemas", {}).get(name, {})
+        if "required" in schema:
+            schema["required"] = [
+                field for field in schema["required"] if field != "usage"
+            ]
     inference_schema_names = referenced_inference_schema_names(inference)
 
     paths = {}

@@ -24,6 +24,7 @@ pub const MediaContent = generating.MediaContent;
 pub const ContentPart = generating.ContentPart;
 pub const ChatMessageContent = generating.ChatMessageContent;
 pub const ToolCall = generating.ToolCall;
+pub const GenerationUsage = generating.GenerationUsage;
 pub const ChatMessage = generating.ChatMessage;
 
 /// Request-scoped local generation controls. Keep these in the provider
@@ -53,6 +54,7 @@ pub const GenerateMessagesRequest = struct {
 };
 
 pub const localGenerationStatusError = generating.localGenerationStatusError;
+pub const remoteGenerationStatusError = generating.remoteGenerationStatusError;
 
 test "local generation budgets preserve explicit limits and reject overflow" {
     try std.testing.expectEqual(@as(i32, 128), (try GenerationOptions.fromMaxTokens(128)).max_tokens);
@@ -340,11 +342,11 @@ pub const SparseEmbedResult = struct {
 
 pub const GenerateResult = struct {
     content: []const u8,
+    usage: ?GenerationUsage = null,
     tool_calls: []ToolCall = &.{},
     tool_calls_synthesized: bool = false,
     token_logprobs_json: ?[]const u8 = null,
     google_parts_json: ?[]const u8 = null,
-    usage: ?struct { input_tokens: u64, output_tokens: u64 } = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *GenerateResult) void {

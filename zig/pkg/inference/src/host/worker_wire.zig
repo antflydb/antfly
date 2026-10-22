@@ -266,6 +266,7 @@ pub const ProviderOutput = struct {
 };
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Http = struct {
+    streaming_body: bool = false,
     route: []const u8,
     method: http.HttpMethod,
     path: []const u8,

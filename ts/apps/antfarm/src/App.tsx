@@ -27,6 +27,7 @@ import CreateTablePage from "./pages/CreateTablePage";
 import EmbeddingPlaygroundPage from "./pages/EmbeddingPlaygroundPage";
 import EvalsPlaygroundPage from "./pages/EvalsPlaygroundPage";
 import ExtractionPlaygroundPage from "./pages/ExtractionPlaygroundPage";
+import InferenceGatewayPage from "./pages/InferenceGatewayPage";
 import KnowledgeGraphPlaygroundPage from "./pages/KnowledgeGraphPlaygroundPage";
 import { LoginPage } from "./pages/LoginPage";
 import ModelsPage from "./pages/ModelsPage";
@@ -235,6 +236,7 @@ function AppContent() {
                     {isProductEnabled("inference") && (
                       <>
                         <Route path="/inference/models" element={<ModelsPage />} />
+                        <Route path="/inference/gateway" element={<InferenceGatewayPage />} />
                         <Route
                           path="/inference/playground/chunk"
                           element={<ChunkingPlaygroundPage />}

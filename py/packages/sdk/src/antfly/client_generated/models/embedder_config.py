@@ -158,6 +158,7 @@ class EmbedderConfig:
 
         Attributes:
             provider (EmbedderProvider): The embedding provider to use.
+            sparse (bool | Unset): This named embedder produces sparse index/value vectors.
             rate_limit (RateLimitConfig | Unset): Outbound provider limits shared within one Antfly process by effective
                 endpoint, operation, model, credential source, project and region/location.
                 Conflicting policies for an active scope are rejected. These limits do
@@ -198,6 +199,7 @@ class EmbedderConfig:
     """
 
     provider: EmbedderProvider
+    sparse: bool | Unset = UNSET
     rate_limit: RateLimitConfig | Unset = UNSET
     inputs: list[EmbedderConfigInputsItem] | Unset = UNSET
     query_input_type: str | Unset = UNSET
@@ -208,6 +210,8 @@ class EmbedderConfig:
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
+
+        sparse = self.sparse
 
         rate_limit: dict[str, Any] | Unset = UNSET
         if not isinstance(self.rate_limit, Unset):
@@ -237,6 +241,8 @@ class EmbedderConfig:
                 "provider": provider,
             }
         )
+        if sparse is not UNSET:
+            field_dict["sparse"] = sparse
         if rate_limit is not UNSET:
             field_dict["rate_limit"] = rate_limit
         if inputs is not UNSET:
@@ -259,6 +265,8 @@ class EmbedderConfig:
 
         d = dict(src_dict)
         provider = EmbedderProvider(d.pop("provider"))
+
+        sparse = d.pop("sparse", UNSET)
 
         _rate_limit = d.pop("rate_limit", UNSET)
         rate_limit: RateLimitConfig | Unset
@@ -291,6 +299,7 @@ class EmbedderConfig:
 
         embedder_config = cls(
             provider=provider,
+            sparse=sparse,
             rate_limit=rate_limit,
             inputs=inputs,
             query_input_type=query_input_type,

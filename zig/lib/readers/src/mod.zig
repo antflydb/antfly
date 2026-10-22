@@ -194,6 +194,8 @@ pub const BatchExecution = struct {
 pub const BatchResult = struct {
     items: []Result,
     execution: BatchExecution,
+    /// Provider-reported token counts, absent when the adapter has no usage.
+    usage: ?inference_api.GenerateUsage = null,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.items) |*item| deinitResult(alloc, item);
@@ -274,7 +276,7 @@ pub const Runtime = struct {
 
     pub fn get(self: *const Runtime, name: ?[]const u8) !Reader {
         const resolved = name orelse self.default_provider orelse return error.NoDefaultReaderProvider;
-        return self.readers.get(resolved) orelse return error.UnknownReaderProvider;
+        return self.readers.get(canonicalName(resolved)) orelse return error.UnknownReaderProvider;
     }
 };
 
@@ -344,7 +346,7 @@ pub const Registry = struct {
 
     pub fn getConfig(self: *const Registry, name: ?[]const u8) !Config {
         const resolved = name orelse self.default_provider orelse return error.NoDefaultReaderProvider;
-        return self.configs.get(resolved) orelse return error.UnknownReaderProvider;
+        return self.configs.get(canonicalName(resolved)) orelse return error.UnknownReaderProvider;
     }
 };
 
@@ -409,8 +411,8 @@ fn initReaderWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, opt
     try cfg.validate();
     return switch (cfg.provider) {
         .antfly => try AntflyReaderState.init(alloc, http, cfg, options),
-        .openai => try OpenAiReaderState.init(alloc, http, cfg),
-        .vertex => try VertexReaderState.init(alloc, http, cfg),
+        .openai => try OpenAiReaderState.init(alloc, http, cfg, options),
+        .vertex => try VertexReaderState.init(alloc, http, cfg, options),
         .apple => try AppleReaderState.init(alloc, http, cfg, options),
     };
 }
@@ -653,6 +655,7 @@ const AntflyReaderState = struct {
         return .{
             .items = out,
             .execution = try batchExecutionFromWire(parsed.value.execution, out.len),
+            .usage = parsed.value.usage,
         };
     }
 
@@ -777,6 +780,7 @@ const AntflyReaderState = struct {
         return .{
             .items = out,
             .execution = try batchExecutionFromWire(parsed.value.execution, out.len),
+            .usage = parsed.value.usage,
         };
     }
 };
@@ -860,14 +864,17 @@ fn CloudReaderState(comptime provider: Provider) type {
         project_id: ?[]const u8 = null,
         location: ?[]const u8 = null,
 
+        options: RemoteOptions,
+
         const Self = @This();
 
-        fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Reader {
+        fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
             const state = try alloc.create(Self);
             errdefer alloc.destroy(state);
             state.* = .{
                 .alloc = alloc,
                 .http = http,
+                .options = options,
                 .base_url = try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
                     .openai => "https://api.openai.com/v1",
                     .vertex => "https://aiplatform.googleapis.com/v1",
@@ -928,13 +935,14 @@ fn CloudReaderState(comptime provider: Provider) type {
             alloc: Allocator,
             headers: *std.ArrayList([2][]const u8),
             minted_auth: *?[]u8,
+            control: google_auth.RequestControl,
         ) !void {
             if (self.auth_header) |header| {
                 try headers.append(alloc, header);
                 return;
             }
             if (self.token_source) |source| {
-                minted_auth.* = try source.authorizationValueAlloc(alloc);
+                minted_auth.* = try source.authorizationValueAllocWithControl(alloc, control);
                 try headers.append(alloc, .{ "Authorization", minted_auth.*.? });
             }
         }
@@ -949,6 +957,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         }
 
         fn readOpenAi(self: *Self, alloc: Allocator, req: Request) ![]Result {
+            const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
             var content = std.json.Array.init(alloc);
             defer {
                 for (content.items) |*item| deinitJsonValue(alloc, item);
@@ -976,11 +985,16 @@ fn CloudReaderState(comptime provider: Provider) type {
             defer headers.deinit(alloc);
             var minted_auth: ?[]u8 = null;
             defer if (minted_auth) |value| alloc.free(value);
-            try self.appendAuthHeaders(alloc, &headers, &minted_auth);
+            try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
             var resp = try self.http.post(url, .{
                 .json = body,
                 .headers = headers.items,
                 .max_response_size = req.max_response_bytes,
+                .timeout_ms = try control.remainingTimeoutMs(),
+                .cancellation = self.options.cancellation,
+                .max_retries = 0,
+                .follow_redirects = false,
+                .cookies_enabled = false,
             });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
@@ -992,6 +1006,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         }
 
         fn readVertex(self: *Self, alloc: Allocator, req: Request) ![]Result {
+            const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
             var parts = std.json.Array.init(alloc);
             defer {
                 for (parts.items) |*item| deinitJsonValue(alloc, item);
@@ -1002,8 +1017,14 @@ fn CloudReaderState(comptime provider: Provider) type {
             const contents = [_]struct { role: []const u8, parts: std.json.Value }{
                 .{ .role = "user", .parts = .{ .array = parts } },
             };
-            const Body = struct { contents: []const @TypeOf(contents[0]) };
-            const body = try httpx.json.Json.stringify(alloc, Body{ .contents = &contents });
+            const Body = struct {
+                contents: []const @TypeOf(contents[0]),
+                generationConfig: ?struct { maxOutputTokens: i64 } = null,
+            };
+            const body = try httpx.json.Json.stringify(alloc, Body{
+                .contents = &contents,
+                .generationConfig = if (req.max_tokens orelse self.max_tokens) |limit| .{ .maxOutputTokens = limit } else null,
+            });
             defer alloc.free(body);
             const url = try std.fmt.allocPrint(alloc, "{s}/projects/{s}/locations/{s}/publishers/google/models/{s}:generateContent", .{
                 self.base_url,
@@ -1016,11 +1037,16 @@ fn CloudReaderState(comptime provider: Provider) type {
             defer headers.deinit(alloc);
             var minted_auth: ?[]u8 = null;
             defer if (minted_auth) |value| alloc.free(value);
-            try self.appendAuthHeaders(alloc, &headers, &minted_auth);
+            try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
             var resp = try self.http.post(url, .{
                 .json = body,
                 .headers = headers.items,
                 .max_response_size = req.max_response_bytes,
+                .timeout_ms = try control.remainingTimeoutMs(),
+                .cancellation = self.options.cancellation,
+                .max_retries = 0,
+                .follow_redirects = false,
+                .cookies_enabled = false,
             });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
@@ -1553,4 +1579,9 @@ fn expectAntflyReaderBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqualStrings("data:image/png;base64,ZmFrZTI=", parsed.value.images[1].url);
     try std.testing.expectEqualStrings("read pages", parsed.value.prompt orelse return error.MissingPrompt);
     try std.testing.expectEqual(@as(?i64, 42), parsed.value.max_tokens);
+}
+
+fn canonicalName(name: []const u8) []const u8 {
+    const prefix = "readers/";
+    return if (std.mem.startsWith(u8, name, prefix)) name[prefix.len..] else name;
 }

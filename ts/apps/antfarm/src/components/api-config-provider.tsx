@@ -81,9 +81,11 @@ export function ApiConfigProvider({ children }: { children: ReactNode }) {
 
   const inferenceUrl = useCallback(
     (operation: string) =>
-      inferenceConnectionId === "local-inference"
-        ? `${inferenceApiUrl}/ai/v1/${operation}`
-        : `${apiUrl}/connections/${encodeURIComponent(inferenceConnectionId)}/inference/${operation}`,
+      inferenceConnectionId === "named-inference"
+        ? `${apiUrl.replace(/\/db\/v1\/?$/, "")}/ai/v1/${operation}`
+        : inferenceConnectionId === "local-inference"
+          ? `${inferenceApiUrl}/ai/v1/${operation}`
+          : `${apiUrl}/connections/${encodeURIComponent(inferenceConnectionId)}/inference/${operation}`,
     [apiUrl, inferenceApiUrl, inferenceConnectionId]
   );
 

@@ -74,7 +74,15 @@ test "RaBitQuantizer recall matches Go fixture subset" {
         defer std.testing.allocator.free(dataset_path);
 
         std.Io.Dir.cwd().access(std.testing.io, dataset_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return error.SkipZigTest,
+            error.FileNotFound => {
+                // The recall conformance target sets this so a missing dataset
+                // fails instead of letting CI pass by skipping.
+                if (std.testing.environ.getPosix("ANTFLY_VECTORSETS_REQUIRED") != null) {
+                    std.debug.print("missing recall dataset {s}; run `zig build antfly-recall-conformance`\n", .{dataset_path});
+                    return error.RecallDatasetMissing;
+                }
+                return error.SkipZigTest;
+            },
             else => return err,
         };
 
@@ -87,16 +95,20 @@ test "RaBitQuantizer recall matches Go fixture subset" {
 }
 
 fn convertedDatasetPathAlloc(alloc: std.mem.Allocator, gob_name: []const u8) ![]u8 {
-    const file_dir = std.fs.path.dirname(@src().file) orelse return error.Unexpected;
-    const root = try std.fs.path.resolve(alloc, &.{ file_dir, "..", "..", ".." });
-    defer alloc.free(root);
-
     const converted = if (std.mem.endsWith(u8, gob_name, ".gob"))
         try std.fmt.allocPrint(alloc, "{s}.pbvec", .{gob_name[0 .. gob_name.len - 4]})
     else
         try std.fmt.allocPrint(alloc, "{s}.pbvec", .{gob_name});
     defer alloc.free(converted);
 
+    // `zig build antfly-recall-conformance` points this at the fetched,
+    // hash-pinned datasets; otherwise use the legacy in-tree location.
+    if (std.testing.environ.getPosix("ANTFLY_VECTORSETS_DIR")) |dir| {
+        return std.fs.path.join(alloc, &.{ dir, converted });
+    }
+    const file_dir = std.fs.path.dirname(@src().file) orelse return error.Unexpected;
+    const root = try std.fs.path.resolve(alloc, &.{ file_dir, "..", "..", ".." });
+    defer alloc.free(root);
     return std.fs.path.join(alloc, &.{ root, "testdata", "vectorsets", converted });
 }
 

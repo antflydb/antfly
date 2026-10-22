@@ -22,6 +22,7 @@ select the full and focused artifacts; defaults are under zig/zig-out/bin.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -52,7 +53,14 @@ def test_worker_launch_body_limits_and_replacement(tmp_path, focused):
     process = None
     with LoopbackPortReservations() as ports, log_path.open("w") as log:
         port = ports.reserve()
-        command = [str(renamed), *([] if focused else ["standalone"])]
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"public_inference": {"enabled": True}}))
+        command = [
+            str(renamed),
+            *([] if focused else ["standalone"]),
+            "--config",
+            str(config_path),
+        ]
         command.extend(
             [
                 "--host",

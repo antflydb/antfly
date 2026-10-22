@@ -623,6 +623,10 @@ fn ManifestServer(comptime prefix: []const u8) type {
             try self.register(.post, path, handler);
         }
 
+        pub fn postStreamingRaw(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            try self.registerWithMetadata(.post, path, handler, .{ .request_body = .streaming_raw, .streaming_response = true });
+        }
+
         pub fn postResponseStreaming(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.registerWithMetadata(.post, path, handler, .{
                 .request_body = .buffered,
@@ -650,6 +654,7 @@ const RouteMetadata = struct {
 };
 
 fn routeMetadata(method: abi.HttpMethod, path: []const u8) RouteMetadata {
+    if (std.mem.endsWith(u8, path, "/events") and std.mem.startsWith(u8, path, "/ai/v1/transcription/sessions/")) return .{ .request_body = .none, .streaming_response = true };
     const method_name = switch (method) {
         .get => "GET",
         .post => "POST",
@@ -766,8 +771,14 @@ test "linked API route manifest preserves internal scan response streaming" {
     var found_scan = false;
     var found_query = false;
     var public_queries: usize = 0;
+    var gateway_routes: usize = 0;
     for (entries.?[0..len]) |entry| {
         if (entry.method != .post) continue;
+        if (@import("inference_gateway.zig").ownsPath(entry.path.slice())) {
+            try std.testing.expectEqual(if (std.mem.endsWith(u8, entry.path.slice(), "/stream")) abi.RequestBodyMode.streaming_raw else abi.RequestBodyMode.buffered, entry.request_body);
+            try std.testing.expectEqual(@as(u8, 1), entry.streaming_response);
+            gateway_routes += 1;
+        }
         inline for (.{ "/db/v1/query", "/db/v1/tables/:tableName/query", "/db/v1/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/query" }) |path| {
             if (std.mem.eql(u8, entry.path.slice(), path)) {
                 try std.testing.expectEqual(abi.RequestBodyMode.buffered, entry.request_body);
@@ -787,6 +798,7 @@ test "linked API route manifest preserves internal scan response streaming" {
         }
     }
     try std.testing.expect(found_scan and found_query);
+    try std.testing.expectEqual(@as(usize, 18), gateway_routes);
     try std.testing.expectEqual(@as(usize, 3), public_queries);
 }
 

@@ -17,6 +17,7 @@ const std = @import("std");
 const data_uri = @import("antfly_scraping").data_uri;
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
+pub const RequestControl = google_auth.RequestControl;
 const inference = @import("antfly_inference_types");
 const provider_defaults = @import("antfly_inference_provider_defaults");
 
@@ -172,7 +173,7 @@ pub const GeminiProvider = struct {
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
+        if (!resp.ok()) return inference.remoteGenerationStatusError(resp.status.code);
         return try parseGenerateResponseAlloc(alloc, resp.body orelse return error.EmptyResponse, messages.len);
     }
 
@@ -528,7 +529,7 @@ pub const Provider = struct {
             .cancellation = control.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
+        if (!resp.ok()) return inference.remoteGenerationStatusError(resp.status.code);
         const body = resp.body orelse return error.EmptyResponse;
 
         return try parseGenerateResponseAlloc(alloc, body, messages.len);
@@ -622,7 +623,7 @@ test "reranking runtime maps Vertex record IDs back to input order" {
 
 fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8, history_len: usize) !inference.GenerateResult {
     const Response = struct {
-        usageMetadata: ?struct { promptTokenCount: u64 = 0, candidatesTokenCount: u64 = 0, thoughtsTokenCount: u64 = 0 } = null,
+        usageMetadata: std.json.Value = .null,
         candidates: []const struct {
             content: struct { parts: []const std.json.Value = &.{} },
         } = &.{},
@@ -676,11 +677,13 @@ fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8, history_len: u
     // Preserve part ordering and thought signatures verbatim for Google replay.
     const google_parts = try std.json.Stringify.valueAlloc(alloc, parts, .{});
     errdefer alloc.free(google_parts);
+    var usage = inference.GenerationUsage.fromValue(parsed.value.usageMetadata, "promptTokenCount", "candidatesTokenCount", "totalTokenCount");
+    if (usage) |*measured| measured.output_tokens +|= inference.GenerationUsage.count(parsed.value.usageMetadata, "thoughtsTokenCount") orelse 0;
     return .{
         .content = content,
+        .usage = usage,
         .tool_calls = try calls.toOwnedSlice(alloc),
         .google_parts_json = google_parts,
-        .usage = if (parsed.value.usageMetadata) |usage| .{ .input_tokens = usage.promptTokenCount, .output_tokens = usage.candidatesTokenCount +| usage.thoughtsTokenCount } else null,
         .allocator = alloc,
     };
 }
@@ -997,12 +1000,17 @@ fn parseDataUri(value: []const u8) ?DataUri {
 /// credentials file. Used by control-plane calls (e.g. model listing) that do
 /// not hold a long-lived Provider.
 pub fn mintAuthorizationValueAlloc(alloc: Allocator, credentials_path: ?[]const u8) ![]u8 {
+    return mintAuthorizationValueAllocWithControl(alloc, credentials_path, .{});
+}
+
+pub fn mintAuthorizationValueAllocWithControl(alloc: Allocator, credentials_path: ?[]const u8, control: google_auth.RequestControl) ![]u8 {
+    try control.check();
     const source = try initVertexTokenSource(alloc, credentials_path);
     defer {
         source.deinit();
         alloc.destroy(source);
     }
-    return try source.authorizationValueAlloc(alloc);
+    return try source.authorizationValueAllocWithControl(alloc, control);
 }
 
 fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
@@ -1021,7 +1029,7 @@ pub fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]con
     return vertexProjectIdFromConfigAllocWithControl(alloc, credentials_path, .{});
 }
 
-fn vertexProjectIdFromConfigAllocWithControl(alloc: Allocator, credentials_path: ?[]const u8, control: google_auth.RequestControl) !?[]u8 {
+pub fn vertexProjectIdFromConfigAllocWithControl(alloc: Allocator, credentials_path: ?[]const u8, control: google_auth.RequestControl) !?[]u8 {
     try control.check();
     if (credentials_path) |path| {
         return google_auth.projectIdFromFileAlloc(alloc, path) catch null;
@@ -1556,6 +1564,27 @@ test "vertex provider tools release partial allocations" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.roundTrip, .{});
 }
 
+test "provider registry gateway discovery auth checks lifetime before credentials" {
+    try std.testing.expectError(error.Timeout, mintAuthorizationValueAllocWithControl(std.testing.allocator, "/missing/discovery-credentials.json", .{ .deadline_ns = 0 }));
+    try std.testing.expectError(error.Timeout, vertexProjectIdFromConfigAllocWithControl(std.testing.allocator, "/missing/discovery-credentials.json", .{ .deadline_ns = 0 }));
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, mintAuthorizationValueAllocWithControl(std.testing.allocator, "/missing/discovery-credentials.json", .{ .cancellation = httpx.CancellationToken.fromAtomic(&cancelled) }));
+}
+
+test "provider registry gateway Google generation retains measured token usage and unknown usage" {
+    const a = std.testing.allocator;
+    const base = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]";
+    const known = base ++ ",\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1,\"totalTokenCount\":5}}";
+    var result = try parseGenerateResponseAlloc(a, known, 1);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 2), result.usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u64, 1), result.usage.?.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 5), result.usage.?.total_tokens);
+    var unknown = try parseGenerateResponseAlloc(a, base ++ "}", 1);
+    defer unknown.deinit();
+    try std.testing.expectEqual(@as(?inference.GenerationUsage, null), unknown.usage);
+}
+
 test "generating backend Gemini preserves exact tool arguments across response and replay" {
     const a = std.testing.allocator;
     var result = try parseGenerateResponseAlloc(a,
@@ -1576,4 +1605,16 @@ test "generating backend Gemini preserves numeric schema constraints" {
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "1.0000000000000001") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "1e-400") != null);
+}
+
+test "provider registry gateway Google retains thought usage alongside exact tool arguments" {
+    const a = std.testing.allocator;
+    var result = try parseGenerateResponseAlloc(a,
+        \\{"candidates":[{"content":{"parts":[{"text":"hello"},{"functionCall":{"name":"output","args":{"value":1.0000000000000001}}}]}}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1,"thoughtsTokenCount":3,"totalTokenCount":6}}
+    , 0);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 2), result.usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u64, 4), result.usage.?.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 6), result.usage.?.total_tokens);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_calls[0].arguments, "1.0000000000000001") != null);
 }

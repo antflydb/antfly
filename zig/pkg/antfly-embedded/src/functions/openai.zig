@@ -106,7 +106,7 @@ pub fn response(a: std.mem.Allocator, questions: d.Json, source: d.Json) !d.Json
             },
             // The shared contract requires a scored answer for every question.
             // Refusals fail the query through its existing invalid-output path.
-            .answer_resource_refusal => return error.InvalidDecisionOutput,
+            .answer_resource_refusal => return error.DecisionRefused,
         }
         try d.put(a, &answers, name, answer);
     }
@@ -170,10 +170,10 @@ test "decision functions OpenAI refuses incomplete ambiguous or invalid distribu
     const predicate = try d.questionsFor(a, .ai_probability, &.{ .{ .string = "context" }, .{ .string = "Safe?" }, .{ .string = "openai" } });
     const choice = try d.questionsFor(a, .ai_choice, &.{ .{ .string = "context" }, .{ .string = "Intent?" }, .{ .string = "{\"read\":\"Read\",\"write\":\"Write\"}" }, .{ .string = "openai" } });
     const score = try d.questionsFor(a, .ai_score, &.{ .{ .string = "context" }, .{ .string = "Risk?" }, .{ .string = "[\"Low\",\"High\"]" }, .{ .string = "openai" } });
-    const Case = struct { questions: d.Json, answers: []const u8 };
+    const Case = struct { questions: d.Json, answers: []const u8, expected: anyerror = error.InvalidDecisionOutput };
     for ([_]Case{
         .{ .questions = predicate, .answers = "[]" },
-        .{ .questions = predicate, .answers = "[{\"type\":\"refusal\",\"name\":\"answer\"}]" },
+        .{ .questions = predicate, .answers = "[{\"type\":\"refusal\",\"name\":\"answer\"}]", .expected = error.DecisionRefused },
         .{ .questions = predicate, .answers = "[{\"type\":\"unknown\",\"name\":\"answer\"}]" },
         .{ .questions = predicate, .answers = "[{\"type\":\"predicate\",\"name\":null,\"probability\":0.9}]" },
         .{ .questions = predicate, .answers = "[{\"type\":\"predicate\",\"name\":\"wrong\",\"probability\":0.9}]" },
@@ -189,7 +189,7 @@ test "decision functions OpenAI refuses incomplete ambiguous or invalid distribu
     }) |case| {
         const bytes = try std.fmt.allocPrint(a, "{{\"model\":\"test\",\"answers\":{s},{s}}}", .{ case.answers, test_usage });
         const source = try std.json.parseFromSliceLeaky(d.Json, a, bytes, .{});
-        try std.testing.expectError(error.InvalidDecisionOutput, response(a, case.questions, source));
+        try std.testing.expectError(case.expected, response(a, case.questions, source));
     }
     const all = try std.json.parseFromSliceLeaky(d.Json, a, test_questions, .{});
     const reordered = try std.json.parseFromSliceLeaky(d.Json, a, test_response, .{});

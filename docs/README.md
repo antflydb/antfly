@@ -30,3 +30,5 @@ to the full verbatim text at a pinned commit instead of keeping it inline.
 Do not present old checklists or test counts as current product guarantees.
 
 The authoritative product license scope remains in [LICENSING.md](../LICENSING.md).
+
+- [Named inference gateway](reference/inference-gateway.md): task aliases, fallback, sessions, SDKs and Antfarm.

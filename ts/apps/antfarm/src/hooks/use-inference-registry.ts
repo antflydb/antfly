@@ -17,9 +17,17 @@ type InferenceTaskKey =
   | "rewriters"
   | "readers"
   | "transcribers"
+  | "deciders"
+  | "synthesizers"
+  | "predictors"
+  | "chains"
   | "other";
 
 const TASK_TO_TYPE: Record<InferenceTaskKey, ModelType> = {
+  deciders: "decider",
+  synthesizers: "synthesizer",
+  predictors: "predictor",
+  chains: "generator",
   embedders: "embedder",
   rerankers: "reranker",
   chunkers: "chunker",
@@ -33,6 +41,9 @@ const TASK_TO_TYPE: Record<InferenceTaskKey, ModelType> = {
 };
 
 const MODEL_TYPE_NAMES: Record<ModelType, string> = {
+  decider: "decision",
+  synthesizer: "synthesis",
+  predictor: "prediction",
   embedder: "embedding",
   reranker: "reranking",
   chunker: "chunking",
@@ -58,6 +69,19 @@ function isHuggingFaceModelRef(name: string): boolean {
 
 // Static model type metadata (not provided by Antfly inference's model list)
 const MODEL_TYPES: ModelTypeInfo[] = [
+  {
+    type: "decider",
+    name: "Decider",
+    description: "Typed decisions and calibrated probabilities",
+    icon: "ListChecks",
+  },
+  { type: "synthesizer", name: "Synthesizer", description: "Text to speech", icon: "AudioLines" },
+  {
+    type: "predictor",
+    name: "Predictor",
+    description: "Schema-based ML predictions",
+    icon: "ChartLine",
+  },
   {
     type: "embedder",
     name: "Embedder",
@@ -170,9 +194,10 @@ export function transformConnectionModels(connections: Connection[]): InferenceM
         const id = modelId(type, `${connection.id}-${listed.name}`);
         if (seen.has(id)) continue;
         seen.add(id);
-        const sourceUrl = isHuggingFaceModelRef(listed.name)
-          ? `https://huggingface.co/${listed.name}`
-          : "";
+        const sourceUrl =
+          connection.id !== "named-inference" && isHuggingFaceModelRef(listed.name)
+            ? `https://huggingface.co/${listed.name}`
+            : "";
         models.push({
           id,
           name: listed.display_name ?? listed.name,
@@ -184,7 +209,9 @@ export function transformConnectionModels(connections: Connection[]): InferenceM
           type,
           description: `${MODEL_TYPE_NAMES[type][0]?.toUpperCase()}${MODEL_TYPE_NAMES[type].slice(1)} model available through ${connectionName}.`,
           variants: [],
-          inRegistry: connection.status === "connected",
+          inRegistry: connection.status === "connected" || connection.id === "named-inference",
+          availability: connection.id === "named-inference" ? "unknown" : connection.status,
+          freshness: connection.id === "named-inference" ? "configured" : "cached",
         });
       }
     }

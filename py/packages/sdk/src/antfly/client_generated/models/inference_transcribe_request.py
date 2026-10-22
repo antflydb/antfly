@@ -20,6 +20,8 @@ class InferenceTranscribeRequest:
         audio (str): Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.).
             Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
         language (str | Unset): Force specific language for transcription (optional, model-dependent) Example: en.
+        timestamps (bool | Unset): Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for
+            transcribe, on for dictate).
         diarization (bool | Unset): Label each segment with a speaker. Runs a local speaker-embedding model (pull
             `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by
             voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
@@ -28,6 +30,7 @@ class InferenceTranscribeRequest:
     model: str
     audio: str
     language: str | Unset = UNSET
+    timestamps: bool | Unset = UNSET
     diarization: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -37,6 +40,8 @@ class InferenceTranscribeRequest:
         audio = self.audio
 
         language = self.language
+
+        timestamps = self.timestamps
 
         diarization = self.diarization
 
@@ -50,6 +55,8 @@ class InferenceTranscribeRequest:
         )
         if language is not UNSET:
             field_dict["language"] = language
+        if timestamps is not UNSET:
+            field_dict["timestamps"] = timestamps
         if diarization is not UNSET:
             field_dict["diarization"] = diarization
 
@@ -64,12 +71,15 @@ class InferenceTranscribeRequest:
 
         language = d.pop("language", UNSET)
 
+        timestamps = d.pop("timestamps", UNSET)
+
         diarization = d.pop("diarization", UNSET)
 
         inference_transcribe_request = cls(
             model=model,
             audio=audio,
             language=language,
+            timestamps=timestamps,
             diarization=diarization,
         )
 

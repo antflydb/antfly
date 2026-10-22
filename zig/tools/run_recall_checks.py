@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import threading
@@ -33,6 +34,7 @@ def build_commands(
     test_executable: Path,
     harness_executable: Path,
     dataset_dir: Path,
+    quantizer_test_executable: Path | None = None,
 ) -> tuple[tuple[str, list[str]], ...]:
     commands: list[tuple[str, list[str]]] = [
         (
@@ -40,6 +42,10 @@ def build_commands(
             [str(test_executable), "--test-filter", "HBC recall"],
         )
     ]
+    if quantizer_test_executable is not None:
+        # Built with a compile-time filter on the stock Zig test runner, which
+        # rejects runtime --test-filter arguments.
+        commands.append(("vector-quantizer", [str(quantizer_test_executable)]))
     for metric in METRICS:
         commands.append(
             (
@@ -56,6 +62,15 @@ def build_commands(
     return tuple(commands)
 
 
+def recall_environment(dataset_dir: Path) -> dict[str, str]:
+    """Point the Zig recall tests at the fetched datasets and forbid skips."""
+    return {
+        **os.environ,
+        "ANTFLY_VECTORSETS_DIR": str(dataset_dir),
+        "ANTFLY_VECTORSETS_REQUIRED": "1",
+    }
+
+
 def stream_output(
     label: str, process: subprocess.Popen[str], lock: threading.Lock
 ) -> None:
@@ -66,7 +81,10 @@ def stream_output(
             sys.stderr.flush()
 
 
-def run_checks(commands: Sequence[tuple[str, Sequence[str]]]) -> int:
+def run_checks(
+    commands: Sequence[tuple[str, Sequence[str]]],
+    env: dict[str, str] | None = None,
+) -> int:
     processes: list[tuple[str, subprocess.Popen[str]]] = []
     try:
         for label, command in commands:
@@ -79,6 +97,7 @@ def run_checks(commands: Sequence[tuple[str, Sequence[str]]]) -> int:
                         stderr=subprocess.STDOUT,
                         text=True,
                         errors="replace",
+                        env=env,
                     ),
                 )
             )
@@ -114,13 +133,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--test-executable", type=Path, required=True)
     parser.add_argument("--harness-executable", type=Path, required=True)
     parser.add_argument("--dataset-dir", type=Path, required=True)
+    parser.add_argument("--quantizer-test-executable", type=Path)
     args = parser.parse_args(argv)
     return run_checks(
         build_commands(
             args.test_executable,
             args.harness_executable,
             args.dataset_dir,
-        )
+            args.quantizer_test_executable,
+        ),
+        recall_environment(args.dataset_dir),
     )
 
 

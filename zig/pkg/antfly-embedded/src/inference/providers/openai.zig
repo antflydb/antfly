@@ -264,7 +264,7 @@ pub const Provider = struct {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
         const Response = struct {
-            usage: ?struct { prompt_tokens: u64 = 0, completion_tokens: u64 = 0 } = null,
+            usage: std.json.Value = .null,
             choices: []const struct {
                 logprobs: ?std.json.Value = null,
                 message: struct {
@@ -293,7 +293,7 @@ pub const Provider = struct {
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
+        if (!resp.ok()) return inference.remoteGenerationStatusError(resp.status.code);
         const body = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
@@ -314,8 +314,8 @@ pub const Provider = struct {
                     .content = try alloc.dupe(u8, content),
                     .tool_calls = tool_calls,
                     .tool_calls_synthesized = synthesized,
-                    .usage = if (parsed.value.usage) |usage| .{ .input_tokens = usage.prompt_tokens, .output_tokens = usage.completion_tokens } else null,
                     .token_logprobs_json = proof,
+                    .usage = inference.GenerationUsage.fromValue(parsed.value.usage, "prompt_tokens", "completion_tokens", "total_tokens"),
                     .allocator = alloc,
                 };
             }
@@ -324,8 +324,8 @@ pub const Provider = struct {
                     .content = try alloc.dupe(u8, ""),
                     .tool_calls = tool_calls,
                     .tool_calls_synthesized = synthesized,
-                    .usage = if (parsed.value.usage) |usage| .{ .input_tokens = usage.prompt_tokens, .output_tokens = usage.completion_tokens } else null,
                     .token_logprobs_json = proof,
+                    .usage = inference.GenerationUsage.fromValue(parsed.value.usage, "prompt_tokens", "completion_tokens", "total_tokens"),
                     .allocator = alloc,
                 };
             }

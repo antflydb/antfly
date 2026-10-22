@@ -64,7 +64,7 @@ fn applyBounded(a: std.mem.Allocator, req: types.SearchRequest, result: *types.S
         fallback_http = httpx.Client.initWithConfig(std.heap.smp_allocator, io, .{ .keep_alive = true, .cookies_enabled = false, .max_response_size = 1024 * 1024 });
         break :blk &fallback_http.?;
     };
-    var execution: runtime.Runtime = .{ .profile_allocator = scratch, .registry = registry, .http = http, .io = io, .context = .{ .io = io, .deadline_ns = req.execution_deadline_ns, .cancellation = req.cancellation }, .source_table = options.source_table, .secret_store = options.secret_store, .antfly_provider = options.antfly_provider, .antfly_url = options.inference_api_url };
+    var execution: runtime.Runtime = .{ .profile_allocator = scratch, .registry = registry, .http = http, .io = io, .context = .{ .io = io, .deadline_ns = req.execution_deadline_ns, .cancellation = req.cancellation }, .source_table = options.source_table, .secret_store = options.secret_store, .antfly_provider = options.antfly_provider, .antfly_api_key = if (@hasField(@TypeOf(options), "inference_api_key")) options.inference_api_key else null, .antfly_url = options.inference_api_url };
     const provider = execution.provider();
     try expr.validatePlanProviders(scratch, plan, provider);
     const documents = try scratch.alloc(Json, count);

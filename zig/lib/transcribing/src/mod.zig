@@ -191,7 +191,7 @@ pub const Runtime = struct {
 
     pub fn get(self: *const Runtime, name: ?[]const u8) !Transcriber {
         const resolved = name orelse self.default_provider orelse return error.NoDefaultTranscribingProvider;
-        return self.transcribers.get(resolved) orelse return error.UnknownTranscribingProvider;
+        return self.transcribers.get(canonicalName(resolved)) orelse return error.UnknownTranscribingProvider;
     }
 };
 
@@ -262,7 +262,7 @@ pub const Registry = struct {
 
     pub fn getConfig(self: *const Registry, name: ?[]const u8) !Config {
         const resolved = name orelse self.default_provider orelse return error.NoDefaultTranscribingProvider;
-        return self.configs.get(resolved) orelse return error.UnknownTranscribingProvider;
+        return self.configs.get(canonicalName(resolved)) orelse return error.UnknownTranscribingProvider;
     }
 };
 
@@ -457,8 +457,8 @@ fn initTranscriberWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config
     try cfg.validate();
     return switch (cfg.provider) {
         .antfly => try AntflyTranscriberState.init(alloc, http, cfg, options),
-        .openai => try OpenAiTranscriberState.init(alloc, http, cfg),
-        .vertex => try VertexTranscriberState.init(alloc, http, cfg),
+        .openai => try OpenAiTranscriberState.init(alloc, http, cfg, options),
+        .vertex => try VertexTranscriberState.init(alloc, http, cfg, options),
         .apple => try AppleTranscriberState.init(alloc, http, cfg, options),
     };
 }
@@ -606,6 +606,29 @@ test "Apple transcription recognizes a recording with phrase and word timestamps
     }));
 }
 
+/// Provider configuration projected into the public request's option names.
+/// These borrowed values are shared by typed and native wire adapters.
+pub const RequestDefaults = struct {
+    language: ?[]const u8,
+    timestamps: ?bool,
+    diarization: ?bool,
+};
+
+pub fn requestDefaults(cfg: Config) RequestDefaults {
+    return .{ .language = cfg.language_code, .timestamps = cfg.timestamps, .diarization = cfg.diarization };
+}
+
+/// Request overrides win, including explicit false values. Borrowed defaults
+/// are applied before choosing an in-process or remote adapter.
+pub fn withRequestDefaults(cfg: Config, request: Request) Request {
+    const defaults = requestDefaults(cfg);
+    var effective = request;
+    effective.language = request.language orelse defaults.language;
+    effective.timestamps = request.timestamps orelse defaults.timestamps;
+    effective.diarization = request.diarization orelse defaults.diarization;
+    return effective;
+}
+
 pub fn transcribeWithConfig(
     alloc: Allocator,
     http: *httpx.Client,
@@ -615,7 +638,7 @@ pub fn transcribeWithConfig(
 ) !Response {
     const transcriber = try initTranscriberWithOptions(alloc, http, cfg, options);
     defer transcriber.deinit();
-    return try transcriber.transcribe(alloc, request);
+    return try transcriber.transcribe(alloc, withRequestDefaults(cfg, request));
 }
 
 const AntflyTranscriberState = struct {
@@ -635,6 +658,7 @@ const AntflyTranscriberState = struct {
     framed_attachments: bool = false,
     /// Provider-level default for speaker labels; a request may override it.
     diarization: ?bool = null,
+    timestamps: ?bool = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Transcriber {
         const configured_model = cfg.model orelse return error.InvalidTranscribingConfig;
@@ -674,6 +698,7 @@ const AntflyTranscriberState = struct {
             .cancellation = options.cancellation,
             .framed_attachments = cfg.framed_attachments,
             .diarization = cfg.diarization,
+            .timestamps = cfg.timestamps,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
@@ -730,6 +755,7 @@ const AntflyTranscriberState = struct {
             .model = self.model,
             .audio = audio_field,
             .language = req.language orelse self.language_code,
+            .timestamps = req.timestamps orelse self.timestamps,
             // Local and remote execution must honour the same options: the
             // inference node cannot label speakers it was never asked for.
             .diarization = req.diarization orelse self.diarization,
@@ -864,6 +890,7 @@ fn antflySpeakersAlloc(alloc: Allocator, api_speakers: []const []const u8) ![]Sp
 
 const OpenAiTranscriberState = struct {
     alloc: Allocator,
+    options: RemoteOptions = .{},
     http: *httpx.Client,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
@@ -872,12 +899,13 @@ const OpenAiTranscriberState = struct {
     max_response_bytes: ?usize = null,
     max_download_bytes: ?usize = null,
 
-    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
+    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Transcriber {
         const state = try alloc.create(OpenAiTranscriberState);
         errdefer alloc.destroy(state);
 
         state.* = .{
             .alloc = alloc,
+            .options = options,
             .http = http,
             .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://api.openai.com/v1"),
             .model = try alloc.dupe(u8, cfg.model orelse "whisper-1"),
@@ -915,7 +943,11 @@ const OpenAiTranscriberState = struct {
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *OpenAiTranscriberState = @ptrCast(@alignCast(ptr));
-        const audio_bytes = try resolveAudioInputAlloc(alloc, req.url, self.max_download_bytes);
+        if (req.diarization orelse false) return error.UnsupportedTranscriptionOptions;
+        const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
+        const content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
+        defer alloc.free(content.content_type);
+        const audio_bytes = content.data;
         defer alloc.free(audio_bytes);
 
         const content_type = "application/octet-stream";
@@ -935,6 +967,11 @@ const OpenAiTranscriberState = struct {
             .body = multipart.body,
             .headers = headers.items,
             .max_response_size = self.max_response_bytes,
+            .timeout_ms = try control.remainingTimeoutMs(),
+            .cancellation = self.options.cancellation,
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
         });
         defer resp.deinit();
         if (!resp.ok()) return error.TranscribeRequestFailed;
@@ -996,6 +1033,7 @@ fn secondsToMs(seconds: f64) i64 {
 
 const VertexTranscriberState = struct {
     alloc: Allocator,
+    options: RemoteOptions = .{},
     http: *httpx.Client,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
@@ -1013,12 +1051,13 @@ const VertexTranscriberState = struct {
     timestamps: ?bool = null,
     diarization: ?bool = null,
 
-    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
+    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Transcriber {
         const state = try alloc.create(VertexTranscriberState);
         errdefer alloc.destroy(state);
 
         state.* = .{
             .alloc = alloc,
+            .options = options,
             .http = http,
             .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://speech.googleapis.com/v2"),
             .project_id = if (cfg.project_id) |value| try alloc.dupe(u8, value) else (try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path) orelse return error.InvalidTranscribingConfig),
@@ -1080,20 +1119,24 @@ const VertexTranscriberState = struct {
         alloc: Allocator,
         headers: *std.ArrayList([2][]const u8),
         minted_auth: *?[]u8,
+        control: google_auth.RequestControl,
     ) !void {
         if (self.auth_header) |header| {
             try headers.append(alloc, header);
             return;
         }
         if (self.token_source) |source| {
-            minted_auth.* = try source.authorizationValueAlloc(alloc);
+            minted_auth.* = try source.authorizationValueAllocWithControl(alloc, control);
             try headers.append(alloc, .{ "Authorization", minted_auth.*.? });
         }
     }
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *VertexTranscriberState = @ptrCast(@alignCast(ptr));
-        const audio_bytes = try resolveAudioInputAlloc(alloc, req.url, self.max_download_bytes);
+        const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
+        const content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
+        defer alloc.free(content.content_type);
+        const audio_bytes = content.data;
         defer alloc.free(audio_bytes);
 
         const encoded_len = std.base64.standard.Encoder.calcSize(audio_bytes.len);
@@ -1154,12 +1197,17 @@ const VertexTranscriberState = struct {
         defer headers.deinit(alloc);
         var minted_auth: ?[]u8 = null;
         defer if (minted_auth) |value| alloc.free(value);
-        try self.appendAuthHeaders(alloc, &headers, &minted_auth);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
 
         var resp = try self.http.post(url, .{
             .json = body,
             .headers = headers.items,
             .max_response_size = self.max_response_bytes,
+            .timeout_ms = try control.remainingTimeoutMs(),
+            .cancellation = self.options.cancellation,
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
         });
         defer resp.deinit();
         if (!resp.ok()) return error.TranscribeRequestFailed;
@@ -1627,6 +1675,17 @@ fn appendMultipartFile(
     try buf.appendSlice(alloc, "\r\n");
 }
 
+fn resolveAudioContentWithContext(a: Allocator, io: std.Io, url: []const u8, max_bytes: ?usize, options: RemoteOptions, control: google_auth.RequestControl) !scraping.DownloadedContent {
+    try control.check();
+    if (options.resolved_audio) |bytes| {
+        if (bytes.len > effectiveMaxDownloadBytes(max_bytes)) return error.ResponseTooLarge;
+        return .{ .data = try a.dupe(u8, bytes), .content_type = try a.dupe(u8, "audio/wav") };
+    }
+    if (scraping.data_uri.hasScheme(url)) return resolveAudioContentAlloc(a, url, max_bytes);
+    const security = remoteFetchSecurity(max_bytes);
+    return scraping.downloadContentAllocWithContext(a, .{ .io = io, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = if (options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null }, url, &security, null);
+}
+
 fn resolveAudioInputAlloc(alloc: Allocator, url: []const u8, max_download_bytes: ?usize) ![]u8 {
     var content = try resolveAudioContentAlloc(alloc, url, max_download_bytes);
     alloc.free(content.content_type);
@@ -1779,8 +1838,18 @@ test "transcribing runtime loads antfly provider and transcribes data uri input"
     defer io_impl.deinit();
     const io = io_impl.io();
 
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try expectAntflyTranscriberBearer(req);
+            const parsed_request = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed_request.deinit();
+            try std.testing.expectEqualStrings("fr", parsed_request.value.object.get("language").?.string);
+            try std.testing.expect(parsed_request.value.object.get("timestamps").?.bool);
+            try std.testing.expect(parsed_request.value.object.get("diarization").?.bool);
+        }
+    };
     var server = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/transcribe", .assert_request = expectAntflyTranscriberBearer, .respond = .{
+        .{ .method = .POST, .path = "/transcribe", .assert_request = Check.request, .respond = .{
             .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"hello from antfly\",\"language\":\"en\"}],\"model\":\"openai/whisper-base\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3}}",
         } },
     });
@@ -1793,7 +1862,7 @@ test "transcribing runtime loads antfly provider and transcribes data uri input"
         \\  "whisper-local": { "provider": "antfly", "api_url": "
     ;
     const suffix =
-        \\", "model": "openai/whisper-base", "api_key": "antfly-secret" }
+        \\", "model": "openai/whisper-base", "api_key": "antfly-secret", "language_code": "fr", "timestamps": true, "diarization": true }
         \\}
     ;
     const cfg_json = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ raw, api_url, suffix });
@@ -2181,4 +2250,21 @@ fn expectAntflyTranscriberFramed(req: httpx.testing_mod.RequestInfo) !void {
 fn expectOpenAiTranscriberBearer(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(httpx.Method.POST, req.method);
     try std.testing.expectEqualStrings("Bearer openai-bearer", req.header("Authorization") orelse return error.MissingHeader);
+}
+
+fn canonicalName(name: []const u8) []const u8 {
+    const prefix = "transcribers/";
+    return if (std.mem.startsWith(u8, name, prefix)) name[prefix.len..] else name;
+}
+
+test "transcribing named defaults preserve explicit request overrides" {
+    const cfg = Config{ .provider = .antfly, .model = "whisper", .language_code = "fr", .timestamps = true, .diarization = true };
+    const inherited = withRequestDefaults(cfg, .{ .url = "data:audio/wav;base64,AA==" });
+    try std.testing.expectEqualStrings("fr", inherited.language.?);
+    try std.testing.expect(inherited.timestamps.?);
+    try std.testing.expect(inherited.diarization.?);
+    const overridden = withRequestDefaults(cfg, .{ .url = "data:audio/wav;base64,AA==", .language = "de", .timestamps = false, .diarization = false });
+    try std.testing.expectEqualStrings("de", overridden.language.?);
+    try std.testing.expect(!overridden.timestamps.?);
+    try std.testing.expect(!overridden.diarization.?);
 }

@@ -37,6 +37,7 @@ import type {
   RerankDocument,
   RerankResponse,
   RewriteResponse,
+  TranscribeRequest,
   TranscribeResponse,
   TransientCapacityError,
 } from "./inference-types.js";
@@ -725,13 +726,12 @@ export class InferenceClient {
    */
   async transcribe(
     audio: string,
-    options: { model: string; language?: string }
+    options: Omit<TranscribeRequest, "audio">
   ): Promise<TranscribeResponse> {
     const { data, error, response } = await this.client.POST("/ai/v1/transcribe", {
       body: {
         audio,
-        model: options.model,
-        language: options.language,
+        ...options,
       },
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);

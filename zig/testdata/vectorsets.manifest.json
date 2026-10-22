@@ -1,0 +1,76 @@
+{
+  "description": "Recall-conformance vector datasets (converted from the Go .gob fixtures). Fetched on demand by tools/fetch_vectorsets.py; never committed to the tree.",
+  "base_url": "https://raw.githubusercontent.com/antflydb/antfly/43c6c7cdcf22e2a564387436fe326edb5770edd4/zig/testdata/vectorsets/",
+  "files": [
+    {
+      "name": "dbpedia-1536d-1k.pbvec",
+      "size": 6144011,
+      "sha256": "cfbb4dd446ef885be5550471de5f511d2cee3b6ef4c88740e84b5b6d207f3d08"
+    },
+    {
+      "name": "fashionminst-784d-10k.pbvec",
+      "size": 31360011,
+      "sha256": "d8fcc3a54ca301c3d84d0f55f7732c92c4b6e645996d4c1d7f7eb0fee8b54a18"
+    },
+    {
+      "name": "fashionminst-784d-1k.pbvec",
+      "size": 3136011,
+      "sha256": "f37eee7ee574627bd10214c38dd32de086b9b5fc641161f15ec8814a7a5c3cae"
+    },
+    {
+      "name": "images-512d-10k.pbvec",
+      "size": 20480011,
+      "sha256": "9a4940fbba579c9c6434617f4d85acc613d1b49e8de17bbe8eb513568c1df628"
+    },
+    {
+      "name": "laionclip-768d-1k.pbvec",
+      "size": 3072011,
+      "sha256": "326e1ed2459c4f9e87f2ff997a0dc4491b11a127cca97a11786dc56a53e0ca6f"
+    },
+    {
+      "name": "laiongemini-1408d-1k.pbvec",
+      "size": 5632011,
+      "sha256": "167cb6426bb73a6cbc34873353ef137442447fc47eb781a27d7917b53b5991cb"
+    },
+    {
+      "name": "laiongemini-512d-10k.pbvec",
+      "size": 20480011,
+      "sha256": "b588feef73a121e8bfcf2e185fcddf5c6180738dd859d2e4627ee8b212d8ef81"
+    },
+    {
+      "name": "random-2048d-1k.pbvec",
+      "size": 8192011,
+      "sha256": "8169a34a23979a0bf31aa86fdc899c1396fcccf48657cc13c1a1bda34f78a007"
+    },
+    {
+      "name": "random-20d-1k.pbvec",
+      "size": 80009,
+      "sha256": "e87a47be3add8b427db0593ee02a2369be7715fc9ca78c106159449fe9c966f9"
+    },
+    {
+      "name": "random-4096d-1k.pbvec",
+      "size": 16384011,
+      "sha256": "eec42f3bc14aaf14220a745852b3fd2b9fd8925031af3036a27e601c16b65244"
+    },
+    {
+      "name": "random-40d-10k.pbvec",
+      "size": 1600009,
+      "sha256": "fd379d8efc36cc964970904ab56505a947bf7dff6611fb9ae184d1532e0fd4c0"
+    },
+    {
+      "name": "random-sparse-1k.pbvec",
+      "size": 3,
+      "sha256": "45fac30b0036ce0ca19acbe965e65db799adc402770f61c0927474411febc2c2"
+    },
+    {
+      "name": "sparse-wiki-1k.pbvec",
+      "size": 3,
+      "sha256": "861d443c25874a8e6632335ae6aa57dfe0d4bfb9482d27e01bf813da0ac58a0d"
+    },
+    {
+      "name": "wikiarticles-768d-10k.pbvec",
+      "size": 30720011,
+      "sha256": "5a3ca12b53ae08fcad892aebed32aae08282fe7c315e5860105f6bb946562015"
+    }
+  ]
+}

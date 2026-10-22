@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.inference_transcribe_response_object import InferenceTranscribeResponseObject
+from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.inference_generate_usage import InferenceGenerateUsage
@@ -23,13 +24,13 @@ class InferenceTranscribeResponse:
         object_ (InferenceTranscribeResponseObject): Object type, always "list"
         data (list[InferenceTranscribeObject]): Transcription result objects.
         model (str): Name of model used for transcription
-        usage (InferenceGenerateUsage):
+        usage (InferenceGenerateUsage | Unset):
     """
 
     object_: InferenceTranscribeResponseObject
     data: list[InferenceTranscribeObject]
     model: str
-    usage: InferenceGenerateUsage
+    usage: InferenceGenerateUsage | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,7 +43,9 @@ class InferenceTranscribeResponse:
 
         model = self.model
 
-        usage = self.usage.to_dict()
+        usage: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.usage, Unset):
+            usage = self.usage.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -51,9 +54,10 @@ class InferenceTranscribeResponse:
                 "object": object_,
                 "data": data,
                 "model": model,
-                "usage": usage,
             }
         )
+        if usage is not UNSET:
+            field_dict["usage"] = usage
 
         return field_dict
 
@@ -74,7 +78,12 @@ class InferenceTranscribeResponse:
 
         model = d.pop("model")
 
-        usage = InferenceGenerateUsage.from_dict(d.pop("usage"))
+        _usage = d.pop("usage", UNSET)
+        usage: InferenceGenerateUsage | Unset
+        if isinstance(_usage, Unset):
+            usage = UNSET
+        else:
+            usage = InferenceGenerateUsage.from_dict(_usage)
 
         inference_transcribe_response = cls(
             object_=object_,

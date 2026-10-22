@@ -239,6 +239,8 @@ pub const EmbedderConfig = struct {
     model_identity: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
+    /// This named embedder produces sparse index/value vectors.
+    sparse: ?bool = null,
     rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
     /// Input types the model accepts. Normally omitted: Antfly learns them from the model's capabilities, which Antfly inference publishes for every model it serves. Set it only to use a model whose capabilities Antfly cannot discover yet, such as a newly released model. When set, it replaces the discovered input types. Only providers whose adapters can send media accept media inputs: `antfly` (`image`, `audio`) and `bedrock` (`image`). Other providers reject `image` and `audio` here rather than silently discarding media. **Example:** ```json { "provider": "antfly", "model": "some-future-multimodal-model", "inputs": ["text", "image"] } ```
     inputs: ?[]const []const u8 = null,
@@ -269,6 +271,7 @@ pub const EmbedderConfig = struct {
         .{ "batch_size", "batch_size", true },
         .{ "model_identity", "model_identity", true },
         .{ "api_url", "api_url", true },
+        .{ "sparse", "sparse", true },
         .{ "rate_limit", "rate_limit", false },
         .{ "inputs", "inputs", true },
         .{ "query_input_type", "query_input_type", true },
@@ -356,6 +359,10 @@ pub const EmbedderConfig = struct {
         }
         if (self.api_url) |value| {
             try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.sparse) |value| {
+            try jw.objectField("sparse");
             try jw.write(value);
         }
         if (self.rate_limit) |value| {

@@ -1,0 +1,61 @@
+openapi: 3.0.3
+info:
+  title: Antfly named inference gateway additions
+  version: v1alpha1
+  description: Database gateway adapters independent of the native runtime route table.
+paths:
+  /ml/v1/predictors:
+    get:
+      operationId: listGatewayPredictors
+      summary: List predictor feature schemas through the gateway
+      responses:
+        '200':
+          description: Predictor schemas keyed by callable model ID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PredictorsResponse'
+  /synthesize:
+    post:
+      operationId: synthesizeSpeech
+      summary: Synthesize speech using a named text-to-speech configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SynthesisRequest'
+      responses:
+        '200':
+          description: Synthesized audio in the requested format; usage is reported only when supplied by the provider.
+          content:
+            audio/mpeg:
+              schema: {type: string, format: binary}
+            audio/wav:
+              schema: {type: string, format: binary}
+        '400':
+          description: Invalid or unsupported synthesis options
+        '502':
+          description: Upstream synthesis failure
+components:
+  schemas:
+    SynthesisRequest:
+      type: object
+      required: [model, text]
+      additionalProperties: false
+      properties:
+        model:
+          type: string
+          description: Canonical synthesizers/name target or qualified connection model.
+        text:
+          type: string
+          minLength: 1
+        voice:
+          type: string
+        format:
+          type: string
+          enum: [mp3, wav, opus, aac, flac, pcm]
+        speed:
+          type: number
+          minimum: 0.25
+          maximum: 4

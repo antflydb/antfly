@@ -25,6 +25,8 @@ class InferenceDictateRequest:
         audio (str): Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in
             windows.
         language (str | Unset): Force the transcript language (ISO 639-1). Omit for automatic detection. Example: en.
+        timestamps (bool | Unset): Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for
+            transcribe, on for dictate).
         cleanup_model (str | Unset): Generator model from models_dir/generators/ that rewrites the transcript. Omit to
             return the raw transcript. Example: ggml-org/gemma-4-E4B-it-GGUF.
         style (InferenceDictationStyle | Unset): How the cleanup pass rewrites the transcript. `clean` removes fillers
@@ -58,6 +60,7 @@ class InferenceDictateRequest:
     model: str
     audio: str
     language: str | Unset = UNSET
+    timestamps: bool | Unset = UNSET
     cleanup_model: str | Unset = UNSET
     style: InferenceDictationStyle | Unset = UNSET
     dictionary: list[str] | Unset = UNSET
@@ -76,6 +79,8 @@ class InferenceDictateRequest:
         audio = self.audio
 
         language = self.language
+
+        timestamps = self.timestamps
 
         cleanup_model = self.cleanup_model
 
@@ -115,6 +120,8 @@ class InferenceDictateRequest:
         )
         if language is not UNSET:
             field_dict["language"] = language
+        if timestamps is not UNSET:
+            field_dict["timestamps"] = timestamps
         if cleanup_model is not UNSET:
             field_dict["cleanup_model"] = cleanup_model
         if style is not UNSET:
@@ -148,6 +155,8 @@ class InferenceDictateRequest:
         audio = d.pop("audio")
 
         language = d.pop("language", UNSET)
+
+        timestamps = d.pop("timestamps", UNSET)
 
         cleanup_model = d.pop("cleanup_model", UNSET)
 
@@ -188,6 +197,7 @@ class InferenceDictateRequest:
             model=model,
             audio=audio,
             language=language,
+            timestamps=timestamps,
             cleanup_model=cleanup_model,
             style=style,
             dictionary=dictionary,

@@ -1307,6 +1307,28 @@ describe("InferenceClient with mock fetch", () => {
       expect(fetch).toHaveBeenCalled();
     });
 
+    it("preserves explicit false transcription overrides", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(JSON.stringify({ model: "transcribers/speech", data: [] }), {
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await client.transcribe("audio", {
+        model: "transcribers/speech",
+        language: "de",
+        timestamps: false,
+        diarization: false,
+      });
+      expect(await lastFetchJSONBody()).toEqual({
+        model: "transcribers/speech",
+        audio: "audio",
+        language: "de",
+        timestamps: false,
+        diarization: false,
+      });
+    });
+
     it("should handle transcribe errors", async () => {
       vi.mocked(fetch).mockResolvedValueOnce({
         ok: false,

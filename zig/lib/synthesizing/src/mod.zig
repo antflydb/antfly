@@ -98,7 +98,7 @@ pub const Runtime = struct {
 
     pub fn get(self: *const Runtime, name: ?[]const u8) !Synthesizer {
         const resolved = name orelse self.default_provider orelse return error.NoDefaultSynthesizingProvider;
-        return self.synthesizers.get(resolved) orelse return error.UnknownSynthesizingProvider;
+        return self.synthesizers.get(canonicalName(resolved)) orelse return error.UnknownSynthesizingProvider;
     }
 };
 
@@ -170,7 +170,7 @@ pub const Registry = struct {
 
     pub fn getConfig(self: *const Registry, name: ?[]const u8) !Config {
         const resolved = name orelse self.default_provider orelse return error.NoDefaultSynthesizingProvider;
-        return self.configs.get(resolved) orelse return error.UnknownSynthesizingProvider;
+        return self.configs.get(canonicalName(resolved)) orelse return error.UnknownSynthesizingProvider;
     }
 };
 
@@ -220,10 +220,33 @@ fn deinitConfigValue(alloc: Allocator, cfg: Config) void {
     deinitConfig(alloc, &owned);
 }
 
-fn initSynthesizer(alloc: Allocator, http: *httpx.Client, cfg: Config) !Synthesizer {
+pub const RemoteOptions = struct {
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
+};
+
+pub fn synthesizeWithConfig(alloc: Allocator, http: *httpx.Client, cfg: Config, request: Request, options: RemoteOptions) !SynthesisResult {
+    const synthesizer = try initSynthesizer(alloc, http, cfg);
+    defer synthesizer.deinit();
+    if (request.text.len == 0 or request.text.len > 65536 or request.s3_output != null or request.s3_credentials != null) return error.UnsupportedSynthesisOptions;
+    if (request.speed) |speed| if (!std.math.isFinite(speed) or speed < 0.25 or speed > 4) return error.UnsupportedSynthesisOptions;
+    switch (cfg.provider) {
+        .openai => {
+            const state: *OpenAiSynthesizerState = @ptrCast(@alignCast(synthesizer.ptr));
+            state.options = options;
+        },
+        else => {
+            const state: *RemoteSynthesizerState = @ptrCast(@alignCast(synthesizer.ptr));
+            state.options = options;
+        },
+    }
+    return synthesizer.synthesize(alloc, request);
+}
+
+pub fn initSynthesizer(alloc: Allocator, http: *httpx.Client, cfg: Config) !Synthesizer {
     return switch (cfg.provider) {
         .openai => try OpenAiSynthesizerState.init(alloc, http, cfg),
-        else => error.UnsupportedSynthesizingProvider,
+        .vertex, .elevenlabs => try RemoteSynthesizerState.init(alloc, http, cfg),
     };
 }
 
@@ -232,6 +255,7 @@ const OpenAiSynthesizerState = struct {
     http: *httpx.Client,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
+    options: RemoteOptions = .{},
     model: []const u8,
     voice: []const u8,
 
@@ -276,6 +300,10 @@ const OpenAiSynthesizerState = struct {
 
     fn synthesize(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!SynthesisResult {
         const self: *OpenAiSynthesizerState = @ptrCast(@alignCast(ptr));
+        if (req.format) |format| switch (format) {
+            .ogg, .webm => return error.UnsupportedSynthesisOptions,
+            else => {},
+        };
         const url = try std.fmt.allocPrint(alloc, "{s}/audio/speech", .{self.base_url});
         defer alloc.free(url);
 
@@ -295,6 +323,12 @@ const OpenAiSynthesizerState = struct {
         var resp = try self.http.post(url, .{
             .json = wire,
             .headers = headers.items,
+            .max_response_size = 64 << 20,
+            .timeout_ms = self.options.timeout_ms,
+            .cancellation = self.options.cancellation,
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
         });
         defer resp.deinit();
         if (!resp.ok()) return error.SynthesizeRequestFailed;
@@ -304,7 +338,7 @@ const OpenAiSynthesizerState = struct {
             .audio = try alloc.dupe(u8, payload),
             .response = .{
                 .format = req.format orelse .mp3,
-                .characters_used = @intCast(req.text.len),
+                .characters_used = null,
             },
         };
     }
@@ -406,5 +440,137 @@ test "synthesizing runtime loads openai provider and returns inline audio" {
 
     try std.testing.expectEqualStrings("FAKEAUDIO", result.?.audio.?);
     try std.testing.expectEqual(audio.AudioFormat.mp3, result.?.response.format.?);
-    try std.testing.expectEqual(@as(i64, 11), result.?.response.characters_used.?);
+    try std.testing.expectEqual(@as(?i64, null), result.?.response.characters_used);
+}
+
+const RemoteSynthesizerState = struct {
+    allocator: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    options: RemoteOptions = .{},
+    fn init(a: Allocator, http: *httpx.Client, cfg: Config) !Synthesizer {
+        const self = try a.create(RemoteSynthesizerState);
+        errdefer a.destroy(self);
+        self.* = .{ .allocator = a, .http = http, .cfg = try cloneConfig(a, cfg) };
+        return .{ .ptr = self, .vtable = &.{ .synthesize = synthesize, .deinit = deinit } };
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *RemoteSynthesizerState = @ptrCast(@alignCast(raw));
+        deinitConfig(self.allocator, &self.cfg);
+        self.allocator.destroy(self);
+    }
+    fn synthesize(raw: *anyopaque, a: Allocator, request: Request) anyerror!SynthesisResult {
+        const self: *RemoteSynthesizerState = @ptrCast(@alignCast(raw));
+        const cfg = self.cfg;
+        const auth = @import("antfly_google").auth;
+        const control = auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
+        const format = request.format orelse .mp3;
+        const base = std.mem.trimEnd(u8, cfg.base_url orelse (if (cfg.provider == .elevenlabs) "https://api.elevenlabs.io/v1" else "https://texttospeech.googleapis.com/v1"), "/");
+        var headers: std.ArrayList([2][]const u8) = .empty;
+        defer headers.deinit(a);
+        var token_source: ?@import("antfly_google").auth.CachedTokenSource = null;
+        defer if (token_source) |*source| source.deinit();
+        var authorization: ?[]u8 = null;
+        defer if (authorization) |value| a.free(value);
+        var url: []u8 = undefined;
+        var body: []u8 = undefined;
+        if (cfg.provider == .elevenlabs) {
+            const voice = request.voice orelse cfg.voice_id orelse return error.InvalidSynthesizingConfig;
+            if (voice.len == 0 or std.mem.indexOfAny(u8, voice, "/?#%") != null) return error.InvalidSynthesizingConfig;
+            if (format != .mp3 or (request.speed != null and request.speed.? != 1)) return error.UnsupportedSynthesisOptions;
+            const key = cfg.api_key orelse return error.MissingSynthesisApiKey;
+            try headers.append(a, .{ "xi-api-key", key });
+            url = try std.fmt.allocPrint(a, "{s}/text-to-speech/{s}?output_format=mp3_44100_128", .{ base, voice });
+            body = try std.json.Stringify.valueAlloc(a, .{ .text = request.text, .model_id = cfg.model_id orelse "eleven_multilingual_v2", .voice_settings = .{ .stability = cfg.stability orelse 0.5, .similarity_boost = cfg.similarity_boost orelse 0.75, .style = cfg.style orelse 0 } }, .{});
+        } else {
+            if (request.text.len > 5000) return error.UnsupportedSynthesisOptions;
+            const encoding = switch (format) {
+                .mp3 => "MP3",
+                .wav => "LINEAR16",
+                .opus => "OGG_OPUS",
+                else => return error.UnsupportedSynthesisOptions,
+            };
+            if (cfg.api_key) |key| {
+                authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{key});
+            } else {
+                const credentials = if (cfg.credentials_path) |path| try auth.configFromFileAlloc(a, path, "https://www.googleapis.com/auth/cloud-platform") else try auth.configFromEnvAlloc(a, "https://www.googleapis.com/auth/cloud-platform");
+                token_source = try auth.CachedTokenSource.init(a, credentials);
+                authorization = try token_source.?.authorizationValueAllocWithControl(a, control);
+            }
+            try headers.append(a, .{ "Authorization", authorization.? });
+            if (cfg.project_id) |project| try headers.append(a, .{ "x-goog-user-project", project });
+            url = try std.fmt.allocPrint(a, "{s}/text:synthesize", .{base});
+            body = try std.json.Stringify.valueAlloc(a, .{ .input = .{ .text = request.text }, .voice = .{ .languageCode = cfg.language_code orelse "en-US", .name = request.voice orelse cfg.voice_name orelse "en-US-Neural2-A" }, .audioConfig = .{ .audioEncoding = encoding, .speakingRate = request.speed orelse 1 } }, .{});
+        }
+        defer a.free(url);
+        defer a.free(body);
+        var response = try self.http.post(url, .{ .json = body, .headers = headers.items, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = self.options.cancellation, .max_response_size = 64 << 20, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false });
+        defer response.deinit();
+        if (!response.ok()) return error.SynthesizeRequestFailed;
+        const payload = response.body orelse return error.EmptyResponse;
+        if (cfg.provider == .elevenlabs) return .{ .audio = try a.dupe(u8, payload), .response = .{ .format = format } };
+        const parsed = try std.json.parseFromSlice(struct { audioContent: []const u8 }, a, payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const bytes = try a.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(parsed.value.audioContent));
+        errdefer a.free(bytes);
+        try std.base64.standard.Decoder.decode(bytes, parsed.value.audioContent);
+        return .{ .audio = bytes, .response = .{ .format = format } };
+    }
+};
+
+fn canonicalName(name: []const u8) []const u8 {
+    const prefix = "synthesizers/";
+    return if (std.mem.startsWith(u8, name, prefix)) name[prefix.len..] else name;
+}
+
+test "synthesizing remote adapters preserve provider wire contracts and actual usage" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Checks = struct {
+        fn vertex(request: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer fixture-token", request.header("authorization").?);
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("hello", parsed.value.object.get("input").?.object.get("text").?.string);
+            try std.testing.expectEqualStrings("LINEAR16", parsed.value.object.get("audioConfig").?.object.get("audioEncoding").?.string);
+        }
+        fn eleven(request: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("fixture-token", request.header("xi-api-key").?);
+            try std.testing.expectEqualStrings("output_format=mp3_44100_128", request.query);
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("hello", parsed.value.object.get("text").?.string);
+            try std.testing.expectEqualStrings("fixture-model", parsed.value.object.get("model_id").?.string);
+        }
+        fn run(alloc: Allocator, client: *httpx.Client, cfg: Config, format: audio.AudioFormat, out: *?SynthesisResult, failure: *?anyerror) std.Io.Cancelable!void {
+            out.* = synthesizeWithConfig(alloc, client, cfg, .{ .text = "hello", .format = format }, .{ .timeout_ms = 5000 }) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    var server = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/text:synthesize", .respond = .{ .body = "{\"audioContent\":\"RkFLRUFVRElP\"}" }, .assert_request = Checks.vertex },
+        .{ .method = .POST, .path = "/text-to-speech/fixture-voice", .respond = .{ .body = "FAKEAUDIO" }, .assert_request = Checks.eleven },
+    });
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    for ([_]Provider{ .vertex, .elevenlabs }) |provider| {
+        var result: ?SynthesisResult = null;
+        defer if (result) |*value| deinitResult(a, value);
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        const format: audio.AudioFormat = if (provider == .vertex) .wav else .mp3;
+        try group.concurrent(io, Checks.run, .{ a, &client, Config{ .provider = provider, .base_url = server.baseUrl(), .api_key = "fixture-token", .voice_id = "fixture-voice", .model_id = "fixture-model" }, format, &result, &failure });
+        try server.handleOne();
+        group.await(io) catch {};
+        if (failure) |err| return err;
+        try std.testing.expectEqualStrings("FAKEAUDIO", result.?.audio.?);
+        try std.testing.expectEqual(format, result.?.response.format.?);
+        try std.testing.expectEqual(@as(?i64, null), result.?.response.characters_used);
+    }
+    try std.testing.expectError(error.UnsupportedSynthesisOptions, synthesizeWithConfig(a, &client, .{ .provider = .elevenlabs, .api_key = "fixture-token", .voice_id = "fixture-voice" }, .{ .text = "hello", .format = .wav }, .{}));
 }

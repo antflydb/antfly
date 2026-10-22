@@ -55,6 +55,30 @@ class RunRecallChecksTest(unittest.TestCase):
             commands[-1][1],
         )
 
+    def test_adds_quantizer_parity_check_when_given(self):
+        commands = recall.build_commands(
+            Path("storage-tests"),
+            Path("recall-harness"),
+            Path("vectors"),
+            Path("vector-tests"),
+        )
+        self.assertEqual(("vector-quantizer", ["vector-tests"]), commands[1])
+        self.assertEqual(5, len(commands))
+
+    def test_environment_requires_fetched_datasets(self):
+        env = recall.recall_environment(Path("/fixtures/vectorsets"))
+        self.assertEqual("/fixtures/vectorsets", env["ANTFLY_VECTORSETS_DIR"])
+        self.assertEqual("1", env["ANTFLY_VECTORSETS_REQUIRED"])
+
+    def test_passes_environment_to_children(self):
+        command = [
+            sys.executable,
+            "-c",
+            "import os, sys; sys.exit(0 if os.environ.get('ANTFLY_VECTORSETS_REQUIRED') == '1' else 3)",
+        ]
+        env = recall.recall_environment(Path("vectors"))
+        self.assertEqual(0, recall.run_checks((("env", command),), env))
+
     def test_runs_all_commands_concurrently(self):
         command = [sys.executable, "-c", "import time; time.sleep(0.5)"]
         started = time.monotonic()
