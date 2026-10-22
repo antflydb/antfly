@@ -6699,3 +6699,51 @@ def test_rejected_numeric_windows_preserve_argument_and_prefix_failures(graph_db
             "g",
             {"query": f"UNWIND [1,2] AS i UNWIND {source} AS x RETURN i,{aggregate} ORDER BY i LIMIT {limit}"},
         )
+
+
+@pytest.mark.parametrize("aggregate", ["min(x)", "max(x)", "sum(x)", "avg(x)", "sum(DISTINCT x)", "avg(DISTINCT x)"])
+def test_ordered_numeric_windows_reuse_certified_domains(graph_db, aggregate):
+    def query(groups):
+        return (
+            f"UNWIND range(1,{groups}) AS i UNWIND [0,1,0] AS x WITH i,x ORDER BY x DESC "
+            f"RETURN i,{aggregate} ORDER BY i LIMIT 5"
+        )
+
+    actual = graph_db.cypher_json("g", {"query": query(10000), "limits": {"memory_bytes": 2 << 20}})
+    expected = graph_db.cypher_json("g", {"query": query(5)})
+    assert actual["rows"] == expected["rows"]
+    assert actual["stats"]["memory_bytes"] < 200000
+
+
+@pytest.mark.parametrize("source", ["range(1,1000000)", "reverse(range(1,500000)+range(500001,1000000))"])
+@pytest.mark.parametrize("argument", ["x", "x+1", "0*x+7"])
+def test_sum_distinct_ranges_keep_exact_symbolic_support(graph_db, source, argument):
+    actual = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND {source} AS x RETURN count(DISTINCT {argument}),sum(DISTINCT {argument})",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    expected = [1, 7] if argument == "0*x+7" else [1000000, 500000500000 + (1000000 if argument == "x+1" else 0)]
+    assert [[int(cell["value"]) for cell in row] for row in actual["rows"]] == [expected]
+    assert actual["stats"]["intermediate_states"] < 2000
+
+
+@pytest.mark.parametrize("groups", ["[1,2]", "[1,2,1,2]"])
+@pytest.mark.parametrize("child", ["", "CALL {UNWIND [7,8] AS y RETURN y} "])
+@pytest.mark.parametrize("window", ["", " LIMIT 1"])
+def test_grouped_distinct_ranges_reuse_typed_packets(graph_db, groups, child, window):
+    actual = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND {groups} AS g UNWIND range(1,1000000) AS x {child}"
+            f"RETURN g,count(DISTINCT x),sum(DISTINCT x) ORDER BY g{window}",
+            "limits": {"intermediate_states": 5000, "memory_bytes": 1 << 20},
+        },
+    )
+    expected = [[1, 1000000, 500000500000]]
+    if not window:
+        expected.append([2, 1000000, 500000500000])
+    assert [[int(cell["value"]) for cell in row] for row in actual["rows"]] == expected
+    assert actual["stats"]["memory_bytes"] < 200000

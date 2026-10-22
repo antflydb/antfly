@@ -2034,6 +2034,24 @@ concatenation compose those summaries in producer order, while constant affine
 images have one distinct value. A synchronous, charged proof cache shares source
 DAGs without retaining transient AST addresses across normalization frames.
 
+DISTINCT integer observers retain exact arithmetic set support per group. Native
+range descriptors carry membership through reducer snapshots without allocating
+one key per integer. COUNT normalizes compatible source ranges; SUM retains
+first-encounter range order. Exact union moments separate negative and positive
+contributions, so removing prior members preserves checked SUM prefix bounds,
+including overlaps, different strides, reversals and affine constant images.
+Ordinary scalar membership remains available alongside compressed ranges, with
+numeric equality shared across INTEGER and NUMBER values. A bounded union proof
+may decline to charged encounter-order replay without expanding prior support.
+Immutable producer support uses a shared DAG with one charged visit per node;
+repeated producer branches cannot expand the certificate exponentially.
+
+Pure integer DISTINCT packets can merge into existing groups using their ordered
+range encounters. Floating SUM and unsupported mixed packet forms preserve
+ordinary replay. Restored membership does not recompute aggregate values or
+change floating representations. All packet data is cloned before reducer
+arenas close; group eviction releases its range support and encounter history.
+
 Bounded COUNT group windows accept pure expanding children using dynamic emitted
 weight certificates. Both materialized and streamed child boundaries check the
 combined caller/child multiplicity; terminal contributions and cached reducer
@@ -2058,8 +2076,9 @@ and global intermediate windows preserve the global sort. The cache admits at
 most the smaller of 4 MiB and one sixteenth of the query memory budget; admission
 failure falls back before publishing partial state.
 
-Count-only group windows may reuse a successful complete domain, including a
-validated ordered domain, before ranking its group key. Such a packet certifies
+COUNT and certified numeric group windows may reuse a successful complete
+domain, including a validated ordered domain, before ranking its group key. Such
+a packet certifies
 argument evaluation for rejected and LIMIT 0 groups as well as selected groups.
 A failed argument probe disables reuse and resumes ordinary row/error order; it
 never hides an error behind eviction. Every COUNT-window transition is charged

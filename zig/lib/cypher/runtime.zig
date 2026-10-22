@@ -1708,6 +1708,7 @@ const Engine = struct {
         distinct_bytes: ?*v.BytePool = null,
         distinct_index: value_work.Index = .{},
         distinct_support: ?*Statistic.SupportSet = null,
+        integer_domain: ?*@import("range_set.zig").Set = null,
         list_domain: ?*const ListCountFacts = null,
         list_domains: std.AutoHashMapUnmanaged(*const ListCountFacts, void) = .empty,
         cohort: ?*DistinctConsumer = null,
@@ -1900,6 +1901,22 @@ const Engine = struct {
         }
         fn addSupport(self: *StreamingAggregate, engine: *Engine, support: StatisticSupport) !void {
             try self.materializeListDomain(engine);
+            if (self.integer_domain != null) {
+                for (support.value.words, 0..) |word, index| {
+                    try engine.state();
+                    var bits = word;
+                    while (bits != 0) {
+                        const first: u6 = @intCast(@ctz(bits));
+                        const shifted = bits >> first;
+                        const length: u7 = @intCast(@ctz(~shifted));
+                        const mask = if (length == 64) std.math.maxInt(u64) else (@as(u64, 1) << @as(u6, @intCast(length))) - 1;
+                        bits &= ~(mask << first);
+                        const start = std.math.cast(i64, @as(i128, support.value.low) + support.offset + @as(i128, @intCast(index)) * 64 + first) orelse return error.CypherNumericOverflow;
+                        try self.addIntegerRanges(engine, &.{.{ .sequence = .{ .start = start, .step = 1, .length = length } }});
+                    }
+                }
+                return;
+            }
             const a = self.distinct_arena.allocator();
             if (self.distinct_support == null) {
                 const set = try a.create(Statistic.SupportSet);
@@ -1918,6 +1935,82 @@ const Engine = struct {
             }
             try Engine.chargeWork(engine, support.value.words.len * 2);
             self.count = try addPathCount(self.count, try self.distinct_support.?.add(a, support.value, support.offset));
+        }
+        fn seedIntegerDomain(self: *@This(), engine: *Engine) anyerror!bool {
+            if (self.distinct_support != null) return false;
+            try self.materializeListDomain(engine);
+            const a = self.distinct_arena.allocator();
+            if (self.integer_domain == null) {
+                self.integer_domain = try a.create(@import("range_set.zig").Set);
+                self.integer_domain.?.* = .{};
+            }
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            const values = if (self.cohort) |cohort| cohort.membership.values.items else self.distinct_values.items;
+            for (values, 0..) |value, ordinal| {
+                try engine.state();
+                if (self.cohort != null and !self.consumedOrdinal(ordinal)) continue;
+                if (supportInteger(value)) |integer| {
+                    if (try self.integer_domain.?.insert(a, scratch.allocator(), .{ .start = integer, .step = 1, .length = 1 }, engine, Engine.chargeWork) == null) return false;
+                }
+            }
+            return true;
+        }
+        fn addIntegerTree(self: *@This(), engine: *Engine, root: ?*const @import("range_set.zig").Node) anyerror!void {
+            const Node = @import("range_set.zig").Node;
+            const Item = struct { node: *const Node, reversed: bool = false };
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            var stack: std.ArrayList(Item) = .empty;
+            var seen: std.AutoHashMapUnmanaged(*const Node, void) = .empty;
+            if (root) |node| try stack.append(a, .{ .node = node });
+            while (stack.pop()) |item| {
+                try engine.state();
+                // Every node denotes a complete immutable domain. After its
+                // first encounter, reversing/repeating it adds no set members.
+                const entry = try seen.getOrPut(a, item.node);
+                if (entry.found_existing) continue;
+                switch (item.node.*) {
+                    .leaf => |input| {
+                        var part = input;
+                        part.reversed = part.reversed != item.reversed;
+                        try self.addIntegerRanges(engine, &.{part});
+                    },
+                    .reverse => |child| try stack.append(a, .{ .node = child, .reversed = !item.reversed }),
+                    .concat => |pair| {
+                        try stack.append(a, .{ .node = if (item.reversed) pair.left else pair.right, .reversed = item.reversed });
+                        try stack.append(a, .{ .node = if (item.reversed) pair.right else pair.left, .reversed = item.reversed });
+                    },
+                }
+            }
+        }
+        fn addIntegerRanges(self: *@This(), engine: *Engine, parts: []const @import("range_set.zig").Part) anyerror!void {
+            const sum = std.ascii.eqlIgnoreCase(self.function.name, "sum");
+            var compressed = (!sum or self.sum == .integer) and try self.seedIntegerDomain(engine);
+            for (parts) |part| {
+                if (compressed and (!sum or self.sum == .integer)) {
+                    var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                    defer scratch.deinit();
+                    if (try self.integer_domain.?.insert(self.distinct_arena.allocator(), scratch.allocator(), part.sequence, engine, Engine.chargeWork)) |novel| {
+                        if (sum) {
+                            if (novel.count != 0) try self.integer_domain.?.encounters.append(self.distinct_arena.allocator(), part);
+                            const ascending = (part.sequence.step > 0) != part.reversed;
+                            const summary: IntegerListSum = .{ .total = novel.total(), .low = if (ascending) novel.negative else @min(0, novel.total()), .high = if (ascending) @max(0, novel.total()) else novel.positive, .positive = novel.positive > 0, .negative = novel.negative < 0 };
+                            try self.addIntegerSummary(engine, summary, Count.one, @intCast(@min(novel.count, std.math.maxInt(u64))));
+                        } else self.count = try addPathCount(self.count, std.math.cast(u64, novel.count) orelse return error.CypherNumericOverflow);
+                        continue;
+                    }
+                }
+                compressed = false;
+                // A complex union or a floating accumulator retains encounter
+                // order. Membership still consults previously compressed ranges.
+                var index: u128 = 0;
+                while (index < part.sequence.length) : (index += 1) {
+                    try engine.state();
+                    try self.addValue(engine, part.sequence.at(if (part.reversed) part.sequence.length - index - 1 else index), Count.one);
+                }
+            }
         }
         fn materializeListDomain(self: *StreamingAggregate, engine: *Engine) anyerror!void {
             const domain = self.list_domain orelse return;
@@ -2027,6 +2120,9 @@ const Engine = struct {
         fn addValue(self: *StreamingAggregate, engine: *Engine, value: v.Value, multiplicity: Count) anyerror!void {
             if (value == .null) return;
             try self.materializeListDomain(engine);
+            if (self.function.distinct) if (self.integer_domain) |domain| if (supportInteger(value)) |integer| {
+                if (try domain.contains(integer, engine, Engine.chargeWork)) return;
+            };
             // Retention is bounded, evaluation is not: every argument above
             // still runs, even after this consumer has received its prefix.
             if (!self.function.collect_summary and self.function.collect_suffix == 0) if (self.function.collect_limit) |limit| if (self.collected.items.len >= limit) return;
@@ -3513,13 +3609,15 @@ const Engine = struct {
         const function_call = state_value.function;
         if (function_call.distinct and state_value.failure == null and !std.ascii.eqlIgnoreCase(function_call.name, "min") and !std.ascii.eqlIgnoreCase(function_call.name, "max")) {
             const keys = if (state_value.list_domain) |facts| facts.distinct.? else if (state_value.cohort) |cohort| blk: {
-                if (cohort.membership.values.items.len == state_value.count) break :blk cohort.membership.values.items;
+                // Symbolic members contribute to count without consuming
+                // cohort ordinals, so length equality alone is insufficient.
+                if (state_value.integer_domain == null and cohort.membership.values.items.len == state_value.count) break :blk cohort.membership.values.items;
                 var kept: std.ArrayList(v.Value) = .empty;
                 for (cohort.membership.values.items, 0..) |value, ordinal| if (state_value.consumedOrdinal(ordinal)) try kept.append(self.a, value);
                 break :blk kept.items;
             } else state_value.distinct_values.items;
             // Arithmetic cardinality-only proofs do not own an enumerable set.
-            if (keys.len != state_value.count) return error.CypherAxisMemoDeclined;
+            if (state_value.integer_domain == null and keys.len != state_value.count) return error.CypherAxisMemoDeclined;
             members = .{ .list = keys };
             if ((try self.values.info(members)).entities) return error.CypherAxisMemoDeclined;
         }
@@ -3541,6 +3639,16 @@ const Engine = struct {
                 .{ .name = "accumulator", .value = consumer.fold.accumulator },
             }) };
         }
+        var integer_ranges: v.Value = .null;
+        var integer_order: v.Value = .null;
+        if (state_value.integer_domain) |domain| {
+            const encoded = try self.a.alloc(v.Value, domain.ranges.items.len);
+            for (encoded, domain.ranges.items) |*item, range| item.* = .{ .list = try self.a.dupe(v.Value, &.{ .{ .integer = range.start }, range.at(range.length - 1), .{ .integer = range.step } }) };
+            integer_ranges = .{ .list = encoded };
+            const ordered = try self.a.alloc(v.Value, domain.encounters.items.len);
+            for (ordered, domain.encounters.items) |*item, part| item.* = .{ .list = try self.a.dupe(v.Value, &.{ .{ .integer = part.sequence.start }, part.sequence.at(part.sequence.length - 1), .{ .integer = part.sequence.step }, .{ .boolean = part.reversed } }) };
+            integer_order = .{ .list = ordered };
+        }
         return self.a.dupe(v.Entry, &.{
             .{ .name = "count", .value = .{ .integer = @bitCast(state_value.count) } },
             .{ .name = "sum", .value = state_value.sum },
@@ -3556,6 +3664,8 @@ const Engine = struct {
             .{ .name = "overflow", .value = .{ .boolean = state_value.collection_overflow } },
             .{ .name = "source_null", .value = .{ .boolean = state_value.source_null } },
             .{ .name = "consumers", .value = .{ .list = consumers } },
+            .{ .name = "integer_ranges", .value = integer_ranges },
+            .{ .name = "integer_order", .value = integer_order },
         });
     }
     fn axisRestore(self: *Engine, state_value: *StreamingAggregate, row: Row) anyerror!void {
@@ -3564,7 +3674,35 @@ const Engine = struct {
         state_value.mean = row[2].value.number;
         state_value.mean_weight = row[3].value.number;
         state_value.best = row[4].value;
-        if (row[5].value != .null) {
+        const integer_ranges = lookup(row, "integer_ranges") orelse v.Value.null;
+        if (integer_ranges == .list) {
+            const a = state_value.distinct_arena.allocator();
+            const domain = try a.create(@import("range_set.zig").Set);
+            domain.* = .{ .measure = null };
+            state_value.integer_domain = domain;
+            for (integer_ranges.list) |item| {
+                try self.state();
+                const range = (try @import("range.zig").Range.init(item.list[0], item.list[1], item.list[2])) orelse return error.CypherInvalidBackendPage;
+                try domain.ranges.append(a, range);
+            }
+            const ordered = lookup(row, "integer_order") orelse v.Value.null;
+            if (ordered == .list) for (ordered.list) |item| {
+                try self.state();
+                const sequence = (try @import("range.zig").Range.init(item.list[0], item.list[1], item.list[2])) orelse return error.CypherInvalidBackendPage;
+                try domain.encounters.append(a, .{ .sequence = sequence, .reversed = item.list[3].boolean });
+            };
+            // Ordinary keys can coexist with compressed integers. Populate
+            // their membership without resetting the captured reducer result.
+            const count_value = state_value.count;
+            const sum_value = state_value.sum;
+            const saved_function = state_value.function;
+            state_value.function.name = "count";
+            defer state_value.function = saved_function;
+            state_value.count = 0;
+            if (row[5].value == .list) for (row[5].value.list) |value| try state_value.addValue(self, value, Count.one);
+            state_value.count = count_value;
+            state_value.sum = sum_value;
+        } else if (row[5].value != .null) {
             // Read-only memo hits promote their complete rows to statement
             // storage. Register that destination before borrowing its support.
             _ = try (try self.rootInvariantState()).work.info(row[5].value);
@@ -3601,6 +3739,15 @@ const Engine = struct {
             consumer.embedding_failure = cells[5].value.boolean;
             if (cells[6].value.boolean) try consumer.fold.own(self, cells[7].value);
         }
+    }
+    fn mergeIntegerSnapshot(self: *Engine, state_value: *StreamingAggregate, snapshot: Row) !void {
+        const sum = std.ascii.eqlIgnoreCase(state_value.function.name, "sum");
+        const encoded = lookup(snapshot, if (sum) "integer_order" else "integer_ranges").?.list;
+        for (encoded) |item| {
+            const sequence = (try @import("range.zig").Range.init(item.list[0], item.list[1], item.list[2])) orelse return error.CypherInvalidBackendPage;
+            try state_value.addIntegerRanges(self, &.{.{ .sequence = sequence, .reversed = sum and item.list[3].boolean }});
+        }
+        if (!sum and snapshot[5].value == .list) for (snapshot[5].value.list) |value| try state_value.addValue(self, value, Count.one);
     }
     fn computeAxis(self: *Engine, parent: *StreamFold, plan: *AxisPlan, key: Row) anyerror!WeightedRows {
         const columns = self.columns;
@@ -3692,10 +3839,18 @@ const Engine = struct {
     /// Every intermediate interval is checked before any observer is replaced.
     /// Prefix sums retain producer order, including reversed/concatenated DAGs.
     const RangeObserver = struct {
+        support: ?*const @import("range_set.zig").Node = null,
         extrema: ?RangeExtrema = null,
         summary: ?IntegerListSum = .{},
-        fn concat(left: @This(), right: @This()) @This() {
+        fn concat(left: @This(), right: @This(), engine: *Engine) !@This() {
+            const support = if (left.support) |l| (if (right.support) |r| blk: {
+                if (l == r) break :blk l;
+                const node = try engine.a.create(@import("range_set.zig").Node);
+                node.* = .{ .concat = .{ .left = l, .right = r } };
+                break :blk node;
+            } else l) else right.support;
             return .{
+                .support = support,
                 .extrema = if (left.extrema) |l| (if (right.extrema) |r| .{ .minimum = @min(l.minimum, r.minimum), .maximum = @max(l.maximum, r.maximum) } else l) else right.extrema,
                 .summary = if (left.summary != null and right.summary != null) left.summary.?.concat(right.summary.?) else null,
             };
@@ -3745,12 +3900,24 @@ const Engine = struct {
         const first = std.math.cast(i64, @as(i128, form.scale) * sequence.start + form.offset) orelse return null;
         const end = std.math.cast(i64, @as(i128, form.scale) * last + form.offset) orelse return null;
         const extrema: RangeExtrema = .{ .minimum = @min(first, end), .maximum = @max(first, end) };
+        const support = try self.a.create(@import("range_set.zig").Node);
+        support.* = .{ .leaf = .{ .sequence = .{ .start = first, .step = if (form.scale == 0 or sequence.length == 1) 1 else std.math.cast(i64, @as(i128, form.scale) * sequence.step) orelse return null, .length = if (form.scale == 0) 1 else sequence.length } } };
         if (form.scale == 0) {
             const total = std.math.mul(i128, first, @intCast(sequence.length)) catch return null;
-            return .{ .extrema = extrema, .summary = .{ .total = total, .low = @min(0, total), .high = @max(0, total), .positive = first > 0, .negative = first < 0 } };
+            return .{ .support = support, .extrema = extrema, .summary = .{ .total = total, .low = @min(0, total), .high = @max(0, total), .positive = first > 0, .negative = first < 0 } };
         }
         const step = if (sequence.length == 1) @as(i64, 1) else std.math.cast(i64, @as(i128, form.scale) * sequence.step) orelse return null;
-        return .{ .extrema = extrema, .summary = IntegerListSum.range(.{ .start = first, .step = step, .length = sequence.length }) };
+        return .{ .support = support, .extrema = extrema, .summary = IntegerListSum.range(.{ .start = first, .step = step, .length = sequence.length }) };
+    }
+    fn reverseObserver(self: *Engine, proof: RangeObserver) !RangeObserver {
+        var reversed = proof;
+        reversed.summary = if (proof.summary) |summary| summary.reversed() else null;
+        if (proof.support) |child| {
+            const node = try self.a.create(@import("range_set.zig").Node);
+            node.* = .{ .reverse = child };
+            reversed.support = node;
+        }
+        return reversed;
     }
     fn observeArithmetic(self: *Engine, expression: *const ast.Expr, row: Row, argument: *const ast.Expr, alias: []const u8, cache: *std.AutoHashMapUnmanaged(usize, ?RangeObserver)) anyerror!?RangeObserver {
         try self.state();
@@ -3772,16 +3939,15 @@ const Engine = struct {
             return self.observeRange(sequence, argument, alias);
         }
         if (reduction_plan.reversedList(expression)) |input| {
-            var proof = (try self.observeArithmetic(input, row, argument, alias, cache)) orelse return null;
-            proof.summary = if (proof.summary) |summary| summary.reversed() else null;
-            return proof;
+            const proof = (try self.observeArithmetic(input, row, argument, alias, cache)) orelse return null;
+            return try self.reverseObserver(proof);
         }
         const parts = reduction_plan.concatenatedList(expression) orelse return null;
         const left = (try self.observeArithmetic(parts.left, row, argument, alias, cache)) orelse return null;
         const right = (try self.observeArithmetic(parts.right, row, argument, alias, cache)) orelse return null;
-        return left.concat(right);
+        return try left.concat(right, self);
     }
-    fn rangeObservers(self: *Engine, fold: *StreamFold, proof: StreamFold.RangeCountProof, source: *const ast.Expr, row: Row, sequence: ?@import("range.zig").Range, reversed: bool) !?[]const ?RangeObserver {
+    fn rangeObservers(self: *Engine, fold: *StreamFold, proof: StreamFold.RangeCountProof, source: *const ast.Expr, row: Row, sequence: ?@import("range.zig").Range, domain: ?ArithmeticDomain, reversed: bool) !?[]const ?RangeObserver {
         const result = try self.a.alloc(?RangeObserver, fold.calls.len);
         @memset(result, null);
         for (proof.slots, fold.calls, result) |qualified, expression, *observer| if (qualified) {
@@ -3790,9 +3956,13 @@ const Engine = struct {
             // addresses from recyclable normalization frames across calls.
             var cache: std.AutoHashMapUnmanaged(usize, ?RangeObserver) = .empty;
             defer cache.deinit(self.scratch_allocator);
-            var observation = (if (sequence) |range| try self.observeRange(range, arg, proof.alias) else try self.observeArithmetic(source, row, arg, proof.alias, &cache)) orelse return null;
-            if (reversed) observation.summary = if (observation.summary) |summary| summary.reversed() else null;
-            if (observation.extrema == null or (std.ascii.eqlIgnoreCase(expression.value.call.name, "sum") and observation.summary == null)) return null;
+            var observation = if (domain != null and expression.value.call.distinct and std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) count: {
+                var result_domain: RangeObserver = .{};
+                for (domain.?.ranges) |range| result_domain = try result_domain.concat((try self.observeRange(range, arg, proof.alias)) orelse return null, self);
+                break :count result_domain;
+            } else (if (sequence) |range| try self.observeRange(range, arg, proof.alias) else try self.observeArithmetic(source, row, arg, proof.alias, &cache)) orelse return null;
+            if (reversed) observation = try self.reverseObserver(observation);
+            if (observation.extrema == null or (std.ascii.eqlIgnoreCase(expression.value.call.name, "sum") and !expression.value.call.distinct and observation.summary == null)) return null;
             observer.* = observation;
         };
         return result;
@@ -3813,7 +3983,7 @@ const Engine = struct {
                 if (fold.active_calls) |active| if (!active[index]) continue;
                 const call_value = expression.value.call;
                 sum = sum or (std.ascii.eqlIgnoreCase(call_value.name, "sum") and !call_value.distinct);
-                range_distinct = range_distinct or (range and std.ascii.eqlIgnoreCase(call_value.name, "count") and call_value.distinct);
+                range_distinct = range_distinct or (range and call_value.distinct and (std.ascii.eqlIgnoreCase(call_value.name, "count") or std.ascii.eqlIgnoreCase(call_value.name, "sum")));
             };
             return .{ .slots = slots, .summary = if (sum) summary.? else null, .facts = facts, .weight = weight, .non_null = non_null, .distinct_range = range_distinct };
         }
@@ -3921,7 +4091,6 @@ const Engine = struct {
         range_extrema: ?RangeExtrema = null,
         range_observers: ?[]const ?RangeObserver = null,
         range_sum: ?struct { value: IntegerListSum, weight: Count, length: u64 } = null,
-        range_distinct_count: ?struct { value: Count, weight: Count } = null,
         list_counts: ?struct { facts: *ListCountFacts, slots: []const bool, weight: Count } = null,
         continuation: ?struct { parent: *StreamFold, index: usize, apply: ?Row = null, returned: ?*bool = null, capture: ?*StreamCapture = null, admission: bool = false } = null,
         fn closeAxes(fold: *@This()) void {
@@ -4099,21 +4268,16 @@ const Engine = struct {
                                 defer scratch.deinit();
                                 const domain = try engine.arithmeticDomain(unwind.expression, row);
                                 if (domain.null_source or domain.length.cap(1) == 0) return;
-                                const observations = (try engine.rangeObservers(fold, proof, unwind.expression, row, null, false)) orelse break :arithmetic;
+                                const observations = (try engine.rangeObservers(fold, proof, unwind.expression, row, null, domain, false)) orelse break :arithmetic;
                                 if (fold.window_certificate) |checked| try checked.ranges(engine, fold.calls, observations);
                                 const saved_observers = fold.range_observers;
                                 fold.range_observers = observations;
                                 defer fold.range_observers = saved_observers;
-                                var needs_distinct = false;
-                                for (slots, fold.calls) |qualified, call_value| if (qualified and call_value.value.call.distinct and std.ascii.eqlIgnoreCase(call_value.value.call.name, "count")) {
-                                    needs_distinct = true;
-                                };
                                 var needs_sum = false;
-                                for (slots, fold.calls) |qualified, call_value| if (qualified and std.ascii.eqlIgnoreCase(call_value.value.call.name, "sum")) {
+                                for (slots, fold.calls) |qualified, call_value| if (qualified and !call_value.value.call.distinct and std.ascii.eqlIgnoreCase(call_value.value.call.name, "sum")) {
                                     needs_sum = true;
                                 };
-                                const unique_count = if (needs_sum and domain.integer_sum == null) @as(?u128, null) else if (needs_distinct) try @import("range.zig").distinctCardinalityWork(scratch.allocator(), domain.ranges, engine, chargeWork) else @as(?u128, 0);
-                                if (unique_count) |unique| {
+                                if (!needs_sum or domain.integer_sum != null) {
                                     const previous = fold.weight;
                                     const previous_counts = fold.range_counts;
                                     const previous_sum = fold.range_sum;
@@ -4122,12 +4286,9 @@ const Engine = struct {
                                     const previous_extrema = fold.range_extrema;
                                     defer fold.range_extrema = previous_extrema;
                                     fold.range_extrema = domain.extrema();
-                                    const previous_distinct = fold.range_distinct_count;
                                     defer fold.weight = previous;
                                     defer fold.range_counts = previous_counts;
-                                    defer fold.range_distinct_count = previous_distinct;
                                     fold.range_counts = slots;
-                                    fold.range_distinct_count = .{ .value = try engine.domainCount(unique), .weight = previous };
                                     fold.weight = try previous.multiply(engine.a, domain.length);
                                     try engine.state();
                                     if (fold.record_rows) fold.stage_counts[index + 1] +|= @intCast(fold.weight.cap(std.math.maxInt(usize)));
@@ -4157,7 +4318,7 @@ const Engine = struct {
                         }
                         var source = (try engine.unwindSource(unwind.expression, row)) orelse return;
                         const range_proof = if (source.values == .range) try fold.rangeCountProof(engine, unwind.alias, index + 1) else null;
-                        const observers = if (range_proof) |proof| try engine.rangeObservers(fold, proof, unwind.expression, row, source.values.range, source.reversed) else null;
+                        const observers = if (range_proof) |proof| try engine.rangeObservers(fold, proof, unwind.expression, row, source.values.range, null, source.reversed) else null;
                         if (fold.window_certificate) |checked| if (observers) |observations| try checked.ranges(engine, fold.calls, observations);
                         const counts = if (observers != null) range_proof.?.slots else null;
                         const list_counts = if (source.values == .list and !source.reversed) try fold.listCountProof(engine, unwind.alias, index + 1, .{ .list = source.values.list }) else null;
@@ -4182,9 +4343,6 @@ const Engine = struct {
                             const previous_extrema = fold.range_extrema;
                             defer fold.range_extrema = previous_extrema;
                             fold.range_extrema = if (source.values == .range) (ArithmeticDomain{ .ranges = &.{source.values.range} }).extrema() else null;
-                            const previous_distinct = fold.range_distinct_count;
-                            fold.range_distinct_count = if (counts != null) .{ .value = cardinality, .weight = previous } else null;
-                            defer fold.range_distinct_count = previous_distinct;
                             const previous_lists = fold.list_counts;
                             fold.list_counts = if (list_counts) |proof| .{ .facts = proof.facts, .slots = proof.slots, .weight = previous } else null;
                             defer fold.list_counts = previous_lists;
@@ -4431,8 +4589,28 @@ const Engine = struct {
                 }
             }
             if (fold.axis_packet) |packet| {
-                for (fold.groups.items[found.?].states) |state_value| if (state_value.count != 0 or state_value.failure != null) return error.CypherAxisMemoDeclined;
-                for (fold.groups.items[found.?].states, packet) |*state_value, snapshot| try engine.axisRestore(state_value, snapshot);
+                const states = fold.groups.items[found.?].states;
+                const populated = for (states) |state_value| {
+                    if (state_value.count != 0 or state_value.failure != null) break true;
+                } else false;
+                if (!populated) {
+                    for (states, packet) |*state_value, snapshot| try engine.axisRestore(state_value, snapshot);
+                } else {
+                    for (states, packet) |state_value, snapshot| {
+                        const ranges = lookup(snapshot, "integer_ranges") orelse return error.CypherAxisMemoDeclined;
+                        if (state_value.failure != null or snapshot[6].value.integer != 0 or ranges != .list or !state_value.function.distinct or state_value.distinct_support != null) return error.CypherAxisMemoDeclined;
+                        const sum = std.ascii.eqlIgnoreCase(state_value.function.name, "sum");
+                        if (!sum and !std.ascii.eqlIgnoreCase(state_value.function.name, "count")) return error.CypherAxisMemoDeclined;
+                        if (sum and (state_value.sum != .integer or snapshot[1].value != .integer or snapshot[5].value.list.len != 0 or (lookup(snapshot, "integer_order") orelse v.Value.null) != .list)) return error.CypherAxisMemoDeclined;
+                    }
+                    for (states, packet) |*state_value, snapshot| {
+                        engine.mergeIntegerSnapshot(state_value, snapshot) catch |err| {
+                            if (fold.group_window != null and fold.window_retry and StreamingAggregate.consumerFailure(err)) return error.CypherGroupWindowDeclined;
+                            if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
+                            state_value.failure = err;
+                        };
+                    }
+                }
                 return;
             }
             input_clones.owned_parent = engine.statement_ownership;
@@ -4479,6 +4657,14 @@ const Engine = struct {
                     continue;
                 };
                 if (fold.range_counts) |slots| if (slots[i]) {
+                    if (accumulator.function.distinct and (std.ascii.eqlIgnoreCase(accumulator.function.name, "count") or std.ascii.eqlIgnoreCase(accumulator.function.name, "sum"))) {
+                        if (!first_domain) continue;
+                        accumulator.addIntegerTree(engine, fold.range_observers.?[i].?.support) catch |err| {
+                            if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
+                            accumulator.failure = err;
+                        };
+                        continue;
+                    }
                     if (std.ascii.eqlIgnoreCase(accumulator.function.name, "sum")) {
                         const packet = fold.range_sum.?;
                         accumulator.addIntegerSummary(engine, packet.value, packet.weight, packet.length) catch |err| {
@@ -4495,15 +4681,9 @@ const Engine = struct {
                     }
                 };
                 const saved_function = accumulator.function;
-                var multiplicity = fold.weight;
+                const multiplicity = fold.weight;
                 if (fold.range_counts) |counts| if (counts[i]) {
-                    // The range packet proves non-NULL values, and DISTINCT
-                    // additionally proves one disjoint axis in this group scope.
-                    if (accumulator.function.distinct) if (fold.range_distinct_count) |packet| {
-                        if (!first_domain) continue;
-                        const domain_count = if (fold.range_observers) |observers| (if (observers[i].?.extrema.?.minimum == observers[i].?.extrema.?.maximum) Count.one else packet.value) else packet.value;
-                        multiplicity = try packet.weight.multiply(engine.a, domain_count);
-                    };
+                    // Non-DISTINCT COUNT observes a complete non-NULL axis.
                     accumulator.function.star = true;
                     accumulator.function.distinct = false;
                 };
@@ -4579,20 +4759,16 @@ const Engine = struct {
                 if (clause.operation != .project) return null;
                 observed_alias = forwardedAxis(clause.operation.project.value, observed_alias) orelse return null;
             }
-            var unique = fold.single_seed and fold.weight.isOne();
-            for (fold.middle[0 .. index - 1]) |clause| if (clause.operation != .project) {
-                unique = false;
-            };
             const counts = try engine.a.alloc(bool, fold.calls.len);
             var observed = false;
             for (fold.calls, counts) |expression, *qualified| {
                 const c = expression.value.call;
                 if (std.ascii.eqlIgnoreCase(c.name, "avg")) return null;
                 const sum = std.ascii.eqlIgnoreCase(c.name, "sum");
-                if (sum and (c.distinct or c.star or c.args.len != 1 or !rangeArgumentShape(c.args[0], observed_alias))) return null;
+                if (sum and (c.star or c.args.len != 1 or !rangeArgumentShape(c.args[0], observed_alias))) return null;
                 const is_count = std.ascii.eqlIgnoreCase(c.name, "count");
                 const extreme = std.ascii.eqlIgnoreCase(c.name, "min") or std.ascii.eqlIgnoreCase(c.name, "max");
-                qualified.* = (is_count or extreme or sum) and !c.star and (extreme or !c.distinct or unique) and c.args.len == 1 and rangeArgumentShape(c.args[0], observed_alias) and (sum or !independentExpressions(c.args[0], observed_alias));
+                qualified.* = (is_count or extreme or sum) and !c.star and c.args.len == 1 and rangeArgumentShape(c.args[0], observed_alias) and (sum or !independentExpressions(c.args[0], observed_alias));
                 observed = observed or qualified.*;
             }
             if (!observed or !axisExpressions(fold.projection, observed_alias, slots, counts)) return null;
@@ -5516,7 +5692,7 @@ const Engine = struct {
             if (StreamingAggregate.consumerFailure(err) or err == error.CypherAxisMemoDeclined) return false;
             return err;
         };
-        if (fold.group_window != null and (fold.group_window.?.extended or !GroupWindow.permitsPacket(self, packet, fold.calls.len))) {
+        if (fold.group_window != null and ((fold.group_window.?.extended and !(lookup(packet.rows[0], "window_safe") orelse v.Value{ .boolean = false }).boolean) or !GroupWindow.permitsPacket(self, packet, fold.calls.len))) {
             if (fold.window_retry) return error.CypherGroupWindowDeclined;
             return false;
         }

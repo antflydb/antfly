@@ -6554,3 +6554,106 @@ test "bounded numeric windows retain failures in rejected path statistic groups"
     try Failure.check("UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..3]->(b) RETURN g,sum(length(p)*1000000000000000000) AS n ORDER BY g DESC LIMIT 1", "UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..3]->(b) WITH g,sum(length(p)*1000000000000000000) AS n RETURN g,n ORDER BY g DESC LIMIT 1");
     try Failure.check("UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..2]->(b) RETURN g,sum(length(p)*length(p)*1000000000000000000) AS n ORDER BY g DESC LIMIT 1", "UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..2]->(b) WITH g,sum(length(p)*length(p)*1000000000000000000) AS n RETURN g,n ORDER BY g DESC LIMIT 1");
 }
+
+test "symbolic DISTINCT ranges keep million value reducers and grouped CALL packets bounded" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "UNWIND range(1,1000000) AS x RETURN sum(DISTINCT x)",
+        "UNWIND range(1,1000000) AS x RETURN sum(DISTINCT x+1),count(DISTINCT x+1)",
+        "UNWIND [1,2] AS g UNWIND range(1,1000000) AS x RETURN g,count(DISTINCT x),sum(DISTINCT x) ORDER BY g",
+        "UNWIND [1,2] AS g UNWIND range(1,1000000) AS x CALL {UNWIND [7,8] AS y RETURN y} RETURN g,count(DISTINCT x),sum(DISTINCT x) ORDER BY g",
+        "UNWIND [1,2,1,2] AS g UNWIND range(1,1000000) AS x RETURN g,count(DISTINCT x),sum(DISTINCT x) ORDER BY g",
+        "UNWIND [1,2,1,2] AS g UNWIND range(1,1000000) AS x RETURN g,count(DISTINCT x),sum(DISTINCT x) ORDER BY g LIMIT 1",
+        "WITH range(1,1000000) AS xs WITH reverse(xs+xs) AS xs UNWIND xs AS x RETURN count(DISTINCT x),sum(DISTINCT x)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 });
+        defer result.deinit();
+        try std.testing.expect(result.rows.len != 0);
+        try std.testing.expect(result.stats.memory_bytes < 200000);
+        const offset: i64 = if (std.mem.indexOf(u8, text, "x+1") != null) 1000000 else 0;
+        for (result.rows) |row| {
+            const total = row[if (offset != 0) 0 else row.len - 1].integer;
+            try std.testing.expectEqual(@as(i64, 500000500000) + offset, total);
+        }
+    }
+}
+
+test "certified ordered numeric windows keep only selected reducer states" {
+    const a = std.testing.allocator;
+    const groups: usize = if (@import("builtin").mode == .debug) 500 else 10000;
+    for ([_][]const u8{ "min(x)", "max(x)", "sum(x)", "avg(x)", "sum(DISTINCT x)", "avg(DISTINCT x)" }) |aggregate| {
+        const text = try std.fmt.allocPrint(a, "UNWIND range(1,{d}) AS i UNWIND [0,1,0] AS x WITH i,x ORDER BY x DESC RETURN i,{s} ORDER BY i LIMIT 5", .{ groups, aggregate });
+        defer a.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 2 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 5), result.rows.len);
+        try std.testing.expect(result.stats.memory_bytes < 200000);
+    }
+}
+
+test "symbolic DISTINCT supports preserve ordered overlap and scalar transitions" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "range(-4,4)",                                      "reverse(range(-4,4))",          "range(-4,4)+range(2,7)", "reverse(range(-4,4)+range(2,7))",
+        "range(-8,8,2)+range(-6,9,3)",                      "range(8,-8,-2)+range(9,-6,-3)", "range(1,0)",             "range(9223372036854775805,9223372036854775807)",
+        "range(-9223372036854775808,-9223372036854775806)",
+    }) |source| for ([_][]const u8{ "x", "x+1", "-x", "2*x-1", "0*x+7" }) |argument| {
+        for ([_][]const u8{ "", "CALL {UNWIND [7,8] AS y RETURN y} " }) |child| {
+            const text = try std.fmt.allocPrint(a, "UNWIND [1,2,1] AS g UNWIND {s} AS x {s}RETURN g,count(DISTINCT {s}),sum(DISTINCT {s}) ORDER BY g", .{ source, child, argument, argument });
+            defer a.free(text);
+            // A fallible dependent predicate prevents arithmetic compression.
+            const control = try std.fmt.allocPrint(a, "UNWIND [1,2,1] AS g UNWIND {s} AS x WITH g,x WHERE x IS NOT NULL {s}RETURN g,count(DISTINCT {s}),sum(DISTINCT {s}) ORDER BY g", .{ source, child, argument, argument });
+            defer a.free(control);
+            try compareReductionPlans(text, control);
+        }
+    };
+    for ([_][]const u8{ "range(1,5)", "[2,3,6]", "[2.0,3.5,7.0]", "[null,1,2]", "['bad',2]" }) |first| for ([_][]const u8{ "range(3,8)", "range(8,3,-1)", "[1.0,2.5,3]", "[null,1,2]" }) |second| {
+        const text = try std.fmt.allocPrint(a, "UNWIND [1,2,1] AS g UNWIND [0,1] AS k UNWIND CASE WHEN k=0 THEN {s} ELSE {s} END AS x RETURN g,count(DISTINCT x),sum(DISTINCT x) ORDER BY g", .{ first, second });
+        defer a.free(text);
+        const control = try std.fmt.allocPrint(a, "UNWIND [1,2,1] AS g UNWIND [0,1] AS k UNWIND CASE WHEN k=0 THEN {s} ELSE {s} END AS x WITH g,x WHERE x IS NOT NULL RETURN g,count(DISTINCT x),sum(DISTINCT x) ORDER BY g", .{ first, second });
+        defer a.free(control);
+        try compareReductionPlans(text, control);
+    };
+}
+
+test "DISTINCT COUNT preserves ordinary fractional members across repeated groups" {
+    const a = std.testing.allocator;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(a, "UNWIND [1,2,1,2] AS g UNWIND [0,1] AS k UNWIND CASE WHEN k=0 THEN [null,1.5,1.0] ELSE range(1,100) END AS x RETURN g,count(DISTINCT x) ORDER BY g LIMIT 1", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 100000, .memory_bytes = 1 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(i64, 101), result.rows[0][1].integer);
+}
+
+test "symbolic DISTINCT and ordered window snapshots release failed allocations" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, text: []const u8) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    for ([_][]const u8{
+        "UNWIND [1,2,1] AS g UNWIND range(-3,3)+range(1,5) AS x RETURN g,count(DISTINCT x),sum(DISTINCT x) ORDER BY g LIMIT 1",
+        "UNWIND [1,2,1] AS g UNWIND [0,1] AS k UNWIND CASE WHEN k=0 THEN [1.5,1.0] ELSE range(1,4) END AS x RETURN g,count(DISTINCT x) ORDER BY g LIMIT 1",
+        "UNWIND [1,2] AS i UNWIND [0,1,0] AS x WITH i,x ORDER BY x DESC RETURN i,sum(x),avg(x) ORDER BY i LIMIT 1",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
+}

@@ -158,6 +158,46 @@ pub fn distinctCardinality(a: std.mem.Allocator, ranges: []const Range) !?u128 {
     return distinctCardinalityWork(a, ranges, &placeholder, NoWork.charge);
 }
 pub fn distinctCardinalityWork(a: std.mem.Allocator, ranges: []const Range, ptr: *anyopaque, charge: *const fn (*anyopaque, usize) anyerror!void) !?u128 {
+    return if (try unionMeasureWork(a, ranges, ptr, charge)) |measure| measure.count else null;
+}
+
+/// Exact integer set moments. Negative and positive totals also determine the
+/// ordered prefix bounds of any monotone sequence with previously seen values
+/// removed. All signed-i64 sets fit these i128 moments, even the full domain.
+pub const Measure = struct {
+    count: u128 = 0,
+    negative: i128 = 0,
+    positive: i128 = 0,
+    pub fn of(range: Range) @This() {
+        if (range.length == 0) return .{};
+        var wide: WideMeasure = .{};
+        wide.add(Run.from(range), 1);
+        return .{ .count = @intCast(wide.count), .negative = @intCast(wide.negative), .positive = @intCast(wide.positive) };
+    }
+    pub fn total(self: @This()) i128 {
+        return self.negative + self.positive;
+    }
+    pub fn difference(self: @This(), prior: @This()) @This() {
+        return .{ .count = self.count - prior.count, .negative = self.negative - prior.negative, .positive = self.positive - prior.positive };
+    }
+};
+const WideMeasure = struct {
+    count: i256 = 0,
+    negative: i256 = 0,
+    positive: i256 = 0,
+    fn add(self: *@This(), run: Run, coefficient: i128) void {
+        const n: i256 = @intCast(run.length());
+        const low: i256 = run.low;
+        const step: i256 = run.step;
+        const total = @divExact(n * (2 * low + (n - 1) * step), 2);
+        const negatives = if (low >= 0) 0 else @min(n, @divFloor(-low + step - 1, step));
+        const negative = @divExact(negatives * (2 * low + (negatives - 1) * step), 2);
+        self.count += n * coefficient;
+        self.negative += negative * coefficient;
+        self.positive += (total - negative) * coefficient;
+    }
+};
+pub fn unionMeasureWork(a: std.mem.Allocator, ranges: []const Range, ptr: *anyopaque, charge: *const fn (*anyopaque, usize) anyerror!void) !?Measure {
     const Term = struct { run: Run, coefficient: i128 };
     var runs: std.ArrayList(Run) = .empty;
     defer runs.deinit(a);
@@ -206,7 +246,7 @@ pub fn distinctCardinalityWork(a: std.mem.Allocator, ranges: []const Range, ptr:
     // Exhausting this proof budget declines; it never consumes the caller's
     // remaining state budget just to establish that a certificate is too hard.
     var remaining: usize = @intCast(@min(@as(u128, 65536), enumeration *| 2));
-    var result: i256 = 0;
+    var result: WideMeasure = .{};
     for (runs.items) |run| {
         pending.clearRetainingCapacity();
         try pending.append(a, .{ .run = run, .coefficient = 1 });
@@ -217,7 +257,7 @@ pub fn distinctCardinalityWork(a: std.mem.Allocator, ranges: []const Range, ptr:
             remaining -= 1;
             try charge(ptr, 1);
             if (term.run.high < run.low) {
-                result += @as(i256, term.coefficient) * @as(i256, @intCast(term.run.length()));
+                result.add(term.run, term.coefficient);
                 _ = terms.swapRemove(i);
                 continue;
             }
@@ -244,8 +284,8 @@ pub fn distinctCardinalityWork(a: std.mem.Allocator, ranges: []const Range, ptr:
             }
         }
     }
-    for (terms.items) |term| result += @as(i256, term.coefficient) * @as(i256, @intCast(term.run.length()));
-    return @intCast(result);
+    for (terms.items) |term| result.add(term.run, term.coefficient);
+    return .{ .count = @intCast(result.count), .negative = @intCast(result.negative), .positive = @intCast(result.positive) };
 }
 
 test "arithmetic domains count overlaps strides descending and signed boundaries" {
@@ -288,10 +328,18 @@ test "arithmetic domain certificates agree with enumeration for arbitrary stride
             while (ordinal < merged.length) : (ordinal += 1) actual[@intCast(merged.at(ordinal).integer + 30)] = true;
             try std.testing.expectEqualSlices(bool, &expected, &actual);
         }
-        var count: u128 = 0;
-        for (seen) |present| count += @intFromBool(present);
-        if (try distinctCardinality(std.testing.allocator, &ranges)) |actual| {
-            try std.testing.expectEqual(count, actual);
+        var expected: Measure = .{};
+        for (seen, 0..) |present, index| if (present) {
+            const integer = @as(i128, @intCast(index)) - 30;
+            expected.count += 1;
+            if (integer < 0) expected.negative += integer else expected.positive += integer;
+        };
+        const NoWork = struct {
+            fn charge(_: *anyopaque, _: usize) !void {}
+        };
+        var placeholder: u8 = 0;
+        if (try unionMeasureWork(std.testing.allocator, &ranges, &placeholder, NoWork.charge)) |actual| {
+            try std.testing.expectEqualDeep(expected, actual);
             proved += 1;
         }
     }
