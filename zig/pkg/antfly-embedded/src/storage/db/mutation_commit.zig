@@ -944,6 +944,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     )
             else if (opts.snapshot_mutation) |lease| lease.retain() else S.ownerField(self, "core").*.snapshot_admission.acquireMutation();
             defer snapshot_mutation.release();
+            // Retain target names until error-exit delivery has run. This
+            // handler precedes apply/read/graph guards in declaration order,
+            // so those holders unwind before any committed notification.
+            var sync_targets: ManagedSyncTargets = .{};
+            defer sync_targets.deinit(S.ownerField(self, "alloc").*);
+            var committed_replay_sequence: ?u64 = null;
+            var committed_replay_sync: types.SyncLevel = .write;
+            var query_target_notified = false;
+            var executor_notified = false;
+            var enrichment_notified = false;
+            var resolvers_notified = false;
+            errdefer if (committed_replay_sequence) |committed_sequence| {
+                foreground_write.release();
+                (mutation_admission.MutationRetirement{
+                    .current = &replication_mutation,
+                    .enclosing = opts.enclosing_mutation_retirement,
+                    .snapshot = &snapshot_mutation,
+                    .row_policy = opts.row_policy_retirement,
+                }).retire();
+                if (!query_target_notified) notifyQueryVisibilityTargetAdvancedScoped(S.ownerField(self, "async_context").*, committed_sequence, sync_targets.target_identities, sync_targets.target_scope_known);
+                if (!executor_notified and S.ownerField(self, "executor").*.hasWorkers()) notifyExecutorForSyncLevelWithDenseBulkDeferral(S.ownerField(self, "async_context").*, S.ownerField(self, "executor").*, committed_replay_sync, committed_sequence, sync_targets);
+                if (!enrichment_notified) if (S.ownerField(self, "enrichment_runtime").*) |runtime| runtime.notifySequence(committed_sequence);
+                if (!resolvers_notified) self.notifyResolverReplayRuntimes(committed_sequence);
+            };
             std.debug.assert(snapshot_mutation.admission == S.ownerField(self, "core").*.snapshot_admission);
             if (builtin.is_test) {
                 if (D.test_portable_runtime_batch_prelock_hook.*) |hook| {
@@ -2437,8 +2461,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &owned_delete_keys,
             );
 
-            var sync_targets: ManagedSyncTargets = .{};
-            defer sync_targets.deinit(S.ownerField(self, "alloc").*);
             var split_shadow_ticket: ?u64 = null;
             var materialized_derived_batch: ?derived_types.DerivedBatch = null;
             defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(preparation_alloc, materialized_batch);
@@ -3367,6 +3389,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
             if (opts.primary_commit_observed) |observed| observed.* = true;
+            if (transaction_applied.applied and append_derived_replay) {
+                committed_replay_sequence = sequence;
+                committed_replay_sync = effective_req.sync_level;
+            }
             // Counter scratch belongs to preparation, including the path with
             // no authored physical owner. Retire it before any visibility wait.
             counter_deltas.deinit();
@@ -3472,13 +3498,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // admission. Releasing here lets optional maintenance make progress
             // while `.full_index` deliberately waits below.
             foreground_write.release();
-            if (append_derived_replay)
+            if (append_derived_replay) {
                 notifyQueryVisibilityTargetAdvancedScoped(
                     S.ownerField(self, "async_context").*,
                     sequence,
                     sync_targets.target_identities,
                     sync_targets.target_scope_known,
                 );
+                query_target_notified = true;
+            }
             (@import("mutation_admission.zig").MutationRetirement{
                 .current = &replication_mutation,
                 .enclosing = opts.enclosing_mutation_retirement,
@@ -3496,6 +3524,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (append_derived_replay and S.ownerField(self, "executor").*.hasWorkers()) {
                 const notify_executor_start_ns = monotonicTimeNs();
                 notifyExecutorForSyncLevelWithDenseBulkDeferral(S.ownerField(self, "async_context").*, S.ownerField(self, "executor").*, effective_req.sync_level, sequence, sync_targets);
+                executor_notified = true;
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
             }
             if (!opts.bypass_replication_write_gate) {
@@ -3598,7 +3627,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     runtime.notifySequence(sequence);
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
                 }
+                enrichment_notified = true;
                 self.notifyResolverReplayRuntimes(sequence);
+                resolvers_notified = true;
             }
         }
 

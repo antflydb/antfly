@@ -5999,6 +5999,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-prepared-replay-plan-test", "Verify canonical prepared request and accepted-effect replay bounds")
         .dependOn(&addCuratedTestRunArtifact(b, replay_plan_tests, &.{"prepared replay plan"}).step);
+    const completion_handoff_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"completion handoff"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-completion-handoff-test", "Verify committed replay notifications survive completion failures after holder retirement")
+        .dependOn(&addCuratedTestRunArtifact(b, completion_handoff_tests, &.{"completion handoff"}).step);
     const commit_memory_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "commit memory", "mutation batch root production retry wrapper" },

@@ -148580,3 +148580,155 @@ test "db prepared transaction effects required commit memory retains committed b
     }
     return error.TestUnexpectedResult;
 }
+
+test "db prepared transaction effects required completion handoff wakes committed replay after observer failure" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        db: *DB,
+        manager: *resource_manager_mod.ResourceManager,
+        calls: usize = 0,
+        sequence: u64 = 0,
+        scope_known: bool = false,
+        scoped_text: bool = false,
+        apply_retired: bool = false,
+        snapshot_retired: bool = false,
+        policy_retired: bool = false,
+        foreground_retired: bool = false,
+        fn change(ptr: *anyopaque, event: QueryVisibilityEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (event.change != .target_advanced) return;
+            self.calls += 1;
+            self.sequence = event.target_sequence orelse 0;
+            self.scope_known = event.target_scope_known;
+            self.scoped_text = event.target_indexes.len == 1 and std.mem.eql(u8, event.target_indexes[0].index_name, "text");
+            self.apply_retired = self.db.core.apply_mutex.tryLockExclusive();
+            if (self.apply_retired) self.db.core.unlockApply();
+            self.snapshot_retired = self.db.core.snapshot_admission.lock.tryLockExclusive();
+            if (self.snapshot_retired) self.db.core.snapshot_admission.lock.unlockExclusive();
+            self.policy_retired = self.db.local_execution.row_policy_gate.quiesced();
+            self.foreground_retired = self.manager.foreground_write_sessions.load(.acquire) == 0;
+        }
+    };
+    const Observer = struct {
+        calls: usize = 0,
+        fn apply(ptr: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.PreparedGenerationChanged;
+        }
+    };
+    for ([_]bool{ false, true }) |relational| {
+        var manager = resource_manager_mod.ResourceManager.init(.{});
+        defer manager.deinit(a);
+        var directory = try TestDirectory.init("completion-handoff-worker");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), .{ .resource_manager = &manager, .start_optional_runtimes = false, .start_independent_maintenance = false, .executor = .{ .backend = .io_threaded } });
+        defer db.close();
+        if (relational) try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "text", .path = "text", .column_type = .string }} });
+        try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        try std.testing.expect(try db.executor.pauseWorker("text"));
+        defer db.executor.resumeWorker("text");
+        var hook: Hook = .{ .db = &db, .manager = &manager };
+        db.setQueryVisibilityHook(.{ .ptr = &hook, .on_change = Hook.change });
+        defer db.setQueryVisibilityHook(null);
+        var observer: Observer = .{};
+        try std.testing.expectError(error.VersionConflict, db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(.{
+            .writes = &.{.{ .key = "denied", .value = "{\"text\":\"uncommitted\"}" }},
+            .predicates = &.{.{ .key = "denied", .expected_version = 17 }},
+            .sync_level = .write,
+        }, null, .{ .ptr = &observer, .apply = Observer.apply }));
+        try std.testing.expectEqual(@as(usize, 0), hook.calls);
+        try std.testing.expectEqual(@as(usize, 0), observer.calls);
+        try std.testing.expectError(error.PreparedGenerationChanged, db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(.{ .writes = &.{.{ .key = "row", .value = "{\"text\":\"committed\"}" }}, .sync_level = .write }, null, .{ .ptr = &observer, .apply = Observer.apply }));
+        const sequence = db.core.nextDerivedSequence();
+        try std.testing.expectEqual(@as(usize, 1), observer.calls);
+        try std.testing.expectEqual(@as(usize, 1), hook.calls);
+        try std.testing.expectEqual(sequence, hook.sequence);
+        try std.testing.expect(hook.scope_known and hook.scoped_text);
+        try std.testing.expect(hook.apply_retired and hook.snapshot_retired and hook.policy_retired and hook.foreground_retired);
+        const Runtime = @import("derived/io_threaded_runtime.zig").DerivedRuntime;
+        const runtime: *Runtime = @ptrCast(@alignCast(db.executor.ptr));
+        const io = runtime.threaded.io();
+        runtime.mutex.lockUncancelable(io);
+        const notified = runtime.last_notified_sequence;
+        runtime.mutex.unlock(io);
+        try std.testing.expectEqual(sequence, notified);
+        db.executor.resumeWorker("text");
+        // Do not use waitForAll: it would notify the target itself and hide a
+        // missing handoff. Resume the registration, then only observe progress.
+        const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+        while (monotonicTimeNs() < deadline) {
+            if ((db.executor.appliedSequence("text") orelse 0) >= sequence and manager.sliceStats(.derived_backlog).used_bytes == 0) break;
+            @import("antfly_platform").time.yieldNow();
+        }
+        try std.testing.expect((db.executor.appliedSequence("text") orelse 0) >= sequence);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_backlog).used_bytes);
+    }
+}
+
+test "db prepared transaction effects required completion handoff avoids duplicate targets after visibility cancellation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("completion-handoff-late-error");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_independent_maintenance = false, .executor = .{ .backend = .io_threaded } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try std.testing.expect(try db.executor.pauseWorker("text"));
+    defer db.executor.resumeWorker("text");
+    const Hook = struct {
+        calls: usize = 0,
+        sequence: u64 = 0,
+        fn change(ptr: *anyopaque, event: QueryVisibilityEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (event.change != .target_advanced) return;
+            self.calls += 1;
+            self.sequence = event.target_sequence orelse 0;
+        }
+    };
+    var hook: Hook = .{};
+    db.setQueryVisibilityHook(.{ .ptr = &hook, .on_change = Hook.change });
+    defer db.setQueryVisibilityHook(null);
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.EnrichmentWaitCanceled, db.batchWithVisibilityCancellation(.{ .writes = &.{.{ .key = "row", .value = "{\"text\":\"committed\"}" }}, .sync_level = .full_text }, types.CancellationToken.fromAtomic(&canceled)));
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(db.core.nextDerivedSequence(), hook.sequence);
+    const row = (try db.get(a, "row")).?;
+    defer a.free(row);
+    try std.testing.expectEqual(@as(u64, 1), try db.primaryDocCount(a));
+}
+
+test "db prepared transaction effects required completion handoff advances paused producer and resolver targets" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("completion-handoff-families");
+    defer directory.cleanup();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    var db = try DB.open(a, directory.path(), .{ .backend_runtime = runtime.ptr(), .start_optional_runtimes = false, .start_index_workers = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .executor = .{ .backend = .manual } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    if (db.resolution_runtime == null) try db.initResolutionRuntime();
+    if (db.promotion_runtime == null) try db.initPromotionRuntime();
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        // Install a real validated resolver without starting its optional work.
+        try db.core.addResolver(.{ .name = "handoff", .table = "entities", .source_artifact = "relations_v1", .resolution_artifact = "resolution_v1", .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}", .config_generation = 1 });
+    }
+    const Observer = struct {
+        fn apply(_: *anyopaque, _: []const u8) !void {
+            return error.Canceled;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(error.Canceled, db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(.{ .writes = &.{.{ .key = "row", .value = "{\"text\":\"committed\"}" }}, .sync_level = .write }, null, .{ .ptr = &context, .apply = Observer.apply }));
+    const sequence = db.core.nextDerivedSequence();
+    try std.testing.expect(sequence > 0);
+    const enrichment = db.enrichment_runtime.?.stats();
+    try std.testing.expectEqual(sequence, enrichment.target_sequence);
+    try std.testing.expect(!enrichment.worker_started);
+    try std.testing.expectEqual(sequence, db.resolution_runtime.?.stats().target_sequence);
+    try std.testing.expectEqual(sequence, db.promotion_runtime.?.stats().target_sequence);
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+}

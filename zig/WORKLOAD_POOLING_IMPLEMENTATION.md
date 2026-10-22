@@ -22766,3 +22766,44 @@ commit-memory-v4.json/log in the cumulative receipts. Earlier diagnostic and
 intermediate runs are retained and supply no final-source qualification. Full
 linked owner-image, object-engine, crash and cross-engine performance
 qualification remain open.
+
+### Committed replay notification handoff
+
+A reported fresh primary commit with a replay append now arms an error-exit
+notification handoff. Fallible replication publication, committed observers,
+split-delta completion and visibility waits can no longer bypass every replay
+notification merely by returning an error. Uncommitted attempts, semantic no-op
+replay elision and preparation-only assembly do not arm it.
+
+Target arrays and their owned index names now outlive error delivery. Declaration
+and unwind order retire the local readers, graph publication lease and apply lock
+before the handoff. It releases the owned foreground, snapshot, mutation and
+policy holders through the existing retirement contract, then sends missing
+query-target, index-executor, enrichment, resolution and promotion notifications.
+These are existing runtime scheduling hints; they create no fresh execution or
+policy admission and do not authorize a worker role.
+
+Delivery flags preserve the successful path's existing ordering, full-text target
+selection and dense-bulk deferral. A late error does not repeat a query target or
+executor notification already sent. The original completion error propagates;
+notification neither retries the primary batch nor waits for derived completion.
+No durable encoding, ABI layout, reader floor or default activation changes.
+
+This owns notification lifetime within the synchronous invocation. Independently
+retained assemblies still need materialized derived/shadow effects, sync targets,
+full live execution/route/DB ownership and funded executable recovery/derived-log
+resources before a PREPARE vote or direct retained-batch consumption can rely on
+them. Remaining counters, backend metadata, durable guards, required-PREPARE
+orchestration and broader scheduler/engine qualification remain open. Strong
+required providers remain off and the full goal stays active. Full Linux
+qualification remains waived; Linux uses pinned Nix/glibc Zig.
+
+Focused coverage checks document and relational commits, no notifications on a
+precommit rejection, retired locks/admissions at callback delivery, autonomous
+index progress and backlog reclamation after an observer failure, no repeated
+target delivery after visibility cancellation, and paused enrichment/resolution/
+promotion target advancement. The final Debug receipt is completion-handoff-v3
+in the cumulative integration receipts; earlier failed fixture runs are retained
+as diagnostics. The required-prepare DB, commit-memory and boundary ABI checks
+accompany the focused suite; full linked owner and cross-engine qualification
+remain open.
