@@ -406,3 +406,11 @@ test "embeddinggemma2 declarations compile" {
     _ = @import("architectures/embedding_gemma2_media_weights.zig");
     _ = server;
 }
+
+/// Shared CLI diagnostics for the public and development inference entry points.
+pub fn printMetalInfo() void {
+    std.debug.print("metal build_enabled={}\n", .{build_options.enable_metal});
+    if (comptime build_options.enable_metal) {
+        std.debug.print("metal device_available={}\n", .{metal_runtime.metalDeviceAvailable()});
+    }
+}

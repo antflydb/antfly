@@ -858,6 +858,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "preload model spec parser categorizes registry variants and backends",
             "inference runtime preload parser preserves registry variants and explicit backends",
             "inference run config",
+            "structured extraction request selects the JSON interface",
             "inference list accepts models directory before or after flags",
             "kernel JIT mode precedence is CLI then environment then config then default",
         },

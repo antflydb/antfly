@@ -1136,6 +1136,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     const run_antfly_lite_cli_smoke = b.addRunArtifact(lite_cli_smoke);
     run_antfly_lite_cli_smoke.addArtifactArg2(antfly_main, .{ .make_absolute = true });
+    b.step("cli-smoke-test", "Exercise public Lite and inference commands without model downloads").dependOn(&run_antfly_lite_cli_smoke.step);
     const library_step = b.step("libantfly", "Build and install the embedding library, header, and pkg-config metadata");
     library_step.dependOn(&b.top_level_steps.get("licenses-libantfly").?.step);
     library_step.dependOn(install_libantfly);

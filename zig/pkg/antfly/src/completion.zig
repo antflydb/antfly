@@ -48,11 +48,13 @@ const agents_subcommands = [_][]const u8{ "retrieval", "query-builder" };
 const connections_subcommands = [_][]const u8{ "login", "list", "models", "logout" };
 const auth_subcommands = [_][]const u8{ "me", "users", "permissions", "roles", "row-filters", "subjects", "api-keys" };
 const inference_subcommands = [_][]const u8{
-    "run",          "embed",            "classify",  "generate",
-    "chat",         "compile-artifact", "export",    "quantize",
-    "run-artifact", "transcribe",       "read",      "extract",
-    "compare",      "finetune",         "smoke",     "list",
-    "pull",         "convert",          "cuda-info",
+    "run",          "embed",            "classify",             "generate",
+    "chat",         "compile-artifact", "export",               "quantize",
+    "run-artifact", "transcribe",       "read",                 "extract",
+    "compare",      "finetune",         "smoke",                "list",
+    "pull",         "convert",          "cuda-info",            "rerank",
+    "decisions",    "a4b-pack",         "quant-kernel-codegen", "metal-info",
+    "bench-cuda",   "version",
 };
 const lite_subcommands = [_][]const u8{
     "init",           "status",  "info",   "batch",      "lookup",

@@ -7,7 +7,7 @@ inference, CLI, SDKs, language bindings, and native and browser libraries.
 
 ## CLI and library
 
-`antfly` is the public executable. Its `lite` commands manage local `.aflite`
+`antfly` is the public database and inference executable. Its `lite` commands manage local `.aflite`
 files, its `inference` commands run models and the inference service, and
 `standalone` starts the database server. Serve a Lite file with:
 

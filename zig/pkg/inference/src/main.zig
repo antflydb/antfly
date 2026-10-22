@@ -338,8 +338,8 @@ pub fn runFromArgs(
         try runServer(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "embed")) {
         try inference.native_embed.main(allocator, init.io, command_args);
-    } else if (std.mem.eql(u8, command, "decisions") or std.mem.eql(u8, command, "extract")) {
-        try inference.native_decide.main(allocator, init.io, command_args, std.mem.eql(u8, command, "extract"));
+    } else if (std.mem.eql(u8, command, "decisions")) {
+        try inference.native_decide.main(allocator, init.io, command_args, false);
     } else if (std.mem.eql(u8, command, "classify")) {
         try inference.native_classify.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "rerank")) {
@@ -365,7 +365,11 @@ pub fn runFromArgs(
     } else if (std.mem.eql(u8, command, "read")) {
         try inference.native_read.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "extract")) {
-        try inference.native_extract.main(allocator, init.io, command_args);
+        if (command_args.len >= 2 and std.mem.eql(u8, command_args[1], "--request")) {
+            try inference.native_decide.main(allocator, init.io, command_args, true);
+        } else {
+            try inference.native_extract.main(allocator, init.io, command_args);
+        }
     } else if (std.mem.eql(u8, command, "compare")) {
         try inference.compare_generate.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "finetune")) {
@@ -373,7 +377,7 @@ pub fn runFromArgs(
     } else if (std.mem.eql(u8, command, "cuda-info")) {
         try inference.cuda_info.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "metal-info")) {
-        printMetalInfo();
+        inference.printMetalInfo();
     } else if (std.mem.eql(u8, command, "bench-cuda")) {
         try inference.cuda_microbench.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "smoke")) {
@@ -799,13 +803,6 @@ pub fn printVersion(usage_name: []const u8) void {
     });
 }
 
-fn printMetalInfo() void {
-    print("metal build_enabled={}\n", .{build_options.enable_metal});
-    if (comptime build_options.enable_metal) {
-        print("metal device_available={}\n", .{inference.metal_runtime.metalDeviceAvailable()});
-    }
-}
-
 fn printUsage(usage_name: []const u8) void {
     print(
         \\Usage: {s} <command> [options]
@@ -814,7 +811,6 @@ fn printUsage(usage_name: []const u8) void {
         \\  run       Start the inference server
         \\  embed     Run native text/image/audio embedding from the command line
         \\  decisions Run structured choice decisions using a JSON request
-        \\  extract   Run version 2 extraction using a JSON request
         \\  classify  Run native text classification from the command line
         \\  rerank    Run native text reranking from the command line
         \\  generate  Run native text generation from the command line
@@ -827,7 +823,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  run-artifact Run or validate a compiled offline artifact
         \\  transcribe Run native audio transcription from the command line
         \\  read      Run image/document reading from the command line
-        \\  extract   Run native entity, relation, or structured extraction from the command line
+        \\  extract   Run entity extraction or version 2 extraction with --request
         \\  compare   Compare inference backends or implementations
         \\  finetune  Run fine-tuning recipes, datasets, adapters, train/eval, and workflows
         \\  smoke     Run a native GGUF/SafeTensors smoke test

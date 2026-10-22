@@ -274,6 +274,20 @@ pub fn runFromIterator(
         return try runServer(alloc, io, args);
     } else if (std.mem.eql(u8, command, "embed")) {
         return try (if (engine.enabled) engine.runCommand(.embed, init, try collectArgs(alloc, args), "") else inference.native_embed.main(alloc, io, try collectArgs(alloc, args)));
+    } else if (std.mem.eql(u8, command, "rerank")) {
+        return try (if (engine.enabled) engine.runCommand(.rerank, init, try collectArgs(alloc, args), "") else inference.native_rerank.main(alloc, io, try collectArgs(alloc, args)));
+    } else if (std.mem.eql(u8, command, "decisions")) {
+        return try (if (engine.enabled) engine.runCommand(.decisions, init, try collectArgs(alloc, args), "") else inference.native_decide.main(alloc, io, try collectArgs(alloc, args), false));
+    } else if (std.mem.eql(u8, command, "a4b-pack")) {
+        return try (if (engine.enabled) engine.runCommand(.a4b_pack, init, try collectArgs(alloc, args), "") else inference.native_a4b_pack.main(alloc, io, try collectArgs(alloc, args)));
+    } else if (std.mem.eql(u8, command, "quant-kernel-codegen")) {
+        return try (if (engine.enabled) engine.runCommand(.quant_kernel_codegen, init, try collectArgs(alloc, args), "") else inference.native_quant_kernel_codegen.main(alloc, io, try collectArgs(alloc, args)));
+    } else if (std.mem.eql(u8, command, "bench-cuda")) {
+        return try (if (engine.enabled) engine.runCommand(.bench_cuda, init, try collectArgs(alloc, args), "") else inference.cuda_microbench.main(alloc, io, try collectArgs(alloc, args)));
+    } else if (std.mem.eql(u8, command, "metal-info")) {
+        return if (engine.enabled) engine.runCommand(.metal_info, init, &.{}, "") else inference.printMetalInfo();
+    } else if (std.mem.eql(u8, command, "version")) {
+        std.debug.print("antfly inference {s}\n", .{@import("build_info").version()});
     } else if (std.mem.eql(u8, command, "classify")) {
         return try (if (engine.enabled) engine.runCommand(.classify, init, try collectArgs(alloc, args), "") else inference.native_classify.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "generate")) {
@@ -307,7 +321,11 @@ pub fn runFromIterator(
     } else if (std.mem.eql(u8, command, "read")) {
         return try (if (engine.enabled) engine.runCommand(.read, init, try collectArgs(alloc, args), "") else inference.native_read.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "extract")) {
-        return try (if (engine.enabled) engine.runCommand(.extract, init, try collectArgs(alloc, args), "") else inference.native_extract.main(alloc, io, try collectArgs(alloc, args)));
+        const command_args = try collectArgs(alloc, args);
+        if (isStructuredExtraction(command_args)) {
+            return try (if (engine.enabled) engine.runCommand(.extract_v2, init, command_args, "") else inference.native_decide.main(alloc, io, command_args, true));
+        }
+        return try (if (engine.enabled) engine.runCommand(.extract, init, command_args, "") else inference.native_extract.main(alloc, io, command_args));
     } else if (std.mem.eql(u8, command, "compare")) {
         return try (if (engine.enabled) engine.runCommand(.compare, init, try collectArgs(alloc, args), "") else inference.compare_generate.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "finetune")) {
@@ -329,6 +347,16 @@ pub fn runFromIterator(
         printUsage();
         return error.InvalidArguments;
     }
+}
+
+fn isStructuredExtraction(args: []const []const u8) bool {
+    return args.len >= 2 and std.mem.eql(u8, args[1], "--request");
+}
+
+test "structured extraction request selects the JSON interface" {
+    try std.testing.expect(isStructuredExtraction(&.{ "models", "--request", "request.json" }));
+    try std.testing.expect(!isStructuredExtraction(&.{ "model", "text" }));
+    try std.testing.expect(!isStructuredExtraction(&.{}));
 }
 
 fn runHelpRequested(args: *std.process.Args.Iterator) bool {
@@ -1130,6 +1158,13 @@ fn printUsage() void {
         \\Commands:
         \\  run         Start the inference server (default)
         \\  embed       Run text/image/audio embedding
+        \\  rerank      Run native text reranking
+        \\  decisions   Run structured choice decisions from a JSON request
+        \\  a4b-pack    Create a pre-sharded Gemma 4 A4B CUDA expert pack
+        \\  quant-kernel-codegen Verify or rewrite generated quant kernel sources
+        \\  metal-info  Inspect Metal build and device availability
+        \\  bench-cuda  Benchmark CUDA kernel shapes
+        \\  version     Print version information
         \\  classify    Run native text classification
         \\  generate    Run text generation
         \\  chat        Interactive chat with a local model (pulls known models on first use)
@@ -1139,7 +1174,7 @@ fn printUsage() void {
         \\  run-artifact Run or validate compiled artifacts
         \\  transcribe  Run audio transcription
         \\  read        Run image/document reading
-        \\  extract     Run entity, relation, or structured extraction
+        \\  extract     Run entity extraction or version 2 extraction with --request
         \\  compare     Compare generation outputs
         \\  finetune    Run LoRA finetuning
         \\  cuda-info   Inspect the compiled CUDA artifact or validate a CUDA device

@@ -149,6 +149,13 @@ fn command(kind: engine.Command, init: *const std.process.Init, allocator: memor
         .cuda_info => try inference.cuda_info.main(alloc, io, args),
         .smoke => try inference.native_smoke.main(alloc, io, args),
         .convert => try inference.tabular.cli.convertMain(alloc, io, args),
+        .rerank => try inference.native_rerank.main(alloc, io, args),
+        .decisions => try inference.native_decide.main(alloc, io, args, false),
+        .extract_v2 => try inference.native_decide.main(alloc, io, args, true),
+        .a4b_pack => try inference.native_a4b_pack.main(alloc, io, args),
+        .quant_kernel_codegen => try inference.native_quant_kernel_codegen.main(alloc, io, args),
+        .metal_info => inference.printMetalInfo(),
+        .bench_cuda => try inference.cuda_microbench.main(alloc, io, args),
     }
 }
 fn pullPredictor(allocator: memory.Allocator, executor: io_abi.Borrow, args: []const []const u8, ml_dir: []const u8) !void {

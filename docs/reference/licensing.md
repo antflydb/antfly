@@ -6,7 +6,7 @@ See [LICENSING.md](../../LICENSING.md) for third-party scope and maintenance che
 
 ## Build and distribution
 
-`antfly` is the public executable: `antfly lite`, `antfly inference`, and
+`antfly` is the public database and inference executable: `antfly lite`, `antfly inference`, and
 `antfly standalone` share the same engine. `libantfly` exposes in-process
 database and inference APIs; language bindings retain the `antfly-embedded`
 package names. They do not require the CLI.
