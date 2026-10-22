@@ -253,6 +253,7 @@ def test_single_process_pause_retains_listener_port(server_type: type, pgwire: b
         server.port_reservations.close()
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_stateful_server_releases_requested_port_when_spawn_fails(
     monkeypatch: pytest.MonkeyPatch,
 ):

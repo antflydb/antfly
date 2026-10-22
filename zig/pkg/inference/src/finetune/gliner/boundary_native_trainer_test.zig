@@ -358,7 +358,12 @@ fn exerciseConfig(a: std.mem.Allocator, execution: controller.Execution, attenti
 }
 
 test "boundary native trainer composes ModernBERT full and heads jobs with cancellation and durable partial resume" {
-    try exerciseModernBert(std.testing.allocator, .native, .materialized_v1);
+    // Training creates many short-lived tensor bindings. Retain memory-safety
+    // and leak checks without unwinding allocation stacks for every operation.
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
+    const a = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    try exerciseModernBert(a, .native, .materialized_v1);
 }
 
 test "boundary native trainer resident Metal composes ModernBERT full and heads jobs with exact durable resume" {
@@ -368,7 +373,12 @@ test "boundary native trainer resident Metal composes ModernBERT full and heads 
 }
 
 test "boundary native trainer composes ModernBERT fused-attention full and heads jobs with durable partial resume" {
-    try exerciseModernBert(std.testing.allocator, .native, .replay_tiled_v1);
+    // Training creates many short-lived tensor bindings. Retain memory-safety
+    // and leak checks without unwinding allocation stacks for every operation.
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
+    const a = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    try exerciseModernBert(a, .native, .replay_tiled_v1);
 }
 
 test "boundary native trainer resident Metal composes ModernBERT fused-attention full and heads jobs with exact durable resume" {
@@ -712,7 +722,11 @@ const NeckedFixture = struct {
 };
 
 test "boundary native trainer distills a necked ModernBERT from a teacher and leaves every head weight frozen" {
-    const a = std.testing.allocator;
+    // Training creates many short-lived tensor bindings. Retain memory-safety
+    // and leak checks without unwinding allocation stacks for every operation.
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
+    const a = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var fixture: NeckedFixture = undefined;
     try fixture.init(a, false);
     defer fixture.deinit();
@@ -762,7 +776,11 @@ test "boundary native trainer distills a necked ModernBERT from a teacher and le
 }
 
 test "boundary native trainer prefetches the next microbatch's teacher states without changing the run" {
-    const a = std.testing.allocator;
+    // Training creates many short-lived tensor bindings. Retain memory-safety
+    // and leak checks without unwinding allocation stacks for every operation.
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
+    const a = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var fixture: NeckedFixture = undefined;
     try fixture.init(a, false);
     defer fixture.deinit();
@@ -802,7 +820,11 @@ test "boundary native trainer prefetches the next microbatch's teacher states wi
 }
 
 test "boundary native trainer fits an identity neck to the teacher before the first update" {
-    const a = std.testing.allocator;
+    // Training creates many short-lived tensor bindings. Retain memory-safety
+    // and leak checks without unwinding allocation stacks for every operation.
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
+    const a = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var fixture: NeckedFixture = undefined;
     try fixture.init(a, true);
     defer fixture.deinit();

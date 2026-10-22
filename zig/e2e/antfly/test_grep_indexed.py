@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 import requests
 import test_auth as auth
+from e2e_scheduler import e2e_resource
 from helpers import start_http_server
 
 pytestmark = pytest.mark.reuse_antfly_process
@@ -221,6 +222,7 @@ def test_native_grep_snapshot_survives_concurrent_mutation(stateful_api, tmp_pat
 
 
 @pytest.fixture
+@e2e_resource("antfly_process")
 def short_cursor_api(monkeypatch, request):
     import conftest
 

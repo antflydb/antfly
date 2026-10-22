@@ -31,6 +31,28 @@ if [ ! -f "$tarball" ]; then
   exit 1
 fi
 
+# npm may process a provenance-bearing package asynchronously after accepting
+# it. Keep publication separate from read-side convergence, including a resumed
+# attempt with identical bytes. Never republish or repair tags with credentials.
+wait_for_tag() {
+  attempt=1
+  while [ "$attempt" -le 120 ]; do
+    published_tag="$(python3 scripts/release/registryctl.py npm-tag \
+      --package "$package_name" --tag "$dist_tag")"
+    if [ "$published_tag" = "$version" ]; then
+      return 0
+    fi
+    if [ "$attempt" -lt 120 ]; then
+      echo "waiting for npm dist-tag ${dist_tag} to expose ${package_name}@${version} (attempt ${attempt}/120)" >&2
+      sleep 10
+    fi
+    attempt=$((attempt + 1))
+  done
+  echo "${package_name}@${version} exists, but dist-tag ${dist_tag} points to ${published_tag:-nothing} after 120 checks" >&2
+  echo "if registry processing has finished, repair the dist-tag with an authorized npm credential, then resume the release" >&2
+  return 1
+}
+
 # Registry reads fail closed. Trusted publishing authenticates npm publish, not
 # arbitrary dist-tag repair commands, so a resumed publish must also observe
 # that the requested tag already points at this exact immutable version.
@@ -44,32 +66,10 @@ if [ -n "$published_integrity" ]; then
     echo "local:    $local_integrity" >&2
     exit 1
   fi
-  published_tag="$(python3 scripts/release/registryctl.py npm-tag \
-    --package "$package_name" --tag "$dist_tag")"
-  if [ "$published_tag" != "$version" ]; then
-    echo "${package_name}@${version} exists, but dist-tag ${dist_tag} points to ${published_tag:-nothing}" >&2
-    echo "repair the dist-tag with an authorized npm credential, then resume the release" >&2
-    exit 1
-  fi
+  wait_for_tag
   echo "${package_name}@${version} already has the same tarball and dist-tag; skipping"
   exit 0
 fi
 
 npm publish "$tarball" --access public --provenance --tag "$dist_tag"
-# A successful publish can precede the registry's read-side dist-tag update.
-# Retry only that observation; never republish or mutate a tag to repair it.
-attempt=1
-while [ "$attempt" -le 30 ]; do
-  published_tag="$(python3 scripts/release/registryctl.py npm-tag \
-    --package "$package_name" --tag "$dist_tag")"
-  if [ "$published_tag" = "$version" ]; then
-    exit 0
-  fi
-  if [ "$attempt" -lt 30 ]; then
-    echo "waiting for npm dist-tag ${dist_tag} to expose ${package_name}@${version} (attempt ${attempt}/30)" >&2
-    sleep 10
-  fi
-  attempt=$((attempt + 1))
-done
-echo "npm publish completed but dist-tag ${dist_tag} does not point to ${version} after 30 checks" >&2
-exit 1
+wait_for_tag

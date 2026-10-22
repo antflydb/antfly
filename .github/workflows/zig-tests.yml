@@ -1558,8 +1558,26 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+            scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file
+        run: |
+          helper=scripts/ci/install_ubuntu_packages.sh
+          if [ ! -f "$helper" ]; then helper=.ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh; fi
+          bash "$helper" build-essential pkg-config ca-certificates git curl xz-utils file
 
       - name: Install uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -1591,20 +1609,6 @@ jobs:
       # Each shard gets its own runner and PVC. Physical storage ownership has
       # several production rebuilds, so give it the full job budget separately
       # from the cold host-generator and linked-cache contract fixtures.
-      # The admitted branch can predate this action. Bootstrap tooling from
-      # the same immutable revision as the executing approval workflow.
-      - name: Check out executing dependency policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: .ci-dependency-policy
-          persist-credentials: false
-          sparse-checkout: |
-            .github/actions/prepare-zig-dependencies
-            scripts/ci/prepare_zig_dependencies.py
-            scripts/ci/zig-dependencies.json
-          sparse-checkout-cone-mode: false
-
       - name: Prepare verified Zig source dependencies
         uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 

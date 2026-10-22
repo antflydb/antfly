@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,39 @@ import antfly_embedded  # noqa: E402
 from antfly_embedded._library import LibraryNotFoundError  # noqa: E402
 
 REQUIRE_LIBRARY = os.environ.get("ANTFLY_LITE_REQUIRE_LIBRARY") == "1"
+
+
+class BackgroundProgressDeadline:
+    """Bound background work by both durable inactivity and total elapsed time."""
+
+    def __init__(self, *, idle_seconds=30, total_seconds=120, clock=time.monotonic):
+        self.clock = clock
+        self.started = self.last_progress = clock()
+        self.idle_seconds = idle_seconds
+        self.total_seconds = total_seconds
+        self.high_water: dict[tuple[str, ...], int] = {}
+
+    def expired(self, stats, *, completed=0):
+        now = self.clock()
+        progress: dict[tuple[str, ...], int] = {("result", "completed"): completed}
+        for stage in ("enrichment", "resolution", "promotion"):
+            progress[(stage, "applied_sequence")] = stats.get(stage, {}).get("applied_sequence", 0)
+        for replacement in stats.get("replacements", []):
+            for field in ("applied_sequence", "scanned_keys"):
+                progress[("replacement", replacement["name"], field)] = replacement.get(field, 0)
+        advanced = False
+        for key, value in progress.items():
+            if value > self.high_water.get(key, 0):
+                self.high_water[key] = value
+                advanced = True
+        if advanced:
+            self.last_progress = now
+        return now - self.started >= self.total_seconds or now - self.last_progress >= self.idle_seconds
+
+
+@pytest.fixture
+def background_progress_deadline():
+    return BackgroundProgressDeadline
 
 
 def ensure_native_library() -> None:

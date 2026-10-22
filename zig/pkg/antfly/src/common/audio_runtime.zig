@@ -247,7 +247,7 @@ test "audio runtime activates configured transcribing and synthesizing providers
     try std.testing.expect(synthesizing.getActiveRuntime() != prev_tts or prev_tts == null);
 }
 
-test "audio runtime rolls back globals when a later provider fails to load" {
+test "audio runtime rolls back globals when a later provider default is invalid" {
     const alloc = std.testing.allocator;
     var io = std.Io.Threaded.init(alloc, .{});
     defer io.deinit();
@@ -265,14 +265,17 @@ test "audio runtime rolls back globals when a later provider fails to load" {
         .api_url = "http://127.0.0.1:9090",
         .model = "vopr-stt",
     });
-    try cfg.text_to_speech.registerConfig("unsupported-later", .{
+    try cfg.text_to_speech.registerConfig("valid-later", .{
         .provider = .elevenlabs,
         .voice_id = "vopr-voice",
     });
 
+    // ElevenLabs is supported. Fail after both registries have loaded by
+    // selecting a missing default, without relying on provider support.
+    cfg.text_to_speech.default_provider = "missing-provider";
     const previous_stt = transcribing.getActiveRuntime();
     const previous_tts = synthesizing.getActiveRuntime();
-    try std.testing.expectError(error.UnsupportedSynthesizingProvider, ActiveRuntime.init(alloc, io.io(), &cfg));
+    try std.testing.expectError(error.UnknownSynthesizingProvider, ActiveRuntime.init(alloc, io.io(), &cfg));
     try std.testing.expect(transcribing.getActiveRuntime() == previous_stt);
     try std.testing.expect(synthesizing.getActiveRuntime() == previous_tts);
 }

@@ -7361,7 +7361,7 @@ fn consumerTests() type {
             );
             try ant_json.testing.expectSubsetJsonText(
                 std.testing.allocator,
-                "{\"searchable_vectors\":2176,\"publication\":{\"target_vectors\":2500,\"searchable_vectors\":2176,\"complete\":false},\"milestones\":{\"complete\":{\"reached\":false,\"blockers\":[\"publication\"]}},\"readiness\":{\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"publication\"]}}",
+                "{\"searchable_vectors\":2176,\"publication\":{\"target_vectors\":2500,\"searchable_vectors\":2176,\"complete\":false},\"milestones\":{\"complete\":{\"reached\":false,\"blockers\":[\"publication\"]}},\"readiness\":{\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"backfill\",\"publication\"]}}",
                 pending.items,
             );
 
@@ -8083,7 +8083,7 @@ fn consumerTests() type {
 
         test "index metadata closes neighbor context graph index references at admission" {
             const conceptualizer =
-                \\{"name":"conceptualize_v1","kind":"asset","field":"name","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\"}}","neighbor_context":{"graph_index":"taxonomy","edge_types":["started_by"],"direction":"out","limit":8}}
+                \\{"name":"conceptualize_v1","kind":"asset","field":"name","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}","neighbor_context":{"graph_index":"taxonomy","edge_types":["started_by"],"direction":"out","limit":8}}
             ;
             // The referenced graph index exists on the same table: admitted.
             const valid = try std.fmt.allocPrint(

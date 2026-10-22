@@ -14818,7 +14818,7 @@ test "embeddinggemma2 generation metadata clones survive retirement and release 
     model.manifest.embedding_style = .embedding_gemma2;
     model.manifest.hidden_size = 512;
     model.manifest.embedding_profile.query.prefix = try a.dupe(u8, "task: search result | query: ");
-    var inference = try manager.publishLoadedModel(model, true, null, null);
+    var inference = try manager.publishLoadedModel(model, true, null, null, 0);
     defer inference.release();
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, manager.copyCachedEmbeddingGemma2Manifest(failing.allocator(), "teardown-fixture"));

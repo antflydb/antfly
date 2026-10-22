@@ -451,6 +451,7 @@ pub fn create(config: Config) Graph {
     });
     inference_internal_mod.addImport("antfly_decisions", decisions_mod);
     inference_internal_mod.addImport("antfly_structured", structured_mod);
+    inference_internal_mod.addImport("antfly_extracting", extracting_mod);
     inference_internal_mod.addImport("build_info", shared.build_info_mod);
     identities.addImports(inference_internal_mod);
     inference_internal_mod.addImport("build_options", build_options_mod);

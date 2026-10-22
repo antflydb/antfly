@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Retain a live Linux test executable before the unit watchdog terminates it."""
+"""Retain live Linux tests or compiler inputs before watchdog termination."""
 
 import argparse
 import hashlib
@@ -27,6 +27,8 @@ def retain(pid: int, destination: Path, proc: Path = Path("/proc")) -> bool:
     process = proc / str(pid)
     executable = (process / "exe").readlink()
     name = executable.name.removesuffix(" (deleted)")
+    if name == "zig":
+        return retain_compiler(pid, destination, proc)
     if name != "test" and not name.endswith("-tests"):
         return False
     # Open through proc: even an unlinked cache executable remains recoverable.
@@ -47,6 +49,51 @@ def retain(pid: int, destination: Path, proc: Path = Path("/proc")) -> bool:
                 "argv": [arg.decode(errors="replace") for arg in command],
                 "cwd": cwd,
                 "sha256": digest.hexdigest(),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return True
+
+
+def retain_compiler(pid: int, destination: Path, proc: Path) -> bool:
+    process = proc / str(pid)
+    command = (process / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+    if len(command) < 2 or command[1] not in (
+        b"test",
+        b"test-obj",
+        b"build-exe",
+        b"build-lib",
+        b"build-obj",
+    ):
+        return False
+    # The response file identifies the actual module, filters, backend and
+    # target. A PID plus `zig test @cache/args/hash` cannot identify an expensive
+    # compile once the runner's private cache has disappeared.
+    output = destination / f"compiler-{pid}"
+    output.mkdir(parents=True, exist_ok=True)
+    cwd = (process / "cwd").readlink()
+    response_files = []
+    for index, argument in enumerate(command[2:]):
+        if not argument.startswith(b"@"):
+            continue
+        path = Path(argument[1:].decode())
+        if not path.is_absolute():
+            path = cwd / path
+        target = output / f"args-{index}.txt"
+        shutil.copyfile(path, target)
+        response_files.append({"original": str(path), "retained": target.name})
+    for metric in ("status", "io", "stat"):
+        path = process / metric
+        if path.exists():
+            shutil.copyfile(path, output / metric)
+    (output / "command.json").write_text(
+        json.dumps(
+            {
+                "argv": [argument.decode(errors="replace") for argument in command],
+                "cwd": str(cwd),
+                "response_files": response_files,
             },
             indent=2,
         )

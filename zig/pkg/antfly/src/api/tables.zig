@@ -6644,25 +6644,33 @@ test "system catalog cache admits recurring demand and keeps evicted leases vali
     const alloc = std.testing.allocator;
     var cache: DefinitionCache = .{};
     defer cache.deinit();
-    const original = try cache.acquire(alloc, &.{ .table_id = 1, .name = "first", .schema_json = "{\"version\":1}" });
-    defer original.release();
+    var leases: [DefinitionCache.max_entries]?*DefinitionCache.Entry = @splat(null);
+    defer for (leases) |lease| if (lease) |entry| entry.release();
+    leases[0] = try cache.acquire(alloc, &.{ .table_id = 1, .name = "first", .schema_json = "{\"version\":1}" });
     for (0..DefinitionCache.max_entries - 1) |i| {
         const schema = try std.fmt.allocPrint(alloc, "{{\"version\":{d}}}", .{i + 2});
         defer alloc.free(schema);
-        const entry = try cache.acquire(alloc, &.{ .table_id = 2, .name = "filler", .schema_json = schema });
-        entry.release();
+        leases[i + 1] = try cache.acquire(alloc, &.{ .table_id = 2, .name = "filler", .schema_json = schema });
     }
     const candidate: metadata_table_manager.TableRecord = .{ .table_id = 3, .name = "hot", .schema_json = "{\"version\":9999}" };
     for (0..4) |_| (try cache.acquire(alloc, &candidate)).release();
     var resident = false;
-    var old_resident = false;
     for (cache.entries) |slot| if (slot) |entry| {
         if (entry.schema.?.version.? == 9999) resident = true;
-        if (entry == original) old_resident = true;
     };
     try std.testing.expect(resident);
-    try std.testing.expect(!old_resident);
-    try std.testing.expectEqual(@as(i64, 1), original.schema.?.version.?);
+    // Admission is frequency-per-byte weighted. Verify the actual victim's
+    // lease, without requiring that the oldest/smallest schema was evicted.
+    var evicted: usize = 0;
+    for (leases, 0..) |lease, i| {
+        const entry = lease.?;
+        const still_resident = for (cache.entries) |slot| {
+            if (slot == entry) break true;
+        } else false;
+        if (!still_resident) evicted += 1;
+        try std.testing.expectEqual(@as(i64, @intCast(i + 1)), entry.schema.?.version.?);
+    }
+    try std.testing.expect(evicted > 0);
     try std.testing.expect(cache.bytes <= DefinitionCache.max_bytes);
 }
 

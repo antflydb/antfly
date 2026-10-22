@@ -60,7 +60,7 @@ pub const specs = [_]common.TestSpec{
         .root_source_file = "src/test_embedding_gemma2_job.zig",
         .filters = &embedding_gemma2_job_filters,
         .description = "Run EmbeddingGemma 2 data, job, contrastive oracle and export tests",
-        .imports = &.{.antfly_platform},
+        .imports = &.{ .antfly_platform, .antfly_extracting },
         .native_link = .default,
     },
     .{

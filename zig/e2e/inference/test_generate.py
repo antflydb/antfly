@@ -806,11 +806,14 @@ def test_stream_generate_with_tools_tool_model(api):
             "tool_choice": "required",
         },
         stream=True,
+        timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
-    _skip_unloadable_tool_model_response(r)
-    r.raise_for_status()
-    body = r.text
-    r.close()
+    try:
+        _skip_unloadable_tool_model_response(r)
+        r.raise_for_status()
+        body = r.text
+    finally:
+        r.close()
 
     data_lines = [
         line[len("data: ") :] for line in body.splitlines() if line.startswith("data: ")

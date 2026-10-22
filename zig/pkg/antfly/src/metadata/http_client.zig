@@ -3546,7 +3546,8 @@ fn consumerTests() type {
 
         test "metadata http client preserves extension ownership across forwarding" {
             const ExtensionOwnedExecutor = struct {
-                outcome: []const u8 = routes.Routes.raft_mutation_outcome_not_proposed,
+                outcome: []const u8,
+
                 fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !http_common.Header {
                     const owned_name = try alloc.dupe(u8, name);
                     errdefer alloc.free(owned_name);
@@ -3584,14 +3585,21 @@ fn consumerTests() type {
                 }
             };
 
-            var executor = ExtensionOwnedExecutor{};
-            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-            try std.testing.expectError(
-                error.ExtensionOwnedObject,
-                client.dropTableForwarded("http://127.0.0.1:9000", "memories"),
-            );
-            executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
-            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.dropTableForwarded("http://127.0.0.1:9000", "memories"));
+            for ([_][]const u8{
+                routes.Routes.raft_mutation_outcome_not_proposed,
+                routes.Routes.raft_mutation_outcome_unknown,
+            }) |outcome| {
+                var executor = ExtensionOwnedExecutor{ .outcome = outcome };
+                var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+                // A domain error cannot override an ambiguous admission result.
+                try std.testing.expectError(
+                    if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed))
+                        error.ExtensionOwnedObject
+                    else
+                        error.MetadataMutationOutcomeUnknown,
+                    client.dropTableForwarded("http://127.0.0.1:9000", "memories"),
+                );
+            }
         }
 
         test "metadata http client preserves unrecognized server outcomes for forwarded table mutations" {

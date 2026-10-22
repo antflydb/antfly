@@ -37,7 +37,11 @@ from conftest import (
 )
 from lake_encoded_fixtures import write_compact_parquet, write_null_compact_parquet
 
-pytestmark = pytest.mark.fresh_antfly_process
+pytestmark = [
+    pytest.mark.fresh_antfly_process,
+    # Directly constructed standalone servers also consume scheduler capacity.
+    pytest.mark.e2e_resource("antfly_process"),
+]
 
 
 def _request_with_idle_ddl_retry(server, method, path, body, *, retry_ddl=False):

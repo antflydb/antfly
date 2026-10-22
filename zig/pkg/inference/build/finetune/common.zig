@@ -16,6 +16,7 @@
 const std = @import("std");
 
 pub const Import = enum {
+    antfly_extracting,
     antfly_image,
     antfly_platform,
     build_options,
@@ -79,6 +80,7 @@ pub const Context = struct {
 
     pub fn moduleFor(ctx: Context, import: Import) *std.Build.Module {
         return switch (import) {
+            .antfly_extracting => ctx.inference_internal_mod.import_table.get("antfly_extracting").?,
             .antfly_image => ctx.antfly_image_mod,
             .antfly_platform => ctx.antfly_platform_mod,
             .build_options => ctx.build_options_mod,
@@ -95,11 +97,15 @@ pub const Context = struct {
             }),
             // These roots intentionally live directly under src/. Their
             // transitive imports need src as the Zig module boundary.
-            .inference_finetune_data => ctx.b.createModule(.{
-                .root_source_file = ctx.path("src/finetune_data_root.zig"),
-                .target = ctx.target,
-                .optimize = ctx.optimize,
-            }),
+            .inference_finetune_data => blk: {
+                const mod = ctx.b.createModule(.{
+                    .root_source_file = ctx.path("src/finetune_data_root.zig"),
+                    .target = ctx.target,
+                    .optimize = ctx.optimize,
+                });
+                mod.addImport("antfly_extracting", ctx.inference_internal_mod.import_table.get("antfly_extracting").?);
+                break :blk mod;
+            },
             .inference_finetune_tokenizer_batch => blk: {
                 const mod = ctx.b.createModule(.{
                     .root_source_file = ctx.path("src/finetune_tokenizer_batch_root.zig"),
