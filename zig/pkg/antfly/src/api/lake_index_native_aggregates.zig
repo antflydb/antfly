@@ -843,7 +843,8 @@ const Reduction = struct {
     fn reduceDelta(self: *@This(), provider: *@import("lake_index_row_source.zig").Provider) anyerror!?Leaf {
         const delta = provider.native_delta orelse return null;
         const index = self.index orelse return null;
-        if (!index.acceptsDelta(delta) or delta.count() != provider.source.inventory.files.len) return null;
+        if (delta.count() != provider.source.inventory.files.len) return null;
+        for (self.names) |name| if (!index.acceptsDeltaFor(name, delta)) return null;
         for (delta.prior_changed) |file| if (file.aggregate_digest == null) return null;
         var prior: ?[32]u8 = null;
         for (self.names, 0..) |name, slot| {
@@ -1473,7 +1474,9 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
         defer index.deinit();
         index.counted = true;
         index.prior_roots = previous_roots;
-        if (previous_navigation) |prior| index.predecessor = .{ .source = prior.source, .schema = prior.schema, .snapshot = prior.snapshot, .count = prior.count };
+        if (previous_navigation) |prior| {
+            for (previous.declarations) |declaration| try index.predecessors.put(a, declaration.name, .{ .source = prior.source, .schema = prior.schema, .snapshot = prior.snapshot, .count = prior.count, .cut = try navigation_api.cutIdentity(a, prior) });
+        }
         var navigation = try navigation_api.build(a, output.allocator(), &store, &provider, previous_navigation, .none);
         defer navigation.deinit();
         provider.native_delta = navigation.delta;

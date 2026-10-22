@@ -248,7 +248,7 @@ fn proofLower(proofs: []const Proof, id: [32]u8, inclusive: bool) usize {
 pub const Record = struct { file: local.serverless_external_source_types.FileEntry, digest: [32]u8, deletes: [32]u8 };
 /// Logical census commitment stays stable across attempt-scoped page rewrites.
 /// Include the predecessor separately when authorizing a partial checkpoint.
-fn cutIdentity(a: A, root: Root) ![32]u8 {
+pub fn cutIdentity(a: A, root: Root) ![32]u8 {
     const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u8, 2), .identity = root.public_identity_version, .domain = root.domain, .source = root.source, .schema = root.schema, .snapshot = root.snapshot, .count = root.count, .summary = root.file_summary, .legacy_files = if (root.file_summary == null and root.count != 0) root.files else null }, .{});
     defer a.free(bytes);
     var hash: [32]u8 = undefined;

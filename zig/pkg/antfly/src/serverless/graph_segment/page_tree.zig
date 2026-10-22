@@ -450,7 +450,7 @@ fn packAt(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ou
     var payload: usize = 0;
     for (entries) |entry| payload += entry.size();
     const pages = @max(1, std.math.divCeil(usize, payload, target - header_bytes) catch unreachable);
-    const balanced = if (target == target_page_bytes) target else header_bytes + (std.math.divCeil(usize, payload, pages) catch unreachable);
+    const balanced = header_bytes + (std.math.divCeil(usize, payload, pages) catch unreachable);
     var begin: usize = 0;
     while (begin < entries.len) {
         var end = begin;
@@ -483,7 +483,7 @@ fn rebalance(alloc: Allocator, store: Store, children: *Children) !void {
         const a = children.items[i];
         const b = children.items[i + 1];
         // A quarter-page threshold leaves headroom for subsequent small edits.
-        if (a.ref.bytes >= target_page_bytes / 2 and b.ref.bytes >= target_page_bytes / 2) {
+        if (a.ref.bytes >= target_page_bytes / 4 and b.ref.bytes >= target_page_bytes / 4) {
             i += 1;
             continue;
         }
@@ -1184,86 +1184,147 @@ pub const Equivalence = struct {
     key_bytes: ?usize = null,
     value_bytes: ?usize = null,
 };
-pub fn equivalent(alloc: Allocator, store: Store, left: ?Ref, right: ?Ref, options: Equivalence) anyerror!bool {
-    try store.check(store.ptr);
-    if (left == null or right == null) return left == null and right == null;
-    try left.?.validate();
-    try right.?.validate();
-    // Attempt tokens locate objects; authenticated content hashes establish
-    // semantic equality. Rewritten leaves can have identical bytes in a new
-    // upload attempt, and need no second evidence scan.
-    if (left.?.bytes == right.?.bytes and left.?.height == right.?.height and left.?.records == right.?.records and std.mem.eql(u8, &left.?.digest, &right.?.digest)) return true;
-    if (left.?.height == right.?.height and left.?.height != 0) {
-        var l = try readPage(alloc, store, left.?);
-        defer l.deinit(alloc);
-        var r = try readPage(alloc, store, right.?);
-        defer r.deinit(alloc);
-        const aligned = if (l.entries.len != r.entries.len) false else blk: {
-            for (l.entries, r.entries) |le, re| if (!std.mem.eql(u8, le.key, re.key)) break :blk false;
-            break :blk true;
-        };
-        if (aligned) {
-            for (l.entries, r.entries, 0..) |le, re, i| {
-                if (options.upper) |upper| if (!less(le.key, upper)) break;
-                if (i + 1 < l.entries.len and !less(options.lower, l.entries[i + 1].key)) continue;
-                if (!try equivalent(alloc, store, le.child, re.child, options)) return false;
+/// Two lazy ordered frontiers retain authenticated subtree references until
+/// they must be opened. Unequal fences or heights only open the overlapping
+/// boundary paths; once frontiers align, shared content is skipped again.
+const RangeFrontier = struct {
+    alloc: Allocator,
+    store: Store,
+    root: ?Ref,
+    options: Equivalence,
+    frames: [max_height + 1]Frame = undefined,
+    depth: usize = 0,
+    const Frame = struct { page: Page, next: usize = 0, end: ?[]const u8 };
+    const Node = struct { ref: ?Ref, key: ?[]const u8, value: []const u8 = "", end: ?[]const u8 = null };
+    fn deinit(self: *RangeFrontier) void {
+        for (self.frames[0..self.depth]) |*frame| frame.page.deinit(self.alloc);
+        self.depth = 0;
+    }
+    fn peek(self: *RangeFrontier) ?Node {
+        if (self.root) |ref| return .{ .ref = ref, .key = null };
+        while (self.depth != 0) {
+            const frame = &self.frames[self.depth - 1];
+            if (frame.next == frame.page.entries.len) {
+                frame.page.deinit(self.alloc);
+                self.depth -= 1;
+                continue;
             }
-            return true;
+            const entry = frame.page.entries[frame.next];
+            const end = if (frame.next + 1 < frame.page.entries.len) frame.page.entries[frame.next + 1].key else frame.end;
+            if (self.options.upper) |upper| if (!less(entry.key, upper)) {
+                frame.next = frame.page.entries.len;
+                continue;
+            };
+            if (entry.child != null) {
+                if (end) |bound| if (!less(self.options.lower, bound)) {
+                    frame.next += 1;
+                    continue;
+                };
+            } else if (less(entry.key, self.options.lower)) {
+                frame.next += 1;
+                continue;
+            }
+            return .{ .ref = entry.child, .key = entry.key, .value = entry.value, .end = end };
+        }
+        return null;
+    }
+    fn advance(self: *RangeFrontier) void {
+        if (self.root != null) self.root = null else self.frames[self.depth - 1].next += 1;
+    }
+    fn expand(self: *RangeFrontier, node: Node) !void {
+        if (self.depth == self.frames.len) return error.InvalidGraphPage;
+        var page = try readPage(self.alloc, self.store, node.ref.?);
+        errdefer page.deinit(self.alloc);
+        if (node.key) |first| if (!std.mem.eql(u8, first, page.entries[0].key)) return error.InvalidGraphPage;
+        if (node.end) |end| if (!less(page.entries[page.entries.len - 1].key, end)) return error.InvalidGraphPage;
+        self.advance();
+        self.frames[self.depth] = .{ .page = page, .end = node.end };
+        self.depth += 1;
+    }
+};
+fn sameContent(l: Ref, r: Ref) bool {
+    return l.bytes == r.bytes and l.height == r.height and l.records == r.records and std.mem.eql(u8, &l.digest, &r.digest);
+}
+const Difference = struct {
+    left: RangeFrontier,
+    right: RangeFrontier,
+    advance_left: bool = false,
+    advance_right: bool = false,
+    const Change = struct { left: ?Cursor.Record, right: ?Cursor.Record };
+    fn init(a: Allocator, store: Store, left: ?Ref, right: ?Ref, options: Equivalence) !Difference {
+        try store.check(store.ptr);
+        if (left) |ref| try ref.validate();
+        if (right) |ref| try ref.validate();
+        const empty = if (options.upper) |upper| !less(options.lower, upper) else false;
+        return .{ .left = .{ .alloc = a, .store = store, .root = if (empty) null else left, .options = options }, .right = .{ .alloc = a, .store = store, .root = if (empty) null else right, .options = options } };
+    }
+    fn deinit(self: *Difference) void {
+        self.left.deinit();
+        self.right.deinit();
+    }
+    fn next(self: *Difference) !?Change {
+        if (self.advance_left) self.left.advance();
+        if (self.advance_right) self.right.advance();
+        self.advance_left = false;
+        self.advance_right = false;
+        while (true) {
+            try self.left.store.check(self.left.store.ptr);
+            const l = self.left.peek();
+            const r = self.right.peek();
+            if (l == null and r == null) return null;
+            if (l != null and r != null and l.?.ref != null and r.?.ref != null and sameContent(l.?.ref.?, r.?.ref.?)) {
+                self.left.advance();
+                self.right.advance();
+                continue;
+            }
+            const order: std.math.Order = if (l == null) .gt else if (r == null) .lt else if (l.?.key == null or r.?.key == null) .eq else std.mem.order(u8, l.?.key.?, r.?.key.?);
+            // Emit earlier records without decoding a later disjoint subtree.
+            const emit_left = l != null and l.?.ref == null and (r == null or order == .lt or r.?.ref == null);
+            const emit_right = r != null and r.?.ref == null and (l == null or order == .gt or l.?.ref == null);
+            if (emit_left or emit_right) {
+                self.advance_left = emit_left and order != .gt;
+                self.advance_right = emit_right and order != .lt;
+                const le: ?Cursor.Record = if (self.advance_left) .{ .key = l.?.key.?, .value = l.?.value } else null;
+                const re: ?Cursor.Record = if (self.advance_right) .{ .key = r.?.key.?, .value = r.?.value } else null;
+                if (le != null and re != null and std.mem.eql(u8, le.?.value, re.?.value)) {
+                    self.left.advance();
+                    self.right.advance();
+                    self.advance_left = false;
+                    self.advance_right = false;
+                    continue;
+                }
+                return .{ .left = le, .right = re };
+            }
+            if (l != null and l.?.ref != null and (r == null or r.?.ref == null or l.?.ref.?.height > r.?.ref.?.height or (l.?.ref.?.height == r.?.ref.?.height and order == .lt))) {
+                try self.left.expand(l.?);
+            } else if (r != null and r.?.ref != null and (l == null or l.?.ref == null or r.?.ref.?.height > l.?.ref.?.height or order == .gt)) {
+                try self.right.expand(r.?);
+            } else {
+                try self.left.expand(l.?);
+                try self.right.expand(r.?);
+            }
         }
     }
-    var l = try Cursor.init(alloc, store, left, options.lower, options.upper);
-    defer l.deinit();
-    var r = try Cursor.init(alloc, store, right, options.lower, options.upper);
-    defer r.deinit();
-    while (try l.next()) |le| {
-        const re = (try r.next()) orelse return false;
-        if (options.key_bytes) |width| if (le.key.len != width or re.key.len != width) return error.InvalidGraphPage;
-        if (options.value_bytes) |width| if (le.value.len != width or re.value.len != width) return error.InvalidGraphPage;
-        if (!std.mem.eql(u8, le.key, re.key) or (options.compare_values and !std.mem.eql(u8, le.value, re.value))) return false;
+};
+pub fn equivalent(alloc: Allocator, store: Store, left: ?Ref, right: ?Ref, options: Equivalence) anyerror!bool {
+    var differences = try Difference.init(alloc, store, left, right, options);
+    defer differences.deinit();
+    while (try differences.next()) |change| {
+        const l = change.left orelse return false;
+        const r = change.right orelse return false;
+        if (options.key_bytes) |width| if (l.key.len != width or r.key.len != width) return error.InvalidGraphPage;
+        if (options.value_bytes) |width| if (l.value.len != width or r.value.len != width) return error.InvalidGraphPage;
+        if (options.compare_values) return false;
     }
-    return (try r.next()) == null;
+    return true;
 }
 
-/// Visit changed records in key order, pruning identical authenticated COW
-/// subtrees. A rebalanced boundary uses an exact merge of bounded cursors.
-/// The visitor borrows records only until change returns.
+/// Visit changes in order with memory bounded by two root-to-leaf paths.
+/// Records borrow the frontiers only until the visitor returns.
 pub fn visitDifferences(alloc: Allocator, store: Store, left: ?Ref, right: ?Ref, visitor: anytype) anyerror!void {
-    try store.check(store.ptr);
-    if (left == null and right == null) return;
-    if (left) |l| try l.validate();
-    if (right) |r| try r.validate();
-    if (left != null and right != null) {
-        const lref = left.?;
-        const rref = right.?;
-        if (lref.bytes == rref.bytes and lref.height == rref.height and lref.records == rref.records and std.mem.eql(u8, &lref.digest, &rref.digest)) return;
-        if (lref.height == rref.height and lref.height != 0) {
-            var l = try readPage(alloc, store, lref);
-            defer l.deinit(alloc);
-            var r = try readPage(alloc, store, rref);
-            defer r.deinit(alloc);
-            const aligned = if (l.entries.len != r.entries.len) false else blk: {
-                for (l.entries, r.entries) |le, re| if (!std.mem.eql(u8, le.key, re.key)) break :blk false;
-                break :blk true;
-            };
-            if (aligned) {
-                for (l.entries, r.entries) |le, re| try visitDifferences(alloc, store, le.child, re.child, visitor);
-                return;
-            }
-        }
-    }
-    var l = try Cursor.init(alloc, store, left, "", null);
-    defer l.deinit();
-    var r = try Cursor.init(alloc, store, right, "", null);
-    defer r.deinit();
-    var le = try l.next();
-    var re = try r.next();
-    while (le != null or re != null) {
-        try store.check(store.ptr);
-        const order: std.math.Order = if (le == null) .gt else if (re == null) .lt else std.mem.order(u8, le.?.key, re.?.key);
-        if (order != .eq or !std.mem.eql(u8, le.?.value, re.?.value)) try visitor.change(if (order != .gt) le else null, if (order != .lt) re else null);
-        if (order != .gt) le = try l.next();
-        if (order != .lt) re = try r.next();
-    }
+    var differences = try Difference.init(alloc, store, left, right, .{});
+    defer differences.deinit();
+    while (try differences.next()) |change| try visitor.change(change.left, change.right);
 }
 
 /// Ordered half-open range scan. Memory is bounded by (height + 1) pages, not
@@ -2985,4 +3046,53 @@ test "external lake batched ranks share paths preserve duplicates and reject abs
         }
     };
     try std.testing.checkAllAllocationFailures(a, Failure.run, .{ backing.store(), root, &keys });
+}
+
+test "external lake range zipper prunes shared pages after boundary insertions splits and deletions" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const count = 10000;
+    const keys = try a.alloc([8]u8, count + 2);
+    defer a.free(keys);
+    const mutations = try a.alloc(Mutation, count);
+    defer a.free(mutations);
+    const value: [128]u8 = @splat(42);
+    for (keys, 0..) |*key, i| std.mem.writeInt(u64, key, i, .big);
+    for (mutations, keys[1 .. count + 1]) |*mutation, *key| mutation.* = .{ .key = key, .value = &value };
+    const original = (try apply(a, backing.store(), null, mutations)).?;
+    const inserted = (try apply(a, backing.store(), original, &.{ .{ .key = &keys[0], .value = &value }, .{ .key = &keys[count + 1], .value = &value } })).?;
+    const Visitor = struct {
+        count: usize = 0,
+        previous: ?u64 = null,
+        fn change(self: *@This(), left: ?Cursor.Record, right: ?Cursor.Record) !void {
+            const row = right orelse left.?;
+            const key = std.mem.readInt(u64, row.key[0..8], .big);
+            if (self.previous) |old| try std.testing.expect(old < key);
+            self.previous = key;
+            self.count += 1;
+            try std.testing.expect((left == null) != (right == null));
+        }
+    };
+    for (0..2) |reverse| {
+        var visitor: Visitor = .{};
+        backing.reads = 0;
+        try visitDifferences(a, backing.store(), if (reverse == 0) original else inserted, if (reverse == 0) inserted else original, &visitor);
+        try std.testing.expectEqual(@as(usize, 2), visitor.count);
+        // The old cursor fallback read 94 pages for just the minimum insertion.
+        try std.testing.expect(backing.reads < 20);
+    }
+    backing.reads = 0;
+    try std.testing.expect(try equivalent(a, backing.store(), original, inserted, .{ .lower = &keys[1], .upper = &keys[count + 1] }));
+    try std.testing.expect(backing.reads < 20);
+    // Independent packing changes height/partitioning. Exact ordered output
+    // still agrees even when there are no identical descendant references.
+    var builder: SortedBuilder = .{ .alloc = a, .store = backing.store(), .target_bytes = bulk_target_page_bytes };
+    defer builder.deinit();
+    for (mutations) |mutation| try builder.add(mutation.key, mutation.value.?);
+    const repacked = (try builder.finish()).?;
+    try std.testing.expect(try equivalent(a, backing.store(), original, repacked, .{}));
+    var visitor: Visitor = .{};
+    try visitDifferences(a, backing.store(), original, repacked, &visitor);
+    try std.testing.expectEqual(@as(usize, 0), visitor.count);
 }

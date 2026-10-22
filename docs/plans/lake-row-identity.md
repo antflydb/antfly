@@ -117,6 +117,15 @@ hashed by value. A per-index recipe includes keys, predicates, covering fields,
 stored source and aggregate cohort inputs. Generated embeddings or remote media
 with uncaptured dependencies cannot receive a reuse proof.
 
+Per-row evidence is keyed by a semantic input cohort (schema and the sorted,
+deduplicated input column set), rather than by declaration name or the table's
+whole index configuration. Declaration names and configuration semantics have
+separate authenticated bindings. Equal input cohorts share one evidence tree
+range; overlapping cohorts and the global row proof hash each typed column value
+once per 64-row tile. Changing one declaration still requires its own matching
+configuration proof, without invalidating unrelated declaration evidence.
+Legacy per-declaration evidence remains readable and is rebuilt on migration.
+
 Identity state uses bounded native spill sorts and immutable copy-on-write trees.
 Stable file slots and per-file membership let an authenticated file delta retain
 unchanged rows without sorting or rebuilding the entire identity map. A separate
@@ -131,6 +140,21 @@ oversized root evidence, null keys and duplicate keys decline the optimization;
 ordinary complete native index construction continues. Cancellation, backing
 allocator failures, source failures and corrupt authenticated evidence still
 propagate. These limits are separate from SQL query limits.
+
+Full verification of at least 128 rows can also capture the projected typed
+payloads in private compressed spill pages during that same source pass. Once
+keys, duplicates and root admission are verified, construction sorts only compact
+physical-to-logical coordinate and payload-offset records. Broad native rebuilds
+reuse those pages instead of reading and decoding Parquet again. Decimal payloads
+keep exact 128-bit coefficients and scale; compatible precisions widen to their
+maximum. Mixed types/scales decline the optional spool. Partial file verification
+continues to use selective gathers or a separate broad spool, since its capture
+would not cover unchanged files. The optional capture has a separate 64 MiB
+retained admission, uses at most half the configured spill quota during verification,
+and leaves only the remaining spill allowance to routing afterward. Exhaustion
+drops the capture and preserves the existing complete construction path. A pure
+relocation may discard unused captured payloads; this trades bounded temporary
+writes for avoiding a second source pass when payloads have changed.
 
 A rewrite with the same visible logical IDs proves reuse separately for each
 native declaration. A label-only change can keep a body-only text index and raw
@@ -263,7 +287,10 @@ Construction chooses between two bounded source paths. Selective changes use
 256-row physical gathers and the existing projected replay. When at least one
 eighth of a source with 128 or more rows needs rebuilding, one delete-aware
 projected physical pass writes typed payload pages once and partitions compact
-logical-coordinate references into private spill trees. Independent builders then
+logical-coordinate references into private spill trees. A complete verification
+capture already owns those payloads, so any nonempty changed selection can reuse
+it without another physical pass, including selections below the broad-spool
+threshold. Independent builders then
 read those partitions without rescanning or decoding Parquet. The spool shares
 a 64 MiB retained-memory reservation and the configured identity spill quota;
 quota denial selects ordinary gathers. It is attempt-private and is never a
@@ -279,9 +306,19 @@ fragment identifiers as source object paths. Invalid/missing identity evidence
 or exhausted optional construction admission selects complete physical rebuilding.
 
 Only retained aggregate declarations keep prior contribution roots live; replaced
-roots retire through counted ownership. Aggregate deltas require the seed's
-original authenticated fragment census. Older retained censuses reconcile file
-metadata and reuse matching contributions rather than assuming a deletion map.
+roots retire through counted ownership. Aggregate deltas require each declaration seed's original authenticated input
+census, including its source, schema, snapshot, file count and content cut. The
+publication owner binds these proofs before parallel reducers start. An aggregate
+retained across unrelated updates can therefore use a delta against its own older
+input census. A mismatched cut safely reconciles metadata and matching contributions
+instead of applying an unrelated deletion map.
+
+Tree comparisons use two lazy ordered subtree frontiers, retaining authenticated
+references through unequal fences and heights. Shared ranges become skippable as
+soon as the frontiers align again. Balanced page splits and a quarter-page repair
+threshold avoid cascading tiny-tail rewrites. Boundary insertion/deletion tests
+measure page reads as well as changed records; logical equality still comes from
+exact ordered records when independently packed trees share no subtree hashes.
 
 A new fragment space, its navigation, native mutations, contribution roots and
 coordinate maps enter the same publication certificate, reader lease, GC and restart

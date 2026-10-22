@@ -34,6 +34,8 @@ pub const Builder = struct {
     files: []const []const u8,
     slots: []u32,
     scan: []bool,
+    cohorts: []const @import("lake_row_input_recipes.zig").Recipe = &.{},
+    prior_cohorts: []const @import("lake_row_input_recipes.zig").Recipe = &.{},
     unchanged: std.AutoHashMapUnmanaged(u32, void) = .empty,
     pending: local.sql_spill.Sort,
     edits: [7]Mutations,
@@ -48,6 +50,7 @@ pub const Builder = struct {
         }
         errdefer self.deinit();
         const ma = self.arena.allocator();
+        self.cohorts = try @import("lake_row_input_recipes.zig").unique(ma, recipes);
         self.slots = try ma.alloc(u32, files.len);
         @memset(self.slots, absent);
         self.scan = try ma.alloc(bool, files.len);
@@ -65,6 +68,7 @@ pub const Builder = struct {
         var removed: std.ArrayList(Removed) = .empty;
         defer removed.deinit(a);
         if (prior) |old| {
+            self.prior_cohorts = try @import("lake_row_input_recipes.zig").unique(ma, old.current.input_recipes);
             var cursor = tree.Cursor.init(a, pages.store(), old.current.files, "", null) catch |err| return identity.derivedReadFailure(err);
             defer cursor.deinit();
             while (cursor.next() catch |err| return identity.derivedReadFailure(err)) |record| {
@@ -133,7 +137,7 @@ pub const Builder = struct {
             try self.edits[4].addRecord(record.key, null);
             const order = identity.orderKey(name, coordinate.group, coordinate.row);
             try self.edits[5].addRecord(&order, null);
-            for (old.current.input_recipes) |recipe| {
+            for (self.prior_cohorts) |recipe| {
                 var input_key: [64]u8 = undefined;
                 input_key[0..32].* = recipe.digest;
                 input_key[32..64].* = record.value[0..32].*;
@@ -146,7 +150,7 @@ pub const Builder = struct {
     }
     pub fn addWithInputs(self: *Builder, state: State, coordinate: Coordinate, inputs: []const identity.logical.Digest) !void {
         try state.validate();
-        if (inputs.len != self.space.input_recipes.len) return error.InvalidLogicalRowIdentity;
+        if (inputs.len != self.cohorts.len) return error.InvalidLogicalRowIdentity;
         const value = try self.a.alloc(u8, 48 + inputs.len * 32);
         defer self.a.free(value);
         value[0..16].* = coordinate.encode();
@@ -174,7 +178,7 @@ pub const Builder = struct {
             _ = scratch.reset(.retain_capacity);
             const a = scratch.allocator();
             const row = (try self.pending.next(a)) orelse break;
-            if (row.keys.len != 1 or row.values.len != 1 or row.keys[0].value != .string or row.values[0].value != .string or row.keys[0].value.string.len != 32 or row.values[0].value.string.len != 48 + self.space.input_recipes.len * 32) return error.InvalidLogicalRowIdentity;
+            if (row.keys.len != 1 or row.values.len != 1 or row.keys[0].value != .string or row.values[0].value != .string or row.keys[0].value.string.len != 32 or row.values[0].value.string.len != 48 + self.cohorts.len * 32) return error.InvalidLogicalRowIdentity;
             const id = row.keys[0].value.string;
             const value = row.values[0].value.string;
             if (previous_id) |previous| if (std.mem.eql(u8, &previous, id)) return error.DuplicateLogicalRowKey;
@@ -204,7 +208,7 @@ pub const Builder = struct {
             try self.edits[4].addRecord(value[0..16], &state);
             const order = identity.orderKey(name, coordinate.group, coordinate.row);
             try self.edits[5].addRecord(&order, id);
-            for (self.space.input_recipes, 0..) |input_recipe, i| {
+            for (self.cohorts, 0..) |input_recipe, i| {
                 var input_key: [64]u8 = undefined;
                 input_key[0..32].* = input_recipe.digest;
                 input_key[32..64].* = id[0..32].*;
@@ -316,6 +320,7 @@ test "external lake index input proofs preserve only unchanged index dependencie
     const recipes = [_]@import("lake_row_input_recipes.zig").Recipe{
         .{ .name = "body", .digest = @splat(10), .columns = &.{"body"} },
         .{ .name = "cover", .digest = @splat(11), .columns = &.{ "body", "label" } },
+        .{ .name = "another_body", .digest = @splat(10), .columns = &.{"body"} },
     };
     var output = std.heap.ArenaAllocator.init(a);
     defer output.deinit();
@@ -325,15 +330,21 @@ test "external lake index input proofs preserve only unchanged index dependencie
     try first.addWithInputs(.{ .id = @splat(3), .values = @splat(4) }, .{ .file = 0, .group = 0, .row = 0 }, &.{ @splat(12), @splat(13) });
     var old = try first.finish(@splat(1), @splat(2), @splat(3));
     old.artifacts = @splat(9);
+    try std.testing.expectEqual(@as(u64, 2), old.current.input_versions.?.records);
     const next = try Builder.create(a, &manager, &pages, &.{"b"}, null, null, &recipes, "source", "two");
     defer next.deinit();
     try next.addWithInputs(.{ .id = @splat(3), .values = @splat(5) }, .{ .file = 0, .group = 2, .row = 17 }, &.{ @splat(12), @splat(14) });
-    var current = try next.finish(@splat(1), @splat(2), @splat(4));
+    var current = try next.finish(@splat(1), @splat(6), @splat(4));
     const binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "one", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} };
     const declarations = [_]local.serverless_segment_sidecar_manifest.DeclaredArtifact{
         .{ .name = "body", .binding = binding, .artifact = .{ .name = "body", .kind = .text_segment, .artifact_id = "unused", .checksum = "unused", .byte_len = 1 } },
         .{ .name = "cover", .binding = binding, .artifact = .{ .name = "cover", .kind = .text_segment, .artifact_id = "unused", .checksum = "unused", .byte_len = 1 } },
     };
+    const changed_bindings = try oa.dupe(@import("lake_row_input_recipes.zig").Recipe, current.current.input_recipes);
+    changed_bindings[0].binding = @splat(99);
+    var reconfigured = current;
+    reconfigured.current.input_recipes = changed_bindings;
+    try std.testing.expectEqual(@as(usize, 0), (try identity.proveIndexReuse(a, oa, &pages, old, reconfigured, &declarations)).len);
     const reused = try identity.proveIndexReuse(a, oa, &pages, old, current, &declarations);
     try std.testing.expectEqual(@as(usize, 1), reused.len);
     try std.testing.expectEqualStrings("body", reused[0].name);

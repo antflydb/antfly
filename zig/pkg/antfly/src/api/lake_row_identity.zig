@@ -84,7 +84,8 @@ pub const Space = struct {
                 } else if (self.rows != 0) return error.InvalidLogicalRowIdentity;
             }
         } else if (self.by_file != null or self.by_order != null) return error.InvalidLogicalRowIdentity;
-        const inputs = try std.math.mul(u64, self.rows, self.input_recipes.len);
+        if (self.input_recipes.len > local.metadata_lake_index_catalog.max_directory_artifacts) return error.InvalidLogicalRowIdentity;
+        const inputs = try std.math.mul(u64, self.rows, @import("lake_row_input_recipes.zig").count(self.input_recipes));
         if (self.input_versions) |ref| {
             try ref.validate();
             if (ref.records != inputs or self.file_slots == null) return error.InvalidLogicalRowIdentity;
@@ -567,13 +568,13 @@ pub fn proveReuse(a: A, pages: *pages_api.PageStore, previous: Root, next: *Root
 pub fn proveIndexReuse(a: A, out: A, pages: *pages_api.PageStore, previous: Root, next: Root, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact) ![]ReusedIndex {
     try previous.validate(a);
     try next.validate(a);
-    if (previous.values_format != next.values_format or !std.mem.eql(u8, &previous.domain, &next.domain) or !std.mem.eql(u8, &previous.namespace, &next.namespace) or !std.mem.eql(u8, &previous.values_recipe, &next.values_recipe) or previous.current.rows != next.current.rows or !std.mem.eql(u8, previous.current.source, next.current.source)) return &.{};
+    if (previous.values_format != next.values_format or !std.mem.eql(u8, &previous.domain, &next.domain) or !std.mem.eql(u8, &previous.namespace, &next.namespace) or previous.current.rows != next.current.rows or !std.mem.eql(u8, previous.current.source, next.current.source)) return &.{};
     if (!(tree.equivalent(a, pages.store(), previous.current.by_id, next.current.by_id, .{ .compare_values = false, .key_bytes = 32, .value_bytes = 56 }) catch |err| return derivedReadFailure(err))) return &.{};
     var reusable: std.ArrayList(ReusedIndex) = .empty;
     for (next.current.input_recipes) |recipe| {
         if (!recipe.reusable) continue;
         const prior_recipe = for (previous.current.input_recipes) |candidate| {
-            if (candidate.reusable and std.mem.eql(u8, candidate.name, recipe.name) and std.mem.eql(u8, &candidate.digest, &recipe.digest)) break candidate;
+            if (candidate.reusable and std.mem.eql(u8, candidate.name, recipe.name) and std.mem.eql(u8, &candidate.digest, &recipe.digest) and std.meta.eql(candidate.binding, recipe.binding)) break candidate;
         } else continue;
         _ = prior_recipe;
         const declaration = for (declarations) |entry| {

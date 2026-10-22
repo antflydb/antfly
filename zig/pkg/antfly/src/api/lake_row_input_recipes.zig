@@ -18,7 +18,48 @@
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const A = std.mem.Allocator;
-pub const Recipe = struct { name: []const u8, digest: [32]u8, columns: []const []const u8, reusable: bool = true };
+pub const Recipe = struct {
+    name: []const u8,
+    /// Semantic input cohort; shared across declarations with identical inputs.
+    digest: [32]u8,
+    columns: []const []const u8,
+    reusable: bool = true,
+    /// Declaration semantics are bound separately from per-row input evidence.
+    binding: ?[32]u8 = null,
+    pub fn jsonStringify(self: Recipe, writer: anytype) !void {
+        if (self.binding) |binding| try writer.write(.{ .name = self.name, .digest = self.digest, .columns = self.columns, .reusable = self.reusable, .binding = binding }) else try writer.write(.{ .name = self.name, .digest = self.digest, .columns = self.columns, .reusable = self.reusable });
+    }
+};
+pub fn count(recipes: []const Recipe) usize {
+    // Root admission caps declarations at 4096. Keep validation allocation-free
+    // without repeatedly comparing every declaration to all its predecessors.
+    if (recipes.len > local.metadata_lake_index_catalog.max_directory_artifacts) return recipes.len;
+    const absent = std.math.maxInt(u16);
+    var slots: [8192]u16 = @splat(absent);
+    var n: usize = 0;
+    for (recipes, 0..) |recipe, i| {
+        var slot = std.hash.Wyhash.hash(0, &recipe.digest) % slots.len;
+        while (slots[slot] != absent) : (slot = (slot + 1) % slots.len) {
+            if (std.mem.eql(u8, &recipes[slots[slot]].digest, &recipe.digest)) break;
+        }
+        if (slots[slot] == absent) {
+            slots[slot] = @intCast(i);
+            n += 1;
+        }
+    }
+    return n;
+}
+pub fn unique(a: A, recipes: []const Recipe) ![]Recipe {
+    var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer seen.deinit(a);
+    var result: std.ArrayList(Recipe) = .empty;
+    errdefer result.deinit(a);
+    for (recipes) |recipe| {
+        const entry = try seen.getOrPut(a, recipe.digest);
+        if (!entry.found_existing) try result.append(a, recipe);
+    }
+    return result.toOwnedSlice(a);
+}
 pub fn configurationReusable(config: std.json.Value) bool {
     if (config != .object) return false;
     if (@import("lake_enrichment_units.zig").configured(config, "embedder") != null) return false;
@@ -27,6 +68,18 @@ pub fn configurationReusable(config: std.json.Value) bool {
     if (config.object.get("sources")) |value| if (value == .array) for (value.array.items) |source| {
         if (source == .object and source.object.contains("artifact")) return false;
     };
+    return true;
+}
+/// Share one eligibility decision before capturing payloads and before
+/// preparing native fragments. Uncaptured enrichments/legacy builders cannot
+/// consume the capture and must not pay its temporary-write cost.
+pub fn nativeFragmentsEligible(configs: std.json.Value) bool {
+    if (configs != .object) return false;
+    for (configs.object.values()) |config| {
+        if (!configurationReusable(config)) return false;
+        const kind = config.object.get("type") orelse return false;
+        if (kind != .string or !(std.mem.eql(u8, kind.string, "full_text") or std.mem.eql(u8, kind.string, "embeddings") or std.mem.eql(u8, kind.string, "algebraic"))) return false;
+    }
     return true;
 }
 pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, source: *@import("lake_index_row_source.zig").Provider, base: local.serverless_manifest_base_source.BaseSourceDescriptor) ![]const Recipe {
@@ -41,6 +94,10 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
+    var semantic = try std.json.parseFromSliceLeaky(std.json.Value, ca, table.schema_json, .{});
+    // Ordered declaration changes bind at the declaration, not every row proof.
+    if (semantic == .object) _ = semantic.object.swapRemove("relational_indexes");
+    const input_schema = try std.json.Stringify.valueAlloc(ca, semantic, .{});
     const configs = try std.json.parseFromSliceLeaky(std.json.Value, ca, table.indexes_json, .{});
     var result: std.ArrayList(Recipe) = .empty;
     for (desired.artifacts) |artifact| {
@@ -71,14 +128,14 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
                 try columns.append(ca, path);
             }
         }
-        try result.append(out, try make(out, table, artifact.name, columns.items, reusable));
+        try result.append(out, try make(out, input_schema, artifact.name, artifact.binding.index_config_hash, columns.items, reusable));
     }
     // Native reducers can share one encoded cohort across materializations.
     // Every declaration's proof covers every input captured in that cohort.
     var schemas = @import("sql_schema_cache.zig").Cache.init(a);
     defer schemas.deinit();
     const sql_table = try schemas.resolve(source.context.io orelse return error.InvalidLogicalRowIdentity, ca, table.schema_json, table.table_id, table.name);
-    const Aggregate = struct { name: []const u8, recipe: local.sql_aggregate_materialization.Recipe, reusable: bool };
+    const Aggregate = struct { name: []const u8, configuration: []const u8, recipe: local.sql_aggregate_materialization.Recipe, reusable: bool };
     var aggregates: std.ArrayList(Aggregate) = .empty;
     var configured = configs.object.iterator();
     while (configured.next()) |entry| {
@@ -92,7 +149,7 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
             const recipe = (try @import("lake_index_native_aggregates.zig").recipeFor(ca, sql_table, config, materialization)) orelse continue;
             const name = materialization.object.get("name") orelse return error.InvalidAlgebraicConfig;
             if (name != .string) return error.InvalidAlgebraicConfig;
-            try aggregates.append(ca, .{ .name = try @import("lake_index_names.zig").materialization(ca, entry.key_ptr.*, name.string), .recipe = recipe, .reusable = configurationReusable(config) });
+            try aggregates.append(ca, .{ .name = try @import("lake_index_names.zig").materialization(ca, entry.key_ptr.*, name.string), .configuration = try std.json.Stringify.valueAlloc(ca, config, .{}), .recipe = recipe, .reusable = configurationReusable(config) });
         }
     }
     for (aggregates.items) |aggregate| {
@@ -104,7 +161,7 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
             for (candidate.recipe.keys) |key| try columns.append(ca, key.path);
             for (candidate.recipe.inputs) |input| if (input.column) |column| try columns.append(ca, column.path);
         }
-        try result.append(out, try make(out, table, aggregate.name, columns.items, reusable));
+        try result.append(out, try make(out, input_schema, aggregate.name, aggregate.configuration, columns.items, reusable));
     }
     if (try parsed.relationalIndexDefinitions(ca)) |indexes| for (indexes) |index| {
         var columns: std.ArrayList([]const u8) = .empty;
@@ -117,7 +174,7 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
             defer predicate.deinit();
             for (predicate.conditions) |condition| for (try condition.tuple.columnBindings(ca)) |name| try columns.append(ca, normalize(schema, name) orelse return error.InvalidLogicalRowIdentity);
         }
-        try result.append(out, try make(out, table, try @import("lake_index_native_rows.zig").logicalName(ca, index.name), columns.items, true));
+        try result.append(out, try make(out, input_schema, try @import("lake_index_native_rows.zig").logicalName(ca, index.name), try std.json.Stringify.valueAlloc(ca, index, .{}), columns.items, true));
     };
     return result.toOwnedSlice(out);
 }
@@ -125,7 +182,7 @@ fn normalize(schema: local.storage_schema.TableSchema, name: []const u8) ?[]cons
     for (schema.relational_columns) |column| if (std.mem.eql(u8, name, column.name) or std.mem.eql(u8, name, column.path)) return column.path;
     return null;
 }
-fn make(a: A, table: local.common_topology_records.TableRecord, name: []const u8, input: []const []const u8, reusable: bool) !Recipe {
+fn make(a: A, schema: []const u8, name: []const u8, configuration: []const u8, input: []const []const u8, reusable: bool) !Recipe {
     const sorted = try a.dupe([]const u8, input);
     std.mem.sort([]const u8, sorted, {}, struct {
         fn less(_: void, l: []const u8, r: []const u8) bool {
@@ -139,11 +196,15 @@ fn make(a: A, table: local.common_topology_records.TableRecord, name: []const u8
         try columns.append(a, try a.dupe(u8, path));
     }
     const paths = try columns.toOwnedSlice(a);
-    const encoded = try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-index-input-v1", .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .name = name, .columns = paths, .reusable = reusable }, .{});
+    const encoded = try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-input-cohort-v2", .schema = schema, .columns = paths }, .{});
     defer a.free(encoded);
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(encoded, &digest, .{});
-    return .{ .name = try a.dupe(u8, name), .digest = digest, .columns = paths, .reusable = reusable };
+    const binding_bytes = try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-input-binding-v2", .cohort = digest, .name = name, .configuration = configuration, .reusable = reusable }, .{});
+    defer a.free(binding_bytes);
+    var binding: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(binding_bytes, &binding, .{});
+    return .{ .name = try a.dupe(u8, name), .digest = digest, .columns = paths, .reusable = reusable, .binding = binding };
 }
 
 test "external lake input recipes capture selected fields and whole source independently" {
@@ -169,5 +230,33 @@ test "external lake input recipes capture selected fields and whole source indep
             try std.testing.expectEqual(@as(usize, 1), recipe.columns.len);
             try std.testing.expectEqualStrings(if (std.mem.eql(u8, recipe.name, "text")) "body" else recipe.name, recipe.columns[0]);
         }
+    }
+}
+
+test "external lake input recipes share cohort evidence but independently bind declaration semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const left = try make(a, "schema", "first", "config-one", &.{ "body", "id", "body" }, true);
+    const right = try make(a, "schema", "second", "config-two", &.{ "id", "body" }, true);
+    const changed = try make(a, "schema", "first", "config-three", &.{ "id", "body" }, true);
+    try std.testing.expectEqualSlices(u8, &left.digest, &right.digest);
+    try std.testing.expectEqualSlices(u8, &left.digest, &changed.digest);
+    try std.testing.expect(!std.meta.eql(left.binding, right.binding));
+    try std.testing.expect(!std.meta.eql(left.binding, changed.binding));
+    try std.testing.expectEqual(@as(usize, 1), count(&.{ left, right, changed }));
+    const different = try make(a, "schema", "third", "config-one", &.{"body"}, true);
+    try std.testing.expectEqual(@as(usize, 2), count(&.{ left, right, different }));
+    const legacy: Recipe = .{ .name = "first", .digest = left.digest, .columns = left.columns };
+    const wire = try std.json.Stringify.valueAlloc(a, legacy, .{});
+    try std.testing.expect(std.mem.indexOf(u8, wire, "binding") == null);
+}
+
+test "external lake input recipes decline payload capture for enrichment and legacy consumers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "{}", "{\"text\":{\"type\":\"full_text\",\"field\":\"body\"}}", "{\"graph\":{\"type\":\"graph\"}}", "{\"text\":{\"type\":\"full_text\",\"enrichments\":[{}]}}" }, 0..) |bytes_, i| {
+        const config = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes_, .{});
+        try std.testing.expectEqual(i < 2, nativeFragmentsEligible(config));
     }
 }

@@ -31,7 +31,7 @@ fn bytes(hash: *std.crypto.hash.Blake3, value: []const u8) void {
 }
 const fingerprints = @import("lake_row_fingerprints.zig");
 
-pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cut: identity.logical.Digest, base: local.serverless_manifest_base_source.BaseSourceDescriptor, navigation: local.serverless_manifest_artifact_ref.ArtifactRef, previous: ?identity.Root, token: Token) !?identity.Root {
+pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cut: identity.logical.Digest, base: local.serverless_manifest_base_source.BaseSourceDescriptor, navigation: local.serverless_manifest_artifact_ref.ArtifactRef, previous: ?identity.Root, token: Token, capture_out: *?*@import("lake_row_payloads.zig").Capture) !?identity.Root {
     if (provider.identity_spill_bytes == 0) return error.LogicalRowIdentityAdmissionDeclined;
     const io = provider.context.io orelse return error.InvalidLogicalRowIdentity;
     const scheduler = local.sql_parallel_scheduler.global();
@@ -48,12 +48,16 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sto
     var input = provider.*;
     input.io_phase = scoped.io_phase;
     var workspace: local.sql_memory_budget = .{ .backing = a, .limit = retained };
-    return buildInner(workspace.allocator(), out, table, &scoped, &input, cut, base, navigation, previous, token) catch |err| {
+    errdefer if (capture_out.*) |capture| {
+        capture.deinit();
+        capture_out.* = null;
+    };
+    return buildInner(workspace.allocator(), out, table, &scoped, &input, cut, base, navigation, previous, token, a, capture_out) catch |err| {
         if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and workspace.isLocallyExhausted())) return error.LogicalRowIdentityAdmissionDeclined;
         return err;
     };
 }
-fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cut: identity.logical.Digest, base: local.serverless_manifest_base_source.BaseSourceDescriptor, navigation: local.serverless_manifest_artifact_ref.ArtifactRef, previous: ?identity.Root, token: Token) !?identity.Root {
+fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cut: identity.logical.Digest, base: local.serverless_manifest_base_source.BaseSourceDescriptor, navigation: local.serverless_manifest_artifact_ref.ArtifactRef, previous: ?identity.Root, token: Token, capture_allocator: A, capture_out: *?*@import("lake_row_payloads.zig").Capture) !?identity.Root {
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
     defer parsed.deinit(a);
     const binding = (parsed.external_base_source orelse return error.InvalidExternalTableBinding).binding;
@@ -127,6 +131,16 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     var by_file: std.StringHashMapUnmanaged(u32) = .empty;
     defer by_file.deinit(a);
     for (files, builder.slots) |name, slot| try by_file.put(a, name, slot);
+    // A full verification already reads the entire typed input union. Retain
+    // its payload once; physical coordinates gain no serving authority here.
+    const full_scan = for (builder.scan) |scan| {
+        if (!scan) break false;
+    } else true;
+    var estimated_rows: u64 = 0;
+    for (inventory.files) |file| estimated_rows +|= file.row_count;
+    const capture_eligible = @import("lake_row_input_recipes.zig").nativeFragmentsEligible(try std.json.parseFromSliceLeaky(std.json.Value, metadata.allocator(), table.indexes_json, .{}));
+    if (full_scan and capture_eligible and input_recipes.len != 0 and estimated_rows >= 128) capture_out.* = try @import("lake_row_payloads.zig").Capture.start(capture_allocator, provider, store, columns);
+    if (capture_out.*) |capture| manager.max_bytes = provider.identity_spill_bytes - capture.manager.max_bytes;
     var input = provider.*;
     input.only_file = null;
     input.only_files = builder.scan;
@@ -156,32 +170,39 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
         const next = source.next(a) catch |err| return phase.failed(err);
         try phase.finish();
         const batch = next orelse break;
+        if (capture_out.*) |capture| capture.add(batch, &by_file, store) catch |err| {
+            if (!capture.optionalFailure(err)) return err;
+            capture.deinit();
+            capture_out.* = null;
+            manager.max_bytes = provider.identity_spill_bytes;
+        };
         var bound = try tuple.bindExternalBatch(a, batch);
         defer bound.deinit();
-        var fingerprint_plan = try fingerprints.Plan.bind(a, recipe, batch, columns);
-        defer fingerprint_plan.deinit();
-        const input_plans = try a.alloc(fingerprints.Plan, input_recipes.len);
+        const input_plans = try a.alloc(fingerprints.Plan, builder.cohorts.len + 1);
         var bound_inputs: usize = 0;
         defer {
             for (input_plans[0..bound_inputs]) |*plan| plan.deinit();
             a.free(input_plans);
         }
-        for (input_recipes, input_plans) |recipe_, *plan| {
+        input_plans[0] = try fingerprints.Plan.bind(a, recipe, batch, columns);
+        bound_inputs += 1;
+        for (builder.cohorts, input_plans[1..]) |recipe_, *plan| {
             plan.* = try fingerprints.Plan.bind(a, recipe_.digest, batch, recipe_.columns);
             bound_inputs += 1;
         }
-        const input_tiles = try a.alloc([64]identity.logical.Digest, input_recipes.len);
+        const input_tiles = try a.alloc([64]identity.logical.Digest, input_plans.len);
         defer a.free(input_tiles);
-        const row_inputs = try a.alloc(identity.logical.Digest, input_recipes.len);
+        const row_inputs = try a.alloc(identity.logical.Digest, builder.cohorts.len);
         defer a.free(row_inputs);
-        var digests: [64]identity.logical.Digest = undefined;
+        var kernels = try fingerprints.Kernels.init(a, input_plans);
+        defer kernels.deinit();
+        const tile_rows = 64;
         for (0..batch.rowCount()) |row| {
-            if (row % digests.len == 0) {
-                const count = @min(digests.len, batch.rowCount() - row);
-                try fingerprint_plan.fill(a, row, digests[0..count]);
-                for (input_plans, input_tiles) |*plan, *tile| try plan.fill(a, row, tile[0..count]);
+            if (row % tile_rows == 0) {
+                const count = @min(tile_rows, batch.rowCount() - row);
+                try kernels.fill(a, row, count, input_tiles);
             }
-            for (row_inputs, input_tiles) |*value, tile| value.* = tile[row % digests.len];
+            for (row_inputs, input_tiles[1..]) |*value, tile| value.* = tile[row % tile_rows];
             try token.check();
             try provider.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
@@ -190,7 +211,7 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
             const ref = batch.rowRef(row);
             if (ref != .external) return error.InvalidLogicalRowIdentity;
             const slot = by_file.get(ref.external.file_id) orelse return error.InvalidLogicalRowIdentity;
-            try builder.addWithInputs(.{ .id = try identity.logical.keyId(namespace, key.items), .values = digests[row % digests.len] }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, row_inputs);
+            try builder.addWithInputs(.{ .id = try identity.logical.keyId(namespace, key.items), .values = input_tiles[0][row % tile_rows] }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, row_inputs);
         }
     }
     var root = try builder.finish(namespace.digest(), recipe, cut);
@@ -199,6 +220,11 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     const encoded = try std.json.Stringify.valueAlloc(a, root, .{});
     defer a.free(encoded);
     if (encoded.len > identity.max_root_bytes) return error.LogicalRowIdentityAdmissionDeclined;
+    if (capture_out.*) |capture| capture.finish(root.current.rows) catch |err| {
+        if (!capture.optionalFailure(err)) return err;
+        capture.deinit();
+        capture_out.* = null;
+    };
     // Only the small admitted root escapes the optional workspace. Temporary
     // file dictionaries and recipe planning cannot consume publication memory.
     return try identity.decode(out, encoded);

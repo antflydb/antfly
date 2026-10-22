@@ -459,7 +459,7 @@ const Spool = struct {
     const spill = local.sql_spill;
     const Page = local.storage_db_types.ColumnSourcePage;
     const workspace_bytes = 64 * 1024 * 1024;
-    const Spec = struct { kind: rows.ColumnKind, precision: i32 = 0, scale: i32 = 0 };
+    const Spec = @import("lake_row_payloads.zig").Spec;
     a: A,
     owner: *Build,
     budget: local.sql_memory_budget,
@@ -476,6 +476,7 @@ const Spool = struct {
     mutex: std.Io.Mutex = .init,
     initialized: bool = false,
     source_passes: u64 = 0,
+    captured: ?*@import("lake_row_payloads.zig").Capture = null,
     fn deinit(self: *Spool) void {
         if (self.initialized) {
             self.routes.deinit();
@@ -504,7 +505,7 @@ const Spool = struct {
         const store = self.routes.store();
         return store.get(store.ptr, a, ref);
     }
-    fn capture(self: *Spool, provider: *Provider, store: *stores.ArtifactStore) !void {
+    fn scanCapture(self: *Spool, provider: *Provider, store: *stores.ArtifactStore) !void {
         const a = self.budget.allocator();
         const out = self.arena.allocator();
         var names: std.StringHashMapUnmanaged(void) = .empty;
@@ -542,6 +543,7 @@ const Spool = struct {
         var read_bytes: u64 = 0;
         var write_bytes: u64 = 0;
         var pages = self.owner.pageStore(&read_bytes, &write_bytes);
+        pages.artifacts = store;
         var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store(), .max_bytes = 2 * 1024 * 1024 };
         defer cache.deinit();
         var root = self.owner.root;
@@ -558,26 +560,7 @@ const Spool = struct {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const pa = arena.allocator();
-            const vectors = try pa.alloc(rows.ColumnVector, columns.len);
-            for (columns, vectors, self.specs) |name, *vector, *spec| {
-                vector.* = batch.findColumn(name) orelse return error.InvalidLogicalRowIdentity;
-                const kind: rows.ColumnKind = if (vector.values == .decimal128) .decimal128 else vector.kind().logical();
-                const current: Spec = if (vector.values == .decimal128) .{ .kind = kind, .precision = vector.values.decimal128.precision, .scale = vector.values.decimal128.scale } else .{ .kind = kind };
-                if (bound and !std.meta.eql(spec.*, current)) return error.RowSourceColumnKindMismatch;
-                spec.* = current;
-                // Decimal payloads retain exact coefficient bits and type metadata.
-                // No numeric text or floating point round trip enters the spool.
-                if (vector.values == .decimal128) {
-                    const values = try pa.alloc([]const u8, batch.rowCount());
-                    for (values, 0..) |*value, row| {
-                        const bytes = try pa.alloc(u8, 16);
-                        std.mem.writeInt(i128, bytes[0..16], if (vector.nulls.isNull(row)) 0 else vector.values.decimal128.values[row], .big);
-                        value.* = bytes;
-                    }
-                    vector.values = .{ .bytes = values };
-                }
-                if (kind == .vector_f32 or kind == .encoded) return error.UnsupportedExternalLakeIndex;
-            }
+            const vectors = try @import("lake_row_payloads.zig").vectors(pa, batch, columns, self.specs, bound);
             bound = true;
             var begin: usize = 0;
             while (begin < batch.rowCount()) {
@@ -624,6 +607,55 @@ const Spool = struct {
                 }
                 begin = end;
             }
+        }
+        self.route_root = try edits.finish(null);
+        self.routes.phase = null;
+    }
+    /// Only compact coordinate/offset records are sorted after verification.
+    /// Typed Parquet payloads stay in the original private capture pages.
+    fn adopt(self: *Spool, capture: *@import("lake_row_payloads.zig").Capture, store: *stores.ArtifactStore) !void {
+        if (!capture.complete or capture.rows != self.owner.root.current.rows) return error.InvalidLogicalRowIdentity;
+        const a = self.budget.allocator();
+        capture.routes.phase = store.io_phase;
+        defer capture.routes.phase = null;
+        self.columns = capture.columns;
+        self.specs = capture.specs;
+        self.captured = capture;
+        for (self.owner.slots, 0..) |slot, ordinal| try self.positions.put(a, slot, ordinal);
+        self.route_store = try @import("../serverless/graph_segment/page_store.zig").PrivatePages.beginRun(&self.routes);
+        var mappings = @import("lake_index_page_mutations.zig").Mutations.init(a, &self.manager, self.route_store);
+        defer mappings.deinit();
+        mappings.private_pages.phase = store.io_phase;
+        var reads: u64 = 0;
+        var writes: u64 = 0;
+        var pages = self.owner.pageStore(&reads, &writes);
+        pages.artifacts = store;
+        pages.read_phase = store.io_phase;
+        var physical = try tree.Cursor.init(a, pages.store(), self.owner.root.current.by_id, "", null);
+        defer physical.deinit();
+        var logical = try tree.Cursor.init(a, pages.store(), self.owner.space.by_id, "", null);
+        defer logical.deinit();
+        while (try physical.next()) |row| {
+            const native = (try logical.next()) orelse return error.InvalidLogicalRowIdentity;
+            if (row.key.len != 32 or row.value.len != 56 or native.value.len != 56 or !std.mem.eql(u8, row.key, native.key)) return error.InvalidLogicalRowIdentity;
+            const coordinate = try identity.logical.Coordinate.decode(native.value[0..16]);
+            const file = self.positions.get(coordinate.file) orelse return error.InvalidLogicalRowIdentity;
+            if (self.needed[file]) try mappings.addRecord(row.value[0..16], native.value[0..16]);
+        }
+        if ((try logical.next()) != null) return error.InvalidLogicalRowIdentity;
+        const mapping = try mappings.finish(null);
+        var by_physical = try tree.Cursor.init(a, self.route_store, mapping, "", null);
+        defer by_physical.deinit();
+        var payload = try tree.Cursor.init(a, capture.route_store, capture.route_root, "", null);
+        defer payload.deinit();
+        var current = try payload.next();
+        var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &self.manager, self.route_store);
+        defer edits.deinit();
+        edits.private_pages.phase = store.io_phase;
+        while (try by_physical.next()) |row| {
+            while (current != null and std.mem.lessThan(u8, current.?.key, row.key)) current = try payload.next();
+            if (current == null or !std.mem.eql(u8, row.key, current.?.key) or current.?.value.len != 24) return error.InvalidLogicalRowIdentity;
+            try edits.addRecord(row.value, current.?.value);
         }
         self.route_root = try edits.finish(null);
         self.routes.phase = null;
@@ -718,7 +750,8 @@ const Spool = struct {
                 var end = begin + 1;
                 while (end < count and items[end].offset == items[begin].offset) end += 1;
                 try self.owner.mutex.lock(self.owner.manager.io);
-                const block = self.owner.payloads.read(items[begin].offset) catch |err| {
+                const payloads = if (self.owner.captured) |capture| &capture.payloads else &self.owner.payloads;
+                const block = payloads.read(items[begin].offset) catch |err| {
                     self.owner.mutex.unlock(self.owner.manager.io);
                     return phase.failed(err);
                 };
@@ -781,7 +814,10 @@ const Spool = struct {
     };
 };
 pub fn prepareSpool(self: *Build, provider: *Provider, store: *stores.ArtifactStore) !void {
-    if (self.root.current.rows < 128 or self.provider.fragment_views.len == 0) return;
+    return prepareCapturedSpool(self, provider, store, null);
+}
+pub fn prepareCapturedSpool(self: *Build, provider: *Provider, store: *stores.ArtifactStore, capture: ?*@import("lake_row_payloads.zig").Capture) !void {
+    if ((capture == null and self.root.current.rows < 128) or self.provider.fragment_views.len == 0) return;
     const needed = try self.a.alloc(bool, self.fragments.len);
     defer self.a.free(needed);
     @memset(needed, false);
@@ -792,7 +828,7 @@ pub fn prepareSpool(self: *Build, provider: *Provider, store: *stores.ArtifactSt
     for (needed, self.fragments) |flag, fragment| if (flag) {
         rows_needed += fragment.count;
     };
-    if (rows_needed < self.root.current.rows / 8 or rows_needed == 0) return;
+    if (rows_needed == 0 or (capture == null and rows_needed < self.root.current.rows / 8)) return;
     const scheduler = local.sql_parallel_scheduler.global();
     if (!scheduler.reservePull(0, Spool.workspace_bytes)) return;
     const spool = self.a.create(Spool) catch |err| {
@@ -802,6 +838,7 @@ pub fn prepareSpool(self: *Build, provider: *Provider, store: *stores.ArtifactSt
     spool.* = .{ .a = self.a, .owner = self, .budget = .{ .backing = self.a, .limit = Spool.workspace_bytes } };
     const a = spool.budget.allocator();
     spool.manager = .{ .alloc = a, .io = self.context.io.?, .context = self, .checkpoint = Build.check, .max_bytes = provider.identity_spill_bytes, .async_writes = false };
+    if (capture) |value| spool.manager.max_bytes -|= value.manager.live_bytes;
     spool.arena = .init(a);
     defer if (self.spool == null) spool.deinit();
     spool.needed = try spool.arena.allocator().dupe(bool, needed);
@@ -815,7 +852,8 @@ pub fn prepareSpool(self: *Build, provider: *Provider, store: *stores.ArtifactSt
     var backend = store.*;
     backend.io_phase = io.capability();
     spool.routes.phase = backend.io_phase;
-    spool.capture(provider, &backend) catch |err| {
+    const captured: anyerror!void = if (capture) |value| spool.adopt(value, &backend) else spool.scanCapture(provider, &backend);
+    captured catch |err| {
         if (err == error.SqlProgramLimitExceeded or err == error.UnsupportedExternalLakeIndex or (err == error.OutOfMemory and spool.budget.isLocallyExhausted())) return;
         return err;
     };
@@ -842,26 +880,7 @@ const Gather = struct {
     refs: []const rows.RowRef = &.{},
     current: []const rows.RowRef = &.{},
     fn selectedBytes(batch: rows.ColumnBatch, selection: []const usize) !usize {
-        try batch.validate();
-        for (selection) |row| if (row >= batch.rowCount()) return error.InvalidSqlBackendResponse;
-        var bytes: usize = 0;
-        for (batch.columns) |column| {
-            bytes +|= column.name.len +| @sizeOf(rows.ColumnVector);
-            for (selection) |row| {
-                bytes +|= 1 + @sizeOf(rows.RowRef);
-                if (column.nulls.isNull(row)) continue;
-                bytes +|= switch (column.values) {
-                    .bytes, .json => |v| v[row].len +| @sizeOf([]const u8),
-                    .dictionary_bytes => |v| v.at(row).len +| @sizeOf([]const u8),
-                    .decimal128 => @sizeOf(i128),
-                    .i64, .f64, .dictionary_i64, .dictionary_f64 => 8,
-                    .bool => 1,
-                    .vector_f32 => |v| v[row].len *| @sizeOf(f32) +| @sizeOf([]const f32),
-                    .encoded => return error.UnsupportedSqlExecution,
-                };
-            }
-        }
-        return bytes;
+        return @import("lake_row_payloads.zig").selectedBytes(batch, selection);
     }
     fn canceled(raw: *const anyopaque) bool {
         const self: *const Gather = @ptrCast(@alignCast(raw));
@@ -964,6 +983,7 @@ const Gather = struct {
             var reads: u64 = 0;
             var writes: u64 = 0;
             var pages = self.owner.pageStore(&reads, &writes);
+            pages.artifacts = &self.store;
             pages.cancellation = .{ .ptr = self, .is_cancelled_fn = Gather.canceled };
             var root = self.owner.root;
             root.indexes = self.owner.space;
@@ -1250,6 +1270,15 @@ test "external lake logical fragments shrink wide Parquet gathers before copying
 }
 
 test "external lake logical fragments route broad Parquet rebuilds through one projected typed spill pass" {
+    try broadSpoolScenario(false, false);
+}
+test "external lake logical fragments reuse verification payloads without another Parquet scan" {
+    try broadSpoolScenario(true, false);
+}
+test "external lake logical fragments reuse captured payloads for selective changed fragments" {
+    try broadSpoolScenario(true, true);
+}
+fn broadSpoolScenario(fused: bool, selective: bool) !void {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("logical-fragment-spool");
     defer directory.cleanup();
@@ -1299,20 +1328,46 @@ test "external lake logical fragments route broad Parquet rebuilds through one p
     defer builder.deinit();
     for (0..257) |row| {
         var id: [32]u8 = @splat(3);
-        id[0] = 0;
+        id[0] = if (selective) @intCast((row % 16) << 4) else 0;
         std.mem.writeInt(u64, id[24..32], row, .big);
         try builder.addWithInputs(.{ .id = id, .values = @splat(4) }, .{ .file = 0, .group = 0, .row = 256 - row }, &.{@splat(5)});
     }
     const root = try builder.finish(@splat(1), @splat(2), @splat(3));
     const native = (try prepare(a, &store, table, &physical, &provider, root, null)).?;
     defer native.deinit();
+    var selection_arena = std.heap.ArenaAllocator.init(a);
+    defer selection_arena.deinit();
+    if (selective) for (@constCast(native.provider.fragment_views)) |*view| {
+        const files = try selection_arena.allocator().alloc(@import("lake_index_native_state.zig").File, view.files.len);
+        const changed = try selection_arena.allocator().alloc(bool, view.files.len);
+        for (files, changed, 0..) |*file, *flag, i| {
+            file.* = try view.delta.file(i);
+            flag.* = i == 0;
+        }
+        view.delta.selection = null;
+        view.delta.files = files;
+        view.delta.changed = changed;
+    };
     provider.identity_spill_bytes = 1;
     try prepareSpool(native, &provider, &store);
     try std.testing.expect(native.spool == null);
     provider.identity_spill_bytes = 1024 * 1024 * 1024;
-    try prepareSpool(native, &provider, &store);
+    var captured: ?*@import("lake_row_payloads.zig").Capture = null;
+    defer if (captured) |value| value.deinit();
+    if (fused) {
+        captured = (try @import("lake_row_payloads.zig").Capture.start(a, &provider, &store, &.{ "id", "body", "price" })).?;
+        var by_file: std.StringHashMapUnmanaged(u32) = .empty;
+        defer by_file.deinit(a);
+        try by_file.put(a, physical.inventory.files[0].file_id, 0);
+        const opening = provider.provider();
+        const source = try opening.open_with_cancellation_fn.?(opening.ptr, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .index_config_hash = "test", .column_bindings = &.{ "id", "body", "price" } }, .none);
+        defer source.deinit(a);
+        while (try source.next(a)) |batch| try captured.?.add(batch, &by_file, &store);
+        try captured.?.finish(root.current.rows);
+    }
+    try prepareCapturedSpool(native, &provider, &store, captured);
     try std.testing.expect(native.spool != null);
-    try std.testing.expectEqual(@as(u64, 1), native.spool.?.source_passes);
+    try std.testing.expectEqual(@as(u64, if (fused) 0 else 1), native.spool.?.source_passes);
     for (0..2) |_| {
         const input = try Build.open(native, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .column_bindings = &.{ "id", "body", "price" }, .index_config_hash = "test" }, 0, .none, null);
         defer input.deinit(a);
@@ -1320,19 +1375,19 @@ test "external lake logical fragments route broad Parquet rebuilds through one p
         while (try input.next(a)) |batch| {
             try std.testing.expect(batch.rowCount() <= 256);
             for (0..batch.rowCount()) |row| {
-                try std.testing.expectEqual(@as(i64, @intCast(256 - count)), try batch.findColumn("id").?.integerAt(row));
+                try std.testing.expectEqual(@as(i64, @intCast(256 - count * @as(usize, if (selective) 16 else 1))), try batch.findColumn("id").?.integerAt(row));
                 try std.testing.expectEqual(payload.len, (try batch.findColumn("body").?.bytesAt(row)).len);
                 const price = batch.findColumn("price").?.values.decimal128;
                 try std.testing.expectEqual(@as(i32, 18), price.precision);
                 try std.testing.expectEqual(@as(i32, 2), price.scale);
-                try std.testing.expectEqual(@as(i128, prices[256 - count]), price.values[row]);
+                try std.testing.expectEqual(@as(i128, prices[256 - count * @as(usize, if (selective) 16 else 1)]), price.values[row]);
                 try std.testing.expectEqual(@as(u64, @intCast(count)), batch.rowRef(row).external.row_ordinal);
                 count += 1;
             }
         }
-        try std.testing.expectEqual(@as(usize, 257), count);
+        try std.testing.expectEqual(@as(usize, if (selective) 17 else 257), count);
     }
-    try std.testing.expectEqual(@as(u64, 1), native.spool.?.source_passes);
+    try std.testing.expectEqual(@as(u64, if (fused) 0 else 1), native.spool.?.source_passes);
 }
 
 test "external lake logical fragments skip unchanged input cohorts and hash only changed leaves" {

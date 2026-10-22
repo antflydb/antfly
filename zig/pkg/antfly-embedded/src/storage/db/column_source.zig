@@ -117,7 +117,8 @@ pub const Page = struct {
                     const values = try pa.alloc(i128, positions.len);
                     for (positions, values, nulls) |position, *value, flag| {
                         const source = position.page.columns[ci].values;
-                        if (source != .decimal128 or (source.decimal128.scale != decimal.scale or source.decimal128.precision != decimal.precision)) return error.RowSourceColumnKindMismatch;
+                        if (source != .decimal128 or source.decimal128.scale != decimal.scale) return error.RowSourceColumnKindMismatch;
+                        result.precision = @max(result.precision, source.decimal128.precision);
                         value.* = if (flag != 0) 0 else source.decimal128.values[position.row];
                     }
                     result.values = values;
@@ -644,4 +645,19 @@ fn retainedPayloadScenario(a: A) !void {
 test "external lake dense column leases share payloads across producer closure and sparse selections gather under OOM" {
     try retainedPayloadScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, retainedPayloadScenario, .{});
+}
+
+test "external lake typed decimal scatter widens precision without losing coefficient bits" {
+    const a = std.testing.allocator;
+    const refs = [_]rows.RowRef{.{ .relational_key = "row" }};
+    const first = try Page.copy(a, .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &refs, .columns = &.{.{ .name = "price", .values = .{ .decimal128 = .{ .values = &.{9007199254740993}, .precision = 18, .scale = 2 } } }} }, &.{0});
+    defer first.release();
+    const second = try Page.copy(a, .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &refs, .columns = &.{.{ .name = "price", .values = .{ .decimal128 = .{ .values = &.{-123456789012345678901}, .precision = 24, .scale = 2 } } }} }, &.{0});
+    defer second.release();
+    const gathered = try Page.gatherPositions(a, &.{ .{ .page = first, .row = 0 }, .{ .page = second, .row = 0 }, .{ .page = first, .row = 0 } });
+    defer gathered.release();
+    const decimal = gathered.columns[0].values.decimal128;
+    try std.testing.expectEqual(@as(i32, 24), decimal.precision);
+    try std.testing.expectEqual(@as(i32, 2), decimal.scale);
+    try std.testing.expectEqualSlices(i128, &.{ 9007199254740993, -123456789012345678901, 9007199254740993 }, decimal.values);
 }

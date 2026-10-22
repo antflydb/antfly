@@ -499,3 +499,145 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+def test_logical_identity_mixed_parquet_decimal_precision(tmp_path):
+    """Optional identity accepts compatible decimal types across physical files."""
+    from decimal import Decimal
+
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    expected = {}
+    for part, precision in enumerate((18, 20)):
+        ids = list(range(part * 65, (part + 1) * 65))
+        price = Decimal("90071992547409.93" if part == 0 else "-123456789012345678.90")
+        expected.update(dict.fromkeys(ids, price))
+        path = tmp_path / f"part-{part}.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "id": pa.array(ids, pa.int64()),
+                    "body": pa.array(["needle"] * len(ids)),
+                    "price": pa.array([price] * len(ids), pa.decimal128(precision, 2)),
+                }
+            ),
+            path,
+            row_group_size=17,
+            write_page_index=True,
+        )
+        payload = path.read_bytes()
+        (objects / path.name).write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+            + payload
+        )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json(parse_float=Decimal) if response.content else None
+
+        call(
+            "POST",
+            "/tables/decimals",
+            {
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "decimals",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                        "row_identity": {"key_columns": ["id"]},
+                    },
+                    "default_type": "row",
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "id": {"type": "integer"},
+                                    "body": {"type": "string"},
+                                    "price": {
+                                        "type": "number",
+                                        "x-antfly-sql-type": "numeric",
+                                    },
+                                },
+                            }
+                        }
+                    },
+                    "relational_indexes": [
+                        {
+                            "name": "decimal_id",
+                            "keys": [{"column": "id"}],
+                            "include_columns": ["price"],
+                        }
+                    ],
+                },
+                "indexes": {"text": {"type": "full_text", "field": "body"}},
+            },
+        )
+        deadline = time.monotonic() + 90
+        while True:
+            indexes = call("GET", "/tables/decimals/indexes")
+            assert all(
+                i["status"]["readiness"]["state"] != "failed" for i in indexes
+            ), json.dumps(indexes) + server.debug_logs()
+            if all(i["status"]["readiness"]["queryable"] for i in indexes):
+                break
+            assert time.monotonic() < deadline, (
+                json.dumps(indexes) + server.debug_logs()
+            )
+            time.sleep(0.1)
+        for restart in (False, True):
+            if restart:
+                server.restart()
+            actual = {}
+            # Keep each response below the SQL default of 128 result rows.
+            for begin in (0, 65):
+                result = call(
+                    "POST",
+                    "/sql",
+                    {
+                        "statement": f"SELECT id, price FROM decimals WHERE id >= {begin} AND id < {begin + 65} ORDER BY id LIMIT 65"
+                    },
+                )
+                actual.update(
+                    {int(row[0]): Decimal(str(row[1])) for row in result["rows"]}
+                )
+            assert actual == expected
+            result = call(
+                "POST",
+                "/tables/decimals/query",
+                {
+                    "full_text_search": {"match": "needle", "field": "body"},
+                    "full_text_index": "text",
+                    "filter_query": {"term": {"path": "/id", "value": 66}},
+                    "fields": ["id", "price"],
+                },
+            )
+            hits = result["responses"][0]["hits"]["hits"]
+            assert len(hits) == 1, result
+            assert hits[0]["_source"]["id"] == 66
+            assert Decimal(str(hits[0]["_source"]["price"])) == expected[66]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

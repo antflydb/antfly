@@ -423,7 +423,9 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
         if (owner.save_checkpoint != null) costing.checkpoint = .{ .ptr = &progress, .save = BuildProgress.saveNavigation };
     }
     const identity_unchanged = previous_identity != null and current.value.published != null and std.meta.eql(current.value.published.?.signature, signature) and relocatableFormats(current.value.published.?.declarations);
-    var row_identity = if (identity_unchanged) previous_identity else @import("lake_row_identity_build.zig").build(a, na, table, &scoped, &provider, signature.source, base_source, navigation.ref, previous_identity, cancellation) catch |err| switch (err) {
+    var captured_rows: ?*@import("lake_row_payloads.zig").Capture = null;
+    defer if (captured_rows) |capture| capture.deinit();
+    var row_identity = if (identity_unchanged) previous_identity else @import("lake_row_identity_build.zig").build(a, na, table, &scoped, &provider, signature.source, base_source, navigation.ref, previous_identity, cancellation, &captured_rows) catch |err| switch (err) {
         // An optional identity declaration is not an enforced SQL constraint.
         // Insufficient identity evidence keeps ordinary complete construction.
         error.NullLogicalRowKey, error.DuplicateLogicalRowKey, error.LogicalRowIdentityAdmissionDeclined => null,
@@ -434,11 +436,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     if (!identity_unchanged) if (row_identity) |identity| {
         // Legacy sidecars/enrichment dependencies retain the physical builder.
         const configs = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{});
-        const reusable_inputs = for (configs.object.values()) |config| {
-            if (!@import("lake_row_input_recipes.zig").configurationReusable(config)) break false;
-            const kind = if (config == .object) config.object.get("type") else null;
-            if (kind == null or kind.? != .string or !(std.mem.eql(u8, kind.?.string, "full_text") or std.mem.eql(u8, kind.?.string, "embeddings") or std.mem.eql(u8, kind.?.string, "algebraic"))) break false;
-        } else true;
+        const reusable_inputs = @import("lake_row_input_recipes.zig").nativeFragmentsEligible(configs);
         if (reusable_inputs) fragments = try @import("lake_row_fragments.zig").prepare(a, &scoped, table, source, &provider, identity, previous_identity);
     };
     var fragment_replay: ?replay_api.Replay = null;
@@ -458,34 +456,14 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
             try contribution_index.init(a, scoped, root, cancellation);
             contribution_index.counted = true;
             contribution_index.prior_roots = previous.contribution_roots;
-            const prior = previous_identity.?.native_space.?;
-            // An aggregate retained across unrelated input updates may still
-            // own an older fragment census. A delta against the table's latest
-            // census cannot delete that root's original leaf identities.
-            var same_census = true;
-            const latest_files = value.prior_navigation.?.files;
+            // Bind each reduction to its original authenticated input census.
+            // Retained aggregates can legitimately own different older cuts.
             for (previous.declarations) |declaration| if (declaration.artifact.kind == .algebraic_segment) {
                 const view = previous_identity.?.spaceForIndex(declaration.name);
-                const ref = view.navigation orelse {
-                    same_census = false;
-                    break;
-                };
+                const ref = view.navigation orelse continue;
                 const bound = try navigation_api.load(na, scoped, ref, cancellation, null);
-                if (bound.files == null or latest_files == null) {
-                    if (bound.files != null or latest_files != null) {
-                        same_census = false;
-                        break;
-                    }
-                } else {
-                    const left = bound.files.?;
-                    const right = latest_files.?;
-                    if (left.bytes != right.bytes or left.height != right.height or left.records != right.records or !std.mem.eql(u8, &left.digest, &right.digest)) {
-                        same_census = false;
-                        break;
-                    }
-                }
+                try contribution_index.predecessors.put(a, declaration.name, .{ .source = bound.source, .schema = bound.schema, .snapshot = bound.snapshot, .count = bound.count, .cut = try navigation_api.cutIdentity(a, bound) });
             };
-            if (same_census) contribution_index.predecessor = .{ .source = prior.source, .schema = source.inventory.schema_fingerprint, .snapshot = prior.snapshot, .count = @intCast(prior.liveFiles()) };
         }
     }
     const native_candidates = if (fragments != null) published_candidates else candidates;
@@ -494,7 +472,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     if (row_identity) |*identity| if (previous_identity) |previous| {
         const published = current.value.published.?;
         const native_only = relocatableFormats(published.declarations);
-        if (!identity_unchanged and native_only and published.directory != null and std.mem.eql(u8, &published.signature.desired, &signature.desired)) {
+        if (!identity_unchanged and native_only and published.directory != null) {
             var reads: u64 = 0;
             var writes: u64 = 0;
             var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &scoped, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .cancellation = cancellation, .streaming = true };
@@ -572,7 +550,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     const legacy_json = try std.json.Stringify.valueAlloc(na, legacy_indexes, .{});
     var manifest = if (relocated) rebuild.ReconciledManifest{ .artifacts = try a.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, 0) } else try rebuild.reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(a, &scoped, provider.provider(), base_source, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = legacy_json }, reusable, cancellation, .{ .published_generation = attempt.generation, .edge_generation = attempt.generation, .computed_at_ms = started }, .{}, scope);
     defer manifest.deinit(a);
-    if (!relocated) if (fragments) |value| try @import("lake_row_fragments.zig").prepareSpool(value, &provider, &scoped);
+    if (!relocated) if (fragments) |value| try @import("lake_row_fragments.zig").prepareCapturedSpool(value, &provider, &scoped, captured_rows);
     const builders = @import("lake_index_publication_builders.zig");
     native_provider.skip_indexes = provider.skip_indexes;
     const built = if (relocated) builders.Result{} else (try builders.build(.{ .a = a, .out = na, .table = table, .store = &scoped, .provider = native_provider, .base = base_source, .reusable = reusable, .candidates = native_candidates, .contributions = previous_contributions, .index = &contribution_index, .token = cancellation })) orelse serial: {
