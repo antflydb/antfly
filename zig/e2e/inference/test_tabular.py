@@ -753,11 +753,16 @@ def test_ml_models_lists_predictors(api):
     ]
 
 
-def test_ai_models_excludes_predictors(api):
-    """/ai/v1/models remains the AI model catalog."""
+def test_ai_models_groups_predictors_for_discovery(api):
+    """Pool discovery includes ML schemas in their own catalog group."""
     r = api.get("/models")
     assert r.status_code == 200, r.text
-    assert "predictors" not in r.json()
+    body = r.json()
+    ml = api.get("/ml/v1/models")
+    assert ml.status_code == 200, ml.text
+    assert body["predictors"] == ml.json()["predictors"]
+    assert "iris-classifier" in body["predictors"]
+    assert all(model["id"] != "iris-classifier" for model in body["data"])
 
 
 def test_hostile_int_does_not_crash_loader(base_url, tmp_path):

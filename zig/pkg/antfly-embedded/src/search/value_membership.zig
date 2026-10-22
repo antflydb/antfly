@@ -356,7 +356,7 @@ pub const Cache = struct {
 };
 // Storage callers must supply a scope installed by openQueryCut *after*
 // validation. Ordinary mutable searches never consult this process cache.
-pub var retained: Cache = .{ .budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 16 * 1024 * 1024 } };
+pub var retained: Cache = .{ .budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(@import("antfly_platform").allocator.concurrentFallback()), .limit = 16 * 1024 * 1024 } };
 
 test "logical value retained facts isolate predicates expire and survive pressure" {
     const a = std.testing.allocator;

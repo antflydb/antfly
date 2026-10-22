@@ -461,6 +461,10 @@ pub const Owner = struct {
     const MaintenanceSchedule = struct {
         shadow_next: bool = true,
         source_recovery_next: bool = true,
+        group_source_next: bool = true,
+        // Separately allocated: table admission can grow the schedule map
+        // while a visibility/idle drain borrows this state.
+        group_sources: ?*h.db_mod.DB.GroupSourceMaintenanceState = null,
         next_source_recovery_ns: i96 = 0,
         live: bool = true,
         ttl: h.db_mod.types.TTLCleanupStats = .{},
@@ -529,6 +533,7 @@ pub const Owner = struct {
     pub fn refresh(self: *Owner) !*h.Handle {
         var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
+            if (current.lite_scheduling_owner == null) try self.bindGroupSourceState(current);
             var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer probe.close();
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
@@ -555,6 +560,7 @@ pub const Owner = struct {
         if (known_maintenance orelse self.current) |verified| options.allocator_verification_owner = &verified.owned_lite_backend.?.native_docstore.?.file;
         const replacement = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, self.current);
         errdefer h.closeHandle(replacement);
+        try self.bindGroupSourceState(replacement);
         if (self.current) |previous| {
             if (known_maintenance) |snapshot| {
                 try replacement.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
@@ -640,6 +646,30 @@ pub const Owner = struct {
                 h.closeHandle(retired);
             }
         }
+    }
+
+    fn bindGroupSourceState(self: *Owner, root: *h.Handle) !void {
+        root.db.borrowed_group_source_state = try self.groupSourceState(&root.db);
+        var tables = root.embedded_tables.valueIterator();
+        while (tables.next()) |table|
+            table.*.db.borrowed_group_source_state = try self.groupSourceState(&table.*.db);
+        root.lite_scheduling_owner = self;
+    }
+
+    /// Called under the connection gate by explicit maintenance as well as the
+    /// background scheduler. The state outlives every refreshed DB wrapper.
+    pub fn groupSourceState(self: *Owner, database: *h.db_mod.DB) !*h.db_mod.DB.GroupSourceMaintenanceState {
+        const entry = try self.maintenance_schedules.getOrPut(alloc, .{
+            .table_id = database.core.identity_namespace.table_id,
+            .incarnation = database.root_incarnation,
+        });
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        if (entry.value_ptr.group_sources == null) {
+            const state = try alloc.create(h.db_mod.DB.GroupSourceMaintenanceState);
+            state.* = .{ .allocator = alloc };
+            entry.value_ptr.group_sources = state;
+        }
+        return entry.value_ptr.group_sources.?;
     }
 
     pub fn notifyMutation(self: *Owner) void {
@@ -920,6 +950,10 @@ pub const Owner = struct {
         }
         var stale = self.maintenance_schedules.iterator();
         while (stale.next()) |entry| if (!entry.value_ptr.live) {
+            if (entry.value_ptr.group_sources) |state| {
+                state.deinit();
+                alloc.destroy(state);
+            }
             self.maintenance_schedules.removeByPtr(entry.key_ptr);
         };
         const count = foreground.embedded_tables.count() + 1;
@@ -931,6 +965,7 @@ pub const Owner = struct {
             for (0..ordinal) |_| selected = tables.next().?.*;
             database = &selected.?.db;
         }
+        const group_state = try self.groupSourceState(database);
         const schedule_entry = try self.maintenance_schedules.getOrPut(alloc, .{
             .table_id = database.core.identity_namespace.table_id,
             .incarnation = database.root_incarnation,
@@ -962,6 +997,17 @@ pub const Owner = struct {
             schedule.next_source_recovery_ns = now + std.time.ns_per_s;
         }
         schedule.source_recovery_next = true;
+        // Group fan-in is bounded control work on the current coordinator.
+        // Alternate it with detached provider replay per namespace so a busy
+        // root or a long backfill cannot starve a child or its consumers.
+        if (self.options.open_mode == .writer and schedule.group_source_next) {
+            if (try database.runGroupSourceMaintenanceSlice(group_state)) {
+                schedule.group_source_next = false;
+                self.notifyMutation();
+                return true;
+            }
+        }
+        schedule.group_source_next = true;
         var ttl_more = false;
         if (now >= schedule.next_ttl_ns) {
             // Each namespace owns its cleanup cadence. Failure still consumes
@@ -1148,6 +1194,15 @@ pub const Owner = struct {
         }
     }
 
+    fn deinitMaintenanceSchedules(self: *Owner) void {
+        var schedules = self.maintenance_schedules.valueIterator();
+        while (schedules.next()) |schedule| if (schedule.group_sources) |state| {
+            state.deinit();
+            alloc.destroy(state);
+        };
+        self.maintenance_schedules.deinit(alloc);
+    }
+
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
         if (self.maintenance_snapshot) |snapshot| closeMaintenanceSnapshot(snapshot);
@@ -1159,7 +1214,7 @@ pub const Owner = struct {
         }
         self.retired.deinit(alloc);
         self.connections.deinit(alloc);
-        self.maintenance_schedules.deinit(alloc);
+        self.deinitMaintenanceSchedules();
         if (self.owned_ttl_owner_id) |id| alloc.free(id);
         if (self.owned_models_dir) |directory| alloc.free(directory);
         alloc.destroy(self);
@@ -1384,6 +1439,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     if (existing == null) {
         owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir };
     }
+    errdefer if (existing == null) owner.deinitMaintenanceSchedules();
     try owner.connections.ensureUnusedCapacity(alloc, 1);
     errdefer if (existing == null) owner.connections.deinit(alloc);
     if (existing == null) {
