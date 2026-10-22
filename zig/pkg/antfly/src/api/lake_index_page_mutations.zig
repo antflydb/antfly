@@ -35,7 +35,7 @@ pub const Mutations = struct {
         var sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 1024 * 1024);
         sort.shared_runs = true;
         sort.encoded_bytes = true;
-        return .{ .a = a, .sort = sort, .forest = .{ .a = a, .store = storage, .policy = .latest }, .destination = storage, .private_pages = .{ .manager = manager, .domain = storage.domain, .attempt = storage.attempt } };
+        return .{ .a = a, .sort = sort, .forest = .{ .a = a, .store = storage, .policy = .latest }, .destination = storage, .private_pages = .{ .manager = manager, .domain = storage.domain, .attempt = storage.attempt, .prefix_keys = storage.prefix_keys } };
     }
     pub fn deinit(self: *Mutations) void {
         self.private_pages.deinit();

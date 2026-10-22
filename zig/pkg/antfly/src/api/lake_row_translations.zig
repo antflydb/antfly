@@ -160,7 +160,7 @@ fn buildInner(a: A, pages: *Pages, original: identity.Space, current: identity.S
         _ = scratch.reset(.retain_capacity);
         const current_record = (next.next() catch |err| return identity.derivedReadFailure(err)) orelse return error.InvalidLogicalRowIdentity;
         const row = (try ranks.next()) orelse return error.InvalidLogicalRowIdentity;
-        if (previous.key.len != 32 or previous.value.len != 56 or current_record.value.len != 56 or row.key.len != 32 or row.value.len != 8 or !std.mem.eql(u8, previous.key, current_record.key) or !std.mem.eql(u8, previous.key, row.key)) return error.InvalidLogicalRowIdentity;
+        if (previous.key.len != 32 or previous.value.len != original.idWidth() or current_record.value.len != current.idWidth() or row.key.len != 32 or row.value.len != 8 or !std.mem.eql(u8, previous.key, current_record.key) or !std.mem.eql(u8, previous.key, row.key)) return error.InvalidLogicalRowIdentity;
         var value: [24]u8 = undefined;
         value[0..16].* = current_record.value[0..16].*;
         @memcpy(value[16..24], row.value);

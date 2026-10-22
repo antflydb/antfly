@@ -251,10 +251,12 @@ const Binding = struct {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("native-lake-coordinate-space-v1");
         hash.update(&self.owner.reader.root.domain);
-        if (self.space.by_location) |ref| {
+        // Compact membership uses slots, so identical coordinate bytes may
+        // name different files after a rewrite. Bind the dictionary as well.
+        for ([_]?@import("../serverless/graph_segment/page_tree.zig").Ref{ self.space.by_location, self.space.files }) |root| if (root) |ref| {
             hash.update(&ref.digest);
             hash.update(&ref.attempt);
-        }
+        };
         var space: [32]u8 = undefined;
         hash.final(&space);
         return .{ .ptr = self, .source = self.space.source, .snapshot = self.space.snapshot, .current_source = self.owner.reader.root.current.source, .current_snapshot = self.owner.reader.root.current.snapshot, .rows = self.owner.reader.root.current.rows, .relocated = self.relocated, .coordinate_space = space, .from_index = fromIndex, .to_index = toIndex, .file = file, .digest = digest, .tie_rank = tieRank, .tie_ranks = tieRanks, .translate_many = translateMany, .translate_many_bounded = translateManyBounded, .close = close };
@@ -767,4 +769,19 @@ test "external lake row-map optional admission preserves required reads and canc
     owner.cached.context.deadline_ns = 0;
     try std.testing.expectError(error.DeadlineExceeded, owner.charge(1, null));
     try std.testing.expectEqual(@as(u64, 196), owner.reads);
+}
+
+test "external lake compact coordinate identity binds file names as well as membership" {
+    const ref: @import("../serverless/graph_segment/page_tree.zig").Ref = .{ .digest = @splat(1), .bytes = 100, .records = 1, .height = 0 };
+    var space: identity.Space = .{ .compact = true, .source = "source", .snapshot = "cut", .rows = 1, .file_count = 1, .files = ref, .file_slots = ref, .by_id = ref, .by_location = ref, .by_file = ref, .by_order = ref };
+    var owner: Owner = undefined;
+    owner.reader.root.domain = @splat(7);
+    owner.reader.root.current = space;
+    var first: Binding = .{ .owner = &owner, .space = space, .relocated = true };
+    // Replacing a file can preserve every slot/row/ID while renaming the file.
+    space.files.?.digest = @splat(2);
+    var renamed: Binding = .{ .owner = &owner, .space = space, .relocated = true };
+    try std.testing.expect(!std.meta.eql(first.capability().coordinate_space, renamed.capability().coordinate_space));
+    renamed.space.files = ref;
+    try std.testing.expectEqual(first.capability().coordinate_space, renamed.capability().coordinate_space);
 }

@@ -316,6 +316,12 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
         first = states()
         assert first, "Logical identity state was not published"
         original = next(root for root in first if root.get("indexes") is None)
+        assert original["values_format"] == 3
+        assert original["current"]["compact"]
+        assert original["current"]["by_location"] == original["current"]["by_file"]
+        original_spaces = {
+            entry["name"]: entry["space"] for entry in original["reused"]
+        }
 
         for step in (1, 2, 5, 3, 6, 4, 7):
             write(step)
@@ -338,17 +344,26 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                 )
             elif step == 5:
                 assert "text" in reused, current
+                # Value-only updates change cohort evidence; stable membership
+                # and coordinate maps remain reusable across those updates.
                 assert (
-                    reused["all_text"]["by_id"] != original["native_space"]["by_id"]
+                    current["native_space"]["by_id"]
+                    == original["native_space"]["by_id"]
+                )
+                assert (
+                    reused["all_text"]["navigation"]
+                    != original_spaces["all_text"]["navigation"]
                 ), current
                 assert current["artifacts"] != original["artifacts"], current
                 assert reused["text"]["snapshot"] == original["current"]["snapshot"]
             elif step == 3:
-                assert reused["text"]["by_id"] != original["native_space"]["by_id"], (
-                    current
-                )
                 assert (
-                    reused["all_text"]["by_id"] != original["native_space"]["by_id"]
+                    reused["text"]["navigation"]
+                    != original_spaces["text"]["navigation"]
+                ), current
+                assert (
+                    reused["all_text"]["navigation"]
+                    != original_spaces["all_text"]["navigation"]
                 ), current
                 assert "dense_native" in reused and "sparse_native" in reused, current
             elif step == 6:
@@ -496,6 +511,31 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                 assert normalize(
                     call("POST", "/tables/logical/query", text)
                 ) == normalize(before)
+        # A new projection verifies its own cohort against the retained key
+        # census; both external formats keep membership while publishing it.
+        membership = states()[-1]["current"]["by_id"]
+        added = {"type": "full_text", "field": "label", "store_source": False}
+        for name in ("logical", oracle):
+            call("POST", f"/tables/{name}/indexes/label_text", added)
+            ready(name, revision if name == "logical" else None)
+        assert states()[-1]["current"]["by_id"] == membership
+        label_query = {
+            "full_text_search": {"match": "row-42", "field": "label"},
+            "full_text_index": "label_text",
+            "fields": ["id", "label"],
+            "limit": 5,
+        }
+        expected = call("POST", f"/tables/{oracle}/query", label_query)
+        actual = call("POST", "/tables/logical/query", label_query)
+        assert normalize(actual) == normalize(expected)
+        assert [hit["_score"] for hit in actual["hits"]["hits"]] == pytest.approx(
+            [hit["_score"] for hit in expected["hits"]["hits"]], rel=1e-6
+        )
+        server.restart()
+        ready("logical")
+        assert normalize(
+            call("POST", "/tables/logical/query", label_query)
+        ) == normalize(expected)
         failed = False
     finally:
         server.stop(test_failed=failed)

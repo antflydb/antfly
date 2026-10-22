@@ -27,6 +27,7 @@ const A = std.mem.Allocator;
 const Token = @import("antfly_cancellation").CancellationToken;
 const Coordinate = logical.Coordinate;
 pub const metadata_version: u16 = 2;
+pub const cohort_values_format: u16 = 3;
 pub const max_root_bytes = 1024 * 1024;
 
 /// Only derived map navigation uses this normalization. Source reads retain
@@ -39,6 +40,8 @@ pub fn derivedReadFailure(err: anyerror) anyerror {
 }
 
 pub const Space = struct {
+    /// Coordinates only; value evidence lives once in the input-cohort tree.
+    compact: bool = false,
     source: []const u8,
     snapshot: []const u8,
     rows: u64,
@@ -54,11 +57,19 @@ pub const Space = struct {
     by_order: ?tree.Ref = null,
     input_versions: ?tree.Ref = null,
     input_recipes: []const @import("lake_row_input_recipes.zig").Recipe = &.{},
+    pub fn idWidth(self: Space) usize {
+        return if (self.compact) 16 else 56;
+    }
+    pub fn memberWidth(self: Space) usize {
+        return if (self.compact) 32 else 64;
+    }
     pub fn liveFiles(self: Space) u64 {
         return if (self.files) |ref| ref.records else 0;
     }
     pub fn jsonStringify(self: Space, writer: anytype) !void {
-        if (self.file_slots == null) {
+        if (self.compact) {
+            try writer.write(.{ .compact = true, .source = self.source, .snapshot = self.snapshot, .rows = self.rows, .file_count = self.file_count, .files = self.files, .navigation = self.navigation, .by_id = self.by_id, .by_location = self.by_location, .file_slots = self.file_slots, .by_file = self.by_file, .by_order = self.by_order, .input_versions = self.input_versions, .input_recipes = self.input_recipes });
+        } else if (self.file_slots == null) {
             try writer.write(.{ .source = self.source, .snapshot = self.snapshot, .rows = self.rows, .file_count = self.file_count, .files = self.files, .navigation = self.navigation, .by_id = self.by_id, .by_location = self.by_location });
         } else if (self.input_versions == null and self.input_recipes.len == 0) {
             try writer.write(.{ .source = self.source, .snapshot = self.snapshot, .rows = self.rows, .file_count = self.file_count, .files = self.files, .navigation = self.navigation, .by_id = self.by_id, .by_location = self.by_location, .file_slots = self.file_slots, .by_file = self.by_file, .by_order = self.by_order });
@@ -67,6 +78,7 @@ pub const Space = struct {
         }
     }
     fn validate(self: Space) !void {
+        if (self.compact and ((self.file_slots == null and self.file_count != 0) or !std.meta.eql(self.by_location, self.by_file))) return error.InvalidLogicalRowIdentity;
         if (self.source.len == 0 or self.source.len > 4096 or self.snapshot.len == 0 or self.snapshot.len > 4096) return error.InvalidLogicalRowIdentity;
         inline for (.{ .{ self.files, if (self.file_slots != null) self.liveFiles() else self.file_count }, .{ self.by_id, self.rows }, .{ self.by_location, self.rows } }) |entry| {
             if (entry[0]) |ref| {
@@ -230,13 +242,14 @@ pub const Root = struct {
         }
     }
     pub fn validate(self: Root, a: A) !void {
-        if ((self.values_format != 1 and self.values_format != 2) or (self.version != 1 and self.version != metadata_version) or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.namespace, 0) or std.mem.allEqual(u8, &self.values_recipe, 0) or std.mem.allEqual(u8, &self.cut, 0)) return error.InvalidLogicalRowIdentity;
+        if ((self.values_format != 1 and self.values_format != 2 and self.values_format != cohort_values_format) or (self.version != 1 and self.version != metadata_version) or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.namespace, 0) or std.mem.allEqual(u8, &self.values_recipe, 0) or std.mem.allEqual(u8, &self.cut, 0)) return error.InvalidLogicalRowIdentity;
         if (self.definition) |definition| if (self.version != 2 or std.mem.allEqual(u8, &definition, 0)) return error.InvalidLogicalRowIdentity;
         try self.current.validate();
-        if ((self.reused.len != 0 and self.values_format != 2) or self.reused.len > local.metadata_lake_index_catalog.max_directory_artifacts) return error.InvalidLogicalRowIdentity;
+        if ((self.values_format == cohort_values_format) != self.current.compact) return error.InvalidLogicalRowIdentity;
+        if ((self.reused.len != 0 and self.values_format < 2) or self.reused.len > local.metadata_lake_index_catalog.max_directory_artifacts) return error.InvalidLogicalRowIdentity;
         if (self.indexes) |index| try self.validateIndexSpace(index);
         if (self.native_space) |space| {
-            if (self.values_format != 2) return error.InvalidLogicalRowIdentity;
+            if (self.values_format < 2) return error.InvalidLogicalRowIdentity;
             try self.validateIndexSpace(space);
         }
         for (self.reused, 0..) |entry, i| {
@@ -255,6 +268,7 @@ pub const Root = struct {
     }
     fn validateIndexSpace(self: Root, space: Space) !void {
         try space.validate();
+        if (space.compact != self.current.compact) return error.InvalidLogicalRowIdentity;
         if (space.rows != self.current.rows or !std.mem.eql(u8, space.source, self.current.source)) return error.InvalidLogicalRowIdentity;
     }
     pub fn definitionFingerprint(self: Root) logical.Digest {
@@ -554,6 +568,10 @@ pub fn proveReuse(a: A, pages: *pages_api.PageStore, previous: Root, next: *Root
     if (std.mem.allEqual(u8, &previous.artifacts, 0)) return error.InvalidLogicalRowIdentity;
     try next.validate(a);
     if (previous.values_format != next.values_format or !std.mem.eql(u8, &previous.definitionFingerprint(), &next.definitionFingerprint()) or !std.mem.eql(u8, &previous.domain, &next.domain) or !std.mem.eql(u8, &previous.namespace, &next.namespace) or !std.mem.eql(u8, &previous.values_recipe, &next.values_recipe) or previous.current.rows != next.current.rows or !std.mem.eql(u8, previous.current.source, next.current.source)) return false;
+    if (next.values_format == cohort_values_format) {
+        for (next.current.input_recipes) |input| if (!input.reusable) return false;
+        if (!try tree.equivalent(a, pages.store(), previous.current.input_versions, next.current.input_versions, .{ .key_bytes = 64, .value_bytes = 32 })) return false;
+    }
     var old = tree.Cursor.init(a, pages.store(), previous.current.by_id, "", null) catch |err| return derivedReadFailure(err);
     defer old.deinit();
     var current = tree.Cursor.init(a, pages.store(), next.current.by_id, "", null) catch |err| return derivedReadFailure(err);
@@ -561,8 +579,9 @@ pub fn proveReuse(a: A, pages: *pages_api.PageStore, previous: Root, next: *Root
     var seen: u64 = 0;
     while (old.next() catch |err| return derivedReadFailure(err)) |left| {
         const right = (current.next() catch |err| return derivedReadFailure(err)) orelse return error.InvalidLogicalRowIdentity;
-        if (left.key.len != 32 or right.key.len != 32 or left.value.len != 56 or right.value.len != 56) return error.InvalidLogicalRowIdentity;
-        if (!std.mem.eql(u8, left.key, right.key) or !std.mem.eql(u8, left.value[16..48], right.value[16..48])) return false;
+        const before = try decodeState(previous.current, left.key, left.value);
+        const after = try decodeState(next.current, right.key, right.value);
+        if (!before.state.unchanged(after.state)) return false;
         seen += 1;
     }
     if ((current.next() catch |err| return derivedReadFailure(err)) != null or seen != next.current.rows) return error.InvalidLogicalRowIdentity;
@@ -579,7 +598,7 @@ pub fn proveIndexReuse(a: A, out: A, pages: *pages_api.PageStore, previous: Root
     try previous.validate(a);
     try next.validate(a);
     if (previous.values_format != next.values_format or !std.mem.eql(u8, &previous.domain, &next.domain) or !std.mem.eql(u8, &previous.namespace, &next.namespace) or previous.current.rows != next.current.rows or !std.mem.eql(u8, previous.current.source, next.current.source)) return &.{};
-    if (!(tree.equivalent(a, pages.store(), previous.current.by_id, next.current.by_id, .{ .compare_values = false, .key_bytes = 32, .value_bytes = 56 }) catch |err| return derivedReadFailure(err))) return &.{};
+    if (!(tree.equivalent(a, pages.store(), previous.current.by_id, next.current.by_id, .{ .compare_values = false, .key_bytes = 32, .value_bytes = next.current.idWidth() }) catch |err| return derivedReadFailure(err))) return &.{};
     var reusable: std.ArrayList(ReusedIndex) = .empty;
     for (next.current.input_recipes) |recipe| {
         if (!recipe.reusable) continue;
@@ -644,8 +663,8 @@ pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, token: Token, cached: ?
 
 pub const Resolved = struct { state: logical.State, coordinate: Coordinate, tie_rank: u64 };
 pub fn decodeState(space: Space, key: []const u8, value: []const u8) !Resolved {
-    if (key.len != 32 or value.len != 56) return error.InvalidLogicalRowIdentity;
-    const resolved: Resolved = .{ .state = .{ .id = key[0..32].*, .values = value[16..48].* }, .coordinate = try Coordinate.decode(value[0..16]), .tie_rank = std.mem.readInt(u64, value[48..56], .big) };
+    if (key.len != 32 or value.len != space.idWidth()) return error.InvalidLogicalRowIdentity;
+    const resolved: Resolved = .{ .state = .{ .id = key[0..32].*, .values = if (space.compact) key[0..32].* else value[16..48].* }, .coordinate = try Coordinate.decode(value[0..16]), .tie_rank = if (space.compact) 0 else std.mem.readInt(u64, value[48..56], .big) };
     try resolved.state.validate();
     if (resolved.coordinate.file >= space.file_count or resolved.tie_rank >= space.rows) return error.InvalidLogicalRowIdentity;
     return resolved;
@@ -678,15 +697,17 @@ pub const Reader = struct {
         return a.dupe(u8, record.value);
     }
     pub fn byId(self: *Reader, a: A, space: Space, id: logical.Id) !?Resolved {
-        const value = (try self.lookup(a, space.by_id, &id, 56)) orelse return null;
+        const value = (try self.lookup(a, space.by_id, &id, space.idWidth())) orelse return null;
         defer a.free(value);
         return try decodeState(space, &id, value);
     }
     pub fn byLocation(self: *Reader, a: A, space: Space, file_id: []const u8, group: u32, row: u64) !?logical.State {
+        const coordinate: Coordinate = .{ .file = if (space.compact) try self.fileSlot(a, space, file_id) else 0, .group = group, .row = row };
         const key = locationKey(file_id, group, row);
-        const value = (try self.lookup(a, space.by_location, &key, 64)) orelse return null;
+        const compact_key = coordinate.encode();
+        const value = (try self.lookup(a, space.by_location, if (space.compact) &compact_key else &key, space.memberWidth())) orelse return null;
         defer a.free(value);
-        const state: logical.State = .{ .id = value[0..32].*, .values = value[32..64].* };
+        const state: logical.State = .{ .id = value[0..32].*, .values = if (space.compact) value[0..32].* else value[32..64].* };
         try state.validate();
         return state;
     }
@@ -752,19 +773,27 @@ pub const Reader = struct {
         const to = if (forward) self.root.current else self.root.indexSpace();
         const keys = try a.alloc([44]u8, refs.len);
         const pointers = try a.alloc([]const u8, refs.len);
+        var slots: std.StringHashMapUnmanaged(u32) = .empty;
         for (refs, keys, pointers) |ref, *key, *pointer| {
             if (ref != .external or !std.mem.eql(u8, ref.external.source_id, from.source) or !std.mem.eql(u8, ref.external.snapshot_id, from.snapshot)) return error.ExternalLakeSnapshotMismatch;
-            key.* = locationKey(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
-            pointer.* = key;
+            if (from.compact) {
+                const slot = try slots.getOrPut(a, ref.external.file_id);
+                if (!slot.found_existing) slot.value_ptr.* = try self.fileSlot(a, from, ref.external.file_id);
+                key[0..16].* = (Coordinate{ .file = slot.value_ptr.*, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }).encode();
+                pointer.* = key[0..16];
+            } else {
+                key.* = locationKey(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
+                pointer.* = key;
+            }
         }
-        const states = try self.lookupMany(a, from.by_location, pointers, 64);
+        const states = try self.lookupMany(a, from.by_location, pointers, from.memberWidth());
         for (pointers, states) |*key, state| key.* = state[0..32];
-        const locations = try self.lookupMany(a, to.by_id, pointers, 56);
+        const locations = try self.lookupMany(a, to.by_id, pointers, to.idWidth());
         const result = try backing.alloc(Resolved, refs.len);
         errdefer backing.free(result);
         for (result, states, locations) |*target, state, location| {
             target.* = try decodeState(to, state[0..32], location);
-            if (self.verify_values and !std.mem.eql(u8, state[32..64], &target.state.values)) return error.InvalidLogicalRowIdentity;
+            if (self.verify_values and !std.mem.eql(u8, if (from.compact) state[0..32] else state[32..64], &target.state.values)) return error.InvalidLogicalRowIdentity;
         }
         return result;
     }

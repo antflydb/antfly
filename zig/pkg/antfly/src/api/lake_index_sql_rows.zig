@@ -678,6 +678,64 @@ pub fn tryOpenPredicateWithContext(a: A, server: *server_api.ApiHttpServer, tabl
     return best;
 }
 
+/// Decoded leases remain admitted until the caller consumes this wave. Each
+/// 16 MiB lane fits the default 32 MiB I/O allowance; saturation runs inline.
+const CoveringWave = struct {
+    const lane_bytes = 16 * 1024 * 1024;
+    const Metadata = @import("lake_index_decoded_metadata.zig");
+    const Block = Metadata.Owned(local.sql_spill.ColumnarBlock);
+    const Job = struct {
+        cached: @import("lake_index_aggregate_artifact.zig").CachedRead,
+        store: @import("../serverless/artifacts/store.zig").ArtifactStore,
+        ref: @import("lake_index_aggregate_artifact.zig").ChunkRef,
+        token: @import("antfly_cancellation").CancellationToken,
+        block: ?Block = null,
+        fn run(self: *@This()) anyerror!void {
+            self.block = try Metadata.acquireColumnBlockBounded(self.cached, self.store, self.ref, self.token, lane_bytes);
+        }
+    };
+    jobs: [4]Job = undefined,
+    count: usize = 0,
+    retained: usize = 0,
+    fn deinit(self: *CoveringWave) void {
+        for (self.jobs[0..self.count]) |job| if (job.block) |block| block.release();
+        if (self.retained != 0) local.sql_parallel_scheduler.global().releasePull(0, self.retained);
+        self.* = .{};
+    }
+    fn read(self: *CoveringWave, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, store: @import("../serverless/artifacts/store.zig").ArtifactStore, refs: []const @import("lake_index_aggregate_artifact.zig").ChunkRef, token: @import("antfly_cancellation").CancellationToken) !void {
+        if (refs.len > self.jobs.len or self.count != 0) return error.InvalidNativeLakeRowIndex;
+        const scheduler = local.sql_parallel_scheduler;
+        const retained = lane_bytes * refs.len;
+        if (!scheduler.global().reservePull(0, retained)) return error.SqlMemoryLimitExceeded;
+        self.retained = retained;
+        for (refs, self.jobs[0..refs.len]) |ref, *job| job.* = .{ .cached = cached, .store = store, .ref = ref, .token = token };
+        self.count = refs.len;
+        var tasks: [4]?scheduler.Task(anyerror!void) = @splat(null);
+        defer if (cached.context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
+            held.cancel(io) catch {};
+        };
+        var failure: ?anyerror = null;
+        for (self.jobs[0..self.count], 0..) |*job, i| {
+            if (failure != null) break;
+            if (cached.context.io) |io| if (self.count > 1) {
+                tasks[i] = scheduler.global().submitIo(io, lane_bytes, Job.run, .{job});
+            };
+            if (tasks[i] == null) job.run() catch |err| {
+                failure = err;
+            };
+        }
+        if (cached.context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
+            held.await(io) catch |err| {
+                if (failure == null) failure = err;
+            };
+            task.* = null;
+        };
+        if (failure) |err| return err;
+        try token.check();
+        try cached.context.ensureActive();
+    }
+};
+
 /// Gather already-ranked physical rows from an existing complete covering
 /// index. This shares the pinned publication and the ordinary typed block
 /// codec; serving-pack compaction does not rewrite or invalidate this layout.
@@ -738,21 +796,12 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
         defer row_arena.deinit();
         var begin: usize = 0;
         while (begin < pending.len) {
-            const Block = @import("lake_index_decoded_metadata.zig").Owned(local.sql_spill.ColumnarBlock);
-            const Job = struct {
-                cached: @import("lake_index_aggregate_artifact.zig").CachedRead,
-                store: @import("../serverless/artifacts/store.zig").ArtifactStore,
-                ref: @import("lake_index_aggregate_artifact.zig").ChunkRef,
-                token: @import("antfly_cancellation").CancellationToken,
-                block: ?Block = null,
-                fn run(self: *@This()) anyerror!void {
-                    self.block = try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(self.cached, self.store, self.ref, self.token);
-                }
-            };
-            var jobs: [4]Job = undefined;
+            var wave: CoveringWave = .{};
+            defer wave.deinit();
+            var block_refs: [4]@import("lake_index_aggregate_artifact.zig").ChunkRef = undefined;
             var groups: [4]struct { begin: usize, end: usize } = undefined;
             var count: usize = 0;
-            while (count < jobs.len and begin < pending.len) {
+            while (count < block_refs.len and begin < pending.len) {
                 const reference = pending[begin].entry.cover.?;
                 var end = begin + 1;
                 while (end < pending.len and std.mem.eql(u8, pending[end].entry.cover.?.block.artifact_id, reference.block.artifact_id)) : (end += 1) {
@@ -760,35 +809,13 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
                     if (same.byte_len != reference.block.byte_len or !std.mem.eql(u8, same.checksum, reference.block.checksum)) return error.InvalidNativeLakeRowIndex;
                 }
                 try @import("../serverless/artifacts/store.zig").chargeReadBudget(&owner.reader.remaining_reads, reference.block.byte_len);
-                jobs[count] = .{ .cached = .{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context }, .store = owner.artifacts, .ref = reference.block, .token = owner.reader.pages.cancellation };
+                block_refs[count] = reference.block;
                 groups[count] = .{ .begin = begin, .end = end };
                 count += 1;
                 begin = end;
             }
-            defer for (jobs[0..count]) |job| if (job.block) |block| block.release();
-            const scheduler = local.sql_parallel_scheduler;
-            var tasks: [4]?scheduler.Task(anyerror!void) = @splat(null);
-            defer if (pinned.read_context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
-                held.cancel(io) catch {};
-            };
-            var failure: ?anyerror = null;
-            for (jobs[0..count], 0..) |*job, i| {
-                if (failure != null) break;
-                if (pinned.read_context.io) |io| {
-                    if (count > 1) tasks[i] = scheduler.global().submitIo(io, 64 * 1024 * 1024, Job.run, .{job});
-                }
-                if (tasks[i] == null) job.run() catch |err| {
-                    failure = err;
-                };
-            }
-            if (pinned.read_context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
-                held.await(io) catch |err| {
-                    if (failure == null) failure = err;
-                };
-                task.* = null;
-            };
-            if (failure) |err| return err;
-            for (jobs[0..count], groups[0..count]) |job, group| {
+            try wave.read(.{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context }, owner.artifacts, block_refs[0..count], owner.reader.pages.cancellation);
+            for (wave.jobs[0..count], groups[0..count]) |job, group| {
                 const block = job.block.?;
                 for (pending[group.begin..group.end]) |item| {
                     try owner.read_context.ensureActive();
@@ -2258,4 +2285,82 @@ test "external lake optional predicate source translation requires bounded capab
     allowance.remaining_rows = 1;
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, owner.mapRefsLimited(std.testing.allocator, refs, &allowance));
     try std.testing.expectEqual(@as(usize, 1), mock.calls);
+}
+
+test "external lake covering waves overlap cold blocks retain admission and join failed reads" {
+    const a = std.testing.allocator;
+    const artifacts = @import("lake_index_aggregate_artifact.zig");
+    const stores = @import("../serverless/artifacts/store.zig");
+    const Token = @import("antfly_cancellation").CancellationToken;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-covering-wave");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(4), .attempt = @splat(1) };
+    var refs: [4]artifacts.ChunkRef = undefined;
+    var initialized: usize = 0;
+    defer for (refs[0..initialized]) |ref| {
+        a.free(ref.artifact_id);
+        a.free(ref.checksum);
+    };
+    for (&refs, 0..) |*ref, i| {
+        const encoded = try local.sql_spill.encodeColumnarBlockAlloc(a, &.{.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = "key" })}, .values = &.{local.sql_scalar.Datum.json(.{ .integer = @intCast(i) })}, .ordinal = i }}, artifacts.max_block_bytes);
+        defer a.free(encoded);
+        const metadata = try store.put(encoded);
+        ref.* = .{ .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
+        initialized += 1;
+    }
+    const Probe = struct {
+        var active: *@This() = undefined;
+        base: stores.ArtifactStore,
+        current: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        cancelled: std.atomic.Value(bool) = .init(false),
+        fail: ?[]const u8 = null,
+        cancel: bool = false,
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).cancelled.load(.acquire);
+        }
+        fn read(_: *anyopaque, alloc: A, id: []const u8, maximum: usize, token: Token) ![]u8 {
+            const self = active;
+            const count = self.current.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.current.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(count, .monotonic);
+            try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+            if (self.fail) |failed| if (std.mem.eql(u8, failed, id)) {
+                if (self.cancel) {
+                    self.cancelled.store(true, .release);
+                    return error.Canceled;
+                }
+                return error.InjectedCoveringReadFailure;
+            };
+            const bytes = try self.base.getVerifiedAllocWithCancellationUsingAllocator(alloc, id, maximum, id[7..71], token);
+            return bytes;
+        }
+    };
+    const scheduler = local.sql_parallel_scheduler.global();
+    const before = scheduler.pull_bytes;
+    for (0..3) |mode| {
+        var probe: Probe = .{ .base = store, .fail = if (mode == 0) null else refs[0].artifact_id, .cancel = mode == 2 };
+        Probe.active = &probe;
+        var vtable = store.vtable.*;
+        vtable.get_bounded_alloc_with_cancellation = Probe.read;
+        var backend = store;
+        backend.vtable = &vtable;
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        var wave: CoveringWave = .{};
+        const read = wave.read(.{ .cache = &cache, .scope = @splat(7), .context = .{ .io = std.testing.io } }, backend, &refs, .{ .ptr = &probe, .is_cancelled_fn = Probe.canceled });
+        defer wave.deinit();
+        if (mode == 0) {
+            try read;
+            try std.testing.expect(probe.peak.load(.monotonic) > 1);
+            try std.testing.expectEqual(before + 4 * CoveringWave.lane_bytes, scheduler.pull_bytes);
+            for (wave.jobs, 0..) |job, i| try std.testing.expectEqual(@as(i64, @intCast(i)), (try job.block.?.value.cell(0, 0)).value.integer);
+        } else if (mode == 1) try std.testing.expectError(error.InjectedCoveringReadFailure, read) else try std.testing.expectError(error.Canceled, read);
+        try std.testing.expectEqual(@as(usize, 0), probe.current.load(.acquire));
+        wave.deinit();
+        try std.testing.expectEqual(before, scheduler.pull_bytes);
+    }
 }

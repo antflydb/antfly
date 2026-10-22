@@ -105,7 +105,9 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     }
     // Identity and index input evidence need no unrelated payload columns.
     const columns = column_storage[0..column_count];
-    const recipe = try @import("lake_row_input_recipes.zig").valuesRecipe(a, table.schema_json, columns);
+    // Membership is independent of index projections. Each input cohort owns
+    // exact typed value evidence under its schema/configuration binding.
+    const recipe = namespace.digest();
     const inventory = provider.source.inventory;
     const files = try a.alloc([]const u8, inventory.files.len);
     defer a.free(files);
@@ -121,13 +123,12 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     const prior: ?identity.Root = compatible: {
         const old = previous orelse break :compatible null;
         const delta = provider.native_delta orelse break :compatible null;
-        if (old.definition == null or old.current.file_slots == null or old.values_format != fingerprints.format or delta.prior_snapshot == null or delta.count() != inventory.files.len or delta.prior_count != old.current.liveFiles() or
+        if (old.definition == null or old.current.file_slots == null or old.values_format != identity.cohort_values_format or !old.current.compact or delta.prior_snapshot == null or delta.count() != inventory.files.len or delta.prior_count != old.current.liveFiles() or
             !std.mem.eql(u8, &old.domain, &scope.domain) or !std.mem.eql(u8, &old.namespace, &namespace.digest()) or
             !std.mem.eql(u8, &old.values_recipe, &recipe) or !std.mem.eql(u8, old.current.source, inventory.source_id) or !std.mem.eql(u8, delta.prior_snapshot.?, old.current.snapshot)) break :compatible null;
-        if (!try @import("lake_row_input_recipes.zig").sameCohorts(a, old.current.input_recipes, input_recipes)) break :compatible null;
         break :compatible old;
     };
-    const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, files, prior, if (prior != null) provider.native_delta else null, input_recipes, inventory.source_id, inventory.snapshot_id);
+    const builder = try @import("lake_row_identity_delta.zig").Builder.createWithOptions(a, &manager, &pages, files, prior, if (prior != null) provider.native_delta else null, input_recipes, inventory.source_id, inventory.snapshot_id, true);
     defer builder.deinit();
     var by_file: std.StringHashMapUnmanaged(u32) = .empty;
     defer by_file.deinit(a);
@@ -188,15 +189,13 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
             manager.max_bytes = provider.identity_spill_bytes;
         };
 
-        const input_plans = try a.alloc(fingerprints.Plan, builder.cohorts.len + 1);
+        const input_plans = try a.alloc(fingerprints.Plan, builder.cohorts.len);
         var bound_inputs: usize = 0;
         defer {
             for (input_plans[0..bound_inputs]) |*plan| plan.deinit();
             a.free(input_plans);
         }
-        input_plans[0] = try fingerprints.Plan.bind(a, recipe, batch, columns);
-        bound_inputs += 1;
-        for (builder.cohorts, input_plans[1..]) |recipe_, *plan| {
+        for (builder.cohorts, input_plans) |recipe_, *plan| {
             plan.* = try fingerprints.Plan.bind(a, recipe_.digest, batch, recipe_.columns);
             bound_inputs += 1;
         }
@@ -212,18 +211,18 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
                 const count = @min(tile_rows, batch.rowCount() - row);
                 try kernels.fill(a, row, count, input_tiles);
             }
-            for (row_inputs, input_tiles[1..]) |*value, tile| value.* = tile[row % tile_rows];
+            for (row_inputs, input_tiles) |*value, tile| value.* = tile[row % tile_rows];
             try token.check();
             try provider.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
             const ref = batch.rowRef(row);
             if (ref != .external) return error.InvalidLogicalRowIdentity;
             const slot = by_file.get(ref.external.file_id) orelse return error.InvalidLogicalRowIdentity;
-            try builder.addWithInputs(.{ .id = ids[row], .values = input_tiles[0][row % tile_rows] }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, row_inputs);
+            try builder.addWithInputs(.{ .id = ids[row], .values = ids[row] }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, row_inputs);
         }
     }
+    try extendInputs(a, builder, provider, store, &tuple, namespace, contract, by_file, token);
     var root = try builder.finish(namespace.digest(), recipe, cut);
-    root.values_format = fingerprints.format;
     root.definition = definition;
     root.current.navigation = navigation;
     const encoded = try std.json.Stringify.valueAlloc(a, root, .{});
@@ -238,7 +237,186 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     // file dictionaries and recipe planning cannot consume publication memory.
     return try identity.decode(out, encoded);
 }
+/// Only missing cohorts are read for retained immutable files. The ordered
+/// physical membership join rejects omissions, duplicates and mismatched keys.
+fn extendInputs(a: A, builder: *@import("lake_row_identity_delta.zig").Builder, provider: *@import("lake_index_row_source.zig").Provider, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, tuple: *tuples.TuplePlan, namespace: identity.logical.Namespace, contract: []const local.serverless_query_lake_schema.Column, slots: std.StringHashMapUnmanaged(u32), token: Token) !void {
+    if (builder.added_cohorts.len == 0) return;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var needed: std.StringHashMapUnmanaged(void) = .empty;
+    for (builder.added_cohorts) |cohort| for (cohort.columns) |column| try needed.put(ca, column, {});
+    for (try tuple.columnBindings(ca)) |column| try needed.put(ca, column, {});
+    var columns: std.ArrayList([]const u8) = .empty;
+    for (contract) |column| if (needed.contains(column.name)) try columns.append(ca, column.name);
+    const scan = try ca.alloc(bool, builder.scan.len);
+    for (scan, builder.scan) |*value, changed| value.* = !changed;
+    var input = provider.*;
+    input.only_file = null;
+    input.only_files = scan;
+    input.only_plan = null;
+    input.replay = null;
+    input.replay_consumer = null;
+    input.enrichment_columns = false;
+    input.schema_contract = contract;
+    input.statistics = null;
+    const inventory = provider.source.inventory;
+    var opening = try store.beginIo(1);
+    defer opening.abort();
+    const source = input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, .{ .sidecar_kind = .text, .source_kind = if (inventory.format == .iceberg) .external_iceberg else .external_parquet, .row_ref_kind = .external, .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .schema_fingerprint = inventory.schema_fingerprint, .index_config_hash = "native-logical-input-extension-v1", .column_bindings = columns.items }, token) catch |err| return opening.failed(err);
+    var source_open = true;
+    defer if (source_open) {
+        if (store.io_phase) |phase| if (phase.park) |park| park(phase.ptr);
+        source.deinit(a);
+    };
+    try opening.finish();
+    while (true) {
+        var phase = try store.beginIo(1);
+        defer phase.abort();
+        const next = source.next(a) catch |err| return phase.failed(err);
+        try phase.finish();
+        const batch = next orelse break;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var bound = try tuple.bindExternalBatch(sa, batch);
+        defer bound.deinit();
+        const plans = try sa.alloc(fingerprints.Plan, builder.added_cohorts.len);
+        for (plans, builder.added_cohorts) |*plan, cohort| plan.* = try fingerprints.Plan.bind(sa, cohort.digest, batch, cohort.columns);
+        var kernels = try fingerprints.Kernels.init(sa, plans);
+        defer kernels.deinit();
+        const tiles = try sa.alloc([64]identity.logical.Digest, plans.len);
+        const values = try sa.alloc(identity.logical.Digest, plans.len);
+        var key: std.ArrayList(u8) = .empty;
+        for (0..batch.rowCount()) |row| {
+            try token.check();
+            try provider.context.ensureActive();
+            if (row % 64 == 0) try kernels.fill(sa, row, @min(64, batch.rowCount() - row), tiles);
+            for (tiles, values) |tile, *value| value.* = tile[row % 64];
+            key.clearRetainingCapacity();
+            if (try bound.append(sa, &key, row)) return error.NullLogicalRowKey;
+            const id = try identity.logical.keyId(namespace, key.items);
+            const ref = batch.rowRef(row);
+            if (ref != .external) return error.InvalidLogicalRowIdentity;
+            const slot = slots.get(ref.external.file_id) orelse return error.InvalidLogicalRowIdentity;
+            try builder.addExtension(id, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, values);
+        }
+    }
+    if (store.io_phase) |phase| if (phase.park) |park| park(phase.ptr);
+    source.deinit(a);
+    source_open = false;
+    if (store.io_phase) |phase| if (phase.resume_cpu) |resume_| try resume_(phase.ptr);
+}
+
 fn checkpoint(raw: *anyopaque) !void {
     const provider: *@import("lake_index_row_source.zig").Provider = @ptrCast(@alignCast(raw));
     try provider.context.ensureActive();
+}
+
+test "external lake new input cohorts verify only new columns and retain compact membership" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-input-extension");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const wide = try a.alloc(u8, 192 * 1024);
+    defer a.free(wide);
+    @memset(wide, 'x');
+    const parquet = local.serverless_query_lake_parquet_rowgroup;
+    const data = try parquet.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{.{ .column_id = "id", .field_id = 1, .values = &.{ 1, 2, 3 } }}, &.{
+        .{ .column_id = "body", .field_id = 2, .converted_type = 0, .values = &.{ wide, wide, wide } },
+        .{ .column_id = "label", .field_id = 3, .converted_type = 0, .values = &.{ "red", "green", "blue" } },
+    });
+    defer a.free(data);
+    var uploaded = try client.putObject("antfly", "part.parquet", data, .{});
+    uploaded.deinit(a);
+    const schema = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"id":{{"type":"integer"}},"body":{{"type":"string"}},"label":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+    , .{directory.path()});
+    defer a.free(schema);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer binding.deinit(a);
+    var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer source.deinit();
+    const artifact_path = try std.fs.path.join(a, &.{ directory.path(), "indexes" });
+    defer a.free(artifact_path);
+    var artifacts_fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, artifact_path);
+    defer artifacts_fs.deinit();
+    var store = artifacts_fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
+    const nav = @import("lake_source_navigation.zig");
+    var roots = std.heap.ArenaAllocator.init(a);
+    defer roots.deinit();
+    var navigation = try nav.build(a, roots.allocator(), &store, &provider, null, .none);
+    defer navigation.deinit();
+    var table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = schema, .indexes_json = "{\"text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":false}}" };
+    const base = try binding.binding.toManifestBaseSource(source.inventory.snapshot_id, "inventory");
+    var captured: ?*@import("lake_row_payloads.zig").Capture = null;
+    defer if (captured) |capture| capture.deinit();
+    const first = (try build(a, roots.allocator(), table, &store, &provider, @splat(3), base, navigation.ref, null, .none, &captured)).?;
+    try std.testing.expect(first.current.compact);
+    try std.testing.expectEqual(first.current.by_file, first.current.by_location);
+    var footer = try local.serverless_query_lake_schema.readFooter(a, source.scanner.reader(), source.inventory.files[0]);
+    defer footer.deinit(a);
+    const body = for (footer.row_groups[0].column_chunks) |chunk| {
+        if (std.mem.eql(u8, chunk.column_id, "body")) break chunk;
+    } else return error.TestUnexpectedResult;
+    const Storage = local.storage_object_storage;
+    const Probe = struct {
+        var active: *@This() = undefined;
+        original: Storage.ObjectStorage,
+        start: u64,
+        end: u64,
+        tail: u64,
+        reads: std.atomic.Value(usize) = .init(0),
+        forbid_all: bool = false,
+        fn get(raw: *anyopaque, alloc: A, bucket: []const u8, key: []const u8, options: Storage.GetOptions) !Storage.GetResult {
+            const self = active;
+            if (self.forbid_all) return error.UnexpectedRetiredCohortRead;
+            const range = options.range orelse return error.UnexpectedWholeSourceRead;
+            // Footer discovery may overlap the last physical column. Ordinary
+            // projected reads must never fetch the retained body payload.
+            if (range.offset != self.tail and range.offset < self.end and range.offset + (range.length orelse return error.UnexpectedWholeSourceRead) > self.start) return error.UnexpectedRetainedColumnRead;
+            _ = self.reads.fetchAdd(1, .monotonic);
+            return self.original.vtable.get_object(raw, alloc, bucket, key, options);
+        }
+    };
+    var probe: Probe = .{ .original = source.scanner.object_reader.client, .start = body.file_offset, .end = body.file_offset + body.compressed_len, .tail = data.len - 64 * 1024 };
+    Probe.active = &probe;
+    var vtable = source.scanner.object_reader.client.vtable.*;
+    vtable.get_object = Probe.get;
+    source.scanner.object_reader.client.vtable = &vtable;
+    defer source.scanner.object_reader.client = probe.original;
+    var delta = try nav.build(a, roots.allocator(), &store, &provider, navigation.root, .none);
+    defer delta.deinit();
+    provider.native_delta = delta.delta;
+    table.indexes_json = "{\"text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":false},\"labels\":{\"type\":\"full_text\",\"field\":\"label\",\"store_source\":false}}";
+    const second = (try build(a, roots.allocator(), table, &store, &provider, @splat(4), base, delta.ref, first, .none, &captured)).?;
+    try std.testing.expect(probe.reads.load(.monotonic) > 0);
+    try std.testing.expectEqual(first.current.by_id, second.current.by_id);
+    try std.testing.expectEqual(first.current.by_file, second.current.by_file);
+    try std.testing.expectEqual(first.current.by_order, second.current.by_order);
+    try std.testing.expectEqual(@as(u64, 6), second.current.input_versions.?.records);
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = first.domain, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    var before = try tree.Cursor.init(a, pages.store(), first.current.input_versions, "", null);
+    defer before.deinit();
+    while (try before.next()) |row| {
+        var after = try tree.Cursor.init(a, pages.store(), second.current.input_versions, row.key, null);
+        defer after.deinit();
+        const retained = (try after.next()).?;
+        try std.testing.expectEqualSlices(u8, row.key, retained.key);
+        try std.testing.expectEqualSlices(u8, row.value, retained.value);
+    }
+    probe.forbid_all = true;
+    table.indexes_json = "{\"labels\":{\"type\":\"full_text\",\"field\":\"label\",\"store_source\":false}}";
+    const third = (try build(a, roots.allocator(), table, &store, &provider, @splat(5), base, delta.ref, second, .none, &captured)).?;
+    try std.testing.expectEqual(first.current.by_id, third.current.by_id);
+    try std.testing.expectEqual(@as(u64, 3), third.current.input_versions.?.records);
+    try std.testing.expect(captured == null);
 }

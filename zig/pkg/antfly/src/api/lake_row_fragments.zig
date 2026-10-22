@@ -150,10 +150,10 @@ fn planRange(self: *Build, a: A, pages: *Pages, prefix: [32]u8, bits: u16, fragm
     var count: u64 = 0;
     while (try cursor.next()) |record| {
         try Build.check(self);
-        if (record.key.len != 32 or record.value.len != 56) return error.InvalidLogicalRowIdentity;
+        const resolved = try identity.decodeState(self.root.current, record.key, record.value);
         self.census_rows_hashed += 1;
         hash.update(record.key);
-        hash.update(record.value[16..48]);
+        hash.update(&resolved.state.values);
         count += 1;
         if (count > max_rows) break;
     }
@@ -188,9 +188,9 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
             fragments: []Fragment,
             pub fn change(self_: *@This(), left: ?tree.Cursor.Record, right: ?tree.Cursor.Record) !void {
                 try Build.check(self_.owner);
-                if (left) |row| if (row.key.len != 32 or row.value.len != 56) return error.InvalidLogicalRowIdentity;
-                if (right) |row| if (row.key.len != 32 or row.value.len != 56) return error.InvalidLogicalRowIdentity;
-                if (left != null and right != null and std.mem.eql(u8, left.?.value[16..48], right.?.value[16..48])) return;
+                const before = if (left) |row| try identity.decodeState(self_.owner.root.current, row.key, row.value) else null;
+                const after = if (right) |row| try identity.decodeState(self_.owner.root.current, row.key, row.value) else null;
+                if (before != null and after != null and before.?.state.unchanged(after.?.state)) return;
                 const id = (right orelse left.?).key;
                 self_.fragments[try fragmentFor(self_.fragments, id)].dirty = true;
             }
@@ -251,7 +251,7 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     old_root.certificate = null;
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.context.io orelse return error.InvalidLogicalRowIdentity, .context = self, .checkpoint = Build.check, .max_bytes = provider.identity_spill_bytes };
     defer manager.deinit();
-    const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, names, if (prior != null) old_root else null, if (prior != null) nav.delta else null, &.{}, inventory.source_id, inventory.snapshot_id);
+    const builder = try @import("lake_row_identity_delta.zig").Builder.createWithOptions(a, &manager, &pages, names, if (prior != null) old_root else null, if (prior != null) nav.delta else null, &.{}, inventory.source_id, inventory.snapshot_id, self.root.current.compact);
     defer builder.deinit();
     for (self.fragments, builder.slots, builder.scan) |fragment, slot, changed| if (changed) {
         const upper = upperBound(fragment.prefix, fragment.bits);
@@ -260,8 +260,8 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
         var row: u64 = 0;
         while (try cursor.next()) |record| {
             try Build.check(self);
-            if (record.key.len != 32 or record.value.len != 56) return error.InvalidLogicalRowIdentity;
-            try builder.add(.{ .id = record.key[0..32].*, .values = record.value[16..48].* }, .{ .file = slot, .group = 0, .row = row });
+            const resolved = try identity.decodeState(self.root.current, record.key, record.value);
+            try builder.add(resolved.state, .{ .file = slot, .group = 0, .row = row });
             row += 1;
         }
         if (row != fragment.count) return error.InvalidLogicalRowIdentity;
@@ -378,7 +378,10 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root) !v
         var versions: std.StringHashMapUnmanaged(Fragment) = .empty;
         defer versions.deinit(a);
         if (previous) |prior| if (self.prior_navigation != null) {
-            const space = prior.spaceForIndex(recipe.name);
+            const prior_name = for (prior.current.input_recipes) |candidate| {
+                if (std.mem.eql(u8, &candidate.digest, &recipe.digest)) break candidate.name;
+            } else recipe.name;
+            const space = prior.spaceForIndex(prior_name);
             if (space.navigation) |ref| {
                 old = try navigation.load(out, self.store, ref, self.token, null);
                 // Legacy global versions lack the input-specific domain marker.
@@ -476,6 +479,7 @@ const Spool = struct {
     mutex: std.Io.Mutex = .init,
     initialized: bool = false,
     source_passes: u64 = 0,
+    adoption_rows: u64 = 0,
     captured: ?*@import("lake_row_payloads.zig").Capture = null,
     fn deinit(self: *Spool) void {
         if (self.initialized) {
@@ -632,23 +636,41 @@ const Spool = struct {
         pages.read_phase = store.io_phase;
         // Both streams are keyed by verified logical ID. No physical census,
         // physical-to-logical sort, or source payload reread is needed.
-        var logical = try tree.Cursor.init(a, pages.store(), self.owner.space.by_id, "", null);
-        defer logical.deinit();
-        var payload = try tree.Cursor.init(a, capture.route_store, capture.route_root, "", null);
-        defer payload.deinit();
         var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &self.manager, self.route_store);
         defer edits.deinit();
         edits.private_pages.phase = store.io_phase;
-        var count: u64 = 0;
-        while (try logical.next()) |row| {
-            const captured = (try payload.next()) orelse return error.InvalidLogicalRowIdentity;
-            if (row.key.len != 32 or row.value.len != 56 or captured.value.len != 24 or !std.mem.eql(u8, row.key, captured.key)) return error.InvalidLogicalRowIdentity;
-            const coordinate = try identity.logical.Coordinate.decode(row.value[0..16]);
-            const file = self.positions.get(coordinate.file) orelse return error.InvalidLogicalRowIdentity;
-            if (self.needed[file]) try edits.addRecord(row.value[0..16], captured.value);
-            count += 1;
+        // Verification already certified the complete capture ID census. Join
+        // only selected radix ranges, coalescing adjacent dirty leaves.
+        var first: usize = 0;
+        while (first < self.needed.len) {
+            if (!self.needed[first]) {
+                first += 1;
+                continue;
+            }
+            var end = first;
+            var expected: u64 = 0;
+            while (end < self.needed.len and self.needed[end]) : (end += 1) expected += self.owner.fragments[end].count;
+            const upper = upperBound(self.owner.fragments[end - 1].prefix, self.owner.fragments[end - 1].bits);
+            const lower = &self.owner.fragments[first].prefix;
+            var logical = try tree.Cursor.init(a, pages.store(), self.owner.space.by_id, lower, if (upper) |*value| value else null);
+            defer logical.deinit();
+            var payload = try tree.Cursor.init(a, capture.route_store, capture.route_root, lower, if (upper) |*value| value else null);
+            defer payload.deinit();
+            var count: u64 = 0;
+            while (try logical.next()) |row| {
+                try Build.check(self.owner);
+                const captured = (try payload.next()) orelse return error.InvalidLogicalRowIdentity;
+                const resolved = try identity.decodeState(self.owner.space, row.key, row.value);
+                if (captured.value.len != 24 or !std.mem.eql(u8, row.key, captured.key)) return error.InvalidLogicalRowIdentity;
+                const file = self.positions.get(resolved.coordinate.file) orelse return error.InvalidLogicalRowIdentity;
+                if (file < first or file >= end) return error.InvalidLogicalRowIdentity;
+                try edits.addRecord(row.value[0..16], captured.value);
+                count += 1;
+            }
+            if (count != expected or (try payload.next()) != null) return error.InvalidLogicalRowIdentity;
+            self.adoption_rows += count;
+            first = end;
         }
-        if (count != capture.rows or (try payload.next()) != null) return error.InvalidLogicalRowIdentity;
         self.route_root = try edits.finish(null);
         self.routes.phase = null;
     }
@@ -1366,6 +1388,7 @@ fn broadSpoolScenario(fused: bool, selective: bool) !void {
     }
     try prepareCapturedSpool(native, &provider, &store, captured);
     try std.testing.expect(native.spool != null);
+    if (fused) try std.testing.expectEqual(@as(u64, if (selective) 17 else 257), native.spool.?.adoption_rows);
     try std.testing.expectEqual(@as(u64, if (fused) 0 else 1), native.spool.?.source_passes);
     for (0..2) |_| {
         const input = try Build.open(native, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .column_bindings = &.{ "id", "body", "price" }, .index_config_hash = "test" }, 0, .none, null);

@@ -29,6 +29,7 @@ pub const ReadCache = struct {
 
 pub const PageStore = struct {
     domain: [32]u8 = @splat(0),
+    prefix_keys: bool = false,
     attempt: [16]u8 = @splat(0),
     artifacts: *artifacts.ArtifactStore,
     cancellation: CancellationToken = .none,
@@ -51,7 +52,7 @@ pub const PageStore = struct {
     }
 
     pub fn store(self: *PageStore) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .ptr = self, .get = get, .read_many = if (self.io != null and self.read_phase == null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null) putMany else null, .check = check };
+        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .ptr = self, .get = get, .read_many = if (self.io != null and self.read_phase == null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null) putMany else null, .check = check };
     }
 
     pub fn namespaceDomain(namespace: []const u8) [32]u8 {
@@ -249,7 +250,7 @@ pub fn readBatch(io: std.Io, a: std.mem.Allocator, sources: []const tree.Store, 
     for (jobs[0..refs_.len], 0..) |*job, i| {
         if (failure != null) break;
         try job.ref.validate();
-        if (refs_.len > 1) tasks[i] = scheduler.global().submitIo(io, @as(usize, job.ref.bytes) * 2 + 32 * 1024, Job.run, .{job});
+        if (refs_.len > 1) tasks[i] = scheduler.global().submitIo(io, tree.readWorkspace(job.ref), Job.run, .{job});
         if (tasks[i] == null) job.run() catch |err| {
             failure = err;
         };
@@ -287,6 +288,7 @@ pub const PrivatePages = struct {
     };
     manager: *spill.Manager,
     domain: [32]u8,
+    prefix_keys: bool = false,
     attempt: [16]u8,
     phase: ?*const artifacts.IoPhase = null,
     pool: ?spill.RunFiles = null,
@@ -342,7 +344,7 @@ pub const PrivatePages = struct {
         try guard.finish();
     }
     pub fn store(self: *PrivatePages) tree.Store {
-        return .{ .domain = self.domain, .attempt = if (self.current) |i| self.runs[i].?.token else self.attempt, .ptr = self, .get = get, .put = put, .check = check };
+        return .{ .domain = self.domain, .prefix_keys = self.prefix_keys, .attempt = if (self.current) |i| self.runs[i].?.token else self.attempt, .ptr = self, .get = get, .put = put, .check = check };
     }
     fn owner(raw: *anyopaque) *PrivatePages {
         return @ptrCast(@alignCast(raw));

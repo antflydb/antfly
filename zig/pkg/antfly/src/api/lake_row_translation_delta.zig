@@ -88,12 +88,12 @@ fn buildInnerExtended(a: A, pages: *Pages, manager: *local.sql_spill.Manager, or
                 try self.context.ensureActive();
                 const old = left orelse return error.InvalidLogicalRowIdentity;
                 const next = right orelse return error.InvalidLogicalRowIdentity;
-                if (old.key.len != 32 or old.value.len != 56 or next.value.len != 56 or !std.mem.eql(u8, old.key, next.key)) return error.InvalidLogicalRowIdentity;
+                if (old.key.len != 32 or old.value.len != self.original.idWidth() or next.value.len != self.original.idWidth() or !std.mem.eql(u8, old.key, next.key)) return error.InvalidLogicalRowIdentity;
                 if (std.mem.eql(u8, old.value[0..16], next.value[0..16])) return;
                 if (self.cursor == null) self.cursor = try tree.Cursor.init(self.a, self.pages.store(), self.original.by_id, old.key, null);
                 try self.cursor.?.seekForward(old.key);
                 const address = (try self.cursor.?.next()) orelse return error.InvalidLogicalRowIdentity;
-                if (!std.mem.eql(u8, address.key, old.key) or address.value.len != 56) return error.InvalidLogicalRowIdentity;
+                if (!std.mem.eql(u8, address.key, old.key) or address.value.len != self.original.idWidth()) return error.InvalidLogicalRowIdentity;
                 try self.forward.addRecord(address.value[0..16], next.value[0..16]);
                 try self.reverse.addRecord(old.value[0..16], null);
                 try self.reverse.addRecord(next.value[0..16], address.value[0..16]);
@@ -122,7 +122,7 @@ fn buildInnerExtended(a: A, pages: *Pages, manager: *local.sql_spill.Manager, or
     while (try old.next()) |record| {
         try context.ensureActive();
         const mapped = (try next.next()) orelse return error.InvalidLogicalRowIdentity;
-        if (record.key.len != 32 or record.value.len != 56 or mapped.value.len != 56 or !std.mem.eql(u8, record.key, mapped.key)) return error.InvalidLogicalRowIdentity;
+        if (record.key.len != 32 or record.value.len != original.idWidth() or mapped.value.len != current.idWidth() or !std.mem.eql(u8, record.key, mapped.key)) return error.InvalidLogicalRowIdentity;
         try forward.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = record.value[0..16] })}, .values = &.{local.sql_scalar.Datum.json(.{ .string = mapped.value[0..16] })}, .ordinal = count });
         try reverse.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = mapped.value[0..16] })}, .values = &.{local.sql_scalar.Datum.json(.{ .string = record.value[0..16] })}, .ordinal = count });
         count += 1;
@@ -147,8 +147,8 @@ fn changedOriginal(a: A, pages: *Pages, manager: *local.sql_spill.Manager, origi
         context: Context,
         pub fn change(self: *@This(), left: ?tree.Cursor.Record, right: ?tree.Cursor.Record) !void {
             try self.context.ensureActive();
-            if (left) |row| if (row.key.len != 32 or row.value.len != 56) return error.InvalidLogicalRowIdentity;
-            if (right) |row| if (row.key.len != 32 or row.value.len != 56) return error.InvalidLogicalRowIdentity;
+            if (left) |row| if (row.key.len != 32 or (row.value.len != 16 and row.value.len != 56)) return error.InvalidLogicalRowIdentity;
+            if (right) |row| if (row.key.len != 32 or (row.value.len != 16 and row.value.len != 56)) return error.InvalidLogicalRowIdentity;
             if (left != null and right != null and std.mem.eql(u8, left.?.value[0..16], right.?.value[0..16])) return;
             const row = right orelse left.?;
             try self.sort.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = row.key })}, .values = &.{}, .ordinal = self.sort.total });

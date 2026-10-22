@@ -224,6 +224,7 @@ pub const Capture = struct {
     pub fn finish(self: *Capture, expected_rows: u64) !void {
         if (self.rows != expected_rows) return error.InvalidLogicalRowIdentity;
         self.route_root = try self.edits.?.finish(null);
+        if ((if (self.route_root) |root| root.records else 0) != expected_rows) return error.InvalidLogicalRowIdentity;
         self.edits.?.deinit();
         self.edits = null;
         self.routes.phase = null;

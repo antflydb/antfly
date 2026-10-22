@@ -121,22 +121,43 @@ Per-row evidence is keyed by a semantic input cohort (schema and the sorted,
 deduplicated input column set), rather than by declaration name or the table's
 whole index configuration. Declaration names and configuration semantics have
 separate authenticated bindings. Equal input cohorts share one evidence tree
-range; overlapping cohorts and the global row proof hash each typed column value
-once per 64-row tile. Changing one declaration still requires its own matching
+range; overlapping cohorts hash each typed column value once per 64-row tile. Changing one declaration still requires its own matching
 configuration proof, without invalidating unrelated declaration evidence.
 Legacy per-declaration evidence remains readable and is rebuilt on migration.
 
 The authenticated root separately binds the publication's `definition` signature
-and its `values_recipe` (schema plus projected input paths). Reader protocol 72
-fences this contract; older roots retain their historical definition binding.
-Changing declaration names, adding another index on an existing cohort, or
-changing a configuration without changing inputs retains the existing row maps
-and cohort evidence. A new input projection still needs source verification.
-Complete directory reuse requires the current desired declaration set, including
-new names; retaining every predecessor declaration alone is insufficient.
+and its membership recipe. Reader protocol 73 introduces evidence format 3:
+identity is independent of projected values, and each cohort separately certifies
+its exact typed inputs. Older roots retain their historical recipe and hash
+semantics and rebuild before entering this compact format. Changing declaration
+names, adding an index on an existing cohort, or changing configuration without
+changing inputs retains existing membership and cohort evidence.
+
+A new cohort over retained, provider-qualified files reads only its input columns
+and stable keys. An ordered join against authenticated physical membership rejects
+changed IDs, coordinate mismatches, duplicate lanes and omitted rows. Changed
+physical files still verify every current cohort. Retired cohort ranges are
+removed without rereading source payloads. Adding or removing projections therefore
+does not invalidate membership or unrelated evidence. Whole-directory reuse still
+requires the current desired declaration set, matching definitions and complete
+value evidence; key equality alone never certifies index reuse.
 
 Identity state uses bounded native spill sorts and immutable copy-on-write trees.
-Stable file slots and per-file membership let an authenticated file delta retain
+Compact ID records store only their 16-byte physical coordinate. A single reverse
+membership map stores coordinate-to-ID and also supplies per-file membership;
+value fingerprints live only in the cohort evidence tree. Ordered membership
+remains separate to support exact canonical ranks. File dictionaries participate
+in coordinate-space identity, so a slot-preserving rename cannot accidentally
+make two physical spaces interchangeable. Legacy record widths remain readable.
+
+Compact maps opt into authenticated page-local key prefixes, reducing repeated
+file/cohort bytes without changing logical keys, cursors or subtree counts. The
+same codec applies to private spill forests and durable pages. Decoding bounds
+the expanded key buffer independently of encoded size, and query scheduling
+accounts for expanded keys and entry descriptors. A 256-row, one-cohort regression
+measures 125,380 bytes across legacy navigation versus 54,270 compact bytes (57%
+less), including distinct reachable page roots. This is a fixture measurement,
+not an archive throughput claim. Stable file slots and per-file membership let an authenticated file delta retain
 unchanged rows without sorting or rebuilding the entire identity map. A separate
 ordered membership tree supplies canonical ranks without rewriting every retained
 row on append. Identity construction and compact translation construction share
@@ -154,8 +175,12 @@ Full verification of at least 128 rows can also capture the projected typed
 payloads in private compressed spill pages during that same source pass. Once
 keys, duplicates and root admission are verified, construction merges the captured
 logical-ID/offset stream directly with the native ID census and sorts only final
-fragment coordinate/offset routes. It does not build a physical-to-logical
-intermediate tree or reread the physical ID census. Broad native rebuilds
+fragment coordinate/offset routes. Adjacent selected radix leaves coalesce into
+half-open joins; untouched ranges are never scanned again during adoption. The
+capture first certifies its complete route count, and every selected range checks
+matching IDs, exact native coordinates and expected row counts. The selective
+regression visits 17 of 257 rows instead of all 257. No physical-to-logical
+intermediate tree or physical census reread is needed. Broad native rebuilds
 reuse those pages instead of reading and decoding Parquet again. Decimal payloads
 keep exact 128-bit coefficients and scale; compatible precisions widen to their
 maximum. Mixed types/scales decline the optional spool. Each producer batch is
@@ -350,9 +375,15 @@ query I/O admission. Each wave joins on success, failure, or cancellation; budge
 owners synchronize shared charges or reserve the whole wave before spawning.
 Decoded row-map leases remain shareable across concurrent readers. Covering
 hydration also batches reverse/forward lookups and reads up to four distinct
-payload blocks concurrently, while preserving ranked result order and performing
-all block/key checks before exposing a row. Required inline fallbacks remain
-available when scheduling admission is full. No publication CPU/I/O capability
+payload blocks in a wave, while preserving ranked result order and performing
+all block/key checks before exposing a row. Each bounded decode lane requests
+16 MiB, so concurrent reads fit the scheduler's default 32 MiB I/O allowance.
+The wave retains its aggregate pull reservation until its decoded leases have
+been consumed and released. Narrow decode flights have distinct cache identities;
+a local size decline selects ordinary source hydration, while genuine backing
+allocation failures propagate. Cold-block regressions assert actual overlap,
+joined read failures/cancellation and complete admission release. Required inline
+fallbacks remain available when scheduling admission is full. No publication CPU/I/O capability
 is inherited by these independent query workers.
 
 Selective dense constraints also cross the native owner boundary as complete
@@ -417,6 +448,22 @@ page waves, duplicate/missing candidates, lower-bound gaps, ranks, cancellation,
 joined read failures and exhaustive allocation-failure cleanup. Catalog,
 error/source-catalog, Apache boundary, license and formatting checks passed.
 Archive-scale throughput and live-cloud retention remain unmeasured.
+
+Protocol 73 qualification: all three real-file Parquet,
+PyIceberg and mixed-precision decimal E2Es passed in 413.57 seconds, including
+new-cohort index publication after external rewrites and restart. The tests assert
+compact membership remains stable across value-only updates while input-specific
+navigation changes. All 85 graph/page tests passed, including prefixed/legacy
+interoperability, malformed prefix framing and exhaustive allocation failures.
+Twenty-one focused lake tests plus three supplemental membership/identity checks
+passed without leaks. Cold covering waves also verify joined failures,
+cancellation, retained admission and decoder size declines without poisoning
+ordinary reads or classifying genuine allocator failures as optional limits.
+Latest main `864910137a` was then merged. The CLI rebuild, regenerated Go SDK
+tests, joined OpenAPI, Rust SDK spec, catalog and error checks passed on the merged
+result. Archive-scale throughput and real-provider retention qualification remain unmeasured. The
+1 GiB default remains an explicit scratch quota; larger archives may require
+more configured scratch capacity even with compact navigation.
 
 ## Prior art
 

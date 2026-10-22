@@ -65,6 +65,8 @@ pub const Store = struct {
     /// content deduplication from coupling independent namespace collectors.
     domain: [32]u8 = @splat(0),
     attempt: [16]u8 = @splat(0),
+    /// Opt-in page-local key prefixes. Legacy pages remain readable verbatim.
+    prefix_keys: bool = false,
     ptr: *anyopaque,
     get: *const fn (*anyopaque, Allocator, Ref) anyerror![]u8,
     /// Optional immutable decoded-page lease. The provider must authenticate
@@ -114,7 +116,7 @@ pub const Cache = struct {
     }
 
     pub fn store(self: *Cache) Store {
-        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .decoded_page = self.underlying.decoded_page, .read_many = self.underlying.read_many, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .check = check, .reduce = self.underlying.reduce };
+        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .prefix_keys = self.underlying.prefix_keys, .decoded_page = self.underlying.decoded_page, .read_many = self.underlying.read_many, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .check = check, .reduce = self.underlying.reduce };
     }
 
     fn check(ptr: *anyopaque) !void {
@@ -193,6 +195,7 @@ pub const Page = struct {
     entries: []const Entry,
     ref: Ref,
     aggregate: []const u8 = "",
+    expanded_keys: []const u8 = &.{},
     lease: ?struct {
         owner: *anyopaque,
         item: *anyopaque,
@@ -205,6 +208,7 @@ pub const Page = struct {
         } else {
             alloc.free(self.entries);
             alloc.free(self.bytes);
+            alloc.free(self.expanded_keys);
         }
         self.* = undefined;
     }
@@ -288,6 +292,12 @@ pub const BatchEntry = struct {
         a.free(self.value);
     }
 };
+/// Encoded prefixes can expand while decoding. Admission includes the bounded
+/// full-key buffer and entry descriptors rather than assuming a 2x wire ratio.
+pub fn readWorkspace(ref: Ref) usize {
+    const entries: usize = @intCast(@min(ref.records, ref.bytes / @as(u32, if (ref.height == 0) 8 else 69)));
+    return @as(usize, ref.bytes) + max_page_bytes + entries * @sizeOf(Entry) + 64 * 1024;
+}
 /// Exact point reads share each routing page and fetch independent children in
 /// bounded waves. Results own their bytes and preserve duplicate/input order.
 pub fn lookupMany(a: Allocator, store: Store, root: ?Ref, keys: []const []const u8) ![]?BatchEntry {
@@ -416,26 +426,48 @@ fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
     if (!std.mem.eql(u8, &digest, &ref.digest)) return error.ArtifactIntegrityMismatch;
     if (!std.mem.eql(u8, bytes[24..56], &store.domain)) return error.GraphPageDomainMismatch;
     if (!std.mem.eql(u8, bytes[0..8], magic) or bytes[8] != ref.height or
-        bytes[9] > 1 or readU64(bytes, 16) != ref.records)
+        bytes[9] & ~@as(u8, 3) != 0 or readU64(bytes, 16) != ref.records)
         return error.InvalidGraphPage;
     const aggregate_len = std.mem.readInt(u16, bytes[10..12], .little);
     if (aggregate_len > max_aggregate_bytes or aggregate_len > bytes.len - header_bytes or
-        (bytes[9] == 0 and aggregate_len != 0) or (bytes[9] == 1 and aggregate_len == 0)) return error.InvalidGraphPage;
+        (bytes[9] & 1 == 0 and aggregate_len != 0) or (bytes[9] & 1 == 1 and aggregate_len == 0)) return error.InvalidGraphPage;
     const aggregate = bytes[header_bytes..][0..aggregate_len];
     const count = readU32(bytes, 12);
     if (count == 0 or count > (bytes.len - header_bytes) / 9) return error.InvalidGraphPage;
     const entries = try alloc.alloc(Entry, count);
     errdefer alloc.free(entries);
     var offset: usize = header_bytes + aggregate_len;
+    var prefix: []const u8 = "";
+    var expanded: []u8 = &.{};
+    errdefer alloc.free(expanded);
+    if (bytes[9] & 2 != 0) {
+        if (bytes.len - offset < 8) return error.InvalidGraphPage;
+        const prefix_len = readU32(bytes, offset);
+        const key_bytes = readU32(bytes, offset + 4);
+        offset += 8;
+        if (prefix_len == 0 or prefix_len > max_key_bytes or prefix_len > bytes.len - offset or
+            key_bytes > max_page_bytes or key_bytes < @as(u64, prefix_len) * count) return error.InvalidGraphPage;
+        prefix = bytes[offset..][0..prefix_len];
+        offset += prefix_len;
+        expanded = try alloc.alloc(u8, key_bytes);
+    }
+    var key_offset: usize = 0;
     var records: u64 = 0;
     for (entries, 0..) |*entry, i| {
         if (offset > bytes.len or bytes.len - offset < 8) return error.InvalidGraphPage;
         const key_len = readU32(bytes, offset);
         const value_len = readU32(bytes, offset + 4);
         offset += 8;
-        if (key_len == 0 or key_len > max_key_bytes or key_len > bytes.len - offset)
-            return error.InvalidGraphPage;
-        const key = bytes[offset..][0..key_len];
+        if (key_len > bytes.len - offset or prefix.len + @as(u64, key_len) > max_key_bytes or (prefix.len == 0 and key_len == 0)) return error.InvalidGraphPage;
+        const key: []const u8 = if (prefix.len != 0) reconstructed: {
+            const length = prefix.len + key_len;
+            if (length > expanded.len - key_offset) return error.InvalidGraphPage;
+            const target = expanded[key_offset..][0..length];
+            @memcpy(target[0..prefix.len], prefix);
+            @memcpy(target[prefix.len..], bytes[offset..][0..key_len]);
+            key_offset += length;
+            break :reconstructed target;
+        } else bytes[offset..][0..key_len];
         offset += key_len;
         if (i != 0 and !less(entries[i - 1].key, key)) return error.InvalidGraphPage;
         if (value_len > bytes.len - offset) return error.InvalidGraphPage;
@@ -446,7 +478,7 @@ fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
             entry.value = value;
             records += 1;
         } else {
-            if (value_len < ref_bytes or value_len > ref_bytes + max_aggregate_bytes or (bytes[9] == 0 and value_len != ref_bytes)) return error.InvalidGraphPage;
+            if (value_len < ref_bytes or value_len > ref_bytes + max_aggregate_bytes or (bytes[9] & 1 == 0 and value_len != ref_bytes)) return error.InvalidGraphPage;
             const child: Ref = .{
                 .digest = value[0..32].*,
                 .bytes = readU32(value, 32),
@@ -462,8 +494,8 @@ fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
         }
         if (entry.size() > max_record_bytes) return error.InvalidGraphPage;
     }
-    if (offset != bytes.len or records != ref.records) return error.InvalidGraphPage;
-    return .{ .bytes = bytes, .entries = entries, .ref = ref, .aggregate = aggregate };
+    if (offset != bytes.len or records != ref.records or key_offset != expanded.len) return error.InvalidGraphPage;
+    return .{ .bytes = bytes, .entries = entries, .ref = ref, .aggregate = aggregate, .expanded_keys = expanded };
 }
 
 fn save(alloc: Allocator, store: Store, entries: []const Entry, height: u8, aggregate_out: *[]u8) !Ref {
@@ -490,24 +522,43 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
         records = try std.math.add(u64, records, if (entry.child) |child| child.records else 1);
     }
     if (size > max_page_bytes) return error.GraphPageTooLarge;
+    var prefix: usize = 0;
+    var key_bytes: usize = 0;
+    if (store.prefix_keys and entries.len > 1) {
+        const first = entries[0].key;
+        const last = entries[entries.len - 1].key;
+        while (prefix < @min(first.len, last.len) and first[prefix] == last[prefix]) prefix += 1;
+        if (prefix * (entries.len - 1) <= 8) prefix = 0;
+        if (prefix != 0) {
+            for (entries) |entry| key_bytes += entry.key.len;
+            size -= prefix * (entries.len - 1) - 8;
+        }
+    }
     const bytes = try alloc.alloc(u8, size);
     errdefer alloc.free(bytes);
     @memcpy(bytes[0..8], magic);
     @memcpy(bytes[24..56], &store.domain);
     bytes[8] = height;
-    bytes[9] = if (aggregate.len == 0) 0 else 1;
+    bytes[9] = @as(u8, if (aggregate.len == 0) 0 else 1) | @as(u8, if (prefix == 0) 0 else 2);
     std.mem.writeInt(u16, bytes[10..12], @intCast(aggregate.len), .little);
     writeU32(bytes, 12, entries.len);
     writeU64(bytes, 16, records);
     @memcpy(bytes[header_bytes..][0..aggregate.len], aggregate);
     var offset: usize = header_bytes + aggregate.len;
+    if (prefix != 0) {
+        writeU32(bytes, offset, prefix);
+        writeU32(bytes, offset + 4, key_bytes);
+        offset += 8;
+        @memcpy(bytes[offset..][0..prefix], entries[0].key[0..prefix]);
+        offset += prefix;
+    }
     for (entries) |entry| {
-        writeU32(bytes, offset, entry.key.len);
+        writeU32(bytes, offset, entry.key.len - prefix);
         const child_aggregate = if (store.reduce != null) entry.aggregate else "";
         writeU32(bytes, offset + 4, if (entry.child != null) ref_bytes + child_aggregate.len else entry.value.len);
         offset += 8;
-        @memcpy(bytes[offset..][0..entry.key.len], entry.key);
-        offset += entry.key.len;
+        @memcpy(bytes[offset..][0 .. entry.key.len - prefix], entry.key[prefix..]);
+        offset += entry.key.len - prefix;
         if (entry.child) |child| {
             @memcpy(bytes[offset..][0..32], &child.digest);
             writeU32(bytes, offset + 32, child.bytes);
@@ -3234,4 +3285,61 @@ test "serverless graph batched seeks preserve duplicates gaps boundaries ranks a
     try std.testing.checkAllAllocationFailures(a, Case.run, .{ backing.store(), root, &pointers });
     backing.canceled = true;
     try std.testing.expectError(error.Canceled, lookupMany(a, backing.store(), root, &pointers));
+}
+
+test "serverless graph prefixed pages preserve legacy cursors updates and allocation ownership" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var backing: TestStore = .{ .alloc = a };
+            defer backing.deinit();
+            var prefixed = backing.store();
+            prefixed.prefix_keys = true;
+            const Source = struct {
+                position: u64 = 0,
+                key: [64]u8 = @splat(7),
+                pub fn next(self: *@This()) !?Cursor.Record {
+                    if (self.position == 64) return null;
+                    std.mem.writeInt(u64, self.key[56..64], self.position, .big);
+                    self.position += 1;
+                    return .{ .key = &self.key, .value = "same" };
+                }
+            };
+            var original: Source = .{};
+            const legacy = (try buildSorted(a, backing.store(), &original)).?;
+            var compressed: Source = .{};
+            const compact = (try buildSorted(a, prefixed, &compressed)).?;
+            try std.testing.expect(compact.bytes * 2 < legacy.bytes);
+            for ([_]u32{ 0, max_key_bytes + 1 }) |prefix_len| {
+                const bad = try a.dupe(u8, backing.pages.get(compact.digest).?);
+                defer a.free(bad);
+                writeU32(bad, header_bytes, prefix_len);
+                var invalid = compact;
+                Sha256.hash(bad, &invalid.digest, .{});
+                try TestStore.put(&backing, invalid, bad);
+                if (readPage(a, backing.store(), invalid)) |decoded| {
+                    var unexpected = decoded;
+                    unexpected.deinit(a);
+                    return error.TestUnexpectedResult;
+                } else |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try std.testing.expectEqual(error.InvalidGraphPage, err);
+                }
+            }
+            try std.testing.expect(try equivalent(a, backing.store(), legacy, compact, .{}));
+            var key: [64]u8 = @splat(7);
+            std.mem.writeInt(u64, key[56..64], 17, .big);
+            const next = (try apply(a, prefixed, compact, &.{.{ .key = &key, .value = "changed" }})).?;
+            var cursor = try Cursor.init(a, backing.store(), next, &key, null);
+            defer cursor.deinit();
+            const row = (try cursor.next()).?;
+            try std.testing.expectEqualSlices(u8, &key, row.key);
+            try std.testing.expectEqualStrings("changed", row.value);
+            var reverse = try Cursor.initReverse(a, backing.store(), next, "", null);
+            defer reverse.deinit();
+            var count: usize = 0;
+            while (try reverse.next()) |_| count += 1;
+            try std.testing.expectEqual(@as(usize, 64), count);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
