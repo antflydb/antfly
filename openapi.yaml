@@ -14452,9 +14452,10 @@ paths:
     post:
       operationId: decide
       summary: Answer named decision questions
-      description: Execute one text input or an Antfly batch. Embedding similarity supports choice and
-        multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish
-        trained probabilities from raw cosine similarities.
+      description: Execute text or multimodal evidence through named deciders, or an Antfly text batch.
+        OpenAI and Jev adapters support images; native deciders require text. Embedding similarity supports
+        choice and multi_choice; trained decision models support choice, score and predicate. Answer variants
+        distinguish trained probabilities from raw cosine similarities.
       tags:
         - Inference
       requestBody:
@@ -32477,6 +32478,14 @@ components:
           type: integer
           minimum: 1
           default: 1000000
+        max_image_input_tokens:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Provider/model upper bound on the input-token contribution of one image. Required
+            when sending images through hosted typed deciders, including image URLs. The runtime reserves
+            this allowance per image in addition to serialized non-image request bytes; actual usage can
+            add shared quota debt. Omit for text-only, native, or generated deciders.
         rate_limit:
           $ref: '#/components/schemas/RateLimitConfig'
         batch_size:
@@ -46366,6 +46375,84 @@ components:
             - chunk.embedding.error
         code:
           type: string
+    DecisionEvidenceText:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - text
+      properties:
+        type:
+          type: string
+          enum:
+            - input_text
+        text:
+          type: string
+          minLength: 1
+    DecisionEvidenceImage:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - image_url
+      properties:
+        type:
+          type: string
+          enum:
+            - input_image
+        image_url:
+          type: string
+          minLength: 1
+          description: Base64 data URL (image/png, image/jpeg, image/webp, image/gif), or a public HTTP(S)
+            URL for OpenAI. Antfly never fetches image URLs for decision adapters.
+        detail:
+          type: string
+          enum:
+            - auto
+            - low
+            - high
+          default: auto
+    DecisionEvidenceMessage:
+      type: object
+      additionalProperties: false
+      required:
+        - role
+        - content
+      properties:
+        type:
+          type: string
+          enum:
+            - message
+        role:
+          type: string
+          enum:
+            - user
+        content:
+          oneOf:
+            - type: string
+              minLength: 1
+            - type: array
+              minItems: 1
+              maxItems: 256
+              items:
+                oneOf:
+                  - $ref: '#/components/schemas/DecisionEvidenceText'
+                  - $ref: '#/components/schemas/DecisionEvidenceImage'
+    DecisionEvidence:
+      description: Text or ordered user messages containing text and images. Named OpenAI and Jev deciders
+        accept messages. Native trained, embedding, and generated deciders require text. At most 128 images
+        and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto;
+        OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user
+        roles are unsupported.
+      oneOf:
+        - type: string
+          minLength: 1
+          maxLength: 1048576
+        - type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/DecisionEvidenceMessage'
     DecisionInput:
       type: object
       additionalProperties: false
@@ -46577,9 +46664,7 @@ components:
           pattern: ^[0-9a-f]{64}$
           description: Pin the exact EmbeddingGemma 2 assets and embedding recipe.
         input:
-          type: string
-          minLength: 1
-          maxLength: 1048576
+          $ref: '#/components/schemas/DecisionEvidence'
         inputs:
           type: array
           items:
@@ -46596,9 +46681,10 @@ components:
           maxItems: 64
         embedding_options:
           $ref: '#/components/schemas/EmbeddingDecisionOptions'
-      description: Supply exactly one of input (single text) or inputs (Antfly batch extension). Question
-        names must be unique. Single text and named question arrays follow OpenAI Decisions conventions;
-        local models support text input and string choice values. Request bodies are bounded at 16 MiB.
+      description: Supply exactly one of input (single evidence item) or inputs (text-only Antfly batch
+        extension). Question names must be unique. Single text and named question arrays follow OpenAI
+        Decisions conventions; local models support text input and string choice values. Request bodies
+        are bounded at 16 MiB.
     GeneratedChoiceDecisionQuestion:
       type: object
       additionalProperties: false
