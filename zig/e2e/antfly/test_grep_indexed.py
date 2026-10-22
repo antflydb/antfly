@@ -2573,19 +2573,25 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
     provider = ThreadingHTTPServer(("127.0.0.1", 0), Decisions)
     threads = [start_http_server(query), start_http_server(provider)]
     try:
-        result = run_grep(
-            tmp_path,
-            f"http://127.0.0.1:{query.server_port}",
-            table,
+        flags = [
             "--media=images",
             "--ask=Does this contain a chart?",
             "--model=fixture",
             "--endpoint",
             f"http://127.0.0.1:{provider.server_port}/decisions",
-            "--no-cache",
             "--json",
             "--decision-concurrency=8",
             "--decision-batch-wait-ms=20",
+            "--cache-dir",
+            str(tmp_path / "scores"),
+        ]
+        if change:
+            flags.append("--no-cache")
+        result = run_grep(
+            tmp_path,
+            f"http://127.0.0.1:{query.server_port}",
+            table,
+            *flags,
             page_size=16,
         )
         assert len(seen) == 2, (seen, result.stderr.decode())
@@ -2617,6 +2623,29 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
             assert len(provider_calls) == 1
             assert len(provider_calls[0]["inputs"]) == parents
             assert json.loads(result.stdout.splitlines()[0])["type"] == "evidence"
+            warm = run_grep(
+                tmp_path,
+                f"http://127.0.0.1:{query.server_port}",
+                table,
+                *flags,
+                page_size=16,
+            )
+            assert warm.returncode == 0, warm.stderr.decode()
+            assert len(provider_calls) == 1
+            conditional = [
+                hit
+                for envelope in responses[2:]
+                for result in envelope["responses"]
+                for hit in result.get("hits", {}).get("hits", [])
+                if "_source_projection" in hit
+            ]
+            assert len(conditional) == parents, responses[2:]
+            for hit in conditional:
+                assert (
+                    hit["_source_projection"]["payloads.image"]["state"] == "unchanged"
+                )
+                assert "image" not in hit["_source"].get("payloads", {})
+
     finally:
         for server, thread in zip((query, provider), threads, strict=True):
             server.shutdown()
