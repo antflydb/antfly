@@ -3055,17 +3055,17 @@ pub const DocStore = struct {
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
     ) !void {
-        return self.putBatchWithReplayOnceAndParticipantAndCounters(writes, deletes, replay, options, participant, null, null);
+        return self.putBatchWithReplayOnceAndParticipantAndMetadata(writes, deletes, replay, options, participant, .{}, null);
     }
 
-    fn putBatchWithReplayOnceAndParticipantAndCounters(
+    fn putBatchWithReplayOnceAndParticipantAndMetadata(
         self: *DocStore,
         writes: []const KVPair,
         deletes: []const []const u8,
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
-        counters: ?*const @import("db/dense_artifact_counter_deltas.zig").Program,
+        metadata: @import("db/prepared_commit_metadata.zig").Programs,
         control: ?@import("../common/read_admission.zig").Port,
     ) !void {
         const has_owner_job = blk: {
@@ -3111,7 +3111,7 @@ pub const DocStore = struct {
         if (replay) |entry| {
             try batch.setReplayOpaque(entry.sequence, entry.payload);
         }
-        if (counters) |program| try program.apply(&txn, control);
+        try metadata.apply(&txn, control);
         try batch.commit();
     }
 
@@ -3153,11 +3153,25 @@ pub const DocStore = struct {
         counters: ?*const @import("db/dense_artifact_counter_deltas.zig").Program,
         control: ?@import("../common/read_admission.zig").Port,
     ) !void {
+        return self.putBatchWithReplayAndParticipantAndMetadata(io, writes, deletes, replay, options, participant, .{ .dense = counters }, control);
+    }
+
+    pub fn putBatchWithReplayAndParticipantAndMetadata(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        metadata: @import("db/prepared_commit_metadata.zig").Programs,
+        control: ?@import("../common/read_admission.zig").Port,
+    ) !void {
         var trace: @import("../common/read_admission.zig").RejectionTrace = .{};
         const original = trace.bind(control);
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            self.putBatchWithReplayOnceAndParticipantAndCounters(writes, deletes, replay, options, participant, counters, original) catch |err| {
+            self.putBatchWithReplayOnceAndParticipantAndMetadata(writes, deletes, replay, options, participant, metadata, original) catch |err| {
                 // A foreign admission denial may share a backend retry name.
                 // Retrying it can swallow the original failure and commit.
                 if (trace.failure) |cause| return cause;
@@ -9011,4 +9025,211 @@ test "docstore dense artifact counter deltas commit atomically with primary writ
     const row = try fixture.store.get(a, physical);
     defer a.free(row);
     try std.testing.expectEqualStrings("committed", row);
+}
+
+const CoverageOutcomeProgramFixture = struct {
+    const outcomes = @import("db/prepared_coverage_outcomes.zig");
+    const tags = std.meta.tags(outcomes.Outcome);
+    fn counts(store: *DocStore, group: *const outcomes.Group, values: [tags.len]u64) !void {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        inline for (group.counters, 0..) |key, i| {
+            var raw: [8]u8 = undefined;
+            std.mem.writeInt(u64, &raw, values[i], .little);
+            try batch.put(key, &raw);
+        }
+        try batch.commit();
+    }
+    fn assertCounts(store: *DocStore, group: *const outcomes.Group, values: [tags.len]u64) !void {
+        const a = std.testing.allocator;
+        inline for (group.counters, 0..) |key, i| {
+            const raw = try store.get(a, key);
+            defer a.free(raw);
+            try std.testing.expectEqual(values[i], try internal_keys.decodeDerivedCoverageOutcomeCount(raw));
+        }
+    }
+};
+
+test "docstore coverage outcome program folds current markers counters and scoped receipts atomically" {
+    const F = CoverageOutcomeProgramFixture;
+    const a = std.testing.allocator;
+    var fixture: PreparedReplayCreditFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var program = F.outcomes.Program.init(a);
+    defer program.deinit();
+    for ([_][]const u8{ "vector", "vector\x00producer-source:body" }) |name| {
+        try program.append(name, 42, "row", .produced, 19, null);
+        try program.append(name, 42, "row", .terminal_failed, 19, null);
+        try program.append(name, 42, "row", .skipped, 19, null);
+    }
+    for (program.groups.items) |*group| {
+        try fixture.store.put(group.desired.items[0].marker, "skipped");
+        try F.counts(&fixture.store, group, .{ 10, 1, 0 });
+    }
+    const physical = try internal_keys.documentKeyAlloc(a, "row");
+    defer a.free(physical);
+    const writes = [_]KVPair{.{ .key = physical, .value = "committed" }};
+    try fixture.store.putBatchWithReplayAndParticipantAndMetadata(null, &writes, &.{}, null, .{}, null, .{ .coverage = &program }, null);
+    for (program.groups.items) |*group| {
+        try F.assertCounts(&fixture.store, group, .{ 10, 0, 1 });
+        const marker = try fixture.store.get(a, group.desired.items[0].marker);
+        defer a.free(marker);
+        try std.testing.expectEqualStrings("terminal_failed", marker);
+        if (group.desired.items[0].receipt) |key| {
+            const raw = try fixture.store.get(a, key);
+            defer a.free(raw);
+            try std.testing.expectEqual(@as(u64, 19), std.mem.readInt(u64, raw[0..8], .little));
+        }
+    }
+    // A raw writer retry of the same desired outcomes changes no counts.
+    try fixture.store.putBatchWithReplayAndParticipantAndMetadata(null, &writes, &.{}, null, .{}, null, .{ .coverage = &program }, null);
+    for (program.groups.items) |*group| try F.assertCounts(&fixture.store, group, .{ 10, 0, 1 });
+}
+
+test "docstore coverage outcome program reconstructs missing sidecars from one generation and preserves known lanes" {
+    const F = CoverageOutcomeProgramFixture;
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |partial| {
+        var fixture: PreparedReplayCreditFixture = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        var program = F.outcomes.Program.init(a);
+        defer program.deinit();
+        const name = "vector\x00binary";
+        try program.append(name, 42, "row", .produced, 19, null);
+        const group = &program.groups.items[0];
+        const marker = group.desired.items[0].marker;
+        try fixture.store.put(marker, "skipped");
+        const other = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, name, 42, "other");
+        defer a.free(other);
+        try fixture.store.put(other, "produced");
+        const outside = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, name, 43, "outside");
+        defer a.free(outside);
+        try fixture.store.put(outside, "skipped");
+        if (partial) {
+            var raw: [8]u8 = undefined;
+            std.mem.writeInt(u64, &raw, 7, .little);
+            try fixture.store.put(group.counters[0], &raw);
+        }
+        try fixture.store.putBatchWithReplayAndParticipantAndMetadata(null, &.{}, &.{}, null, .{}, null, .{ .coverage = &program }, null);
+        try F.assertCounts(&fixture.store, group, .{ if (partial) 8 else 2, 0, 0 });
+    }
+}
+
+test "docstore coverage outcome program retains no-op receipt stamping without manufacturing sidecars" {
+    const F = CoverageOutcomeProgramFixture;
+    const a = std.testing.allocator;
+    var fixture: PreparedReplayCreditFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var program = F.outcomes.Program.init(a);
+    defer program.deinit();
+    try program.append("vector\x00producer-source:body", 42, "row", .produced, 19, null);
+    const group = &program.groups.items[0];
+    try fixture.store.put(group.desired.items[0].marker, "produced");
+    try fixture.store.putBatchWithReplayAndParticipantAndMetadata(null, &.{}, &.{}, null, .{}, null, .{ .coverage = &program }, null);
+    for (group.counters) |key| try std.testing.expectError(error.NotFound, fixture.store.get(a, key));
+    const receipt = try fixture.store.get(a, group.desired.items[0].receipt.?);
+    defer a.free(receipt);
+    try std.testing.expectEqual(@as(u64, 19), std.mem.readInt(u64, receipt[0..8], .little));
+}
+
+test "docstore coverage outcome program rejects corrupt state and rolls back primary marker receipt and counters" {
+    const F = CoverageOutcomeProgramFixture;
+    const a = std.testing.allocator;
+    for (0..4) |damage| {
+        var fixture: PreparedReplayCreditFixture = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        var program = F.outcomes.Program.init(a);
+        defer program.deinit();
+        try program.append("vector\x00producer-source:body", 42, "row", .produced, 19, null);
+        const group = &program.groups.items[0];
+        try F.counts(&fixture.store, group, .{ 0, if (damage == 1) 0 else 1, 0 });
+        try fixture.store.put(group.desired.items[0].marker, if (damage == 0) "invalid" else "skipped");
+        if (damage == 2) try fixture.store.put(group.counters[0], "bad");
+        if (damage == 3) try std.testing.expectError(error.PreparedGenerationChanged, program.append("vector\x00producer-source:body", 43, "other", .produced, 19, null));
+        const physical = try internal_keys.documentKeyAlloc(a, "row");
+        defer a.free(physical);
+        const expected: anyerror = switch (damage) {
+            0 => error.InvalidDerivedCoverageOutcome,
+            1 => error.InvalidDerivedCoverageCounter,
+            2 => error.InvalidDerivedCoverageOutcomeCount,
+            else => error.InvalidPreparedEffects,
+        };
+        try std.testing.expectError(expected, fixture.store.putBatchWithReplayAndParticipantAndMetadata(null, &.{.{ .key = physical, .value = "not published" }}, &.{}, null, .{}, null, .{ .coverage = &program }, null));
+        try std.testing.expectError(error.NotFound, fixture.store.get(a, physical));
+        try std.testing.expectError(error.NotFound, fixture.store.get(a, group.desired.items[0].receipt.?));
+        const marker = try fixture.store.get(a, group.desired.items[0].marker);
+        defer a.free(marker);
+        try std.testing.expectEqualStrings(if (damage == 0) "invalid" else "skipped", marker);
+    }
+}
+
+test "docstore coverage outcome program unwinds every original checkpoint through legacy scanning and staged writes" {
+    const F = CoverageOutcomeProgramFixture;
+    const a = std.testing.allocator;
+    var fixture: PreparedReplayCreditFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var program = F.outcomes.Program.init(a);
+    defer program.deinit();
+    try program.append("vector\x00producer-source:body", 42, "row", .produced, 19, null);
+    const group = &program.groups.items[0];
+    try fixture.store.put(group.desired.items[0].marker, "skipped");
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.DeadlineExceeded,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(store: *DocStore, owned: *const F.outcomes.Program, checks: *@This()) !void {
+            var batch = try store.beginWriteBatch();
+            defer batch.abort();
+            const controls = @import("../common/read_admission.zig");
+            var source: controls.Payload = .{ .ptr = checks, .vtable = &.{ .checkpoint = check } };
+            try owned.apply(&batch, .init(&source));
+        }
+    };
+    var baseline: Checks = .{};
+    try Checks.run(&fixture.store, &program, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(&fixture.store, &program, &checks));
+    };
+    const marker = try fixture.store.get(a, group.desired.items[0].marker);
+    defer a.free(marker);
+    try std.testing.expectEqualStrings("skipped", marker);
+    for (group.counters) |key| try std.testing.expectError(error.NotFound, fixture.store.get(a, key));
+    try std.testing.expectError(error.NotFound, fixture.store.get(a, group.desired.items[0].receipt.?));
+}
+
+test "docstore coverage outcome program legacy primary counts exclude metadata and retain primary phantoms" {
+    const a = std.testing.allocator;
+    var fixture: PreparedReplayCreditFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const row = try internal_keys.documentKeyAlloc(a, "row\x00binary");
+    defer a.free(row);
+    try fixture.store.put(row, "{}");
+    const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, "vector", 42, "row");
+    defer a.free(marker);
+    try fixture.store.put(marker, "produced");
+    const read_set = @import("db/prepared_read_set.zig");
+    var reads = read_set.Owned.init(a, null);
+    defer reads.deinit();
+    const count = try @import("db/range_cardinality.zig").countPrimaryDocuments(a, read_set.observe(&fixture.store, &reads), .{ .start = "", .end = "" });
+    try std.testing.expectEqual(@as(u64, 1), count);
+    try reads.finish();
+    try fixture.store.put(marker, "terminal_failed");
+    try fixture.store.put("\x03independent-identity-control", "progress");
+    try reads.validate(&fixture.store, null);
+    const next = try internal_keys.documentKeyAlloc(a, "new-row");
+    defer a.free(next);
+    try fixture.store.put(next, "{}");
+    try std.testing.expectError(error.PreparedReadSetChanged, reads.validate(&fixture.store, null));
 }

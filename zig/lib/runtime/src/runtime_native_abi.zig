@@ -95,7 +95,8 @@ const builtin = @import("builtin");
 // Replay reservation writers retain input contracts through final commit validation.
 // Batch preparation can return owned uncommitted bytes and their witnesses.
 // Owned assemblies and resolution options carry final-writer counter programs.
-pub const abi_version: u32 = 63;
+// Coverage outcome transitions join final-writer metadata programs.
+pub const abi_version: u32 = 64;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

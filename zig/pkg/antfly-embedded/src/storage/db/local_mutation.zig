@@ -377,6 +377,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const appendPrecomputedArtifactCoverageOutcomes = materialization.appendPrecomputedArtifactCoverageOutcomes;
         pub const appendPrecomputedCoverageCandidate = materialization.appendPrecomputedCoverageCandidate;
         pub const appendPrecomputedCoverageOutcomeMutations = materialization.appendPrecomputedCoverageOutcomeMutations;
+        pub const preparePrecomputedCoverageOutcomes = materialization.preparePrecomputedCoverageOutcomes;
         pub const appendPrecomputedEmbeddingCoverageOutcomes = materialization.appendPrecomputedEmbeddingCoverageOutcomes;
         pub const appendPreparedGraphEdgeArtifactWrite = materialization.appendPreparedGraphEdgeArtifactWrite;
         pub const appendRelationItemsFromPath = materialization.appendRelationItemsFromPath;

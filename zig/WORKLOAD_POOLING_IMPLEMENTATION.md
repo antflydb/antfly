@@ -22527,3 +22527,67 @@ receipts. Pinned formatting, control-catalog, generated-error and whitespace
 checks pass. The embedded production boundary audit passes 965 sources without
 server coordination imports. Existing bootstrap/range behavior is exercised;
 this does not qualify all engines or a full linked storage-owner image.
+
+### Final-writer local coverage outcome transitions (2026-10-21)
+
+The shared primary-batch assembler now owns desired local coverage outcomes,
+rather than reading current outcome markers/count sidecars and storing their
+absolute afterimages. The program pins each index generation, owns marker and
+optional producer-receipt keys, and collapses repeated document outcomes with
+the existing skipped/produced/terminal-failed priority. Current coverage metadata
+is resolved only inside the final writer. The immutable program retains no
+borrowed controls or accepted-frame buffers. Construction failures poison the
+program so an ignored append failure cannot apply a partial outcome set.
+
+Ordinary writes and transaction resolution consume dense-counter and coverage
+programs through one native metadata bundle. Markers, source-revision receipts,
+counts, primary mutations and the transaction decision commit atomically. An
+existing marker transition decrements its current lane with the existing
+underflow check and saturating-increments the desired lane. Identical outcomes
+leave counts alone, while scoped producer receipts still stamp the new source
+revision. Missing legacy sidecars use one generation-bounded cursor to reconstruct
+all missing lanes from the same writer before staging markers; existing lanes
+retain their stored values. No-op transitions do not manufacture sidecars.
+This fallback is not an executable-resource guarantee for a future PREPARE vote.
+
+The owning candidate no longer retains these mutable marker/counter reads.
+Other producer completions may therefore advance them while preparation is held,
+without installing a broad metadata exclusion. Catalog/authority, primary-data,
+policy and existing preparation dependencies remain checked. Candidate sequencing
+is still provisional and independently fenced. Native ABI 64 and storage-owner
+ABI 122 cover the expanded programs and resolution options; durable encodings,
+reader floors and provider/default activation are unchanged.
+
+Replay relocation, remaining producer/control counters and backend metadata,
+durable data-read guards, live route/DB lifetime ownership, executable recovery
+resources/derived-log quota and normal required PREPARE integration remain open.
+Strong required providers stay disabled and the full goal remains active.
+Full Linux qualification remains waived; Linux builds require pinned Nix/glibc
+Zig. Cross-engine performance remains unproven.
+
+A legacy range-cardinality fallback counted only primary document rows but scanned
+from the document prefix through physical EOF. It now uses the finite document-
+namespace upper bound even when the logical range has no end. This preserves
+primary-row phantom validation while removing unrelated replay/identity metadata
+from the captured scan. No read-set comparison or conflict validation was relaxed.
+
+Pinned Debug qualification passes ten coverage-program cases, ten dense-counter
+cases, 69 required-PREPARE DB cases and 51 runtime error/identity companions. Five
+native ABI cases also pass: 145 executions on the final source, with no skips,
+failures or leaks. Coverage includes desired-outcome priority, scoped receipts,
+known/partial/missing counters, no-op preservation, corruption/underflow rollback,
+ignored construction failures, every construction allocation failure and every
+original checkpoint through scanning and staged writes, retained producer
+progress, terminal idempotence, and Lite writer-cursor application plus reopen.
+The legacy cardinality case proves that replay/identity metadata changes pass
+validation while a newly inserted primary document still invalidates it.
+
+The 5,497 native/schema inputs are independently reverified against final source;
+see coverage-outcome-program-verified.json and coverage-outcome-program-v3.json/log
+in the cumulative receipts. Earlier failed runs retain the allocation-test
+correction and the overbroad range diagnosis and supply no final qualification.
+Pinned formatting, control-catalog, generated-error, whitespace and production
+source-boundary checks pass (967 sources without server coordination imports).
+This verifies the native directory path and the stated Lite primitive/reopen
+case; full linked owner-image, object-engine, crash and cross-engine performance
+qualification remain open.

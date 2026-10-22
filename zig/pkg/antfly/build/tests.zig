@@ -6126,6 +6126,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-read-observation-catalog-test", "Verify reader floors and prepared catalog observation leases")
         .dependOn(&addCuratedTestRunArtifact(b, observation_catalog_tests, &observation_catalog_filters).step);
+    const coverage_outcome_program_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"coverage outcome program"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-coverage-outcome-program-test", "Verify final-writer coverage outcomes, counts and producer receipts")
+        .dependOn(&addCuratedTestRunArtifact(b, coverage_outcome_program_tests, &.{"coverage outcome program"}).step);
     const counter_materialization_filters = [_][]const u8{
         "dense artifact counter deltas",
         "db inline dense coverage counters rebase with range ownership",

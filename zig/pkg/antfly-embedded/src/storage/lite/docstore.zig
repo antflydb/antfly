@@ -11944,3 +11944,42 @@ pub fn qualifySnapshotCaptureDependencies() !void {
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }
 }
+
+test "lite coverage outcome program uses the final writer cursor and persists outcomes counters and receipts through reopen" {
+    const a = std.testing.allocator;
+    const outcomes = @import("../db/prepared_coverage_outcomes.zig");
+    const DocStore = @import("../docstore.zig").DocStore;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "coverage-outcome-program.aflite");
+    defer a.free(path);
+    var program = outcomes.Program.init(a);
+    defer program.deinit();
+    try program.append("vector\x00producer-source:body", 42, "row", .produced, 19, null);
+    const group = &program.groups.items[0];
+    for (0..2) |phase| {
+        var native_store = if (phase == 0)
+            try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } })
+        else
+            try Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+        defer native_store.close();
+        native_store.maintenance_start_suppressed = true;
+        var store = try DocStore.openRuntime(a, try native_store.runtimeStore(a));
+        defer store.close();
+        if (phase == 0) {
+            try store.put(group.desired.items[0].marker, "skipped");
+            try store.putBatchWithReplayAndParticipantAndMetadata(null, &.{}, &.{}, null, .{}, null, .{ .coverage = &program }, null);
+        }
+        const marker = try store.get(a, group.desired.items[0].marker);
+        defer a.free(marker);
+        try std.testing.expectEqualStrings("produced", marker);
+        for (group.counters, [_]u64{ 1, 0, 0 }) |key, expected| {
+            const raw = try store.get(a, key);
+            defer a.free(raw);
+            try std.testing.expectEqual(expected, try internal_keys.decodeDerivedCoverageOutcomeCount(raw));
+        }
+        const receipt = try store.get(a, group.desired.items[0].receipt.?);
+        defer a.free(receipt);
+        try std.testing.expectEqual(@as(u64, 19), std.mem.readInt(u64, receipt[0..8], .little));
+    }
+}

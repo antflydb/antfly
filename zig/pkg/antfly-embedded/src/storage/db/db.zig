@@ -55744,6 +55744,7 @@ const precomputedCoverageOutcomePriority = local_mutation.precomputedCoverageOut
 /// primary commit. Keys and encoded counter values are retained in the caller's
 /// ownership lists until the backend batch completes.
 const appendPrecomputedCoverageOutcomeMutations = local_mutation.appendPrecomputedCoverageOutcomeMutations;
+const preparePrecomputedCoverageOutcomes = local_mutation.preparePrecomputedCoverageOutcomes;
 
 const setDerivedCoverageOutcomes = local_mutation.setDerivedCoverageOutcomes;
 
@@ -147998,6 +147999,82 @@ test "db prepared transaction effects required assembly dense artifact counter d
             const result = try db.core.store.get(a, counter);
             defer a.free(result);
             try std.testing.expectEqual(@as(u64, 101), std.mem.readInt(u64, result[0..8], .little));
+        }
+        const before = try PreparedAssemblyFixture.snapshot(&db);
+        defer PreparedAssemblyFixture.free(before);
+        try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 19, .propose);
+        const after = try PreparedAssemblyFixture.snapshot(&db);
+        defer PreparedAssemblyFixture.free(after);
+        try std.testing.expectEqualDeep(before, after);
+    }
+}
+
+test "db prepared transaction effects required assembly coverage outcome program permits producer progress and applies current state once" {
+    const a = std.testing.allocator;
+    const id: types.TxnId = @splat(203);
+    for ([_]bool{ false, true }) |legacy| {
+        var directory = try TestDirectory.init("prepared-coverage-outcomes");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), PreparedAssemblyFixture.options);
+        defer db.close();
+        try db.enablePreparedTransactionProtocol();
+        try db.addIndex(.{ .name = "vector", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":3,\"external\":true}", .coverage_generation = 42 });
+        const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, "vector", 42, "row");
+        defer a.free(marker);
+        const other = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, "vector", 42, "other");
+        defer a.free(other);
+        try db.core.store.put(marker, "skipped");
+        try db.core.store.put(other, "produced");
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            _ = try db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+        }
+        try db.writeTransaction(id, .{ .writes = &.{.{ .key = "row", .value = "{\"body\":\"prepared\"}" }} });
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            var captured = try db.core.capturePreparedTransactionInputs(a, id, .deferred, null);
+            defer captured.deinit();
+            var outcomes = [_]PrecomputedCoverageOutcome{.{ .index_name = @constCast("vector"), .doc_key = @constCast("row"), .outcome = .produced }};
+            const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = captured.contract, .effects = .{ .coverage_outcomes = &outcomes } }, null);
+            defer a.free(frame);
+            try db.core.sealPreparedTransactionEffects(id, frame, .deferred, null);
+        }
+        var plan = try db.prepareTransactionAssembly(a, id, 19, null);
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(usize, 1), plan.coverage_outcomes.?.groups.items.len);
+        const group = &plan.coverage_outcomes.?.groups.items[0];
+        for (plan.bytes.writes) |write| {
+            try std.testing.expect(!std.mem.eql(u8, write.key, marker));
+            for (group.counters) |key| try std.testing.expect(!std.mem.eql(u8, write.key, key));
+        }
+        // Old producer completion can advance while this candidate is held.
+        // Existing sidecars must agree with the current marker transition;
+        // missing legacy sidecars are reconstructed only in the final writer.
+        try db.core.store.put(marker, "terminal_failed");
+        if (legacy) {
+            for (group.counters) |key| db.core.store.delete(key) catch |cause| if (cause != error.NotFound) return cause;
+        } else {
+            for (group.counters, [_]u64{ 20, 0, 1 }) |key, count| {
+                var raw: [8]u8 = undefined;
+                std.mem.writeInt(u64, &raw, count, .little);
+                try db.core.store.put(key, &raw);
+            }
+        }
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            try plan.validateDependencies(db.core, null);
+        }
+        try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 19, .propose);
+        const actual = try db.core.store.get(a, marker);
+        defer a.free(actual);
+        try std.testing.expectEqualStrings("produced", actual);
+        for (group.counters, [_]u64{ if (legacy) 2 else 21, 0, 0 }) |key, expected| {
+            const raw = try db.core.store.get(a, key);
+            defer a.free(raw);
+            try std.testing.expectEqual(expected, try internal_keys.decodeDerivedCoverageOutcomeCount(raw));
         }
         const before = try PreparedAssemblyFixture.snapshot(&db);
         defer PreparedAssemblyFixture.free(before);

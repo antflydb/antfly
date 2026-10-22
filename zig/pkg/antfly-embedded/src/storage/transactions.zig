@@ -341,6 +341,7 @@ pub const ResolutionExtraBatch = struct {
     /// Prepared ordered adjustments; folded once in the final native writer.
     /// Terminal retries and aborts never reapply them.
     dense_counter_deltas: ?*const @import("db/dense_artifact_counter_deltas.zig").Program = null,
+    coverage_outcomes: ?*const @import("db/prepared_coverage_outcomes.zig").Program = null,
     /// Borrowed through this resolution attempt. Terminal-decision retries do
     /// not attach it: they must never re-certify already applied row effects.
     commit_participant: ?@import("commit_participant.zig").Participant = null,
@@ -1519,7 +1520,7 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, indexed_deletes.items);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyResolutionResourceBatch(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control, .{ .id = txn_id, .status = status, .prepared = consumed != null }, null, if (status == .committed) extra_batch.dense_counter_deltas else null);
+        try self.applyResolutionResourceBatch(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control, .{ .id = txn_id, .status = status, .prepared = consumed != null }, null, if (status == .committed) .{ .dense = extra_batch.dense_counter_deltas, .coverage = extra_batch.coverage_outcomes } else null);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -3620,7 +3621,7 @@ pub const TxnManager = struct {
         return self.applyResolutionResourceBatch(writes, deletes, replay, reservation, participant, control, null, null, null);
     }
 
-    fn applyResolutionResourceBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port, transition: ?struct { id: TxnId, status: TxnStatus, prepared: bool = false }, guard_scope: ?writer_read_guards.Scope, counters: ?*const @import("db/dense_artifact_counter_deltas.zig").Program) !void {
+    fn applyResolutionResourceBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port, transition: ?struct { id: TxnId, status: TxnStatus, prepared: bool = false }, guard_scope: ?writer_read_guards.Scope, metadata: ?@import("db/prepared_commit_metadata.zig").Programs) !void {
         if (control) |owner| try owner.checkpoint();
         const mutation_batch = @import("transaction_batch_admission.zig");
         // Prepared data is detached before acquiring the writer. Its byte owner
@@ -3681,7 +3682,7 @@ pub const TxnManager = struct {
         if (participant) |observer| try batch.setCommitParticipant(observer);
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
         try mutation_batch.stage(&batch, physical_writes, physical_deletes, physical_replay, control);
-        if (counters) |program| try program.apply(&batch, control);
+        if (metadata) |programs| try programs.apply(&batch, control);
         try batch.commit();
     }
 

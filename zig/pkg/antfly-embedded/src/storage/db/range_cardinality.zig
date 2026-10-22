@@ -98,10 +98,10 @@ fn countPrimaryDocumentsFromTxn(
 ) !u64 {
     const lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
     defer alloc.free(lower);
-    const upper = if (byte_range.end.len == 0)
-        null
-    else
-        try internal_keys.documentRangeUpperAlloc(alloc, byte_range.end);
+    // An unbounded logical range still ends at the document namespace.
+    // Scanning to physical EOF observes replay/control metadata which the
+    // callback never counts and unnecessarily fences its independent progress.
+    const upper = try internal_keys.documentRangeUpperAlloc(alloc, byte_range.end);
     defer if (upper) |key| alloc.free(key);
 
     const CountState = struct {

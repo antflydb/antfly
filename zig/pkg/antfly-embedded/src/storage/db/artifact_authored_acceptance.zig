@@ -216,6 +216,7 @@ pub const OwnedPhysicalPlan = struct {
     acceptance: Prepared,
     dependencies: ?@import("prepared_mutation_dependencies.zig").Owned = null,
     counter_deltas: ?@import("dense_artifact_counter_deltas.zig").Program = null,
+    coverage_outcomes: ?@import("prepared_coverage_outcomes.zig").Program = null,
     /// This candidate cannot authorize a vote or a direct commit. Until replay
     /// relocation/deltas have an owner, sequence advancement invalidates it.
     preparation: ?struct {
@@ -265,6 +266,7 @@ pub const OwnedPhysicalPlan = struct {
 
     pub fn deinit(self: *OwnedPhysicalPlan) void {
         if (self.counter_deltas) |*program| program.deinit();
+        if (self.coverage_outcomes) |*program| program.deinit();
         if (self.dependencies) |*owned| owned.deinit();
         self.acceptance.deinit();
         self.bytes.deinit();

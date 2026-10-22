@@ -35,7 +35,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Replay reservation writers retain input contracts through final commit validation.
 // Batch preparation can return owned uncommitted bytes and their witnesses.
 // Owned assemblies and resolution options carry final-writer counter programs.
-pub const abi_version: u32 = 121;
+// Coverage outcome transitions join final-writer metadata programs.
+pub const abi_version: u32 = 122;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

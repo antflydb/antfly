@@ -2864,6 +2864,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try out.append(alloc, .{ .request = cloned, .produced = produced });
         }
 
+        pub fn preparePrecomputedCoverageOutcomes(
+            store: anytype,
+            index_manager: *index_manager_mod.IndexManager,
+            outcomes: []const PrecomputedCoverageOutcome,
+            sequence: u64,
+            program: *@import("prepared_coverage_outcomes.zig").Program,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) !void {
+            if (outcomes.len == 0 or try orderedCoverageActive(store)) return;
+            for (outcomes) |candidate| {
+                if (control) |owner| try owner.checkpoint();
+                const generation = index_manager.coverageGenerationForIndex(@import("artifact_producer_readiness.zig").localScopeIndex(candidate.index_name)) orelse continue;
+                try program.append(candidate.index_name, generation, candidate.doc_key, candidate.outcome, sequence, control);
+            }
+        }
+
         pub fn appendPrecomputedCoverageOutcomeMutations(
             alloc: Allocator,
             store: anytype,
@@ -10531,11 +10547,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn precomputedCoverageOutcomePriority(outcome: DerivedCoverageOutcome) u8 {
-            return switch (outcome) {
-                .skipped => 0,
-                .produced => 1,
-                .terminal_failed => 2,
-            };
+            return @import("prepared_coverage_outcomes.zig").priority(outcome);
         }
 
         pub fn precomputedEmbeddingCoverageOutcome(
