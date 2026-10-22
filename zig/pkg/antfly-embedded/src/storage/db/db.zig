@@ -42935,7 +42935,9 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
-            .all_docs_visible = allDocsVisibleCallback,
+            // An absent legacy summary is unknown, not a reason to scan the
+            // primary population before searching selective postings.
+            .all_docs_visible = allDocsVisibleFastCallback,
             .requires_full_candidate_visibility_filter = requiresFullCandidateVisibilityFilterCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .postprocess = postprocessTextSearchResultCallback,
@@ -43401,7 +43403,10 @@ pub const DB = struct {
     ) anyerror!doc_set.ResolvedDocSet {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         const duration_ns = ttlDurationNs(self);
-        var identity_visible = if (try self.allDocsVisibleAtGeneration(generation))
+        // A bounded candidate set can be checked directly when the summary
+        // is absent. Recomputing full stats for every batch defeats pruning.
+        const all_visible = if (set.* == .all) try self.allDocsVisibleAtGeneration(generation) else try self.allDocsVisibleSummaryFast(generation);
+        var identity_visible = if (all_visible)
             try doc_set.cloneAlloc(alloc, set)
         else if (set.* == .all)
             try self.broadLiveDocSetCachedAlloc(alloc, generation)
@@ -72054,73 +72059,80 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
 }
 
 test "db query capture seals outside mutation fences and retains the selected generation" {
-    const alloc = std.testing.allocator;
-    var directory = try TestDirectory.init("query-seal-admission");
-    defer directory.cleanup();
-    const path = std.mem.span(directory.path().ptr);
-    defer cleanupTempDir(directory.path().ptr);
-    const pins = try std.fmt.allocPrint(alloc, "{s}.query-pins", .{path});
-    defer alloc.free(pins);
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
-    var db = try DB.open(alloc, path, .{
-        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
-        .start_index_workers = false,
-        .start_optional_runtime_workers = false,
-        .ttl_cleanup = .{ .enabled = false },
-    });
-    defer db.close();
-    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
-    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .full_index });
-    const Probe = struct {
-        db: *DB,
-        released: bool = false,
-        failure: ?anyerror = null,
-        fn admitted(_: *anyopaque) void {}
-        fn materialize(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            // Fail without blocking if a regression retains any fence. Only
-            // run synchronous writes after proving admission is available.
-            if (!self.db.core.tryLockApplyExclusive()) return;
-            self.db.core.unlockApply();
-            var capture = self.db.core.snapshot_admission.tryAcquireCapture() orelse return;
-            capture.release();
-            var replay = self.db.core.snapshot_replay_admission.tryAcquireCapture() orelse return;
-            replay.release();
-            if (!self.db.local_execution.index_structural_mutation_mutex.tryLock()) return;
-            self.db.local_execution.index_structural_mutation_mutex.unlock();
-            if (self.db.indexCatalogBarrierActive()) return;
-            self.released = true;
-            self.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"replacement\"}" }}, .sync_level = .full_index }) catch |err| {
-                self.failure = err;
-                return;
-            };
-            _ = self.db.runLsmMaintenanceStepBestEffort() catch |err| {
-                self.failure = err;
-                return;
-            };
+    for ([_]bool{ false, true }) |missing_summary| {
+        const alloc = std.testing.allocator;
+        var directory = try TestDirectory.init("query-seal-admission");
+        defer directory.cleanup();
+        const path = std.mem.span(directory.path().ptr);
+        defer cleanupTempDir(directory.path().ptr);
+        const pins = try std.fmt.allocPrint(alloc, "{s}.query-pins", .{path});
+        defer alloc.free(pins);
+        defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+        var db = try DB.open(alloc, path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .full_index });
+        if (missing_summary) {
+            try db.core.store.putBatch(&.{}, &.{internal_keys.identity_visibility_summary_key[0..]});
+            db.core.identity_visibility.summary = null;
         }
-    };
-    var probe = Probe{ .db = &db };
-    DB.test_snapshot_fence_hook = .{ .ptr = &probe, .after_capture_admission = Probe.admitted, .before_artifact_materialize = Probe.materialize };
-    defer DB.test_snapshot_fence_hook = null;
-    const cut = @import("native_query_cut.zig");
-    const id: [64]u8 = @splat('b');
-    var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
-    try db.captureQueryCut(request, .none);
-    if (probe.failure) |err| return err;
-    try std.testing.expect(probe.released);
-    request.create = false;
-    var retained = try db.openQueryCut(request, .none);
-    defer retained.close();
-    const old = (try retained.get(alloc, "doc")).?;
-    defer alloc.free(old);
-    try std.testing.expect(std.mem.indexOf(u8, old, "original") != null);
-    const current = (try db.get(alloc, "doc")).?;
-    defer alloc.free(current);
-    try std.testing.expect(std.mem.indexOf(u8, current, "replacement") != null);
-    var old_hits = try retained.search(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "original" } }, .include_stored = false });
-    defer old_hits.deinit();
-    try std.testing.expectEqual(@as(usize, 1), old_hits.hits.len);
+        const Probe = struct {
+            db: *DB,
+            released: bool = false,
+            failure: ?anyerror = null,
+            fn admitted(_: *anyopaque) void {}
+            fn materialize(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                // Fail without blocking if a regression retains any fence. Only
+                // run synchronous writes after proving admission is available.
+                if (!self.db.core.tryLockApplyExclusive()) return;
+                self.db.core.unlockApply();
+                var capture = self.db.core.snapshot_admission.tryAcquireCapture() orelse return;
+                capture.release();
+                var replay = self.db.core.snapshot_replay_admission.tryAcquireCapture() orelse return;
+                replay.release();
+                if (!self.db.local_execution.index_structural_mutation_mutex.tryLock()) return;
+                self.db.local_execution.index_structural_mutation_mutex.unlock();
+                if (self.db.indexCatalogBarrierActive()) return;
+                self.released = true;
+                self.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"replacement\"}" }}, .sync_level = .full_index }) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                _ = self.db.runLsmMaintenanceStepBestEffort() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+            }
+        };
+        var probe = Probe{ .db = &db };
+        DB.test_snapshot_fence_hook = .{ .ptr = &probe, .after_capture_admission = Probe.admitted, .before_artifact_materialize = Probe.materialize };
+        defer DB.test_snapshot_fence_hook = null;
+        const cut = @import("native_query_cut.zig");
+        const id: [64]u8 = @splat('b');
+        var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+        try db.captureQueryCut(request, .none);
+        if (probe.failure) |err| return err;
+        try std.testing.expect(probe.released);
+        request.create = false;
+        var retained = try db.openQueryCut(request, .none);
+        defer retained.close();
+        if (missing_summary) try std.testing.expect(try doc_identity.visibilitySummaryFromStore(retained.core.store) == null);
+        const old = (try retained.get(alloc, "doc")).?;
+        defer alloc.free(old);
+        try std.testing.expect(std.mem.indexOf(u8, old, "original") != null);
+        const current = (try db.get(alloc, "doc")).?;
+        defer alloc.free(current);
+        try std.testing.expect(std.mem.indexOf(u8, current, "replacement") != null);
+        var old_hits = try retained.search(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "original" } }, .include_stored = false });
+        defer old_hits.deinit();
+        try std.testing.expectEqual(@as(usize, 1), old_hits.hits.len);
+    }
 }
 
 test "db query capture retains settled terminal repair debt without acknowledging visibility" {
