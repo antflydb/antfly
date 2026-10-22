@@ -72076,6 +72076,18 @@ test "db query capture seals outside mutation fences and retains the selected ge
         });
         defer db.close();
         try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        const cut = @import("native_query_cut.zig");
+        const empty_id: [64]u8 = @splat('c');
+        var empty_request: cut.Request = .{ .id = &empty_id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+        try db.captureQueryCut(empty_request, .none);
+        empty_request.create = false;
+        {
+            var empty = try db.openQueryCut(empty_request, .none);
+            defer empty.close();
+            var empty_hits = try empty.search(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "original" } }, .include_stored = false });
+            defer empty_hits.deinit();
+            try std.testing.expectEqual(@as(usize, 0), empty_hits.hits.len);
+        }
         try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .full_index });
         if (missing_summary) {
             try db.core.store.putBatch(&.{}, &.{internal_keys.identity_visibility_summary_key[0..]});
@@ -72083,6 +72095,7 @@ test "db query capture seals outside mutation fences and retains the selected ge
         }
         const Probe = struct {
             db: *DB,
+            replace_index: bool,
             released: bool = false,
             failure: ?anyerror = null,
             fn admitted(_: *anyopaque) void {}
@@ -72108,12 +72121,42 @@ test "db query capture seals outside mutation fences and retains the selected ge
                     self.failure = err;
                     return;
                 };
+                // Catalog admission requires its maintained summary. The
+                // missing-summary variant exercises conservative reads only.
+                if (!self.replace_index) return;
+                const removed = self.db.deleteIndex("text") catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (!removed) {
+                    self.failure = error.TestExpectedEqual;
+                    return;
+                }
+                var drained = false;
+                for (0..1000) |_| {
+                    const progress = self.db.advanceGeneratedArtifactCleanupPage("text") catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                    if (progress == .idle) {
+                        drained = true;
+                        break;
+                    }
+                    if (progress == .busy) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                }
+                if (!drained) {
+                    self.failure = error.TestCleanupDidNotComplete;
+                    return;
+                }
+                self.db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" }) catch |err| {
+                    self.failure = err;
+                    return;
+                };
             }
         };
-        var probe = Probe{ .db = &db };
+        var probe = Probe{ .db = &db, .replace_index = !missing_summary };
         DB.test_snapshot_fence_hook = .{ .ptr = &probe, .after_capture_admission = Probe.admitted, .before_artifact_materialize = Probe.materialize };
         defer DB.test_snapshot_fence_hook = null;
-        const cut = @import("native_query_cut.zig");
         const id: [64]u8 = @splat('b');
         var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
         try db.captureQueryCut(request, .none);

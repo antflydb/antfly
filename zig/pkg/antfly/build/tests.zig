@@ -6183,7 +6183,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, resolver_alias_tests).step);
     const query_capture_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{"query capture"},
+        .filters = selectTestFilters(b, &.{"query capture"}),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-query-capture-test", "Verify retained query consistency, cancellation and enrichment independence")
