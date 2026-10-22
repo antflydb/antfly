@@ -640,7 +640,7 @@ def test_inline_resolver_ownership_and_table_scoped_identity(tmp_path, storage) 
             with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
                 alpha.add_index(invalid)
             alpha.run_until_idle()
-            # Partial registration must restore a previously retired identity.
+            # Conflicting declarations must fail before reactivating a retired identity.
             invalid = json.loads(json.dumps(configs["alpha"]))
             invalid["resolvers"].append({**invalid["resolvers"][0], "name": "conflicting"})
             with pytest.raises(antfly_embedded.InvalidArgumentError):

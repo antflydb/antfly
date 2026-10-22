@@ -7273,7 +7273,9 @@ pub const DB = struct {
     }
     fn localGroupSourceSettled(ptr: *anyopaque, sequence: u64, units: []const []const u8) !bool {
         const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
-        const self = context.db;
+        return context.db.groupSourceSettled(sequence, units);
+    }
+    fn groupSourceSettled(self: *DB, sequence: u64, units: []const []const u8) !bool {
         var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
         defer arena.deinit();
         var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = arena.allocator(), .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
@@ -8633,7 +8635,7 @@ pub const DB = struct {
                 const observed = try @import("group_source_state.zig").readSnapshot(owned, &read, finish.held.group, finish.held.partition);
                 if (observed) |observed_snapshot| {
                     const generation = self.core.index_manager.writePlanGeneration();
-                    if (try localGroupSourceSettled(self, observed_snapshot.sequence, try std.mem.concat(owned, []const u8, &.{ observed_snapshot.units, observed_snapshot.retired }))) {
+                    if (try groupSourceSettled(self, observed_snapshot.sequence, try std.mem.concat(owned, []const u8, &.{ observed_snapshot.units, observed_snapshot.retired }))) {
                         control_opts.legacy_group_completed_through = observed_snapshot.sequence;
                         control_opts.legacy_group_plan_generation = generation;
                     }
@@ -18839,7 +18841,7 @@ pub const DB = struct {
                     if (progress) |value| try value.requireAuthority(active);
                     complete = progress != null and progress.?.baseline_complete;
                 }
-                if (authority == null and !try self.maintenanceRequiresOrderedApply()) complete = try localGroupSourceSettled(self, query.through_sequence, query.documents);
+                if (authority == null and !try self.maintenanceRequiresOrderedApply()) complete = try groupSourceSettled(self, query.through_sequence, query.documents);
                 for (query.documents) |document| {
                     if (!self.core.byteRange().contains(document)) return error.KeyOutOfRange;
                     if (authority != null and !try @import("artifact_completion_progress.zig").groupReady(owned, &read, self.root_incarnation, document)) {
