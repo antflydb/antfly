@@ -1728,7 +1728,7 @@ pub const TableSchema = struct {
     foreign_keys: ?[]const RelationalForeignKeyConstraint = null,
     /// Desired ordered indexes for a relational table. Names must be unique. An explicit array replaces the declarations; an empty array drops them. Omission preserves existing declarations during schema updates. Index definitions commit atomically with the schema; build progress and readiness are local to each owning shard, not client-writable.
     relational_indexes: ?[]const RelationalIndexDefinition = null,
-    /// Default type to use from the document_types.
+    /// Default type to use from the document_schemas.
     default_type: ?[]const u8 = null,
     /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
     enforce_types: ?bool = null,
