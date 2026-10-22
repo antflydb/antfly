@@ -61,6 +61,7 @@ class GrepPackagingTests(unittest.TestCase):
                     "completions/antfly-grep.ps1",
                     "share/man/man1/antfly-grep.1",
                     "share/antfly-grep/schema/document-v1.json",
+                    "share/antfly-grep/schema/document-v2.json",
                     "share/antfly-grep/schema/workspace-request-v1.json",
                     "share/antfly-grep/COMPATIBILITY.md",
                 ]:

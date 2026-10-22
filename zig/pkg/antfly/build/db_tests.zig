@@ -700,11 +700,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addCuratedTestRunArtifact(b, parent_match_all_tests, &parent_match_all_filters).step);
     const logical_db_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "logical query primary", "logical query sort" },
+        .filters = &.{ "logical query primary", "logical query sort", "logical source certificates" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("logical-field-db-test", "Run logical-field native primary and indexed query contracts")
-        .dependOn(&addFilteredTestRunArtifact(b, logical_db_tests).step);
+    const logical_db_step = b.step("logical-field-db-test", "Run logical-field native primary and indexed query contracts");
+    logical_db_step.dependOn(&addFilteredTestRunArtifact(b, logical_db_tests).step);
+    const source_proof_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_proof_registry.zig"),
+        .target = antfly_test_mod.resolved_target,
+        .optimize = antfly_test_mod.optimize,
+    }) });
+    const source_proof_run = b.addRunArtifact(source_proof_tests);
+    logical_db_step.dependOn(&source_proof_run.step);
+    b.step("source-proof-test", "Run bounded source certificate ownership and race tests").dependOn(&source_proof_run.step);
 
     const lib_db_query_step = b.step("antfly-storage-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);

@@ -132106,14 +132106,69 @@ const StoredLogicalSources = struct {
     db: *DB,
     view: ?schema_registry_mod.SchemaView,
     txn: docstore_mod.DocStore.Txn,
+    proof_token: ?@import("../source_proof_registry.zig").Token = null,
     repair_requested: bool = false,
+    profile: ?@import("../logical_source.zig").ReadProfile = null,
     fn close(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.profile) |*profile| profile.report();
         self.txn.abort();
         if (self.view) |*v| v.release();
         const a = self.a;
         a.destroy(self);
     }
+    const CertifiedScope = struct {
+        upstream: *@import("../backend_erased.zig").ReadScope,
+        owner: *StoredLogicalSources,
+        pub fn getManySorted(self: *@This(), keys: []const []const u8, output: []?[]const u8) !void {
+            try self.upstream.getManySorted(keys, output);
+        }
+        pub fn getRangesMany(self: *@This(), requests: []const @import("../backend_erased.zig").RangeRequest) !void {
+            try self.upstream.getRangesMany(requests);
+        }
+        pub fn loadProofWindow(self: *@This(), a: Allocator, physical: []const []const u8, ids: []const []const u8, proofs: []?@import("../document_mutation_revision.zig").Content, timestamps: []u64) !void {
+            const revisions = @import("../document_mutation_revision.zig");
+            const registry = &self.owner.db.core.store.source_certificates;
+            var missing: [64][]const u8 = undefined;
+            var names: [64][]const u8 = undefined;
+            var indices: [64]usize = undefined;
+            var count: usize = 0;
+            var identities: [64][32]u8 = undefined;
+            var cached: [64]?@TypeOf(registry.*).Facts = undefined;
+            for (physical, 0..) |row, i| {
+                const key = revisions.keyForPhysical(row) orelse return error.InvalidArgument;
+                identities[i] = key[key.len - 32 ..].*;
+            }
+            registry.getMany(self.owner.proof_token, identities[0..physical.len], cached[0..physical.len]);
+            for (physical, ids, 0..) |row, id, i| {
+                if (cached[i]) |facts| {
+                    if (facts.content.kind == row[row.len - 1]) {
+                        proofs[i] = facts.content;
+                        timestamps[i] = facts.timestamp;
+                        if (self.owner.profile) |*p| _ = p.proof_cache_hits.fetchAdd(1, .monotonic);
+                        continue;
+                    }
+                }
+                if (self.owner.profile) |*p| _ = p.proof_cache_misses.fetchAdd(1, .monotonic);
+                missing[count] = row;
+                names[count] = id;
+                indices[count] = i;
+                count += 1;
+            }
+            var fetched: [64]?revisions.Content = @splat(null);
+            var times: [64]u64 = @splat(0);
+            if (count > 0) try revisions.loadWindow(self.upstream, a, missing[0..count], names[0..count], fetched[0..count], times[0..count]);
+            var registrations: [64]?@TypeOf(registry.*).Facts = @splat(null);
+            for (indices[0..count], fetched[0..count], times[0..count]) |i, proof, timestamp| {
+                proofs[i] = proof;
+                timestamps[i] = timestamp;
+                if (proof) |content| {
+                    registrations[i] = .{ .content = content, .timestamp = timestamp };
+                }
+            }
+            if (count > 0) registry.putMany(self.owner.db.core.store.alloc, self.owner.proof_token, identities[0..physical.len], registrations[0..physical.len]);
+        }
+    };
     fn load(raw: *anyopaque, alloc: Allocator, ids: []const []const u8, roots: []const []const u8) anyerror![]db_query_search.LogicalSourceRow {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (ids.len > 64) return error.InvalidBatch;
@@ -132124,10 +132179,11 @@ const StoredLogicalSources = struct {
         for (ids, keys[0..ids.len]) |id, *key| key.* = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, id, self.view);
         var scope = try self.txn.openReadScope(a);
         defer scope.close();
+        var certified: CertifiedScope = .{ .upstream = &scope, .owner = self };
         // Empty roots deliberately load complete bodies from this same cut.
         // Authentication here authorizes omitted ranges, not primary reads;
         // skipped metadata must not masquerade as missing authority to repair.
-        const rows = try @import("../logical_source.zig").load(alloc, a, &scope, keys[0..ids.len], ids, roots, roots.len != 0 and self.db.core.store.valuesAreAuthenticated());
+        const rows = try @import("../logical_source.zig").loadProfiled(alloc, a, &certified, keys[0..ids.len], ids, roots, roots.len != 0 and self.db.core.store.valuesAreAuthenticated(), if (self.profile) |*p| p else null);
         if (!self.repair_requested and !openModeRequiresReadOnlyBackends(self.db.open_mode)) {
             for (rows) |row| if (row.repair_authority) {
                 self.repair_requested = true;
@@ -132152,7 +132208,11 @@ fn openStoredLogicalSourcesCallback(ctx: ?*anyopaque, a: Allocator) anyerror!?db
     };
     const owner = try a.create(StoredLogicalSources);
     errdefer a.destroy(owner);
-    owner.* = .{ .a = a, .db = db, .view = view, .txn = try db.core.store.beginReadTxn() };
+    const before = db.core.store.source_certificates.capture();
+    var txn = try db.core.store.beginReadTxn();
+    errdefer txn.abort();
+    const token = db.core.store.source_certificates.confirm(before);
+    owner.* = .{ .a = a, .db = db, .view = view, .txn = txn, .proof_token = token, .profile = if (getenv("ANTFLY_BENCH_LOGICAL_SOURCE_PHASES")) |flag| if (std.mem.eql(u8, flag, "1")) .{} else null else null };
     return .{ .ctx = owner, .load = StoredLogicalSources.load, .close = StoredLogicalSources.close };
 }
 
@@ -142300,4 +142360,60 @@ test "lite generation cleanup and capacity accounting survive reopen (#1210)" {
     try std.testing.expectError(error.FileNotFound, storage.fileSize(corrupt_file));
     try std.testing.expectEqual(@as(u64, 40), try storage.fileSize(active_file));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, base, .{}));
+}
+
+test "logical source certificates skip revision reads across unrelated writes and reject stale registration" {
+    const a = std.testing.allocator;
+    var temporary = try TestDirectory.init("source-certificates");
+    defer temporary.cleanup();
+    var db = try DB.open(a, temporary.path(), .{});
+    defer db.close();
+    const padding = try a.alloc(u8, 16384);
+    defer a.free(padding);
+    @memset(padding, 'x');
+    const before = try std.fmt.allocPrint(a, "{{\"body\":\"old\",\"unindexed\":1,\"padding\":\"{s}\"}}", .{padding});
+    defer a.free(before);
+    const after = try std.fmt.allocPrint(a, "{{\"body\":\"new\",\"unindexed\":2,\"padding\":\"{s}\"}}", .{padding});
+    defer a.free(after);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = before }} });
+    const Free = struct {
+        fn rows(items: []db_query_search.LogicalSourceRow) void {
+            for (items) |row| if (row.bytes) |bytes| std.testing.allocator.free(bytes);
+            std.testing.allocator.free(items);
+        }
+    };
+    const old = (try openStoredLogicalSourcesCallback(&db, a)).?;
+    defer old.close(old.ctx);
+    {
+        const rows = try old.load(old.ctx, a, &.{"doc"}, &.{"body"});
+        defer Free.rows(rows);
+        try std.testing.expect(std.mem.indexOf(u8, rows[0].bytes.?, "old") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), db.core.store.source_certificates.entries.count());
+    try db.batch(.{ .writes = &.{.{ .key = "unrelated", .value = "{\"body\":\"other\"}" }} });
+    const warm = (try openStoredLogicalSourcesCallback(&db, a)).?;
+    defer warm.close(warm.ctx);
+    const warm_owner: *StoredLogicalSources = @ptrCast(@alignCast(warm.ctx));
+    warm_owner.profile = .{};
+    {
+        const rows = try warm.load(warm.ctx, a, &.{"doc"}, &.{"body"});
+        defer Free.rows(rows);
+        try std.testing.expect(std.mem.indexOf(u8, rows[0].bytes.?, "old") != null);
+        try std.testing.expectEqual(@as(u64, 1), warm_owner.profile.?.proof_cache_hits.load(.monotonic));
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = after }} });
+    {
+        const rows = try old.load(old.ctx, a, &.{"doc"}, &.{"body"});
+        defer Free.rows(rows);
+        try std.testing.expect(std.mem.indexOf(u8, rows[0].bytes.?, "old") != null);
+        try std.testing.expectEqual(@as(usize, 0), db.core.store.source_certificates.entries.count());
+    }
+    const fresh = (try openStoredLogicalSourcesCallback(&db, a)).?;
+    defer fresh.close(fresh.ctx);
+    {
+        const rows = try fresh.load(fresh.ctx, a, &.{"doc"}, &.{"body"});
+        defer Free.rows(rows);
+        try std.testing.expect(std.mem.indexOf(u8, rows[0].bytes.?, "new") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), db.core.store.source_certificates.entries.count());
 }
