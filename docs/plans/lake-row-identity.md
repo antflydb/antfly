@@ -370,9 +370,10 @@ coordinate maps enter the same publication certificate, reader lease, GC and res
 closure. Rank-free maps update the union of changed IDs on both the old/new native
 and physical sides; additions take priority over deleted addresses during swaps.
 They retain unchanged COW pages rather than re-sorting all rows after membership
-changes. Canonical tie ranks come from current physical membership. Competitive
-text hits resolve ranks in batches of 64; each operation owns its cache and shares
-map/tree paths without holding a mutex across remote I/O. Exact multi-seeks,
+changes. Canonical tie ranks come from current physical membership. Text rank
+lookups wait for equal-score comparisons or final winners; repeated score classes
+resolve in batches of 64. Each operation owns its cache and shares map/tree paths
+without holding a mutex across remote I/O. Exact multi-seeks,
 lower-bound covering seeks, and batched ranks partition requests by authenticated
 child fences. Independent children load in waves of at most eight through shared
 query I/O admission. Each wave joins on success, failure, or cancellation; budget
@@ -618,3 +619,19 @@ reallocation or arena destruction; sealing observes a complete batch. Durable
 certificate writes remain atomic and namespace epochs still invalidate changed
 payloads. An optional prefetch quota decline cannot override a later explicit
 source, integrity or lease failure in publication diagnostics.
+
+
+Ranked collectors defer relocation tie lookup while scores alone determine heap
+and cursor order. Bounded tiles batch repeated score classes; a heap resolves
+cross-tile ties before comparisons, and final winners are prepared before pure
+sorting or delivery. Sift paths are planned before mutation, so navigation or
+allocation failure cannot leave a partially reordered heap. Scalar consumers
+also support batch-only resolver capabilities. The 257 distinct-score regression
+resolves only its three winners; equal-score workloads preserve their batched
+navigation and canonical pagination.
+
+Private native segment reads park CPU admission before waiting on a blocking
+`std.Io.Mutex`. The lock protects shared file buffers and is released before CPU
+admission resumes, including read failures. Independent prefetch reads use the
+same lock without borrowing the serial builder's scheduling callback. No file
+lock spans a CPU/I/O admission transition.

@@ -273,6 +273,10 @@
     "manifest_prefetch_allocator": "enclosing build/host quotas preserved alongside scheduler reservation",
     "navigation_resident_bytes_max": 16777216,
     "navigation_resident_entries_max": 256,
-    "navigation_residency": "separate from compact file-order and planning metadata"
+    "navigation_residency": "separate from compact file-order and planning metadata",
+    "distinct_score_candidate_fixture_rows": 257,
+    "distinct_score_fixture_resolved_ranks": 3,
+    "heap_rank_resolution": "score ties and final winners; repeated score classes batched",
+    "local_segment_read_lock": "blocking std.Io mutex, outside CPU/I/O admission transitions"
   }
 }

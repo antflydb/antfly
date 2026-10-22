@@ -51,6 +51,7 @@ test {
     _ = @import("api/lake_index_ordered_rows.zig");
     _ = @import("api/lake_index_native_files.zig");
     _ = @import("api/lake_index_native_text.zig");
+    _ = @import("api/lake_index_segment_spill.zig");
     _ = @import("api/lake_index_native_sparse.zig");
     _ = @import("api/lake_row_identity_delta.zig");
     _ = @import("api/lake_row_identity_build.zig");

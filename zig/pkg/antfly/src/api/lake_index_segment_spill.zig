@@ -26,7 +26,7 @@ pub const LocalSegment = struct {
     test_ahead_reads: if (@import("builtin").is_test) std.atomic.Value(usize) else void = if (@import("builtin").is_test) .init(0) else {},
     statistics: ?*@import("lake_index_text_statistics.zig").Captured = null,
     store: *stores.ArtifactStore,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
     buffer: [16 * 1024]u8 = undefined,
     used: usize = 0,
     pub fn empty(a: A, manager: *local.sql_spill.Manager, store: *stores.ArtifactStore) !*LocalSegment {
@@ -131,11 +131,12 @@ pub const LocalSegment = struct {
     }
     fn read(raw: *anyopaque, offset: u64, target: []u8) !void {
         const self: *LocalSegment = @ptrCast(@alignCast(raw));
-        @import("antfly_platform").sync.lockYielding(&self.mutex);
-        defer self.mutex.unlock();
+        // Park CPU before waiting on the shared file, then drop its lock before
+        // restoring CPU admission. A reader holding the last CPU permit cannot
+        // block an I/O owner that needs that permit before releasing this file.
         var phase = try self.store.beginIo(1);
         defer phase.abort();
-        self.file.readRaw(offset, target) catch |err| return phase.failed(err);
+        self.readLocked(offset, target) catch |err| return phase.failed(err);
         try phase.finish();
     }
     /// Borrow a local immutable file through a separately admitted I/O task.
@@ -149,9 +150,12 @@ pub const LocalSegment = struct {
     fn readUnadmitted(raw: *anyopaque, offset: u64, target_: []u8) !void {
         const self: *LocalSegment = @ptrCast(@alignCast(raw));
         if (@import("builtin").is_test) _ = self.test_ahead_reads.fetchAdd(1, .monotonic);
-        @import("antfly_platform").sync.lockYielding(&self.mutex);
-        defer self.mutex.unlock();
-        try self.file.readRaw(offset, target_);
+        try self.readLocked(offset, target_);
+    }
+    fn readLocked(self: *LocalSegment, offset: u64, target: []u8) !void {
+        try self.mutex.lock(self.file.manager.io);
+        defer self.mutex.unlock(self.file.manager.io);
+        try self.file.readRaw(offset, target);
     }
     fn close(_: *anyopaque) void {}
     pub fn source(self: *LocalSegment) local.index.SegmentSource {
@@ -233,3 +237,52 @@ pub const AdaptiveSink = struct {
         return .{ .ptr = self, .vtable = &.{ .len = length, .append_slice = appendSlice, .append_byte = appendByte, .append_ntimes = appendNTimes, .write_at = writeAt, .crc32_prefix = crcPrefix, .crc32_range = crcRange, .resident_bytes = resident } };
     }
 };
+
+test "external lake segment spill releases file locks across admission and read failures" {
+    const a = std.testing.allocator;
+    var store: stores.ArtifactStore = undefined;
+    store.io_phase = null;
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.check };
+    defer manager.deinit();
+    const segment = try LocalSegment.create(a, &manager, &store, "immutable native segment");
+    defer segment.release();
+    const Probe = struct {
+        segment: *LocalSegment,
+        begins: usize = 0,
+        finishes: usize = 0,
+        aborted: usize = 0,
+        fn unlocked(self: *@This()) !void {
+            if (!self.segment.mutex.tryLock()) return error.SegmentLockHeldAcrossAdmission;
+            self.segment.mutex.unlock(std.testing.io);
+        }
+        fn begin(raw: *anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.unlocked();
+            try std.testing.expectEqual(@as(usize, 1), count);
+            self.begins += 1;
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.unlocked();
+            self.finishes += 1;
+        }
+        fn abort(raw: *anyopaque) void {
+            @as(*@This(), @ptrCast(@alignCast(raw))).aborted += 1;
+        }
+    };
+    var probe: Probe = .{ .segment = segment };
+    const phase: stores.IoPhase = .{ .io = std.testing.io, .ptr = &probe, .max_parallel = 1, .begin = Probe.begin, .finish = Probe.finish, .abort = Probe.abort };
+    store.io_phase = &phase;
+    var output: [9]u8 = undefined;
+    try LocalSegment.read(segment, 0, &output);
+    try std.testing.expectEqualStrings("immutable", &output);
+    try std.testing.expectError(error.InvalidSqlSpill, LocalSegment.read(segment, segment.file.size + 1, &output));
+    try probe.unlocked();
+    try std.testing.expectEqual(@as(usize, 2), probe.begins);
+    try std.testing.expectEqual(probe.begins, probe.finishes);
+    try std.testing.expectEqual(@as(usize, 0), probe.aborted);
+}
