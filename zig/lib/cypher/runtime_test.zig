@@ -7098,3 +7098,146 @@ test "range pipeline certificates and tuple window proofs release failed allocat
         "UNWIND range(1,30) AS i UNWIND [0,1,0] AS x RETURN i-i AS g,count(*)",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
 }
+
+test "ordered lineage composes DISTINCT singleton stages domains and ranked windows" {
+    const a = std.testing.allocator;
+    for ([_]struct { text: []const u8, expected: []const u8 }{
+        .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT x+1 AS y RETURN avg(y)", .expected = "[[500001.5]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT 7 AS y RETURN count(*),sum(y),avg(y)", .expected = "[[1,7,7]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x+1 AS y CALL {RETURN 7 AS z} RETURN avg(y)", .expected = "[[500001.5]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x+1 AS y UNWIND [7] AS z RETURN avg(y)", .expected = "[[500001.5]]" },
+        .{ .text = "UNWIND range(1,500000)+range(500001,1000000) AS x WITH x WHERE x%2=0 RETURN count(*),sum(x),avg(x)", .expected = "[[500000,250000500000,500001]]" },
+        .{ .text = "UNWIND reverse(range(1,500000)+range(500001,1000000)) AS x WITH x+1 AS y RETURN avg(y)", .expected = "[[500001.5]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x WHERE x<6 OR x>999995 RETURN count(*),sum(x)", .expected = "[[10,5000005]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x WHERE x%2=0 RETURN x,count(*) ORDER BY x LIMIT 5", .expected = "[[2,1],[4,1],[6,1],[8,1],[10,1]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x+1 AS y RETURN y,count(*) ORDER BY y LIMIT 5", .expected = "[[2,1],[3,1],[4,1],[5,1],[6,1]]" },
+        .{ .text = "UNWIND [7] AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5", .expected = "[[1,0.33333333333333337],[2,0.33333333333333337],[3,0.33333333333333337],[4,0.33333333333333337],[5,0.33333333333333337]]" },
+        .{ .text = "UNWIND range(900001,1000000)+range(1,900000) AS x WITH x+1 AS y RETURN y,count(*) ORDER BY y SKIP 2 LIMIT 5", .expected = "[[4,1],[5,1],[6,1],[7,1],[8,1]]" },
+    }) |item| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, item.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 });
+        defer result.deinit();
+        try std.testing.expect(result.stats.intermediate_states < 1500);
+        const encoded = try std.json.Stringify.valueAlloc(a, result.rows, .{});
+        defer a.free(encoded);
+        try std.testing.expectEqualStrings(item.expected, encoded);
+    }
+    for ([_][]const u8{ "UNWIND [7] AS z", "CALL {RETURN 7 AS z}", "WITH 7 AS z", "UNWIND [7] AS z WITH z" }) |prefix| {
+        const text = try std.fmt.allocPrint(a, "{s} UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i SKIP 2 LIMIT 5", .{prefix});
+        defer a.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 3), result.rows[0][0].integer);
+        try std.testing.expect(result.stats.intermediate_states < 1500);
+    }
+}
+
+test "ordered lineage retains bag order empty scopes eager errors and scalar fallbacks" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "range(-10,10)", "reverse(range(-10,10))",                         "range(-10,0)+range(1,10)",                         "reverse(range(-10,0)+range(1,10))", "range(-5,5)+range(-2,8)",
+        "range(1,0)",    "range(9223372036854775790,9223372036854775807)", "range(-9223372036854775808,-9223372036854775790)",
+    }) |source| for ([_][]const u8{
+        "WITH DISTINCT x+1 AS y RETURN count(*),sum(y),avg(y),avg(DISTINCT y)",
+        "WITH DISTINCT x-x AS y RETURN count(*),sum(y),avg(y)",
+        "WITH x+1 AS y CALL {RETURN 7 AS z} RETURN count(*),sum(y),avg(y)",
+        "WITH x AS y CALL {WITH 1 AS z WHERE false RETURN count(*) AS z} RETURN count(*),sum(y),avg(y)",
+        "WITH x AS y CALL {RETURN 7 AS z LIMIT 0} RETURN count(*),avg(y)",
+        "WITH x AS y CALL {RETURN 1/0 AS z} RETURN count(*),sum(y)",
+        "WITH x AS y CALL {RETURN 7 AS y} RETURN count(*),avg(y)",
+        "WITH x+1 AS y UNWIND [7] AS z RETURN count(*),sum(y),avg(y)",
+        "WITH x+1 AS y UNWIND [] AS z RETURN count(*),sum(y),avg(y)",
+        "WITH x WHERE x<0 OR x>3 RETURN count(*),sum(x),avg(x)",
+        "WITH x WHERE x!=2 AND x%3=0 RETURN count(*),sum(x),avg(x)",
+        "WITH x WHERE x<0 OR x%3=1 RETURN count(*),sum(x),avg(x)",
+        "WITH x WHERE true OR 1/0=1 RETURN count(*)",
+        "WITH x WHERE null OR 1/0=1 RETURN count(*)",
+        "WITH x WHERE x<0 OR x+9223372036854775807>0 RETURN count(*)",
+        "WITH x+1 AS y WHERE x>0 RETURN y,count(*) ORDER BY y LIMIT 2",
+        "WITH x WHERE x%2=0 RETURN x,count(*) ORDER BY x DESC SKIP 1 LIMIT 3",
+        "WITH DISTINCT x+1 AS y RETURN y,count(*) ORDER BY y SKIP 1 LIMIT 2",
+    }) |tail| {
+        const text = try std.fmt.allocPrint(a, "UNWIND {s} AS x {s}", .{ source, tail });
+        defer a.free(text);
+        const control = try std.fmt.allocPrint(a, "UNWIND {s} AS x WITH x WHERE x IS NOT NULL {s}", .{ source, tail });
+        defer a.free(control);
+        try compareReductionPlans(text, control);
+    };
+    for ([_][]const u8{ "[7]", "[7,8]", "[]" }) |prefix| {
+        const text = try std.fmt.allocPrint(a, "UNWIND {s} AS z UNWIND range(30,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 2", .{prefix});
+        defer a.free(text);
+        const control = try std.fmt.allocPrint(a, "UNWIND {s} AS z UNWIND range(30,1,-1) AS i WITH i,z WHERE i IS NOT NULL UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 2", .{prefix});
+        defer a.free(control);
+        try compareReductionPlans(text, control);
+    }
+}
+
+test "ordered lineage records logical DISTINCT CALL filter and singleton prefix stages" {
+    const a = std.testing.allocator;
+    for ([_]struct { text: []const u8, counts: []const usize }{
+        .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT x+1 AS y CALL {RETURN 7 AS z} RETURN avg(y)", .counts = &.{ 1000000, 1000000, 1000000 } },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT 7 AS y RETURN count(*)", .counts = &.{ 1000000, 1 } },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x AS y CALL {RETURN 7 AS z LIMIT 0} RETURN count(*)", .counts = &.{ 1000000, 1000000, 0 } },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH x WHERE x%2=0 RETURN x,count(*) ORDER BY x LIMIT 5", .counts = &.{ 1000000, 500000 } },
+        .{ .text = "UNWIND [7] AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5", .counts = &.{ 1, 1000000, 3000000 } },
+    }) |item| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, item.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 });
+        defer result.deinit();
+        for (item.counts, 0..) |count, index| try std.testing.expectEqual(count, result.stages[index].output_rows);
+    }
+}
+
+test "ordered lineage programs release allocations after proof and packet failures" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, text: []const u8) !void {
+            var callbacks = backing.vtable.*;
+            callbacks.resize = std.mem.Allocator.noResize;
+            callbacks.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &callbacks };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    for ([_][]const u8{
+        "UNWIND range(1,20) AS x WITH DISTINCT x+1 AS y CALL {RETURN 7 AS z} RETURN avg(y)",
+        "UNWIND range(-20,0)+range(1,20) AS x WITH x WHERE x<3 OR x>17 RETURN count(*),sum(x),avg(x)",
+        "UNWIND range(1,20) AS x WITH x+1 AS y RETURN y,count(*) ORDER BY y LIMIT 2",
+        "UNWIND [7] AS z UNWIND range(20,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 2",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
+}
+
+test "ordered lineage singleton probes preserve nested CALL recursion limits" {
+    const a = std.testing.allocator;
+    // The four-call case reaches the optimized pipeline at depth four. Its
+    // child probe must still count the outer CALL, requiring depth five.
+    for ([_]struct { text: []const u8, depth: usize }{
+        .{ .text = "UNWIND range(1,20) AS x WITH x+1 AS y CALL {CALL {RETURN 7 AS z} RETURN z} RETURN avg(y)", .depth = 3 },
+        .{ .text = "UNWIND range(1,20) AS x WITH x+1 AS y CALL {CALL {CALL {CALL {RETURN 7 AS z} RETURN z} RETURN z} RETURN z} RETURN avg(y)", .depth = 5 },
+    }) |item| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, item.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        for (0..item.depth) |depth| {
+            try std.testing.expectError(error.CypherRecursionBudgetExceeded, runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .recursion_depth = depth }));
+        }
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .recursion_depth = item.depth });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(f64, 11.5), result.rows[0][0].number);
+    }
+}

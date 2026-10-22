@@ -7009,3 +7009,98 @@ def test_tuple_keys_and_singleton_calls_compose_monotone_windows(graph_db, key, 
         assert result["plan"][2]["output_rows"] == 3000000
     assert result["stats"]["intermediate_states"] < 1000
     assert result["stats"]["memory_bytes"] < 200000
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(
+    "source,tail,control_source,control_tail",
+    [
+        (
+            "range(1,1000000)",
+            "WITH DISTINCT x+1 AS y RETURN avg(y)",
+            "range(1,1000000)",
+            "RETURN avg(DISTINCT x+1)",
+        ),
+        (
+            "range(1,1000000)",
+            "WITH DISTINCT 7 AS y RETURN count(*),sum(y),avg(y)",
+            "[7]",
+            "RETURN count(*),sum(x),avg(x)",
+        ),
+        (
+            "range(1,1000000)",
+            "WITH x+1 AS y CALL {RETURN 7 AS z} RETURN avg(y)",
+            "range(1,1000000)",
+            "CALL {RETURN 7 AS z} RETURN avg(x+1)",
+        ),
+        (
+            "range(1,1000000)",
+            "WITH x+1 AS y UNWIND [7] AS z RETURN avg(y)",
+            "range(1,1000000)",
+            "RETURN avg(x+1)",
+        ),
+        (
+            "range(1,500000)+range(500001,1000000)",
+            "WITH x WHERE x%2=0 RETURN count(*),sum(x),avg(x)",
+            "range(2,1000000,2)",
+            "RETURN count(*),sum(x),avg(x)",
+        ),
+        (
+            "range(1,500000)+range(500001,1000000)",
+            "WITH x+1 AS y RETURN avg(y)",
+            "range(1,500000)+range(500001,1000000)",
+            "RETURN avg(x+1)",
+        ),
+        (
+            "range(1,1000000)",
+            "WITH x WHERE x<6 OR x>999995 RETURN count(*),sum(x)",
+            "range(1,5)+range(999996,1000000)",
+            "RETURN count(*),sum(x)",
+        ),
+        (
+            "range(1,1000000)",
+            "WITH x WHERE x%2=0 RETURN x,count(*) ORDER BY x LIMIT 5",
+            "range(2,1000000,2)",
+            "RETURN x,count(*) ORDER BY x LIMIT 5",
+        ),
+        (
+            "range(1,1000000)",
+            "WITH x+1 AS y RETURN y,count(*) ORDER BY y LIMIT 5",
+            "range(1,1000000)",
+            "RETURN x+1 AS y,count(*) ORDER BY y LIMIT 5",
+        ),
+        (
+            "range(900001,1000000)+range(1,900000)",
+            "WITH x+1 AS y RETURN y,count(*) ORDER BY y SKIP 2 LIMIT 5",
+            "range(1,1000000)",
+            "RETURN x+1 AS y,count(*) ORDER BY y SKIP 2 LIMIT 5",
+        ),
+    ],
+)
+def test_ordered_lineage_composes_million_value_domains_and_consumers(
+    graph_db, source, tail, control_source, control_tail, reverse
+):
+    if reverse:
+        source = f"reverse({source})"
+        control_source = f"reverse({control_source})"
+    result = graph_db.cypher_json(
+        "g",
+        {"query": f"UNWIND {source} AS x {tail}", "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20}},
+    )
+    expected = graph_db.cypher_json("g", {"query": f"UNWIND {control_source} AS x {control_tail}"})
+    assert result["rows"] == expected["rows"]
+    assert result["plan"][0]["output_rows"] == 1000000
+    assert result["stats"]["intermediate_states"] < 1500
+    assert result["stats"]["memory_bytes"] < 250000
+
+
+@pytest.mark.parametrize("prefix", ["UNWIND [7] AS z", "CALL {RETURN 7 AS z}", "WITH 7 AS z", "UNWIND [7] AS z WITH z"])
+def test_certified_unit_prefix_keeps_ranked_windows_bounded(graph_db, prefix):
+    query = "UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i SKIP 2 LIMIT 5"
+    result = graph_db.cypher_json(
+        "g", {"query": f"{prefix} {query}", "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20}}
+    )
+    expected = graph_db.cypher_json("g", {"query": query})
+    assert result["rows"] == expected["rows"]
+    assert result["stats"]["intermediate_states"] < 1500
+    assert result["stats"]["memory_bytes"] < 250000

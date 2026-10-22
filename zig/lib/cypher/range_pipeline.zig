@@ -26,6 +26,7 @@ pub const Binding = struct { name: []const u8, value: Known };
 pub const Context = struct {
     a: std.mem.Allocator,
     sequence: Range,
+    parts: ?[]const Range = null,
     bindings: []const Binding,
     positions: std.StringHashMapUnmanaged(usize) = .empty,
     parameters: []const v.Entry,
@@ -45,6 +46,101 @@ pub const Context = struct {
         try result.setBindings(bindings.items);
         return result;
     }
+    /// Ordered bag segments; no set normalization may reorder or erase copies.
+    pub fn ranges(self: *const Context) []const Range {
+        return self.parts orelse @as(*const [1]Range, @ptrCast(&self.sequence));
+    }
+    pub fn domainLength(self: *const Context) u128 {
+        var total: u128 = 0;
+        for (self.ranges()) |part| total +|= part.length;
+        return total;
+    }
+    pub fn firstValue(self: *const Context) ?v.Value {
+        for (self.ranges()) |part| if (part.length != 0) return part.at(0);
+        return null;
+    }
+    pub fn setRanges(self: *Context, parts: []const Range) void {
+        self.parts = parts;
+    }
+    pub fn bind(self: *Context, name: []const u8, value: v.Value) !void {
+        var entries: std.ArrayList(Binding) = .empty;
+        try entries.appendSlice(self.a, self.bindings);
+        if (self.positions.get(name)) |position| {
+            entries.items[position].value = known(value);
+        } else try entries.append(self.a, .{ .name = name, .value = known(value) });
+        try self.setBindings(entries.items);
+    }
+    pub fn injective(self: *Context) !bool {
+        const size = (try @import("range.zig").distinctCardinalityWork(self.a, self.ranges(), self.ptr, self.charge)) orelse return false;
+        return size == self.domainLength();
+    }
+    pub fn render(self: *const Context, raw: i64) ![]const v.Entry {
+        const row = try self.a.alloc(v.Entry, self.bindings.len);
+        for (self.bindings, row) |entry, *cell| cell.* = .{ .name = entry.name, .value = switch (entry.value) {
+            .scalar => |value| value,
+            .integer => |form| .{ .integer = std.math.cast(i64, @as(i128, form.scale) * raw + form.offset) orelse return error.CypherIntegerOverflow },
+        } };
+        return row;
+    }
+    fn subrange(part: Range, start: u128, count: u128) Range {
+        return .{ .start = if (count == 0) part.start else part.at(start).integer, .step = part.step, .length = count };
+    }
+    fn countBelow(part: Range, bound: i128) u128 {
+        if (part.length == 0) return 0;
+        const end = part.at(part.length - 1).integer;
+        const low = @min(part.start, end);
+        const high = @max(part.start, end);
+        if (bound < low) return 0;
+        if (bound >= high) return part.length;
+        return @intCast(@divTrunc(bound - low, @as(i128, @intCast(@abs(@as(i128, part.step))))) + 1);
+    }
+    /// Select a raw-value rank boundary, retaining original encounter order.
+    /// NULL rank means stable source ties. At most 64 charged binary rounds,
+    /// independent of the number of represented rows.
+    pub fn window(self: *Context, capacity: u128, ascending: ?bool) ![]const Range {
+        var selected: std.ArrayList(Range) = .empty;
+        const keep = @min(capacity, self.domainLength());
+        if (keep == 0) return &.{};
+        if (ascending == null) {
+            var left = keep;
+            for (self.ranges()) |part| {
+                const count = @min(left, part.length);
+                if (count != 0) try selected.append(self.a, subrange(part, 0, count));
+                left -= count;
+                if (left == 0) break;
+            }
+            return selected.items;
+        }
+        if (self.ranges().len == 1) {
+            const part = self.ranges()[0];
+            try selected.append(self.a, subrange(part, if ((part.step > 0) == ascending.?) 0 else part.length - keep, keep));
+            return selected.items;
+        }
+        var low: i128 = std.math.maxInt(i64);
+        var high: i128 = std.math.minInt(i64);
+        for (self.ranges()) |part| if (part.length != 0) {
+            const end = part.at(part.length - 1).integer;
+            low = @min(low, @min(part.start, end));
+            high = @max(high, @max(part.start, end));
+        };
+        const ordinal = if (ascending.?) keep else self.domainLength() - keep + 1;
+        while (low < high) {
+            const middle = low + @divTrunc(high - low, 2);
+            var count: u128 = 0;
+            for (self.ranges()) |part| {
+                try self.charge(self.ptr, 1);
+                count +|= countBelow(part, middle);
+            }
+            if (count < ordinal) low = middle + 1 else high = middle;
+        }
+        for (self.ranges()) |part| {
+            const below = countBelow(part, if (ascending.?) low else low - 1);
+            const count = if (ascending.?) below else part.length - below;
+            const prefix = (part.step > 0) == ascending.?;
+            if (count != 0) try selected.append(self.a, subrange(part, if (prefix) 0 else part.length - count, count));
+        }
+        return selected.items;
+    }
     fn known(value: v.Value) Known {
         return if (value == .integer) .{ .integer = Form.literal(value.integer) } else .{ .scalar = value };
     }
@@ -57,11 +153,18 @@ pub const Context = struct {
         }
     }
     fn bounded(self: *Context, form: Form) ?Form {
-        if (self.sequence.length == 0) return null;
-        const first = @as(i128, form.scale) * self.sequence.start + form.offset;
-        const last = @as(i128, form.scale) * self.sequence.at(self.sequence.length - 1).integer + form.offset;
+        if (self.domainLength() == 0) return null;
+        var low: i128 = std.math.maxInt(i64);
+        var high: i128 = std.math.minInt(i64);
+        for (self.ranges()) |part| {
+            if (part.length == 0) continue;
+            const first_value = @as(i128, form.scale) * part.start + form.offset;
+            const last_value = @as(i128, form.scale) * part.at(part.length - 1).integer + form.offset;
+            low = @min(low, @min(first_value, last_value));
+            high = @max(high, @max(first_value, last_value));
+        }
         var result = form;
-        result.interval = .{ .low = std.math.cast(i64, @min(first, last)) orelse return null, .high = std.math.cast(i64, @max(first, last)) orelse return null };
+        result.interval = .{ .low = std.math.cast(i64, low) orelse return null, .high = std.math.cast(i64, high) orelse return null };
         return result;
     }
     pub fn integer(self: *Context, expression_value: *const ast.Expr) !?Form {
@@ -112,7 +215,7 @@ pub const Context = struct {
     /// WITH expressions share the old scope. WHERE overlays projected names on
     /// that old scope; its output drops unprojected input names afterwards.
     pub fn project(self: *Context, projection: ast.Projection, names: []const []const u8) !bool {
-        if (projection.distinct or projection.order.len != 0 or projection.skip != null or projection.limit != null) return false;
+        if (projection.order.len != 0 or projection.skip != null or projection.limit != null) return false;
         var output: std.ArrayList(Binding) = .empty;
         if (projection.wildcard) try output.appendSlice(self.a, self.bindings);
         for (projection.items, names) |item, name| try output.append(self.a, .{ .name = name, .value = (try self.expression(item.expression)) orelse return false });
@@ -132,6 +235,25 @@ pub const Context = struct {
             if (!try self.restrict(predicate_value)) return false;
         }
         try self.setBindings(output.items);
+        if (projection.distinct and self.domainLength() != 0) {
+            var varying = false;
+            for (output.items) |entry| {
+                if (entry.value == .integer) {
+                    varying = varying or entry.value.integer.scale != 0;
+                } else switch (entry.value.scalar) {
+                    .null, .boolean, .string => {},
+                    .number => |n| if (!std.math.isFinite(n)) return false,
+                    else => return false,
+                }
+            }
+            if (varying) {
+                if (!try self.injective()) return false;
+            } else {
+                const selected = try self.a.alloc(Range, 1);
+                selected[0] = .{ .start = self.firstValue().?.integer, .step = 1, .length = 1 };
+                self.parts = selected;
+            }
+        }
         return true;
     }
     fn slice(self: *Context, first: u128, end: u128) void {
@@ -172,7 +294,12 @@ pub const Context = struct {
             .eq => self.slice(low, high),
             .gte => self.slice(low, self.sequence.length),
             .gt => self.slice(high, self.sequence.length),
-            .neq => if (low == high) {} else if (low == 0) self.slice(high, self.sequence.length) else if (high == self.sequence.length) self.slice(0, low) else return false,
+            .neq => if (low == high) {} else if (low == 0) self.slice(high, self.sequence.length) else if (high == self.sequence.length) self.slice(0, low) else {
+                const pieces = try self.a.alloc(Range, 2);
+                pieces[0] = .{ .start = self.sequence.start, .step = self.sequence.step, .length = low };
+                pieces[1] = .{ .start = self.sequence.at(high).integer, .step = self.sequence.step, .length = self.sequence.length - high };
+                self.parts = pieces;
+            },
             else => return false,
         }
         return true;
@@ -224,11 +351,69 @@ pub const Context = struct {
         self.sequence = .{ .start = self.sequence.at(first).integer, .step = step, .length = length };
         return true;
     }
+    /// Union relative to one incoming sequence, preserving its ordinal order.
+    /// Overlapping incompatible lattices decline instead of interleaving badly.
+    fn unionParts(self: *Context, left: []const Range, right: []const Range) !bool {
+        var pieces: std.ArrayList(Range) = .empty;
+        for ([_][]const Range{ left, right }) |runs| for (runs) |part| {
+            if (part.length == 0) continue;
+            if (pieces.items.len == 128) return false;
+            try pieces.append(self.a, part);
+        };
+        const Order = struct {
+            fn less(descending: bool, x: Range, y: Range) bool {
+                return if (descending) x.start > y.start else x.start < y.start;
+            }
+        };
+        try self.charge(self.ptr, pieces.items.len *| 8);
+        std.mem.sort(Range, pieces.items, self.sequence.step < 0, Order.less);
+        var size: usize = 0;
+        for (pieces.items) |part| {
+            if (size != 0) {
+                const prior = &pieces.items[size - 1];
+                const end = prior.at(prior.length - 1).integer;
+                const distance = (@as(i128, part.start) - end) * @as(i128, if (self.sequence.step < 0) -1 else 1);
+                if (distance <= 0) {
+                    if (prior.step != part.step or @rem(@as(i128, part.start) - prior.start, prior.step) != 0) return false;
+                    const last = part.at(part.length - 1).integer;
+                    const span = @divTrunc(@as(i128, last) - prior.start, prior.step) + 1;
+                    prior.length = @max(prior.length, @as(u128, @intCast(span)));
+                    continue;
+                }
+            }
+            pieces.items[size] = part;
+            size += 1;
+        }
+        self.parts = pieces.items[0..size];
+        return true;
+    }
     pub fn restrict(self: *Context, predicate_value: *const ast.Expr) anyerror!bool {
+        if (self.parts) |parts| {
+            var output: std.ArrayList(Range) = .empty;
+            for (parts) |part| {
+                var leaf = self.*;
+                leaf.parts = null;
+                leaf.sequence = part;
+                if (!try leaf.restrict(predicate_value)) return false;
+                for (leaf.ranges()) |selected| if (selected.length != 0) {
+                    if (output.items.len == 128) return false;
+                    try output.append(self.a, selected);
+                };
+            }
+            self.parts = output.items;
+            return true;
+        }
         try self.charge(self.ptr, 1);
         if (self.sequence.length == 0) return true;
         if (predicate_value.value == .binary) {
             const b = predicate_value.value.binary;
+            if (b.op == .@"or") {
+                var left = self.*;
+                if (!try left.restrict(b.left)) return false;
+                var right = self.*;
+                if (!try right.restrict(b.right)) return false;
+                return self.unionParts(left.ranges(), right.ranges());
+            }
             if (b.op == .@"and") {
                 // AND evaluates both operands, even when the left is false or
                 // NULL. Prove both over the complete incoming domain before
@@ -238,6 +423,7 @@ pub const Context = struct {
                 var right = self.*;
                 if (!try right.restrict(b.right)) return false;
                 self.sequence = left.sequence;
+                self.parts = left.parts;
                 return self.restrict(b.right);
             }
             if (b.op == .eq) {

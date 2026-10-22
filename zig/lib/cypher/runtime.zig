@@ -4392,77 +4392,157 @@ const Engine = struct {
             if (fold.record_rows) fold.stage_counts[0] +|= weight;
             return fold.expand(engine, initial, 0);
         }
-        /// Collapse a reached, total affine/filter program into one ordered
-        /// reducer contribution, retaining every original logical stage count.
-        fn scalarRange(fold: *@This(), engine: *Engine, row: Row, index: usize, unwind: @FieldType(@FieldType(ast.Clause, "operation"), "unwind"), source: ListSource) anyerror!bool {
-            if (!engine.read_only or !fold.axis_enabled or fold.axis_trace != null or fold.consumer != null or fold.continuation != null or fold.group_window != null or fold.ordered_index != null or fold.active_calls != null or source.values != .range or fold.calls.len == 0 or fold.projection.wildcard) return false;
-            const tail = fold.middle[index + 1 ..];
-            if (tail.len == 0) return false;
-            for (tail) |clause| {
-                if (clause.operation != .project) return false;
-                const p = clause.operation.project.value;
-                if (p.distinct or p.order.len != 0 or p.skip != null or p.limit != null) return false;
-                for (p.items) |item| if (aggregates(item.expression)) return false;
+        const Pipeline = @import("range_pipeline.zig");
+        const RangeProgram = struct {
+            context: Pipeline.Context,
+            end: usize,
+            lengths: []const u64,
+        };
+        /// A single reached producer invocation, not merely a unit weight from
+        /// one of many outer rows. Prefixes may filter but cannot fan out.
+        fn unitPrefix(fold: *@This(), index: usize) bool {
+            if (!fold.single_seed or !fold.weight.isOne()) return false;
+            for (fold.middle[0..index]) |clause| switch (clause.operation) {
+                .project => |p| {
+                    for (p.value.items) |item| if (aggregates(item.expression)) return false;
+                },
+                .unwind => |u| if (u.expression.value != .list or u.expression.value.list.len > 1) return false,
+                .subquery => |inner| if (!unitReturningCall(inner)) return false,
+                else => return false,
+            };
+            return true;
+        }
+        fn pipelineIndependent(context: *const Pipeline.Context, expression: anytype) bool {
+            for (context.bindings) |entry| {
+                const varying = entry.value == .integer and entry.value.integer.scale != 0;
+                const structural = entry.value == .scalar and !primitive(entry.value.scalar);
+                if ((varying or structural) and !independentExpressions(expression, entry.name)) return false;
             }
-            var sequence = source.values.range;
-            if (sequence.length > std.math.maxInt(u64)) return false;
-            if (source.reversed and sequence.length != 0) {
-                sequence.start = sequence.at(sequence.length - 1).integer;
-                sequence.step = if (sequence.length == 1) 1 else std.math.negate(sequence.step) catch return false;
+            return true;
+        }
+        /// Certify the reached row-local prefix before publishing any group.
+        /// CALLs run on one child input; their own reducers/windows stay local.
+        fn rangeProgram(fold: *@This(), engine: *Engine, row: Row, index: usize, alias: []const u8, ranges: []const @import("range.zig").Range) anyerror!?RangeProgram {
+            var context = try Pipeline.Context.init(engine.a, .{ .start = 0, .step = 1, .length = 0 }, row, alias, engine.parameters, engine, Engine.chargeWork);
+            context.setRanges(ranges);
+            const counts = try engine.a.alloc(u64, fold.middle.len - index - 1);
+            var end = index + 1;
+            for (fold.middle[index + 1 ..]) |clause| {
+                if (context.domainLength() > std.math.maxInt(u64)) return null;
+                if (context.domainLength() != 0) switch (clause.operation) {
+                    .project => |step| {
+                        const p = step.value;
+                        if (p.order.len != 0 or p.skip != null or p.limit != null) break;
+                        var grouped = false;
+                        for (p.items) |item| grouped = grouped or aggregates(item.expression);
+                        if (grouped or (p.distinct and !fold.unitPrefix(index))) break;
+                        const names = try engine.a.alloc([]const u8, p.items.len);
+                        for (p.items, names) |item, *name| name.* = item.alias orelse try engine.expressionName(item.expression);
+                        if (!try context.project(p, names)) return null;
+                    },
+                    .subquery => |inner| {
+                        if (!unitReturningCall(inner) or !pipelineIndependent(&context, inner)) break;
+                        for (context.bindings) |entry| if (entry.value == .integer and entry.value.integer.scale != 0) {
+                            if (!try engine.independentUnitCall(inner, entry.name)) return null;
+                        };
+                        const input = try context.render(context.firstValue().?.integer);
+                        engine.recursion += 1;
+                        defer engine.recursion -= 1;
+                        if (engine.recursion > engine.limits.recursion_depth) return null;
+                        const scope = PatternScope.enter(engine);
+                        defer scope.leave(engine);
+                        const columns = engine.columns;
+                        const stages = engine.stages;
+                        engine.stages = .empty;
+                        defer engine.columns = columns;
+                        defer engine.stages = stages;
+                        const child = engine.runWeightedRows(inner, .{ .rows = &.{input}, .weights = &.{Count.one} }, true, true) catch |err| {
+                            if (StreamingAggregate.consumerFailure(err)) return null;
+                            return err;
+                        };
+                        if (child.rows.len > 1 or (child.rows.len == 1 and !child.weights[0].isOne())) return null;
+                        if (child.rows.len == 0) context.setRanges(&.{}) else {
+                            var merged = input;
+                            for (child.rows[0]) |entry| {
+                                if (!primitive(entry.value)) return null;
+                                merged = (try engine.bind(merged, entry.name, entry.value)) orelse return null;
+                                try context.bind(entry.name, entry.value);
+                            }
+                        }
+                    },
+                    .unwind => |u| {
+                        if (!axisPure(u.expression) or !pipelineIndependent(&context, u.expression)) break;
+                        const input = try context.render(context.firstValue().?.integer);
+                        const source = engine.unwindSource(u.expression, input) catch |err| {
+                            if (StreamingAggregate.consumerFailure(err)) return null;
+                            return err;
+                        };
+                        if (source) |values| {
+                            if (values.length() > 1) break;
+                            if (values.length() == 0) context.setRanges(&.{}) else {
+                                const value = values.at(0);
+                                if (!primitive(value)) return null;
+                                try context.bind(u.alias, value);
+                            }
+                        } else context.setRanges(&.{});
+                    },
+                    else => break,
+                };
+                counts[end - index - 1] = @intCast(context.domainLength());
+                end += 1;
             }
+            return .{ .context = context, .end = end, .lengths = counts[0 .. end - index - 1] };
+        }
+        fn recordRangeProgram(fold: *@This(), engine: *Engine, index: usize, original: u128, program: RangeProgram) !void {
+            if (!fold.record_rows) return;
+            fold.stage_counts[index + 1] +|= @intCast((try fold.weight.multiply(engine.a, Count.init(@intCast(original)))).cap(std.math.maxInt(usize)));
+            for (program.lengths, index + 2..) |length, stage| fold.stage_counts[stage] +|= @intCast((try fold.weight.multiply(engine.a, Count.init(length))).cap(std.math.maxInt(usize)));
+        }
+        /// Shared checked lineage for scalar reducers and key-ranked windows.
+        fn orderedPipeline(fold: *@This(), engine: *Engine, row: Row, index: usize, alias: []const u8, ranges: []const @import("range.zig").Range) anyerror!bool {
+            if (!engine.read_only or !fold.axis_enabled or fold.axis_trace != null or fold.consumer != null or fold.continuation != null or fold.ordered_index != null or fold.active_calls != null or fold.calls.len == 0 or fold.projection.wildcard) return false;
+            if (fold.group_window == null and index + 1 == fold.middle.len) return false;
             var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
             defer scratch.deinit();
             const scope = EvalScope.enter(engine, scratch.allocator());
             defer scope.leave(engine);
-            var context = try @import("range_pipeline.zig").Context.init(engine.a, sequence, row, unwind.alias, engine.parameters, engine, Engine.chargeWork);
-            const stage_lengths = try engine.a.alloc(u64, tail.len);
-            for (tail, stage_lengths) |clause, *length| {
-                if (context.sequence.length == 0) {
-                    length.* = 0;
-                    continue;
-                }
-                const p = clause.operation.project.value;
-                const names = try engine.a.alloc([]const u8, p.items.len);
-                for (p.items, names) |item, *name| name.* = item.alias orelse try engine.expressionName(item.expression);
-                if (!try context.project(p, names)) return false;
-                length.* = @intCast(context.sequence.length);
-            }
-            if (context.sequence.length == 0) {
-                if (fold.record_rows) {
-                    fold.stage_counts[index + 1] +|= @intCast((try fold.weight.multiply(engine.a, Count.init(@intCast(sequence.length)))).cap(std.math.maxInt(usize)));
-                    for (stage_lengths, index + 2..) |length, stage| fold.stage_counts[stage] +|= @intCast((try fold.weight.multiply(engine.a, Count.init(length))).cap(std.math.maxInt(usize)));
-                }
+            var original: u128 = 0;
+            for (ranges) |part| original +|= part.length;
+            if (original > std.math.maxInt(u64)) return false;
+            var program = (try fold.rangeProgram(engine, row, index, alias, ranges)) orelse return false;
+            var context = &program.context;
+            if (context.domainLength() == 0) {
+                try fold.recordRangeProgram(engine, index, original, program);
                 return true;
             }
-            // A complete axis can enter one group only if every grouping key is
-            // total and invariant over its reached, filtered domain.
+            if (fold.group_window != null) return fold.pipelineWindow(engine, row, index, original, &program);
+            if (program.end != fold.middle.len) return false;
             for (fold.projection.items) |item| if (!aggregates(item.expression)) {
                 const known = (try context.expression(item.expression)) orelse return false;
                 if (known == .integer and known.integer.scale != 0) return false;
                 if (known == .scalar and known.scalar == .number and !std.math.isFinite(known.scalar.number)) return false;
             };
             const slots = try engine.a.alloc(bool, fold.calls.len);
-            const observers = try engine.a.alloc(?RangeObserver, fold.calls.len);
+            const forms = try engine.a.alloc(?Affine, fold.calls.len);
             @memset(slots, false);
-            @memset(observers, null);
-            for (fold.calls, slots, observers) |call_value, *slot, *observer| {
+            @memset(forms, null);
+            for (fold.calls, slots, forms) |call_value, *slot, *form| {
                 const specification = call_value.value.call;
                 if (std.ascii.eqlIgnoreCase(specification.name, "count") and specification.star) continue;
                 if (specification.args.len != 1 or specification.star) return false;
                 if (!std.ascii.eqlIgnoreCase(specification.name, "count") and !std.ascii.eqlIgnoreCase(specification.name, "sum") and !std.ascii.eqlIgnoreCase(specification.name, "avg") and !std.ascii.eqlIgnoreCase(specification.name, "min") and !std.ascii.eqlIgnoreCase(specification.name, "max")) return false;
                 if (std.ascii.eqlIgnoreCase(specification.name, "avg") and !specification.distinct and !fold.weight.isOne()) return false;
-                const form = (try context.integer(specification.args[0])) orelse return false;
-                const observation = (try engine.observeRangeForm(context.sequence, form)) orelse return false;
-                if (std.ascii.eqlIgnoreCase(specification.name, "sum") and !specification.distinct and observation.summary == null) return false;
-                if (std.ascii.eqlIgnoreCase(specification.name, "avg") and !specification.distinct and observation.average == null) return false;
+                form.* = (try context.integer(specification.args[0])) orelse return false;
                 slot.* = true;
-                observer.* = observation;
             }
-            var representative = try engine.replace(row, unwind.alias, context.sequence.at(0));
-            for (tail) |clause| {
-                const output = try engine.projectUnordered(&.{representative}, clause.operation.project.value, false);
-                if (output.len != 1) return error.CypherInvalidBackendPage;
-                representative = output[0];
+            const packets = try engine.a.alloc([]const ?RangeObserver, context.ranges().len);
+            for (context.ranges(), packets) |part, *packet| {
+                const observations = try engine.a.alloc(?RangeObserver, fold.calls.len);
+                @memset(observations, null);
+                for (forms, observations) |form, *observation| if (form) |known| {
+                    observation.* = (try engine.observeRangeForm(part, known)) orelse return false;
+                };
+                packet.* = observations;
             }
             const previous = fold.weight;
             const prior_counts = fold.range_counts;
@@ -4478,93 +4558,81 @@ const Engine = struct {
                 fold.axis_observation = prior_observation;
                 fold.axis_copies = prior_copies;
             }
-            fold.range_counts = slots;
-            fold.range_observers = observers;
-            const summary = IntegerListSum.range(context.sequence);
-            fold.range_sum = .{ .value = summary, .weight = previous, .length = @intCast(context.sequence.length) };
-            var observation = AxisObservation.init(fold, slots, summary, previous, @intCast(context.sequence.length), true, null);
-            defer observation.copies.deinit(engine.scratch_allocator);
-            fold.axis_observation = &observation;
-            fold.axis_copies = Count.one;
-            fold.weight = try previous.multiply(engine.a, Count.init(@intCast(context.sequence.length)));
-            if (fold.record_rows) {
-                fold.stage_counts[index + 1] +|= @intCast((try previous.multiply(engine.a, Count.init(@intCast(sequence.length)))).cap(std.math.maxInt(usize)));
-                for (stage_lengths, index + 2..) |length, stage| fold.stage_counts[stage] +|= @intCast((try previous.multiply(engine.a, Count.init(length))).cap(std.math.maxInt(usize)));
+            try fold.recordRangeProgram(engine, index, original, program);
+            for (context.ranges(), packets) |part, packet| {
+                if (part.length == 0) continue;
+                fold.range_counts = slots;
+                fold.range_observers = packet;
+                const summary = IntegerListSum.range(part);
+                fold.range_sum = .{ .value = summary, .weight = previous, .length = @intCast(part.length) };
+                var observation = AxisObservation.init(fold, slots, summary, previous, @intCast(part.length), true, null);
+                defer observation.copies.deinit(engine.scratch_allocator);
+                fold.axis_observation = &observation;
+                fold.axis_copies = Count.one;
+                fold.weight = try previous.multiply(engine.a, Count.init(@intCast(part.length)));
+                try fold.expand(engine, try context.render(part.start), fold.middle.len);
+                try observation.finish(engine, fold);
             }
-            try fold.expand(engine, representative, fold.middle.len);
-            try observation.finish(engine, fold);
             return true;
         }
-        fn monotoneWindow(fold: *@This(), engine: *Engine, row: Row, index: usize, unwind: @FieldType(@FieldType(ast.Clause, "operation"), "unwind"), source: ListSource) anyerror!bool {
-            const window = fold.group_window orelse return false;
-            if (!engine.read_only or !fold.axis_enabled or !fold.single_seed or index != 0 or !fold.weight.isOne() or fold.consumer != null or fold.continuation != null or fold.active_calls != null or fold.ordered_index != null or fold.groups.items.len != 0 or fold.calls.len == 0 or source.values != .range) return false;
-            const sequence = source.values.range;
-            const keep = @min(sequence.length, window.capacity);
-            if (sequence.length <= keep) return false;
+        fn pipelineWindow(fold: *@This(), engine: *Engine, row: Row, index: usize, original: u128, program: *RangeProgram) anyerror!bool {
+            _ = row;
+            const window = fold.group_window.?;
+            if (!fold.unitPrefix(index) or fold.groups.items.len != 0) return false;
+            var context = &program.context;
+            const length = context.domainLength();
+            const keep = @min(length, window.capacity);
+            if (length <= keep) return false;
             var forms: std.ArrayList(?Affine) = .empty;
             var injective = false;
-            const last = sequence.at(sequence.length - 1).integer;
             for (fold.projection.items) |item| if (!aggregates(item.expression)) {
-                const form = if (rangeArgumentShape(item.expression, unwind.alias))
-                    (try engine.rangeArgument(item.expression, unwind.alias, .{ .low = @min(sequence.start, last), .high = @max(sequence.start, last) })) orelse return false
-                else constant: {
-                    switch (item.expression.value) {
-                        .literal, .parameter, .variable => {},
-                        else => return false,
-                    }
-                    const value = engine.constant(item.expression, row) orelse return false;
-                    if (!primitive(value) or (value == .number and !std.math.isFinite(value.number))) return false;
-                    break :constant @as(?Affine, null);
-                };
-                if (form) |known| injective = injective or known.scale != 0;
+                const known = (try context.expression(item.expression)) orelse return false;
+                if (known == .scalar and known.scalar == .number and !std.math.isFinite(known.scalar.number)) return false;
+                const form = if (known == .integer) known.integer else null;
+                if (form) |integer| injective = injective or integer.scale != 0;
                 try forms.append(engine.a, form);
             };
-            if (!injective) return false;
-            // Constant leading rank components do not break ties. The first
-            // varying component is injective over this complete key domain.
-            var ranked: ?struct { scale: i64, descending: bool } = null;
+            if (!injective or !try context.injective()) return false;
+            var ascending: ?bool = null;
             for (window.slots, fold.projection.order) |slot, order| {
                 if (forms.items[slot]) |form| if (form.scale != 0) {
-                    ranked = .{ .scale = form.scale, .descending = order.descending };
+                    ascending = (form.scale > 0) != order.descending;
                     break;
                 };
             }
-            // Preserve the key's identity, and never hide correlated scalar
-            // evaluation, joins, filters, or DISTINCT partition membership.
-            for (fold.middle[index + 1 ..]) |clause| switch (clause.operation) {
-                .unwind => |u| if (std.mem.eql(u8, u.alias, unwind.alias) or !independentExpressions(u.expression, unwind.alias)) return false,
-                .project => |step| {
-                    const projection = step.value;
-                    if (projection.distinct or projection.order.len != 0 or projection.skip != null or projection.limit != null or projection.predicate != null) return false;
-                    var forwarded = false;
-                    for (projection.items) |item| {
-                        const name = item.alias orelse try engine.expressionName(item.expression);
-                        if (std.mem.eql(u8, name, unwind.alias)) {
-                            if (item.expression.value != .variable or !std.mem.eql(u8, item.expression.value.variable, unwind.alias)) return false;
-                            forwarded = true;
-                        } else if (!independentExpressions(item.expression, unwind.alias)) return false;
-                    }
-                    if (!forwarded) return false;
+            // The complete remaining suffix must not observe any varying
+            // prefix binding. Its packet certifies all omitted rows first.
+            for (fold.middle[program.end..]) |clause| switch (clause.operation) {
+                .unwind => |u| {
+                    if (!pipelineIndependent(context, u.expression)) return false;
+                    for (context.bindings) |entry| if (entry.value == .integer and entry.value.integer.scale != 0 and std.mem.eql(u8, entry.name, u.alias)) return false;
                 },
-                .subquery => |inner| if (!try engine.independentUnitCall(inner, unwind.alias)) return false,
+                .project => |step| {
+                    const p = step.value;
+                    if (p.distinct or p.order.len != 0 or p.skip != null or p.limit != null or p.predicate != null) return false;
+                    for (context.bindings) |entry| if (entry.value == .integer and entry.value.integer.scale != 0) {
+                        if (!identityAxis(p, entry.name)) return false;
+                    };
+                },
+                .subquery => |inner| {
+                    for (context.bindings) |entry| if (entry.value == .integer and entry.value.integer.scale != 0) {
+                        if (!try engine.independentUnitCall(inner, entry.name)) return false;
+                    };
+                },
                 else => return false,
             };
-            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
-            defer scratch.deinit();
-            const scope = EvalScope.enter(engine, scratch.allocator());
-            defer scope.leave(engine);
-            const initial = try engine.replace(row, unwind.alias, source.at(0));
-            const plan = (try engine.axisPlan(fold, index + 1, initial)) orelse return false;
+            const initial = try context.render(context.firstValue().?.integer);
+            const plan = (try engine.axisPlan(fold, program.end, initial)) orelse return false;
             var registered = false;
             var accepted = false;
             defer if (!registered) plan.memo.deinit() else if (!accepted) {
                 plan.memo.disabled = true;
             };
-            if (plan.captures.contains(unwind.alias)) return false;
-            try fold.axis_plans.put(fold.retained, index + 1, plan);
+            for (context.bindings) |entry| if (entry.value == .integer and entry.value.integer.scale != 0 and plan.captures.contains(entry.name)) return false;
+            try fold.axis_plans.put(fold.retained, program.end, plan);
             registered = true;
             var key: std.ArrayList(v.Entry) = .empty;
-            for (row) |entry| if (plan.captures.contains(entry.name)) try key.append(engine.a, entry);
+            for (initial) |entry| if (plan.captures.contains(entry.name)) try key.append(engine.a, entry);
             const packet = engine.computeAxis(fold, plan, key.items) catch |err| {
                 if (StreamingAggregate.consumerFailure(err) or err == error.CypherAxisMemoDeclined) return false;
                 return err;
@@ -4579,20 +4647,19 @@ const Engine = struct {
                 return err;
             };
             if (try plan.memo.find(engine, key.items, null) == null) return false;
+            const selected = try context.window(keep, ascending);
             accepted = true;
-            const best_first = if (ranked) |rank| (((sequence.step > 0) != source.reversed) != (rank.scale < 0)) != rank.descending else true;
-            const first = if (best_first) 0 else sequence.length - keep;
-            var ordinal = first;
-            while (ordinal < first + keep) : (ordinal += 1) {
-                try engine.state();
-                const value = sequence.at(if (source.reversed) sequence.length - ordinal - 1 else ordinal);
-                if (!try fold.memoAxis(engine, try engine.replace(row, unwind.alias, value), index + 1)) return error.CypherInvalidBackendPage;
+            try fold.recordRangeProgram(engine, index, original, program.*);
+            for (selected) |part| {
+                var ordinal: u128 = 0;
+                while (ordinal < part.length) : (ordinal += 1) {
+                    try engine.state();
+                    if (!try fold.memoAxis(engine, try context.render(part.at(ordinal).integer), program.end)) return error.CypherInvalidBackendPage;
+                }
             }
             if (fold.record_rows) {
-                const omitted: usize = @intCast(@min(sequence.length - keep, std.math.maxInt(usize)));
-                const extent: usize = @intCast(@min(sequence.length, std.math.maxInt(usize)));
-                fold.stage_counts[index + 1] +|= extent;
-                for (packet.rows[0][1].value.list[1..], index + 1..) |stage_count, offset| fold.stage_counts[offset + 1] +|= omitted *| @as(usize, @intCast(@as(u64, @bitCast(stage_count.integer))));
+                const omitted: usize = @intCast(@min(length - keep, std.math.maxInt(usize)));
+                for (packet.rows[0][1].value.list[1..], program.end..) |stage_count, stage| fold.stage_counts[stage + 1] +|= omitted *| @as(usize, @intCast(@as(u64, @bitCast(stage_count.integer))));
                 fold.matched.* +|= omitted *| @as(usize, @intCast(packet.weights[0].cap(std.math.maxInt(usize))));
             }
             return true;
@@ -4663,6 +4730,18 @@ const Engine = struct {
                                 }
                             }
                         }
+                        if ((fold.group_window != null or index + 1 < fold.middle.len) and engine.read_only and fold.axis_enabled and projectedSource(unwind.expression) and !isRange(unwind.expression) and engine.arithmeticDomainShape(unwind.expression, 0)) {
+                            var ordered_scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                            defer ordered_scratch.deinit();
+                            const ordered_scope = EvalScope.enter(engine, ordered_scratch.allocator());
+                            defer ordered_scope.leave(engine);
+                            var ordered: std.ArrayList(@import("range.zig").Range) = .empty;
+                            var null_source = false;
+                            var source_work: usize = 1024;
+                            if (try engine.orderedRangeSource(unwind.expression, row, false, &ordered, &null_source, 0, &source_work)) {
+                                if (try fold.orderedPipeline(engine, row, index, unwind.alias, if (null_source) &.{} else ordered.items)) return;
+                            }
+                        }
                         if (projectedSource(unwind.expression) and !arithmeticSource(unwind.expression)) {
                             const independent = try fold.independentTail(engine, unwind.alias, index + 1, null);
                             if (!independent and try fold.memoAxis(engine, row, index)) return;
@@ -4674,8 +4753,14 @@ const Engine = struct {
                             return;
                         }
                         var source = (try engine.unwindSource(unwind.expression, row)) orelse return;
-                        if (try fold.monotoneWindow(engine, row, index, unwind, source)) return;
-                        if (try fold.scalarRange(engine, row, index, unwind, source)) return;
+                        if (source.values == .range) {
+                            var sequence = source.values.range;
+                            if (source.reversed and sequence.length != 0) {
+                                sequence.start = sequence.at(sequence.length - 1).integer;
+                                sequence.step = if (sequence.length == 1) 1 else std.math.negate(sequence.step) catch 0;
+                            }
+                            if (sequence.step != 0 and try fold.orderedPipeline(engine, row, index, unwind.alias, &.{sequence})) return;
+                        }
                         const range_proof = if (source.values == .range) try fold.rangeCountProof(engine, unwind.alias, index + 1) else null;
                         const observers = if (range_proof) |proof| try engine.rangeObservers(fold, proof, unwind.expression, row, source.values.range, null, source.reversed) else null;
                         if (fold.window_certificate) |checked| if (observers) |observations| try checked.ranges(engine, fold.calls, observations);
@@ -12358,6 +12443,47 @@ const Engine = struct {
         };
         domain.ranges = try self.planning_allocator.dupe(@import("range.zig").Range, ranges.items);
         return domain;
+    }
+    /// Ordered bag segments are separate from arithmetic set support. Reverse
+    /// changes both child order and leaf direction; repeated branches retain copies.
+    fn orderedRangeSource(self: *Engine, expression: *const ast.Expr, row: Row, reverse: bool, output: *std.ArrayList(@import("range.zig").Range), null_source: *bool, depth: usize, remaining: *usize) anyerror!bool {
+        if (depth > 64 or output.items.len >= 128 or remaining.* == 0) return false;
+        remaining.* -= 1;
+        try self.state();
+        if (expression.execution_list_source) |id| {
+            const source = self.producer_sources.items[id];
+            const owner = self.local_invariants;
+            const locals = self.projection_locals;
+            self.local_invariants = source.owner;
+            self.projection_locals = source.locals;
+            defer self.local_invariants = owner;
+            defer self.projection_locals = locals;
+            return self.orderedRangeSource(source.expression, source.row, reverse, output, null_source, depth + 1, remaining);
+        }
+        if (isRange(expression)) {
+            var part = (try self.rangeInput(expression, row, null)) orelse {
+                null_source.* = true;
+                return true;
+            };
+            if (part.length == 0) return true;
+            if (reverse) {
+                part.start = part.at(part.length - 1).integer;
+                part.step = if (part.length == 1) 1 else std.math.negate(part.step) catch return false;
+            }
+            try output.append(self.a, part);
+            return true;
+        }
+        if (reduction_plan.reversedList(expression)) |input| return self.orderedRangeSource(input, row, !reverse, output, null_source, depth + 1, remaining);
+        const parts = reduction_plan.concatenatedList(expression) orelse return false;
+        // Validate in expression order, even though output encounter order reverses.
+        var left: std.ArrayList(@import("range.zig").Range) = .empty;
+        var right: std.ArrayList(@import("range.zig").Range) = .empty;
+        if (!try self.orderedRangeSource(parts.left, row, reverse, &left, null_source, depth + 1, remaining)) return false;
+        if (!try self.orderedRangeSource(parts.right, row, reverse, &right, null_source, depth + 1, remaining)) return false;
+        if (output.items.len + left.items.len + right.items.len > 128) return false;
+        try output.appendSlice(self.a, if (reverse) right.items else left.items);
+        try output.appendSlice(self.a, if (reverse) left.items else right.items);
+        return true;
     }
     fn domainCount(self: *Engine, length: u128) !Count {
         const low = Count.init(@truncate(length));

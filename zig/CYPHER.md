@@ -2053,14 +2053,29 @@ renaming, arithmetic and predicates. Each intermediate expression is total over
 its own incoming domain, before any following filter narrows that domain.
 Comparison restrictions use bounded ordinal searches; modular equalities solve
 an exact integer congruence and preserve signed-remainder semantics and source
-encounter order. Eager AND operands are independently certified over their full
-incoming domain before intersection. WHERE overlays projected aliases on the
+encounter order. Eager AND and OR operands are independently certified over their
+full incoming domain before intersection or union. Compatible OR branches and
+interior inequalities retain multiple ordered segments; incompatible overlapping
+lattices decline. WHERE overlays projected aliases on the
 input scope; later stages receive only the projected scope. Binding indexes
 preserve first-name lookup and avoid quadratic proof lookup on wide projections.
 The resulting ordered domain feeds the existing aggregate certificates, including
 checked SUM prefixes and exact-recurrence AVG; unsupported or rounded cases
 retain ordinary replay. Empty domains retain grouping slots and do not evaluate
 unreached consumers. Every original logical stage cardinality remains recorded.
+
+The same checked program feeds reductions and ranked windows. Its ordered bag
+segments remain separate from unordered DISTINCT support: concatenation retains
+copies and reversal changes both segment order and leaf direction. Source proof
+work and segment count are bounded, with ordinary replay on a decline. Arithmetic
+WITH DISTINCT keeps an injective tuple without materializing members only after
+proving that its entire reached raw domain has no duplicates; constant tuples
+retain the first encounter. This requires a certified unit producer invocation,
+so repeated outer rows cannot bypass shared DISTINCT membership. Independent
+zero-or-one-row CALLs and singleton UNWINDs extend the program after their values,
+binding compatibility and child-local cardinality are checked. Failed probes
+decline before publishing results. CALL reducers and windows retain unit-input
+semantics, and structural or varying captures keep their ordinary paths.
 
 Total, invariant affine grouping keys can also collapse an unobserved producer
 axis through independent fanout. The grouping key is retained and evaluated on a
@@ -2177,14 +2192,18 @@ rank direction; all-constant ordering retains source encounter order for ties.
 Independent zero-or-one-row CALLs compose with the same suffix packet proof,
 including nested calls and empty-input reducers. Checked nonzero integer affine
 keys share this rank certificate, with negative slopes reversing rank direction.
-Every intermediate key expression must
-be total over the full source interval; a tuple with no injective component or
+Every intermediate key expression must be total over its reached domain; a tuple
+with no injective component or
 unknown forms declines.
 The suffix packet first certifies successful argument evaluation, all
 consumer bounds and all producer stages. Selected keys retain source encounter
 order; omitted logical rows still contribute to stage counters. Correlated
-expressions, joins, DISTINCT stages, filters, key rebinding and uncertified
-packets keep ordinary execution. Failed preflight disables its memo instead of
+expressions, joins and uncertified suffixes keep ordinary execution. Checked
+projections, DISTINCT and filters in the row-local prefix share the ordered
+domain proof. Unit prefixes may include singleton UNWINDs and pure singleton
+CALLs; a general outer fanout still declines. Multiple segments use a charged
+integer rank boundary, then visit selected keys in original encounter order.
+Failed preflight disables its memo instead of
 repeating the same failed probe for each key. Unsafe packet cardinalities
 request the ordinary no-eviction retry. LIMIT 0 still validates the suffix.
 
