@@ -1,0 +1,49 @@
+---
+title: Transaction Outcomes
+sidebar: reference
+description: How to reconcile commits, conflicts, and pending visibility before deciding what to retry
+---
+
+A write response describes both its durable outcome and requested visibility.
+Inspect the response diagnostic `code`, transaction `status`, and conflict details
+before deciding to retry; HTTP status alone is insufficient.
+
+| HTTP response and diagnostic | Meaning | Client action |
+| --- | --- | --- |
+| 409 with `status: "aborted"` and a structured `conflict` (for example `kind: "version_conflict"`) | Optimistic predicates or another transaction condition prevented this attempt from committing. | Refresh the read set and recompute writes after a version conflict. For other conflicts, inspect `retryable`, `retry_scope`, and `retry_after_ms` before retrying. |
+| 409 with `code: "transaction_outcome_unknown"` and `retryable: false` | The request may already have committed. | Do not replay the stateless mutation, even with a new ID. Retain `transaction_id` and follow the response's `recovery` guidance. |
+| 202 with `committed_visibility_pending` or `committed_recovery_pending` | The commit decision is durable; visibility or participant resolution is pending. | Observe/reconcile the committed transaction. Do not submit the business mutation again. |
+| 202 with `committed_repair_required` | The commit decision is durable, with terminal derived-work failure requiring operator repair. | Inspect and repair the affected index/enrichment, then observe visibility; do not replay the write. |
+| 200 with `committed` | The commit and requested barrier completed. | Consume the result. |
+
+Committed mutation envelopes on batch and other write endpoints similarly
+represent committed results with pending visibility or repair debt. A 202 does
+not itself mean the commit outcome is ambiguous. A transport failure or an
+explicit unknown-outcome diagnostic requires reconciliation before replay.
+
+## Explicit sessions for retryable commits
+
+Use `/db/v1/transactions/begin`, stage reads and writes under the returned
+transaction ID, and commit with `/db/v1/transactions/{transaction_id}/commit`
+when the client needs to retry the commit safely by ID. Retain the ID across
+connection failures and retry/reconcile that same session rather than opening
+a new transaction and replaying the mutation. `GET /db/v1/transactions/{transaction_id}` provides read-only reconciliation while
+the session remains available. Its `outcome_unknown` state is not permission to
+repeat writes under a new ID. Session leases and retention still apply.
+
+The stateless `/db/v1/transactions/commit` endpoint submits a read set and writes
+in one request. It cannot give a client that lost its response the same retry
+contract as an explicit session. The implementation's unknown-outcome response
+says to use an explicit session for client-retryable commits; see
+[public write recovery guidance](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfly/src/api/public_table_http.zig)
+and the [transaction/HLC recovery contract](https://github.com/antflydb/antfly/blob/main/zig/DB.md#transaction--hlc-contract).
+
+## Visibility after commit
+
+A durable decision and a completed search visibility barrier are separate
+facts. `sync_level` selects the write-local barrier; pending results do not
+undo the committed decision. See the [write contract](https://github.com/antflydb/antfly/blob/main/zig/DB.md#write-contract)
+and [derived readiness and repair](https://github.com/antflydb/antfly/blob/main/zig/DB.md#readiness-and-repair).
+For writable lake reads, [read requirements](/docs/read-requirements) carry a
+minimum accepted/published frontier; they do not replace transaction recovery
+or identify a retained cursor snapshot.

@@ -42,9 +42,16 @@ installs:
 
 <DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} />
 
-For the Apache-2.0 embedded database and inference runtime, download the matching
-Embedded archive (for example, `antfly-embedded_{ANTFLY_VERSION}_Linux_x86_64_gnu.tar.gz`
-or `antfly-embedded_{ANTFLY_VERSION}_Darwin_arm64.tar.gz`). It contains
+The separate Apache-2.0 Embedded archive layout applies to **v0.3.0+**, including
+the verified [v0.3.0-rc.2 assets](https://github.com/antflydb/antfly/releases/tag/v0.3.0-rc.2).
+Older releases such as v0.2.4 do not publish a matching Embedded archive. Select
+only filenames listed in that release's assets or `artifacts.json`; do not
+construct an Embedded download from the stable version selector above.
+Before stable promotion, use a listed RC asset such as
+`antfly-embedded_0.3.0-rc.2_Darwin_arm64.tar.gz` or
+`antfly-embedded_0.3.0-rc.2_Linux_x86_64_gnu.tar.gz`, or build from a pinned source
+revision using the [repository instructions](https://github.com/antflydb/antfly/tree/main/zig/pkg/antfly-embedded).
+The Embedded archive contains
 `antfly-lite`, `antfly-inference`, `libantfly`, `include/antfly.h`, the private
 inference worker, runtime files, and license notices.
 
