@@ -1,0 +1,1093 @@
+1/111 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...LIGHTONOCR3 admission_items=1 host_scratch=40845184 backend_scratch=242810112 kv=42467328 scratch_limit=4294967296 kv_limit=4294967296
+metal_encoder_timing_frame: encoders=10 gpu_ms=14.734 timed_ms=14.939
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=9.732 timed_ms=9.423
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=8.580 timed_ms=8.521
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=8.509 timed_ms=8.465
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=8.613 timed_ms=8.624
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=8.969 timed_ms=8.870
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=8.529 timed_ms=8.173
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=8.240 timed_ms=8.125
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=8.412 timed_ms=8.198
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=8.151 timed_ms=7.950
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=8.105 timed_ms=7.909
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=8.374 timed_ms=8.126
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=289 gpu_ms=356.448 timed_ms=148.152
+metal_dispatch_profile: pipelines=18 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=126 threadgroups=126 threads=0 grid_items=81984 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=0 threads=61 grid_items=47088 label=termite_apply_rms_norm_rows
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=21233664 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=248832 label=termite_apply_linear_bf16_multi_row
+metal_dispatch_profile_pipeline: rank=5 dispatches=36 threadgroups=0 threads=36 grid_items=17252352 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=0 threads=24 grid_items=37158912 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=24 threadgroups=24 threads=0 grid_items=5376 label=termite_apply_linear_bf16_mm_m64_n32_vec4
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=47775744 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=124416 label=termite_qwen35_norm
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=124416 label=termite_qwen35_prepare
+metal_dispatch_profile_pipeline: rank=12 dispatches=18 threadgroups=0 threads=18 grid_items=1179648 label=termite_qwen35_recurrent
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=1658880 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=14 dispatches=12 threadgroups=0 threads=12 grid_items=6635520 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=5308416 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=0 threads=6 grid_items=5308416 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=6 threads=0 grid_items=20736 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=18 dispatches=6 threadgroups=0 threads=6 grid_items=1327104 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=15.743 timed_ms=9.925
+metal_dispatch_profile: pipelines=18 dispatches=505
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=12 threadgroups=0 threads=12 grid_items=5308416 label=termite_copy_bytes
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=18 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=8.608 timed_ms=5.548
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.889 timed_ms=5.305
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.457 timed_ms=4.867
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.693 timed_ms=5.043
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=11.218 timed_ms=4.731
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.379 timed_ms=5.110
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.075 timed_ms=4.744
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.936 timed_ms=4.699
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.343 timed_ms=4.763
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.067 timed_ms=4.708
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.190 timed_ms=4.796
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.023 timed_ms=4.683
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.208 timed_ms=4.737
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.266 timed_ms=4.906
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.237 timed_ms=4.812
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.138 timed_ms=4.758
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.087 timed_ms=4.681
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.199 timed_ms=4.833
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.942 timed_ms=4.616
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.054 timed_ms=4.681
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+LIGHTONOCR3 tokens prompt=432 completion=21
+LIGHTONOCR3 phases vision_prepare=212 runtime_prepare=0 prefill=595 decode=273 total=1080
+LIGHTONOCR3 memory device_allocated=1961082880 bf16_weights=1503789056 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4251444 tracked=1522233396 scratch_pool=0 tensor_live=24194304 observed_owned=448209592 observed_alias=1503789056 frame_gpu_ms=631
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=5299 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+LIGHTONOCR3 admission_items=1 host_scratch=40845184 backend_scratch=242810112 kv=42467328 scratch_limit=4294967296 kv_limit=4294967296
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.561 timed_ms=5.484
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.926 timed_ms=5.699
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.369 timed_ms=5.314
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.710 timed_ms=5.555
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.704 timed_ms=5.573
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.809 timed_ms=5.620
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.571 timed_ms=5.518
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.257 timed_ms=5.205
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.524 timed_ms=5.465
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.550 timed_ms=5.497
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.493 timed_ms=5.435
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=10 gpu_ms=5.548 timed_ms=5.414
+metal_dispatch_profile: pipelines=7 dispatches=15
+metal_dispatch_profile_pipeline: rank=1 dispatches=4 threadgroups=4 threads=0 grid_items=5724 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=3 threadgroups=0 threads=3 grid_items=3852288 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=3 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=2 threadgroups=2 threads=0 grid_items=3344 label=termite_apply_layer_norm_rows
+metal_dispatch_profile_pipeline: rank=5 dispatches=2 threadgroups=0 threads=2 grid_items=2568192 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=6 dispatches=1 threadgroups=0 threads=1 grid_items=5136384 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=1 threadgroups=1 threads=0 grid_items=636 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_frame: encoders=289 gpu_ms=92.207 timed_ms=74.641
+metal_dispatch_profile: pipelines=18 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=126 threadgroups=126 threads=0 grid_items=81984 label=termite_lightonocr3_mpp_float_32_64
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=0 threads=61 grid_items=47088 label=termite_apply_rms_norm_rows
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=21233664 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=248832 label=termite_apply_linear_bf16_multi_row
+metal_dispatch_profile_pipeline: rank=5 dispatches=36 threadgroups=0 threads=36 grid_items=17252352 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=0 threads=24 grid_items=37158912 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=7 dispatches=24 threadgroups=24 threads=0 grid_items=5376 label=termite_apply_linear_bf16_mm_m64_n32_vec4
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=47775744 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=124416 label=termite_qwen35_norm
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=124416 label=termite_qwen35_prepare
+metal_dispatch_profile_pipeline: rank=12 dispatches=18 threadgroups=0 threads=18 grid_items=1179648 label=termite_qwen35_recurrent
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=1658880 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=14 dispatches=12 threadgroups=0 threads=12 grid_items=6635520 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=5308416 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=0 threads=6 grid_items=5308416 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=6 threads=0 grid_items=20736 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=18 dispatches=6 threadgroups=0 threads=6 grid_items=1327104 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.855 timed_ms=4.564
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.045 timed_ms=4.636
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.010 timed_ms=4.788
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.839 timed_ms=4.482
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.797 timed_ms=4.465
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.921 timed_ms=4.731
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.993 timed_ms=4.652
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.827 timed_ms=4.499
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.876 timed_ms=4.545
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.180 timed_ms=4.631
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.930 timed_ms=4.616
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.057 timed_ms=4.750
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.024 timed_ms=4.598
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.991 timed_ms=4.640
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.077 timed_ms=4.657
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.017 timed_ms=4.482
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.089 timed_ms=4.594
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.035 timed_ms=4.656
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.050 timed_ms=4.618
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=7.183 timed_ms=4.642
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+metal_encoder_timing_frame: encoders=241 gpu_ms=6.899 timed_ms=4.518
+metal_dispatch_profile: pipelines=17 dispatches=493
+metal_dispatch_profile_pipeline: rank=1 dispatches=162 threadgroups=162 threads=0 grid_items=375360 label=termite_lightonocr3_gemv_vec4
+metal_dispatch_profile_pipeline: rank=2 dispatches=61 threadgroups=61 threads=0 grid_items=109 label=termite_apply_rms_norm_rows_simd4_reduce
+metal_dispatch_profile_pipeline: rank=3 dispatches=48 threadgroups=0 threads=48 grid_items=49152 label=termite_apply_add_1x
+metal_dispatch_profile_pipeline: rank=4 dispatches=36 threadgroups=0 threads=36 grid_items=39936 label=termite_slice_last_dim_f32_2d
+metal_dispatch_profile_pipeline: rank=5 dispatches=24 threadgroups=0 threads=24 grid_items=86016 label=termite_apply_activation_multiply_1x
+metal_dispatch_profile_pipeline: rank=6 dispatches=24 threadgroups=24 threads=0 grid_items=12288 label=termite_lightonocr3_gemv_vec4_rows2
+metal_dispatch_profile_pipeline: rank=7 dispatches=18 threadgroups=0 threads=18 grid_items=110592 label=termite_qwen35_conv
+metal_dispatch_profile_pipeline: rank=8 dispatches=18 threadgroups=0 threads=18 grid_items=442368 label=termite_qwen35_history
+metal_dispatch_profile_pipeline: rank=9 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_norm_parallel
+metal_dispatch_profile_pipeline: rank=10 dispatches=18 threadgroups=0 threads=18 grid_items=9216 label=termite_qwen35_prepare_parallel
+metal_dispatch_profile_pipeline: rank=11 dispatches=18 threadgroups=0 threads=18 grid_items=36864 label=termite_qwen35_recurrent_decode
+metal_dispatch_profile_pipeline: rank=12 dispatches=12 threadgroups=0 threads=12 grid_items=3840 label=termite_apply_mrope
+metal_dispatch_profile_pipeline: rank=13 dispatches=12 threadgroups=0 threads=12 grid_items=15360 label=termite_concat_lastdim_f32_2d
+metal_dispatch_profile_pipeline: rank=14 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_activation_1x
+metal_dispatch_profile_pipeline: rank=15 dispatches=6 threadgroups=0 threads=6 grid_items=12288 label=termite_apply_multiply_1x
+metal_dispatch_profile_pipeline: rank=16 dispatches=6 threadgroups=6 threads=0 grid_items=48 label=termite_paged_attention_kv_1x
+metal_dispatch_profile_pipeline: rank=17 dispatches=6 threadgroups=0 threads=6 grid_items=3072 label=termite_paged_f16_kv_seed
+LIGHTONOCR3 tokens prompt=432 completion=21
+LIGHTONOCR3 phases vision_prepare=118 runtime_prepare=0 prefill=141 decode=247 total=506
+LIGHTONOCR3 memory device_allocated=1961213952 bf16_weights=1503789056 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4251444 tracked=1522233396 scratch_pool=0 tensor_live=24194304 observed_owned=448209592 observed_alias=1503789056 frame_gpu_ms=305
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 warm_run=0 ms=526 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+OK
+1 selected; 1 passed; 0 skipped.
+metal_encoder_timing: frames=68 frame_gpu_ms=937.072 timed_ms=599.609 untimed_ms=337.463 dropped=0
+metal_encoder_timing_kernel: rank=1 share=21.3% total_ms=199.250 count=348 avg_us=572.56 label=termite_lightonocr3_mpp_float_32_64
+metal_encoder_timing_kernel: rank=2 share=11.3% total_ms=105.565 count=4536 avg_us=23.27 label=termite_lightonocr3_gemv_vec4
+metal_encoder_timing_kernel: rank=3 share=10.6% total_ms=98.945 count=792 avg_us=124.93 label=termite_qwen35_conv
+metal_encoder_timing_kernel: rank=4 share=9.1% total_ms=85.273 count=24 avg_us=3553.06 label=termite_sdpa_f32_vision_hd64_flash_q32
+metal_encoder_timing_kernel: rank=5 share=3.3% total_ms=30.552 count=1008 avg_us=30.31 label=termite_lightonocr3_gemv_vec4_rows2
+metal_encoder_timing_kernel: rank=6 share=2.6% total_ms=24.068 count=74 avg_us=325.24 label=termite_apply_rms_norm_rows
+metal_encoder_timing_kernel: rank=7 share=1.8% total_ms=17.092 count=36 avg_us=474.78 label=termite_apply_linear_bf16_mm_m64_n32_vec4
+metal_encoder_timing_kernel: rank=8 share=1.6% total_ms=14.661 count=72 avg_us=203.63 label=termite_apply_linear_bf16_multi_row
+metal_encoder_timing_kernel: rank=9 share=0.8% total_ms=7.355 count=1128 avg_us=6.52 label=termite_slice_last_dim_f32_2d
+metal_encoder_timing_kernel: rank=10 share=0.6% total_ms=5.974 count=1056 avg_us=5.66 label=termite_apply_activation_multiply_1x
+metal_encoder_timing_kernel: rank=11 share=0.6% total_ms=5.736 count=312 avg_us=18.38 label=termite_apply_mrope
+metal_encoder_timing_kernel: rank=12 share=0.5% total_ms=5.138 count=1554 avg_us=3.31 label=termite_apply_rms_norm_rows_simd4_reduce

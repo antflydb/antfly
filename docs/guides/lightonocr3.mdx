@@ -483,3 +483,56 @@ GPU execution. This remains unresolved. These are exploratory runs with differin
 not a controlled performance guarantee. Continuous cohort refill and batched
 vision/prefill remain unimplemented. Complete settings, gaps and rejected experiments are retained
 in `zig/pkg/inference/scripts/lightonocr3/results/concurrent_readers_m4_max/README.md`.
+
+### Kernel optimization follow-up
+
+Qualified M4 kernels now fuse single-token recurrent convolution, normalization,
+gates, state update and output normalization. Request-owned recurrent history
+and side weights use fresh storage so small persistent tensors cannot retain
+oversized prefill buffers. The 0.8B decoder also calls the single-token FFN
+fusion. Smaller F32-input TensorOps tiles cover gate/up projections at seven/eight
+rows for 0.8B and four through eight rows for 4B, plus both models' QKV
+projections at four through eight rows. Florence channel-score reductions and
+window softmax distribute work across SIMD groups.
+
+Global LightOn decode attention uses a separate split-K SIMD matrix path for
+head dimension 256, the supported 8/2 and 16/4 query/KV head counts, and contexts
+192–2048. This path rounds query/probability tiles to F16, with F32 accumulation
+and output. Recurrent state and projection activations remain F32 by default.
+Unsupported geometry, hardware or missing pipelines keep the previous paths.
+These isolated kernel gains do not establish whole-page parity.
+
+Measurements, checkpoint hashes, ablations and reproduction instructions are in
+`zig/pkg/inference/scripts/lightonocr3/results/kernel_parity_m4_max/README.md`.
+The final follow-up runs reached 1.58/0.49/3.71 pages/s for 0.8B/4B/Florence,
+versus refreshed references of 2.99/0.85/5.12. Parity remains unfinished.
+These are successive runs on a busy machine with differing precision and
+Florence generation policies, not controlled paired comparisons.
+Three synthetic fixtures check output consistency; they do not establish OCR
+accuracy across real documents. Live-memory admission remains active, including
+for the successful 4B throughput runs.
+
+Kernel rollback switches are:
+
+- `TERMITE_METAL_DISABLE_QWEN35_FUSED_DECODE=1`
+- `TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP=1`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE=1`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE=1`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_GQA_SPLIT=1`
+- `TERMITE_METAL_DISABLE_FLORENCE2_CHANNEL_REDUCTION=1`
+- `TERMITE_METAL_DISABLE_FLORENCE2_WINDOW_SOFTMAX=1`
+
+The concurrency runner exposes matching ablation arguments. Its experimental
+`--prefill-sg-attention` selects the existing F16-tiled prefill kernel;
+`--bf16-prefill-inputs` rounds only bulk projection inputs (32 or more rows),
+while preserving the small-row F32 decode kernels. These options are opt-in;
+validate throughput and output on representative documents before selecting them.
+
+On qualified M4 hardware, Florence readers collect compatible pages for up to
+5 ms before acquiring the provider. A full cohort executes immediately.
+`ANTFLY_FLORENCE2_BATCH_WAIT_US=0` restores the configured generic collection
+window (normally 200 µs); explicit reader overrides are capped at 20 ms.
+This adds a small bounded wait to sparse requests and reduces underfilled
+cohorts under concurrent load. `benchmark_concurrency.py --florence-batch-wait-us`
+controls this independently of the LightOn window. `--profile-reader` enables
+reader phase logs in the opt-in checkpoint test.

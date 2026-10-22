@@ -8458,6 +8458,22 @@ test "LightOnOCR3 Metal recurrent core matches CPU prefill continuation and rese
             defer cb.free(p);
             try std.testing.expect(try cb.decoderRuntimeBeginFrame());
             errdefer cb.decoderRuntimeCancelFrame() catch {};
+            // Prefill leaves large released private buffers in the frame pool.
+            // Persistent history must not capture these oversized allocations.
+            const check_storage = round == 0 and offset == 0 and platform.env.getenvBoolDefault("TERMITE_METAL_BUFFER_REUSE", true);
+            var oversized: [7]?*anyopaque = @splat(null);
+            if (check_storage) {
+                const Tensor = @import("../backends/metal_tensor.zig").MetalTensor;
+                const raw_runtime: *anyopaque = @ptrCast(compute.provider_impl.raw_decode_runtime.?);
+                for (&oversized) |*handle| {
+                    var temporary = try Tensor.deviceAllocateFreshWithAllocator(a, raw_runtime, 4 * 1024 * 1024, .private, &.{1024 * 1024});
+                    handle.* = temporary.deviceHandle();
+                    temporary.deinit();
+                }
+                var probe = try Tensor.deviceAllocateWithAllocator(a, raw_runtime, 512, .private, &.{128});
+                defer probe.deinit();
+                try std.testing.expect(std.mem.indexOfScalar(?*anyopaque, &oversized, probe.deviceHandle()) != null);
+            }
             const queued = round == 2 and count == 1 and try metal_compute_mod.MetalCompute.beginQwen35LinearBatch(&cb, 2);
             var pending = queued;
             defer if (pending) metal_compute_mod.MetalCompute.abortQwen35LinearBatch(&cb);
@@ -8484,6 +8500,11 @@ test "LightOnOCR3 Metal recurrent core matches CPU prefill continuation and rese
                 };
                 const first = (try metal_compute_mod.MetalCompute.qwen35LinearCore(&cb, &state, request)) orelse return error.UnexpectedNull;
                 errdefer cb.free(first);
+                if (check_storage) {
+                    for (state.conv) |tensor| try std.testing.expect(std.mem.indexOfScalar(?*anyopaque, &oversized, tensor.?.deviceHandle()) == null);
+                    try std.testing.expect(std.mem.indexOfScalar(?*anyopaque, &oversized, state.recurrent.?.deviceHandle()) == null);
+                    for (state.weights) |tensor| try std.testing.expect(std.mem.indexOfScalar(?*anyopaque, &oversized, tensor.?.deviceHandle()) == null);
+                }
                 const peer = (try metal_compute_mod.MetalCompute.qwen35LinearCore(&cb, &peer_state, request)) orelse return error.UnexpectedNull;
                 errdefer cb.free(peer);
                 if (queued) {
@@ -9605,10 +9626,11 @@ fn feedForward(
             defer cb.free(up_w);
             const down_w = try getFFNWeight(cb, config, layer, "down", name_buf);
             defer cb.free(down_w);
-            // The integrated 4B OCR decoder can fuse gate/up and SiLU during
-            // single-token decoding. Preserve the paired projection fallback.
+            // Both integrated OCR decoders have qualified gate/up + SiLU
+            // kernels. Keep the paired projection fallback on other profiles.
             if (total == 1 and config.hasQwen35VisionArchitectureContract() and
-                hidden_size == 2560 and inter_size == 9216 and config.num_hidden_layers == 32)
+                ((hidden_size == 1024 and inter_size == 3584 and config.num_hidden_layers == 24) or
+                    (hidden_size == 2560 and inter_size == 9216 and config.num_hidden_layers == 32)))
             {
                 if (try cb.gatedFfnNoBias(&.{
                     .input = input,

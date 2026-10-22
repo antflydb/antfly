@@ -45,7 +45,16 @@ def run(args, model, label, mode, concurrency, output):
             ("TERMITE_METAL_DISABLE_LIGHTONOCR3", "TERMITE_METAL_DISABLE_QWEN35")
         ) or key in (
             "TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS",
+            "TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS",
             "ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE",
+            "ANTFLY_FLORENCE2_BATCH_WAIT_US",
+            "ANTFLY_INFERENCE_READ_PROFILE",
+            "TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION",
+            "TERMITE_METAL_ENABLE_QWEN3VL_PREFILL_SG_ATTENTION",
+            "TERMITE_METAL_DISABLE_QWEN3VL_PREFILL_SG_ATTENTION",
+            "TERMITE_METAL_DISABLE_PREFILL_SG_ATTENTION",
+            "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD",
+            "TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD",
             "TERMITE_SERVER_GENERATE_TIMING",
             "TERMITE_METAL_ENABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED",
             "TERMITE_METAL_DISABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED",
@@ -54,12 +63,39 @@ def run(args, model, label, mode, concurrency, output):
             "TERMITE_METAL_DISABLE_QWEN35_CORE_PARALLEL_NORM",
             "TERMITE_METAL_LIGHTONOCR3_SMALL_MPP",
             "TERMITE_METAL_FLORENCE2_ENCODER_MIRRORS",
+            "TERMITE_METAL_DISABLE_FLORENCE2_CHANNEL_REDUCTION",
+            "TERMITE_METAL_DISABLE_FLORENCE2_WINDOW_SOFTMAX",
+            "TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP",
+            "TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE",
         ):
             del env[key]
+    if args.bf16_prefill_inputs:
+        env["TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS"] = "1"
+    if args.prefill_sg_attention:
+        env["TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION"] = "1"
+    if args.prefill_direct_kv:
+        env["TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD"] = "1"
+    if args.profile_reader:
+        env["ANTFLY_INFERENCE_READ_PROFILE"] = "1"
+    env["ANTFLY_FLORENCE2_BATCH_WAIT_US"] = str(args.florence_batch_wait_us)
     if args.deferred_attention == "on":
         env["TERMITE_METAL_ENABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED"] = "1"
     elif args.deferred_attention == "off":
         env["TERMITE_METAL_DISABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED"] = "1"
+    if args.disable_florence_window_softmax:
+        env["TERMITE_METAL_DISABLE_FLORENCE2_WINDOW_SOFTMAX"] = "1"
+    if args.disable_ocr_ffn_fusion:
+        env["TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP"] = "1"
+    if args.disable_ocr_attention:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_GQA_SPLIT"] = "1"
+    if args.disable_qkv_small_tile:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE"] = "1"
+    if args.disable_ffn_small_tile:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE"] = "1"
+    if args.disable_recurrent_fusion:
+        env["TERMITE_METAL_DISABLE_QWEN35_FUSED_DECODE"] = "1"
+    if args.disable_florence_channel_reduction:
+        env["TERMITE_METAL_DISABLE_FLORENCE2_CHANNEL_REDUCTION"] = "1"
     if args.disable_recurrent_batch:
         env["TERMITE_METAL_DISABLE_QWEN35_CORE_BATCH"] = "1"
     if args.disable_recurrent_encoder:
@@ -226,6 +262,11 @@ def main():
     parser.add_argument("--batch-rows", type=int, default=4)
     parser.add_argument("--batch-window", type=int, default=8)
     parser.add_argument("--batch-wait-us", type=int, default=5000)
+    parser.add_argument("--florence-batch-wait-us", type=int, default=5000)
+    parser.add_argument("--profile-reader", action="store_true")
+    parser.add_argument("--prefill-sg-attention", action="store_true")
+    parser.add_argument("--bf16-prefill-inputs", action="store_true")
+    parser.add_argument("--prefill-direct-kv", action="store_true")
     parser.add_argument("--decode-wait-us", type=int, default=1000)
     parser.add_argument(
         "--deferred-attention", choices=["auto", "on", "off"], default="auto"
@@ -237,6 +278,13 @@ def main():
     )
     parser.add_argument("--disable-tiled-projections", action="store_true")
     parser.add_argument("--disable-recurrent-batch", action="store_true")
+    parser.add_argument("--disable-recurrent-fusion", action="store_true")
+    parser.add_argument("--disable-ffn-small-tile", action="store_true")
+    parser.add_argument("--disable-qkv-small-tile", action="store_true")
+    parser.add_argument("--disable-ocr-attention", action="store_true")
+    parser.add_argument("--disable-florence-window-softmax", action="store_true")
+    parser.add_argument("--disable-ocr-ffn-fusion", action="store_true")
+    parser.add_argument("--disable-florence-channel-reduction", action="store_true")
     parser.add_argument("--disable-recurrent-encoder", action="store_true")
     parser.add_argument("--disable-recurrent-norm", action="store_true")
     parser.add_argument("--disable-step-pool", action="store_true")
@@ -273,6 +321,8 @@ def main():
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    if args.prefill_direct_kv and not args.prefill_sg_attention:
+        parser.error("direct KV prefill requires --prefill-sg-attention")
     if args.requests < 1 or any(c < 1 or c > 16 for c in args.concurrency):
         parser.error("requests must be positive; concurrency must be 1..16")
     if args.admission_units < 1:
@@ -287,6 +337,8 @@ def main():
         parser.error("choose only one Florence mirror override")
     if not 0 <= args.decode_wait_us <= 10000:
         parser.error("decode wait must be 0..10000 microseconds")
+    if not 0 <= args.florence_batch_wait_us <= 20000:
+        parser.error("Florence batch wait must be 0..20000 microseconds")
     if not 0 <= args.batch_wait_us <= 20000:
         parser.error("batch wait must be 0..20000 microseconds")
     if any(

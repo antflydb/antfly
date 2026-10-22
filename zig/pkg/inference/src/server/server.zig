@@ -8466,7 +8466,7 @@ pub const Node = struct {
                 .max_bytes = broker_contract.batch.max_encoded_media_bytes,
                 .max_pixels = broker_contract.batch.max_decoded_pixels orelse std.math.maxInt(u64),
                 .max_tokens = max_batch_tokens,
-                .max_wait_us = self.config.executor_microbatch_max_wait_us,
+                .max_wait_us = nativeReadCollectionWaitUs(self.config.executor_microbatch_max_wait_us, broker_fence.backend()),
             },
             shapes,
             identities,
@@ -8721,7 +8721,7 @@ pub const Node = struct {
                 .max_bytes = std.math.maxInt(usize),
                 .max_pixels = broker_contract.batch.max_decoded_pixels orelse std.math.maxInt(u64),
                 .max_tokens = max_batch_tokens,
-                .max_wait_us = self.config.executor_microbatch_max_wait_us,
+                .max_wait_us = nativeReadCollectionWaitUs(self.config.executor_microbatch_max_wait_us, broker_fence.backend()),
             },
             shapes,
             identities,
@@ -25335,6 +25335,15 @@ fn effectiveLightOnReadWindow() usize {
     return @min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_WINDOW") orelse 8, 1), 16);
 }
 
+/// Give concurrent OCR pages time to reach the same cohort before acquiring
+/// the serialized provider. A short generic tensor window underfills readers
+/// on a busy CPU; retain that window for unqualified backends and explicit 0.
+fn nativeReadCollectionWaitUs(configured: u64, backend: backends_mod.BackendType) u64 {
+    if (backend != .metal or !@import("../backends/metal_runtime.zig").qualifiedM4DeviceDefault()) return configured;
+    const reader_wait = @min(platform.env.getenvUsize("ANTFLY_FLORENCE2_BATCH_WAIT_US") orelse 5000, 20000);
+    return @max(configured, reader_wait);
+}
+
 pub fn effectiveNativeReadBatchSize() usize {
     return readers_mod.nativeFlorenceReadBatchSize();
 }
@@ -38676,6 +38685,8 @@ test "LightOnOCR3 HTTP read rejects untrained prompts before loading weights" {
 }
 
 test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
+    // Reader profiling is opt-in; the test runner normally hides info logs.
+    if (platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE")) std.testing.log_level = .info;
     const model_dir = if (std.c.getenv("ANTFLY_TEST_LIGHTONOCR3_MODEL_DIR")) |value| std.mem.span(value) else return error.SkipZigTest;
     // The opt-in full checkpoint has hundreds of thousands of tokenizer
     // allocations; allocator stack tracing would dominate this smoke test.

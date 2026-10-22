@@ -1690,16 +1690,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (state.key_heads != 0 and (state.key_heads != request.key_heads or state.value_heads != request.value_heads)) return error.InvalidTensorShape;
         state.key_heads = request.key_heads;
         state.value_heads = request.value_heads;
+        // These buffers survive prefill and every subsequent decode frame.
+        // Reusing an arbitrarily larger prefill temporary here pins its whole
+        // allocation for the request, even when the state is only a few bytes.
         for (&state.conv) |*tensor| {
-            if (tensor.* == null) tensor.* = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, channels * request.conv_kernel * 4, .private, &.{ @intCast(channels), @intCast(request.conv_kernel) });
+            if (tensor.* == null) tensor.* = try MetalTensor.deviceAllocateFreshWithAllocator(self.allocator, runtime, channels * request.conv_kernel * 4, .private, &.{ @intCast(channels), @intCast(request.conv_kernel) });
         }
-        if (state.recurrent == null) state.recurrent = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, request.value_heads * request.dim * request.dim * 4, .private, &.{ @intCast(request.value_heads), @intCast(request.dim), @intCast(request.dim) });
+        if (state.recurrent == null) state.recurrent = try MetalTensor.deviceAllocateFreshWithAllocator(self.allocator, runtime, request.value_heads * request.dim * request.dim * 4, .private, &.{ @intCast(request.value_heads), @intCast(request.dim), @intCast(request.dim) });
         const weight_inputs = [_]CT{ request.conv_weight, request.a_log, request.dt_bias, request.norm_weight };
         for (weight_inputs, &state.weights) |input, *tensor| {
             if (tensor.* == null) {
                 const host = try cb.toFloat32(input, self.allocator);
                 defer self.allocator.free(host);
-                var device = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, host.len * 4, .private, &.{@intCast(host.len)});
+                var device = try MetalTensor.deviceAllocateFreshWithAllocator(self.allocator, runtime, host.len * 4, .private, &.{@intCast(host.len)});
                 errdefer device.deinit();
                 try device.uploadBytes(std.mem.sliceAsBytes(host));
                 tensor.* = device;

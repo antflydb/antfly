@@ -1,0 +1,33 @@
+{
+  "lighton08": {
+    "repository": "lightonai/LightOnOCR-3-0.8B",
+    "revision": "36d8636925327c671bd8e479c517a004f7566bd9",
+    "weight_file": "model.safetensors",
+    "weight_bytes": 1706030528,
+    "weight_sha256": "ae46aa6fd7136d57297ac006ed9ec345b7a2083feb2e99501bedcb014ca3efdf"
+  },
+  "lighton4b": {
+    "repository": "lightonai/LightOnOCR-3-4B",
+    "revision": "b71010f095dc3735de7ee6b9969bff8f8f50b39a",
+    "weight_file": "model.safetensors",
+    "weight_bytes": 9078620536,
+    "weight_sha256": "6b0dab74a2dab02d5b10ca56322255024ed8dca35c02746b42e9f296aaeb4e67"
+  },
+  "florence-fp16": {
+    "repository": "microsoft/Florence-2-base",
+    "revision": "5ca5edf5bd017b9919c05d08aebef5e4c7ac3bac",
+    "weight_file": "model.safetensors",
+    "weight_bytes": 463221266,
+    "weight_sha256": "03075d2d2d2bbd3e180b9ba0afae4aa8563226e2d32911656966e05b2f2ee060"
+  },
+  "florence-native": {
+    "publisher": "antflydb/florence-2-base",
+    "weights": [
+      {
+        "file": "Florence-2-base.Q4_K.gguf",
+        "bytes": 141657728,
+        "sha256": "523000d1759e8a61469aaf33378c6c8affe2ff107b6bbfd1b82a44b53f4bd156"
+      }
+    ]
+  }
+}
