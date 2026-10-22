@@ -165,10 +165,14 @@ fallbacks still apply to each decoded character code.
 Embedded-text quality assessment samples bounded intervals across the page,
 with deterministic offsets to avoid repeatedly sampling the same position in
 repeated prose. A spaced heading alone should not condemn readable body text;
-a clean prefix should not hide corruption later in the page. Numeric recovery
-rejects broken-prose rows rather than appending their split digits to a better
-OCR transcription. Row fragmentation uses alphabetic tokens and requires at
-least four consecutive letter fragments including lowercase text. Interleaved
+a clean prefix should not hide corruption later in the page. When both embedded
+and OCR text pass the configured quality checks, retain the embedded text;
+sampled-ratio differences and a longer OCR result do not establish an improvement.
+Forced OCR still guarantees an attempt, with selection subject to these checks.
+
+Numeric recovery rejects broken-prose rows rather than appending their split
+digits to a better OCR transcription. Row fragmentation uses alphabetic tokens
+and requires at least four consecutive letter fragments including lowercase text. Interleaved
 class labels, letter/value pairs, and uppercase column labels remain eligible;
 numeric cells neither dilute broken labels nor count as fragmented prose.
 Reliable numeric rows retain their labels, signed values,

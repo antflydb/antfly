@@ -1470,6 +1470,10 @@ pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
     if (!embedded.font_corrupted and !embedded.replacement_corrupted and
         ocr.non_whitespace_chars *| 2 < embedded.non_whitespace_chars) return false;
     if (embedded.needsFallback() != ocr.needsFallback()) return !ocr.needsFallback();
+    // Both candidates pass every configured check. Sampling differences or
+    // extra OCR text do not establish an improvement over readable source text.
+    // Forced mode guarantees an attempt; it does not bypass source retention.
+    if (!embedded.needsFallback()) return false;
     if (embedded.failureCount() != ocr.failureCount()) return ocr.failureCount() < embedded.failureCount();
     if (embedded.replacement_char_ratio != ocr.replacement_char_ratio) return ocr.replacement_char_ratio < embedded.replacement_char_ratio;
     if (embedded.corrupted_line_ratio != ocr.corrupted_line_ratio) return ocr.corrupted_line_ratio < embedded.corrupted_line_ratio;
@@ -5122,6 +5126,46 @@ test "OCR text selection retains embedded text on ties and chooses a better tran
     try std.testing.expect(!preferOcrText(embedded, trivial_ocr));
 }
 
+test "OCR text selection retains clean embedded content despite sampled ratios and OCR length" {
+    const alloc = std.testing.allocator;
+    const prefix = "The report documents completed deliveries and verified records for every district. ";
+    const certification = "I certify these figures and confirm their accuracy. ";
+    const embedded = z17RepeatString(prefix, 5) ++ z17RepeatString(certification, 8);
+    // Both a shorter incomplete result and a longer repetitive result omit
+    // the certification, while scoring better on single-character words.
+    const candidates = [_][]const u8{ z17RepeatString(prefix, 8), z17RepeatString(prefix, 16) };
+    for ([_]usize{ 0, 25, 50, 100 }) |sample_words| {
+        const config = OcrQualityConfig{ .garbled_sample_words = sample_words };
+        const embedded_quality = assessOcrQuality(embedded, config);
+        try std.testing.expect(!embedded_quality.needsFallback());
+        for (candidates) |ocr| {
+            const ocr_quality = assessOcrQuality(ocr, config);
+            try std.testing.expect(!ocr_quality.needsFallback());
+            if (sample_words == 50)
+                try std.testing.expect(embedded_quality.single_char_word_ratio > ocr_quality.single_char_word_ratio);
+            try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(
+                alloc,
+                embedded,
+                ocr,
+                embedded_quality,
+                ocr_quality,
+            ));
+        }
+    }
+
+    const table = "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
+    const missing_cells = "The report summarizes quarterly performance in complete readable prose without reproducing the individual numeric table cells.";
+    const table_quality = assessOcrQuality(table, .{});
+    try std.testing.expect(!table_quality.needsFallback());
+    try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(
+        alloc,
+        table,
+        missing_cells,
+        table_quality,
+        assessOcrQuality(missing_cells, .{}),
+    ));
+}
+
 test "OCR text selection checks availability before quality ratios" {
     const alloc = std.testing.allocator;
     const config = OcrQualityConfig{};
@@ -5151,10 +5195,13 @@ test "OCR text selection checks availability before quality ratios" {
 test "OCR text selection preserves dense embedded numeric tables" {
     const alloc = std.testing.allocator;
     const config = OcrQualityConfig{};
-    const embedded_text = "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
+    // The prose needs OCR, while the decoded table values remain reliable.
+    const embedded_text = "T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h\n" ++
+        "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
     const missing_cells = "Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.";
     const preserved_cells = "Quarter Revenue Cost Margin Q1 101 81 20 Q2 115 90 25 Q3 124 94 30 Q4 140 100 40 with complete table values and readable prose.";
     const embedded = assessOcrQuality(embedded_text, config);
+    try std.testing.expect(embedded.needsFallback());
     const missing = assessOcrQuality(missing_cells, config);
     const preserved = assessOcrQuality(preserved_cells, config);
     try std.testing.expectEqual(OcrTextChoice.ocr_with_embedded_numeric_rows, try chooseOcrTextForContentAlloc(alloc, embedded_text, missing_cells, embedded, missing));
@@ -5234,11 +5281,21 @@ test "numeric recovery retains single letter class labels and their balances" {
     const ocr = "The report describes the share classes and their balances. It summarizes the results in readable prose without reproducing the individual values.";
     const recall = try numericTokenRecallAlloc(alloc, embedded, ocr);
     try std.testing.expectEqual(@as(usize, 8), recall.reference_count);
-    try std.testing.expectEqual(OcrTextChoice.ocr_with_embedded_numeric_rows, try chooseOcrTextForContentAlloc(
+    try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(
         alloc,
         embedded,
         ocr,
         assessOcrQuality(embedded, .{}),
+        assessOcrQuality(ocr, .{}),
+    ));
+    const damaged = "T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h\n" ++ embedded;
+    const damaged_quality = assessOcrQuality(damaged, .{});
+    try std.testing.expect(damaged_quality.needsFallback());
+    try std.testing.expectEqual(OcrTextChoice.ocr_with_embedded_numeric_rows, try chooseOcrTextForContentAlloc(
+        alloc,
+        damaged,
+        ocr,
+        damaged_quality,
         assessOcrQuality(ocr, .{}),
     ));
     const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
@@ -5480,6 +5537,7 @@ test "OCR numeric hybrid preserves fragmented single-value lines" {
     const alloc = std.testing.allocator;
     const config = OcrQualityConfig{};
     const embedded_text =
+        \\T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h
         \\Classified references
         \\Alpha listing
         \\101
@@ -5500,6 +5558,7 @@ test "OCR numeric hybrid preserves fragmented single-value lines" {
     ;
     const ocr_text = "The OCR transcription makes every classified listing readable and preserves the descriptive prose, but the small reference values are absent from the clearer transcription.";
     const embedded_quality = assessOcrQuality(embedded_text, config);
+    try std.testing.expect(embedded_quality.needsFallback());
     const ocr_quality = assessOcrQuality(ocr_text, config);
     try std.testing.expectEqual(
         OcrTextChoice.ocr_with_embedded_numeric_rows,
