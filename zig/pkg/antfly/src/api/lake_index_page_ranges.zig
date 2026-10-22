@@ -137,7 +137,6 @@ pub fn load(a: A, store: stores.ArtifactStore, domain: [32]u8, refs: []const tre
     var missing: [tree.max_read_batch]usize = undefined;
     var count: usize = 0;
     var logical: u64 = 0;
-    var miss_bytes: u64 = 0;
     for (refs, 0..) |ref, i| {
         try ref.validate();
         ids[i] = try pages.PageStore.identity(domain, ref);
@@ -151,7 +150,6 @@ pub fn load(a: A, store: stores.ArtifactStore, domain: [32]u8, refs: []const tre
         };
         missing[count] = i;
         count += 1;
-        miss_bytes += ref.bytes;
     }
     const Order = struct {
         refs: []const tree.Ref,
@@ -166,7 +164,7 @@ pub fn load(a: A, store: stores.ArtifactStore, domain: [32]u8, refs: []const tre
     var jobs: [tree.max_read_batch]Job = undefined;
     var group_for: [tree.max_read_batch]usize = undefined;
     var groups: usize = 0;
-    var physical: u64 = 0;
+    var gap_bytes: u64 = 0;
     for (missing[0..count]) |i| {
         const ref = refs[i];
         const end = @as(u64, ref.offset()) + ref.bytes;
@@ -176,7 +174,7 @@ pub fn load(a: A, store: stores.ArtifactStore, domain: [32]u8, refs: []const tre
                 @max(end, previous.begin + previous.length) - previous.begin <= tree.max_page_bytes)
             {
                 const length: usize = @intCast(@max(end, previous.begin + previous.length) - previous.begin);
-                physical += length - previous.length;
+                gap_bytes += ref.offset() -| (previous.begin + previous.length);
                 previous.length = length;
                 group_for[i] = groups - 1;
                 continue;
@@ -185,11 +183,10 @@ pub fn load(a: A, store: stores.ArtifactStore, domain: [32]u8, refs: []const tre
         jobs[groups] = .{ .store = store, .a = allocations.allocator(), .id = &ids[i], .begin = ref.offset(), .length = ref.bytes, .token = token, .domain = domain, .refs = refs, .cached = cached };
         group_for[i] = groups;
         groups += 1;
-        physical += ref.bytes;
     }
     // Cache hits retain the ordinary logical read charge. Coalesced gaps are
     // additional physical traffic and cannot bypass the request's allowance.
-    try budget.charge(budget.ptr, logical + (physical -| miss_bytes));
+    try budget.charge(budget.ptr, logical + gap_bytes);
     defer for (jobs[0..groups]) |*job| job.deinit();
     var tasks: [tree.max_read_batch]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
     const io = if (cached) |cache| cache.context.io else null;
@@ -342,6 +339,14 @@ test "external lake navigation range waves coalesce authenticate cache and bound
         defer wave.deinit();
         try std.testing.expectEqual(@as(u64, 0), remaining);
         try std.testing.expectEqual(before + 1, probe.reads.load(.monotonic));
+        // Duplicate logical seeks do not provide credit for physical gap IO.
+        const repeated = [_]tree.Ref{ gap[0], gap[0], gap[1] };
+        remaining = 384;
+        try std.testing.expectError(error.ArtifactReadBudgetExceeded, load(a, backend, scope.domain, &repeated, .none, null, .{ .ptr = &remaining, .charge = Charge.charge }));
+        remaining = 400;
+        var duplicates = try load(a, backend, scope.domain, &repeated, .none, null, .{ .ptr = &remaining, .charge = Charge.charge });
+        defer duplicates.deinit();
+        try std.testing.expectEqual(@as(u64, 0), remaining);
     }
     const Sweep = struct {
         fn run(alloc: A, store: stores.ArtifactStore, domain: [32]u8, references: []const tree.Ref) !void {
