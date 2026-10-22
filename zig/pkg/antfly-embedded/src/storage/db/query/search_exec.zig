@@ -11927,18 +11927,82 @@ fn visibleTextCandidateCount(
 /// would project the entire primary population before even a rare term search.
 /// This owner borrows only the request's pinned snapshot and callback context.
 const TextLiveVisibilityProducer = struct {
+    alloc: Allocator,
     snapshot: *const index_mod.IndexSnapshot,
     ctx: ?*anyopaque,
     live_filter: @typeInfo(@FieldType(StructuredFilterResolverExecutor, "live_filter_doc_set")).optional.child,
     generation: ?u64,
     control: @FieldType(search_mod.SearchRequest, "control"),
+    examined: std.atomic.Value(u64) = .init(0),
+    building: std.atomic.Value(bool) = .init(false),
+    complete: std.atomic.Value(?*roaring.RoaringBitmap) = .init(null),
 
     fn producer(self: *@This()) query_mod.DocNumProducer {
-        return .{ .ptr = self, .produce = produce };
+        return .{ .ptr = self, .produce = produce, .materialized = materialized };
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.complete.load(.acquire)) |bitmap| {
+            bitmap.deinit();
+            self.alloc.destroy(bitmap);
+        }
+    }
+
+    fn materialized(raw: *anyopaque) ?*const roaring.RoaringBitmap {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.complete.load(.acquire);
+    }
+
+    fn buildComplete(self: *@This()) !?*roaring.RoaringBitmap {
+        const all: doc_set.ResolvedDocSet = .all;
+        var live = try self.live_filter(self.ctx, self.alloc, &all, self.generation);
+        defer live.deinit(self.alloc);
+        // Legacy key-only membership cannot refine ordinal candidates. Keep
+        // the already working selective path when bulk projection is absent.
+        if (live == .doc_keys) return null;
+        const docs = if (live == .all)
+            try self.snapshot.docNumsWithOrdinalsAlloc(self.alloc)
+        else
+            (try textDocNumsForResolvedDocSetAlloc(self.alloc, self.snapshot, &live)) orelse return null;
+        defer self.alloc.free(docs);
+        const bitmap = try self.alloc.create(roaring.RoaringBitmap);
+        errdefer self.alloc.destroy(bitmap);
+        bitmap.* = roaring.RoaringBitmap.init(self.alloc);
+        errdefer bitmap.deinit();
+        try bitmap.addSortedAscending(docs);
+        try bitmap.prepareRead();
+        try self.control.check();
+        return bitmap;
+    }
+
+    fn fromComplete(self: *@This(), bitmap: *const roaring.RoaringBitmap, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        const input = candidates orelse return bitmap.sliceRebased(alloc, offset, @as(u64, offset) + count);
+        var result = roaring.RoaringBitmap.init(alloc);
+        errdefer result.deinit();
+        var it = input.iterator();
+        while (it.next()) |doc| {
+            try self.control.check();
+            if (doc >= count) return error.InvalidQueryRequest;
+            const global = std.math.add(u32, offset, doc) catch return error.InvalidQueryRequest;
+            if (bitmap.contains(global)) try result.add(doc);
+        }
+        return result;
     }
 
     fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.control.check();
+        if (self.complete.load(.acquire)) |bitmap| return self.fromComplete(bitmap, alloc, offset, count, candidates);
+        const incoming: u64 = if (candidates) |bitmap| bitmap.cardinality() else count;
+        const before = self.examined.fetchAdd(incoming, .monotonic);
+        // Bound selective probes before a broad query pays for one population
+        // projection. Never wait for another builder: concurrent lanes keep
+        // refining their candidates until immutable membership is published.
+        const threshold = @max(1024, self.snapshot.liveDocCount() / 128);
+        if (before + incoming >= threshold and self.building.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+            if (try self.buildComplete()) |bitmap| self.complete.store(bitmap, .release);
+        }
+        if (self.complete.load(.acquire)) |bitmap| return self.fromComplete(bitmap, alloc, offset, count, candidates);
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
         var iterator = if (candidates) |bitmap| bitmap.iterator() else null;
@@ -12053,6 +12117,7 @@ pub fn searchTextQuery(
     const can_apply_live_all_docs = !chunk_backed or (try snapshot.hasDocOrdinalCoverage());
     var apply_broad_live_all_docs = can_apply_live_all_docs;
     var live_visibility: ?TextLiveVisibilityProducer = null;
+    defer if (live_visibility) |*visibility| visibility.deinit();
     if (can_apply_live_all_docs and executor.live_filter_doc_set != null and !executor.native_count_visibility_exact) {
         const needs_full_visibility = if (executor.requires_full_candidate_visibility_filter) |requires|
             try requires(executor.ctx, effective_req.identity_read_generation)
@@ -12067,6 +12132,7 @@ pub fn searchTextQuery(
                 apply_broad_live_all_docs = false;
             } else if (try snapshot.hasDocOrdinalCoverage()) {
                 live_visibility = .{
+                    .alloc = alloc,
                     .snapshot = snapshot,
                     .ctx = executor.ctx,
                     .live_filter = executor.live_filter_doc_set.?,
@@ -34909,6 +34975,8 @@ test "text live visibility refines posting candidates and skips an all-visible f
         seen: usize = 0,
         all_visible: bool = false,
         fail: bool = false,
+        broad: enum { forbidden, bitmap, all, keys } = .forbidden,
+        broad_calls: usize = 0,
         fn acquire(raw: ?*anyopaque, _: ?[]const u8) !?PinnedTextSource {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             return .{ .snapshot = self.writer.acquireSnapshot(), .name = "text", .text_analysis = .{}, .runtime_schema = null };
@@ -34939,13 +35007,28 @@ test "text live visibility refines posting candidates and skips an all-visible f
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             if (self.fail) return error.TestVisibilityFailure;
             try std.testing.expectEqual(@as(?u64, 9), generation);
-            if (requested.* != .ordinals or requested.ordinals.len > 4) return error.TestUnexpectedResult;
+            if (requested.* == .all) {
+                self.broad_calls += 1;
+                switch (self.broad) {
+                    .forbidden => return error.TestUnexpectedResult,
+                    .all => return .all,
+                    .keys => return doc_set.cloneDocKeysAlloc(alloc, &.{"legacy"}),
+                    .bitmap => {
+                        var bitmap = roaring.RoaringBitmap.init(alloc);
+                        errdefer bitmap.deinit();
+                        try bitmap.addRange(1, 112);
+                        try bitmap.addRange(113, 10001);
+                        return .{ .ordinal_bitmap = bitmap };
+                    },
+                }
+            }
+            if (requested.* != .ordinals or requested.ordinals.len > (if (self.broad == .forbidden) @as(usize, 4) else 64)) return error.TestUnexpectedResult;
             self.calls += 1;
             self.seen += requested.ordinals.len;
-            var kept: [4]u32 = undefined;
+            var kept: [64]u32 = undefined;
             var used: usize = 0;
             for (requested.ordinals) |ordinal| {
-                if (ordinal != 18 and ordinal != 112 and ordinal != 7001 and ordinal != 9002) return error.TestUnexpectedResult;
+                if (self.broad == .forbidden and ordinal != 18 and ordinal != 112 and ordinal != 7001 and ordinal != 9002) return error.TestUnexpectedResult;
                 if (ordinal != 112) {
                     kept[used] = ordinal;
                     used += 1;
@@ -34999,6 +35082,17 @@ test "text live visibility refines posting candidates and skips an all-visible f
     try std.testing.expectEqual(@as(usize, 4), all.hits.len);
     try std.testing.expectEqual(@as(usize, 0), harness.calls);
     harness.all_visible = false;
+    for ([_]@FieldType(Harness, "broad"){ .bitmap, .all, .keys }) |mode| {
+        harness.broad = mode;
+        harness.broad_calls = 0;
+        harness.seen = 0;
+        var broad = try searchTextQuery(a, count_req, .{ .match = .{ .field = "body", .text = "haystack" } }, executor);
+        defer broad.deinit();
+        try std.testing.expectEqual(@as(u64, 9996), broad.total_hits);
+        try std.testing.expectEqual(@as(usize, 1), harness.broad_calls);
+        if (mode != .keys) try std.testing.expect(harness.seen <= 1024);
+    }
+    harness.broad = .forbidden;
     harness.fail = true;
     try std.testing.expectError(error.TestVisibilityFailure, searchTextQuery(a, req, query, executor));
 }

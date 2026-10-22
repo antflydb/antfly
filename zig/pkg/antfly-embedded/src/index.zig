@@ -1757,6 +1757,15 @@ pub const IndexSnapshot = struct {
         return self.docNumsForOrdinalMembershipAlloc(alloc, ordinals);
     }
 
+    pub fn docNumsWithOrdinalsAlloc(self: *const IndexSnapshot, alloc: Allocator) ![]u32 {
+        const All = struct {
+            fn contains(_: @This(), _: u32) bool {
+                return true;
+            }
+        };
+        return self.docNumsForOrdinalMembershipAlloc(alloc, All{});
+    }
+
     fn docNumsForOrdinalMembershipAlloc(self: *const IndexSnapshot, alloc: Allocator, membership: anytype) ![]u32 {
         var out = std.ArrayListUnmanaged(u32).empty;
         errdefer out.deinit(alloc);
@@ -5025,6 +5034,9 @@ test "ordinal projection preserves mixed native legacy deleted and duplicate ord
     const bitmap_after = try held.docNumsForOrdinalBitmapAlloc(a, &membership);
     defer a.free(bitmap_after);
     try std.testing.expectEqualSlices(u32, after, bitmap_after);
+    const all_after = try held.docNumsWithOrdinalsAlloc(a);
+    defer a.free(all_after);
+    try std.testing.expectEqualSlices(u32, after, all_after);
     const absent = try held.docNumsForOrdinalsAlloc(a, &.{ 0, 123 });
     defer a.free(absent);
     try std.testing.expectEqual(@as(usize, 0), absent.len);

@@ -72178,6 +72178,58 @@ test "db query capture seals outside mutation fences and retains the selected ge
     }
 }
 
+// Opt-in native benchmark: avoids rebuilding HTTP/runtime archives while
+// measuring the production visibility callback against real identity rows.
+// ANTFLY_TEXT_VISIBILITY_BENCH=1 zig build antfly-query-capture-test \
+//   -Dtest-filter='db text visibility native rank benchmark' -Doptimize=ReleaseFast
+test "db text visibility native rank benchmark" {
+    if (platform.env.getenv("ANTFLY_TEXT_VISIBILITY_BENCH") == null) return error.SkipZigTest;
+    const alloc = std.heap.c_allocator;
+    var directory = try TestDirectory.init("text-visibility-bench");
+    defer directory.cleanup();
+    defer cleanupTempDir(directory.path().ptr);
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    var start: usize = 0;
+    while (start < 100_000) : (start += 1000) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var writes: [1000]types.BatchWrite = undefined;
+        for (&writes, start..) |*write, i| write.* = .{
+            .key = try std.fmt.allocPrint(arena.allocator(), "doc:{d:0>8}", .{i}),
+            .value = if (i % 10_000 == 0) "{\"body\":\"Lolita ghislain raretoken\"}" else "{\"body\":\"ordinary common text document\"}",
+        };
+        try db.batch(.{ .writes = &writes, .sync_level = .full_index });
+    }
+    try db.batch(.{ .deletes = &.{"doc:00000001"}, .sync_level = .full_index });
+    const Rank = struct {
+        fn rank(_: *const anyopaque, doc: u32) u64 {
+            return @as(u64, std.math.maxInt(u32)) - doc;
+        }
+    };
+    const queries = [_]struct { name: []const u8, query: types.TextQuery }{
+        .{ .name = "rare", .query = .{ .match = .{ .field = "body", .text = "Lolita" } } },
+        .{ .name = "common", .query = .{ .match = .{ .field = "body", .text = "ordinary" } } },
+        .{ .name = "prefix", .query = .{ .prefix = .{ .field = "body", .prefix = "ghisl" } } },
+    };
+    for (queries) |query| {
+        var samples: [5]u64 = undefined;
+        for (0..6) |i| {
+            const began = monotonicTimeNs();
+            var result = try db.search(alloc, .{ .full_text = query.query, .limit = 10, .include_stored = false, .native_text_tie_rank = .{ .ptr = &db, .rank = Rank.rank } });
+            defer result.deinit();
+            if (i != 0) samples[i - 1] = (monotonicTimeNs() - began) / std.time.ns_per_us;
+            try std.testing.expectEqual(@as(usize, 10), result.hits.len);
+        }
+        std.debug.print("TEXT_VISIBILITY_BENCH docs=100000 query={s} warm_us={any}\n", .{ query.name, samples });
+    }
+}
+
 test "db query capture retains settled terminal repair debt without acknowledging visibility" {
     const Fixture = struct {
         fn produce(raw: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
