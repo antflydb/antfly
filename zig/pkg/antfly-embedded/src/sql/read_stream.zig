@@ -826,7 +826,7 @@ pub const Stream = struct {
         self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = @import("decision_eval.zig").scopedBackend(statement_backend, binding), .binding = binding, .parameters = &.{}, .limits = execution_limits, .typed_output = true };
         const params = if (self.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else try arena.dupe(Json, parameters);
         self.context.parameters = params;
-        try @import("decision_eval.zig").validateStatement(arena, statement_backend.decision_provider, binding, params);
+        try @import("decision_eval.zig").validateStatement(arena, self.context.backend.decision_provider, binding, params);
         const requested_order = if (!binding.primary_order) try describe.scanOrder(arena, binding, statement) else &.{};
         var preferred: ?catalog.Cursor = null;
         errdefer if (preferred) |cursor| cursor.close(cursor.ptr);
@@ -1594,7 +1594,7 @@ test "SQL decisions pull streaming batches predicates before offset and projecti
     const Fake = struct {
         calls: usize = 0,
         max_batch: usize = 0,
-        fn validate(_: *anyopaque, _: []const u8, questions: Json) !void {
+        fn validate(_: *anyopaque, _: []const u8, questions: Json, _: []const u8) !void {
             try d.validateQuestions(questions, d.capabilities(.antfly));
         }
         fn evaluate(ptr: *anyopaque, a: std.mem.Allocator, requests: []const d.Request) ![]const Json {

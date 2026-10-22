@@ -27,7 +27,8 @@ T = TypeVar("T", bound="InferenceDecideResponse")
 @_attrs_define
 class InferenceDecideResponse:
     """Single-input responses have answers. Batch responses have data in input order, with one named answer array per input
-    and aggregate usage.
+    and aggregate usage including reported usage from failed items. Named gateway batches identify the configured model
+    at the top level and resolved models per successful item.
 
         Attributes:
             model (str):

@@ -206,6 +206,7 @@ pub const BackendFactory = struct {
     execution: execution_context.Context = .{},
     request_context: ?RequestContext = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
+    usage_observer: ?provider_limits.UsageObserver = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -232,6 +233,7 @@ pub const BackendFactory = struct {
         execution: execution_context.Context = .{},
         request_context: ?RequestContext = null,
         limits: *provider_limits.Registry = &provider_limits.process_registry,
+        usage_observer: ?provider_limits.UsageObserver = null,
     };
 
     pub fn initWithOptions(
@@ -257,6 +259,7 @@ pub const BackendFactory = struct {
             .execution = execution,
             .request_context = options.request_context,
             .limits = options.limits,
+            .usage_observer = options.usage_observer,
         };
     }
 
@@ -277,7 +280,7 @@ pub const BackendFactory = struct {
             state.* = .{ .alloc = alloc, .provider = .{ .http = self.http, .failure = self.chatgpt_failure, .pin = self.chatgpt_pin, .registrations = manager, .owner = owner, .connection_id = cfg.connection_id.?, .tools_json = cfg.tools_json, .tool_choice_json = cfg.tool_choice_json, .reasoning_effort = if (cfg.reasoning_effort) |effort| @tagName(effort) else null, .max_response_bytes = self.max_response_bytes orelse 16 * 1024 * 1024 }, .context = self.request_context };
             return .{ .ptr = state, .vtable = &.{ .generate = ChatGPTBackend.generate, .deinit = ChatGPTBackend.deinit } };
         }
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits, self.usage_observer);
     }
 };
 
@@ -304,6 +307,7 @@ const BackendState = struct {
     http: *httpx.Client,
     quota: ?provider_limits.Handle = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
+    usage_observer: ?provider_limits.UsageObserver = null,
     alloc: std.mem.Allocator,
     io: ?std.Io = null,
     cfg: GeneratorConfig,
@@ -334,6 +338,7 @@ const BackendState = struct {
         execution: execution_context.Context,
         request_context: ?RequestContext,
         limits: *provider_limits.Registry,
+        usage_observer: ?provider_limits.UsageObserver,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
@@ -341,6 +346,7 @@ const BackendState = struct {
         try cfg.validate();
         if (cfg.provider == .apple) try lib.apple_native.checkAvailable();
         state.limits = limits;
+        state.usage_observer = usage_observer;
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
         state.alloc = alloc;
         state.io = http.io;
@@ -523,7 +529,9 @@ const BackendState = struct {
             try self.limits.acquire(self.quotaIdentity(model), policy);
         defer if (temporary) |*handle| handle.release();
         const quota = temporary orelse self.quota.?;
-        const observer = quota.limiter().observer(try generationOutputBudget(self.cfg, 1));
+        const media = try generationMediaReservation(self.cfg, messages);
+        var reservation = provider_limits.TokenReservation{ .limiter = quota.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(self.cfg, 1), .usage_observer = self.usage_observer };
+        const observer = if (media.tokens > 0 or self.usage_observer != null) reservation.observer() else quota.limiter().observer(try generationOutputBudget(self.cfg, 1));
         switch (self.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.attempt_observer = observer,
             .embedded_antfly, .apple => {},
@@ -615,6 +623,7 @@ const BackendState = struct {
                     defer alloc.free(body);
                     const response = try local.generateJson(alloc, body, self.request_context);
                     defer alloc.free(response);
+                    if (self.usage_observer) |usage_sink| if (provider_limits.responseUsage(response)) |usage| usage_sink.record(usage.input_tokens, usage.output_tokens);
                     break :blk try antfly_provider.Provider.parseGenerationResponse(alloc, response, self.cfg.tools_json, self.cfg.tool_choice_json);
                 }
                 if (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null) return error.UnsupportedGeneratorProvider;
@@ -1265,18 +1274,38 @@ pub fn validateGenerationOutputTokenBudget(cfg: GeneratorConfig, count: usize) !
         return error.ProviderTokenBudgetExceeded;
 }
 
+const MediaReservation = struct { tokens: u64 = 0, inline_bytes: usize = 0 };
+fn generationMediaReservation(cfg: GeneratorConfig, messages: []const ChatMessage) !MediaReservation {
+    var result: MediaReservation = .{};
+    for (messages) |message| if (message.content) |content| {
+        if (content == .parts) for (content.parts) |part| {
+            if (part == .text) continue;
+            const bound = cfg.image_input_token_bound orelse {
+                if ((try provider_limits.Policy.fromConfig(cfg.rate_limit)).tokens_per_minute != 0) return error.UnsupportedMediaTokenBudget;
+                continue;
+            };
+            result.tokens = std.math.add(u64, result.tokens, bound) catch return error.ProviderTokenBudgetExceeded;
+            switch (part) {
+                .text => unreachable,
+                .media => |media| {
+                    if (!std.mem.startsWith(u8, media.mime_type, "image/")) return error.UnsupportedMediaTokenBudget;
+                    if (media.url == null) result.inline_bytes += media.data.len;
+                },
+                .image_url => |image| if (std.mem.startsWith(u8, image.url, "data:")) {
+                    const start = std.mem.indexOf(u8, image.url, ";base64,") orelse return error.UnsupportedMediaTokenBudget;
+                    result.inline_bytes += image.url.len - start - 8;
+                },
+            }
+        };
+    };
+    return result;
+}
+
 pub fn validateGenerationMessagesTokenBudget(cfg: GeneratorConfig, messages: []const ChatMessage) !void {
     try validateGenerationOutputTokenBudget(cfg, 1);
     const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
     if (policy.tokens_per_minute == 0) return;
-    for (messages) |message| {
-        if (message.content) |content| switch (content) {
-            .text => {},
-            .parts => |parts| for (parts) |part| {
-                if (part != .text) return error.UnsupportedMediaTokenBudget;
-            },
-        };
-    }
+    _ = try generationMediaReservation(cfg, messages);
 }
 
 test "generating backend batch preserves cancellation alongside quota policy" {

@@ -475,6 +475,7 @@ pub const Handle = struct {
     }
 
     fn artifactHasProfile(self: *const Handle, expected: []const u8) !bool {
+        if (comptime builtin.os.tag == .freestanding) return false;
         if (self.engine != .native_single_file) return false;
         const value = (try self.native_docstore.?.getCatalogRecordAlloc(self.allocator, artifact_profile_catalog_key)) orelse return false;
         defer self.allocator.free(value);

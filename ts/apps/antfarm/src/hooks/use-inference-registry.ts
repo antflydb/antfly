@@ -7,7 +7,7 @@ import type {
   QuantizationOption,
 } from "@/data/inference-models";
 import { useConnectedModels } from "@/hooks/use-connections";
-import { INFERENCE_MODEL_GROUPS, INFERENCE_MODEL_GROUP_TYPES } from "@/lib/inference-model-tasks";
+import { INFERENCE_MODEL_GROUP_TYPES, INFERENCE_MODEL_GROUPS } from "@/lib/inference-model-tasks";
 
 const MODEL_TYPE_NAMES: Record<ModelType, string> = {
   decider: "decision",

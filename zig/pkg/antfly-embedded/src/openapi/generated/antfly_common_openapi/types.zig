@@ -752,7 +752,7 @@ pub const DeciderConfig = struct {
     api_key: ?[]const u8 = null,
     max_rows: ?i64 = null,
     max_input_tokens: ?i64 = null,
-    /// Provider/model upper bound on the input-token contribution of one image. Required when sending images through hosted typed deciders, including image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Omit for text-only, native, or generated deciders.
+    /// Provider/model upper bound on the input-token contribution of one image. Required when sending images through typed hosted or generated deciders, including native generators and image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Generated deciders apply the allowance to the selected generator's shared quota. Omit for text-only deciders.
     max_image_input_tokens: ?i64 = null,
     rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
     batch_size: ?i64 = null,

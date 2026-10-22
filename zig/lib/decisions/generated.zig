@@ -121,6 +121,7 @@ pub fn responseValue(a: A, cfg: Options, questions: V, value: V, proof: ?c.Token
     return root;
 }
 
+pub const InputItem = struct { input: V, id: ?[]const u8 = null };
 pub const Request = struct {
     generator: V,
     model: []const u8,
@@ -128,7 +129,7 @@ pub const Request = struct {
     probabilities: c.Probabilities = .token_logprobs,
     batch: c.Batch = .{},
     instructions: []const u8 = "",
-    inputs: []const @import("root.zig").Item,
+    inputs: []const InputItem,
     questions: V,
     batched: bool,
 };
@@ -155,14 +156,30 @@ pub fn parseRequest(a: A, value: V) !Request {
     const items = if (batched) blk: {
         const raw = root.get("inputs").?;
         if (raw != .array or raw.array.items.len == 0 or raw.array.items.len > 128) return error.DecideRequestLimitExceeded;
-        const items = try a.alloc(@import("root.zig").Item, raw.array.items.len);
+        const items = try a.alloc(InputItem, raw.array.items.len);
         for (raw.array.items, items) |entry, *item| {
             try allowed(entry, &.{ "id", "input" });
-            item.* = .{ .input = try fieldText(entry.object.get("input") orelse return error.InvalidDecideRequest), .id = if (entry.object.get("id")) |id| try fieldText(id) else null };
+            item.* = .{ .input = entry.object.get("input") orelse return error.InvalidDecideRequest, .id = if (entry.object.get("id")) |id| try fieldText(id) else null };
         }
         break :blk items;
-    } else try a.dupe(@import("root.zig").Item, &.{.{ .input = try fieldText(root.get("input").?) }});
-    for (items) |item| if (item.input.len > 1024 * 1024) return error.DecideRequestLimitExceeded;
+    } else try a.dupe(InputItem, &.{.{ .input = root.get("input").? }});
+    var bytes: usize = 0;
+    for (items) |item| {
+        const input = @import("evidence.zig").Input.fromJson(item.input) catch |err| return if (err == error.OutOfMemory) err else error.InvalidDecideRequest;
+        const size = try input.byteSize(a);
+        if (size > 1024 * 1024) return error.DecideRequestLimitExceeded;
+        bytes += size;
+        if (bytes > 16 * 1024 * 1024) return error.DecideRequestLimitExceeded;
+        // Native generation consumes inline image content with automatic detail.
+        if (input == .messages) for (input.messages) |message| {
+            const content = message.object.get("content").?;
+            if (content == .array) for (content.array.items) |part| {
+                if (!std.mem.eql(u8, part.object.get("type").?.string, "input_image")) continue;
+                if (!std.mem.startsWith(u8, part.object.get("image_url").?.string, "data:")) return error.UnsupportedInferenceFeature;
+                if (part.object.get("detail")) |detail| if (!std.mem.eql(u8, detail.string, "auto")) return error.UnsupportedInferenceFeature;
+            };
+        };
+    }
     const raw_questions = root.get("questions") orelse return error.InvalidDecideRequest;
     if (raw_questions != .array or raw_questions.array.items.len == 0 or raw_questions.array.items.len > 64) return error.InvalidDecideRequest;
     const global_instructions = if (root.get("instructions")) |value_| try fieldText(value_) else "";
@@ -238,4 +255,24 @@ test "generated constrained scores project only after exact validation and retai
     const answer = response.object.get("answers").?.object.get("rating").?;
     try std.testing.expectEqualStrings("0.12345678901234567890123456789", answer.object.get("raw_structured_answer").?.number_string);
     try std.testing.expect(answer.object.get("score").? == .float);
+}
+
+test "generated decisions parse mixed evidence while trained decisions retain their text contract" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var value = try std.json.parseFromSliceLeaky(V, a,
+        \\{"decision_method":"generated","generator":{"provider":"antfly","model":"vision"},"probabilities":"verdict_only","inputs":[{"id":"text","input":"source"},{"id":"image","input":[{"role":"user","content":[{"type":"input_text","text":"Inspect"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]}],"questions":[{"name":"safe","type":"predicate","instructions":"Is it safe?"}]}
+    , .{});
+    const request = try parseRequest(a, value);
+    try std.testing.expectEqual(@as(usize, 2), request.inputs.len);
+    try std.testing.expectEqualStrings("source", request.inputs[0].input.string);
+    try std.testing.expectEqualStrings("image", request.inputs[1].id.?);
+    const image = try @import("evidence.zig").Input.fromJson(request.inputs[1].input);
+    try std.testing.expectEqual(@as(usize, 1), image.imageCount());
+    const part = &value.object.getPtr("inputs").?.array.items[1].object.getPtr("input").?.array.items[0].object.getPtr("content").?.array.items[1];
+    try part.object.put(a, "image_url", .{ .string = "https://example.org/image.png" });
+    try std.testing.expectError(error.UnsupportedInferenceFeature, parseRequest(a, value));
+    try part.object.put(a, "type", .{ .string = "input_audio" });
+    try std.testing.expectError(error.InvalidDecideRequest, parseRequest(a, value));
 }

@@ -56,7 +56,10 @@ fn parseResponse(a: std.mem.Allocator, bytes: []const u8) !decisions.Json {
 }
 
 fn requestPayload(a: std.mem.Allocator, io: std.Io, cfg: decisions.DeciderConfig, request: decisions.Request) !decisions.WirePayload {
-    if (cfg.decision_method == .generated) return .{ .body = try std.json.Stringify.valueAlloc(a, .{ .input = try request.input.requireText(), .questions = request.questions, .instructions = cfg.instructions }, .{}) };
+    if (cfg.decision_method == .generated) {
+        try constrained_runtime.validateEvidence(cfg.generator.?, request.input);
+        return .{ .body = try std.json.Stringify.valueAlloc(a, .{ .input = request.input.jsonValue(a), .questions = request.questions, .instructions = cfg.instructions }, .{}), .image_bytes = request.input.inlineImageBytes() };
+    }
     if (cfg.provider == .openai) return .{ .body = try openai.requestBody(a, cfg.modelName(), request.input, request.questions), .image_bytes = request.input.inlineImageBytes() };
     if (cfg.provider == .jev) return jev.request(a, io, cfg, request.input, request.questions);
     return .{ .body = try decisions.wireRequest(a, cfg, try request.input.requireText(), request.questions) };
@@ -73,18 +76,33 @@ fn estimateInputTokens(cfg: decisions.DeciderConfig, input: decisions.Input, pay
     return std.math.add(u64, text_bytes, images) catch error.DecisionLimitExceeded;
 }
 
-fn reconcileUsage(reservation: *quotas.TokenReservation, source: decisions.Json) void {
-    if (source != .object) return;
-    const usage = source.object.get("usage") orelse return;
-    if (usage != .object) return;
-    const input = usage.object.get("input_tokens") orelse return;
-    const output = usage.object.get("output_tokens") orelse return;
-    if (input != .integer or output != .integer or input.integer < 0 or output.integer < 0) return;
-    reservation.reconcile(@intCast(input.integer), @intCast(output.integer));
+const Usage = struct { input_tokens: u64 = 0, output_tokens: u64 = 0 };
+fn reportedUsage(source: decisions.Json) ?Usage {
+    if (source != .object) return null;
+    const usage = source.object.get("usage") orelse return null;
+    if (usage != .object) return null;
+    const input = usage.object.get("input_tokens") orelse return null;
+    const output = usage.object.get("output_tokens") orelse return null;
+    if (input != .integer or output != .integer or input.integer < 0 or output.integer < 0) return null;
+    return .{ .input_tokens = @intCast(input.integer), .output_tokens = @intCast(output.integer) };
+}
+fn upstreamFailure(status: u16) anyerror {
+    return switch (status) {
+        429, 529 => error.DecisionRateLimited,
+        401, 403 => error.DecisionUnauthorized,
+        else => error.DecisionUpstreamFailure,
+    };
+}
+fn fatalItemFailure(err: anyerror) bool {
+    return err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled or err == error.Timeout;
 }
 
 pub const Runtime = struct {
     registry: *const registry_mod.Registry,
+    resolution_allocator: std.mem.Allocator = std.heap.smp_allocator,
+    resolution_mutex: std.atomic.Mutex = .unlocked,
+    resolved_generators: std.ArrayList(*ResolvedGenerator) = .empty,
+
     limits: *quotas.Registry = &quotas.process_registry,
     http: *httpx.Client,
     io: std.Io,
@@ -95,6 +113,7 @@ pub const Runtime = struct {
     antfly_api_key: ?[]const u8 = null,
     source_table: []const u8 = "",
     rows: u64 = 0,
+    reserved_rows: u64 = 0,
     input_tokens: u64 = 0,
     estimated_input_tokens: u64 = 0,
     output_tokens: u64 = 0,
@@ -102,6 +121,63 @@ pub const Runtime = struct {
     latency_ns: u64 = 0,
     profile_allocator: ?std.mem.Allocator = null,
     provenance: std.ArrayList(struct { decider: []const u8, provider: []const u8, model: []const u8, rows: u64 = 0 }) = .empty,
+    const ResolvedGenerator = struct {
+        arena: std.heap.ArenaAllocator,
+        cache: remote_capabilities.Cache,
+        name: []const u8,
+        source_table: []const u8,
+        generator: @import("../generating/mod.zig").GeneratorConfig,
+        capabilities: @import("antfly_structured").Capabilities,
+    };
+
+    /// Model facts live for this runtime's request/statement; routing leases renew.
+    /// Profile/provenance storage remains owned by profile_allocator's caller.
+    pub fn deinit(self: *Runtime) void {
+        for (self.resolved_generators.items) |entry| {
+            entry.cache.deinit();
+            entry.arena.deinit();
+            self.resolution_allocator.destroy(entry);
+        }
+        self.resolved_generators.deinit(self.resolution_allocator);
+        self.resolved_generators = .empty;
+    }
+
+    fn resolveGenerator(self: *Runtime, name: []const u8, source_table: []const u8) !*ResolvedGenerator {
+        @import("antfly_platform").sync.lockYielding(&self.resolution_mutex);
+        defer self.resolution_mutex.unlock();
+        for (self.resolved_generators.items) |entry| {
+            if (std.mem.eql(u8, entry.name, name) and std.mem.eql(u8, entry.source_table, source_table)) return entry;
+        }
+        const cfg = try self.registry.getDeciderConfig(name);
+        var arena = std.heap.ArenaAllocator.init(self.resolution_allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var generator = try (cfg.generator orelse return error.InvalidDeciderConfig).clone(a);
+        if (generator.provider == .antfly and generator.url.len == 0) {
+            generator.url = try a.dupe(u8, self.antfly_url orelse "");
+            if (generator.url.len > 0 and generator.api_key == null) {
+                if (self.antfly_api_key) |key| generator.api_key = try a.dupe(u8, key);
+            }
+        }
+        const entry = try self.resolution_allocator.create(ResolvedGenerator);
+        errdefer self.resolution_allocator.destroy(entry);
+        entry.cache = remote_capabilities.Cache.init(self.resolution_allocator, self.io);
+        errdefer entry.cache.deinit();
+        var engine = self.constrainedRuntime(&entry.cache);
+        engine.options.source_table = source_table;
+        engine.options.execution.routing.source_table = source_table;
+        const caps = try engine.capabilities(a, &generator);
+        const owned_name = try a.dupe(u8, name);
+        const owned_table = try a.dupe(u8, source_table);
+        entry.arena = arena;
+        entry.name = owned_name;
+        entry.source_table = owned_table;
+        entry.generator = generator;
+        entry.capabilities = caps;
+        try self.resolved_generators.append(self.resolution_allocator, entry);
+        return entry;
+    }
+
     fn recordProvenance(self: *Runtime, name: []const u8, cfg: decisions.DeciderConfig, value: decisions.Json) !void {
         const stats_a = self.profile_allocator orelse return;
         const model = value.object.get("model").?.string;
@@ -119,15 +195,20 @@ pub const Runtime = struct {
     pub fn provider(self: *@This()) decisions.DecisionProvider {
         return .{ .ptr = self, .validate_fn = validate, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint, .capabilities_fn = resolvedCapabilities };
     }
-    fn resolvedCapabilities(ptr: *anyopaque, name: []const u8) !decisions.Capabilities {
+    fn resolvedCapabilities(ptr: *anyopaque, name: []const u8, source_table: []const u8) !decisions.Capabilities {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
-        return self.registry.getDeciderCapabilities(name);
+        var result = try self.registry.getDeciderCapabilities(name);
+        const cfg = try self.registry.getDeciderConfig(name);
+        if (cfg.decision_method == .generated and cfg.generator.?.provider == .antfly and result.images) {
+            result.images = (try self.resolveGenerator(name, if (source_table.len > 0) source_table else self.source_table)).capabilities.images;
+        }
+        return result;
     }
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         if (self.context) |ctx| try ctx.check();
     }
-    fn validate(ptr: *anyopaque, name: []const u8, questions: decisions.Json) !void {
+    fn validate(ptr: *anyopaque, name: []const u8, questions: decisions.Json, source_table: []const u8) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         const cfg = try self.registry.getDeciderConfig(name);
         try cfg.validate();
@@ -136,13 +217,9 @@ pub const Runtime = struct {
         if (cfg.decision_method == .generated) {
             var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
             defer arena.deinit();
-            var cache = remote_capabilities.Cache.init(std.heap.smp_allocator, self.io);
-            defer cache.deinit();
-            var engine = self.constrainedRuntime(&cache);
-            var generator = try cfg.generator.?.clone(arena.allocator());
-            if (generator.provider == .antfly and generator.url.len == 0) generator.url = self.antfly_url orelse "";
-            const caps = try engine.capabilities(arena.allocator(), &generator);
-            const mode = try caps.select(cfg.output, cfg.probabilities);
+            const resolved = try self.resolveGenerator(name, if (source_table.len > 0) source_table else self.source_table);
+            const generator = resolved.generator;
+            const mode = try resolved.capabilities.select(cfg.output, cfg.probabilities);
             try @import("antfly_structured").validateProviderSchema(generator, mode, try generated.questionSchema(arena.allocator(), questions));
             if (cfg.probabilities == .token_logprobs) for (questions.object.values()) |question| {
                 const kind = question.object.get("type").?.string;
@@ -154,6 +231,7 @@ pub const Runtime = struct {
         return .{ .http = self.http, .cache = cache, .options = .{
             .antfly_provider = self.antfly_provider,
             .secret_store = self.secret_store,
+            .inference_api_key = self.antfly_api_key,
             .max_response_bytes = max_response_bytes,
             .source_table = self.source_table,
             .execution = .{ .routing = .{ .source_table = self.source_table } },
@@ -162,12 +240,14 @@ pub const Runtime = struct {
         } };
     }
     pub fn evaluateGeneratedPartial(self: *Runtime, a: std.mem.Allocator, name: []const u8, requests: []const decisions.Request) !GeneratedBatch {
-        try validate(self, name, requests[0].questions);
+        if (requests.len == 0) return error.InvalidDecisionSpecification;
+        try self.provider().validateRequests(a, requests);
+        try self.provider().withSourceTable(requests[0].source_table).validate(name, requests[0].questions);
         const cfg = try self.registry.getDeciderConfig(name);
         if (cfg.decision_method != .generated) return error.InvalidDeciderConfig;
         var lease = admission.tryAcquireLease() orelse return error.DecisionRateLimited;
         defer lease.release();
-        if (self.rows + requests.len > cfg.max_rows) return error.DecisionLimitExceeded;
+        if (self.reserved_rows + requests.len > cfg.max_rows) return error.DecisionLimitExceeded;
         var estimated = self.estimated_input_tokens;
         for (requests) |request| {
             try request.input.checkLimit(a, cfg.resolvedCapabilities().max_input_bytes);
@@ -178,6 +258,7 @@ pub const Runtime = struct {
             if (estimated > cfg.max_input_tokens) return error.DecisionLimitExceeded;
         }
         self.estimated_input_tokens = estimated;
+        self.reserved_rows += requests.len;
         const result = try self.generateBatchPartial(a, cfg, requests);
         self.rows += requests.len;
         self.input_tokens +|= result.input_tokens;
@@ -187,32 +268,35 @@ pub const Runtime = struct {
         return result;
     }
     fn generateBatchPartial(self: *Runtime, a: std.mem.Allocator, cfg: decisions.DeciderConfig, requests: []const decisions.Request) !GeneratedBatch {
-        var cache = remote_capabilities.Cache.init(a, self.io);
-        defer cache.deinit();
-        var engine = self.constrainedRuntime(&cache);
         const source_table = if (requests[0].source_table.len > 0) requests[0].source_table else self.source_table;
+        const resolved = try self.resolveGenerator(requests[0].decider, source_table);
+        var engine = self.constrainedRuntime(&resolved.cache);
+        engine.capability_snapshot = resolved.capabilities;
+        engine.require_execution_lease = resolved.generator.capability_token != null;
         engine.options.source_table = source_table;
         engine.options.execution.routing.source_table = source_table;
-        var generator = try cfg.generator.?.clone(a);
+        var generator = try resolved.generator.clone(a);
         defer generator.deinit(a);
-        if (generator.provider == .antfly and generator.url.len == 0 and self.antfly_url != null) {
-            generator.url = try a.dupe(u8, self.antfly_url.?);
-        }
-        const caps = try engine.capabilities(a, &generator);
+        const caps = resolved.capabilities;
+        engine.limits = caps.limits;
         const mode = try caps.select(cfg.output, cfg.probabilities);
         generator.logprobs = cfg.probabilities == .token_logprobs;
-        const inputs = try a.alloc([]const u8, requests.len);
+        const inputs = try a.alloc(decisions.Json, requests.len);
         defer a.free(inputs);
-        for (inputs, requests) |*input, request| input.* = try request.input.requireText();
+        for (inputs, requests) |*input, request| {
+            if (request.input.imageCount() > 0 and !caps.images) return error.UnsupportedInferenceFeature;
+            input.* = request.input.jsonValue(a);
+        }
+        generator.image_input_token_bound = cfg.max_image_input_tokens;
         var batch = cfg.batch;
         batch.max_items_per_call = @min(batch.max_items_per_call, cfg.batch_size);
         const responses = try a.alloc(?decisions.Json, requests.len);
         @memset(responses, null);
         var validation = GeneratedValidation{ .cfg = cfg, .requests = requests, .responses = responses };
         engine.semantic_validation = .{ .ptr = &validation, .validate = GeneratedValidation.validate };
-        const result = try engine.execute(a, generator, mode, try generated.questionSchema(a, requests[0].questions), cfg.instructions, batch, inputs);
+        const result = try engine.executeEvidence(a, generator, mode, try generated.questionSchema(a, requests[0].questions), cfg.instructions, batch, inputs);
         for (responses) |*response| if (response.*) |*value| {
-            if (caps.model_revision) |revision| try value.object.put(a, "model_revision", .{ .string = revision });
+            if (caps.model_revision) |revision| try value.object.put(a, "model_revision", .{ .string = try a.dupe(u8, revision) });
         };
         // Charge all attempts once, including attempts for invalid items.
         for (responses) |*response| if (response.*) |*value| {
@@ -240,12 +324,6 @@ pub const Runtime = struct {
             self.responses[id] = try generated.responseValue(a, self.cfg, self.requests[id].questions, value, proof, id, 0, 0);
         }
     };
-    fn generateBatch(self: *Runtime, a: std.mem.Allocator, cfg: decisions.DeciderConfig, requests: []const decisions.Request) ![]const decisions.Json {
-        const partial = try self.generateBatchPartial(a, cfg, requests);
-        const responses = try a.alloc(decisions.Json, requests.len);
-        for (partial.values, partial.failures, responses) |value, failure, *response| response.* = value orelse return failure orelse error.InvalidDecisionOutput;
-        return responses;
-    }
     const Job = struct {
         runtime: *Runtime,
         request: decisions.Request,
@@ -254,6 +332,11 @@ pub const Runtime = struct {
         budget: @import("../sql/memory_budget.zig"),
         response: ?decisions.Json = null,
         failure: ?anyerror = null,
+        usage: Usage = .{},
+        fn observeUsage(self: *Job, reservation: *quotas.TokenReservation, source: decisions.Json) void {
+            self.usage = reportedUsage(source) orelse return;
+            reservation.reconcile(self.usage.input_tokens, self.usage.output_tokens);
+        }
         fn run(self: *Job) void {
             self.response = self.invoke() catch |err| {
                 self.failure = if (self.budget.exhausted) error.DecisionLimitExceeded else err;
@@ -269,7 +352,11 @@ pub const Runtime = struct {
             try checkpoint(self.runtime);
             const a = self.arena.allocator();
             const cfg = self.cfg;
-            if (cfg.decision_method == .generated) return (try self.runtime.generateBatch(a, cfg, &.{self.request}))[0];
+            if (cfg.decision_method == .generated) {
+                const result = try self.runtime.generateBatchPartial(a, cfg, &.{self.request});
+                self.usage = .{ .input_tokens = result.input_tokens, .output_tokens = result.output_tokens };
+                return result.values[0] orelse return result.failures[0] orelse error.InvalidDecisionOutput;
+            }
             const payload = try requestPayload(a, self.runtime.io, cfg, self.request);
             const body = payload.body;
             const base = if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_url) |endpoint| try registry_mod.gateway.apiBaseAlloc(a, endpoint) else cfg.baseUrl() else cfg.baseUrl();
@@ -292,6 +379,9 @@ pub const Runtime = struct {
             } }, try quotas.Policy.fromConfig(cfg.rate_limit));
             defer quota.release();
             var reservation: quotas.TokenReservation = .{ .limiter = quota.limiter(), .input_tokens = try estimateInputTokens(cfg, self.request.input, payload) };
+            defer if (reservation.reported_usage) |usage| {
+                self.usage = .{ .input_tokens = usage.input_tokens, .output_tokens = usage.output_tokens };
+            };
             const observer = reservation.observer();
             if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_provider) |embedded| if (embedded.decide_json) |_| {
                 try observer.before(observer.ptr, .{
@@ -310,7 +400,7 @@ pub const Runtime = struct {
                     return operationalError(err);
                 };
                 const parsed = try parseResponse(a, bytes);
-                reconcileUsage(&reservation, parsed);
+                self.observeUsage(&reservation, parsed);
                 return parsed;
             };
             const key = key_source.resolveOwned(a, self.runtime.secret_store) catch |err| return operationalError(err);
@@ -344,16 +434,12 @@ pub const Runtime = struct {
                 .cancellation = if (ctx) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else null,
             }) catch |err| return operationalError(err);
             defer response.deinit();
-            if (!response.ok()) return switch (response.status.code) {
-                429, 529 => error.DecisionRateLimited,
-                401, 403 => error.DecisionUnauthorized,
-                else => error.DecisionUpstreamFailure,
-            };
-            const bytes = response.body orelse return error.InvalidDecisionOutput;
-            const parsed = try parseResponse(a, bytes);
+            const bytes = response.body orelse return if (response.ok()) error.InvalidDecisionOutput else upstreamFailure(response.status.code);
+            const parsed = parseResponse(a, bytes) catch |err| return if (response.ok()) err else upstreamFailure(response.status.code);
             // Account usage before semantic output validation, including refused
             // or invalid answers for which the provider has already spent tokens.
-            reconcileUsage(&reservation, parsed);
+            self.observeUsage(&reservation, parsed);
+            if (!response.ok()) return upstreamFailure(response.status.code);
             if (cfg.provider == .antfly) {
                 const root = try decisions.object(parsed);
                 const answers = root.get("answers") orelse return error.InvalidDecisionOutput;
@@ -362,29 +448,52 @@ pub const Runtime = struct {
             return if (cfg.provider == .openai) openai.response(a, self.request.questions, parsed) else parsed;
         }
     };
+    pub const PartialBatch = struct {
+        values: []?decisions.Json,
+        failures: []?anyerror,
+    };
+    pub fn evaluatePartial(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request) !PartialBatch {
+        try self.provider().validateRequests(a, requests);
+        return self.evaluateCore(a, requests, true);
+    }
     fn evaluate(ptr: *anyopaque, a: std.mem.Allocator, requests: []const decisions.Request) ![]const decisions.Json {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
+        const result = try self.evaluateCore(a, requests, false);
+        const out = try a.alloc(decisions.Json, requests.len);
+        for (result.values, result.failures, out) |value, failure, *target| target.* = value orelse return failure orelse error.InvalidDecisionOutput;
+        return out;
+    }
+    fn evaluateCore(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, preserve_failures: bool) !PartialBatch {
+        const ptr: *anyopaque = self;
         const started = std.Io.Clock.awake.now(self.io).nanoseconds;
         defer self.latency_ns +|= @intCast(@max(0, std.Io.Clock.awake.now(self.io).nanoseconds - started));
         var lease = admission.tryAcquireLease() orelse return error.DecisionRateLimited;
         defer lease.release();
-        const out = try a.alloc(decisions.Json, requests.len);
+        const out = try a.alloc(?decisions.Json, requests.len);
+        @memset(out, null);
+        const failures = try a.alloc(?anyerror, requests.len);
+        @memset(failures, null);
         var batch_size: usize = 32;
         var estimated = self.estimated_input_tokens;
         for (requests) |request| {
             const cfg = try self.registry.getDeciderConfig(request.decider);
-            if (self.rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
+            if (cfg.decision_method == .generated) _ = try self.resolveGenerator(request.decider, if (request.source_table.len > 0) request.source_table else self.source_table);
+            if (self.reserved_rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
             try request.input.checkLimit(a, cfg.resolvedCapabilities().max_input_bytes);
             // Reserve text bytes plus the configured visual token bound before
             // any I/O. The shared quota uses this same estimate and actual usage.
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
             const payload = try requestPayload(scratch.allocator(), self.io, cfg, request);
-            estimated = std.math.add(u64, estimated, try estimateInputTokens(cfg, request.input, payload)) catch return error.DecisionLimitExceeded;
+            const estimate = try estimateInputTokens(cfg, request.input, payload);
+            const policy = try quotas.Policy.fromConfig(cfg.rate_limit);
+            if (policy.tokens_per_minute != 0 and estimate > policy.tokens_per_minute) return error.DecisionLimitExceeded;
+            estimated = std.math.add(u64, estimated, estimate) catch return error.DecisionLimitExceeded;
             if (estimated > cfg.max_input_tokens) return error.DecisionLimitExceeded;
             batch_size = @min(batch_size, cfg.batch_size);
         }
         self.estimated_input_tokens = estimated;
+        self.reserved_rows += requests.len;
         if (requests.len > 0) {
             const first = try self.registry.getDeciderConfig(requests[0].decider);
             var compatible = first.decision_method == .generated;
@@ -402,11 +511,17 @@ pub const Runtime = struct {
                 self.output_tokens +|= partial.output_tokens;
                 self.batches +|= partial.calls;
                 if (self.input_tokens > first.max_input_tokens) return error.DecisionLimitExceeded;
-                for (partial.values, partial.failures, out, requests) |value, failure, *response, request| {
-                    response.* = value orelse return failure orelse error.InvalidDecisionOutput;
-                    try self.recordProvenance(request.decider, first, response.*);
+                for (partial.values, partial.failures, out, failures, requests) |value, failure, *response, *failed, request| {
+                    if (value) |valid| {
+                        response.* = valid;
+                        try self.recordProvenance(request.decider, first, valid);
+                    } else {
+                        const err = failure orelse error.InvalidDecisionOutput;
+                        if (!preserve_failures or fatalItemFailure(err)) return err;
+                        failed.* = err;
+                    }
                 }
-                return out;
+                return .{ .values = out, .failures = failures };
             }
         }
 
@@ -431,25 +546,37 @@ pub const Runtime = struct {
             }
             try group.await(self.io);
             self.batches += 1;
-            for (jobs, out[begin..end]) |*job, *value| {
-                if (job.failure) |err| return err;
-                if (job.cfg.model_identity) |expected| {
-                    const root = try decisions.object(job.response.?);
-                    const actual = root.get("model_identity") orelse return error.InvalidDecisionOutput;
-                    if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InvalidDecisionOutput;
+            try checkpoint(ptr);
+            for (jobs, out[begin..end], failures[begin..end]) |*job, *value, *failure| {
+                const usage = if (job.response) |response| reportedUsage(response) orelse job.usage else job.usage;
+                self.input_tokens +|= usage.input_tokens;
+                self.output_tokens +|= usage.output_tokens;
+                if (self.input_tokens > job.cfg.max_input_tokens) return error.DecisionLimitExceeded;
+                if (job.failure) |err| {
+                    if (!preserve_failures or fatalItemFailure(err)) return err;
+                    failure.* = err;
+                    continue;
                 }
-                const normalized = try decisions.normalizeResponseWithConfig(a, job.request.questions, job.response.?, job.cfg);
-                const usage = normalized.object.get("usage").?.object;
+                const normalized = self.normalizeJob(a, job) catch |err| {
+                    if (!preserve_failures or fatalItemFailure(err)) return err;
+                    failure.* = err;
+                    continue;
+                };
                 try self.recordProvenance(job.request.decider, job.cfg, normalized);
                 self.rows += 1;
-                self.input_tokens +|= @intCast(usage.get("input_tokens").?.integer);
-                self.output_tokens +|= @intCast(usage.get("output_tokens").?.integer);
-                if (self.input_tokens > job.cfg.max_input_tokens) return error.DecisionLimitExceeded;
                 value.* = normalized;
             }
             begin = end;
         }
-        return out;
+        return .{ .values = out, .failures = failures };
+    }
+    fn normalizeJob(_: *Runtime, a: std.mem.Allocator, job: *const Job) !decisions.Json {
+        if (job.cfg.model_identity) |expected| {
+            const root = try decisions.object(job.response.?);
+            const actual = root.get("model_identity") orelse return error.InvalidDecisionOutput;
+            if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InvalidDecisionOutput;
+        }
+        return decisions.normalizeResponseWithConfig(a, job.request.questions, job.response.?, job.cfg);
     }
 };
 
@@ -491,6 +618,7 @@ test "decision functions single embedded decision needs no additional IO worker"
         .extract = Fake.extract,
         .decide_json = Fake.decide,
     } };
+    defer runtime.deinit();
     const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
         \\{"same":{"type":"choice","instructions":"Same entity?","criteria":{"same":"Same entity","different":"Different entities"}}}
     , .{});
@@ -539,6 +667,7 @@ test "decision functions concurrent batches preserve one input per wire request 
     defer arena.deinit();
     const questions = try decisions.questionsFor(arena.allocator(), .ai_probability, &.{ .{ .string = "refund" }, .{ .string = "Refund?" }, .{ .string = "local" } });
     var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+    defer runtime.deinit();
     const Run = struct {
         fn run(r: *Runtime, alloc: std.mem.Allocator, q: decisions.Json, failure: *?anyerror) void {
             const results = r.provider().withSourceTable("docs").evaluateBatch(alloc, &.{ .{ .input = .{ .text = "refund" }, .decider = "local", .questions = q }, .{ .input = .{ .text = "refund" }, .decider = "remote", .questions = q } }) catch |err| {
@@ -561,6 +690,7 @@ test "decision functions concurrent batches preserve one input per wire request 
     try std.testing.expectEqual(@as(u64, 2), runtime.rows);
     try std.testing.expectEqual(@as(u64, 4), runtime.input_tokens);
     var budgeted: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+    defer budgeted.deinit();
     try std.testing.expectError(error.DecisionLimitExceeded, budgeted.provider().evaluateBatch(arena.allocator(), &.{.{ .input = .{ .text = "refund" }, .decider = "budgeted", .questions = questions }}));
     try std.testing.expectEqual(@as(u64, 0), budgeted.rows);
     const Once = struct {
@@ -573,6 +703,7 @@ test "decision functions concurrent batches preserve one input per wire request 
     };
     for ([_][]const u8{ "local", "remote" }, [_]anyerror{ error.InvalidDecisionOutput, error.DecisionRateLimited }) |name, expected| {
         var failing: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+        defer failing.deinit();
         failure = null;
         try group.concurrent(io, Once.run, .{ &failing, arena.allocator(), name, questions, &failure });
         try server.handleOne();
@@ -619,6 +750,7 @@ test "decision functions HTTP ceiling rejects oversized advertised bodies before
     };
     for ([_][]const u8{ "local", "remote", "openai" }) |name| {
         var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+        defer runtime.deinit();
         var failure: ?anyerror = null;
         var group = std.Io.Group.init;
         defer group.cancel(io);
@@ -685,6 +817,7 @@ test "decision functions EmbeddingGemma 2 HTTP preserves identity calibration an
         }
     };
     var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+    defer runtime.deinit();
     var failure: ?anyerror = null;
     var group = std.Io.Group.init;
     defer group.cancel(io);
@@ -694,6 +827,7 @@ test "decision functions EmbeddingGemma 2 HTTP preserves identity calibration an
     if (failure) |err| return err;
     try std.testing.expectEqual(@as(u64, expected_body.len), runtime.estimated_input_tokens);
     var budgeted: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+    defer budgeted.deinit();
     try std.testing.expectError(error.DecisionLimitExceeded, budgeted.provider().evaluateBatch(alloc, &.{.{ .input = .{ .text = "reset password" }, .decider = "budgeted-similarity", .questions = questions }}));
     try std.testing.expectEqual(@as(u64, 0), budgeted.rows);
 }
@@ -767,6 +901,7 @@ test "decision functions OpenAI HTTP routing alignment provenance budgets and er
         }
     };
     var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io, .profile_allocator = alloc };
+    defer runtime.deinit();
     var failure: ?anyerror = null;
     var group = std.Io.Group.init;
     defer group.cancel(io);
@@ -784,9 +919,11 @@ test "decision functions OpenAI HTTP routing alignment provenance budgets and er
     try std.testing.expectEqual(@as(u64, 2), runtime.provenance.items[0].rows);
     try std.testing.expectError(error.DecisionLimitExceeded, runtime.provider().evaluateBatch(alloc, &.{.{ .input = .{ .text = "refund" }, .decider = "openai", .questions = questions }}));
     var budgeted: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+    defer budgeted.deinit();
     try std.testing.expectError(error.DecisionLimitExceeded, budgeted.provider().evaluateBatch(alloc, &.{.{ .input = .{ .text = "refund" }, .decider = "budgeted-openai", .questions = questions }}));
     for ([_]anyerror{ error.DecisionRefused, error.DecisionRateLimited, error.DecisionUnauthorized, error.DecisionUpstreamFailure, error.InvalidDecisionOutput }) |expected| {
         var failing: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+        defer failing.deinit();
         failure = null;
         try group.concurrent(io, Run.run, .{ &failing, alloc, questions, 1, &failure });
         try server.handleOne();
@@ -835,6 +972,7 @@ test "generating backend generated decisions batch through native constrained ou
         .generate_json = Fake.generate,
         .model_capabilities = Fake.caps,
     } };
+    defer runtime.deinit();
     const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
         \\{"answer":{"type":"choice","instructions":"Compare concepts","criteria":{"same":"Same entity","different":"Distinct entities"}}}
     , .{});
@@ -923,6 +1061,7 @@ test "decision functions multimodal HTTP preserves OpenAI parts and Jev multipar
     , .{}));
     const questions = try decisions.questionsFor(alloc, .ai_probability, &.{ .{ .string = "item" }, .{ .string = "Damaged?" }, .{ .string = "openai" } });
     var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+    defer runtime.deinit();
     const Run = struct {
         fn run(r: *Runtime, allocator: std.mem.Allocator, name: []const u8, q: decisions.Json, evidence: decisions.Input, failure: *?anyerror) void {
             const result = r.provider().withSourceTable("docs").evaluateBatch(allocator, &.{.{ .decider = name, .questions = q, .input = evidence }}) catch |err| {
@@ -980,4 +1119,879 @@ test "decision functions image token estimates account for opaque URLs and requi
     overflow.max_image_input_tokens = std.math.maxInt(u64);
     try std.testing.expectError(error.DecisionLimitExceeded, estimateInputTokens(overflow, input, .{ .body = &body }));
     try std.testing.expectEqual(@as(u64, 100), try estimateInputTokens(cfg, .{ .text = "unchanged" }, .{ .body = &body }));
+}
+
+test "decision functions partial batches preserve siblings order and failed usage across bounded windows" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("batch", .{ .model = "native", .batch_size = 2 });
+    const Fake = struct {
+        fn decide(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const parsed = try std.json.parseFromSlice(decisions.Json, alloc, body, .{});
+            defer parsed.deinit();
+            const bad = std.mem.eql(u8, parsed.value.object.get("input").?.string, "invalid");
+            return std.json.Stringify.valueAlloc(alloc, .{
+                .model = "native",
+                .answers = .{.{ .name = "answer", .type = "predicate", .decision_method = "typed", .probability = if (bad) @as(f64, 2) else @as(f64, 0.9) }},
+                .usage = .{ .input_tokens = if (bad) @as(u64, 7) else @as(u64, 3), .output_tokens = @as(u64, 1) },
+            }, .{});
+        }
+    };
+    var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io, .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide } };
+    defer runtime.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const parsed = try @import("decision_batch.zig").parse(alloc, try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+        \\{"inputs":[{"id":"a","input":"first"},{"id":"b","input":"invalid"},{"id":"c","input":"last"}]}
+    , .{}));
+    const questions = try decisions.questionsFor(alloc, .ai_probability, &.{ .{ .string = "x" }, .{ .string = "Safe?" }, .{ .string = "batch" } });
+    var requests: [3]decisions.Request = undefined;
+    for (&requests, parsed.items) |*request, item| request.* = .{ .input = item.input, .questions = questions, .decider = "batch" };
+    const result = try runtime.evaluatePartial(alloc, &requests);
+    try std.testing.expect(result.values[0] != null and result.values[1] == null and result.values[2] != null);
+    try std.testing.expectEqual(@as(?anyerror, error.InvalidDecisionOutput), result.failures[1]);
+    try std.testing.expectEqual(@as(u64, 13), runtime.input_tokens);
+    try std.testing.expectEqual(@as(u64, 3), runtime.output_tokens);
+    try std.testing.expectEqual(@as(u64, 2), runtime.batches);
+    try std.testing.expectEqual(@as(u64, 2), runtime.rows);
+    try std.testing.expectEqual(@as(u64, 3), runtime.reserved_rows);
+    // The same preflight keeps native providers text-only even in a mixed batch.
+    requests[2].input = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/a.png"}]}]
+    , .{}));
+    try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.evaluatePartial(alloc, &requests));
+    try std.testing.expectEqual(@as(u64, 2), runtime.rows);
+}
+
+test "decision functions hosted partial batches retain failed provider usage and preflight quotas" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const valid = try std.json.Stringify.valueAlloc(alloc, .{
+        .model = "resolved-vision",
+        .answers = .{.{ .name = "answer", .type = "predicate", .probability = @as(f64, 0.9) }},
+        .usage = .{ .input_tokens = @as(u64, 3), .output_tokens = @as(u64, 1), .total_tokens = @as(u64, 4), .input_tokens_details = .{ .cached_tokens = 0, .cache_write_tokens = 0 }, .output_tokens_details = .{ .reasoning_tokens = 0 } },
+    }, .{});
+    const Check = struct {
+        fn image(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer batch-key", req.header("authorization").?);
+            const parsed = try std.json.parseFromSlice(decisions.Json, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), (try decisions.Input.fromJson(parsed.value.object.get("input").?)).imageCount());
+        }
+    };
+    var server = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/v1/decisions", .max_uses = 1, .assert_request = Check.image, .respond = .{ .status = 503, .body = "{\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}" } },
+        .{ .method = .POST, .path = "/v1/decisions", .assert_request = Check.image, .respond = .{ .body = valid } },
+    });
+    defer server.deinit();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    const cfg = decisions.DeciderConfig{ .provider = .openai, .model = "vision", .url = try std.fmt.allocPrint(alloc, "{s}/v1", .{server.baseUrl()}), .api_key = "batch-key", .max_image_input_tokens = 8192, .batch_size = 1 };
+    try registry.registerDeciderConfig("hosted", cfg);
+    var tiny = cfg;
+    tiny.rate_limit = .{ .tokens_per_minute = 1000 };
+    try registry.registerDeciderConfig("tiny", tiny);
+    var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+    defer runtime.deinit();
+    const input = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/a.png"}]}]
+    , .{}));
+    const q = try decisions.questionsFor(alloc, .ai_probability, &.{ .{ .string = "x" }, .{ .string = "Safe?" }, .{ .string = "hosted" } });
+    var requests: [3]decisions.Request = @splat(.{ .input = input, .questions = q, .decider = "hosted" });
+    const Run = struct {
+        fn run(r: *Runtime, allocator: std.mem.Allocator, reqs: []const decisions.Request, failure: *?anyerror) void {
+            execute(r, allocator, reqs) catch |err| {
+                failure.* = err;
+            };
+        }
+        fn execute(r: *Runtime, allocator: std.mem.Allocator, reqs: []const decisions.Request) !void {
+            const result = try r.evaluatePartial(allocator, reqs);
+            try std.testing.expectEqual(@as(?anyerror, error.DecisionUpstreamFailure), result.failures[0]);
+            try std.testing.expect(result.values[0] == null and result.values[1] != null and result.values[2] != null);
+            try std.testing.expectEqualStrings("resolved-vision", result.values[1].?.object.get("model").?.string);
+        }
+    };
+    var group = std.Io.Group.init;
+    var failure: ?anyerror = null;
+    try group.concurrent(io, Run.run, .{ &runtime, alloc, &requests, &failure });
+    defer group.cancel(io);
+    for (0..3) |_| try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(u64, 13), runtime.input_tokens);
+    try std.testing.expectEqual(@as(u64, 3), runtime.output_tokens);
+    // An oversized per-item TPM reservation rejects the whole request before I/O.
+    requests[2].decider = "tiny";
+    try std.testing.expectError(error.DecisionLimitExceeded, runtime.evaluatePartial(alloc, &requests));
+    try std.testing.expectEqual(@as(u64, 2), runtime.rows);
+    var cancelled = std.atomic.Value(bool).init(true);
+    runtime.context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) };
+    try std.testing.expectError(error.Cancelled, runtime.evaluatePartial(alloc, &requests));
+}
+
+test "decision functions generated multimodal decisions preserve evidence and item IDs through native repair" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("vision", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only, .max_image_input_tokens = 8192 });
+    const Fake = struct {
+        calls: usize = 0,
+        images: bool = true,
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const body = try std.json.parseFromSliceLeaky(decisions.Json, alloc, bytes, .{});
+            try std.testing.expect(body.object.contains("response_format"));
+            const messages = body.object.get("messages").?.array.items;
+            const prompt = try std.json.parseFromSliceLeaky(decisions.Json, alloc, messages[1].object.get("content").?.string, .{});
+            const items = prompt.object.get("items").?.array.items;
+            try std.testing.expectEqual(@as(usize, if (self.calls == 1) 2 else 1), items.len);
+            try std.testing.expectEqual(@as(i64, 1), items[items.len - 1].object.get("id").?.integer);
+            try std.testing.expect(std.mem.indexOf(u8, messages[1].object.get("content").?.string, "iVBORw0KGgo=") == null);
+            try std.testing.expectEqualStrings("Evidence for item ID 1:", messages[2].object.get("content").?.string);
+            try std.testing.expectEqualStrings("Shared context", messages[3].object.get("content").?.string);
+            const parts = messages[4].object.get("content").?.array.items;
+            try std.testing.expectEqualStrings("Inspect", parts[0].object.get("text").?.string);
+            try std.testing.expectEqualStrings("image/png", parts[1].object.get("mime_type").?.string);
+            try std.testing.expectEqualStrings("iVBORw0KGgo=", parts[1].object.get("data").?.string);
+            if (self.calls == 1) return alloc.dupe(u8,
+                \\{"choices":[{"message":{"content":"{\"items\":[{\"item\":0,\"value\":{\"answer\":\"same\"}}]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+            );
+            return alloc.dupe(u8,
+                \\{"choices":[{"message":{"content":"{\"items\":[{\"item\":1,\"value\":{\"answer\":\"different\"}}]}"}}],"usage":{"prompt_tokens":7,"completion_tokens":3}}
+            );
+        }
+        fn caps(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_inference_work").Task) !@import("antfly_inference_work").InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .generate, .input_modalities = .{ .text = true, .image = self.images }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true, .batch = .{ .max_media_parts_per_item = if (self.images) 8 else 0 } };
+        }
+    };
+    var fake = Fake{};
+    var runtime = Runtime{ .registry = &registry, .http = &client, .io = std.testing.io, .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate, .model_capabilities = Fake.caps } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"answer":{"type":"choice","instructions":"Compare concepts","criteria":{"same":"Same entity","different":"Distinct entities"}}}
+    , .{});
+    const evidence = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\[{"role":"user","content":"Shared context"},{"role":"user","content":[{"type":"input_text","text":"Inspect"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]
+    , .{}));
+    const requests = [_]decisions.Request{ .{ .decider = "vision", .questions = questions, .input = .{ .text = "Text" } }, .{ .decider = "vision", .questions = questions, .input = evidence } };
+    const result = try runtime.evaluatePartial(scratch, &requests);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqualStrings("same", result.values[0].?.object.get("answers").?.array.items[0].object.get("choice").?.string);
+    try std.testing.expectEqualStrings("different", result.values[1].?.object.get("answers").?.array.items[0].object.get("choice").?.string);
+    try std.testing.expectEqual(@as(u64, 17), runtime.input_tokens);
+    try std.testing.expectEqual(@as(u64, 8), runtime.output_tokens);
+    fake.images = false;
+    var text_only = Runtime{ .registry = &registry, .http = &client, .io = std.testing.io, .antfly_provider = runtime.antfly_provider };
+    defer text_only.deinit();
+    try std.testing.expectError(error.UnsupportedInferenceFeature, text_only.evaluatePartial(scratch, &requests));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    var cfg = try registry.getDeciderConfig("vision");
+    const remote_image = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/image.png"}]}]
+    , .{}));
+    try std.testing.expectError(error.UnsupportedInferenceFeature, requestPayload(scratch, std.testing.io, cfg, .{ .decider = "vision", .questions = questions, .input = remote_image }));
+    cfg.max_image_input_tokens = null;
+    try registry.registerDeciderConfig("unbudgeted", cfg);
+    try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.evaluatePartial(scratch, &.{.{ .decider = "unbudgeted", .questions = questions, .input = evidence }}));
+}
+
+test "decision functions generated multimodal decisions reach hosted structured adapters with image quota reservations" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(decisions.Json, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            if (root.get("contents")) |contents| {
+                try std.testing.expect(root.contains("tools"));
+                var found = false;
+                for (contents.array.items) |content| for (content.object.get("parts").?.array.items) |part| {
+                    if (part.object.get("inlineData")) |image| {
+                        try std.testing.expectEqualStrings("image/png", image.object.get("mimeType").?.string);
+                        try std.testing.expectEqualStrings("iVBORw0KGgo=", image.object.get("data").?.string);
+                        found = true;
+                    }
+                };
+                try std.testing.expect(found);
+            } else {
+                try std.testing.expect(root.contains("response_format"));
+                const messages = root.get("messages").?.array.items;
+                const image = messages[3].object.get("content").?.array.items[1].object.get("image_url").?;
+                try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgo=", image.object.get("url").?.string);
+                try std.testing.expectEqualStrings("high", image.object.get("detail").?.string);
+            }
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            server.handleOne() catch |err| {
+                failure.* = err;
+            };
+        }
+    };
+    for ([_]@import("../generating/mod.zig").Provider{ .openai, .gemini }) |provider| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const google = provider == .gemini;
+        const path = if (google) "/models/gemini-2.5-flash:generateContent" else "/chat/completions";
+        const reply = if (google)
+            "{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"antfly_output\",\"args\":{\"items\":[{\"item\":0,\"value\":{\"answer\":\"same\"}}]}}}]}}],\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":3}}"
+        else
+            "{\"choices\":[{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"item\\\":0,\\\"value\\\":{\\\"answer\\\":\\\"same\\\"}}]}\"}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}";
+        var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = path, .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = reply } }});
+        defer server.deinit();
+        const url = server.baseUrl();
+        var client = httpx.Client.init(a, io);
+        defer client.deinit();
+        var limits = quotas.Registry.init(a);
+        defer limits.deinit();
+        var registry = registry_mod.Registry.init(a);
+        defer registry.deinit();
+        try registry.registerDeciderConfig("vision", .{ .decision_method = .generated, .generator = .{ .provider = provider, .model = if (google) "gemini-2.5-flash" else "gpt-4.1", .url = url, .api_key = "fixture", .rate_limit = .{ .tokens_per_minute = 100000 } }, .output = if (google) .tool_call else .json_schema, .probabilities = .verdict_only, .max_image_input_tokens = 8192 });
+        var runtime = Runtime{ .registry = &registry, .http = &client, .io = io, .limits = &limits };
+        defer runtime.deinit();
+        const evidence = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, scratch, if (google)
+            "[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]"
+        else
+            "[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\",\"detail\":\"high\"}]}]", .{}));
+        const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+            \\{"answer":{"type":"choice","instructions":"Compare concepts","criteria":{"same":"Same entity","different":"Distinct entities"}}}
+        , .{});
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Check.serve, .{ &server, &failure });
+        const result = try runtime.evaluatePartial(scratch, &.{.{ .decider = "vision", .questions = questions, .input = evidence }});
+        try group.await(io);
+        if (failure) |err| return err;
+        try std.testing.expect(result.failures[0] == null);
+        try std.testing.expectEqualStrings("same", result.values[0].?.object.get("answers").?.array.items[0].object.get("choice").?.string);
+        try std.testing.expectEqual(@as(u64, 12), runtime.input_tokens);
+        try std.testing.expectEqual(@as(u64, 3), runtime.output_tokens);
+    }
+}
+
+test "decision functions failed generated calls retain hosted reported usage" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(decisions.Json, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            if (root.get("contents")) |contents| {
+                try std.testing.expect(root.contains("tools"));
+                var found = false;
+                for (contents.array.items) |content| for (content.object.get("parts").?.array.items) |part| {
+                    if (part.object.get("inlineData")) |image| {
+                        try std.testing.expectEqualStrings("image/png", image.object.get("mimeType").?.string);
+                        try std.testing.expectEqualStrings("iVBORw0KGgo=", image.object.get("data").?.string);
+                        found = true;
+                    }
+                };
+                try std.testing.expect(found);
+            } else {
+                try std.testing.expect(root.contains("response_format"));
+                const messages = root.get("messages").?.array.items;
+                const image = messages[3].object.get("content").?.array.items[1].object.get("image_url").?;
+                try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgo=", image.object.get("url").?.string);
+                try std.testing.expectEqualStrings("high", image.object.get("detail").?.string);
+            }
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            server.handleOne() catch |err| {
+                failure.* = err;
+            };
+        }
+    };
+    for ([_]@import("../generating/mod.zig").Provider{ .openai, .gemini }) |provider| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const google = provider == .gemini;
+        const path = if (google) "/models/gemini-2.5-flash:generateContent" else "/chat/completions";
+        const reply = if (google)
+            "{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"antfly_output\",\"args\":{\"items\":[{\"item\":0,\"value\":{\"answer\":\"same\"}}]}}}]}}],\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":3}}"
+        else
+            "{\"choices\":[{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"item\\\":0,\\\"value\\\":{\\\"answer\\\":\\\"same\\\"}}]}\"}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}";
+        var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = path, .max_uses = 1, .assert_request = Check.request, .respond = .{ .status = 503, .body = reply } }});
+        defer server.deinit();
+        const url = server.baseUrl();
+        var client = httpx.Client.initWithConfig(a, io, .{ .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        var limits = quotas.Registry.init(a);
+        defer limits.deinit();
+        var registry = registry_mod.Registry.init(a);
+        defer registry.deinit();
+        try registry.registerDeciderConfig("vision", .{ .decision_method = .generated, .generator = .{ .provider = provider, .model = if (google) "gemini-2.5-flash" else "gpt-4.1", .url = url, .api_key = "fixture", .rate_limit = .{ .tokens_per_minute = 100000 } }, .output = if (google) .tool_call else .json_schema, .probabilities = .verdict_only, .max_image_input_tokens = 8192 });
+        var runtime = Runtime{ .registry = &registry, .http = &client, .io = io, .limits = &limits };
+        defer runtime.deinit();
+        const evidence = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, scratch, if (google)
+            "[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]"
+        else
+            "[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\",\"detail\":\"high\"}]}]", .{}));
+        const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+            \\{"answer":{"type":"choice","instructions":"Compare concepts","criteria":{"same":"Same entity","different":"Distinct entities"}}}
+        , .{});
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Check.serve, .{ &server, &failure });
+        const result = try runtime.evaluatePartial(scratch, &.{.{ .decider = "vision", .questions = questions, .input = evidence }});
+        try group.await(io);
+        if (failure) |err| return err;
+        try std.testing.expect(result.failures[0] != null);
+        try std.testing.expect(result.values[0] == null);
+        try std.testing.expectEqual(@as(u64, 12), runtime.input_tokens);
+        try std.testing.expectEqual(@as(u64, 3), runtime.output_tokens);
+    }
+}
+
+test "decision functions generated capabilities are captured once per request and survive discovery outages" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("judge", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "generator", .url = "" }, .probabilities = .verdict_only, .max_image_input_tokens = 8192 });
+    const Fake = struct {
+        calls: usize = 0,
+        discoveries: usize = 0,
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const body = try std.json.parseFromSliceLeaky(decisions.Json, alloc, bytes, .{});
+            try std.testing.expect(body.object.contains("response_format"));
+            const messages = body.object.get("messages").?.array.items;
+            const prompt = try std.json.parseFromSliceLeaky(decisions.Json, alloc, messages[1].object.get("content").?.string, .{});
+            try std.testing.expectEqual(@as(usize, 2), prompt.object.get("items").?.array.items.len);
+            return alloc.dupe(u8,
+                \\{"choices":[{"message":{"content":"{\"items\":[{\"item\":0,\"value\":{\"answer\":\"same\"}},{\"item\":1,\"value\":{\"answer\":\"different\"}}]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+            );
+        }
+        fn caps(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_inference_work").Task) !@import("antfly_inference_work").InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.discoveries += 1;
+            if (self.calls > 0) return error.CapabilityDiscoveryUnavailable;
+            return .{ .model_revision = @splat(1), .task = .generate, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true };
+        }
+    };
+    var fake = Fake{};
+    var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = std.testing.io, .antfly_provider = .{
+        .ptr = &fake,
+        .embed_dense_texts = undefined,
+        .embed_sparse_texts = undefined,
+        .generate_json = Fake.generate,
+        .model_capabilities = Fake.caps,
+    } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"answer":{"type":"choice","instructions":"Compare concepts","criteria":{"same":"Same entity","different":"Distinct entities"}}}
+    , .{});
+    const result = try runtime.provider().evaluateBatch(scratch, &.{ .{ .decider = "judge", .questions = questions, .input = .{ .text = "A B" } }, .{ .decider = "judge", .questions = questions, .input = .{ .text = "C D" } } });
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings("same", result[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
+    try std.testing.expectEqualStrings("verdict", result[1].object.get("answers").?.array.items[0].object.get("probability_source").?.string);
+    try std.testing.expectEqual(@as(u64, 10), runtime.input_tokens);
+    try std.testing.expectEqual(@as(usize, 1), fake.discoveries);
+    runtime.deinit();
+    const revision: [32]u8 = @splat(1);
+    const expected_revision = try std.fmt.allocPrint(scratch, "{x}", .{&revision});
+    try std.testing.expectEqualStrings(expected_revision, result[0].object.get("model_revision").?.string);
+    var next_request = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = std.testing.io, .antfly_provider = runtime.antfly_provider };
+    defer next_request.deinit();
+    try std.testing.expectError(error.CapabilityDiscoveryUnavailable, next_request.provider().evaluateBatch(scratch, &.{.{ .decider = "judge", .questions = questions, .input = .{ .text = "A B" } }}));
+    try std.testing.expectEqual(@as(usize, 2), fake.discoveries);
+}
+
+test "decision functions native generated batches pack media limits and preserve oversized siblings" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("vision", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only, .max_image_input_tokens = 100 });
+    const Fake = struct {
+        calls: usize = 0,
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const body = try std.json.parseFromSliceLeaky(decisions.Json, alloc, bytes, .{});
+            var images: usize = 0;
+            for (body.object.get("messages").?.array.items) |message| {
+                const content = message.object.get("content").?;
+                if (content == .array) for (content.array.items) |part| {
+                    if (std.mem.eql(u8, part.object.get("type").?.string, "media")) images += 1;
+                };
+            }
+            if (images > 8) return error.GenerateMediaPartLimitExceeded;
+            return alloc.dupe(u8,
+                \\{"choices":[{"message":{"content":"{\"items\":[{\"item\":0,\"value\":{\"answer\":\"same\"}},{\"item\":1,\"value\":{\"answer\":\"same\"}}]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+            );
+        }
+        fn caps(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_inference_work").Task) !@import("antfly_inference_work").InferenceCapabilities {
+            return .{ .task = .generate, .input_modalities = .{ .text = true, .image = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true, .batch = .{ .max_media_parts_per_item = 8 } };
+        }
+    };
+    var fake = Fake{};
+    var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = std.testing.io, .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate, .model_capabilities = Fake.caps } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"answer":{"type":"choice","instructions":"Compare concepts","criteria":{"same":"Same entity","different":"Distinct entities"}}}
+    , .{});
+    const raw = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]
+    , .{});
+    const parts = raw.array.items[0].object.getPtr("content").?;
+    const image = parts.array.items[0];
+    for (0..4) |_| try parts.array.append(image);
+    const input = try decisions.Input.fromJson(raw);
+    const result = try runtime.evaluatePartial(scratch, &.{ .{ .decider = "vision", .questions = questions, .input = input }, .{ .decider = "vision", .questions = questions, .input = input } });
+    try std.testing.expect(result.values[0] != null and result.values[1] != null);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(u64, 20), runtime.input_tokens);
+    for (0..4) |_| try parts.array.append(image);
+    const large = try decisions.Input.fromJson(raw);
+    const partial = try runtime.evaluatePartial(scratch, &.{ .{ .decider = "vision", .questions = questions, .input = large }, .{ .decider = "vision", .questions = questions, .input = .{ .text = "Valid sibling" } } });
+    try std.testing.expectEqual(error.ConstrainedInputTooLarge, partial.failures[0].?);
+    try std.testing.expect(partial.values[1] != null);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "decision functions native generated batches pack decoded pixel limits and preserve oversized siblings" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("vision", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only, .max_image_input_tokens = 100 });
+    const Fake = struct {
+        calls: usize = 0,
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const body = try std.json.parseFromSliceLeaky(decisions.Json, alloc, bytes, .{});
+            var images: usize = 0;
+            for (body.object.get("messages").?.array.items) |message| {
+                const content = message.object.get("content").?;
+                if (content == .array) for (content.array.items) |part| {
+                    if (std.mem.eql(u8, part.object.get("type").?.string, "media")) images += 1;
+                };
+            }
+            var pixels: u64 = 0;
+            for (body.object.get("messages").?.array.items) |message| {
+                const content = message.object.get("content").?;
+                if (content == .array) for (content.array.items) |part| {
+                    if (!std.mem.eql(u8, part.object.get("type").?.string, "media")) continue;
+                    const encoded = part.object.get("data").?.string;
+                    const image_bytes = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(encoded));
+                    try std.base64.standard.Decoder.decode(image_bytes, encoded);
+                    pixels += try @import("antfly_inference_work").encodedImagePixels(part.object.get("mime_type").?.string, image_bytes);
+                };
+            }
+            const capabilities = try caps(ptr, alloc, "vision", .generate);
+            try capabilities.validateInvocation(.generate, .{ .item_count = 1, .modalities = .{ .text = true, .image = images > 0 }, .decoded_pixels = pixels, .max_media_parts_per_item = images });
+            return alloc.dupe(u8,
+                \\{"choices":[{"message":{"content":"{\"items\":[{\"item\":0,\"value\":{\"answer\":\"same\"}},{\"item\":1,\"value\":{\"answer\":\"same\"}}]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+            );
+        }
+        fn caps(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_inference_work").Task) !@import("antfly_inference_work").InferenceCapabilities {
+            return .{ .task = .generate, .input_modalities = .{ .text = true, .image = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true, .batch = .{ .max_media_parts_per_item = 8, .max_decoded_pixels = 1 } };
+        }
+    };
+    var fake = Fake{};
+    var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = std.testing.io, .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate, .model_capabilities = Fake.caps } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"answer":{"type":"choice","instructions":"Compare concepts","criteria":{"same":"Same entity","different":"Distinct entities"}}}
+    , .{});
+    const raw = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAEAAAAB"}]}]
+    , .{});
+    const parts = raw.array.items[0].object.getPtr("content").?;
+    const image = parts.array.items[0];
+
+    const input = try decisions.Input.fromJson(raw);
+    const result = try runtime.evaluatePartial(scratch, &.{ .{ .decider = "vision", .questions = questions, .input = input }, .{ .decider = "vision", .questions = questions, .input = input } });
+    try std.testing.expect(result.values[0] != null and result.values[1] != null);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(u64, 20), runtime.input_tokens);
+    try parts.array.append(image);
+    const large = try decisions.Input.fromJson(raw);
+    const partial = try runtime.evaluatePartial(scratch, &.{ .{ .decider = "vision", .questions = questions, .input = large }, .{ .decider = "vision", .questions = questions, .input = .{ .text = "Valid sibling" } } });
+    try std.testing.expectEqual(error.ConstrainedInputTooLarge, partial.failures[0].?);
+    try std.testing.expect(partial.values[1] != null);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "decision functions generated statement renews revoked leases without changing its model contract" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Scenario = enum { renew, changed_model, changed_limit, outage, repeatedly_stale, missing_lease, cancelled, cancelled_discovery, upstream_failure };
+    const Fixture = struct {
+        var scenario: Scenario = .renew;
+        var revoked: bool = false;
+        var routes: []httpx.testing_mod.Route = undefined;
+        var cancellation: *std.atomic.Value(bool) = undefined;
+        const answer = "{\"choices\":[{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"item\\\":0,\\\"value\\\":{\\\"answer\\\":\\\"same\\\"}}]}\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}";
+        const revision = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const headers = [_]httpx.testing_mod.HeaderPair{ .{ .name = "X-Antfly-Capability-Token", .value = "new-token" }, .{ .name = "X-Antfly-Capability-Revision", .value = revision } };
+        fn authority(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer fixture", req.header("Authorization") orelse return error.MissingAuthorization);
+            try std.testing.expectEqualStrings("docs", req.header("X-Antfly-Source-Table") orelse return error.MissingScope);
+        }
+        fn catalog(req: httpx.testing_mod.RequestInfo) !void {
+            try authority(req);
+            // The concrete execution is /generate, not /generate/batch.
+            try std.testing.expectEqualStrings("model=vision&task=generate&operation=generate", req.query);
+            if (revoked and scenario == .cancelled_discovery) cancellation.store(true, .release);
+        }
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try authority(req);
+            try std.testing.expectEqualStrings(revision, req.header("X-Antfly-Capability-Revision") orelse return error.MissingRevision);
+            const token = req.header("X-Antfly-Capability-Token") orelse return error.MissingToken;
+            if (revoked and scenario == .cancelled) cancellation.store(true, .release);
+            if (revoked and scenario == .upstream_failure) {
+                routes[1].respond = .{ .status = 503, .body = "{\"error\":\"service unavailable\"}" };
+            } else if (revoked and (scenario == .repeatedly_stale or std.mem.eql(u8, token, "old-token"))) {
+                routes[1].respond = .{ .status = 409, .headers = &.{.{ .name = "X-Antfly-Capability-Stale", .value = "true" }}, .body = "{\"error\":\"stale lease\",\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}" };
+            } else routes[1].respond = .{ .body = answer };
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            while (true) server.handleOne() catch |err| {
+                if (err != error.Canceled and err != error.Cancelled) failure.* = err;
+                return;
+            };
+        }
+    };
+    const catalog =
+        \\{"generators":{"vision":{"model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","inputs":["text"],"inference_capabilities":{"version":3,"task":"generate","input_modalities":["text"],"accepted_mime_types":["text/plain"],"input_granularity":"item","output":"generated_text","result_cardinality":"one_per_item","prompt_policy":"explicit","borrowed_attachments":false,"numeric_responses_v1":false,"rerank_documents_v1":false,"generation_grammar_v1":true,"batch":{"mode":"none","preferred_items":1,"max_items":1,"max_encoded_media_bytes":null,"max_decoded_pixels":null,"max_media_parts_per_item":0,"per_item_failures":false}}}}}
+    ;
+    for (std.enums.values(Scenario)) |scenario| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var routes = [_]httpx.testing_mod.Route{
+            .{ .path = "/ai/v1/models", .assert_request = Fixture.catalog, .respond = .{ .body = catalog, .headers = &.{ .{ .name = "X-Antfly-Capability-Token", .value = "old-token" }, .{ .name = "X-Antfly-Capability-Revision", .value = Fixture.revision } } } },
+            .{ .method = .POST, .path = "/generate", .assert_request = Fixture.request },
+        };
+        var cancellation = std.atomic.Value(bool).init(false);
+        Fixture.cancellation = &cancellation;
+        Fixture.scenario = scenario;
+        Fixture.revoked = false;
+        Fixture.routes = &routes;
+        var server = try httpx.TestServer.start(a, io, &routes);
+        defer server.deinit();
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Fixture.serve, .{ &server, &failure });
+        var client = httpx.Client.initWithConfig(a, io, .{ .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        var registry = registry_mod.Registry.init(a);
+        defer registry.deinit();
+        try registry.registerDeciderConfig("judge", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only });
+        var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = io, .source_table = "docs", .antfly_url = server.baseUrl(), .antfly_api_key = "fixture" };
+        defer runtime.deinit();
+        runtime.context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancellation) };
+        const questions = try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+            \\{"answer":{"type":"choice","instructions":"Compare","criteria":{"same":"Same","different":"Different"}}}
+        , .{});
+        const requests = [_]decisions.Request{.{ .decider = "judge", .questions = questions, .input = .{ .text = "A B" } }};
+        const first = try runtime.provider().evaluateBatch(alloc, &requests);
+        try std.testing.expectEqualStrings("same", first[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
+        try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
+        Fixture.revoked = true;
+        routes[0].respond.headers = &Fixture.headers;
+        if (scenario == .changed_model) {
+            routes[0].respond.body = try std.mem.replaceOwned(u8, alloc, catalog, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        }
+        if (scenario == .changed_limit) routes[0].respond.body = try std.mem.replaceOwned(u8, alloc, catalog, "\"max_decoded_pixels\":null", "\"max_decoded_pixels\":0");
+        if (scenario == .outage) routes[0].respond.status = 503;
+        if (scenario == .missing_lease) routes[0].respond.headers = &.{};
+        if (scenario == .cancelled_discovery) routes[0].respond.delay_ns = 5 * std.time.ns_per_s;
+        const started = @import("antfly_platform").time.monotonicNs();
+        const second = runtime.provider().evaluateBatch(alloc, &requests);
+        switch (scenario) {
+            .renew => {
+                const values = try second;
+                try std.testing.expectEqualStrings("same", values[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
+                try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", values[0].object.get("model_revision").?.string);
+                // Reuse the replacement on a later window, including after the
+                // result has been normalized against the original snapshot.
+                _ = try runtime.provider().evaluateBatch(alloc, &requests);
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 4), server.routeHitCount(1));
+                try std.testing.expectEqual(@as(u64, 32), runtime.input_tokens);
+                try std.testing.expectEqual(@as(u64, 16), runtime.output_tokens);
+            },
+            .changed_model, .changed_limit, .missing_lease => {
+                try std.testing.expectError(error.InferenceCapabilitiesStale, second);
+                try std.testing.expectError(error.InferenceCapabilitiesStale, runtime.provider().evaluateBatch(alloc, &requests));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
+            },
+            .outage => {
+                try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, second);
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
+                routes[0].respond.status = 200;
+                _ = try runtime.provider().evaluateBatch(alloc, &requests);
+                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(1));
+            },
+            .repeatedly_stale => {
+                try std.testing.expectError(error.InferenceCapabilitiesStale, second);
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(1));
+            },
+            .cancelled, .cancelled_discovery => {
+                // Cancellation must interrupt the in-flight discovery read,
+                // rather than waiting for its delayed response to complete.
+                try std.testing.expect(@import("antfly_platform").time.monotonicNs() - started < 2 * std.time.ns_per_s);
+                if (second) |_| return error.TestExpectedError else |err| try std.testing.expect(err == error.Cancelled or err == error.Canceled);
+                try std.testing.expectEqual(@as(usize, if (scenario == .cancelled) 1 else 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
+            },
+            .upstream_failure => {
+                if (second) |_| return error.TestExpectedError else |_| {}
+                try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
+            },
+        }
+        group.cancel(io);
+        if (failure) |err| return err;
+    }
+}
+
+test "decision functions scoped generated image validation and execution share a route" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Fixture = struct {
+        var routes: []httpx.testing_mod.Route = undefined;
+        var vision_catalog: []const u8 = undefined;
+        const text_catalog =
+            \\{"generators":{"vision":{"model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","inputs":["text"],"inference_capabilities":{"version":3,"task":"generate","input_modalities":["text"],"accepted_mime_types":["text/plain"],"input_granularity":"item","output":"generated_text","result_cardinality":"one_per_item","prompt_policy":"explicit","borrowed_attachments":false,"numeric_responses_v1":false,"rerank_documents_v1":false,"generation_grammar_v1":true,"batch":{"mode":"none","preferred_items":1,"max_items":1,"max_encoded_media_bytes":null,"max_decoded_pixels":null,"max_media_parts_per_item":0,"per_item_failures":false}}}}}
+        ;
+        fn catalog(req: httpx.testing_mod.RequestInfo) !void {
+            const table = req.header("X-Antfly-Source-Table") orelse return error.MissingScope;
+            try std.testing.expectEqualStrings("model=vision&task=generate&operation=generate", req.query);
+            routes[0].respond.body = if (std.mem.eql(u8, table, "photos")) vision_catalog else text_catalog;
+        }
+        fn generate(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("photos", req.header("X-Antfly-Source-Table") orelse return error.MissingScope);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "iVBORw0KGgo=") != null);
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            while (true) server.handleOne() catch |err| {
+                if (err != error.Canceled and err != error.Cancelled) failure.* = err;
+                return;
+            };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var vision_catalog = try std.mem.replaceOwned(u8, alloc, Fixture.text_catalog, "[\"text\"]", "[\"text\",\"image\"]");
+    vision_catalog = try std.mem.replaceOwned(u8, alloc, vision_catalog, "[\"text/plain\"]", "[\"text/plain\",\"image/png\"]");
+    Fixture.vision_catalog = try std.mem.replaceOwned(u8, alloc, vision_catalog, "\"max_media_parts_per_item\":0", "\"max_media_parts_per_item\":8");
+    var routes = [_]httpx.testing_mod.Route{
+        .{ .path = "/ai/v1/models", .assert_request = Fixture.catalog },
+        .{ .method = .POST, .path = "/generate", .assert_request = Fixture.generate, .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"item\\\":0,\\\"value\\\":{\\\"answer\\\":\\\"same\\\"}}]}\"}}]}" } },
+    };
+    Fixture.routes = &routes;
+    var server = try httpx.TestServer.start(a, io, &routes);
+    defer server.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{ &server, &failure });
+    var client = httpx.Client.initWithConfig(a, io, .{ .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("judge", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only, .max_image_input_tokens = 8192 });
+    // SQL keeps a statement-wide runtime and puts each bound table on the
+    // provider. Its default must not supply discovery for another table.
+    var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = io, .antfly_url = server.baseUrl(), .source_table = "default" };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+        \\{"answer":{"type":"choice","instructions":"Compare","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    const input = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]
+    , .{}));
+    const request = decisions.Request{ .decider = "judge", .questions = questions, .input = input };
+    const first = try runtime.provider().withSourceTable("photos").evaluateBatch(alloc, &.{request});
+    try std.testing.expectEqualStrings("same", first[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
+    try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(1));
+    try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.provider().withSourceTable("text_docs").evaluateBatch(alloc, &.{request}));
+    try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(1));
+    // Internal batches can carry per-item scopes without a provider override.
+    var scoped = request;
+    scoped.source_table = "photos";
+    const partial = try runtime.evaluatePartial(alloc, &.{scoped});
+    try std.testing.expect(partial.values[0] != null);
+    try std.testing.expect(partial.failures[0] == null);
+    // The bound provider remains authoritative over an item's inherited scope.
+    scoped.source_table = "text_docs";
+    _ = try runtime.provider().withSourceTable("photos").evaluateBatch(alloc, &.{scoped});
+    try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(1));
+    try std.testing.expectEqualStrings("default", runtime.source_table);
+    group.cancel(io);
+    if (failure) |err| return err;
+}
+
+test "decision functions late stale responses preserve a renewed execution lease during discovery outage" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Fixture = struct {
+        var server_io: std.Io = undefined;
+        var revoked: bool = false;
+        var old_inflight: std.Io.Event = .unset;
+        var replacement_ready: std.Io.Event = .unset;
+        var routes: []httpx.testing_mod.Route = undefined;
+        const revision = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const answer = "{\"choices\":[{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"item\\\":0,\\\"value\\\":{\\\"answer\\\":\\\"same\\\"}}]}\"}}]}";
+        fn authority(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer fixture", req.header("Authorization") orelse return error.MissingAuthorization);
+            try std.testing.expectEqualStrings("docs", req.header("X-Antfly-Source-Table") orelse return error.MissingScope);
+        }
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try authority(req);
+            const token = req.header("X-Antfly-Capability-Token") orelse return error.MissingToken;
+            const descriptor = req.header("X-Antfly-Capability-Revision") orelse return error.MissingRevision;
+            if (revoked and std.mem.eql(u8, token, "old-token") and std.mem.eql(u8, descriptor, revision)) {
+                old_inflight.set(server_io);
+                try replacement_ready.wait(server_io);
+                routes[1].respond = .{ .status = 409, .headers = &.{.{ .name = "X-Antfly-Capability-Stale", .value = "true" }}, .body = "{\"error\":\"old lease revoked\"}" };
+            } else routes[1].respond = .{ .body = answer };
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            while (true) server.handleOne() catch |err| {
+                if (err != error.Canceled and err != error.Cancelled) failure.* = err;
+                return;
+            };
+        }
+        fn run(runtime: *Runtime, alloc: std.mem.Allocator, requests: []const decisions.Request, failure: *?anyerror) void {
+            _ = runtime.provider().evaluateBatch(alloc, requests) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    const catalog =
+        \\{"generators":{"vision":{"model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","inputs":["text"],"inference_capabilities":{"version":3,"task":"generate","input_modalities":["text"],"accepted_mime_types":["text/plain"],"input_granularity":"item","output":"generated_text","result_cardinality":"one_per_item","prompt_policy":"explicit","borrowed_attachments":false,"numeric_responses_v1":false,"rerank_documents_v1":false,"generation_grammar_v1":true,"batch":{"mode":"none","preferred_items":1,"max_items":1,"max_encoded_media_bytes":null,"max_decoded_pixels":null,"max_media_parts_per_item":0,"per_item_failures":false}}}}}
+    ;
+    for ([_]bool{ false, true }) |rotate_revision_only| {
+        var routes = [_]httpx.testing_mod.Route{
+            .{ .path = "/ai/v1/models", .assert_request = Fixture.authority, .respond = .{ .body = catalog, .headers = &.{ .{ .name = "X-Antfly-Capability-Token", .value = "old-token" }, .{ .name = "X-Antfly-Capability-Revision", .value = Fixture.revision } } } },
+            .{ .method = .POST, .path = "/generate", .assert_request = Fixture.request },
+        };
+        Fixture.routes = &routes;
+        Fixture.server_io = io;
+        Fixture.revoked = false;
+        Fixture.old_inflight = .unset;
+        Fixture.replacement_ready = .unset;
+        var server = try httpx.TestServer.start(a, io, &routes);
+        defer server.deinit();
+        var server_failure: ?anyerror = null;
+        var servers = std.Io.Group.init;
+        defer servers.cancel(io);
+        try servers.concurrent(io, Fixture.serve, .{ &server, &server_failure });
+        var client = httpx.Client.initWithConfig(a, io, .{ .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        var registry = registry_mod.Registry.init(a);
+        defer registry.deinit();
+        try registry.registerDeciderConfig("judge", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only });
+        var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = io, .source_table = "docs", .antfly_url = server.baseUrl(), .antfly_api_key = "fixture" };
+        defer runtime.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const questions = try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+            \\{"answer":{"type":"choice","instructions":"Compare","criteria":{"same":"Same","different":"Different"}}}
+        , .{});
+        const requests = [_]decisions.Request{.{ .decider = "judge", .questions = questions, .input = .{ .text = "A B" } }};
+        _ = try runtime.provider().evaluateBatch(alloc, &requests);
+        Fixture.revoked = true;
+        var client_failure: ?anyerror = null;
+        var calls = std.Io.Group.init;
+        defer calls.cancel(io);
+        defer Fixture.replacement_ready.set(io);
+        try calls.concurrent(io, Fixture.run, .{ &runtime, alloc, &requests, &client_failure });
+        try Fixture.old_inflight.wait(io);
+        // A second caller revokes the old tuple and resolves a replacement
+        // while the first invocation's stale response is still in flight.
+        try servers.concurrent(io, Fixture.serve, .{ &server, &server_failure });
+        const cache = &runtime.resolved_generators.items[0].cache;
+        const headers: []const [2][]const u8 = &.{ .{ "Authorization", "Bearer fixture" }, .{ "X-Antfly-Source-Table", "docs" } };
+        try cache.invalidateLease(server.baseUrl(), "vision", .generate, headers, try remote_capabilities.LeaseIdentity.init("old-token", Fixture.revision));
+        const replacement_token = if (rotate_revision_only) "old-token" else "new-token";
+        const replacement_revision = if (rotate_revision_only) "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" else Fixture.revision;
+        const replacement_headers = [_]httpx.testing_mod.HeaderPair{
+            .{ .name = "X-Antfly-Capability-Token", .value = replacement_token },
+            .{ .name = "X-Antfly-Capability-Revision", .value = replacement_revision },
+        };
+        routes[0].respond.headers = &replacement_headers;
+        const lease = try cache.getOrDiscoverLeaseWithContext(&client, server.baseUrl(), "vision", .generate, headers, .{});
+        try std.testing.expectEqualStrings(replacement_token, lease.routing_token.?.slice());
+        try std.testing.expectEqualStrings(replacement_revision, lease.descriptor_revision.?.slice());
+        // Discovery is now unavailable. The delayed rejection must use the
+        // cached replacement for retry, and keep it for subsequent windows.
+        routes[0].respond.status = 503;
+        Fixture.replacement_ready.set(io);
+        try calls.await(io);
+        if (client_failure) |err| return err;
+        _ = try runtime.provider().evaluateBatch(alloc, &requests);
+        try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+        try std.testing.expectEqual(@as(usize, 4), server.routeHitCount(1));
+        const retained = try cache.routingToken(server.baseUrl(), "vision", .generate, headers);
+        try std.testing.expectEqualStrings(replacement_token, retained.?.slice());
+        servers.cancel(io);
+        if (server_failure) |err| return err;
+    }
 }

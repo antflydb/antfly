@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 from pathlib import Path
 
 from release_channels import NIGHTLY_PATTERN
@@ -168,6 +169,31 @@ def verify_payload(
     return actual_ledger_digest
 
 
+def materialize_scope(
+    ledger_path: Path,
+    source_dir: Path,
+    payload_dir: Path,
+    tag: str,
+    commit: str,
+    ledger_sha256: str,
+    scope: str,
+) -> str:
+    """Copy a ledger-defined scope only after authenticating the full payload."""
+    verify_payload(ledger_path, source_dir, tag, commit, ledger_sha256)
+    if payload_dir.exists() and any(payload_dir.iterdir()):
+        raise SystemExit("scope destination must be empty")
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    names = [
+        entry["name"] for entry in ledger["artifacts"] if inferred_scope(entry) == scope
+    ]
+    if not names:
+        raise SystemExit(f"release ledger has no {scope} artifacts")
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        shutil.copyfile(source_dir / name, payload_dir / name)
+    return verify_payload(ledger_path, payload_dir, tag, commit, ledger_sha256, scope)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ledger", required=True, type=Path)
@@ -180,7 +206,25 @@ def main() -> int:
         choices=("runtime", "cli", "support"),
         help="require the payload directory to contain the complete named scope",
     )
+    parser.add_argument(
+        "--materialize-from",
+        type=Path,
+        help="verify the complete source payload, then copy exactly --scope into --payload-dir",
+    )
     args = parser.parse_args()
+    if args.materialize_from is not None:
+        if args.scope is None:
+            parser.error("--materialize-from requires --scope")
+        materialize_scope(
+            args.ledger,
+            args.materialize_from,
+            args.payload_dir,
+            args.tag,
+            args.commit,
+            args.ledger_sha256,
+            args.scope,
+        )
+        return 0
 
     verify_payload(
         args.ledger,

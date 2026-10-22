@@ -586,10 +586,9 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             });
         },
         .decide => {
-            try only(request, &.{ "model", "input", "questions" });
-            const input = try @import("antfly_local_sources").functions_decisions.Input.fromJson(request.object.get("input") orelse return error.InvalidInferenceRequest);
-            const questions = request.object.get("questions") orelse return error.InvalidInferenceRequest;
-            const result = try executor.decide(a, name, input, questions);
+            try only(request, &.{ "model", "input", "inputs", "questions", "context_version", "contexts" });
+            const result = try executor.decideRequest(a, name, request);
+            observation.usageJson(result);
             return ctx.json(result);
         },
         .embed => {
@@ -964,7 +963,7 @@ fn inlineTaskAttachments(a: std.mem.Allocator, task: gateway.Task, request: Json
                             }
                         }
                     }
-                    inline for (.{ "messages", "content", "input", "documents", "prompts" }) |field| if (object.getPtr(field)) |child| try self.media(child);
+                    inline for (.{ "messages", "content", "input", "inputs", "documents", "prompts" }) |field| if (object.getPtr(field)) |child| try self.media(child);
                 },
                 else => {},
             }
@@ -1729,6 +1728,14 @@ test "httpx inference gateway framed typed adapters inline only media references
     const decision_parts = adapted_decide.object.get("input").?.array.items[0].object.get("content").?.array.items;
     try std.testing.expectEqualStrings("attachment:0", decision_parts[0].object.get("text").?.string);
     try std.testing.expectEqualStrings("data:image/png;base64,aW1hZ2U=", decision_parts[1].object.get("image_url").?.string);
+    const batch_decide = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"model":"deciders/visual","inputs":[{"id":"text","input":"attachment:0"},{"id":"image","input":[{"role":"user","content":[{"type":"input_image","image_url":"attachment:0"}]}]}]}
+    , .{});
+    const adapted_batch = try inlineTaskAttachments(a, .decide, batch_decide, attachments);
+    const batch_inputs = adapted_batch.object.get("inputs").?.array.items;
+    try std.testing.expectEqualStrings("attachment:0", batch_inputs[0].object.get("input").?.string);
+    const image_part = batch_inputs[1].object.get("input").?.array.items[0].object.get("content").?.array.items[0];
+    try std.testing.expectEqualStrings("data:image/png;base64,aW1hZ2U=", image_part.object.get("image_url").?.string);
     const audio = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"transcribers/speech\",\"audio\":\"attachment:0\"}", .{});
     const adapted_audio = try inlineTaskAttachments(a, .transcribe, audio, &.{.{ .mime_type = "audio/flac", .data = "audio" }});
     try std.testing.expect(!adapted_audio.object.contains("audio"));

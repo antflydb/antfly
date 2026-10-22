@@ -258,6 +258,7 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_schema_openapi/root.zig",
     ),
     "antfly_scraping": ("zig/lib/scraping/src/mod.zig",),
+    "antfly_source_reference": ("zig/lib/scraping/src/source_reference.zig",),
     "antfly_scraping_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_scraping_openapi/root.zig",
     ),

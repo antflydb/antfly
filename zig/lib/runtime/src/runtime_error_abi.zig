@@ -52,6 +52,13 @@ test "document extraction failures retain terminal identity across callbacks" {
     }
 }
 
+test "metadata head races remain retryable across runtime callbacks" {
+    const transported = statusFromError(error.MetadataSnapshotHeadMismatch);
+    try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
+    try std.testing.expectEqual(error.MetadataSnapshotHeadMismatch, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.MetadataSnapshotHeadMismatch));
+}
+
 pub const Code = enum(c_int) {
     ok = 0,
     out_of_memory,
@@ -883,6 +890,7 @@ pub const Detail = enum(c_int) {
     value_verification_limit_exceeded,
     invalid_embedding_identity,
     graph_start_identity_required,
+    metadata_snapshot_head_mismatch,
     // Append-only Cypher details preserve graph errors across owner callbacks.
     cypher_aggregate_scope,
     cypher_aggregate_wildcard,
@@ -1296,7 +1304,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnknownMergeRuntime => status(.not_found, .unknown_merge_runtime),
         error.MissingSplitRuntime => status(.not_found, .missing_split_runtime),
         error.MissingMergeRuntime => status(.not_found, .missing_merge_runtime),
-        error.MetadataSnapshotUnavailable, error.MetadataSnapshotHeadMismatch => status(.retryable, .metadata_snapshot_unavailable),
+        error.MetadataSnapshotUnavailable => status(.retryable, .metadata_snapshot_unavailable),
+        error.MetadataSnapshotHeadMismatch => status(.retryable, .metadata_snapshot_head_mismatch),
         error.SplitSourceProjectionNotReady => status(.retryable, .split_source_projection_not_ready),
         error.SplitSourceProjectionAdvanced => status(.retryable, .split_source_projection_advanced),
         error.DurableRootIncarnationUnavailable => status(.retryable, .durable_root_incarnation_unavailable),
@@ -2242,6 +2251,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .missing_split_runtime => "MissingSplitRuntime",
         .missing_merge_runtime => "MissingMergeRuntime",
         .metadata_snapshot_unavailable => "MetadataSnapshotUnavailable",
+        .metadata_snapshot_head_mismatch => "MetadataSnapshotHeadMismatch",
         .split_source_projection_not_ready => "SplitSourceProjectionNotReady",
         .split_source_projection_advanced => "SplitSourceProjectionAdvanced",
         .durable_root_incarnation_unavailable => "DurableRootIncarnationUnavailable",
@@ -3098,10 +3108,10 @@ test "temporary SQL statement capture failure preserves retryable boundary ident
     try std.testing.expect(errorHasStableDetail(error.SqlStatementReadUnavailable));
 }
 
-test "provisioning races retain canonical availability across runtime archives" {
+test "provisioning races retain metadata identity and canonical protocol availability" {
     const metadata = statusFromError(error.MetadataSnapshotHeadMismatch);
     try std.testing.expectEqual(@backingInt(Code.retryable), metadata.code);
-    try std.testing.expectEqual(error.MetadataSnapshotUnavailable, errorFromStatus(metadata));
+    try std.testing.expectEqual(error.MetadataSnapshotHeadMismatch, errorFromStatus(metadata));
     for ([_]anyerror{ error.RaftBatchMergeProtocolUnavailable, error.RaftBatchSplitDeltaProtocolUnavailable }) |err| {
         const wire = statusFromError(err);
         try std.testing.expectEqual(@backingInt(Code.unavailable), wire.code);
@@ -3239,7 +3249,8 @@ test "merged runtime error details preserve main wire identifiers" {
     try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
     try std.testing.expectEqual(@as(c_int, 778), @backingInt(Detail.invalid_embedding_identity));
     try std.testing.expectEqual(@as(c_int, 779), @backingInt(Detail.graph_start_identity_required));
-    try std.testing.expectEqual(@as(c_int, 780), @backingInt(Detail.cypher_aggregate_scope));
+    try std.testing.expectEqual(@as(c_int, 780), @backingInt(Detail.metadata_snapshot_head_mismatch));
+    try std.testing.expectEqual(@as(c_int, 781), @backingInt(Detail.cypher_aggregate_scope));
 }
 
 test "logical query work and scan policy failures retain their identities" {

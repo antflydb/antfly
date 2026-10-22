@@ -47,7 +47,10 @@ fn sourceTable(bound: @import("describe.zig").BoundStatement, inherited: []const
     return "";
 }
 
-pub fn validateStatement(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, bound: @import("describe.zig").BoundStatement, parameters: []const std.json.Value) anyerror!void {
+pub fn validateStatement(a: std.mem.Allocator, inherited_provider: ?decisions.DecisionProvider, bound: @import("describe.zig").BoundStatement, parameters: []const std.json.Value) anyerror!void {
+    // Nested statements can select a different physical table from their
+    // enclosing statement. Preflight must bind the same route as execution.
+    const provider = if (inherited_provider) |active| active.withSourceTable(sourceTable(bound, active.source_table)) else null;
     try bound.scalars.validateDecisions(a, parameters, provider);
     if (bound.insert_source) |source| try validateStatement(a, provider, source.*, parameters);
     if (bound.returning) |returning| try validateStatement(a, provider, returning.*, parameters);
@@ -261,11 +264,14 @@ const Mock = struct {
     fail: bool = false,
     fail_after: ?usize = null,
     expect_messages: bool = false,
-    fn capabilities(ptr: *anyopaque, _: []const u8) !decisions.Capabilities {
+    fn capabilities(ptr: *anyopaque, _: []const u8, source_table: []const u8) !decisions.Capabilities {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.expected_source) |table| try std.testing.expectEqualStrings(table, source_table);
         return decisions.capabilities(if (self.expect_messages) .openai else .antfly);
     }
-    fn validate(_: *anyopaque, _: []const u8, questions: decisions.Json) !void {
+    fn validate(ptr: *anyopaque, _: []const u8, questions: decisions.Json, source_table: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.expected_source) |table| try std.testing.expectEqualStrings(table, source_table);
         try decisions.validateQuestions(questions, decisions.capabilities(.antfly));
     }
     fn batch(ptr: *anyopaque, a: std.mem.Allocator, requests: []const decisions.Request) ![]const decisions.Json {
@@ -551,8 +557,39 @@ test "decision functions SQL JSONB input preserves multimodal evidence" {
     const bound = try @import("bound_scalars.zig").bindTyped(alloc, null, compiled.statement, &types, null, &.{});
     var prepared = try bound.prepareParameters(a, &.{.{ .text = "[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]" }}, .{});
     defer prepared.deinit();
-    var mock: Mock = .{ .expect_messages = true };
-    try prepared.validateDecisions(alloc, mock.provider());
-    try std.testing.expectApproxEqAbs(@as(f64, 0.9), (try evaluatePrepared(alloc, mock.provider(), prepared.projections[0].?, &.{})).value.float, 0.001);
+    var mock: Mock = .{ .expect_messages = true, .expected_source = "photos" };
+    const provider = mock.provider().withSourceTable("photos");
+    try prepared.validateDecisions(alloc, provider);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), (try evaluatePrepared(alloc, provider, prepared.projections[0].?, &.{})).value.float, 0.001);
     try std.testing.expectEqual(@as(usize, 1), mock.calls);
+}
+
+test "SQL decision preflight binds each nested statement to its physical table" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compile(a, "SELECT ai_probability('input', 'Damaged?', 'vision')", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const scalars = try @import("bound_scalars.zig").bind(alloc, null, compiled.statement, &.{});
+    const Bound = @import("describe.zig").BoundStatement;
+    const inner: Bound = .{
+        .table = .{ .id = 2, .physical_name = "photos", .schema_version = 1, .columns = &.{} },
+        .action = .read,
+        .columns = &.{},
+        .parameter_types = &.{},
+        .json_literals = .empty,
+        .scalars = scalars,
+    };
+    const outer: Bound = .{
+        .table = .{ .id = 1, .physical_name = "destination", .schema_version = 1, .columns = &.{} },
+        .action = .write,
+        .columns = &.{},
+        .parameter_types = &.{},
+        .json_literals = .empty,
+        .insert_source = &inner,
+    };
+    var mock: Mock = .{ .expected_source = "photos" };
+    try validateStatement(alloc, mock.provider().withSourceTable("destination"), outer, &.{});
+    try std.testing.expectEqual(@as(usize, 0), mock.calls);
 }

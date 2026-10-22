@@ -3,8 +3,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isProductEnabled } from "@/config/products";
 import { useApiConfig } from "@/hooks/use-api-config";
 import {
-  INFERENCE_MODEL_GROUPS,
   INFERENCE_MODEL_GROUP_TYPES,
+  INFERENCE_MODEL_GROUPS,
   inferenceModelGroups,
 } from "@/lib/inference-model-tasks";
 

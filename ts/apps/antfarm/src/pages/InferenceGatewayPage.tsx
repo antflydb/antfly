@@ -42,6 +42,30 @@ const samples: Record<InferenceGatewayOperation, Record<string, unknown>> = {
     requests: [{ custom_id: "example", body: { messages: [{ role: "user", content: "Hello" }] } }],
   },
 };
+const decisionImageSample = {
+  input: [
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: "Inspect this image." },
+        {
+          type: "input_image",
+          image_url:
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+          detail: "auto",
+        },
+      ],
+    },
+  ],
+  questions: [
+    {
+      name: "red",
+      type: "predicate",
+      instructions: "Is this image red?",
+    },
+  ],
+};
+
 const taskOperation: Record<string, InferenceGatewayOperation> = {
   generate: "chat/completions",
   decide: "decisions",
@@ -313,33 +337,7 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
                     onClick={() =>
                       setDraft((draft) => ({
                         ...draft,
-                        request: JSON.stringify(
-                          {
-                            input: [
-                              {
-                                role: "user",
-                                content: [
-                                  { type: "input_text", text: "Inspect this image." },
-                                  {
-                                    type: "input_image",
-                                    image_url:
-                                      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
-                                    detail: "auto",
-                                  },
-                                ],
-                              },
-                            ],
-                            questions: [
-                              {
-                                name: "red",
-                                type: "predicate",
-                                instructions: "Is this image red?",
-                              },
-                            ],
-                          },
-                          null,
-                          2
-                        ),
+                        request: JSON.stringify(decisionImageSample, null, 2),
                         requestIsSample: false,
                         automaticOperation: false,
                       }))
@@ -348,6 +346,36 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
                     Use image example
                   </Button>
                 )}
+              {operation === "decisions" && selected?.task === "decide" && (
+                <Button
+                  variant="outline"
+                  disabled={running}
+                  onClick={() => {
+                    const { input, ...question } =
+                      selected.gateway_capabilities?.images === "supported"
+                        ? decisionImageSample
+                        : samples.decisions;
+                    setDraft((draft) => ({
+                      ...draft,
+                      request: JSON.stringify(
+                        {
+                          ...question,
+                          inputs: [
+                            { id: "first", input },
+                            { id: "second", input },
+                          ],
+                        },
+                        null,
+                        2
+                      ),
+                      requestIsSample: false,
+                      automaticOperation: false,
+                    }));
+                  }}
+                >
+                  Use batch example
+                </Button>
+              )}
               <Label htmlFor="gateway-body">JSON request</Label>
               <Textarea
                 id="gateway-body"
