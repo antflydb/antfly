@@ -77,7 +77,7 @@ class TableSchema:
             them. Omission preserves existing declarations during schema updates.
             Index definitions commit atomically with the schema; build progress
             and readiness are local to each owning shard, not client-writable.
-        default_type (str | Unset): Default type to use from the document_types.
+        default_type (str | Unset): Default type to use from the document_schemas.
         enforce_types (bool | Unset): Whether to enforce that documents must match one of the provided document types.
             If false, documents not matching any type will be accepted but not indexed.
         document_schemas (TableSchemaDocumentSchemas | Unset): A map of type names to their document json schemas.

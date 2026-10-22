@@ -715,7 +715,8 @@ only.
   scans are bounded by the encoded document component, not a textual prefix.
 - In-memory maps keyed by user-controlled components use length-prefixed tuple
   components, never separator joins: derived replay batcher dedupe (sparse
-  `(index, doc)`, graph `(source, target, edge_type)`), transaction
+  `(index, doc)`, graph legacy shorthand `(source, target, edge_type)`;
+  current graph identities also retain owner/index and optional explicit edge ID), transaction
   read-snapshot `(table, doc_id)` maps, DB and enrichment-worker
   chunk-generation caches, and text-stat `(index, field)` /
   `(aggregation, field)` grouping.

@@ -26,9 +26,9 @@ const std = @import("std");
 // The reader does not parse JSON — it emits raw record bytes so downstream
 // code can decide how to interpret each line.
 //
-// Slurps the whole file into memory on init (via `Dir.readFileAlloc`); the
-// Zig 0.16 Io interface does not support seekable streaming, making
-// in-memory scanning the simplest correct design.
+// Loads the whole file into memory on init (via `Dir.readFileAlloc`). This is
+// this reader's implementation choice for scanning, shuffle, and resume; it is
+// not a restriction of std.Io or a claim that seekable streaming is unsupported.
 // ---------------------------------------------------------------------------
 
 /// Maximum bytes a single JSONL line may occupy. Long chat records can be

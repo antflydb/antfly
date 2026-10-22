@@ -24,26 +24,31 @@ antfly-sdk = { path = "../sdk" }  # or a git/registry dependency once published
 
 ## Usage
 
-```rust
-use antfly_sdk::Client;
-use antfly_sdk::types::QueryRequest;
+Search currently needs raw HTTP: the generated `QueryRequest` has `Default`,
+but cannot express `semantic_search` or `full_text_search`. Deserializing JSON
+into that type silently discards unknown fields, so a successful compile does
+not prove search intent reaches the server.
 
+The following raw HTTP example preserves `semantic_search` in the transmitted
+JSON. Add `reqwest = { version = "0.12", features = ["json"] }`, `serde_json = "1"`
+and `tokio = { version = "1", features = ["macros", "rt-multi-thread"] }` to
+`Cargo.toml`:
+
+```rust
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::new("http://localhost:8080");
-
-    // QueryRequest has no Default impl, but every field is `#[serde(default)]`,
-    // so it's easiest to build one from JSON with only the fields you need.
-    let body: QueryRequest = serde_json::from_value(serde_json::json!({
+    let body = serde_json::json!({
         "table": "wikipedia",
         "semantic_search": "anatomy and physiology",
         "fields": ["title", "url"],
-        "limit": 5,
-    }))?;
-
-    let result = client.query_table("wikipedia", &body).await?;
-    println!("{:?}", result.into_inner());
-
+        "limit": 5
+    });
+    let response = reqwest::Client::new()
+        .post("http://localhost:8080/db/v1/tables/wikipedia/query")
+        .json(&body)
+        .send().await?
+        .error_for_status()?;
+    println!("{}", response.text().await?);
     Ok(())
 }
 ```

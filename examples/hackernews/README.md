@@ -496,10 +496,10 @@ Saved definitions are immutable; drop/recreate to change an expression. Reads ne
 permission on the saved source and each underlying table. For overlapping edits,
 save an overlay instead and retain tombstones in its changes table.
 
-Direct HTTP SQL SELECT can use `"lake_visibility":"accepted"` to include the
+Direct HTTP SQL SELECT can use `"read_requirements":{"visibility":"accepted"}` to include the
 bounded durable WAL suffix after restart; committed visibility remains the default.
-Search can use `"lake_read":{"visibility":"published"}` to explicitly select a
-published archive, or add a `through` receipt from `/lake/changes` and `wait_ms`
+Search can use `"read_requirements":{"visibility":"published"}` to explicitly select a
+published archive, or add an `after_write` receipt from `/lake/changes` and `wait_ms`
 to require minimum coverage. Accepted vector queries use coherent recent native
 dense/sparse segments; managed text embeddings are computed by a durable retrying background job before Parquet
 publication. Check `{"action":"enrichment_status"}` on the maintenance endpoint

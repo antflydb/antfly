@@ -217,27 +217,29 @@ Transaction setup:
 
 ## Mapping to Zig Implementation
 
+Implementation paths below are relative to `zig/`.
+
 | TLA+ Variable | Zig Code |
 |---|---|
 | `clock` | Timestamp parameter in `initTransactionWithParticipants` |
-| `txnStatus` | Orchestrator state in `src/api/distributed_txn.zig` (`ParticipantWorker` vtable) |
-| `txnRecords` | Transaction records managed by `src/storage/transactions.zig` (`TxnManager`) |
+| `txnStatus` | Orchestrator state in `pkg/antfly/src/api/distributed_txn.zig` (`ParticipantWorker` vtable) |
+| `txnRecords` | Transaction records managed by `pkg/antfly-embedded/src/storage/transactions.zig` (`TxnManager`) |
 | `resolvedParts` | Participant tracking in `TxnManager.resolveIntents` |
-| `intents` | Write intents in `src/storage/transactions.zig` (`WriteIntent` struct) |
-| `dataStore` | LMDB key-value data, written during intent resolution |
+| `intents` | Write intents in `pkg/antfly-embedded/src/storage/transactions.zig` (`WriteIntent` struct) |
+| `dataStore` | Primary storage through DocStore, written during intent resolution |
 | `predicateSnapshot` | `VersionPredicate` structs passed to `writeIntents` and `checkVersionPredicates` |
 
 | TLA+ Action | Zig Code |
 |---|---|
-| `InitTransaction` | `storage/transactions.zig:initTransactionWithParticipants` |
-| `CheckPredicates` | `storage/transactions.zig:checkVersionPredicates` |
-| `WriteIntentOnShard` | `storage/transactions.zig:writeIntents` (success path) |
-| `WriteIntentFails` | `storage/transactions.zig:writeIntents` (error: VersionConflict or IntentConflict) |
-| `CommitTransaction` | `api/distributed_txn.zig:resolve_group` (status=committed) |
-| `AbortTransaction` | `api/distributed_txn.zig:resolve_group` (status=aborted) |
-| `ResolveIntentsOnShard` | `storage/transactions.zig:resolveIntents` |
-| `RecoveryResolve` | `storage/db/maintenance/transaction_runtime.zig:runRecoveryWithConfig` |
-| `CleanupTxnRecord` | `storage/db/maintenance/transaction_runtime.zig` (after cleanup) |
+| `InitTransaction` | `pkg/antfly-embedded/src/storage/transactions.zig:initTransactionWithParticipants` |
+| `CheckPredicates` | `pkg/antfly-embedded/src/storage/transactions.zig:checkVersionPredicates` |
+| `WriteIntentOnShard` | `pkg/antfly-embedded/src/storage/transactions.zig:writeIntents` (success path) |
+| `WriteIntentFails` | `pkg/antfly-embedded/src/storage/transactions.zig:writeIntents` (error: VersionConflict or IntentConflict) |
+| `CommitTransaction` | `pkg/antfly/src/api/distributed_txn.zig:resolve_group` (status=committed) |
+| `AbortTransaction` | `pkg/antfly/src/api/distributed_txn.zig:resolve_group` (status=aborted) |
+| `ResolveIntentsOnShard` | `pkg/antfly-embedded/src/storage/transactions.zig:resolveIntents` |
+| `RecoveryResolve` | `pkg/antfly-embedded/src/storage/db/maintenance/transaction_runtime.zig:runRecoveryWithConfig` |
+| `CleanupTxnRecord` | `pkg/antfly-embedded/src/storage/db/maintenance/transaction_runtime.zig` (after cleanup) |
 
 ---
 
@@ -304,9 +306,11 @@ The model in `SnapshotTransferMC.tla` uses:
 
 ### Mapping to Zig Implementation
 
+Implementation paths below are relative to `zig/`.
+
 | TLA+ Variable | Zig Code |
 |---|---|
-| `leader` | Raft election in `../raft/src/core/raft.zig` |
+| `leader` | Raft election in `lib/raft/src/core/raft.zig` |
 | `persistedSnap` | Snapshot state in `pkg/antfly/src/raft/host.zig` |
 | `targetSnap` | In-memory snapshot metadata during transfer |
 | `snapStore` | Snapshot storage in `pkg/antfly/src/raft/storage/` |
@@ -352,6 +356,8 @@ java -XX:+UseParallelGC -cp /path/to/tla2tools.jar tlc2.TLC \
 | `IndexFailedOpFreedTemps` | Failed `IndexWriter.removeSegments` operations free temporary `SegmentEntry` arrays. |
 
 ### Mapping to Zig Implementation
+
+Implementation paths below are relative to `zig/`.
 
 | TLA+ action | Zig code |
 |---|---|

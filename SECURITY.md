@@ -8,4 +8,4 @@ data in a reproduction.
 
 We will investigate the report and coordinate disclosure with you.
 
-For deployment guidance, see [Secure Deployment](docs/auth.md#secure-deployment).
+For deployment guidance, see [Secure Deployment](docs/reference/auth.md#secure-deployment).

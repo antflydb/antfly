@@ -7,12 +7,15 @@ Python SDK for [Antfly](https://github.com/antflydb/antfly) - a distributed key-
 
 Supported Python versions: 3.11 through 3.14.
 
-For the nightly version, visit the [TestPyPI page](https://test.pypi.org/project/antfly-sdk/).
+The examples here target the pinned development source below. The inspected
+PyPI `0.0.2.dev2` wheel lacks `AntflyClient.query`; TestPyPI `0.0.1` has `query`
+but lacks current read-requirement helpers and media chunking. TestPyPI is not a
+fallback for this API surface (package contents checked 2026-10-22).
 
 ## Installation
 
 ```bash
-pip install antfly-sdk
+pip install "antfly-sdk @ git+https://github.com/antflydb/antfly.git@ddba6584b38b59c62e261ef63e0374dc1f711617#subdirectory=py/packages/sdk"
 ```
 
 ## Quick Start
@@ -32,14 +35,17 @@ client.create_table(
     name="users",
     num_shards=4,
     schema={
-        "key": "user_id",
-        "document_types": {
+        "default_type": "user",
+        "document_schemas": {
             "user": {
-                "fields": {
-                    "name": {"type": "string"},
-                    "email": {"type": "keyword"},
-                    "age": {"type": "int"},
-                    "created_at": {"type": "time"}
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "email": {"type": "string"},
+                        "age": {"type": "integer"},
+                        "created_at": {"type": "string", "format": "date-time"}
+                    }
                 }
             }
         }

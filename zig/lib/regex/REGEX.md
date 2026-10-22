@@ -29,9 +29,9 @@ scanning.
     literals, 32 bytes each) for FST-side pruning and for the plain-haystack
     prefilter below.
 - `src/mod.zig`: the AST-based matcher (`PreparedPattern`) used by non-FST
-  callers such as `pkg/antfly/src/search/pattern_filter.zig`,
-  `pkg/antfly/src/storage/db/query/graph_exec.zig`, and
-  `pkg/antfly/src/storage/db/aggregations.zig`. It parses the pattern into a
+  callers such as `zig/pkg/antfly-embedded/src/search/pattern_filter.zig`,
+  `zig/pkg/antfly-embedded/src/storage/db/query/graph_exec.zig`, and
+  `zig/pkg/antfly-embedded/src/storage/db/aggregations.zig`. It parses the pattern into a
   small AST, then matches by walking that AST against the input (NFA
   simulation, not backtracking).
   - Compiled-regex substring matching is centralized here so every non-FST

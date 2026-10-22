@@ -317,7 +317,7 @@ pub const Config = struct {
     cors: ?antfly_middleware_openapi.CORSConfig = null,
     /// How many replicas of each shard should be maintained.
     replication_factor: ?i64 = null,
-    /// Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal when enabled, but do not currently enforce per-model or per-operation inference RBAC.
+    /// Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal and enforce inference:read or inference:write authorization when enabled. The inference resource remains '*'; per-model scopes are not supported.
     enable_auth: ?bool = null,
     /// Disables automatic shard reallocation (splitting/merging).
     disable_shard_alloc: ?bool = null,

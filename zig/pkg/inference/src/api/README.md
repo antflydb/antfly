@@ -22,5 +22,6 @@ transport read/write limits remain separate. Cooperative expiration returns
 `504 INFERENCE_TIMEOUT` after cleanup. A process-required unsafe driver call can
 instead cause the hard watchdog to terminate its worker and close the connection;
 the supervisor replaces that generation. Group metrics are generation scoped.
-See [video deadline qualification](../../../../lib/video/testdata/deadline-model-validation/README.md)
-for tested shapes, failed historical runs and remaining recovery/performance scope.
+The named video deadline qualification evidence directory is unavailable in this
+checkout. No pinned replacement is recorded here; recover the original evidence
+before relying on its tested-shape or recovery/performance claims.

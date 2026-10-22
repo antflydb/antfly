@@ -233,8 +233,8 @@ Outside a transaction, each accepted statement obtains its own cut. This is the
 implemented transaction contract; read-write serializable lake participation remains
 pending.
 
-Writable-lake search requests accept `lake_read` with `visibility: "accepted"` or
-`"published"`, an optional `through` receipt (`table_id`, `object_generation`,
+Writable-lake HTTP search requests accept `read_requirements` with `visibility: "accepted"` or
+`"published"`, an optional `after_write` receipt (`table_id`, `object_generation`,
 `wal_lsn`) and `wait_ms` from 0 to 60000. Change acceptance includes those receipt
 fields. Published reads explicitly select the archive publication and skip pending
 changes. A receipt requires its coverage and rejects a different incarnation.

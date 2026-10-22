@@ -100,7 +100,7 @@ Standalone runs inference in-process, and managed enrichments call it directly i
 ## Consistency and Transactions
 
 - **Raft per shard.** Writes commit through the owning shard's Raft log, and each shard has its own leader. Only the active leader runs reconciliation, enrichment, and other background mutation work.
-- **Cross-shard writes.** These use coordinator-driven two-phase commit over write intents. The coordinator shard writes a transaction record and participants write intents that stay invisible until resolution. A recovery loop finishes resolution after a coordinator failure.
+- **Cross-shard writes.** These use coordinator-driven two-phase commit over write intents. The coordinator shard writes a transaction record and participants write intents that stay invisible until resolution. A recovery loop finishes resolution after a coordinator failure. See [transaction outcomes](/docs/reference/transaction-outcomes) to distinguish aborted conflicts, unknown outcomes, and committed 202 results before retrying.
 - **Optimistic concurrency.** `POST /transactions/commit` is stateless OCC: the client submits read versions (from `X-Antfly-Version`) with its writes, and a changed version aborts with `409`. Server-managed sessions under `/transactions/begin` add staged reads and writes, plus savepoints.
 - **Timestamps.** A committed key's visible version is the transaction's commit timestamp, not its intent timestamp. Batch predicates and transactional predicates compare against the same versioning model.
 

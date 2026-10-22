@@ -65,8 +65,12 @@ You can specify a custom timestamp field as the TTL reference:
 
 In this example:
 - Documents expire 24 hours after their `created_at` field value
-- The `created_at` field must be present in all documents
-- Timestamps must be in RFC3339 format (e.g., `2025-01-01T12:00:00Z`)
+- This example's document schema requires `created_at`; TTL itself falls back to
+  the write timestamp when a custom field is missing or null unless schema
+  validation rejects the document
+- The TTL parser accepts nonnegative integer Unix nanoseconds, decimal timestamp
+  strings, or supported RFC3339/RFC3339Nano strings (e.g., `2025-01-01T12:00:00Z`).
+  Floating-point timestamps are not accepted; the example schema requires strings.
 
 ## TTL Duration Format
 
@@ -84,8 +88,8 @@ are `ns`, `us`, `ms`, `s`, `m`, `h`, and `d`:
 
 When documents are inserted:
 - If using the default `_timestamp` field, it's automatically added with the current time
-- If using a custom TTL field, it must be present in the document
-- Validation ensures the TTL field exists
+- Missing or null custom TTL fields fall back to the write timestamp
+- Document-schema requirements may independently reject missing/null fields
 - **Performance Optimization**: The TTL timestamp is extracted and stored in a separate internal TTL key for fast lookups
 
 ```bash
@@ -106,10 +110,11 @@ curl -X POST http://localhost:8080/db/v1/tables/my_table/batch \
 
 A background job runs on the Raft leader:
 - **Optimized Scanning**: Scans only internal TTL keys - no JSON deserialization needed
-- Runs every 30 seconds
+- Is scheduled at a 30-second interval; this is not a deletion deadline
 - Deletes documents where `current_time > timestamp + ttl_duration + grace_period`
-- Includes a 5-second grace period to ensure writes are fully replicated
-- Processes deletions in batches of 256, with each scan page bounded to 4096 keys or 4 MiB
+- Adds a 5-second cleanup grace; elapsed wall time is not a replication fence
+- Clamps candidate pages to `min(128, max(1, batch_size))` for both document and
+  graph cleanup, separately from scan budgets of 4096 keys or 4 MiB
 
 **Performance**: Scanning is O(1) per document - just reads an 8-byte timestamp, no JSON parsing required.
 
@@ -194,7 +199,7 @@ Events expire 30 days after their `_timestamp` (insertion time). Old events are 
 
 ## Monitoring
 
-Expired documents are hidden from reads immediately; physical cleanup runs in the background. The cleanup job does not currently emit dedicated TTL logs or metrics.
+Expired documents are hidden from reads immediately; physical cleanup runs in the background. The cleanup job does not currently emit dedicated TTL logs or metrics. Table/storage status reports aggregate storage state, not a TTL deletion deadline. Hosted embedded profiles disable the background TTL runtime; hosts drive supported maintenance explicitly, and `runUntilIdle()` advances derived indexing rather than promising TTL deletion.
 
 ## Modifying TTL Configuration
 
@@ -255,8 +260,8 @@ complete schema and should only be used when the caller intends replacement:
 ### Grace Period
 
 A 5-second grace period is added to the expiration time to prevent premature deletion:
-- Ensures writes are fully replicated across the cluster
-- Prevents race conditions between write and expiration
+- Delays cleanup eligibility; it does not prove replication completion
+- Ownership, write admission, and bounded scan pages can delay deletion further
 - Only applies to background cleanup (not query filtering)
 
 ### Leader-Only Operation
@@ -268,34 +273,39 @@ TTL cleanup runs only on the Raft leader:
 
 ### Cleanup Batch Size
 
-Documents are deleted in batches of 256, and each scan page is bounded to 4096 keys or 4 MiB:
-- Prevents overwhelming the system with large deletions
-- Maintains system responsiveness
+The configured cleanup batch default is 256, but both document and graph
+collectors clamp candidate pages to `min(128, max(1, batch_size))`. The embedded
+`ttl_cleanup_batch_size` option uses zero to preserve the configured default of
+256, yielding an effective candidate cap of 128. Nonzero values are forwarded
+to the collectors; values above 128 are clamped, not rejected. The collector's
+internal zero-to-one clamp does not change the embedded option's zero-as-default
+semantics.
+The independent scan budgets are 4096 keys or 4 MiB per page. A page can contain
+fewer eligible deletions than candidates scanned.
+
+Supporting larger embedded batches would require a separate implementation task
+that checks downstream safety budgets and both cleanup paths. This guide does
+not change the runtime bound.
 
 ### Performance Characteristics
 
-**Cleanup Scan Performance:**
-- Traditional approach: O(N × document_size) - must decompress and parse every document
-- Optimized approach: O(N × 30 bytes) - only reads timestamp keys
-- **Speedup**: ~100-1000x faster depending on document size
-
-**Query Filtering Performance:**
-- Single point lookup (~microseconds)
-- No impact on query latency
-- Scales to millions of documents
+Cleanup scans structured timestamp keys instead of parsing every document.
+Read-time checks still require storage access; latency and throughput depend on
+cache state, workload, expiry density, and admission. No fixed speedup or
+zero-latency overhead is guaranteed.
 
 ## Limitations and Considerations
 
 1. **Clock Synchronization**: TTL relies on system clocks being synchronized across cluster nodes (use NTP)
-2. **Cleanup Latency**: Expired documents are deleted within ~30 seconds (cleanup interval)
+2. **Cleanup Latency**: Cleanup is scheduled every 30 seconds; grace, bounded pages, leader ownership, and admission can delay physical deletion
 3. **Query Filtering**: Even though cleanup runs periodically, expired documents are filtered in real-time from queries
-4. **Timestamp Format**: Timestamps must be in RFC3339 or RFC3339Nano format
+4. **Timestamp Format**: Use nonnegative integer Unix nanoseconds, decimal timestamp strings, or supported RFC3339/RFC3339Nano strings; floats are rejected
 5. **Table-Level Configuration**: TTL is configured per-table, not per-document
 
 ## Best Practices
 
 1. **Use Default Field**: Use the default `_timestamp` field unless you need custom TTL behavior
 2. **Appropriate Durations**: Set TTL durations appropriate to your use case (avoid very short durations like seconds)
-3. **Monitor Cleanup**: Watch cleanup logs to ensure expired documents are being processed
+3. **Monitor Cleanup**: Check read-time expiry and available table/storage status; there are no dedicated TTL cleanup logs or metrics
 4. **Test Before Production**: Test TTL behavior with sample data before production deployment
 5. **Document Schema**: Document your TTL configuration in your schema for maintainability

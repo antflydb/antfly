@@ -20,6 +20,24 @@ tags: [inference, embeddings, reranking, models]
 
 Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, decision, transcription, reading, and generation models (text generation from text, image, and audio prompts) on the same machine as the database, with no external API and nothing leaving the host. It executes GGUF, safetensors, and ONNX artifacts on its own native backend (CPU, Metal on macOS, CUDA in CUDA builds); ONNX graphs are parsed and run on Antfly's kernels, with no external ONNX runtime. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
 
+For the v0.3.0 development source documented here, standalone public inference
+requires an explicit opt-in before calling `/ai/v1`. Save `antfly.json`:
+
+```json
+{"public_inference": {"enabled": true}}
+```
+
+```bash
+antfly standalone --config antfly.json
+```
+
+There is no enablement CLI flag. Without this setting, public execution returns
+HTTP 403 even when models are installed. See the
+[public execution policy](/docs/reference/inference-gateway#public-execution-policy).
+This prerequisite applies to database API nodes on this source version; the
+independent `antfly inference run` listener and older stable releases have their
+own policies.
+
 Pull a model, then embed a sentence through the running engine:
 
 ```bash

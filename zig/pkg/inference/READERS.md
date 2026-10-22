@@ -1,6 +1,8 @@
 # Readers Parity
 
-This document tracks reader and OCR parity between the Zig server in this repo and the Go server in `~/go/src/github.com/antflydb/antfly/termite`.
+This document records the implemented Zig reader/OCR surface and the remaining
+model-qualification work. Historical Go parity goals are retained only where
+they explain a current implementation boundary.
 
 ## Goal
 
@@ -14,52 +16,26 @@ Bring Zig reader support up to Go parity for:
 This is intentionally narrower than the repo-root `TODO.md` parity sections. It
 is the working plan for `/api/read` and reader model support.
 
-**Status**: the reader layer (formerly "Phase 1") and metadata-driven reader
-dispatch (formerly "Phase 3") are implemented and described below in the
-present tense. Moondream reading (formerly Phase 8) runs natively and is
-described in present tense below. Structured outputs, Pix2Struct, the shared
-multi-stage OCR infrastructure, PaddleOCR, and Surya (Phases 2 and 4-7) are
-still in progress; those sections keep their phase numbering, purpose,
-status, and "Still remaining" notes below.
+**Status**: reader dispatch, structured `fields`/`regions`, metadata-driven
+multi-stage OCR routing, detection/CTC recognition, and optional layout/order and
+Vision2Seq recognition stages are implemented. Model coverage and output quality
+remain family-specific: the sections below retain real Donut, Pix2Struct and
+Surya qualification limits. Implemented routing does not certify every upstream
+model export.
 
 ## Current State
-
-### Go already has
-
-- a reader abstraction that returns:
-  - `text`
-  - `fields`
-  - `regions`
-- pooled Vision2Seq readers for:
-  - TrOCR
-  - Donut
-  - Florence-2
-  - Pix2Struct
-  - Moondream2
-- metadata-driven multi-stage OCR readers for:
-  - PaddleOCR
-  - Surya-style pipelines
-
-Key Go references:
-
-- `pkg/inference/lib/reading/reader.go`
-- `pkg/inference/lib/reading/multistage_reader.go`
-- `pkg/inference/lib/pipelines/multistage_ocr.go`
-- `pkg/inference/lib/pipelines/multistage_ocr_loader.go`
-- `pkg/inference/reader_registry.go`
-- `specs/008-ocr-models-v2.md`
 
 ### Zig currently has
 
 - a new reader wrapper in `src/readers/reader.zig` for the current Vision2Seq/native Florence path
 - `/api/read` routed through that reader layer
-- a single `ReadingPipeline` in `src/pipelines/reading.zig`
+- a shared `ReadingPipeline` plus multi-stage OCR coordination
 - support centered on:
   - split encoder/decoder readers
   - native Florence directories backed by `safetensors`
 - response items that can now expose:
   - `text`
-  - optional `fields`
+  - optional `fields`, `regions`, and internal structured output
 
 Key Zig references:
 
@@ -69,47 +45,18 @@ Key Zig references:
 - `src/native_read.zig`
 - `src/models/manifest.zig`
 
-## Main Gaps
+## Remaining qualification
 
-### 1. Reader abstraction gap
+The reader abstraction dispatches Vision2Seq and metadata-described multi-stage
+OCR outside the server. Results support text, optional fields/regions, and an
+internal structured payload used by image-backed extraction. `termite_metadata.json`
+is parsed by `src/readers/multistage_metadata.zig`; the loader selects stages in
+`src/readers/multistage_reader.zig` and `src/pipelines/multistage_ocr.zig`.
 
-Go has a reader layer and registry dispatch. Zig currently wires `/api/read` directly to one pipeline inside the server.
-
-Impact:
-
-- model-family-specific behavior accumulates in the server
-- there is no clean dispatch point for multi-stage OCR
-- response-shape parity is harder to add cleanly
-
-### 2. Output structure gap
-
-Go reader results can include `fields` and `regions`. Zig results are text-only today.
-
-Impact:
-
-- no Donut-style structured extraction parity
-- no PaddleOCR or Surya region parity
-- no stable response shape for richer readers
-
-### 3. Metadata-driven OCR gap
-
-Go can load multi-stage OCR from `termite_metadata.json`. Zig does not currently parse or route on that metadata.
-
-Impact:
-
-- no PaddleOCR parity
-- no Surya parity
-- no stage-based detection/recognition/layout/order orchestration
-
-### 4. Reader family coverage gap
-
-Missing or incomplete in Zig:
-
-- Pix2Struct
-- Donut structured output handling
-- multi-stage OCR families
-
-## Recommended Rollout
+Remaining work is validating supported model exports, quality thresholds and
+reading order against real fixtures. Pix2Struct, Donut, and Surya sections below
+identify their specific validation gaps. Moondream's current CPU/crop limits
+remain applicable.
 
 ## Zig Reader Layer
 
@@ -294,7 +241,7 @@ Implemented in this pass:
 
 Still remaining in this phase:
 
-- optional layout and reading-order model support
+- model-backed qualification of optional layout and reading-order stages
 - broader model-validated tests beyond unit coverage
 
 ## Phase 6: PaddleOCR parity
@@ -433,36 +380,25 @@ Still remaining:
   is upstream at this revision; newer multi-crop moondream2 revisions are not
   supported.
 
-## Verification Plan
+## Verification coverage and remaining qualification
 
-Current Zig coverage is very thin for readers. We should add both unit coverage and API/e2e coverage as each phase lands.
+Unit tests already cover reader output parsing, `termite_metadata.json` parsing,
+detection post-processing, CTC decoding, and reading-order assembly. The current
+`e2e/inference/test_read.py` also includes model-gated Donut field checks,
+PaddleOCR multistage region checks, Surya region/layout/order checks, and
+Pix2Struct prompt checks. These tests are the executable reference; the retired
+external Go checkout is not required.
 
-### Unit coverage to add
-
-- reader output parsing
-- `termite_metadata.json` parsing
-- detection post-processors
-- CTC decoding
-- reading-order assembly
-
-### API and e2e coverage to add
-
-- extend `e2e/inference/test_read.py` for:
-  - optional `fields`
-  - optional `regions`
-- add model-gated OCR tests for:
-  - Pix2Struct
-  - PaddleOCR
-  - Surya
-
-Use Go tests as reference:
-
-- `e2e/reader_test.go`
-- `e2e/paddleocr_test.go`
+Existing test paths do not certify every model export or document shape.
+Remaining qualification work is to pin real model/fixture expectations for
+Donut, Pix2Struct, and Surya, tighten OCR quality and ordering assertions, and
+validate supported exports against those expectations. Model-gated tests require
+the corresponding installed models; their presence alone does not establish
+that those model-backed checks ran in a particular test invocation.
 
 ## Risks and Notes
 
-- The biggest design risk is skipping the reader abstraction and pushing feature branches directly into `src/server/server.zig`.
+- Keep family-specific parsing and routing in the implemented reader abstraction, outside `src/server/server.zig`.
 - `termite_metadata.json` is likely better handled as reader-specific metadata rather than overloaded into the generic manifest path.
 - Surya has licensing considerations; PaddleOCR and Pix2Struct are cleaner first targets.
 - Response-shape changes should be introduced in a backwards-compatible way:
@@ -476,12 +412,8 @@ Use Go tests as reference:
   - reader results now carry an internal structured payload, and the native image-extraction branch consumes that structured value first, falling back to flattened `fields` only for older readers
   - extractor selection and image/text dispatch now live under `src/extractors/`, so `/extract` is no longer carrying its own parallel resolver/runtime path inside `src/server/server.zig`
 
-## Suggested Next Implementation Step
+## Next qualification work
 
-Start with Phase 1 and Phase 2 together:
-
-- introduce the Zig reader layer
-- switch `/api/read` to it
-- add response support for optional `fields`
-
-That gives us a clean seam for everything else and delivers useful parity before the multi-stage OCR work begins.
+Pin real model/fixture expectations for the remaining Donut, Pix2Struct and
+Surya cases. Extend model-gated coverage of structured fields, layout labels,
+and ordering without replacing the implemented reader dispatch or stage loader.

@@ -12,7 +12,7 @@ description: How one full-text, vector, or graph index unions the records that e
 - Which request forms are canonical, alternative, legacy, or deprecated?
 </Questions>
 
-An artifact-backed index consumes the records that named enrichments produce, rather than the source documents themselves. Its `sources` array unions up to 64 streams into one full-text, embeddings, or graph index, and each member keeps the stable identity `(artifact, key)`, so records from different streams never collide even when their keys match. The decision this page is read for: when to search whole documents and their extracted chunks as one index, and how to know when that index is actually serving all of them.
+An artifact-backed index consumes the records that named enrichments produce, rather than the source documents themselves. Its `sources` array unions up to 64 streams into one full-text, embeddings, or graph index, and full-text/embeddings members keep the stable identity `(artifact, key)`, so records from those streams do not collide when their keys match. Graph sources instead reconcile by relationship identity: they may intentionally collide, with source declaration order determining precedence and producing-document ownership retained. The decision this page is read for: when to search whole documents and their extracted chunks as one index, and how to know when that index is actually serving all of them.
 
 Confirm the deployment supports it first:
 

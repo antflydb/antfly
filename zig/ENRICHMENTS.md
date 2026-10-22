@@ -66,7 +66,7 @@ Lookup rules:
 
 Current helpers:
 
-- `go/pkg/antfly-embedded/src/storage/db/artifact_ids.zig` encodes and decodes public artifact IDs and
+- `zig/pkg/antfly-embedded/src/storage/db/artifact_ids.zig` encodes and decodes public artifact IDs and
   reconstructs internal keys from `ArtifactRef`.
 - `DB.getArtifact` looks up a stored artifact by public artifact ID.
 - `antfly_decode_artifact_id_json` decodes a public artifact ID to
@@ -1339,11 +1339,9 @@ The current thin journal is enough for:
 
 because those can be rebuilt from committed document/artifact state.
 
-Graph is the remaining outlier because direct graph mutations are currently
-carried as replay payloads, and a thin journal with only doc keys cannot
-reconstruct exact edge deletes or updates.
-
-If graph edges are primary artifacts, the model becomes consistent again:
+Graph uses the same artifact/replay contract: direct and generated edges are
+primary artifacts, and replay tracks changed artifact keys so exact edge
+deletes and updates can be reconstructed from committed state:
 
 - generated graph edges are materialized as graph artifacts
 - direct graph API writes/deletes also write/delete graph artifacts

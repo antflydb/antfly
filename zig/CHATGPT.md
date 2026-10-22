@@ -385,7 +385,7 @@ OpenID Connect with PKCE, explicit linking to existing Antfly accounts, secure
 application sessions, and existing organization/SSO policy. The gateway may issue
 Antfly trusted-principal tokens with local permissions; OpenAI identity tokens
 are not Antfly authorization tokens. The existing boundary is described in
-[`docs/auth.md`](../docs/auth.md).
+[`docs/auth.md`](../docs/reference/auth.md).
 
 This later phase replaces the relevant hosted browser credential flow and keeps
 identity consent separate from optional plan consent. Availability requires the
