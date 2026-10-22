@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..models.memory_entity_proposal_inputs_evidence_item import MemoryEntityProposalInputsEvidenceItem
     from ..models.memory_entity_proposal_inputs_model_type_0 import MemoryEntityProposalInputsModelType0
     from ..models.memory_entity_proposal_inputs_operation_type_0 import MemoryEntityProposalInputsOperationType0
+    from ..models.memory_entity_proposal_inputs_views_type_0_item import MemoryEntityProposalInputsViewsType0Item
 
 
 T = TypeVar("T", bound="MemoryEntityProposalInputs")
@@ -29,6 +30,7 @@ class MemoryEntityProposalInputs:
         operation (MemoryEntityProposalInputsOperationType0 | None | Unset):
         actor (str | Unset):
         verdict_actor (str | Unset):
+        views (list[MemoryEntityProposalInputsViewsType0Item] | None | Unset):
         verdict_revision (int | None | Unset):
         model (MemoryEntityProposalInputsModelType0 | None | Unset):
     """
@@ -41,6 +43,7 @@ class MemoryEntityProposalInputs:
     operation: MemoryEntityProposalInputsOperationType0 | None | Unset = UNSET
     actor: str | Unset = UNSET
     verdict_actor: str | Unset = UNSET
+    views: list[MemoryEntityProposalInputsViewsType0Item] | None | Unset = UNSET
     verdict_revision: int | None | Unset = UNSET
     model: MemoryEntityProposalInputsModelType0 | None | Unset = UNSET
 
@@ -76,6 +79,18 @@ class MemoryEntityProposalInputs:
 
         verdict_actor = self.verdict_actor
 
+        views: list[dict[str, Any]] | None | Unset
+        if isinstance(self.views, Unset):
+            views = UNSET
+        elif isinstance(self.views, list):
+            views = []
+            for views_type_0_item_data in self.views:
+                views_type_0_item = views_type_0_item_data.to_dict()
+                views.append(views_type_0_item)
+
+        else:
+            views = self.views
+
         verdict_revision: int | None | Unset
         if isinstance(self.verdict_revision, Unset):
             verdict_revision = UNSET
@@ -108,6 +123,8 @@ class MemoryEntityProposalInputs:
             field_dict["actor"] = actor
         if verdict_actor is not UNSET:
             field_dict["verdict_actor"] = verdict_actor
+        if views is not UNSET:
+            field_dict["views"] = views
         if verdict_revision is not UNSET:
             field_dict["verdict_revision"] = verdict_revision
         if model is not UNSET:
@@ -121,6 +138,7 @@ class MemoryEntityProposalInputs:
         from ..models.memory_entity_proposal_inputs_evidence_item import MemoryEntityProposalInputsEvidenceItem
         from ..models.memory_entity_proposal_inputs_model_type_0 import MemoryEntityProposalInputsModelType0
         from ..models.memory_entity_proposal_inputs_operation_type_0 import MemoryEntityProposalInputsOperationType0
+        from ..models.memory_entity_proposal_inputs_views_type_0_item import MemoryEntityProposalInputsViewsType0Item
 
         d = dict(src_dict)
         owner = d.pop("owner")
@@ -164,6 +182,28 @@ class MemoryEntityProposalInputs:
 
         verdict_actor = d.pop("verdict_actor", UNSET)
 
+        def _parse_views(data: object) -> list[MemoryEntityProposalInputsViewsType0Item] | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, list):
+                    raise TypeError()
+                views_type_0 = []
+                _views_type_0 = data
+                for views_type_0_item_data in _views_type_0:
+                    views_type_0_item = MemoryEntityProposalInputsViewsType0Item.from_dict(views_type_0_item_data)
+
+                    views_type_0.append(views_type_0_item)
+
+                return views_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(list[MemoryEntityProposalInputsViewsType0Item] | None | Unset, data)
+
+        views = _parse_views(d.pop("views", UNSET))
+
         def _parse_verdict_revision(data: object) -> int | None | Unset:
             if data is None:
                 return data
@@ -199,6 +239,7 @@ class MemoryEntityProposalInputs:
             operation=operation,
             actor=actor,
             verdict_actor=verdict_actor,
+            views=views,
             verdict_revision=verdict_revision,
             model=model,
         )

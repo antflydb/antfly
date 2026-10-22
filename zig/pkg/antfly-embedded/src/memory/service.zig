@@ -104,6 +104,7 @@ pub const Context = struct {
     admin: bool = false,
     curator: bool = false,
     now_ms: i64,
+    clock_ms_fn: ?*const fn () i64 = null,
     grant_ptr: ?*anyopaque = null,
     require_grant_fn: ?*const fn (*anyopaque, t.RequiredGrant) anyerror!void = null,
     final_check_ptr: ?*anyopaque = null,
@@ -114,6 +115,9 @@ pub const Context = struct {
     checkpoint_fn: ?*const fn (*anyopaque) anyerror!void = null,
     check_ptr: ?*anyopaque = null,
     check_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    pub fn currentTime(self: Context) i64 {
+        return if (self.clock_ms_fn) |clock| clock() else self.now_ms;
+    }
     pub fn requireGrant(self: Context, grant: t.RequiredGrant) !void {
         if (grant == .admin and !self.admin) return error.Forbidden;
         if (grant == .curator and !self.admin and !self.curator) return error.Forbidden;
@@ -315,7 +319,11 @@ pub const Service = struct {
             if (op.phase == .pending and (action == .observe or action == .configure)) try run.put(try key(a, "pending", op.id), .{ .id = op.id });
             try run.put("control", run.state);
             try self.context.finish();
-            if (run.inferred) try run.validateResources();
+            if (run.inferred or switch (action) {
+                .observe, .assertions, .correct, .curate_entity, .propose_entity, .review_entity, .propose_relationship, .review_relationship, .stage_embeddings => true,
+                else => false,
+            }) try run.validateResources();
+            try run.validateJudgedViews();
             try self.backend.commit(self.backend.ptr, a, state_row, run.changes.items);
             try run.finishSemanticPublication();
             output = try run.encode(publicOperation(op));
@@ -362,6 +370,7 @@ const Run = struct {
     historical_resource_reads: bool = false,
     retention_maintenance: bool = false,
     resource_states: std.StringHashMapUnmanaged(ResourceRead) = .empty,
+    judged_views: std.ArrayList(t.EntityViewInput) = .empty,
     inferred: bool = false,
     semantic_ready_after_commit: bool = false,
     temporal_tracking: bool = false,
@@ -1485,6 +1494,7 @@ const Run = struct {
         }
     }
     fn proposalInputsRetained(self: *Run, binding: ProposalBinding) !bool {
+        if (!try self.viewInputsRetained(binding.views)) return false;
         for (binding.entities) |ref| {
             const record = (try self.read(t.EntityRecord, try key(self.a, "entity", ref.id))) orelse return false;
             self.authorize(record.owner, record.entity.visibility) catch return false;
@@ -1495,6 +1505,91 @@ const Run = struct {
             self.authorize(source.owner, source.evidence.visibility) catch return false;
             if (!try self.evidenceRetained(source)) return false;
         }
+        return true;
+    }
+    fn entityViewInput(self: *Run, id: []const u8) !t.EntityViewInput {
+        const record = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
+        try self.authorize(record.owner, record.entity.visibility);
+        if (!try self.entityVisible(record)) return error.MemoryNotFound;
+        const selected = try self.canonical(id);
+        if (selected == null) return .{ .id = id, .canonical_id = null, .fingerprint = try hash(self.a, .{ id, record.revision, self.state.config.generation, selected }), .dependencies = try self.a.dupe(t.DerivedDependency, &.{.{ .resource = try self.resourceRef(.entity, id, record.revision), .evidence = record.entity.evidence }}) };
+        const view = try self.entityView(id, .{});
+        return .{ .id = id, .canonical_id = view.canonical_id, .fingerprint = view.fingerprint, .dependencies = view.dependencies };
+    }
+    fn captureEntityViews(self: *Run, ids: []const []const u8, expected: []const t.EntityViewPin) ![]const t.EntityViewInput {
+        var inputs: std.ArrayList(t.EntityViewInput) = .empty;
+        for (ids) |id| {
+            var duplicate = false;
+            for (inputs.items) |input| if (eql(u8, input.id, id)) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) try inputs.append(self.a, try self.entityViewInput(id));
+        }
+        try self.checkViewPins(inputs.items, expected);
+        try self.judged_views.appendSlice(self.a, inputs.items);
+        return inputs.items;
+    }
+    fn checkViewPins(self: *Run, inputs: []const t.EntityViewInput, expected: []const t.EntityViewPin) !void {
+        _ = self;
+        if (expected.len == 0) return;
+        if (expected.len != inputs.len) return error.InvalidMemoryRequest;
+        for (inputs) |input| {
+            var found: usize = 0;
+            for (expected) |pin| if (eql(u8, pin.id, input.id)) {
+                if (!eql(u8, pin.fingerprint, input.fingerprint)) return error.MemoryResourceChanged;
+                found += 1;
+            };
+            if (found != 1) return error.InvalidMemoryRequest;
+        }
+    }
+    fn bindJudgedViews(self: *Run, stored: ?[]const t.EntityViewInput, expected: []const t.EntityViewPin) !void {
+        // Legacy attempts without an admitted view snapshot require an explicit
+        // proposal refresh. Never silently judge a freshly reconstructed view.
+        const inputs = stored orelse return error.MemoryResourceChanged;
+        try self.checkViewPins(inputs, expected);
+        for (inputs) |input| {
+            const current = try self.entityViewInput(input.id);
+            if (!eql(u8, try self.encode(input), try self.encode(current))) return error.MemoryResourceChanged;
+        }
+        try self.judged_views.appendSlice(self.a, inputs);
+    }
+    fn validateJudgedViews(self: *Run) !void {
+        if (self.judged_views.items.len == 0) return;
+        // Validate against the admitted state, excluding the verdict's own
+        // redirect/assertion overlay. The control CAS fences concurrent writes.
+        var before = self.*;
+        before.changes = .empty;
+        before.identity_policy = null;
+        before.identity_index = null;
+        before.suppression_index = null;
+        before.views = .empty;
+        before.historical = .empty;
+        before.temporal_tracking = true;
+        before.temporal_boundary = null;
+        before.semantic_assertions = .empty;
+        before.service.context.now_ms = self.service.context.currentTime();
+        for (self.judged_views.items) |input| {
+            const current = try before.entityViewInput(input.id);
+            if (!eql(u8, try self.encode(input), try self.encode(current))) return error.MemoryResourceChanged;
+        }
+        // A validity boundary crossed during the final reads also invalidates
+        // the judgment, even if rendering began before that boundary.
+        if (before.temporal_boundary) |boundary| if (boundary <= self.service.context.currentTime()) return error.MemoryResourceChanged;
+    }
+    fn viewInputsRetained(self: *Run, inputs: ?[]const t.EntityViewInput) !bool {
+        for (inputs orelse return true) |input| for (input.dependencies) |dependency| {
+            const ref = dependency.resource;
+            if (ref.kind == .assertion) {
+                const record = (try self.read(t.StoredAssertion, try historyKey(self.a, ref.id, ref.revision))) orelse return false;
+                self.authorize(record.owner, record.assertion.visibility) catch return false;
+                if (!try self.retained(record, 0)) return false;
+            } else if (ref.kind == .entity) {
+                const record = (try self.read(t.EntityRecord, try key(self.a, "entity", ref.id))) orelse return false;
+                self.authorize(record.owner, record.entity.visibility) catch return false;
+                if (!try self.entityRetained(record)) return false;
+            } else return error.MemoryCorruptState;
+        };
         return true;
     }
     fn reviewEvidence(self: *Run, refs: []const t.EvidenceRef) !void {
@@ -1779,6 +1874,7 @@ const Run = struct {
         return .{ .entity = record.entity, .canonical_id = selected, .description = text.items, .dependencies = dependencies.items, .fingerprint = try hash(self.a, .{ selected, record.revision, self.state.config.generation, dependencies.items, text.items }), .revision = self.state.revision, .config_generation = self.state.config.generation, .complete = complete, .scanned = related.scanned };
     }
     fn relationshipRetained(self: *Run, proposal: t.RelationshipProposal) !bool {
+        if (!try self.viewInputsRetained(proposal.views)) return false;
         if (try self.read(bool, "forgotten-all") != null) return false;
         if (!try self.retainedSupport(proposal.assertion.evidence, proposal.assertion.depends_on, 0)) return false;
         for ([_][]const u8{ proposal.assertion.subject, proposal.assertion.value }) |id| {
@@ -1816,7 +1912,7 @@ const Run = struct {
         if (request.assertion.support_sets.len != 0 or request.assertion.embedding != null) return error.InvalidMemoryRequest;
         try self.validateAssertion(request.assertion, false);
         if (try self.assertion(request.assertion.id) != null) return error.MemoryAssertionConflict;
-        const proposal: t.RelationshipProposal = .{ .id = request.id, .assertion = request.assertion, .owner = self.service.context.principal, .actor = request.actor, .config_generation = self.state.config.generation, .revision = self.state.revision, .recorded_at = self.service.context.now_ms };
+        const proposal: t.RelationshipProposal = .{ .views = try self.captureEntityViews(&.{ request.assertion.subject, request.assertion.value }, request.views), .id = request.id, .assertion = request.assertion, .owner = self.service.context.principal, .actor = request.actor, .config_generation = self.state.config.generation, .revision = self.state.revision, .recorded_at = self.service.context.now_ms };
         if (!try self.relationshipRetained(proposal)) return error.MemoryEvidenceRequired;
         try self.put(try key(self.a, "relationship-proposal", request.id), proposal);
         if (request.actor.len > 0) receipt.origin = .{ .agent = .{ .id = request.actor, .kind = .agent } };
@@ -1835,6 +1931,7 @@ const Run = struct {
         if (proposal.state != .open) return error.MemoryEntityConflict;
         if (proposal.config_generation != self.state.config.generation) return error.MemoryConfigurationChanged;
         try self.reviewEvidence(request.evidence);
+        try self.bindJudgedViews(proposal.views, request.views);
         if (request.accept) |accept| {
             if (accept) {
                 for (request.evidence) |ref| {
@@ -2171,6 +2268,48 @@ const Run = struct {
             };
         }
     }
+    const SemanticFailure = struct { id: []const u8, generation: u64, attempts: u16, error_code: []const u8, next_retry_at: i64 };
+    fn deferSemanticFailure(self: *Run, record: t.EntityRecord, failure: anyerror, inputs: ResourceSet) !void {
+        switch (failure) {
+            error.OutOfMemory, error.Canceled, error.Forbidden, error.Unauthorized, error.MemorySourceAccessDenied, error.MemoryResourceChanged, error.MemoryRevisionConflict, error.MemorySpaceBindingChanged, error.NotLeader, error.MemoryCorruptState => return failure,
+            else => {},
+        }
+        if (isProcessingTimeout(failure)) try self.service.context.beginCheckpoint();
+        // A failed invocation can release an embedded lease too. Restore the
+        // complete source/control/authority fence before publishing retry debt.
+        try self.inferenceCompleted(inputs);
+        const path = try key(self.a, "entity-semantic-failure", record.entity.id);
+        const previous = try self.read(SemanticFailure, path);
+        const attempts = if (previous != null and previous.?.generation == self.state.config.generation) previous.?.attempts +| 1 else @as(u16, 1);
+        const delay: i64 = @min(300000, @as(i64, 1000) << @intCast(@min(attempts, 9)));
+        const retry_at = self.service.context.currentTime() +| delay;
+        try self.put(path, SemanticFailure{ .id = record.entity.id, .generation = self.state.config.generation, .attempts = attempts, .error_code = @errorName(failure), .next_retry_at = retry_at });
+        try self.put(try key(self.a, "entity-semantic-blocked", record.entity.id), .{ .id = record.entity.id });
+        const timer = try self.read(SemanticTimer, try key(self.a, "entity-semantic-timer", record.entity.id));
+        try self.scheduleSemanticTimer(record.entity.id, if (timer) |current| @min(current.at, retry_at) else retry_at);
+        try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
+        return error.MemorySemanticDeferred;
+    }
+    fn semanticEmbedding(self: *Run, record: t.EntityRecord, model: t.Model, text: []const u8, inputs: ResourceSet, progressed: bool) ![]const f32 {
+        const computed = self.service.backend.embed_document.?(self.service.backend.ptr, self.a, model, text) catch |err| {
+            // Yield a cumulative budget after useful work. If the first
+            // unfinished entity fails again on its own quantum, defer it and
+            // advance the scan so it cannot pin unrelated healthy entities.
+            if (isProcessingTimeout(err) and progressed) return err;
+            try self.deferSemanticFailure(record, err, inputs);
+            unreachable;
+        };
+        try self.inferenceCompleted(inputs);
+        if (computed.len != model.dimensions.?) {
+            try self.deferSemanticFailure(record, error.MemoryEmbeddingMismatch, inputs);
+            unreachable;
+        }
+        for (computed) |value| if (!std.math.isFinite(value)) {
+            try self.deferSemanticFailure(record, error.MemoryEmbeddingMismatch, inputs);
+            unreachable;
+        };
+        return computed;
+    }
     fn semanticMaintenance(self: *Run) !void {
         if (!self.state.config.semantic_discovery.enabled) return;
         try self.requireAdmin();
@@ -2184,6 +2323,11 @@ const Run = struct {
         var yielded = false;
         for (page.rows) |row| {
             self.semanticEntity(row, initial, &progressed) catch |err| {
+                if (err == error.MemorySemanticDeferred) {
+                    position = row.key;
+                    yielded = true;
+                    break;
+                }
                 if ((!isProcessingTimeout(err) and err != error.MemoryWorkLimit) or !progressed) return err;
                 try self.service.context.beginCheckpoint();
                 yielded = true;
@@ -2206,6 +2350,7 @@ const Run = struct {
                 try self.semanticBindings(work.id, .empty, &.{}, .empty);
                 try self.scheduleSemanticTimer(work.id, null);
                 try self.remove(try key(self.a, "entity-semantic-blocked", work.id));
+                try self.remove(try key(self.a, "entity-semantic-failure", work.id));
                 try self.remove(row.key);
                 return;
             };
@@ -2237,9 +2382,7 @@ const Run = struct {
                     try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, index_name, model.dimensions.?);
                     const reusable = if (existing) |prior| prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and eql(u8, prior.text, text) and eql(u8, try self.encode(prior.model), try self.encode(model)) else false;
                     const embedding = if (reusable) existing.?.embedding else blk: {
-                        const computed = try self.service.backend.embed_document.?(self.service.backend.ptr, self.a, model, text);
-                        try self.inferenceCompleted(captured.resources);
-                        break :blk computed;
+                        break :blk try self.semanticEmbedding(record, model, text, captured.resources, progressed.*);
                     };
                     if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
                     for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
@@ -2269,6 +2412,7 @@ const Run = struct {
         }
         try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
         try self.remove(try key(self.a, "entity-semantic-blocked", record.entity.id));
+        try self.remove(try key(self.a, "entity-semantic-failure", record.entity.id));
     }
     fn finishSemanticPublication(self: *Run) !void {
         if (!self.semantic_ready_after_commit) return;
@@ -2557,7 +2701,7 @@ const Run = struct {
             if (eql(u8, value.id, proposal_id)) break @as(?curation.Proposal, value);
         } else null;
         const previous_binding = try self.read(ProposalBinding, try key(self.a, "proposal-input", proposal_id));
-        const binding: ProposalBinding = .{ .revision = self.state.revision, .operation = try self.resourceRef(.operation, receipt.id, receipt.revision), .owner = self.service.context.principal, .actor = request.actor, .config_generation = self.state.config.generation, .entities = entities.items, .evidence = request.evidence };
+        const binding: ProposalBinding = .{ .views = try self.captureEntityViews(ids, request.views), .revision = self.state.revision, .operation = try self.resourceRef(.operation, receipt.id, receipt.revision), .owner = self.service.context.principal, .actor = request.actor, .config_generation = self.state.config.generation, .entities = entities.items, .evidence = request.evidence };
         var previous: ?prov.Resource = null;
         if (prior) |proposal| {
             if (proposal.state != .open) {
@@ -2568,7 +2712,7 @@ const Run = struct {
             }
             if (previous_binding) |old| {
                 if (eql(u8, old.owner, binding.owner) and eql(u8, old.actor, binding.actor) and old.config_generation == binding.config_generation and
-                    eql(u8, try self.encode(old.entities), try self.encode(binding.entities)) and eql(u8, try self.encode(old.evidence), try self.encode(binding.evidence)) and
+                    eql(u8, try self.encode(old.entities), try self.encode(binding.entities)) and eql(u8, try self.encode(old.views), try self.encode(binding.views)) and eql(u8, try self.encode(old.evidence), try self.encode(binding.evidence)) and
                     eql(u8, try self.encode(proposal.options), try self.encode(input.options)))
                 {
                     receipt.proposal_id = proposal_id;
@@ -2634,6 +2778,7 @@ const Run = struct {
             if (eql(u8, proposal.id, id)) break proposal;
         } else return error.MemoryNotFound;
         if (proposal.state != .open) return error.MemoryEntityConflict;
+        try self.bindJudgedViews(binding.views, request.views);
         const previous = try self.proposalOperation(proposal, binding);
         try self.archiveProposal(proposal, binding, previous);
         const inputs = try self.a.alloc(t.EvidenceRef, binding.evidence.len + request.evidence.len);
@@ -3140,6 +3285,7 @@ const Run = struct {
         // the durable obligation and its retry budget.
         if (err == error.MemorySourceAccessDenied) return err;
         self.inferred = false;
+        self.judged_views.clearRetainingCapacity();
         self.decision_targets.clearRetainingCapacity();
         // A rejected model output publishes no partial assertions or entities.
         self.changes.clearRetainingCapacity();
@@ -3216,20 +3362,22 @@ const Run = struct {
         const config = self.state.pending_config orelse return error.MemoryConfigurationChanged;
         if (config.generation != pending.config_generation) return error.MemoryConfigurationChanged;
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", pending.cursor, 8);
+        var position = pending.cursor;
+        var progressed = false;
+        var yielded = false;
         for (page.rows) |row| {
-            const record = try parse(t.StoredAssertion, self.a, row.json);
-            const inputs = try self.captureResources(publicationCandidate, .{record});
-            if (!inputs.result) continue;
-            if (eql(u8, config.models.embedder.?.provider, "external")) {
-                if (try self.vectorFor(config, record.assertion) == null) return error.MemoryExternalVectorRequired;
-            } else {
-                const embedding = try self.embed(config.models.embedder.?, record.assertion.statement, inputs.resources);
-                try self.putVector(config, record.assertion, embedding);
-            }
+            self.reindexAssertion(config, row) catch |err| {
+                if ((!isProcessingTimeout(err) and err != error.MemoryWorkLimit) or !progressed) return err;
+                try self.service.context.beginCheckpoint();
+                yielded = true;
+                break;
+            };
+            position = row.key;
+            progressed = true;
         }
-        // Do not mutate the pending receipt or serving state before all
-        // projections for this page, including final belief cutover, succeed.
-        if (page.next == null) {
+        // Checkpoint completed vectors without cutting over the serving model.
+        // The unfinished assertion remains after the durable cursor.
+        if (!yielded and page.next == null) {
             try self.applyConfiguration(config);
             self.state.pending_config = null;
             try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
@@ -3237,11 +3385,21 @@ const Run = struct {
             pending.assertions_ready = true;
             try self.remove(try key(self.a, "pending", pending.id));
         }
-        pending.cursor = page.next;
+        pending.cursor = if (yielded) position else page.next;
         pending.attempts = 0;
         pending.error_code = null;
         pending.next_retry_at = null;
         try self.put(path, pending.*);
+    }
+    fn reindexAssertion(self: *Run, config: t.Config, row: Row) !void {
+        const record = try parse(t.StoredAssertion, self.a, row.json);
+        const inputs = try self.captureResources(publicationCandidate, .{record});
+        if (!inputs.result) return;
+        self.inferred = true;
+        if (try self.vectorFor(config, record.assertion) != null) return;
+        if (eql(u8, config.models.embedder.?.provider, "external")) return error.MemoryExternalVectorRequired;
+        const embedding = try self.embed(config.models.embedder.?, record.assertion.statement, inputs.resources);
+        try self.putVector(config, record.assertion, embedding);
     }
     fn retireAssertion(self: *Run, id: []const u8) !void {
         try self.semanticInvalidateAssertion(id);
@@ -3498,6 +3656,10 @@ const Run = struct {
             const timer = try parse(SemanticTimer, self.a, row.json);
             const current = try self.read(SemanticTimer, try key(self.a, "entity-semantic-timer", timer.id));
             if (current == null or current.?.at != timer.at) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "entity-semantic-failure/")) {
+            const failure = try parse(SemanticFailure, self.a, row.json);
+            const record = try self.read(t.EntityRecord, try key(self.a, "entity", failure.id));
+            if (!self.state.config.semantic_discovery.enabled or failure.generation != self.state.config.generation or record == null or !try self.entityRetained(record.?)) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "entity-semantic-work/") or std.mem.startsWith(u8, row.key, "entity-semantic-blocked/")) {
             const work = try parse(struct { id: []const u8 }, self.a, row.json);
             const record = try self.read(t.EntityRecord, try key(self.a, "entity", work.id));
@@ -3963,6 +4125,7 @@ const Run = struct {
                         if (attempt.previous) |previous| try links.append(self.a, .{ .relation = .supersedes, .target = previous });
                         for (attempt.inputs.evidence) |evidence_ref| if (try self.evidence(evidence_ref.id)) |source| try links.append(self.a, .{ .relation = .supported_by, .target = try self.resourceRef(.evidence, source.evidence.id, source.revision) });
                         for (attempt.inputs.entities) |entity_ref| try links.append(self.a, .{ .relation = .depends_on, .target = try self.resourceRef(.entity, entity_ref.id, entity_ref.revision) });
+                        for (attempt.inputs.views orelse &.{}) |view| for (view.dependencies) |dependency| try links.append(self.a, .{ .relation = .depends_on, .target = dependency.resource });
                     };
                 };
                 const decision_ref = if (snapshot) |version| version.decision else if (try self.read(prov.Decision, try key(self.a, "audit", record.id))) |decision| decision.resource else null;

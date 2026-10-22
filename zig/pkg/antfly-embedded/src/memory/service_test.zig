@@ -4883,7 +4883,11 @@ test "memory semantic inference failures cannot roll back retention cleanup" {
     } else return error.TestUnexpectedResult;
     try std.testing.expect(store.values.get(try fixtureKey(a, "assertion", "secret")) == null);
     try std.testing.expect(store.values.get(try fixtureKey(a, "evidence", "retire")) == null);
-    try std.testing.expectError(error.TransientInferenceFailure, service.execute(a, .advance, "", "{}", "inference"));
+    _ = try service.execute(a, .advance, "", "{}", "inference");
+    const failure = try service.backend.scan(service.backend.ptr, a, "entity-semantic-failure/", null, 8);
+    try std.testing.expectEqual(@as(usize, 1), failure.rows.len);
+    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, a, failure.rows[0].json, .{});
+    try std.testing.expectEqualStrings("TransientInferenceFailure", metadata.object.get("error_code").?.string);
 }
 
 test "memory semantic continuation spans two disjoint maximum neighbor windows" {
@@ -5641,5 +5645,297 @@ test "memory semantic checkpoints preserve progress across storage and work-budg
         try std.testing.expectEqual(@as(usize, 2), Boundary.calls);
         const index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, (try service.backend.get(service.backend.ptr, a, "entity-semantic-index")).?.json, .{});
         try std.testing.expect(index.complete and index.backfill_complete);
+    }
+}
+
+test "memory semantic provider failures defer without blocking healthy entities" {
+    const Failure = struct {
+        var calls: usize = 0;
+        fn embed(_: *anyopaque, _: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            calls += 1;
+            return error.Timeout;
+        }
+    };
+    for ([_]bool{ false, true }) |dirty| {
+        Failure.calls = 0;
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var svc = SemanticFixture.service(&store, 1);
+        const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+        _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+        _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"}],\"entities\":[{\"id\":\"a\",\"name\":\"Graph\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"b\",\"name\":\"Graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+        const rows = try svc.backend.scan(svc.backend.ptr, a, "entity/", null, 8);
+        const first = try std.json.parseFromSliceLeaky(m.types.EntityRecord, a, rows.rows[0].json, .{});
+        const second = try std.json.parseFromSliceLeaky(m.types.EntityRecord, a, rows.rows[1].json, .{});
+        // Only the first entity's text fails. A later entity would succeed.
+        var updated = first;
+        updated.entity.name = "Fails";
+        try store.values.put(a, rows.rows[0].key, try std.json.Stringify.valueAlloc(a, updated, .{}));
+        const Selective = struct {
+            fn embed(ptr: *anyopaque, alloc: A, model: m.types.Model, text: []const u8) ![]const f32 {
+                if (std.mem.eql(u8, text, "Fails")) return Failure.embed(ptr, alloc, model, text);
+                return fakeEmbed(ptr, alloc, model, text);
+            }
+        };
+        svc.backend.embed_document = Selective.embed;
+        if (dirty) try store.values.put(a, "entity-semantic-index", try std.json.Stringify.valueAlloc(a, m.types.SemanticIndex{ .version = m.types.semantic_index_version, .generation = 1, .backfill_complete = true, .complete = true }, .{}));
+        _ = try svc.execute(a, .advance, "", "{}", "defer-first");
+        // Retry after reconstructing policy from durable state, without advancing
+        // time to the failed input's retry deadline.
+        var reopened = SemanticFixture.service(&store, 1);
+        reopened.backend.embed_document = Selective.embed;
+        for (0..5) |i| _ = try reopened.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "healthy-{d}", .{i}));
+        try std.testing.expectEqual(@as(usize, 1), Failure.calls);
+        const projections = try svc.backend.scan(svc.backend.ptr, a, "entity-semantic/", null, 8);
+        try std.testing.expectEqual(@as(usize, 2), projections.rows.len);
+        for (projections.rows) |row| {
+            const projection = try std.json.parseFromSliceLeaky(m.types.EntityProjection, a, row.json, .{});
+            try std.testing.expectEqualStrings(second.entity.id, projection.entity_id);
+        }
+        const index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, (try svc.backend.get(svc.backend.ptr, a, "entity-semantic-index")).?.json, .{});
+        try std.testing.expect(index.backfill_complete and !index.complete);
+        reopened.context.now_ms = 3000;
+        for (0..3) |i| _ = try reopened.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "retry-{d}", .{i}));
+        try std.testing.expectEqual(@as(usize, 2), Failure.calls);
+        reopened.backend.embed_document = fakeEmbed;
+        reopened.context.now_ms = 10000;
+        for (0..8) |i| _ = try reopened.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "recover-{d}", .{i}));
+        try std.testing.expectEqual(@as(usize, 4), (try reopened.backend.scan(reopened.backend.ptr, a, "entity-semantic/", null, 8)).rows.len);
+        try std.testing.expectEqual(@as(usize, 0), (try reopened.backend.scan(reopened.backend.ptr, a, "entity-semantic-failure/", null, 8)).rows.len);
+    }
+}
+
+test "memory external entity verdict fences the exact temporal view" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"base\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Two concepts\"},{\"id\":\"view-source\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"entities\":[{\"id\":\"a\",\"name\":\"Antfly\",\"evidence\":[{\"id\":\"base\"}]},{\"id\":\"b\",\"name\":\"AntflyDB\",\"evidence\":[{\"id\":\"base\"}]}],\"assertions\":[{\"id\":\"description\",\"subject\":\"a\",\"predicate\":\"description\",\"value\":\"database\",\"statement\":\"Antfly and AntflyDB identify the same database\",\"valid_to\":20,\"evidence\":[{\"id\":\"view-source\"}]}]}", "observe");
+    const old = try std.json.parseFromSliceLeaky(m.types.EntityView, a, try svc.execute(a, .entity_view, "a", "{}", ""), .{});
+    try std.testing.expect(std.mem.indexOf(u8, old.description, "same database") != null);
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const proposal = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, m.types.EntityProposalRequest{ .action = .merge, .from = "a", .to = "b", .expected_revision = state.revision, .evidence = &.{.{ .id = "view-source" }} }, .{}), "propose"), .{});
+    var later = svc;
+    later.context.now_ms = 30;
+    const current = try std.json.parseFromSliceLeaky(m.types.EntityView, a, try later.execute(a, .entity_view, "a", "{}", ""), .{});
+    try std.testing.expect(!std.mem.eql(u8, old.fingerprint, current.fingerprint));
+    try std.testing.expectEqualStrings("Antfly", current.description);
+    try std.testing.expectError(error.MemoryResourceChanged, later.execute(a, .review_entity, proposal.proposal_id.?, try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposal.revision, .accept = true }, .{}), "accept"));
+    const resolved = try std.json.parseFromSliceLeaky(std.json.Value, a, try svc.execute(a, .resolve_entity, "a", "{}", ""), .{});
+    try std.testing.expectEqualStrings("a", resolved.object.get("canonical_id").?.string);
+    const old_pins = [_]m.types.EntityViewPin{ .{ .id = "a", .fingerprint = old.fingerprint }, .{ .id = "b", .fingerprint = "incorrect" } };
+    const refresh: m.types.EntityProposalRequest = .{ .action = .merge, .from = "a", .to = "b", .expected_revision = proposal.revision, .views = &old_pins };
+    try std.testing.expectError(error.MemoryResourceChanged, later.execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, refresh, .{}), "stale-refresh"));
+    const refreshed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try later.execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, m.types.EntityProposalRequest{ .action = .merge, .from = "a", .to = "b", .expected_revision = proposal.revision }, .{}), "refresh"), .{});
+    _ = try later.execute(a, .review_entity, proposal.proposal_id.?, try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = refreshed.revision, .accept = true }, .{}), "fresh-verdict");
+}
+
+test "memory assertion reindex checkpoints vectors across cumulative timeouts" {
+    const Slow = struct {
+        var elapsed: usize = 0;
+        var calls: usize = 0;
+        fn embed(_: *anyopaque, alloc: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            elapsed += 20;
+            calls += 1;
+            if (elapsed >= 120) return error.Timeout;
+            return alloc.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = modelService(&store, 1);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", source, "observe");
+    var claims: [8]m.types.Assertion = undefined;
+    for (&claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = "s", .predicate = "p", .value = "v", .statement = "A grounded statement", .evidence = &.{.{ .id = "e1" }} };
+    _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "claims");
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const config: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+    const pending = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = state.revision, .config = config }, .{}), "configure"), .{});
+    svc.backend.embed = Slow.embed;
+    var result: m.types.OperationStatus = undefined;
+    for (0..2) |i| {
+        Slow.elapsed = 0;
+        svc.context.now_ms = @intCast(100000 * (i + 1));
+        result = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .advance, pending.id, "{}", try std.fmt.allocPrint(a, "advance-{d}", .{i})), .{});
+    }
+    try std.testing.expectEqual(.succeeded, result.phase);
+    try std.testing.expectEqual(@as(usize, 9), Slow.calls);
+    try std.testing.expectEqual(@as(usize, 8), (try Store.scan(&store, a, "vector/", null, 32)).rows.len);
+}
+
+test "memory external verdict rechecks sources after final authorization" {
+    const Authority = struct {
+        fn check(ptr: *anyopaque) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.resource_revision = 8;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"base\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Two concepts\"},{\"id\":\"judgment\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"entities\":[{\"id\":\"a\",\"name\":\"Antfly\",\"evidence\":[{\"id\":\"base\"}]},{\"id\":\"b\",\"name\":\"AntflyDB\",\"evidence\":[{\"id\":\"base\"}]}]}", "observe");
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const proposal = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, m.types.EntityProposalRequest{ .action = .merge, .from = "a", .to = "b", .expected_revision = state.revision, .evidence = &.{.{ .id = "judgment" }} }, .{}), "propose"), .{});
+    svc.context.final_check_ptr = &store;
+    svc.context.final_check_fn = Authority.check;
+    try std.testing.expectError(error.MemoryResourceChanged, svc.execute(a, .review_entity, proposal.proposal_id.?, try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposal.revision, .accept = true }, .{}), "accept"));
+    const resolved = try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", true, 10).execute(a, .resolve_entity, "a", "{}", ""), .{});
+    try std.testing.expectEqualStrings("a", resolved.object.get("canonical_id").?.string);
+    try std.testing.expectEqual(@as(u64, 8), store.resource_revision);
+}
+
+test "memory relationship verdicts fence temporal views and final source authority" {
+    const Authority = struct {
+        fn change(ptr: *anyopaque) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.resource_revision = 8;
+        }
+        fn revoke(ptr: *anyopaque) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.resource_state = .denied;
+        }
+    };
+    for (0..3) |mode| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var svc = store.service("alice", true, 10);
+        _ = try svc.execute(a, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create");
+        _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"base\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Two concepts\"},{\"id\":\"judgment\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"entities\":[{\"id\":\"a\",\"name\":\"Antfly\",\"evidence\":[{\"id\":\"base\"}]},{\"id\":\"b\",\"name\":\"Database\",\"evidence\":[{\"id\":\"base\"}]}],\"assertions\":[{\"id\":\"description\",\"subject\":\"a\",\"predicate\":\"description\",\"value\":\"database\",\"statement\":\"Antfly is a database\",\"valid_to\":20,\"evidence\":[{\"id\":\"judgment\"}]}]}", "observe");
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        const request: m.types.RelationshipProposalRequest = .{ .id = "relation", .expected_revision = state.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "Antfly is a database", .evidence = &.{.{ .id = "base" }} } };
+        const proposed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, request, .{}), "propose"), .{});
+        if (mode == 0) svc.context.now_ms = 30 else {
+            svc.context.final_check_ptr = &store;
+            svc.context.final_check_fn = if (mode == 1) Authority.change else Authority.revoke;
+        }
+        const verdict: m.types.EntityVerdict = .{ .expected_revision = proposed.revision, .accept = true, .evidence = &.{.{ .id = "judgment" }} };
+        try std.testing.expectError(if (mode == 2) error.MemorySourceAccessDenied else error.MemoryResourceChanged, svc.execute(a, .review_relationship, "relation", try std.json.Stringify.valueAlloc(a, verdict, .{}), "accept"));
+        try std.testing.expect(store.values.get(try fixtureKey(a, "assertion", "link")) == null);
+        const current = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        try std.testing.expectEqual(proposed.revision, current.revision);
+    }
+}
+
+test "memory legacy proposal views require explicit refresh and pin admission validates every identity" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try externalReviewSetup(&store);
+    const proposed = try externalProposal(&store);
+    const id = proposed.proposal_id.?;
+    const path = try fixtureKey(a, "proposal-input", id);
+    var binding = try std.json.parseFromSliceLeaky(m.types.EntityProposalInputs, a, store.values.get(path).?, .{});
+    const captured = binding.views.?;
+    binding.views = null;
+    try store.values.put(a, path, try std.json.Stringify.valueAlloc(a, binding, .{}));
+    var svc = store.service("alice", true, 10);
+    const verdict: m.types.EntityVerdict = .{ .expected_revision = proposed.revision, .accept = true };
+    try std.testing.expectError(error.MemoryResourceChanged, svc.execute(a, .review_entity, id, try std.json.Stringify.valueAlloc(a, verdict, .{}), "legacy"));
+    const pins = [_]m.types.EntityViewPin{ .{ .id = captured[0].id, .fingerprint = captured[0].fingerprint }, .{ .id = captured[1].id, .fingerprint = captured[1].fingerprint } };
+    var refresh: m.types.EntityProposalRequest = .{ .action = .merge, .from = "a", .to = "b", .expected_revision = proposed.revision, .views = &pins };
+    refresh.views = pins[0..1];
+    try std.testing.expectError(error.InvalidMemoryRequest, svc.execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, refresh, .{}), "partial"));
+    refresh.views = &pins;
+    const refreshed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, refresh, .{}), "refresh"), .{});
+    _ = try svc.execute(a, .review_entity, id, try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = refreshed.revision, .accept = true, .views = &pins }, .{}), "accept");
+}
+
+test "memory judged view publication uses live time and excludes its own mutation overlay" {
+    const Clock = struct {
+        var now: i64 = 10;
+        var during: bool = false;
+        var reads: usize = 0;
+        fn clock() i64 {
+            reads += 1;
+            return if (during and reads > 1) 30 else now;
+        }
+        fn finish(_: *anyopaque) !void {
+            if (!during) now = 30;
+        }
+    };
+    for ([_]bool{ false, true }) |during| {
+        Clock.during = during;
+        Clock.now = 10;
+        Clock.reads = 0;
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try externalReviewSetup(&store);
+        _ = try store.service("alice", true, 10).execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"description\",\"subject\":\"a\",\"predicate\":\"description\",\"value\":\"database\",\"statement\":\"Temporary description\",\"valid_to\":20,\"evidence\":[{\"id\":\"e\"}]}]}", "describe");
+        var svc = store.service("alice", true, 10);
+        svc.context.clock_ms_fn = Clock.clock;
+        svc.context.final_check_ptr = &store;
+        svc.context.final_check_fn = Clock.finish;
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        const request: m.types.EntityProposalRequest = .{ .action = .merge, .from = "a", .to = "b", .expected_revision = state.revision };
+        try std.testing.expectError(error.MemoryResourceChanged, svc.execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, request, .{}), "late-proposal"));
+        const after = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        try std.testing.expectEqual(state.revision, after.revision);
+    }
+}
+
+test "memory reindex checkpoints retain source grant revision and foreground deadline fences" {
+    const Fault = struct {
+        var elapsed: usize = 0;
+        var mode: usize = 0;
+        fn check(_: *anyopaque) !void {
+            if (mode == 3 and elapsed >= 120) return error.DeadlineExceeded;
+        }
+        fn finish(ptr: *anyopaque) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (mode == 1 and store.failures != 0) return error.Forbidden;
+        }
+        fn embed(ptr: *anyopaque, alloc: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            elapsed += 20;
+            if (elapsed >= 120) {
+                if (mode == 0) store.resource_revision = 8;
+                if (mode == 1) store.failures = 1;
+                if (mode == 2) store.revision += 1;
+                return error.Timeout;
+            }
+            return alloc.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    for (0..4) |mode| {
+        Fault.mode = mode;
+        Fault.elapsed = 0;
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var svc = modelService(&store, 1);
+        _ = try svc.execute(a, .create, "", "{}", "create");
+        _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}]}", "observe");
+        var claims: [8]m.types.Assertion = undefined;
+        for (&claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = "s", .predicate = "p", .value = "v", .statement = "Grounded statement", .evidence = &.{.{ .id = "e1" }} };
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "claims");
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        const config: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+        const configured = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = state.revision, .config = config }, .{}), "configure"), .{});
+        svc.backend.embed = Fault.embed;
+        svc.context.check_ptr = &store;
+        svc.context.check_fn = Fault.check;
+        svc.context.final_check_ptr = &store;
+        svc.context.final_check_fn = Fault.finish;
+        const failure: anyerror = switch (mode) {
+            0 => error.MemoryResourceChanged,
+            1 => error.Forbidden,
+            2 => error.MemoryRevisionConflict,
+            else => error.DeadlineExceeded,
+        };
+        try std.testing.expectError(failure, svc.execute(a, .advance, configured.id, "{}", "checkpoint"));
+        try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "vector/", null, 32)).rows.len);
+        const retained = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        try std.testing.expectEqual(configured.revision, retained.revision);
+        try std.testing.expect(!retained.config.features.semantic_recall);
+        const operation = try std.json.parseFromSliceLeaky(m.types.Operation, a, store.values.get(try fixtureKey(a, "operation", configured.id)).?, .{});
+        try std.testing.expectEqual(@as(u8, 0), operation.attempts);
     }
 }

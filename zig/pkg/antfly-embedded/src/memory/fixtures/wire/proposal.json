@@ -52,7 +52,61 @@
     ],
     "evidence": [],
     "verdict_revision": null,
-    "model": null
+    "model": null,
+    "views": [
+      {
+        "id": "a",
+        "canonical_id": "a",
+        "fingerprint": "ceff2f082c55843d2f590e71b3c6d34eced8d422670c153772a0a90fd03de6b5",
+        "dependencies": [
+          {
+            "resource": {
+              "database": "default",
+              "namespace": "public",
+              "table": "memory_wire",
+              "table_id": 7,
+              "storage_name": null,
+              "kind": "entity",
+              "id": "a",
+              "revision": 3,
+              "digest": null
+            },
+            "evidence": [
+              {
+                "id": "e",
+                "span": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "b",
+        "canonical_id": "b",
+        "fingerprint": "a1019dc0fbd82a3e0ff35aee01e43ffec416ad4c7bce175b01c82de1287317bb",
+        "dependencies": [
+          {
+            "resource": {
+              "database": "default",
+              "namespace": "public",
+              "table": "memory_wire",
+              "table_id": 7,
+              "storage_name": null,
+              "kind": "entity",
+              "id": "b",
+              "revision": 3,
+              "digest": null
+            },
+            "evidence": [
+              {
+                "id": "e",
+                "span": null
+              }
+            ]
+          }
+        ]
+      }
+    ]
   },
   "reason": null,
   "stale_configuration": false,

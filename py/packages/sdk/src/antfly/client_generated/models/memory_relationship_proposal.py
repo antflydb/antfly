@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from ..models.memory_relationship_proposal_verdict_evidence_item import (
         MemoryRelationshipProposalVerdictEvidenceItem,
     )
+    from ..models.memory_relationship_proposal_views_type_0_item import MemoryRelationshipProposalViewsType0Item
 
 
 T = TypeVar("T", bound="MemoryRelationshipProposal")
@@ -30,6 +31,7 @@ class MemoryRelationshipProposal:
         config_generation (int):
         revision (int):
         recorded_at (int):
+        views (list[MemoryRelationshipProposalViewsType0Item] | None | Unset):
         state (MemoryRelationshipProposalState | Unset):  Default: MemoryRelationshipProposalState.OPEN.
         verdict_actor (str | Unset):
         verdict_principal (str | Unset):
@@ -46,6 +48,7 @@ class MemoryRelationshipProposal:
     config_generation: int
     revision: int
     recorded_at: int
+    views: list[MemoryRelationshipProposalViewsType0Item] | None | Unset = UNSET
     state: MemoryRelationshipProposalState | Unset = MemoryRelationshipProposalState.OPEN
     verdict_actor: str | Unset = UNSET
     verdict_principal: str | Unset = UNSET
@@ -70,6 +73,18 @@ class MemoryRelationshipProposal:
         revision = self.revision
 
         recorded_at = self.recorded_at
+
+        views: list[dict[str, Any]] | None | Unset
+        if isinstance(self.views, Unset):
+            views = UNSET
+        elif isinstance(self.views, list):
+            views = []
+            for views_type_0_item_data in self.views:
+                views_type_0_item = views_type_0_item_data.to_dict()
+                views.append(views_type_0_item)
+
+        else:
+            views = self.views
 
         state: str | Unset = UNSET
         if not isinstance(self.state, Unset):
@@ -115,6 +130,8 @@ class MemoryRelationshipProposal:
                 "recorded_at": recorded_at,
             }
         )
+        if views is not UNSET:
+            field_dict["views"] = views
         if state is not UNSET:
             field_dict["state"] = state
         if verdict_actor is not UNSET:
@@ -139,6 +156,7 @@ class MemoryRelationshipProposal:
         from ..models.memory_relationship_proposal_verdict_evidence_item import (
             MemoryRelationshipProposalVerdictEvidenceItem,
         )
+        from ..models.memory_relationship_proposal_views_type_0_item import MemoryRelationshipProposalViewsType0Item
 
         d = dict(src_dict)
         id = d.pop("id")
@@ -154,6 +172,28 @@ class MemoryRelationshipProposal:
         revision = d.pop("revision")
 
         recorded_at = d.pop("recorded_at")
+
+        def _parse_views(data: object) -> list[MemoryRelationshipProposalViewsType0Item] | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, list):
+                    raise TypeError()
+                views_type_0 = []
+                _views_type_0 = data
+                for views_type_0_item_data in _views_type_0:
+                    views_type_0_item = MemoryRelationshipProposalViewsType0Item.from_dict(views_type_0_item_data)
+
+                    views_type_0.append(views_type_0_item)
+
+                return views_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(list[MemoryRelationshipProposalViewsType0Item] | None | Unset, data)
+
+        views = _parse_views(d.pop("views", UNSET))
 
         _state = d.pop("state", UNSET)
         state: MemoryRelationshipProposalState | Unset
@@ -213,6 +253,7 @@ class MemoryRelationshipProposal:
             config_generation=config_generation,
             revision=revision,
             recorded_at=recorded_at,
+            views=views,
             state=state,
             verdict_actor=verdict_actor,
             verdict_principal=verdict_principal,

@@ -481,8 +481,24 @@ an expected space revision, declared actor, evidence and optional qualified
 model metadata. The authenticated principal remains the authoritative initiator;
 a supplied actor is declared agent attribution. Accept applies the same native
 curation and belief rebuild atomically; config/input changes fence stale review.
+Proposal admission captures the exact default entity views: requested and canonical
+identities, content fingerprints and dependency references. Entity and relationship
+proposal requests accept optional `views: [{id, fingerprint}]` expectations from
+candidate pages; supplied expectations must cover every endpoint exactly once.
+Without expectations, the service captures the current views explicitly. Verdicts
+may repeat those pins, but cannot replace the admitted snapshot. Both verdict
+admission and final publication rederive the admitted views, using live time and
+the state before the verdict's own changes. A validity boundary, source transition
+or identity change requires an explicit entity-proposal refresh or a new
+relationship proposal, even when the space revision did not change. Legacy attempts
+without view bindings remain auditable but cannot apply a verdict until refreshed.
+Pinned assertion revisions remain retention and explanation dependencies.
+
 Verdict admission revalidates both the proposal's original evidence and any new
-judge evidence against current source resources. Retained changed captures may
+judge evidence against current source resources. Successful external mutations,
+including externally judged verdicts, revalidate their captured source closure
+after final live authorization and before the memory control CAS. This fence does
+not depend on whether Antfly invoked a model. Retained changed captures may
 remain available for audit, but cannot authorize a new identity judgment.
 Terminal queue entries cannot be reopened by changing an idempotency token.
 For an open queue item, an explicit `propose_entity` with changed evidence,
@@ -827,8 +843,21 @@ embeddings. Partial entities retain dependency bindings and timers, and generati
 readiness remains false until every obligation is complete. Background owners
 may open one fresh five-second publication window, without further inference;
 publication still rechecks leadership, live grants, the memory revision and every
-captured source. Foreground deadlines cannot be extended. With no completed work,
-the original failure propagates. For receipt-backed processing, if the entire
+captured source. Foreground deadlines cannot be extended. A provider failure on the first unfinished entity instead persists a durable
+per-entity failure obligation (configuration generation, attempt count, error code,
+and retry deadline), removes that entity from the runnable queue, and advances
+the scan. Ordered timers retry it with exponential backoff capped at five minutes;
+healthy entities can finish while the failed obligation keeps indexed readiness
+false. Successful retries reuse partial projections and retire the failure row.
+Leadership, grant, source and revision failures still abort publication. Foreground
+expiry cannot be renewed to persist retry metadata.
+
+Assertion embedding reindexing checkpoints completed vectors and its last finished
+assertion cursor under the same bounded publication window. Retries reuse staged
+vectors and do not charge cumulative budget yields as failed model attempts. The
+serving model changes only after the final page succeeds; a failed or ambiguous
+publication retains the previous serving generation and its revision fences.
+For receipt-backed processing, if the entire
 attempt overruns, the worker
 re-enters the native service with a fresh, bounded finalization context and the
 original revision/receipt fence, recording the failure without invoking a model.

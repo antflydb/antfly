@@ -5438,6 +5438,9 @@ pub const ApiHttpServer = struct {
         var work: MemoryWorkExecution = .{ .server = self, .alloc = a, .table = table, .state = state, .context = context, .deadline = &deadline };
         try @import("antfly_local_sources").memory_scheduling.advance(adapter.backend(), a, context.now_ms, state, entry.value_ptr, .{ .ptr = &work, .execute = MemoryWorkExecution.execute });
     }
+    fn memoryClockMs() i64 {
+        return @intCast(platform_time.realtimeNs() / std.time.ns_per_ms);
+    }
     const MemoryWorkDeadline = struct {
         // Selection/cleanup and durable finalization stay short. Model work has
         // its own bounded budget, leaving time to record a provider timeout.
@@ -5488,6 +5491,7 @@ pub const ApiHttpServer = struct {
             const module = @import("memory.zig");
             var context = work.context;
             context.now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms);
+            context.clock_ms_fn = memoryClockMs;
             try context.check();
             var adapter: module.engine.Routed = .{ .table = table, .reads = server.table_reads.?, .writes = server.table_writes.?, .context = context };
             adapter.request = .{ .deadline_ns = work.deadline.end };
@@ -21711,6 +21715,7 @@ pub const ApiHttpServer = struct {
             .execution_principal = executor,
             .execution_signature = signature,
             .durable_execution_required = true,
+            .clock_ms_fn = memoryClockMs,
             .principal = owner,
             .admin = if (identity) |value| permissionsAllow(value.permissions, .table, table, .admin) else !self.cfg.auth_enabled,
             .curator = if (identity) |value| permissionsAllow(value.permissions, .table, table, .curator) else !self.cfg.auth_enabled,

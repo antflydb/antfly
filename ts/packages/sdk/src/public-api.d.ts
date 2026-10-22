@@ -25079,6 +25079,40 @@ export interface components {
                 /** Format: uint64 */
                 revision: number;
             }[];
+            /** @default null */
+            views?: {
+                id: string;
+                canonical_id: string | null;
+                fingerprint: string;
+                dependencies: {
+                    resource: {
+                        database?: string;
+                        namespace?: string;
+                        table: string;
+                        /** Format: uint64 */
+                        table_id: number;
+                        /** @default null */
+                        storage_name?: string | null;
+                        /** @enum {string} */
+                        kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                        id: string;
+                        /** Format: uint64 */
+                        revision: number;
+                        /** @default null */
+                        digest?: string | null;
+                    };
+                    evidence: {
+                        id: string;
+                        /** @default null */
+                        span?: {
+                            /** Format: uint32 */
+                            start: number;
+                            /** Format: uint32 */
+                            end: number;
+                        } | null;
+                    }[];
+                }[];
+            }[] | null;
             evidence: {
                 id: string;
                 /** @default null */
@@ -25122,6 +25156,10 @@ export interface components {
             revision: number;
         };
         MemoryEntityProposalRequest: {
+            views?: {
+                id: string;
+                fingerprint: string;
+            }[];
             /** @enum {string} */
             action: "merge" | "unmerge" | "suppress" | "unsuppress" | "distinct";
             from: string;
@@ -25151,6 +25189,10 @@ export interface components {
             }[];
         };
         MemoryEntityVerdict: {
+            views?: {
+                id: string;
+                fingerprint: string;
+            }[];
             /** Format: uint64 */
             expected_revision: number;
             /** @default null */
@@ -25488,6 +25530,10 @@ export interface components {
             revision: number;
         };
         MemoryRelationshipProposalRequest: {
+            views?: {
+                id: string;
+                fingerprint: string;
+            }[];
             id: string;
             /** Format: uint64 */
             expected_revision: number;
@@ -25588,6 +25634,40 @@ export interface components {
             actor?: string;
         };
         MemoryRelationshipProposal: {
+            /** @default null */
+            views?: {
+                id: string;
+                canonical_id: string | null;
+                fingerprint: string;
+                dependencies: {
+                    resource: {
+                        database?: string;
+                        namespace?: string;
+                        table: string;
+                        /** Format: uint64 */
+                        table_id: number;
+                        /** @default null */
+                        storage_name?: string | null;
+                        /** @enum {string} */
+                        kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                        id: string;
+                        /** Format: uint64 */
+                        revision: number;
+                        /** @default null */
+                        digest?: string | null;
+                    };
+                    evidence: {
+                        id: string;
+                        /** @default null */
+                        span?: {
+                            /** Format: uint32 */
+                            start: number;
+                            /** Format: uint32 */
+                            end: number;
+                        } | null;
+                    }[];
+                }[];
+            }[] | null;
             id: string;
             assertion: {
                 id: string;

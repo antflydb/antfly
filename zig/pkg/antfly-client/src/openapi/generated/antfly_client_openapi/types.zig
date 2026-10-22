@@ -33779,6 +33779,7 @@ pub const MemoryEntityProposalInputs = struct {
     verdict_actor: ?[]const u8 = null,
     config_generation: u64,
     entities: []const std.json.Value,
+    views: OpenApiOptionalNullable([]const std.json.Value) = .absent,
     evidence: []const std.json.Value,
     verdict_revision: OpenApiOptionalNullable(u64) = .absent,
     model: OpenApiOptionalNullable(std.json.Value) = .absent,
@@ -33792,6 +33793,7 @@ pub const MemoryEntityProposalInputs = struct {
         .{ "verdict_actor", "verdict_actor", true },
         .{ "config_generation", "config_generation", false },
         .{ "entities", "entities", false },
+        .{ "views", "views", false },
         .{ "evidence", "evidence", false },
         .{ "verdict_revision", "verdict_revision", false },
         .{ "model", "model", false },
@@ -33836,6 +33838,17 @@ pub const MemoryEntityProposalInputs = struct {
         try jw.write(self.config_generation);
         try jw.objectField("entities");
         try jw.write(self.entities);
+        switch (self.views) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("views");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("views");
+                try jw.write(value);
+            },
+        }
         try jw.objectField("evidence");
         try jw.write(self.evidence);
         switch (self.verdict_revision) {
@@ -33901,6 +33914,7 @@ pub const MemoryEntityProposalPage = struct {
 };
 
 pub const MemoryEntityProposalRequest = struct {
+    views: ?[]const std.json.Value = null,
     action: []const u8,
     from: []const u8,
     to: OpenApiOptionalNullable([]const u8) = .absent,
@@ -33913,6 +33927,7 @@ pub const MemoryEntityProposalRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "views", "views", true },
         .{ "action", "action", false },
         .{ "from", "from", false },
         .{ "to", "to", false },
@@ -33934,6 +33949,10 @@ pub const MemoryEntityProposalRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.views) |value| {
+            try jw.objectField("views");
+            try jw.write(value);
+        }
         try jw.objectField("action");
         try jw.write(self.action);
         try jw.objectField("from");
@@ -34023,6 +34042,7 @@ pub const MemoryEntityRecord = struct {
 };
 
 pub const MemoryEntityVerdict = struct {
+    views: ?[]const std.json.Value = null,
     expected_revision: u64,
     accept: OpenApiOptionalNullable(bool) = .absent,
     pin_distinct: ?bool = null,
@@ -34033,6 +34053,7 @@ pub const MemoryEntityVerdict = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "views", "views", true },
         .{ "expected_revision", "expected_revision", false },
         .{ "accept", "accept", false },
         .{ "pin_distinct", "pin_distinct", true },
@@ -34052,6 +34073,10 @@ pub const MemoryEntityVerdict = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.views) |value| {
+            try jw.objectField("views");
+            try jw.write(value);
+        }
         try jw.objectField("expected_revision");
         try jw.write(self.expected_revision);
         switch (self.accept) {
@@ -35380,6 +35405,7 @@ pub const MemoryRecordPage = struct {
 };
 
 pub const MemoryRelationshipProposal = struct {
+    views: OpenApiOptionalNullable([]const std.json.Value) = .absent,
     id: []const u8,
     assertion: std.json.Value,
     owner: []const u8,
@@ -35397,6 +35423,7 @@ pub const MemoryRelationshipProposal = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "views", "views", false },
         .{ "id", "id", false },
         .{ "assertion", "assertion", false },
         .{ "owner", "owner", false },
@@ -35423,6 +35450,17 @@ pub const MemoryRelationshipProposal = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        switch (self.views) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("views");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("views");
+                try jw.write(value);
+            },
+        }
         try jw.objectField("id");
         try jw.write(self.id);
         try jw.objectField("assertion");
@@ -35484,6 +35522,7 @@ pub const MemoryRelationshipProposal = struct {
 };
 
 pub const MemoryRelationshipProposalRequest = struct {
+    views: ?[]const std.json.Value = null,
     id: []const u8,
     expected_revision: u64,
     assertion: std.json.Value,
@@ -35491,6 +35530,7 @@ pub const MemoryRelationshipProposalRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "views", "views", true },
         .{ "id", "id", false },
         .{ "expected_revision", "expected_revision", false },
         .{ "assertion", "assertion", false },
@@ -35507,6 +35547,10 @@ pub const MemoryRelationshipProposalRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.views) |value| {
+            try jw.objectField("views");
+            try jw.write(value);
+        }
         try jw.objectField("id");
         try jw.write(self.id);
         try jw.objectField("expected_revision");

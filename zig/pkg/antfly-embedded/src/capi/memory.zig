@@ -26,6 +26,10 @@ pub const Request = struct {
     body: std.json.Value = .{ .object = .empty },
 };
 
+fn clockMs() i64 {
+    return @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+}
+
 const ResourceReader = struct {
     // The guard is rebound when inference resumes; a captured Handle can be
     // retired and freed by another connection while the lease is released.
@@ -69,7 +73,7 @@ pub fn execute(guard: *@import("db.zig").HandleGuard, handle_ptr: ?*anyopaque, a
     if (memory.mutates(request.action) and !h.liteOpenModeCanWrite(handle.open_mode)) return error.SqlReadOnlyTransaction;
     if (request.action == .create) try tables.create(handle.parent_handle orelse handle, table, "{}", true);
     const database = try tables.get(handle.parent_handle orelse handle, table);
-    const context: memory.Context = .{ .table_id = database.core.identity_namespace.table_id, .space = space, .principal = request.principal, .admin = true, .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) };
+    const context: memory.Context = .{ .table_id = database.core.identity_namespace.table_id, .space = space, .principal = request.principal, .admin = true, .clock_ms_fn = clockMs, .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) };
     var resources: ResourceReader = .{ .guard = guard };
     var adapter: engine.Native(h.db_mod.DB) = .{ .db = database, .context = context, .resource_ptr = &resources, .resource_fn = ResourceReader.read };
     // Provider lifetime is independent of the storage generation. Retain it

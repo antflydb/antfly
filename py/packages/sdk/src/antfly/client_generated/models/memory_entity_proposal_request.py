@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.memory_entity_proposal_request_evidence_item import MemoryEntityProposalRequestEvidenceItem
+    from ..models.memory_entity_proposal_request_views_item import MemoryEntityProposalRequestViewsItem
 
 
 T = TypeVar("T", bound="MemoryEntityProposalRequest")
@@ -23,6 +24,7 @@ class MemoryEntityProposalRequest:
         action (MemoryEntityProposalRequestAction):
         from_ (str):
         expected_revision (int):
+        views (list[MemoryEntityProposalRequestViewsItem] | Unset):
         to (None | str | Unset):
         replace (bool | Unset):  Default: False.
         pin_distinct (bool | Unset):  Default: False.
@@ -34,6 +36,7 @@ class MemoryEntityProposalRequest:
     action: MemoryEntityProposalRequestAction
     from_: str
     expected_revision: int
+    views: list[MemoryEntityProposalRequestViewsItem] | Unset = UNSET
     to: None | str | Unset = UNSET
     replace: bool | Unset = False
     pin_distinct: bool | Unset = False
@@ -47,6 +50,13 @@ class MemoryEntityProposalRequest:
         from_ = self.from_
 
         expected_revision = self.expected_revision
+
+        views: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.views, Unset):
+            views = []
+            for views_item_data in self.views:
+                views_item = views_item_data.to_dict()
+                views.append(views_item)
 
         to: None | str | Unset
         if isinstance(self.to, Unset):
@@ -80,6 +90,8 @@ class MemoryEntityProposalRequest:
                 "expected_revision": expected_revision,
             }
         )
+        if views is not UNSET:
+            field_dict["views"] = views
         if to is not UNSET:
             field_dict["to"] = to
         if replace is not UNSET:
@@ -98,6 +110,7 @@ class MemoryEntityProposalRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.memory_entity_proposal_request_evidence_item import MemoryEntityProposalRequestEvidenceItem
+        from ..models.memory_entity_proposal_request_views_item import MemoryEntityProposalRequestViewsItem
 
         d = dict(src_dict)
         action = MemoryEntityProposalRequestAction(d.pop("action"))
@@ -105,6 +118,15 @@ class MemoryEntityProposalRequest:
         from_ = d.pop("from")
 
         expected_revision = d.pop("expected_revision")
+
+        _views = d.pop("views", UNSET)
+        views: list[MemoryEntityProposalRequestViewsItem] | Unset = UNSET
+        if _views is not UNSET:
+            views = []
+            for views_item_data in _views:
+                views_item = MemoryEntityProposalRequestViewsItem.from_dict(views_item_data)
+
+                views.append(views_item)
 
         def _parse_to(data: object) -> None | str | Unset:
             if data is None:
@@ -141,6 +163,7 @@ class MemoryEntityProposalRequest:
             action=action,
             from_=from_,
             expected_revision=expected_revision,
+            views=views,
             to=to,
             replace=replace,
             pin_distinct=pin_distinct,

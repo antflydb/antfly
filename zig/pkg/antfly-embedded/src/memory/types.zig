@@ -419,6 +419,10 @@ pub const EntityCandidatePage = struct {
 // The resolver owns queue mechanics and their wire shape. Memory adds the
 // versioned causal inputs and read envelope, without a second queue model.
 pub const EntityProposal = @import("antfly_resolver").curation.Proposal;
+/// Expected descriptions supplied by a judge; omitted expectations are captured
+/// by the service at proposal admission, never reconstructed at verdict time.
+pub const EntityViewPin = struct { id: []const u8, fingerprint: []const u8 };
+pub const EntityViewInput = struct { id: []const u8, canonical_id: ?[]const u8, fingerprint: []const u8, dependencies: []const DerivedDependency };
 pub const EntityProposalInputs = struct {
     revision: u64 = 0,
     operation: ?provenance.Resource = null,
@@ -427,6 +431,7 @@ pub const EntityProposalInputs = struct {
     verdict_actor: []const u8 = "",
     config_generation: u64,
     entities: []const struct { id: []const u8, revision: u64 },
+    views: ?[]const EntityViewInput = null,
     evidence: []const EvidenceRef,
     verdict_revision: ?u64 = null,
     model: ?Model = null,
@@ -434,6 +439,7 @@ pub const EntityProposalInputs = struct {
 pub const EntityProposalPage = struct { items: []const EntityProposal, next_cursor: ?[]const u8, complete: bool, revision: u64 };
 pub const EntityProposalDetail = struct { proposal: EntityProposal, inputs: EntityProposalInputs, reason: ?[]const u8, stale_configuration: bool, revision: u64 };
 pub const EntityProposalRequest = struct {
+    views: []const EntityViewPin = &.{},
     action: enum { merge, unmerge, suppress, unsuppress, distinct },
     from: []const u8,
     to: ?[]const u8 = null,
@@ -445,6 +451,7 @@ pub const EntityProposalRequest = struct {
     evidence: []const EvidenceRef = &.{},
 };
 pub const EntityVerdict = struct {
+    views: []const EntityViewPin = &.{},
     expected_revision: u64,
     /// null keeps the proposal open for another reviewer.
     accept: ?bool = null,
@@ -488,8 +495,9 @@ pub const GraphRecall = struct {
 };
 pub const GraphRecallStatus = struct { nodes: usize, edges: usize, iterations: u8, complete: bool, omitted: usize, algorithm: []const u8 = "personalized_pagerank" };
 
-pub const RelationshipProposalRequest = struct { id: []const u8, expected_revision: u64, assertion: Assertion, actor: []const u8 = "" };
+pub const RelationshipProposalRequest = struct { views: []const EntityViewPin = &.{}, id: []const u8, expected_revision: u64, assertion: Assertion, actor: []const u8 = "" };
 pub const RelationshipProposal = struct {
+    views: ?[]const EntityViewInput = null,
     id: []const u8,
     assertion: Assertion,
     owner: []const u8,

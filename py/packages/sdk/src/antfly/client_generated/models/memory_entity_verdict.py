@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.memory_entity_verdict_evidence_item import MemoryEntityVerdictEvidenceItem
     from ..models.memory_entity_verdict_model_type_0 import MemoryEntityVerdictModelType0
+    from ..models.memory_entity_verdict_views_item import MemoryEntityVerdictViewsItem
 
 
 T = TypeVar("T", bound="MemoryEntityVerdict")
@@ -20,6 +21,7 @@ class MemoryEntityVerdict:
     """
     Attributes:
         expected_revision (int):
+        views (list[MemoryEntityVerdictViewsItem] | Unset):
         accept (bool | None | Unset):
         pin_distinct (bool | Unset):  Default: False.
         actor (str | Unset):
@@ -29,6 +31,7 @@ class MemoryEntityVerdict:
     """
 
     expected_revision: int
+    views: list[MemoryEntityVerdictViewsItem] | Unset = UNSET
     accept: bool | None | Unset = UNSET
     pin_distinct: bool | Unset = False
     actor: str | Unset = UNSET
@@ -40,6 +43,13 @@ class MemoryEntityVerdict:
         from ..models.memory_entity_verdict_model_type_0 import MemoryEntityVerdictModelType0
 
         expected_revision = self.expected_revision
+
+        views: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.views, Unset):
+            views = []
+            for views_item_data in self.views:
+                views_item = views_item_data.to_dict()
+                views.append(views_item)
 
         accept: bool | None | Unset
         if isinstance(self.accept, Unset):
@@ -75,6 +85,8 @@ class MemoryEntityVerdict:
                 "expected_revision": expected_revision,
             }
         )
+        if views is not UNSET:
+            field_dict["views"] = views
         if accept is not UNSET:
             field_dict["accept"] = accept
         if pin_distinct is not UNSET:
@@ -94,9 +106,19 @@ class MemoryEntityVerdict:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.memory_entity_verdict_evidence_item import MemoryEntityVerdictEvidenceItem
         from ..models.memory_entity_verdict_model_type_0 import MemoryEntityVerdictModelType0
+        from ..models.memory_entity_verdict_views_item import MemoryEntityVerdictViewsItem
 
         d = dict(src_dict)
         expected_revision = d.pop("expected_revision")
+
+        _views = d.pop("views", UNSET)
+        views: list[MemoryEntityVerdictViewsItem] | Unset = UNSET
+        if _views is not UNSET:
+            views = []
+            for views_item_data in _views:
+                views_item = MemoryEntityVerdictViewsItem.from_dict(views_item_data)
+
+                views.append(views_item)
 
         def _parse_accept(data: object) -> bool | None | Unset:
             if data is None:
@@ -141,6 +163,7 @@ class MemoryEntityVerdict:
 
         memory_entity_verdict = cls(
             expected_revision=expected_revision,
+            views=views,
             accept=accept,
             pin_distinct=pin_distinct,
             actor=actor,

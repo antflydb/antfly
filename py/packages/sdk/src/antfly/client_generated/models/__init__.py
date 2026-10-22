@@ -1227,6 +1227,22 @@ from .memory_entity_proposal_inputs_evidence_item_span_type_0 import MemoryEntit
 from .memory_entity_proposal_inputs_model_type_0 import MemoryEntityProposalInputsModelType0
 from .memory_entity_proposal_inputs_operation_type_0 import MemoryEntityProposalInputsOperationType0
 from .memory_entity_proposal_inputs_operation_type_0_kind import MemoryEntityProposalInputsOperationType0Kind
+from .memory_entity_proposal_inputs_views_type_0_item import MemoryEntityProposalInputsViewsType0Item
+from .memory_entity_proposal_inputs_views_type_0_item_dependencies_item import (
+    MemoryEntityProposalInputsViewsType0ItemDependenciesItem,
+)
+from .memory_entity_proposal_inputs_views_type_0_item_dependencies_item_evidence_item import (
+    MemoryEntityProposalInputsViewsType0ItemDependenciesItemEvidenceItem,
+)
+from .memory_entity_proposal_inputs_views_type_0_item_dependencies_item_evidence_item_span_type_0 import (
+    MemoryEntityProposalInputsViewsType0ItemDependenciesItemEvidenceItemSpanType0,
+)
+from .memory_entity_proposal_inputs_views_type_0_item_dependencies_item_resource import (
+    MemoryEntityProposalInputsViewsType0ItemDependenciesItemResource,
+)
+from .memory_entity_proposal_inputs_views_type_0_item_dependencies_item_resource_kind import (
+    MemoryEntityProposalInputsViewsType0ItemDependenciesItemResourceKind,
+)
 from .memory_entity_proposal_options import MemoryEntityProposalOptions
 from .memory_entity_proposal_options_absorbed import MemoryEntityProposalOptionsAbsorbed
 from .memory_entity_proposal_origin import MemoryEntityProposalOrigin
@@ -1237,12 +1253,14 @@ from .memory_entity_proposal_request_absorbed import MemoryEntityProposalRequest
 from .memory_entity_proposal_request_action import MemoryEntityProposalRequestAction
 from .memory_entity_proposal_request_evidence_item import MemoryEntityProposalRequestEvidenceItem
 from .memory_entity_proposal_request_evidence_item_span_type_0 import MemoryEntityProposalRequestEvidenceItemSpanType0
+from .memory_entity_proposal_request_views_item import MemoryEntityProposalRequestViewsItem
 from .memory_entity_proposal_state import MemoryEntityProposalState
 from .memory_entity_record import MemoryEntityRecord
 from .memory_entity_verdict import MemoryEntityVerdict
 from .memory_entity_verdict_evidence_item import MemoryEntityVerdictEvidenceItem
 from .memory_entity_verdict_evidence_item_span_type_0 import MemoryEntityVerdictEvidenceItemSpanType0
 from .memory_entity_verdict_model_type_0 import MemoryEntityVerdictModelType0
+from .memory_entity_verdict_views_item import MemoryEntityVerdictViewsItem
 from .memory_entity_view import MemoryEntityView
 from .memory_entity_view_dependencies_item import MemoryEntityViewDependenciesItem
 from .memory_entity_view_dependencies_item_evidence_item import MemoryEntityViewDependenciesItemEvidenceItem
@@ -1626,10 +1644,27 @@ from .memory_relationship_proposal_request_assertion_support_sets_item_evidence_
 from .memory_relationship_proposal_request_assertion_visibility import (
     MemoryRelationshipProposalRequestAssertionVisibility,
 )
+from .memory_relationship_proposal_request_views_item import MemoryRelationshipProposalRequestViewsItem
 from .memory_relationship_proposal_state import MemoryRelationshipProposalState
 from .memory_relationship_proposal_verdict_evidence_item import MemoryRelationshipProposalVerdictEvidenceItem
 from .memory_relationship_proposal_verdict_evidence_item_span_type_0 import (
     MemoryRelationshipProposalVerdictEvidenceItemSpanType0,
+)
+from .memory_relationship_proposal_views_type_0_item import MemoryRelationshipProposalViewsType0Item
+from .memory_relationship_proposal_views_type_0_item_dependencies_item import (
+    MemoryRelationshipProposalViewsType0ItemDependenciesItem,
+)
+from .memory_relationship_proposal_views_type_0_item_dependencies_item_evidence_item import (
+    MemoryRelationshipProposalViewsType0ItemDependenciesItemEvidenceItem,
+)
+from .memory_relationship_proposal_views_type_0_item_dependencies_item_evidence_item_span_type_0 import (
+    MemoryRelationshipProposalViewsType0ItemDependenciesItemEvidenceItemSpanType0,
+)
+from .memory_relationship_proposal_views_type_0_item_dependencies_item_resource import (
+    MemoryRelationshipProposalViewsType0ItemDependenciesItemResource,
+)
+from .memory_relationship_proposal_views_type_0_item_dependencies_item_resource_kind import (
+    MemoryRelationshipProposalViewsType0ItemDependenciesItemResourceKind,
 )
 from .memory_result import MemoryResult
 from .memory_space_config import MemorySpaceConfig
@@ -3448,6 +3483,12 @@ __all__ = (
     "MemoryEntityProposalInputsModelType0",
     "MemoryEntityProposalInputsOperationType0",
     "MemoryEntityProposalInputsOperationType0Kind",
+    "MemoryEntityProposalInputsViewsType0Item",
+    "MemoryEntityProposalInputsViewsType0ItemDependenciesItem",
+    "MemoryEntityProposalInputsViewsType0ItemDependenciesItemEvidenceItem",
+    "MemoryEntityProposalInputsViewsType0ItemDependenciesItemEvidenceItemSpanType0",
+    "MemoryEntityProposalInputsViewsType0ItemDependenciesItemResource",
+    "MemoryEntityProposalInputsViewsType0ItemDependenciesItemResourceKind",
     "MemoryEntityProposalOptions",
     "MemoryEntityProposalOptionsAbsorbed",
     "MemoryEntityProposalOrigin",
@@ -3458,12 +3499,14 @@ __all__ = (
     "MemoryEntityProposalRequestAction",
     "MemoryEntityProposalRequestEvidenceItem",
     "MemoryEntityProposalRequestEvidenceItemSpanType0",
+    "MemoryEntityProposalRequestViewsItem",
     "MemoryEntityProposalState",
     "MemoryEntityRecord",
     "MemoryEntityVerdict",
     "MemoryEntityVerdictEvidenceItem",
     "MemoryEntityVerdictEvidenceItemSpanType0",
     "MemoryEntityVerdictModelType0",
+    "MemoryEntityVerdictViewsItem",
     "MemoryEntityView",
     "MemoryEntityViewDependenciesItem",
     "MemoryEntityViewDependenciesItemEvidenceItem",
@@ -3687,9 +3730,16 @@ __all__ = (
     "MemoryRelationshipProposalRequestAssertionSupportSetsItemEvidenceItem",
     "MemoryRelationshipProposalRequestAssertionSupportSetsItemEvidenceItemSpanType0",
     "MemoryRelationshipProposalRequestAssertionVisibility",
+    "MemoryRelationshipProposalRequestViewsItem",
     "MemoryRelationshipProposalState",
     "MemoryRelationshipProposalVerdictEvidenceItem",
     "MemoryRelationshipProposalVerdictEvidenceItemSpanType0",
+    "MemoryRelationshipProposalViewsType0Item",
+    "MemoryRelationshipProposalViewsType0ItemDependenciesItem",
+    "MemoryRelationshipProposalViewsType0ItemDependenciesItemEvidenceItem",
+    "MemoryRelationshipProposalViewsType0ItemDependenciesItemEvidenceItemSpanType0",
+    "MemoryRelationshipProposalViewsType0ItemDependenciesItemResource",
+    "MemoryRelationshipProposalViewsType0ItemDependenciesItemResourceKind",
     "MemoryResult",
     "MemorySpaceConfig",
     "MemorySpaceConfigFeatures",

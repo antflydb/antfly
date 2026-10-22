@@ -53291,6 +53291,121 @@ components:
               - id
               - revision
             additionalProperties: false
+        views:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              canonical_id:
+                type: string
+                nullable: true
+                x-go-type-skip-optional-pointer: false
+              fingerprint:
+                type: string
+              dependencies:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    resource:
+                      type: object
+                      properties:
+                        database:
+                          type: string
+                        namespace:
+                          type: string
+                        table:
+                          type: string
+                        table_id:
+                          type: integer
+                          minimum: 1
+                          maximum: 18446744073709551615
+                          format: uint64
+                          x-go-type: uint64
+                        storage_name:
+                          type: string
+                          default: null
+                          nullable: true
+                          x-go-type-skip-optional-pointer: false
+                        kind:
+                          type: string
+                          enum:
+                            - table
+                            - record
+                            - relationship
+                            - trace
+                            - evidence
+                            - assertion
+                            - entity
+                            - outcome
+                            - decision
+                            - operation
+                            - configuration
+                        id:
+                          type: string
+                        revision:
+                          type: integer
+                          minimum: 1
+                          maximum: 18446744073709551615
+                          format: uint64
+                          x-go-type: uint64
+                        digest:
+                          type: string
+                          default: null
+                          nullable: true
+                          x-go-type-skip-optional-pointer: false
+                      required:
+                        - table
+                        - table_id
+                        - kind
+                        - id
+                        - revision
+                      additionalProperties: false
+                    evidence:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          span:
+                            type: object
+                            properties:
+                              start:
+                                type: integer
+                                minimum: 0
+                                maximum: 4294967295
+                                format: uint32
+                                x-go-type: uint32
+                              end:
+                                type: integer
+                                minimum: 0
+                                maximum: 4294967295
+                                format: uint32
+                                x-go-type: uint32
+                            required:
+                              - start
+                              - end
+                            additionalProperties: false
+                            default: null
+                            nullable: true
+                        required:
+                          - id
+                        additionalProperties: false
+                  required:
+                    - resource
+                    - evidence
+                  additionalProperties: false
+            required:
+              - id
+              - canonical_id
+              - fingerprint
+              - dependencies
+            additionalProperties: false
+          default: null
+          nullable: true
         evidence:
           type: array
           items:
@@ -53416,6 +53531,19 @@ components:
     MemoryEntityProposalRequest:
       type: object
       properties:
+        views:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              fingerprint:
+                type: string
+            required:
+              - id
+              - fingerprint
+            additionalProperties: false
         action:
           type: string
           enum:
@@ -53494,6 +53622,19 @@ components:
     MemoryEntityVerdict:
       type: object
       properties:
+        views:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              fingerprint:
+                type: string
+            required:
+              - id
+              - fingerprint
+            additionalProperties: false
         expected_revision:
           type: integer
           minimum: 0
@@ -54371,6 +54512,19 @@ components:
     MemoryRelationshipProposalRequest:
       type: object
       properties:
+        views:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              fingerprint:
+                type: string
+            required:
+              - id
+              - fingerprint
+            additionalProperties: false
         id:
           type: string
         expected_revision:
@@ -54631,6 +54785,121 @@ components:
     MemoryRelationshipProposal:
       type: object
       properties:
+        views:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              canonical_id:
+                type: string
+                nullable: true
+                x-go-type-skip-optional-pointer: false
+              fingerprint:
+                type: string
+              dependencies:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    resource:
+                      type: object
+                      properties:
+                        database:
+                          type: string
+                        namespace:
+                          type: string
+                        table:
+                          type: string
+                        table_id:
+                          type: integer
+                          minimum: 1
+                          maximum: 18446744073709551615
+                          format: uint64
+                          x-go-type: uint64
+                        storage_name:
+                          type: string
+                          default: null
+                          nullable: true
+                          x-go-type-skip-optional-pointer: false
+                        kind:
+                          type: string
+                          enum:
+                            - table
+                            - record
+                            - relationship
+                            - trace
+                            - evidence
+                            - assertion
+                            - entity
+                            - outcome
+                            - decision
+                            - operation
+                            - configuration
+                        id:
+                          type: string
+                        revision:
+                          type: integer
+                          minimum: 1
+                          maximum: 18446744073709551615
+                          format: uint64
+                          x-go-type: uint64
+                        digest:
+                          type: string
+                          default: null
+                          nullable: true
+                          x-go-type-skip-optional-pointer: false
+                      required:
+                        - table
+                        - table_id
+                        - kind
+                        - id
+                        - revision
+                      additionalProperties: false
+                    evidence:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          span:
+                            type: object
+                            properties:
+                              start:
+                                type: integer
+                                minimum: 0
+                                maximum: 4294967295
+                                format: uint32
+                                x-go-type: uint32
+                              end:
+                                type: integer
+                                minimum: 0
+                                maximum: 4294967295
+                                format: uint32
+                                x-go-type: uint32
+                            required:
+                              - start
+                              - end
+                            additionalProperties: false
+                            default: null
+                            nullable: true
+                        required:
+                          - id
+                        additionalProperties: false
+                  required:
+                    - resource
+                    - evidence
+                  additionalProperties: false
+            required:
+              - id
+              - canonical_id
+              - fingerprint
+              - dependencies
+            additionalProperties: false
+          default: null
+          nullable: true
         id:
           type: string
         assertion:
