@@ -3451,7 +3451,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "owner-close-preflight-tests",
         .root_module = owner_preflight_context_root,
         .filters = &.{"controlled owner close preflight C entry"},
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("owner-close-preflight-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024),
     });
     b.step("antfly-owner-close-preflight-test", "Exercise controlled close preflight with a real DB and original cleanup capsule")
         .dependOn(&b.addRunArtifact(owner_close_preflight_tests).step);
@@ -4191,7 +4191,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const maintenance_shutdown_admission_tests = b.addTest(.{
         .name = "maintenance-shutdown-admission-tests",
         .root_module = maintenance_shutdown_admission_root,
-        .filters = &.{ "independent maintenance", "maintenance scheduler", "maintenance runtime", "graph cleanup owner", "quarantine recovery", "external lake native warming" },
+        .filters = &.{ "independent maintenance", "maintenance scheduler", "maintenance runtime", "graph cleanup owner", "quarantine recovery", "external lake native warming", "publication recovery registration" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-maintenance-shutdown-admission-test", "Verify recurring maintenance stops admitting stages and physically joins current callbacks")

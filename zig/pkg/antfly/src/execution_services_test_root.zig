@@ -807,3 +807,60 @@ test "execution services archive boundary readiness cancellation retains a remot
     live = false;
     try std.testing.expectEqual(@as(usize, 0), (try client.maintenanceStats()).?.owned_registrations);
 }
+
+test "execution services archive boundary durable quiescence retains its owner after original reentry failure" {
+    var fixture: Fixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var client = try services.Client.open(&fixture.offer);
+    defer client.close() catch @panic("scope close");
+    const lane = try client.durableJobs();
+    const owner = try client.allocOwnerId();
+    const F = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        retired: std.atomic.Value(bool) = .init(false),
+        begins: usize = 0,
+        ends: usize = 0,
+        fn run(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+        fn deinit(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retired.store(true, .release);
+        }
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            self.release.store(true, .release);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            return error.Canceled;
+        }
+    };
+    var f: F = .{};
+    defer {
+        f.release.store(true, .release);
+        lane.closeOwner(owner);
+    }
+    try lane.submit(.{ .owner_id = owner, .class = .maintenance, .ptr = &f, .run = F.run, .deinit = F.deinit });
+    try yieldUntil(&f.entered);
+    try std.testing.expect(!try lane.quiesceOwner(owner));
+    const admission = local.common_read_admission;
+    var payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.begin, .end = F.end } };
+    try std.testing.expectError(error.Canceled, lane.quiesceOwnerWithAdmission(owner, .init(&payload)));
+    try std.testing.expect(f.retired.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), f.begins);
+    try std.testing.expectEqual(@as(usize, 1), f.ends);
+    try std.testing.expect(try lane.quiesceOwner(owner));
+    try std.testing.expectError(error.BackgroundOwnerIdExhausted, lane.reopenOwner(owner));
+    try std.testing.expectError(error.BackgroundOwnerClosing, lane.submit(.{ .owner_id = owner, .class = .maintenance, .ptr = &f, .run = F.run, .deinit = F.deinit }));
+}

@@ -636,7 +636,7 @@ pub const DbOpenConfigurator = struct {
 };
 
 pub const DurableJobLane = struct {
-    const NativeCallbacks = struct { submit: @FieldType(DurableJobLane.VTable, "submit"), pause_owner: @FieldType(DurableJobLane.VTable, "pause_owner"), resume_owner: @FieldType(DurableJobLane.VTable, "resume_owner"), reopen_owner: @FieldType(DurableJobLane.VTable, "reopen_owner"), poll: @FieldType(DurableJobLane.VTable, "poll") };
+    const NativeCallbacks = struct { wait_owner: @FieldType(DurableJobLane.VTable, "wait_owner"), quiesce_owner: @FieldType(DurableJobLane.VTable, "quiesce_owner"), submit: @FieldType(DurableJobLane.VTable, "submit"), pause_owner: @FieldType(DurableJobLane.VTable, "pause_owner"), resume_owner: @FieldType(DurableJobLane.VTable, "resume_owner"), reopen_owner: @FieldType(DurableJobLane.VTable, "reopen_owner"), poll: @FieldType(DurableJobLane.VTable, "poll") };
     const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);
     callback_dispatch: @import("named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
 
@@ -647,8 +647,14 @@ pub const DurableJobLane = struct {
         return error.BackgroundOwnerLifecycleUnsupported;
     }
 
+    fn quiesceUnsupported(_: *anyopaque, _: u64) anyerror!bool {
+        return error.BackgroundOwnerLifecycleUnsupported;
+    }
+
     pub const VTable = struct {
         submit: *const fn (ptr: *anyopaque, job: Job) anyerror!void,
+        quiesce_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!bool = quiesceUnsupported,
+        wait_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!bool = quiesceUnsupported,
         drain_owner: *const fn (ptr: *anyopaque, owner_id: u64) void,
         close_owner: *const fn (ptr: *anyopaque, owner_id: u64) void,
         pause_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!void = lifecycleUnsupported,
@@ -667,6 +673,48 @@ pub const DurableJobLane = struct {
 
     pub fn drainOwner(self: DurableJobLane, owner_id: u64) void {
         self.vtable.drain_owner(self.ptr, owner_id);
+    }
+
+    /// Fence new jobs/probes and report completion of all accepted callbacks
+    /// and payload destruction. Keep the registry generation until closeOwner.
+    /// This observation never joins a future, runs work or destroys metadata.
+    pub fn quiesceOwner(self: DurableJobLane, owner_id: u64) !bool {
+        return NativeBoundary.call("quiesce_owner", self.callback_dispatch, self.vtable.quiesce_owner, .{ self.ptr, owner_id });
+    }
+
+    /// One notification wait of at most 1 ms. The owner must already be
+    /// fenced, and callers must lend execution before entering this wait.
+    pub fn waitOwner(self: DurableJobLane, owner_id: u64) !bool {
+        return NativeBoundary.call("wait_owner", self.callback_dispatch, self.vtable.wait_owner, .{ self.ptr, owner_id });
+    }
+
+    pub fn quiesceOwnerWithAdmission(self: DurableJobLane, owner_id: u64, original: @import("../common/read_admission.zig").Port) !void {
+        var trace: @import("../common/read_admission.zig").RejectionTrace = .{};
+        const control = trace.bind(original).?;
+        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        while (true) {
+            try control.checkpoint();
+            if (try self.quiesceOwner(owner_id)) return;
+            try boundary.beginWait();
+            var failure: ?anyerror = null;
+            while (true) {
+                control.checkLifetime() catch |cause| {
+                    failure = trace.failure orelse cause;
+                    break;
+                };
+                const ready = self.waitOwner(owner_id) catch |cause| {
+                    failure = cause;
+                    break;
+                };
+                if (ready) break;
+            }
+            boundary.endWait() catch |cause| {
+                if (failure) |first| return first;
+                return trace.failure orelse cause;
+            };
+            if (failure) |cause| return cause;
+        }
     }
 
     pub fn closeOwner(self: DurableJobLane, owner_id: u64) void {
@@ -1078,6 +1126,34 @@ const OwnerRegistry = struct {
         state.maintenance_probe = null;
         if (state.maintenance_probe_enqueued) self.unlinkMaintenanceProbeLocked(owner_id, state);
         return true;
+    }
+
+    fn quiesce(self: *OwnerRegistry, owner_id: u64) bool {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        const state = self.states.getPtr(owner_id) orelse return true;
+        state.closing = true;
+        state.maintenance_probe = null;
+        if (state.maintenance_probe_enqueued) self.unlinkMaintenanceProbeLocked(owner_id, state);
+        return state.in_flight == 0;
+    }
+
+    fn waitIdleSlice(self: *OwnerRegistry, owner_id: u64) !bool {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        const state = self.states.getPtr(owner_id) orelse return true;
+        if (!state.closing) return error.BackgroundOwnerLifecycleUnsupported;
+        if (state.in_flight == 0) return true;
+        self.idle.waitTimeout(self.sync_io, &self.mutex, .{
+            .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake },
+        }) catch |cause| switch (cause) {
+            error.Timeout => {},
+            else => return cause,
+        };
+        // Waiting releases the mutex; never retain the old hash-map pointer.
+        const current = self.states.getPtr(owner_id) orelse return true;
+        if (!current.closing) return error.BackgroundOwnerLifecycleUnsupported;
+        return current.in_flight == 0;
     }
 
     fn waitIdle(self: *OwnerRegistry, owner_id: u64) void {
@@ -2645,6 +2721,16 @@ const InlineDurableJobLane = struct {
         job.deinit(job.ptr);
     }
 
+    fn waitOwner(ptr: *anyopaque, owner_id: u64) !bool {
+        const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        return owners.waitIdleSlice(owner_id);
+    }
+
+    fn quiesceOwner(ptr: *anyopaque, owner_id: u64) !bool {
+        const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        return owners.quiesce(owner_id);
+    }
+
     fn drainOwner(ptr: *anyopaque, owner_id: u64) void {
         const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
         owners.waitIdle(owner_id);
@@ -2678,6 +2764,8 @@ const InlineDurableJobLane = struct {
 
 const inline_vtable = DurableJobLane.VTable{
     .submit = InlineDurableJobLane.submit,
+    .wait_owner = InlineDurableJobLane.waitOwner,
+    .quiesce_owner = InlineDurableJobLane.quiesceOwner,
     .drain_owner = InlineDurableJobLane.drainOwner,
     .close_owner = InlineDurableJobLane.closeOwner,
     .pause_owner = InlineDurableJobLane.pauseOwner,
@@ -2706,6 +2794,14 @@ const UnsupportedDurableJobLane = struct {
     pub fn deinit(_: *ThreadedDurableJobLane) void {}
 
     fn submit(_: *anyopaque, _: Job) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    fn waitOwner(_: *anyopaque, _: u64) !bool {
+        return error.UnsupportedPlatform;
+    }
+
+    fn quiesceOwner(_: *anyopaque, _: u64) !bool {
         return error.UnsupportedPlatform;
     }
 
@@ -2850,6 +2946,16 @@ const NativeDurableJobLane = struct {
         try self.entries.ensureUnusedCapacity(self.alloc, 1);
         entry.future = try self.io_impl.io().concurrent(runEntry, .{entry});
         self.entries.appendAssumeCapacity(entry);
+    }
+
+    fn waitOwner(ptr: *anyopaque, owner_id: u64) !bool {
+        const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        return self.owners.waitIdleSlice(owner_id);
+    }
+
+    fn quiesceOwner(ptr: *anyopaque, owner_id: u64) !bool {
+        const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        return self.owners.quiesce(owner_id);
     }
 
     fn drainOwner(ptr: *anyopaque, owner_id: u64) void {
@@ -3027,6 +3133,8 @@ const NativeDurableJobLane = struct {
 
 const threaded_vtable = DurableJobLane.VTable{
     .submit = ThreadedDurableJobLane.submit,
+    .wait_owner = ThreadedDurableJobLane.waitOwner,
+    .quiesce_owner = ThreadedDurableJobLane.quiesceOwner,
     .drain_owner = ThreadedDurableJobLane.drainOwner,
     .close_owner = ThreadedDurableJobLane.closeOwner,
     .pause_owner = ThreadedDurableJobLane.pauseOwner,
@@ -5274,4 +5382,178 @@ test "backend recovery dispatch runs with ordinary allocation refused and genera
     runtime.durable_jobs.closeOwner(owner);
     try std.testing.expect(work.recovered.load(.acquire) and work.destroyed.load(.acquire));
     try std.testing.expect(!work.release.load(.acquire));
+}
+
+test "maintenance runtime durable owner quiescence retains accepted payload cleanup after original failures" {
+    const admission = @import("../common/read_admission.zig");
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    for (std.enums.values(Job.Class)) |class| for (std.enums.values(Case)) |case| {
+        var runtime = try BackendRuntimeHandle.init(std.testing.allocator, .{});
+        defer runtime.deinit();
+        const lane = runtime.ptr().durable_jobs;
+        const owner = try runtime.ptr().allocOwnerId();
+        defer lane.closeOwner(owner);
+        const io = runtime.ptr().io().?;
+        const F = struct {
+            io: Io,
+            entered: Io.Event = .unset,
+            release: Io.Event = .unset,
+            retired: bool = false,
+            fn run(_: *anyopaque) !void {}
+            fn deinit(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.entered.set(self.io);
+                self.release.waitUncancelable(self.io);
+                self.retired = true;
+            }
+        };
+        const Control = struct {
+            f: *F,
+            case: Case,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case != .lifetime_in_wait) self.f.release.set(self.f.io);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                self.f.release.set(self.f.io);
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        var f: F = .{ .io = io };
+        defer {
+            f.release.set(io);
+            lane.closeOwner(owner);
+        }
+        try lane.submit(.{ .owner_id = owner, .class = class, .ptr = &f, .run = F.run, .deinit = F.deinit });
+        try f.entered.wait(io);
+        try std.testing.expect(!try lane.quiesceOwner(owner));
+        try std.testing.expectError(error.BackgroundOwnerClosing, lane.submit(.{ .owner_id = owner, .class = class, .ptr = &f, .run = F.run, .deinit = F.deinit }));
+        var control: Control = .{ .f = &f, .case = case };
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const result = lane.quiesceOwnerWithAdmission(owner, .init(&payload));
+        if (case == .success) try result else {
+            try std.testing.expectError(switch (case) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .lifetime_in_wait => error.DeadlineExceeded,
+                .success => unreachable,
+            }, result);
+            runtime.ptr().owner_registry.mutex.lockUncancelable(runtime.ptr().owner_registry.sync_io);
+            const retained = runtime.ptr().owner_registry.states.contains(owner);
+            runtime.ptr().owner_registry.mutex.unlock(runtime.ptr().owner_registry.sync_io);
+            try std.testing.expect(retained);
+            f.release.set(io);
+            lane.drainOwner(owner);
+        }
+        try std.testing.expect(try lane.quiesceOwner(owner));
+        try std.testing.expect(f.retired);
+        try std.testing.expectError(error.BackgroundOwnerIdExhausted, lane.reopenOwner(owner));
+        try std.testing.expectEqual(@as(usize, 1), control.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .begin_failure) 0 else 1), control.ends);
+    };
+}
+
+test "maintenance runtime durable owner wait lends the sole ordinary execution slot" {
+    const native = @import("../common/runnable_scheduler.zig");
+    const admission = @import("../common/read_admission.zig");
+    const now = platform.time.monotonicNs;
+    const io = std.testing.io;
+    var cpu = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_wait_ms = 5000 });
+    defer cpu.close();
+    var producer: native.Execution = .{};
+    defer producer.finish();
+    try producer.start(&cpu, .{ .io = io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .background);
+    try producer.park(.resource_blocked);
+    var closer: native.Execution = .{};
+    defer closer.finish();
+    try closer.start(&cpu, .{ .io = io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .query);
+    var health: native.Execution = .{};
+    defer health.finish();
+    try health.start(&cpu, .{ .io = io, .native_now_ns = now }, .control);
+    var runtime = try BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const owner = try runtime.ptr().allocOwnerId();
+    const lane = runtime.ptr().durable_jobs;
+    const F = struct {
+        io: Io,
+        execution: *native.Execution,
+        idle: *Io.Condition,
+        entered: Io.Event = .unset,
+        ran: bool = false,
+        retired: bool = false,
+        fn run(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            defer self.execution.finish();
+            self.entered.set(self.io);
+            try self.execution.enter(.background);
+            const until = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+            // Release the payload only after the closer has actually blocked
+            // on the registry condition, rather than inferring from a sleep.
+            while (self.idle.state.load(.acquire).waiters == 0) {
+                if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+                platform.time.yieldNow();
+            }
+            self.ran = true;
+        }
+        fn deinit(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retired = true;
+        }
+    };
+    const Control = struct {
+        execution: *native.Execution,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.checkLifetime();
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try lifetime(raw);
+            if (self.execution.entry.?.scheduler.?.state(&self.execution.entry.?) != .running) return error.InvalidRunnableTransition;
+        }
+        fn deadline(raw: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.execution.entry.?.options.deadline_ns;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            try self.execution.enter(.query);
+        }
+    };
+    var f: F = .{ .io = io, .execution = &producer, .idle = &runtime.ptr().owner_registry.idle };
+    defer {
+        closer.finish();
+        lane.closeOwner(owner);
+    }
+    try lane.submit(.{ .owner_id = owner, .class = .maintenance, .ptr = &f, .run = F.run, .deinit = F.deinit });
+    try f.entered.wait(io);
+    var control: Control = .{ .execution = &closer };
+    var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    try lane.quiesceOwnerWithAdmission(owner, .init(&payload));
+    try std.testing.expect(f.ran and f.retired);
+    try std.testing.expectEqual(@as(usize, 1), control.begins);
+    try std.testing.expectEqual(@as(usize, 1), control.ends);
+    try std.testing.expectEqual(native.State.running, cpu.state(&closer.entry.?));
+    try std.testing.expectEqual(native.State.running, cpu.state(&health.entry.?));
 }

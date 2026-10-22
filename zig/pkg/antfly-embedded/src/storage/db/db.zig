@@ -6206,6 +6206,7 @@ pub const DB = struct {
         try self.independent_maintenance.stopWithAdmission(self.backend_runtime, original);
         try self.quarantine_recovery.stopWithAdmission(self.backend_runtime, original);
         try self.graph_cleanup_owner.stopWithAdmission(self.backend_runtime.io(), original);
+        try self.publication_recovery.stopWithAdmission(original);
     }
 
     fn stopRetainedPreparations(self: *DB) void {

@@ -23236,3 +23236,56 @@ are in controlled-close-workers-verified.json in the cumulative receipts.
 Embedded boundary (1,035 sources), generated errors, control catalog, formatting
 and whitespace checks pass. These checks do not qualify the remaining shutdown
 phases or full cross-engine execution behavior.
+
+### Durable owner quiescence and publication recovery close
+
+Durable job lanes expose a nonblocking quiescence observation through the checked
+native callback boundary. It fences new submissions and maintenance probes,
+removes unclaimed probes, and reports ready only after accepted jobs, claimed
+probes and payload destruction finish. Accepted recovery successors already in
+the queue still run. The observation retains the owner generation and performs
+no future joins, callback work or metadata destruction. Missing capabilities
+fail closed. After lending execution, the controlled wait blocks on the registry
+completion condition in relative slices of at most 1 ms, rechecking the original
+finite lifetime between slices. It rejoins after every successful park and
+preserves original errors. Direct admission-borrow waits sleep between lifetime
+checks rather than spinning; neither wait runs callbacks while parked.
+
+Serving close applies this to publication recovery's dedicated owner. It first
+fences direct producers, then waits for lane work and remaining direct admission
+borrows. Interrupted waits retain the DB, generation and payload ownership for
+retry. Physical deinit distinguishes stopping from retired, so it still runs
+after preflight but cannot retire a subsequently reopened generation on repeated
+cleanup. Shared-service scopes check owner identity before forwarding quiescence.
+Native ABI 76 and storage-owner ABI 134 fence the lane and owner layouts.
+
+The backend durable owner remains shared by schema reconciliation, activation
+and backend work needed by later shutdown phases. It cannot be closed at this
+prefix without coordinating those producers. Those dependencies, future and
+registry metadata cleanup costs, derived executors, cache/IO teardown, complete
+mandatory completion, routes and recovery funding remain open. Durable formats
+and defaults are unchanged; strong required providers remain disabled. Full Linux
+qualification remains waived, with pinned Nix/glibc Zig required on Linux.
+
+Pinned Debug validation passes all 89 build steps in the final run, plus lifetime/error-identity custom-runner suites and five native ABI
+cases. The shared-service target reports 18 passing cases; its independent direct
+run confirms the new archive-boundary quiescence case by name. A direct run of
+the current maintenance binary passes
+all 37 cases by name. The durable-job matrix covers all four job classes with
+cleanup still in flight on success, failed begin, failed reentry and expired
+lifetime. The sole-ordinary-slot test observes an actual registry-condition
+waiter before releasing the producer; health/control capacity remains running.
+The archive-boundary test retains the owner after original reentry rejection.
+The direct-borrow fixture verifies final retirement after interrupted preflight
+and repeated cleanup after reopening. The real-DB C-entry fixture checks that
+publication quiescence preserves its generation until physical deinit.
+
+All 5,503 native/schema inputs match controlled-close-durable-v4; snapshots and
+hashes are in controlled-close-durable-verified.json in the cumulative receipts.
+Earlier runs are retained as diagnostics; the final run includes the required
+license header in the maintenance test root.
+The first also exceeded the real-DB test's authored 8 GiB compiler reservation
+on macOS (9.67 GB measured). Its macOS compile reservation is now 12 GiB; runtime
+limits are unchanged, and the final run has no reservation overrun. Embedded
+boundary, generated errors, control catalog, formatting and whitespace checks
+pass. Remaining shutdown and full cross-engine execution behavior are unqualified.

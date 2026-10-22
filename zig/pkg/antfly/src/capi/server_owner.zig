@@ -7020,6 +7020,10 @@ test "controlled owner close preflight C entry drains a real DB with the origina
     try std.testing.expect(handle.db.independent_maintenance.joined.isSet());
     try std.testing.expect(handle.db.quarantine_recovery.joined.isSet());
     try std.testing.expect(handle.db.graph_cleanup_owner.joined.isSet());
+    try std.testing.expect(handle.db.publication_recovery.stopping.load(.acquire));
+    try std.testing.expect(!handle.db.publication_recovery.retired.load(.acquire));
+    try std.testing.expectError(error.BackgroundOwnerIdExhausted, handle.db.backend_runtime.durable_jobs.reopenOwner(handle.db.publication_recovery.owner_id));
+    try std.testing.expect(try handle.db.backend_runtime.durable_jobs.quiesceOwner(handle.db.publication_recovery.owner_id));
     try std.testing.expect(handle.db.local_execution.retained_preparation_owner.?.closed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().cleanup_operations);
 }

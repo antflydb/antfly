@@ -716,6 +716,20 @@ const Scope = struct {
             .reopen => try self.runtime.durable_jobs.reopenOwner(id),
         }
     }
+    fn waitOwner(raw: *anyopaque, id: u64) !bool {
+        const self = cast(raw);
+        try self.begin(true);
+        defer self.end();
+        try self.checkOwner(id);
+        return self.runtime.durable_jobs.waitOwner(id);
+    }
+    fn quiesceOwner(raw: *anyopaque, id: u64) !bool {
+        const self = cast(raw);
+        try self.begin(true);
+        defer self.end();
+        try self.checkOwner(id);
+        return self.runtime.durable_jobs.quiesceOwner(id);
+    }
     fn drainOwner(raw: *anyopaque, id: u64) void {
         ownerAction(raw, id, .drain) catch {};
     }
@@ -829,6 +843,8 @@ const Token = struct {
 };
 const threaded_jobs: background.DurableJobLane.VTable = .{
     .submit = Scope.submit,
+    .wait_owner = Scope.waitOwner,
+    .quiesce_owner = Scope.quiesceOwner,
     .drain_owner = Scope.drainOwner,
     .close_owner = Scope.closeOwner,
     .pause_owner = Scope.pauseOwner,

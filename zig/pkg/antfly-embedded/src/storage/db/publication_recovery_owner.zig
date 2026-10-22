@@ -24,6 +24,7 @@ pub const Owner = struct {
     driver: policy.Driver = .{},
     mutex: std.atomic.Mutex = .unlocked,
     stopping: std.atomic.Value(bool) = .init(false),
+    retired: std.atomic.Value(bool) = .init(false),
     in_flight: std.atomic.Value(u32) = .init(0),
     bound: bool = false,
     maintenance_only: std.atomic.Value(bool) = .init(false),
@@ -74,17 +75,52 @@ pub const Owner = struct {
         arm(self);
     }
     pub fn deinit(self: *Owner) void {
+        if (self.retired.load(.acquire)) return;
         self.lock();
-        if (self.stopping.swap(true, .acq_rel)) {
-            self.mutex.unlock();
-            return;
-        }
+        self.stopping.store(true, .release);
         self.mutex.unlock();
         self.runtime.disarmOwnerMaintenanceProbe(self.owner_id);
         self.runtime.durable_jobs.closeOwner(self.owner_id);
         // Direct admission callers may have raced the close. The closed
         // registry rejects their enqueue/rearm, and their borrow must retire.
         while (self.in_flight.load(.acquire) != 0) @import("antfly_platform").time.yieldNow();
+        self.retired.store(true, .release);
+    }
+    /// Interruptions retain the registry generation and DB borrow. The
+    /// synchronous admission callers are separate from lane-owned callbacks.
+    pub fn stopWithAdmission(self: *Owner, original: @import("../../common/read_admission.zig").Port) !void {
+        self.lock();
+        self.stopping.store(true, .release);
+        self.mutex.unlock();
+        try self.runtime.durable_jobs.quiesceOwnerWithAdmission(self.owner_id, original);
+        var trace: @import("../../common/read_admission.zig").RejectionTrace = .{};
+        const control = trace.bind(original).?;
+        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        while (true) {
+            try control.checkpoint();
+            if (self.in_flight.load(.acquire) == 0) return;
+            try boundary.beginWait();
+            var failure: ?anyerror = null;
+            while (self.in_flight.load(.acquire) != 0) {
+                control.checkLifetime() catch |cause| {
+                    failure = trace.failure orelse cause;
+                    break;
+                };
+                const io = self.runtime.io() orelse self.runtime.filesystemIo() orelse {
+                    failure = error.BackendRuntimeUnavailable;
+                    break;
+                };
+                io.sleep(.fromMilliseconds(1), .awake) catch |cause| {
+                    failure = cause;
+                    break;
+                };
+            }
+            boundary.endWait() catch |cause| {
+                if (failure) |first| return first;
+                return trace.failure orelse cause;
+            };
+            if (failure) |cause| return cause;
+        }
     }
     fn cast(ptr: *anyopaque) *Owner {
         return @ptrCast(@alignCast(ptr));
@@ -388,4 +424,63 @@ test "publication recovery registration keeps legacy materialization on ordinary
     try std.testing.expectEqual(@as(usize, 1), fixture.ordinary_calls.load(.acquire));
     try std.testing.expect(!owner.maintenance_only.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), owner.driver.failure_streak);
+}
+
+test "maintenance runtime publication recovery interrupted direct admission cleanup remains retireable" {
+    const admission = @import("../../common/read_admission.zig");
+    const Case = enum { begin_failure, end_failure, lifetime_in_wait };
+    for (std.enums.values(Case)) |case| {
+        var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual, .filesystem_io = std.testing.io });
+        defer runtime.deinit();
+        var owner = try Owner.init(runtime.ptr());
+        defer owner.deinit();
+        // Hold the direct-caller count separately from the lane's job count.
+        // The fixture releases that borrow only at the original wait boundary.
+        owner.in_flight.store(1, .release);
+        defer owner.in_flight.store(0, .release);
+        const F = struct {
+            owner: *Owner,
+            case: Case,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case == .end_failure) self.owner.in_flight.store(0, .release);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                self.owner.in_flight.store(0, .release);
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        var f: F = .{ .owner = &owner, .case = case };
+        var payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.begin, .end = F.end } };
+        try std.testing.expectError(switch (case) {
+            .begin_failure => error.NotFound,
+            .end_failure => error.Canceled,
+            .lifetime_in_wait => error.DeadlineExceeded,
+        }, owner.stopWithAdmission(.init(&payload)));
+        try std.testing.expect(owner.stopping.load(.acquire));
+        try std.testing.expectError(error.BackgroundOwnerIdExhausted, runtime.ptr().durable_jobs.reopenOwner(owner.owner_id));
+        owner.in_flight.store(0, .release);
+        owner.deinit();
+        // Physical deinit must still retire a preflight-stopped owner.
+        try runtime.ptr().durable_jobs.reopenOwner(owner.owner_id);
+        defer runtime.ptr().durable_jobs.closeOwner(owner.owner_id);
+        owner.deinit();
+        try std.testing.expectError(error.BackgroundOwnerIdExhausted, runtime.ptr().durable_jobs.reopenOwner(owner.owner_id));
+        try std.testing.expect(try runtime.ptr().durable_jobs.quiesceOwner(owner.owner_id));
+        try std.testing.expectEqual(@as(usize, 1), f.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .begin_failure) 0 else 1), f.ends);
+    }
 }
