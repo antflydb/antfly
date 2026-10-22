@@ -832,6 +832,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         sentencepiece_proto_mod,
     );
     hf_tokenizer_tests.root_module.addImport("antfly_platform", platform_mod);
+    hf_tokenizer_tests.root_module.addImport("antfly_grapheme", regex_mod.import_table.get("antfly_grapheme").?);
     const run_hf_tokenizer_tests = b.addRunArtifact(hf_tokenizer_tests);
     const hf_tokenizer_test_step = b.step(
         "lib-tokenizer-test",

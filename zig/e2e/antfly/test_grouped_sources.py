@@ -30,6 +30,10 @@ import requests
 from helpers import start_http_server, wait_until
 
 
+# Server ownership is dynamic/direct, outside static fixture inference.
+pytestmark = pytest.mark.e2e_resource("antfly_process")
+
+
 def _write_grouped_fixture(
     api, table_name, *, inserts=None, deletes=None, sync_level=None, timeout_s=120.0
 ):

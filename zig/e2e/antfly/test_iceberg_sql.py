@@ -37,7 +37,11 @@ from conftest import (
     resolve_binary_path,
 )
 
-pytestmark = [pytest.mark.iceberg_integration, pytest.mark.fresh_antfly_process]
+pytestmark = [
+    pytest.mark.iceberg_integration,
+    pytest.mark.fresh_antfly_process,
+    pytest.mark.e2e_resource("antfly_process"),
+]
 
 
 def _export_table(table, root):

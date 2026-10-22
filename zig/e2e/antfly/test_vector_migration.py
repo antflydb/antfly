@@ -24,6 +24,7 @@ import time
 
 import pytest
 import requests
+from conftest import ready_index_status
 from helpers import wait_until
 from test_vector_store import hit_ids
 
@@ -75,9 +76,16 @@ def seed(api, table):
         },
         sync_level="full_index",
     )
-    assert wait_until(
-        lambda: nearest(api, table, "model_a", [1, 0, 0]) == ["a", "b"], timeout_s=90
-    )
+    # Index admission returns before structural publication finishes. Capture
+    # a complete two-index cohort before a test freezes it or kills the server;
+    # seeing model_a's rows alone says nothing about model_b's publication.
+    for index, vector in (("model_a", [1, 0, 0]), ("model_b", [0, 1, 0])):
+        assert wait_until(
+            lambda: api.get_index(table, index),
+            ready_when=lambda value: ready_index_status(value, until="complete"),
+            timeout_s=90,
+        ), api.get_index(table, index)
+        assert nearest(api, table, index, vector) == ["a", "b"]
 
 
 def nearest(api, table, index, vector):

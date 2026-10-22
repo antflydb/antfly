@@ -4663,6 +4663,14 @@ pub const DB = struct {
         }
         if (self.local_execution.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
         if (self.core.splitState() != null) return error.VectorStoreLifecycleUnsupported;
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            // Configuration will be frozen for the migration's lifetime.
+            // Do not strand an already-admitted catalog transition behind
+            // that freeze; let its durable owner finish before capturing it.
+            try self.requireArtifactReconcileUnfenced(&read, null);
+        }
         for (self.core.index_manager.dense_indexes.items) |entry| {
             if (!entry.native_physical_v2 and !try self.core.index_manager.denseNativePhysicalMigrationRequired(entry.config.name))
                 return error.VectorStoreLifecycleUnsupported;
@@ -25617,6 +25625,9 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
+        // Reject before staging the durable intent. The catalog materializer
+        // cannot change configuration while source ownership is migrating.
+        try self.enforceVectorMigrationConfigurationGate();
         var txn = try self.core.store.beginWriteTxn();
         var preflight_open = true;
         defer if (preflight_open) txn.abort();
@@ -132235,6 +132246,46 @@ fn completeVectorMigrationForTest(db: *DB, job_id: []const u8) !void {
         if (state.value.phase == .reclaiming)
             try db.core.index_manager.checkpointIo().sleep(.fromMilliseconds(1), .awake);
     }
+}
+
+test "source vector migration waits for an admitted artifact catalog transition" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("vector-migration-artifact-admission");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{
+        .table_storage = .{ .dense_embeddings = .primary_lsm },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const intent = @import("artifact_reconcile_intent.zig");
+    var command = try db.artifactInventoryCommand(alloc);
+    defer command.catalogs.deinit(alloc);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, intent.Intent{
+        .token = @splat(1),
+        .command = command,
+        .applied_index = 1,
+    }, .{});
+    defer alloc.free(encoded);
+    try db.core.store.put(intent.key, encoded);
+    const request: vector_migration.contract.Request = .{
+        .job_id = "after-catalog",
+        .mode = .online,
+        .budget = .{ .batch_rows = 1, .disk_reserve_bytes = 0 },
+    };
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.startVectorMigration(request));
+    try std.testing.expect((try db.vectorMigrationStatus(alloc)) == null);
+    try std.testing.expect(db.local_execution.source_vectors.load(.acquire) == null);
+    try std.testing.expect(!db.local_execution.vector_migration_active.load(.acquire));
+    try db.core.store.delete(intent.key);
+    try db.startVectorMigration(request);
+    try std.testing.expectError(error.VectorMigrationActive, db.reconcileReplicatedArtifactAdmission(
+        .{ .artifact_catalog = command },
+        .{ .term = 1, .index = 1 },
+    ));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, intent.key));
+    try completeVectorMigrationForTest(&db, request.job_id);
 }
 
 test "source vector migration progress pages sync the WAL without flushing tiny runs" {
