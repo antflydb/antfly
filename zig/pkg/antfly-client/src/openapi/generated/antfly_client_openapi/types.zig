@@ -5735,6 +5735,10 @@ pub const ConnectedModel = struct {
     dimensions: ?i64 = null,
     /// True when this model is referenced by a configured embedder, generator, reranker, or chunker.
     configured: ?bool = null,
+    /// Inference capabilities advertised by the provider for this model and task.
+    capabilities: ?[]const []const u8 = null,
+    /// Input modalities accepted by the provider's resolved executor.
+    inputs: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -5745,6 +5749,8 @@ pub const ConnectedModel = struct {
         .{ "display_name", "display_name", true },
         .{ "dimensions", "dimensions", true },
         .{ "configured", "configured", true },
+        .{ "capabilities", "capabilities", true },
+        .{ "inputs", "inputs", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -5781,6 +5787,14 @@ pub const ConnectedModel = struct {
         }
         if (self.configured) |value| {
             try jw.objectField("configured");
+            try jw.write(value);
+        }
+        if (self.capabilities) |value| {
+            try jw.objectField("capabilities");
+            try jw.write(value);
+        }
+        if (self.inputs) |value| {
+            try jw.objectField("inputs");
             try jw.write(value);
         }
         try jw.endObject();
@@ -28722,6 +28736,95 @@ pub const InferenceModelInfo = struct {
         }
         try jw.endObject();
     }
+};
+
+/// One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private.
+pub const InferenceModelInstance = struct {
+    /// Opaque incarnation identifier; changes after eviction and reload.
+    id: []const u8,
+    model: []const u8,
+    tasks: []const InferenceModelKind,
+    state: []const u8,
+    /// Internal owners or loading waiters preventing eviction. This is not a count of HTTP requests.
+    active_handles: i64,
+    startup_managed: bool,
+    /// Whether an unload would be permitted at snapshot time; concurrent use can change this.
+    unloadable: bool,
+    unload_blocked_reason: ?[]const u8 = null,
+    /// Selected execution backend, when known.
+    backend: ?[]const u8 = null,
+    /// Weight residency policy; loaded does not imply full device residency.
+    residency_mode: []const u8,
+    /// Elapsed milliseconds since last use, not a wall-clock timestamp.
+    idle_ms: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "model", "model", false },
+        .{ "tasks", "tasks", false },
+        .{ "state", "state", false },
+        .{ "active_handles", "active_handles", false },
+        .{ "startup_managed", "startup_managed", false },
+        .{ "unloadable", "unloadable", false },
+        .{ "unload_blocked_reason", "unload_blocked_reason", true },
+        .{ "backend", "backend", true },
+        .{ "residency_mode", "residency_mode", false },
+        .{ "idle_ms", "idle_ms", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("tasks");
+        try jw.write(self.tasks);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("active_handles");
+        try jw.write(self.active_handles);
+        try jw.objectField("startup_managed");
+        try jw.write(self.startup_managed);
+        try jw.objectField("unloadable");
+        try jw.write(self.unloadable);
+        if (self.unload_blocked_reason) |value| {
+            try jw.objectField("unload_blocked_reason");
+            try jw.write(value);
+        }
+        if (self.backend) |value| {
+            try jw.objectField("backend");
+            try jw.write(value);
+        }
+        try jw.objectField("residency_mode");
+        try jw.write(self.residency_mode);
+        try jw.objectField("idle_ms");
+        try jw.write(self.idle_ms);
+        try jw.endObject();
+    }
+};
+
+pub const InferenceModelInstanceList = struct {
+    object: []const u8,
+    data: []const InferenceModelInstance,
+};
+
+pub const InferenceModelInstanceLoadRequest = struct {
+    model: []const u8,
+    task: InferenceModelKind,
+};
+
+pub const InferenceModelInstanceUnloadResponse = struct {
+    outcome: []const u8,
 };
 
 /// Model registry kind.

@@ -5280,6 +5280,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/models/instances": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List model instances
+         * @description Inspect this inference server's shared model cache without loading models or extending idle eviction deadlines. Each incarnation appears once, even when it supports multiple tasks.
+         */
+        get: operations["listModelInstances"];
+        put?: never;
+        /**
+         * Load a model instance
+         * @description Prepare the instance used by the requested task. Reuses an existing compatible instance. Normal idle eviction still applies; loading does not pin weights or guarantee device residency.
+         */
+        post: operations["loadModelInstance"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/models/instances/{instance_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Unload a model instance
+         * @description Evict one exact incarnation from the shared server cache. A stale ID is an idempotent miss and never evicts a replacement. Loading, busy, and startup-managed instances cannot be unloaded.
+         */
+        delete: operations["unloadModelInstance"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/models": {
         parameters: {
             query?: never;
@@ -7011,6 +7055,10 @@ export interface components {
             dimensions?: number;
             /** @description True when this model is referenced by a configured embedder, generator, reranker, or chunker. */
             configured?: boolean;
+            /** @description Inference capabilities advertised by the provider for this model and task. */
+            capabilities?: string[];
+            /** @description Input modalities accepted by the provider's resolved executor. */
+            inputs?: string[];
         };
         InferenceConnection: {
             provider: components["schemas"]["InferenceProviderType"];
@@ -21047,6 +21095,50 @@ export interface components {
             actor?: string;
             reason?: string;
             wait?: components["schemas"]["ResolverWait"];
+        };
+        /** @description One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private. */
+        InferenceModelInstance: {
+            /** @description Opaque incarnation identifier; changes after eviction and reload. */
+            id: string;
+            model: string;
+            tasks: components["schemas"]["InferenceModelKind"][];
+            /** @enum {string} */
+            state: "loading" | "loaded";
+            /**
+             * Format: int64
+             * @description Internal owners or loading waiters preventing eviction. This is not a count of HTTP requests.
+             */
+            active_handles: number;
+            startup_managed: boolean;
+            /** @description Whether an unload would be permitted at snapshot time; concurrent use can change this. */
+            unloadable: boolean;
+            /** @enum {string} */
+            unload_blocked_reason?: "loading" | "in_use" | "startup_managed";
+            /** @description Selected execution backend, when known. */
+            backend?: string;
+            /**
+             * @description Weight residency policy; loaded does not imply full device residency.
+             * @enum {string}
+             */
+            residency_mode: "backend_managed" | "streamed" | "resident";
+            /**
+             * Format: int64
+             * @description Elapsed milliseconds since last use, not a wall-clock timestamp.
+             */
+            idle_ms: number;
+        };
+        InferenceModelInstanceList: {
+            /** @enum {string} */
+            object: "list";
+            data: components["schemas"]["InferenceModelInstance"][];
+        };
+        InferenceModelInstanceLoadRequest: {
+            model: string;
+            task: components["schemas"]["InferenceModelKind"];
+        };
+        InferenceModelInstanceUnloadResponse: {
+            /** @enum {string} */
+            outcome: "unloaded" | "already_unloaded";
         };
         InferenceError: {
             /** @description Stable machine-readable error code */
@@ -35530,6 +35622,155 @@ export interface operations {
             };
             /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: components["responses"]["TransientCapacity"];
+        };
+    };
+    listModelInstances: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Loaded and loading model instances */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstanceList"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    loadModelInstance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceModelInstanceLoadRequest"];
+            };
+        };
+        responses: {
+            /** @description Prepared model instance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstance"];
+                };
+            };
+            /** @description Invalid model or unsupported task */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    unloadModelInstance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                instance_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Instance unloaded or already absent */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstanceUnloadResponse"];
+                };
+            };
+            /** @description Malformed instance ID */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Instance is loading, has active owners, or is managed by startup configuration */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
         };
     };
     listModels: {

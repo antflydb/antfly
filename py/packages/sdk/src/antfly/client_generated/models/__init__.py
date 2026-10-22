@@ -991,6 +991,15 @@ from .inference_model_info import InferenceModelInfo
 from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
 from .inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
+from .inference_model_instance import InferenceModelInstance
+from .inference_model_instance_list import InferenceModelInstanceList
+from .inference_model_instance_list_object import InferenceModelInstanceListObject
+from .inference_model_instance_load_request import InferenceModelInstanceLoadRequest
+from .inference_model_instance_residency_mode import InferenceModelInstanceResidencyMode
+from .inference_model_instance_state import InferenceModelInstanceState
+from .inference_model_instance_unload_blocked_reason import InferenceModelInstanceUnloadBlockedReason
+from .inference_model_instance_unload_response import InferenceModelInstanceUnloadResponse
+from .inference_model_instance_unload_response_outcome import InferenceModelInstanceUnloadResponseOutcome
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
@@ -2674,6 +2683,15 @@ __all__ = (
     "InferenceModelInfoChunkingLimits",
     "InferenceModelInfoInferenceCapabilities",
     "InferenceModelInfoQualifiedLimits",
+    "InferenceModelInstance",
+    "InferenceModelInstanceList",
+    "InferenceModelInstanceListObject",
+    "InferenceModelInstanceLoadRequest",
+    "InferenceModelInstanceResidencyMode",
+    "InferenceModelInstanceState",
+    "InferenceModelInstanceUnloadBlockedReason",
+    "InferenceModelInstanceUnloadResponse",
+    "InferenceModelInstanceUnloadResponseOutcome",
     "InferenceModelKind",
     "InferenceModelQuantization",
     "InferenceModelRef",

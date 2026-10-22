@@ -16,12 +16,7 @@ import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
-  DashboardPage,
   DashboardPageActions,
-  DashboardPageDescription,
-  DashboardPageHeader,
-  DashboardPageTitle,
-  DashboardToolbar,
   Dialog,
   DialogContent,
   DialogDescription,
@@ -60,6 +55,7 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { AIWorkflowHeader, AIWorkflowPage } from "@/components/ai-workflow";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import {
   formatGeneratorSummary,
@@ -67,6 +63,7 @@ import {
   GeneratorSelector,
   getInheritedGeneratorLabels,
 } from "@/components/playground/GeneratorSelector";
+import { RetrievalContextBar } from "@/components/retrieval-context";
 import { useApi } from "@/hooks/use-api-config";
 import { useEvalSets } from "@/hooks/use-eval-sets";
 import { useGeneratorPreference } from "@/hooks/use-generator-preference";
@@ -131,6 +128,7 @@ const EvalsPlaygroundPage: React.FC = () => {
   const [showAnswerGeneratorSettings, setShowAnswerGeneratorSettings] = useState(false);
   const [showJudgeSettings, setShowJudgeSettings] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [wasCancelled, setWasCancelled] = useState(false);
   const [progress, setProgress] = useState<{ current: number; total: number } | null>(null);
   const [results, setResults] = useState<EvalRunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -157,6 +155,28 @@ const EvalsPlaygroundPage: React.FC = () => {
   const inheritedJudgeLabel = "Playground default judge";
   const inheritedJudgeDescription = "Keep Antfarm's built-in judge selection for evals.";
 
+  const selectedSet = selectedSetName ? getEvalSet(selectedSetName) : undefined;
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Request context changes invalidate the active run and its results.
+  useEffect(() => {
+    setIsLoading(false);
+    setProgress(null);
+    setError(null);
+    setResults(null);
+    setWasCancelled(false);
+    return () => {
+      abortControllerRef.current?.abort();
+      abortControllerRef.current = null;
+    };
+  }, [
+    apiClient,
+    selectedTable,
+    selectedIndex,
+    selectedSet,
+    effectiveAnswerGenerator,
+    effectiveJudge,
+  ]);
+
   // Set first eval set as default
   useEffect(() => {
     const names = getEvalSetNames();
@@ -164,8 +184,6 @@ const EvalsPlaygroundPage: React.FC = () => {
       setSelectedSetName(names[0]);
     }
   }, [getEvalSetNames, selectedSetName]);
-
-  const selectedSet = selectedSetName ? getEvalSet(selectedSetName) : undefined;
 
   const handleCreateSet = () => {
     if (!newSetName.trim()) return;
@@ -288,18 +306,24 @@ const EvalsPlaygroundPage: React.FC = () => {
   };
 
   const loadSampleSet = () => {
-    // Create sample set if it doesn't exist
-    const set = getEvalSet(SAMPLE_EVAL_SET.name);
-    if (!set) {
-      createEvalSet(SAMPLE_EVAL_SET.name);
-      for (const item of SAMPLE_EVAL_SET.items) {
-        addItem(SAMPLE_EVAL_SET.name, item.question, item.referenceAnswer);
+    // Import the complete sample atomically: addItem cannot see a set created
+    // earlier in the same React event until that state update has rendered.
+    if (!getEvalSet(SAMPLE_EVAL_SET.name)) {
+      const result = importEvalSet(JSON.stringify(SAMPLE_EVAL_SET));
+      if (!result.success) {
+        setError(result.error ?? "Could not load sample evaluation set");
+        return;
       }
     }
     setSelectedSetName(SAMPLE_EVAL_SET.name);
   };
 
   const handleReset = () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
+    setProgress(null);
+    setWasCancelled(false);
     setResults(null);
     setError(null);
   };
@@ -331,7 +355,9 @@ const EvalsPlaygroundPage: React.FC = () => {
       abortControllerRef.current.abort();
     }
 
-    abortControllerRef.current = new AbortController();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    setWasCancelled(false);
     setIsLoading(true);
     setError(null);
     setResults(null);
@@ -342,8 +368,9 @@ const EvalsPlaygroundPage: React.FC = () => {
 
     try {
       for (let i = 0; i < selectedSet.items.length; i++) {
+        if (controller.signal.aborted) break;
         const item = selectedSet.items[i];
-        setProgress({ current: i + 1, total: selectedSet.items.length });
+        setProgress({ current: i, total: selectedSet.items.length });
         const itemStartTime = performance.now();
 
         try {
@@ -377,9 +404,12 @@ const EvalsPlaygroundPage: React.FC = () => {
                   },
                 },
               },
-            }
-            // No callbacks - we want JSON response
+            },
+            undefined,
+            { signal: controller.signal }
           );
+          if (abortControllerRef.current !== controller) return;
+          if (controller.signal.aborted) break;
 
           if (answerResult instanceof AbortController) {
             throw new Error("Unexpected streaming response");
@@ -404,9 +434,7 @@ const EvalsPlaygroundPage: React.FC = () => {
             error: isEvalError ? reason : undefined,
           });
         } catch (err) {
-          if (err instanceof Error && err.name === "AbortError") {
-            return;
-          }
+          if (controller.signal.aborted) break;
           itemResults.push({
             itemId: item.id,
             question: item.question,
@@ -421,6 +449,8 @@ const EvalsPlaygroundPage: React.FC = () => {
         }
       }
 
+      if (abortControllerRef.current !== controller) return;
+      setWasCancelled(controller.signal.aborted);
       const passed = itemResults.filter((r) => r.pass && !r.error).length;
       const failed = itemResults.filter((r) => !r.pass && !r.error).length;
       const errors = itemResults.filter((r) => r.error).length;
@@ -447,8 +477,10 @@ const EvalsPlaygroundPage: React.FC = () => {
       }
       setError(err instanceof Error ? err.message : "Failed to run evals");
     } finally {
-      setIsLoading(false);
-      setProgress(null);
+      if (abortControllerRef.current === controller) {
+        setIsLoading(false);
+        setProgress(null);
+      }
     }
   }, [
     selectedSet,
@@ -461,38 +493,40 @@ const EvalsPlaygroundPage: React.FC = () => {
   ]);
 
   return (
-    <DashboardPage className="h-full space-y-3">
-      <DashboardPageHeader>
-        <div>
-          <DashboardPageTitle className="font-aeonik">Evals Playground</DashboardPageTitle>
-          <DashboardPageDescription>
-            Build eval sets and test RAG answers against reference answers
-          </DashboardPageDescription>
-        </div>
-        <DashboardPageActions>
-          <Button variant="outline" onClick={loadSampleSet}>
-            <FileText className="h-4 w-4 mr-2" />
-            Load Sample
-          </Button>
-          <Button variant="outline" onClick={handleReset}>
-            <RotateCcw className="h-4 w-4 mr-2" />
-            Reset
-          </Button>
-        </DashboardPageActions>
-      </DashboardPageHeader>
+    <AIWorkflowPage className="h-full" aria-busy={isLoading}>
+      <AIWorkflowHeader
+        eyebrow="Retrieval"
+        title="Evaluate answers"
+        description="Compare generated answers with a reference set and inspect each result."
+        actions={
+          <DashboardPageActions>
+            <Button variant="outline" onClick={loadSampleSet}>
+              <FileText className="h-4 w-4 mr-2" />
+              Load Sample
+            </Button>
+            <Button variant="outline" onClick={handleReset}>
+              <RotateCcw className="h-4 w-4 mr-2" />
+              Reset
+            </Button>
+          </DashboardPageActions>
+        }
+      />
 
-      {/* Active Table/Index Indicator */}
-      {selectedTable ? (
-        <DashboardToolbar className="flex-row items-center gap-2 text-sm text-muted-foreground md:items-center">
-          <Badge>{selectedTable}</Badge>
-          {selectedIndex && <Badge>{selectedIndex}</Badge>}
-        </DashboardToolbar>
-      ) : (
-        <DashboardToolbar className="border-dashed text-sm text-muted-foreground">
-          Select a table from the sidebar to get started.
-        </DashboardToolbar>
-      )}
-
+      <RetrievalContextBar />
+      <p className="text-xs text-muted-foreground">
+        Eval sets are saved in this browser. Export a set to share it or keep a copy.
+      </p>
+      {savedDashboardGenerator?.provider === "chatgpt" ? (
+        <p role="status" className="border border-border bg-muted/30 p-3 text-sm">
+          Personal ChatGPT connections are available in Conversation and Pipeline. Select a
+          server-side answer model and judge for evaluations.
+        </p>
+      ) : null}
+      {wasCancelled ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          Evaluation stopped. Completed results are retained below.
+        </p>
+      ) : null}
       {/* Configuration Panel */}
       <Card>
         <CardHeader className="pb-4">
@@ -580,6 +614,11 @@ const EvalsPlaygroundPage: React.FC = () => {
                   </>
                 )}
               </Button>
+              {isLoading ? (
+                <Button variant="outline" onClick={() => abortControllerRef.current?.abort()}>
+                  Stop evaluation
+                </Button>
+              ) : null}
             </div>
           </div>
 
@@ -1035,7 +1074,7 @@ const EvalsPlaygroundPage: React.FC = () => {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </DashboardPage>
+    </AIWorkflowPage>
   );
 };
 
@@ -1046,7 +1085,7 @@ function EvalItemCard({ item, onRemove }: { item: EvalItem; onRemove: () => void
       <Button
         variant="ghost"
         size="icon"
-        className="absolute top-2 right-2 h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity"
+        className="absolute top-2 right-2 h-6 w-6 opacity-100 transition-opacity"
         onClick={onRemove}
       >
         <X className="h-3 w-3" />

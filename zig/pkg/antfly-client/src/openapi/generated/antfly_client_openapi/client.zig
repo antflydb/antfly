@@ -666,6 +666,37 @@ pub const Client = struct {
         return ApiResponse(types.InferenceModelsResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// List model instances
+    /// GET /ai/v1/models/instances
+    pub fn listModelInstances(self: *@This()) !ApiResponse(types.InferenceModelInstanceList) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/models/instances", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceModelInstanceList).fromResponse(self.allocator, &resp);
+    }
+
+    /// Load a model instance
+    /// POST /ai/v1/models/instances
+    pub fn loadModelInstance(self: *@This(), body: types.InferenceModelInstanceLoadRequest) !ApiResponse(types.InferenceModelInstance) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/models/instances", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceModelInstance).fromResponse(self.allocator, &resp);
+    }
+
+    /// Unload a model instance
+    /// DELETE /ai/v1/models/instances/{instance_id}
+    pub fn unloadModelInstance(self: *@This(), instance_id: []const u8) !ApiResponse(types.InferenceModelInstanceUnloadResponse) {
+        const encoded_instance_id = try httpx.PercentEncoding.encode(self.allocator, instance_id);
+        defer self.allocator.free(encoded_instance_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/models/instances/{s}", .{ self.base_url, encoded_instance_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceModelInstanceUnloadResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Read text from images (OCR/document understanding)
     /// POST /ai/v1/read
     pub fn readImages(self: *@This(), body: types.InferenceReadRequest) !ApiResponse(types.InferenceReadResponse) {
