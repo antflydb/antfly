@@ -422,6 +422,82 @@ const PathGate = struct {
 };
 var registry_mutex: std.Io.Mutex = .init;
 var gates: std.StringHashMapUnmanaged(*PathGate) = .empty;
+
+/// File replacement must join the same fair queue as foreground operations
+/// and maintenance before acquiring the cross-process writer lease. Retaining
+/// the gate also keeps its identity stable when the last connection closes.
+pub const PathReplacementGuard = struct {
+    gate: *PathGate,
+
+    pub fn release(self: PathReplacementGuard) void {
+        self.gate.mutex.unlock(h.handleLockIo());
+        releaseGate(self.gate);
+    }
+};
+
+pub fn acquirePathReplacement(path: []const u8) !PathReplacementGuard {
+    const io = h.handleLockIo();
+    const canonical = native.realPathAlloc(alloc, io, path) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            const parent = try native.realPathAlloc(alloc, io, std.fs.path.dirname(path) orelse ".");
+            defer alloc.free(parent);
+            break :blk try std.fs.path.join(alloc, &.{ parent, std.fs.path.basename(path) });
+        },
+        else => return err,
+    };
+    defer alloc.free(canonical);
+    const gate = try retainGate(canonical);
+    gate.mutex.lockUncancelable(io);
+    return .{ .gate = gate };
+}
+
+pub fn testPathReplacementAdmission() !void {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replacement.aflite", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const io = h.handleLockIo();
+    // Also exercise a destination that does not exist yet: creation and later
+    // replacement must use one canonical queue, including relative aliases.
+    const held = try acquirePathReplacement(path);
+    var held_live = true;
+    defer if (held_live) held.release();
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    file.close(io);
+    const canonical = try native.realPathAlloc(alloc, io, path);
+    defer alloc.free(canonical);
+    const Replacement = struct {
+        acquired: bool = false,
+        failure: ?anyerror = null,
+        fn run(self: *@This(), target: []const u8, expected: *PathGate) void {
+            const replacement = acquirePathReplacement(target) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer replacement.release();
+            self.acquired = replacement.gate == expected;
+        }
+    };
+    var replacement: Replacement = .{};
+    const thread = try std.Thread.spawn(.{}, Replacement.run, .{ &replacement, canonical, held.gate });
+    defer thread.join();
+    while (true) {
+        held.gate.mutex.state.lockUncancelable(io);
+        const queued = held.gate.mutex.next == 2;
+        held.gate.mutex.state.unlock(io);
+        if (queued) break;
+        std.Thread.yield() catch {};
+    }
+    held.release();
+    held_live = false;
+    // The following foreground operation must queue behind replacement.
+    const next = try acquirePathReplacement(path);
+    defer next.release();
+    try std.testing.expect(replacement.failure == null);
+    try std.testing.expect(replacement.acquired);
+}
+
 fn retainGate(path: []const u8) !*PathGate {
     const io = h.handleLockIo();
     registry_mutex.lockUncancelable(io);

@@ -1002,17 +1002,10 @@ func TestLiteCAPI(t *testing.T) {
 	}}, 7); err != nil {
 		t.Fatalf("write restore target: %v", err)
 	}
-	// Native idle maintenance can briefly own the actual writer lease.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		err := Restore(openRestorePath, backupBytes, RestoreOptions{Replace: true})
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, Busy) || time.Now().After(deadline) {
-			t.Fatalf("restore between connection calls: %v", err)
-		}
-		time.Sleep(10 * time.Millisecond)
+	// Replacement queues behind in-process maintenance. Contention from our
+	// own idle worker must not escape as Busy or require caller-side polling.
+	if err := Restore(openRestorePath, backupBytes, RestoreOptions{Replace: true}); err != nil {
+		t.Fatalf("restore between connection calls: %v", err)
 	}
 	if _, err := openRestore.LookupJSON("doc:pre-restore-target"); !errors.Is(err, NotFound) {
 		t.Fatalf("old document after replacement = %v, want %v", err, NotFound)
