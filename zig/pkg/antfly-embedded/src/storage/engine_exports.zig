@@ -154,6 +154,13 @@ fn finishBackgroundGraphReplacement(self: *DB, name: []const u8, generation: u64
     return .{ .value = self.finishBackgroundGraphReplacement(name, generation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn hasGroupedSourceMaintenance(self: *DB) engine.Outcome(bool) {
+    return .{ .value = self.hasGroupedSourceMaintenance() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn inheritGroupedSourceMaintenance(self: *DB, previous: *DB) engine.Outcome(void) {
+    self.inheritGroupedSourceMaintenance(previous) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
+}
 fn runGroupedSourceMaintenanceSlice(self: *DB) engine.Outcome(bool) {
     return .{ .value = self.runGroupedSourceMaintenanceSlice() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

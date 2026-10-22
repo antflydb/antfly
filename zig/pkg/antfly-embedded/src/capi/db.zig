@@ -10096,7 +10096,7 @@ test "capi native memory grouped episodes advance without a waiting write in roo
     defer antfly_db_close(table);
     const work = @import("../storage/db/group_source_worker.zig");
     const contract = @import("../storage/db/group_source_contract.zig");
-    for ([_]?*anyopaque{ root, table }) |id| {
+    for ([_]?*anyopaque{ root, table }, 0..) |id, namespace_index| {
         {
             const guard = enterHandle(id, .write) orelse return error.TestUnexpectedResult;
             defer guard.leave();
@@ -10126,6 +10126,23 @@ test "capi native memory grouped episodes advance without a waiting write in roo
                 }
             }
             try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        if (!published) {
+            const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+            defer guard.leave();
+            const stats = try pendingWorkStatsJson(guard.handle);
+            defer std.heap.c_allocator.free(stats.ptr.?[0..stats.len]);
+            std.debug.print("group background namespace={d} stats={s}\n", .{ namespace_index, stats.ptr.?[0..stats.len] });
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const temporary = arena.allocator();
+            const database = guard.handle.database();
+            const definitions = (try database.lookup(temporary, "", .{ .group_source_query_json = "{\"action\":\"definitions\"}" })).?;
+            const entries = try std.json.parseFromSliceLeaky([]work.Definition, temporary, definitions.json, .{});
+            if (entries.len > 0) {
+                const response = (try database.lookup(temporary, "", .{ .group_source_query_json = try std.json.Stringify.valueAlloc(temporary, contract.Query{ .action = .status, .artifact = "turns", .definition = entries[0].definition, .group = "thread", .segment = "turn", .cell = 0 }, .{}) })).?;
+                std.debug.print("group background status={s}\n", .{response.json});
+            }
         }
         try std.testing.expect(published);
     }

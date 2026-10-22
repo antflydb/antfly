@@ -507,6 +507,8 @@ pub const VTable = struct {
     runUntilIdle: *const fn (*DB) Outcome(void),
     runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation: *const fn (*DB, types.CancellationToken) Outcome(void),
     finishBackgroundGraphReplacement: *const fn (*DB, []const u8, u64) Outcome(bool),
+    hasGroupedSourceMaintenance: *const fn (*DB) Outcome(bool),
+    inheritGroupedSourceMaintenance: *const fn (*DB, *DB) Outcome(void),
     runGroupedSourceMaintenanceSlice: *const fn (*DB) Outcome(bool),
     runBackgroundTurnWithCancellation: *const fn (*DB, types.CancellationToken, bool) Outcome(bool),
     runBackgroundMaintenanceWithCancellation: *const fn (*DB, types.CancellationToken) Outcome(bool),

@@ -564,7 +564,36 @@ pub const Owner = struct {
             }
             try replacement.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(&previous.owned_lite_backend.?.native_docstore.?.file);
             inheritReclamationTelemetry(replacement.owned_lite_backend.?.native_docstore.?, previous.owned_lite_backend.?.native_docstore.?);
-            try self.retired.append(alloc, previous);
+            // Reserve before moving any continuation so allocation failure
+            // cannot discard the live owner's lease identity.
+            try self.retired.ensureUnusedCapacity(alloc, 1);
+            // A view refresh is not a worker restart. Losing these cursors or
+            // the lease identity strands a claimed group until lease expiry.
+            // Only reopen namespaces with an actual continuation, preserving
+            // lazy discovery and isolation from unrelated broken tables.
+            const Continuation = struct { prior: *h.db_mod.DB, next: *h.db_mod.DB };
+            var continuations: std.ArrayList(Continuation) = .empty;
+            defer continuations.deinit(alloc);
+            try continuations.ensureTotalCapacity(alloc, previous.embedded_tables.count() + 1);
+            continuations.appendAssumeCapacity(.{ .prior = &previous.db, .next = &replacement.db });
+            var group_tables = previous.embedded_tables.valueIterator();
+            while (group_tables.next()) |old_table| {
+                if (!try old_table.*.db.hasGroupedSourceMaintenance()) continue;
+                const database = @import("tables.zig").get(replacement, old_table.*.name) catch continue;
+                continuations.appendAssumeCapacity(.{ .prior = &old_table.*.db, .next = database });
+            }
+            var transferred: usize = 0;
+            errdefer for (continuations.items[0..transferred]) |pair| {
+                // The path gate excludes controls; these owners have no
+                // resident registration. A completed transfer is reversible
+                // without allocation or any intervening worker execution.
+                pair.prior.inheritGroupedSourceMaintenance(pair.next) catch unreachable;
+            };
+            for (continuations.items) |pair| {
+                try pair.next.inheritGroupedSourceMaintenance(pair.prior);
+                transferred += 1;
+            }
+            self.retired.appendAssumeCapacity(previous);
             previous.lease_snapshot = true;
             // Cursor continuation can only read this generation. Make every
             // namespace's shared native store reject publication immediately.
@@ -945,9 +974,16 @@ pub const Owner = struct {
         // cannot starve the downstream enrichment/resolver replay it creates.
         const group_next = schedule.group_next;
         schedule.group_next = !group_next;
-        if (self.options.open_mode == .writer and group_next and try database.runGroupedSourceMaintenanceSlice()) {
-            self.notifyMutation();
-            return true;
+        if (self.options.open_mode == .writer and group_next) {
+            const advanced = database.runGroupedSourceMaintenanceSlice() catch |err| {
+                self.publication_stats.maintenance_errors +|= 1;
+                self.publication_stats.last_maintenance_error = @errorName(err);
+                return err;
+            };
+            if (advanced) {
+                self.notifyMutation();
+                return true;
+            }
         }
         // TTL is a short publication for the selected table, never a drain of
         // every namespace under one file lease.

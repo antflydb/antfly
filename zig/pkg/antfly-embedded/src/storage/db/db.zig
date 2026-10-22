@@ -5194,7 +5194,8 @@ pub const DB = struct {
         self.startArtifactRepairMetadataWorkerIfNeeded();
         self.startQuarantineRetryWorkerIfNeeded();
         self.startGraphEndpointCleanupWorker();
-        self.group_source_owner.start(.{ .ptr = self, .runtime = self.backend_runtime, .run = runLocalGroupSourceSlice });
+        if (self.local_execution.optional_runtime_workers_enabled)
+            self.group_source_owner.start(.{ .ptr = self, .runtime = self.backend_runtime, .run = runLocalGroupSourceSlice });
     }
 
     pub fn closeOwned(self: *DB) void {
@@ -7149,6 +7150,35 @@ pub const DB = struct {
     }
 
     pub const maintenanceRequiresOrderedApply = local_mutation.maintenanceRequiresOrderedApply;
+
+    /// Connection-owned controls outlive a disposable native DB view. Keep
+    /// the continuation in the physical owner; never lend its allocator/maps
+    /// to a consumer or move a registered resident worker.
+    pub fn hasGroupedSourceMaintenance(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("hasGroupedSourceMaintenance", .{self});
+        return self.group_source_owner.worker != null;
+    }
+    pub fn inheritGroupedSourceMaintenance(self: *DB, previous: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("inheritGroupedSourceMaintenance", .{ self, previous });
+        if (self == previous or self.group_source_owner.worker != null or previous.group_source_owner.worker == null) return;
+        if (self.root_incarnation != previous.root_incarnation or !std.meta.eql(self.core.identity_namespace, previous.core.identity_namespace)) return;
+        const current_range = self.core.byteRange();
+        const prior_range = previous.core.byteRange();
+        if (!std.mem.eql(u8, current_range.start, prior_range.start) or !std.mem.eql(u8, current_range.end, prior_range.end)) return;
+        if (self.group_source_owner.registration != null or previous.group_source_owner.registration != null) return error.UnsupportedOperation;
+        if (!previous.group_source_owner.slice_mutex.tryLock()) return error.WouldBlock;
+        defer previous.group_source_owner.slice_mutex.unlock();
+        if (!self.group_source_owner.slice_mutex.tryLock()) return error.WouldBlock;
+        defer self.group_source_owner.slice_mutex.unlock();
+        // Worker memory uses the process-stable runtime allocator, and its
+        // ports are supplied anew per slice. No old DB pointer survives.
+        self.group_source_owner.worker = previous.group_source_owner.worker;
+        self.group_source_owner.next_definition = previous.group_source_owner.next_definition;
+        self.group_source_owner.submitted = previous.group_source_owner.submitted;
+        previous.group_source_owner.worker = null;
+        previous.group_source_owner.next_definition = 0;
+        previous.group_source_owner.submitted = 0;
+    }
 
     /// One bounded group-control turn. The caller owns writer admission;
     /// connection-based Lite calls this before releasing its path lease.

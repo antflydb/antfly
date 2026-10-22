@@ -309,7 +309,9 @@ available and retains its existing lexical/vector pagination contract.
 
 - [#1241](https://github.com/antflydb/antfly/issues/1241): Lite connection
   maintenance executes bounded grouped-source controls under owner/writer
-  admission, alternating with detached enrichment replay. Legacy opened table
+  admission, alternating with detached enrichment replay. Compatible view refreshes
+  transfer the physical worker's lease identity, cursors and definition position;
+  dropped/recreated namespaces do not inherit them. Legacy opened table
   objects start resident optional workers at their stable heap address. Waiting
   at `sync_level: enrichments` is not required to publish groups.
 - [#1244](https://github.com/antflydb/antfly/issues/1244): the private owner ABI
