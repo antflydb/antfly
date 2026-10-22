@@ -366,7 +366,7 @@ components:
           x-go-type: uint64
         enable_auth:
           type: boolean
-          description: "Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal when enabled, but do not currently enforce per-model or per-operation inference RBAC."
+          description: "Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal and enforce inference:read or inference:write authorization when enabled. The inference resource remains '*'; per-model scopes are not supported."
           default: false
         disable_shard_alloc:
           type: boolean

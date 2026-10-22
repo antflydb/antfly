@@ -4,13 +4,34 @@ Standalone decisions use `POST /decisions` (`/ai/v1/decisions` on the standalone
 server). Named question and answer arrays, `input`, `choices`, `levels` and
 predicate `probability` follow the [OpenAI Decisions conventions](https://developers.openai.com/api/docs/guides/decisions).
 Antfly adds embedding similarity answers, multi-choice selection and text
-batches. This is a text-only subset: choice values are strings and every
-question needs a unique name. See the [decision schema](../../specs/openapi/ai/decision.yaml).
+batches. Supported hosted providers also accept multimodal evidence; see the
+[gateway decision contract](../reference/inference-gateway.md#public-contracts)
+for provider and method restrictions. Native trained/embedding decisions and the
+browser surface retain their text restrictions. Choice values are strings and
+every question needs a unique name. See the [decision schema](../../specs/openapi/ai/decision.yaml).
 
 `/extract` retains entities, relations, attributes, structured records and
 ordinary classification. Standalone Laya, OpenDecider and EmbeddingGemma
 workflows use `/decisions`. The unreleased extraction decision output and
 Boolean and ordinal decision modes have been removed.
+
+For the v0.3.0 development source documented here, standalone public inference
+requires an explicit opt-in before calling `/ai/v1`. Save `antfly.json`:
+
+```json
+{"public_inference": {"enabled": true}}
+```
+
+```bash
+antfly standalone --config antfly.json
+```
+
+There is no enablement CLI flag. Without this setting, public execution returns
+HTTP 403 even when models are installed. See the
+[public execution policy](../reference/inference-gateway.md#public-execution-policy).
+This prerequisite applies to database API nodes on this source version; the
+independent `antfly inference run` listener and older stable releases have their
+own policies.
 
 ## Questions and answers
 

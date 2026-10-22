@@ -1264,7 +1264,7 @@ Report contents: dataset stats, bootstrap summary, initial adapter inspection, t
 
 ## CLI Reference
 
-### Fused Chunker (`src/train_fused_chunker.zig`)
+### Fused Chunker (`zig/pkg/inference/src/finetune/train/train_fused_chunker.zig`)
 
 ```
 usage: train-fused-chunker --data <path> --output <dir> [options]
@@ -1323,7 +1323,7 @@ Flags:
 
 Token classification uses identical positional and flag interface (`train-eval-layoutlmv3-lora-token`).
 
-### Reranker Surrogate (`src/train_eval_reranker_lora_surrogate.zig`)
+### Reranker Surrogate (`zig/pkg/inference/src/finetune/train/train_eval_reranker_lora_surrogate.zig`)
 
 This is a backend command behind the `lora-sft` / `qlora-sft` reranker recipe.
 

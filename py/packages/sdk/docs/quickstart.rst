@@ -25,6 +25,10 @@ First, import and create an Antfly client:
 Working with Tables
 -------------------
 
+These examples require the current source SDK; use the pinned installation in
+`the SDK README <https://github.com/antflydb/antfly/blob/main/py/packages/sdk/README.md#installation>`_.
+Older registry packages do not expose every method shown here.
+
 Creating a Table
 ~~~~~~~~~~~~~~~~
 
@@ -34,10 +38,18 @@ Creating a Table
        name="products",
        num_shards=4,
        schema={
-           "properties": {
-               "name": {"type": "string"},
-               "price": {"type": "number"},
-               "description": {"type": "string"}
+           "default_type": "product",
+           "document_schemas": {
+               "product": {
+                   "schema": {
+                       "type": "object",
+                       "properties": {
+                           "name": {"type": "string"},
+                           "price": {"type": "number"},
+                           "description": {"type": "string"}
+                       }
+                   }
+               }
            }
        }
    )
@@ -49,7 +61,7 @@ Listing Tables
 
    tables = client.list_tables()
    for table in tables:
-       print(f"Table: {table.name}")
+       print(f"Table: {table['name']}")
 
 Getting Table Details
 ~~~~~~~~~~~~~~~~~~~~~
@@ -57,8 +69,8 @@ Getting Table Details
 .. code-block:: python
 
    table_status = client.get_table("products")
-   print(f"Shards: {table_status.num_shards}")
-   print(f"Document count: {table_status.doc_count}")
+   print(f"Shards: {len(table_status['shards'])}")
+   print(f"Storage statistics: {table_status['storage_status']}")
 
 Dropping a Table
 ~~~~~~~~~~~~~~~~
@@ -128,8 +140,8 @@ Full-Text Search
        limit=10
    )
 
-   for hit in results.hits:
-       print(f"Found: {hit.id} - Score: {hit.score}")
+   for hit in results.responses[0].hits.hits:
+       print(f"Found: {hit.field_id} - Score: {hit.field_score}")
 
 Semantic Search
 ~~~~~~~~~~~~~~~
