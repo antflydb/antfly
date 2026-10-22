@@ -255,6 +255,8 @@ test {
     _ = native_quantize;
     _ = kernel_jit_profile_output;
     _ = native_quant_kernel_codegen;
+    // Evidence serialization and policy tests also run without a CUDA device.
+    _ = cuda_microbench;
     _ = native_export_gguf;
     _ = gliner_boundary_export;
     _ = native_export_safetensors;
@@ -285,7 +287,6 @@ test {
     }
     if (build_options.enable_cuda) {
         _ = cuda_info;
-        _ = cuda_microbench;
         _ = cuda_attention_diff;
         _ = cuda_ffn_diff;
         _ = cuda_nvrtc;
