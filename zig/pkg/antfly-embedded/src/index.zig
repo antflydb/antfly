@@ -1741,6 +1741,23 @@ pub const IndexSnapshot = struct {
         std.mem.sort(u32, sorted_ordinals, {}, u32LessThan);
         const unique_ordinals = sorted_ordinals[0..uniqueSortedU32(sorted_ordinals)];
 
+        const Membership = struct {
+            values: []const u32,
+            fn contains(membership: @This(), ordinal: u32) bool {
+                return containsSortedU32(membership.values, ordinal);
+            }
+        };
+        return self.docNumsForOrdinalMembershipAlloc(alloc, Membership{ .values = unique_ordinals });
+    }
+
+    /// Preserve compact resolved membership instead of expanding, copying and
+    /// sorting a table-sized ordinal array before each text query.
+    pub fn docNumsForOrdinalBitmapAlloc(self: *const IndexSnapshot, alloc: Allocator, ordinals: *const roaring.RoaringBitmap) ![]u32 {
+        if (ordinals.cardinality() == 0) return try alloc.alloc(u32, 0);
+        return self.docNumsForOrdinalMembershipAlloc(alloc, ordinals);
+    }
+
+    fn docNumsForOrdinalMembershipAlloc(self: *const IndexSnapshot, alloc: Allocator, membership: anytype) ![]u32 {
         var out = std.ArrayListUnmanaged(u32).empty;
         errdefer out.deinit(alloc);
 
@@ -1749,6 +1766,7 @@ pub const IndexSnapshot = struct {
             var segment_lease = try self.leaseSegment(segment_idx);
             defer segment_lease.deinit();
             const seg = segment_lease.entry;
+            var ordinals_cursor: ?segment_mod.DocOrdinalCursor = null;
             {
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
@@ -1757,8 +1775,9 @@ pub const IndexSnapshot = struct {
                     if (seg.shared.deleted) |deleted| {
                         if (deleted.contains(local_doc)) continue;
                     }
-                    const ordinal = (try seg.reader.docOrdinal(local_doc)) orelse continue;
-                    if (!containsSortedU32(unique_ordinals, ordinal)) continue;
+                    if (ordinals_cursor == null) ordinals_cursor = try segment_mod.DocOrdinalCursor.init(&seg.reader);
+                    const ordinal = (try ordinals_cursor.?.get(local_doc)) orelse continue;
+                    if (!membership.contains(ordinal)) continue;
                     const global_doc = doc_offset + local_doc;
                     try out.append(alloc, global_doc);
                 }
@@ -4963,4 +4982,96 @@ test "external lake metadata navigation foreign corpora retain physical allocato
     destination_open = false;
     try std.testing.expectEqual(@as(usize, 0), physical_budget.live);
     try std.testing.expectEqual(@as(usize, 0), private_budget.live);
+}
+
+test "ordinal projection preserves mixed native legacy deleted and duplicate ordinal rows" {
+    const a = std.testing.allocator;
+    var first = segment_mod.SegmentWriter.init(a);
+    defer first.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d" }) |id| try first.addStoredDoc(id, "{}");
+    try first.addDocOrdinals(&.{ 9, 0, 2, 9 });
+    const first_bytes = try first.build();
+    defer a.free(first_bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = first_bytes }));
+    var legacy = segment_mod.SegmentWriter.init(a);
+    defer legacy.deinit();
+    try legacy.addStoredDoc("x", "{}");
+    try legacy.addStoredDoc("y", "{}");
+    const legacy_bytes = try legacy.build();
+    defer a.free(legacy_bytes);
+    try writer.addSegment(legacy_bytes);
+    var last = segment_mod.SegmentWriter.init(a);
+    defer last.deinit();
+    try last.addStoredDoc("e", "{}");
+    try last.addStoredDoc("f", "{}");
+    try last.addDocOrdinals(&.{ 7, 2 });
+    const last_bytes = try last.build();
+    defer a.free(last_bytes);
+    try writer.addSegment(last_bytes);
+    const held = writer.acquireSnapshot();
+    defer held.release();
+    const before = try held.docNumsForOrdinalsAlloc(a, &.{ 2, 9, 7, 9 });
+    defer a.free(before);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 3, 6, 7 }, before);
+    try std.testing.expect(try writer.deleteById("c"));
+    const after = try held.docNumsForOrdinalsAlloc(a, &.{ 2, 9, 7, 9 });
+    defer a.free(after);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 6, 7 }, after);
+    var membership = roaring.RoaringBitmap.init(a);
+    defer membership.deinit();
+    try membership.addSortedAscending(&.{ 2, 7, 9 });
+    const bitmap_after = try held.docNumsForOrdinalBitmapAlloc(a, &membership);
+    defer a.free(bitmap_after);
+    try std.testing.expectEqualSlices(u32, after, bitmap_after);
+    const absent = try held.docNumsForOrdinalsAlloc(a, &.{ 0, 123 });
+    defer a.free(absent);
+    try std.testing.expectEqual(@as(usize, 0), absent.len);
+}
+
+test "ordinal bitmap projection bounds native reads for a broad live population" {
+    const a = std.testing.allocator;
+    const count = 100_000;
+    const ordinals = try a.alloc(u32, count);
+    defer a.free(ordinals);
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (ordinals, 0..) |*ordinal, i| {
+        ordinal.* = @intCast(i + 1);
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "doc:{d}", .{i}), "{}");
+    }
+    try segment.addDocOrdinals(ordinals);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    const snapshot_ref = writer.acquireSnapshot();
+    defer snapshot_ref.release();
+    const cache = &snapshot_ref.segments[0].reader.native.?.metadata_cache.?;
+    // One non-visible identity makes the broad live population exclude it.
+    // Physical segment rows still include it, just as with a lagging delete.
+    var membership = roaring.RoaringBitmap.init(a);
+    defer membership.deinit();
+    try membership.addRange(2, count + 1);
+    const scalar_before = cache.cache.clock;
+    const scalar_start = platform_time.monotonicNs();
+    const expected = try snapshot_ref.docNumsForOrdinalsAlloc(a, ordinals[1..]);
+    defer a.free(expected);
+    const scalar_ns = platform_time.monotonicNs() - scalar_start;
+    const scalar_probes = cache.cache.clock - scalar_before;
+    const before = cache.cache.clock;
+    const start = platform_time.monotonicNs();
+    const actual = try snapshot_ref.docNumsForOrdinalBitmapAlloc(a, &membership);
+    defer a.free(actual);
+    const elapsed_ns = platform_time.monotonicNs() - start;
+    const probes = cache.cache.clock - before;
+    try std.testing.expectEqualSlices(u32, expected, actual);
+    try std.testing.expectEqual(@as(usize, count - 1), actual.len);
+    try std.testing.expectEqual(@as(u32, 1), actual[0]);
+    try std.testing.expectEqual(@as(u32, count - 1), actual[actual.len - 1]);
+    try std.testing.expect(probes <= 256);
+    std.debug.print("ORDINAL_PROJECTION docs={d} array_us={d} bitmap_us={d} array_probes={d} bitmap_probes={d}\n", .{ count, scalar_ns / 1000, elapsed_ns / 1000, scalar_probes, probes });
 }

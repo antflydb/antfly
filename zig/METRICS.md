@@ -161,6 +161,14 @@ The sampled benchmark logs include:
 
 The query env toggles are cached once per process.
 
+`ANTFLY_BENCH_QUERY_PROFILE=1` also logs retained snapshot capture phases as
+`QUERY_CAPTURE phase=<name> elapsed_us=<duration>`. These unsampled capture
+logs distinguish the query-pin lock, snapshot publication lock, mutation and
+replay admission, maintenance drain, structural mutation lock, projection
+worker drain, catalog readers, apply lock, checkpoint pinning, sealing, and
+repository publication. A canceled capture logs its interrupted phase as it
+unwinds. The phase names are available in stripped release binaries.
+
 ## Dense Stack Benchmark Profiles
 
 `bench/vectors/dense_stack_bench.zig` supports `--profile <path>`.

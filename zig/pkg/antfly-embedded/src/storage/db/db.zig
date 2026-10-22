@@ -458,6 +458,26 @@ fn benchQueryProfileEnabled() bool {
     return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
 }
 
+/// Phase names remain available in stripped release builds, including the
+/// interrupted phase when cancellation unwinds a capture.
+const QueryCaptureProfile = struct {
+    enabled: bool,
+    phase: []const u8,
+    started_ns: u64,
+    fn init(enabled: bool, phase: []const u8) @This() {
+        return .{ .enabled = enabled, .phase = phase, .started_ns = if (enabled) monotonicTimeNs() else 0 };
+    }
+    fn finish(self: *const @This()) void {
+        if (self.enabled) std.log.info("QUERY_CAPTURE phase={s} elapsed_us={d}", .{ self.phase, (monotonicTimeNs() -| self.started_ns) / std.time.ns_per_us });
+    }
+    fn next(self: *@This(), phase: []const u8) void {
+        if (!self.enabled) return;
+        self.finish();
+        self.phase = phase;
+        self.started_ns = monotonicTimeNs();
+    }
+};
+
 fn observeSearchFailureMetric(name: ?[]const u8, query_type: db_query_metrics.QueryType, duration_ns: u64) void {
     if (db_query_search.peekLastSortRejectionDiagnostic()) |diagnostic| {
         db_query_metrics.observeSortRejection(name, query_type, duration_ns, diagnostic.reason, diagnostic.detail);
@@ -20274,8 +20294,11 @@ pub const DB = struct {
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| if (self.primary_lsm_storage) |storage| {
             if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
         };
+        var profile = QueryCaptureProfile.init(benchQueryProfileEnabled(), "query_pin_lock");
+        defer profile.finish();
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
+        profile.next("reuse_and_admission");
         if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
         try self.admitQueryCut(io, request.id, token);
         const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
@@ -20284,6 +20307,7 @@ pub const DB = struct {
         // A failed new capture must not consume the capacity reserved for
         // usable cursors. The parent guard excludes readers of this new root.
         errdefer if (!existed) std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        profile.next("snapshot");
         _ = self.snapshotInternal(request.id, true, token, deadline, null, false, request) catch |err| {
             try token.check();
             return switch (err) {
@@ -20293,6 +20317,7 @@ pub const DB = struct {
                 else => err,
             };
         };
+        profile.next("repository_publication");
         try self.admitQueryCut(io, request.id, token);
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
             if (try repository.publishReusable(io, root, request, self.core.identity_namespace, token)) |proof| {
@@ -20484,12 +20509,15 @@ pub const DB = struct {
     ) !u64 {
         if (comptime storage_engine.enabled) return storage_engine.call("snapshotInternal", .{ self, id, include_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut });
         const seal_only = backup_seal_only or query_cut != null;
+        var profile = QueryCaptureProfile.init(query_cut != null and benchQueryProfileEnabled(), "snapshot_publication_lock");
+        defer profile.finish();
         if (query_cut == null) try self.ensurePrimaryOnlySnapshot();
         // Serialize only snapshot construction/publication. Normal writes can
         // resume before native manifest hashing, while same-ID captures cannot
         // race the fresh-directory check or atomic rename.
         try lockAtomicWithCancellation(&self.snapshot_publication_mutex, cancellation);
         defer self.snapshot_publication_mutex.unlock();
+        profile.next("staging");
         try ensureSnapshotActive(cancellation);
         try validateSnapshotId(id);
         if (include_generated) {
@@ -20586,6 +20614,7 @@ pub const DB = struct {
         // barrier is writer preferring, so continuous client traffic cannot
         // starve capture. Internal enrichment and resolution callbacks remain
         // admitted while maintenance drains already-committed work.
+        profile.next("snapshot_admission");
         var capture = self.core.snapshot_admission.acquireCaptureIo(io, @as(?types.CancellationToken, cancellation)) catch |err| switch (err) {
             error.Cancelled => return error.Canceled,
             else => return err,
@@ -20611,6 +20640,7 @@ pub const DB = struct {
         // optimistic loop, primary writes and catalog churn are already barred,
         // so an external write stream cannot keep this loop alive forever.
         while (true) {
+            profile.next("maintenance_drain");
             const target_sequence = self.currentMaintenanceTargetSequence();
             self.runMaintenanceUntilWithEnrichmentCompletion(
                 target_sequence,
@@ -20626,7 +20656,9 @@ pub const DB = struct {
             try self.flushAppliedSequencesForIdle();
 
             if (query_cut != null) {
+                profile.next("structural_mutation_lock");
                 try lockAtomicWithCancellation(&self.local_execution.index_structural_mutation_mutex, cancellation);
+                profile.next("projection_worker_drain");
                 structural = .{
                     .db = self,
                     .snapshot_mutation = capture.borrowMutation(),
@@ -20635,11 +20667,13 @@ pub const DB = struct {
                     .restart_text_merge = self.quiesceTextMergeForStructuralMutation(),
                     .restart_sparse_compaction = self.quiesceSparseCompactionForStructuralMutation(),
                 };
+                profile.next("catalog_reader_drain");
                 try structural.?.acquireCatalogBarrierWithCancellation(io, cancellation);
             } else {
                 structural = self.beginDrainedIndexStructuralMutationWithLease("native snapshot", "*", capture.borrowMutation());
                 if (!structural.?.acquireCatalogBarrierUntil(std.math.maxInt(u64))) unreachable;
             }
+            profile.next("replay_admission");
             replay_capture = self.core.snapshot_replay_admission.acquireCaptureIo(
                 io,
                 @as(?types.CancellationToken, cancellation),
@@ -20648,6 +20682,7 @@ pub const DB = struct {
                 else => return err,
             };
             if (query_cut != null) {
+                profile.next("apply_lock");
                 try self.enforcePortableRuntimeGate();
                 while (!self.core.tryLockApplyExclusive()) {
                     try cancellation.check();
@@ -20672,6 +20707,7 @@ pub const DB = struct {
             structural = null;
         }
 
+        profile.next("checkpoint_pin");
         if (query_cut == null) try self.ensurePrimaryOnlySnapshotLocked() else try self.requireQueryCutStorage();
         if (expected_topology_fence) |expected| {
             var read = try self.core.store.beginProbeTxn();
@@ -20806,6 +20842,28 @@ pub const DB = struct {
                 var remaining_wal = seal.wal_budget_bytes - wal_bytes;
                 vector_bytes = try source.sealQuerySnapshot(io, vector_root, &remaining_wal, cancellation);
             };
+            // The source-vector generation and every primary/generated
+            // checkpoint are now retained independently of live publication.
+            // Compute reuse eligibility under the fence, then let writers and
+            // maintenance resume before WAL sealing, inventory and fsyncs.
+            const reuse_digest = if (query_cut != null) reuse: {
+                const final_digest = try self.nativeQueryReuseDigestLocked(self.alloc);
+                break :reuse if (query_reuse_digest != null and final_digest != null and std.mem.eql(u8, &query_reuse_digest.?, &final_digest.?)) query_reuse_digest else null;
+            } else null;
+            self.core.unlockApply();
+            apply_held = false;
+            if (builtin.is_test) if (test_snapshot_fence_hook) |hook| {
+                if (hook.after_apply_release) |run| run(hook.ptr);
+            };
+            replay_capture.?.release();
+            replay_capture = null;
+            structural.?.release();
+            structural = null;
+            capture.release();
+            if (builtin.is_test) if (test_snapshot_fence_hook) |hook| {
+                if (hook.before_artifact_materialize) |run| run(hook.ptr);
+            };
+            profile.next("seal_and_publish");
             const primary_root = if (query_cut != null) try self.alloc.dupe(u8, staging_root) else try std.fmt.allocPrint(self.alloc, "{s}/primary-lsm", .{staging_root});
             defer self.alloc.free(primary_root);
             var total: u64 = switch (primary_snapshot) {
@@ -20820,8 +20878,6 @@ pub const DB = struct {
             try std.Io.Dir.cwd().deleteTree(io, generated_native_pin_root);
             try std.Io.Dir.cwd().deleteTree(io, generated_metadata_pin_root);
             if (query_cut) |request| {
-                const final_digest = try self.nativeQueryReuseDigestLocked(self.alloc);
-                const reuse_digest = if (query_reuse_digest != null and final_digest != null and std.mem.eql(u8, &query_reuse_digest.?, &final_digest.?)) query_reuse_digest else null;
                 try @import("native_query_cut.zig").finishWithReuseDigest(self.alloc, io, staging_root, request, self.core.identity_namespace, capture_target_sequence, reuse_digest, cancellation);
             } else _ = try seal.finish(self.alloc, io, staging_root, expected_topology_fence.?, capture_target_sequence, .{
                 .artifact_format = primary_snapshot.artifactFormat(),
@@ -71995,6 +72051,76 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
     try db.captureQueryCut(request, .{});
     try @import("native_query_cut.zig").validate(alloc, io, root, request, db.core.identity_namespace, .{});
     try std.testing.expect(!db.indexCatalogBarrierActive());
+}
+
+test "db query capture seals outside mutation fences and retains the selected generation" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("query-seal-admission");
+    defer directory.cleanup();
+    const path = std.mem.span(directory.path().ptr);
+    defer cleanupTempDir(directory.path().ptr);
+    const pins = try std.fmt.allocPrint(alloc, "{s}.query-pins", .{path});
+    defer alloc.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+    var db = try DB.open(alloc, path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .full_index });
+    const Probe = struct {
+        db: *DB,
+        released: bool = false,
+        failure: ?anyerror = null,
+        fn admitted(_: *anyopaque) void {}
+        fn materialize(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Fail without blocking if a regression retains any fence. Only
+            // run synchronous writes after proving admission is available.
+            if (!self.db.core.tryLockApplyExclusive()) return;
+            self.db.core.unlockApply();
+            var capture = self.db.core.snapshot_admission.tryAcquireCapture() orelse return;
+            capture.release();
+            var replay = self.db.core.snapshot_replay_admission.tryAcquireCapture() orelse return;
+            replay.release();
+            if (!self.db.local_execution.index_structural_mutation_mutex.tryLock()) return;
+            self.db.local_execution.index_structural_mutation_mutex.unlock();
+            if (self.db.indexCatalogBarrierActive()) return;
+            self.released = true;
+            self.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"replacement\"}" }}, .sync_level = .full_index }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            _ = self.db.runLsmMaintenanceStepBestEffort() catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var probe = Probe{ .db = &db };
+    DB.test_snapshot_fence_hook = .{ .ptr = &probe, .after_capture_admission = Probe.admitted, .before_artifact_materialize = Probe.materialize };
+    defer DB.test_snapshot_fence_hook = null;
+    const cut = @import("native_query_cut.zig");
+    const id: [64]u8 = @splat('b');
+    var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+    try db.captureQueryCut(request, .none);
+    if (probe.failure) |err| return err;
+    try std.testing.expect(probe.released);
+    request.create = false;
+    var retained = try db.openQueryCut(request, .none);
+    defer retained.close();
+    const old = (try retained.get(alloc, "doc")).?;
+    defer alloc.free(old);
+    try std.testing.expect(std.mem.indexOf(u8, old, "original") != null);
+    const current = (try db.get(alloc, "doc")).?;
+    defer alloc.free(current);
+    try std.testing.expect(std.mem.indexOf(u8, current, "replacement") != null);
+    var old_hits = try retained.search(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "original" } }, .include_stored = false });
+    defer old_hits.deinit();
+    try std.testing.expectEqual(@as(usize, 1), old_hits.hits.len);
 }
 
 test "db query capture retains settled terminal repair debt without acknowledging visibility" {

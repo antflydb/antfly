@@ -14,6 +14,7 @@
 // limitations.
 
 test {
+    _ = @import("antfly_local_sources").index;
     _ = @import("antfly_local_sources").section_vector_section;
     _ = @import("antfly_local_sources").section_doc_values;
     _ = @import("antfly_local_sources").search_search;

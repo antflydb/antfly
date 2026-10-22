@@ -2849,6 +2849,7 @@ fn textDocNumsForResolvedDocSetAlloc(
     snapshot: *const index_mod.IndexSnapshot,
     set: *const doc_set.ResolvedDocSet,
 ) !?[]const u32 {
+    if (set.* == .ordinal_bitmap) return try snapshot.docNumsForOrdinalBitmapAlloc(alloc, &set.ordinal_bitmap);
     const ordinals = (try docNumsForResolvedDocSetAlloc(alloc, set)) orelse return null;
     defer alloc.free(ordinals);
     return try snapshot.docNumsForOrdinalsAlloc(alloc, ordinals);
@@ -11922,6 +11923,59 @@ fn visibleTextCandidateCount(
     return visible_count;
 }
 
+/// Refine posting candidates in their own ordinal space. A broad live mask
+/// would project the entire primary population before even a rare term search.
+/// This owner borrows only the request's pinned snapshot and callback context.
+const TextLiveVisibilityProducer = struct {
+    snapshot: *const index_mod.IndexSnapshot,
+    ctx: ?*anyopaque,
+    live_filter: @typeInfo(@FieldType(StructuredFilterResolverExecutor, "live_filter_doc_set")).optional.child,
+    generation: ?u64,
+    control: @FieldType(search_mod.SearchRequest, "control"),
+
+    fn producer(self: *@This()) query_mod.DocNumProducer {
+        return .{ .ptr = self, .produce = produce };
+    }
+
+    fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var result = roaring.RoaringBitmap.init(alloc);
+        errdefer result.deinit();
+        var iterator = if (candidates) |bitmap| bitmap.iterator() else null;
+        var position: u32 = 0;
+        var docs: [64]u32 = undefined;
+        var ordinals: [64]u32 = undefined;
+        var used: usize = 0;
+        while (true) {
+            try self.control.check();
+            const local = if (iterator) |*it| it.next() else if (position < count) position else null;
+            if (local) |doc| {
+                if (doc >= count) return error.InvalidQueryRequest;
+                position = doc +| 1;
+                const global = std.math.add(u32, offset, doc) catch return error.InvalidQueryRequest;
+                if (try self.snapshot.docOrdinal(global)) |ordinal| {
+                    docs[used] = doc;
+                    ordinals[used] = ordinal;
+                    used += 1;
+                }
+            }
+            if (used == docs.len or (local == null and used != 0)) {
+                var requested = try doc_set.fromOrdinalsAlloc(alloc, ordinals[0..used]);
+                defer requested.deinit(alloc);
+                var visible = try self.live_filter(self.ctx, alloc, &requested, self.generation);
+                defer visible.deinit(alloc);
+                if (visible == .doc_keys) return error.UnsupportedQueryRequest;
+                for (docs[0..used], ordinals[0..used]) |doc, ordinal| {
+                    if (visible.containsOrdinal(ordinal)) try result.add(doc);
+                }
+                used = 0;
+            }
+            if (local == null) break;
+        }
+        return result;
+    }
+};
+
 pub fn searchTextQuery(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -11997,6 +12051,32 @@ pub fn searchTextQuery(
     // still scoring it (observed as allocator corruption in termDocFreq()).
     const snapshot = text_source.snapshot;
     const can_apply_live_all_docs = !chunk_backed or (try snapshot.hasDocOrdinalCoverage());
+    var apply_broad_live_all_docs = can_apply_live_all_docs;
+    var live_visibility: ?TextLiveVisibilityProducer = null;
+    if (can_apply_live_all_docs and executor.live_filter_doc_set != null and !executor.native_count_visibility_exact) {
+        const needs_full_visibility = if (executor.requires_full_candidate_visibility_filter) |requires|
+            try requires(executor.ctx, effective_req.identity_read_generation)
+        else
+            false;
+        if (!needs_full_visibility) {
+            const all_visible = if (executor.all_docs_visible) |visible|
+                try visible(executor.ctx, effective_req.identity_read_generation)
+            else
+                false;
+            if (all_visible) {
+                apply_broad_live_all_docs = false;
+            } else if (try snapshot.hasDocOrdinalCoverage()) {
+                live_visibility = .{
+                    .snapshot = snapshot,
+                    .ctx = executor.ctx,
+                    .live_filter = executor.live_filter_doc_set.?,
+                    .generation = effective_req.identity_read_generation,
+                    .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+                };
+                apply_broad_live_all_docs = false;
+            }
+        }
+    }
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var indexed_include: ?IndexedTextPredicate = null;
     defer if (indexed_include) |*predicate| predicate.deinit();
@@ -12013,11 +12093,12 @@ pub fn searchTextQuery(
             };
         }
     }
-    if (indexed_include != null or indexed_exclude != null) {
-        const must = try arena_alloc.alloc(search_mod.SearchQuery, if (indexed_include != null) 2 else 1);
+    if (indexed_include != null or indexed_exclude != null or live_visibility != null) {
+        const must = try arena_alloc.alloc(search_mod.SearchQuery, 1 + @as(usize, @intFromBool(indexed_include != null)) + @as(usize, @intFromBool(live_visibility != null)));
         must[0] = base_search_query;
         const exclusions = try arena_alloc.alloc(search_mod.SearchQuery, if (indexed_exclude != null) 1 else 0);
         if (indexed_include) |*bitmap| must[1] = .{ .doc_num = .{ .ids = &.{}, .bitmap = if (bitmap.producer == null) &bitmap.bitmap else null, .producer = bitmap.producer, .boost = 0 } };
+        if (live_visibility) |*visibility| must[must.len - 1] = .{ .doc_num = .{ .ids = &.{}, .producer = visibility.producer(), .boost = 0 } };
         if (indexed_exclude) |*bitmap| exclusions[0] = .{ .doc_num = .{ .ids = &.{}, .bitmap = if (bitmap.producer == null) &bitmap.bitmap else null, .producer = bitmap.producer } };
         base_search_query = .{ .bool_query = .{ .must = must, .must_not = exclusions } };
     }
@@ -12057,7 +12138,7 @@ pub fn searchTextQuery(
         .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
         .text_snapshot_for_doc_num_projection = snapshot,
-        .apply_live_all_docs = can_apply_live_all_docs,
+        .apply_live_all_docs = apply_broad_live_all_docs,
     });
     defer native_constraints.deinit(alloc);
     if (indexed_include) |predicate| if (predicate.exact) {
@@ -32697,6 +32778,28 @@ test "text native constraints project resolved ordinals through segment sidecar"
     try std.testing.expectEqual(@as(u32, 0), constraints.exclude_doc_nums[0]);
     try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_ids.len);
     try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_ids.len);
+
+    // Preserve the same exact projection when the resolved population is a
+    // bitmap, including live ordinals absent from this particular text index.
+    filter.include.deinit(alloc);
+    filter.exclude.deinit(alloc);
+    filter = .{
+        .include = .{ .ordinal_bitmap = roaring.RoaringBitmap.init(alloc) },
+        .exclude = .{ .ordinal_bitmap = roaring.RoaringBitmap.init(alloc) },
+    };
+    try filter.include.ordinal_bitmap.addSortedAscending(&.{ 7, 99 });
+    try filter.exclude.ordinal_bitmap.addSortedAscending(&.{ 42, 123 });
+    var bitmap_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .text_snapshot_for_doc_num_projection = writer.snapshot(),
+    });
+    defer bitmap_constraints.deinit(alloc);
+    try std.testing.expect(bitmap_constraints.positive_filter);
+    try std.testing.expectEqualSlices(u32, constraints.filter_doc_nums, bitmap_constraints.filter_doc_nums);
+    try std.testing.expectEqualSlices(u32, constraints.exclude_doc_nums, bitmap_constraints.exclude_doc_nums);
 }
 
 test "text resolved doc filter projection passes identity generation to live filtering" {
@@ -34778,4 +34881,124 @@ test "logical value bootstrap reads only two originals before pinning projection
     try std.testing.expectEqual(@as(usize, docs.len - 2), loader.projected);
     try std.testing.expectEqual(@as(usize, 1), loader.opens);
     try std.testing.expectEqual(@as(u64, docs.len * body.len), execution.local_work.bytes.load(.monotonic));
+}
+
+test "text live visibility refines posting candidates and skips an all-visible filter" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const mapper = @import("../document_mapper.zig");
+    const docs = try scratch.alloc(mapper.MapperDoc, 10_000);
+    for (docs, 0..) |*doc, i| doc.* = .{
+        .key = try std.fmt.allocPrint(scratch, "doc:{d}", .{i}),
+        .value = if (i == 17 or i == 111 or i == 7000 or i == 9001) "{\"body\":\"needle\"}" else "{\"body\":\"haystack\"}",
+        .doc_ordinal = @intCast(i + 1),
+    };
+    const bytes = (try mapper.buildTextSegmentFromDocuments(a, docs[0..5000], .{}, null)).?;
+    defer a.free(bytes);
+    const second_bytes = (try mapper.buildTextSegmentFromDocuments(a, docs[5000..], .{}, null)).?;
+    defer a.free(second_bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    try writer.addSegment(second_bytes);
+    const Harness = struct {
+        writer: *index_mod.IndexWriter,
+        calls: usize = 0,
+        seen: usize = 0,
+        all_visible: bool = false,
+        fail: bool = false,
+        fn acquire(raw: ?*anyopaque, _: ?[]const u8) !?PinnedTextSource {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .snapshot = self.writer.acquireSnapshot(), .name = "text", .text_analysis = .{}, .runtime_schema = null };
+        }
+        fn entry(_: ?*anyopaque, _: ?[]const u8) !?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+        fn chunk(_: ?*anyopaque, _: Allocator, _: ?[]const u8) !bool {
+            return false;
+        }
+        fn matchAll(_: ?*anyopaque, _: Allocator, _: types.SearchRequest) !types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+        fn stored(_: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn project(_: ?*anyopaque, out: Allocator, _: types.SearchRequest, _: []const u8, data: []const u8) ![]u8 {
+            return out.dupe(u8, data);
+        }
+        fn post(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, result: types.SearchResult, _: bool) !types.SearchResult {
+            return result;
+        }
+        fn visible(raw: ?*anyopaque, _: ?u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.all_visible;
+        }
+        fn filter(raw: ?*anyopaque, alloc: Allocator, requested: *const doc_set.ResolvedDocSet, generation: ?u64) !doc_set.ResolvedDocSet {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.fail) return error.TestVisibilityFailure;
+            try std.testing.expectEqual(@as(?u64, 9), generation);
+            if (requested.* != .ordinals or requested.ordinals.len > 4) return error.TestUnexpectedResult;
+            self.calls += 1;
+            self.seen += requested.ordinals.len;
+            var kept: [4]u32 = undefined;
+            var used: usize = 0;
+            for (requested.ordinals) |ordinal| {
+                if (ordinal != 18 and ordinal != 112 and ordinal != 7001 and ordinal != 9002) return error.TestUnexpectedResult;
+                if (ordinal != 112) {
+                    kept[used] = ordinal;
+                    used += 1;
+                }
+            }
+            return doc_set.fromOrdinalsAlloc(alloc, kept[0..used]);
+        }
+    };
+    var harness = Harness{ .writer = &writer };
+    const executor: SearchTextQueryExecutor = .{
+        .ctx = &harness,
+        .acquire_text_source = Harness.acquire,
+        .text_index_entry = Harness.entry,
+        .text_index_is_chunk_backed = Harness.chunk,
+        .search_match_all = Harness.matchAll,
+        .project_stored_search = Harness.project,
+        .load_stored = Harness.stored,
+        .postprocess = Harness.post,
+        .all_docs_visible = Harness.visible,
+        .live_filter_doc_set = Harness.filter,
+    };
+    const req: types.SearchRequest = .{ .include_stored = false, .limit = 10, .identity_read_generation = 9 };
+    const query: types.TextQuery = .{ .match = .{ .field = "body", .text = "needle" } };
+    harness.all_visible = true;
+    var baseline = try searchTextQuery(a, req, query, executor);
+    defer baseline.deinit();
+    try std.testing.expectEqual(@as(usize, 4), baseline.hits.len);
+    harness.all_visible = false;
+    var result = try searchTextQuery(a, req, query, executor);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+    try std.testing.expectEqual(@as(u64, 3), result.total_hits);
+    for (result.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:111"));
+    try std.testing.expect(harness.calls != 0);
+    try std.testing.expect(harness.seen <= 16);
+    var count_req = req;
+    count_req.count_only = true;
+    var counted = try searchTextQuery(a, count_req, query, executor);
+    defer counted.deinit();
+    try std.testing.expectEqual(@as(u64, 3), counted.total_hits);
+    var sorted_req = req;
+    sorted_req.order_by = &.{.{ .field = "_id" }};
+    var sorted = try searchTextQuery(a, sorted_req, query, executor);
+    defer sorted.deinit();
+    try std.testing.expectEqual(@as(usize, 3), sorted.hits.len);
+    try std.testing.expectEqualStrings("doc:17", sorted.hits[0].id);
+    harness.all_visible = true;
+    harness.calls = 0;
+    var all = try searchTextQuery(a, req, query, executor);
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 4), all.hits.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.calls);
+    harness.all_visible = false;
+    harness.fail = true;
+    try std.testing.expectError(error.TestVisibilityFailure, searchTextQuery(a, req, query, executor));
 }
