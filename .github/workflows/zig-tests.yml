@@ -1059,14 +1059,13 @@ jobs:
           cd ..
           python3 scripts/ci/prepare_lite_previous_reader.py
 
-      - name: Exercise real Lite extraction through public graph APIs
+      - name: Compile and run Lite model unit contracts
         if: needs.changes.outputs.zig_tests == 'true'
-        timeout-minutes: 25
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
           model_dir="$models_root/fastino/gliner2.5-base-v1"
-          trap 'rm -rf "$models_root"' EXIT
           python3 scripts/ci/prepare_lite_graph_model.py "$model_dir" --embedding-destination "$models_root/Qwen/Qwen3-Embedding-0.6B-GGUF"
           cd zig
           ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi-test \
@@ -1076,7 +1075,13 @@ jobs:
           python3 ../../tools/run_bounded_zig_build.py build test \
             '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
             --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix ../../zig-out
-          cd ../../..
+      - name: Exercise real Lite extraction through public graph APIs
+        if: needs.changes.outputs.zig_tests == 'true'
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
+          trap 'rm -rf "$models_root"' EXIT
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
           ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
           ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
@@ -1089,6 +1094,10 @@ jobs:
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
+
+      - name: Clean Lite qualification models
+        if: always() && needs.changes.outputs.zig_tests == 'true'
+        run: rm -rf "$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
 
       - name: Locate real-model extraction evaluation
         id: lite_extraction_report

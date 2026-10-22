@@ -1128,6 +1128,8 @@ fn loadCheckpoint(alloc: Allocator, io: std.Io, path: []const u8) !CheckpointMap
 fn loadCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8) !CheckpointMap {
     const raw = if (storage) |files|
         try files.readFileAlloc(alloc, path, checkpoint_max_bytes)
+    else if (comptime builtin.os.tag == .freestanding)
+        return error.UnsupportedPlatform
     else
         try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(checkpoint_max_bytes));
     defer alloc.free(raw);
