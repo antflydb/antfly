@@ -815,8 +815,13 @@ unsupported bindings stay fenced and pending without consuming model attempts;
 they cannot pin later jobs, including jobs beyond the first queue page. Execution
 deadlines and transient failures also leave the selection cursor advanced.
 The worker gives model processing a 120-second budget, separate from five-second
-selection/cleanup and finalization budgets. Provider deadlines leave a grace period
-for durable retry/error publication. If the entire attempt overruns, the worker
+selection/cleanup and finalization budgets. A shared maintenance classification
+selects retention before semantic work; semantic backfills and refreshes receive
+the model budget even though they have no pending operation receipt. Retention
+keeps its short budget and never invokes a provider in that quantum. Provider
+deadlines leave a grace period for publication. A timed-out semantic quantum
+retains its durable frontier for a later retry. For receipt-backed processing,
+if the entire attempt overruns, the worker
 re-enters the native service with a fresh, bounded finalization context and the
 original revision/receipt fence, recording the failure without invoking a model.
 Receipt replay handles an ambiguously committed result; a changed control revision

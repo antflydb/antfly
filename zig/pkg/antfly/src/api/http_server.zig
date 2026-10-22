@@ -5451,15 +5451,24 @@ pub const ApiHttpServer = struct {
             self.end = inference_end +| finalization_ns;
             return inference_end;
         }
+        fn beginExecution(self: *@This(), backend: @import("memory.zig").memory.Backend, a: std.mem.Allocator, now: u64, now_ms: i64, state: @import("memory.zig").memory.types.State, pending: ?@import("memory.zig").memory.types.Operation) !u64 {
+            // Maintenance has no pending receipt, but semantic backfills and
+            // refreshes perform model work. Keep retention on its short lane.
+            const models = pending != null or try @import("antfly_local_sources").memory_scheduling.maintenanceKind(backend, a, now_ms, state) == .semantic;
+            return if (models) self.beginProcessing(now) else self.end;
+        }
         fn beginFinalization(self: *@This(), now: u64) void {
             self.end = now +| finalization_ns;
         }
         fn check(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.checkAt(platform_time.monotonicNs());
+        }
+        fn checkAt(self: *@This(), now: u64) !void {
             if (self.server.cfg.relational_maintenance_leadership) |leadership| {
                 if (!leadership.isLocalLeader(self.group_id)) return error.NotLeader;
             } else if (self.server.cfg.deployment_mode != .standalone) return error.NotLeader;
-            if (platform_time.monotonicNs() >= self.end) return error.DeadlineExceeded;
+            if (now >= self.end) return error.DeadlineExceeded;
         }
     };
     const MemoryWorkExecution = struct {
@@ -5478,10 +5487,11 @@ pub const ApiHttpServer = struct {
             const state = work.state;
             const module = @import("memory.zig");
             var context = work.context;
-            const inference_deadline = if (pending != null) work.deadline.beginProcessing(platform_time.monotonicNs()) else work.deadline.end;
             context.now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms);
             try context.check();
             var adapter: module.engine.Routed = .{ .table = table, .reads = server.table_reads.?, .writes = server.table_writes.?, .context = context };
+            adapter.request = .{ .deadline_ns = work.deadline.end };
+            const inference_deadline = try work.deadline.beginExecution(adapter.backend(), a, platform_time.monotonicNs(), context.now_ms, state, pending);
             const executor = if (pending) |item| item.execution_principal else state.execution_principal;
             const signature = if (pending) |item| item.execution_signature else state.execution_signature;
             context.principal = if (pending) |item| item.owner else if (state.execution_owner.len > 0) state.execution_owner else state.owner;
@@ -59590,4 +59600,107 @@ test "native memory worker separates model and finalization budgets while fencin
     try ApiHttpServer.MemoryWorkDeadline.check(&budget);
     fixture.leader = false;
     try std.testing.expectError(error.NotLeader, ApiHttpServer.MemoryWorkDeadline.check(&budget));
+}
+
+test "native memory worker budgets slow semantic publication independently from retention" {
+    const memory = @import("memory.zig");
+    const scheduling = @import("antfly_local_sources").memory_scheduling;
+    const Native = memory.engine.Native(db_mod.DB);
+    const Fixture = struct {
+        now: u64,
+        budget: *ApiHttpServer.MemoryWorkDeadline,
+        leader: bool = true,
+        lose_leadership: bool = false,
+        embeddings: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn isLeader(ptr: *anyopaque, _: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.leader;
+        }
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.budget.checkAt(self.now);
+        }
+        fn validate(_: *anyopaque, _: memory.memory.types.Config) !void {}
+        fn embed(ptr: *anyopaque, a: std.mem.Allocator, _: memory.memory.types.Model, _: []const u8) ![]const f32 {
+            const native: *Native = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @ptrCast(@alignCast(native.context.check_ptr.?));
+            self.now += 3 * std.time.ns_per_s;
+            self.embeddings += 1;
+            if (self.lose_leadership) self.leader = false;
+            return a.dupe(f32, &.{ 1, 0 });
+        }
+        fn state(backend: memory.memory.Backend, a: std.mem.Allocator) !memory.memory.types.State {
+            return std.json.parseFromSliceLeaky(memory.memory.types.State, a, (try backend.get(backend.ptr, a, "control")).?.json, .{});
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("memory-worker-semantic-budget");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var budget: ApiHttpServer.MemoryWorkDeadline = .{ .server = undefined, .group_id = 7001, .end = 5 * std.time.ns_per_s };
+    var fixture: Fixture = .{ .now = 0, .budget = &budget };
+    var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone, .relational_maintenance_leadership = .{ .ptr = &fixture, .vtable = &.{ .is_local_leader = Fixture.isLeader } } }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
+    defer server.deinit();
+    budget.server = &server;
+    const context: memory.memory.Context = .{ .principal = "owner", .admin = true, .now_ms = 1, .check_ptr = &fixture, .check_fn = Fixture.check };
+    var native: Native = .{ .db = &db, .context = context };
+    var backend = native.backend();
+    backend.validate_models = Fixture.validate;
+    backend.embed = Fixture.embed;
+    backend.embed_document = Fixture.embed;
+    const service: memory.memory.Service = .{ .backend = backend, .context = context };
+    const config: memory.memory.types.Config = .{ .semantic_discovery = .{ .enabled = true }, .models = .{ .embedder = .{ .provider = "fixture", .model = "fixture", .revision = "v1", .dimensions = 2 } } };
+    _ = try service.execute(alloc, .create, "", try std.json.Stringify.valueAlloc(alloc, config, .{}), "create");
+    _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"},{\"id\":\"obsolete\",\"source_id\":\"old\",\"source_version\":\"1\",\"text\":\"Old\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    var state = try Fixture.state(backend, alloc);
+    const inference_end = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
+    try std.testing.expectEqual(@as(u64, 120 * std.time.ns_per_s), inference_end);
+    _ = try service.advanceAtRevision(alloc, "", "backfill", state.revision);
+    try std.testing.expect(fixture.now > 5 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 2), fixture.embeddings);
+    const index_row = (try backend.get(backend.ptr, alloc, "entity-semantic-index")).?;
+    const index = try std.json.parseFromSliceLeaky(memory.memory.types.SemanticIndex, alloc, index_row.json, .{});
+    try std.testing.expect(index.complete and index.backfill_complete);
+    try std.testing.expectEqual(@as(usize, 2), (try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 8)).rows.len);
+
+    // A new view and retention debt compete. Cleanup keeps the short budget
+    // and cannot invoke the slow provider or roll back its own progress.
+    _ = try service.execute(alloc, .assertions, "", "{\"assertions\":[{\"id\":\"description\",\"subject\":\"graph\",\"predicate\":\"p\",\"value\":\"graph\",\"statement\":\"Derived graph description\",\"evidence\":[{\"id\":\"e\"}]}]}", "description");
+    _ = try service.execute(alloc, .forget, "", "{\"evidence_ids\":[\"obsolete\"]}", "forget");
+    for (0..32) |i| {
+        state = try Fixture.state(backend, alloc);
+        if (try scheduling.maintenanceKind(backend, alloc, 1, state) != .retention) break;
+        budget.end = fixture.now + 5 * std.time.ns_per_s;
+        const cleanup_end = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
+        try std.testing.expectEqual(fixture.now + 5 * std.time.ns_per_s, cleanup_end);
+        _ = try service.advanceAtRevision(alloc, "", try std.fmt.allocPrint(alloc, "cleanup-{d}", .{i}), state.revision);
+        try std.testing.expectEqual(@as(usize, 2), fixture.embeddings);
+    }
+    state = try Fixture.state(backend, alloc);
+    try std.testing.expectEqual(.semantic, try scheduling.maintenanceKind(backend, alloc, 1, state));
+    // The longer budget never extends leadership authority. A lost owner
+    // publishes neither refreshed vectors nor a cursor and can retry safely.
+    _ = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
+    fixture.lose_leadership = true;
+    try std.testing.expectError(error.NotLeader, service.advanceAtRevision(alloc, "", "lost-owner", state.revision));
+    fixture.leader = true;
+    fixture.lose_leadership = false;
+    try std.testing.expectEqual(state.revision, (try Fixture.state(backend, alloc)).revision);
+    try std.testing.expectEqual(.semantic, try scheduling.maintenanceKind(backend, alloc, 1, state));
+    _ = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
+    _ = try service.advanceAtRevision(alloc, "", "refresh", state.revision);
+    state = try Fixture.state(backend, alloc);
+    try std.testing.expectEqual(.idle, try scheduling.maintenanceKind(backend, alloc, 1, state));
+    const rows = try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 8);
+    for (rows.rows) |row| {
+        const projection = try std.json.parseFromSliceLeaky(memory.memory.types.EntityProjection, alloc, row.json, .{});
+        if (projection.kind == .view) try std.testing.expect(std.mem.indexOf(u8, projection.text, "Derived graph description") != null);
+    }
 }

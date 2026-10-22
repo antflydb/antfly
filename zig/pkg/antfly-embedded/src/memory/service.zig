@@ -3272,7 +3272,7 @@ const Run = struct {
         // retirement. Foreground authorization still hides it immediately.
         self.retention_maintenance = true;
         defer self.retention_maintenance = false;
-        if (!try @import("scheduling.zig").retentionDue(self.service.backend, self.a, self.service.context.now_ms, self.state)) return self.semanticMaintenance();
+        if (try @import("scheduling.zig").maintenanceKind(self.service.backend, self.a, self.service.context.now_ms, self.state) != .retention) return self.semanticMaintenance();
         try self.pollResources();
         try self.semanticTimers();
         var candidate_index = (try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{};

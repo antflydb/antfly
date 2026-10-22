@@ -62,8 +62,15 @@ pub fn semanticDue(backend: m.Backend, a: A, state: m.types.State) !bool {
     // spinning or committing a new maintenance receipt on every worker round.
     return !index.complete and (try backend.scan(backend.ptr, a, "entity-semantic-blocked/", null, 1)).rows.len == 0;
 }
+pub const MaintenanceKind = enum { idle, retention, semantic };
+/// Selection, execution budgets and policy dispatch share the same priority.
+/// Retention never invokes inference, even when semantic work is also due.
+pub fn maintenanceKind(backend: m.Backend, a: A, now: i64, state: m.types.State) !MaintenanceKind {
+    if (try retentionDue(backend, a, now, state)) return .retention;
+    return if (try semanticDue(backend, a, state)) .semantic else .idle;
+}
 fn cleanup(backend: m.Backend, a: A, now: i64, state: m.types.State, executor: Executor) !bool {
-    if (!try semanticDue(backend, a, state) and !try retentionDue(backend, a, now, state)) return false;
+    if (try maintenanceKind(backend, a, now, state) == .idle) return false;
     executor.execute(executor.ptr, null) catch |err| {
         if (blocked(err)) return false;
         return err;
