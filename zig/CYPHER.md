@@ -1979,9 +1979,13 @@ Invocation-local variation is tracked separately from caller correlation. A dead
 bound-variable key that is constant throughout the child invocation becomes a
 NULL grouping slot. Keeping the slot preserves zero rows on empty grouped input;
 removing its value dependency allows reducer domains to share across callers.
-Only proven primitive bindings qualify: entity reads may invoke backend
-visibility projection, and container reads enforce structural depth limits even
-when their values are dead. Varying keys, entity/container reads and potentially
+Primitive bindings and certified entity-free containers qualify. Container
+certificates bound every nested read to the structural depth limit; unknown or
+excessive depths retain ordinary reads. Type proofs compose list concatenation,
+records and nested sequences, with memoized DAG traversal. Original producers
+still execute, so constructor, parameter and expression failures retain their
+position. Entity reads may invoke backend visibility projection. Varying keys,
+uncertified reads and potentially
 failing expressions keep their original evaluation.
 
 Primitive certificates follow parameter lists through forwarding projections and
@@ -2033,6 +2037,16 @@ retains its own transformed extrema and ordered prefix sum. Reversal and
 concatenation compose those summaries in producer order, while constant affine
 images have one distinct value. A synchronous, charged proof cache shares source
 DAGs without retaining transient AST addresses across normalization frames.
+
+Arithmetic AVG has a separate exact-recurrence certificate. A single ordered
+arithmetic progression, including affine images, reversals and consecutive
+concatenations, can advance a group's mean without visiting its values. The
+proof bounds the complete prefix so integer values, half-integer means,
+subtractions and denominators are exactly representable in binary64. Existing
+state must match the certified prefix, including its weight representation.
+Unsupported prefixes, nonconsecutive domains, DISTINCT averages and expanding
+children retain ordinary contribution order and rounding. This certificate
+never replaces a rounded online mean with a generic SUM/COUNT quotient.
 
 DISTINCT integer observers retain exact arithmetic set support per group. Native
 range descriptors carry membership through reducer snapshots without allocating
@@ -2111,6 +2125,17 @@ ranges, immutable lists and expanding child bags. Cancellation cannot conceal an
 overflowing prefix when keys repeat or are evicted; unsafe packet bounds retry
 the ordinary symbolic reduction before publication. Unvalidated packets cannot bypass these checks; effectful
 or downstream folds retain their ordinary execution paths.
+
+Monotone arithmetic group keys have an exact rank interval for key-ranked
+windows. A read-only single-seed domain with one preserved integer key and a
+complete independent suffix can allocate reducers only for its best SKIP+LIMIT
+keys. The suffix packet first certifies successful argument evaluation, all
+consumer bounds and all producer stages. Selected keys retain source encounter
+order; omitted logical rows still contribute to stage counters. Correlated
+expressions, joins, DISTINCT stages, filters, key rebinding and uncertified
+packets keep ordinary execution. Failed preflight disables its memo instead of
+repeating the same failed probe for each key. Unsafe packet cardinalities
+request the ordinary no-eviction retry. LIMIT 0 still validates the suffix.
 
 Pure CALL bodies containing only projections and nested singleton CALLs preserve
 at most one unit output from one unit input, including filters, local DISTINCT,

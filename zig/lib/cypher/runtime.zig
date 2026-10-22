@@ -2012,6 +2012,25 @@ const Engine = struct {
                 }
             }
         }
+        fn addAverageSequence(self: *@This(), engine: *Engine, sequence: @import("arithmetic_average.zig").Sequence) anyerror!void {
+            try engine.state();
+            if (self.mean_scaled == null and self.mean_weight == @as(f64, @floatFromInt(self.count))) {
+                if (sequence.meanAfter(self.count, self.mean)) |mean| {
+                    self.count += @intCast(sequence.length);
+                    self.mean_weight = @floatFromInt(self.count);
+                    self.mean = mean;
+                    return;
+                }
+            }
+            // The exact recurrence may cease to be representable after a
+            // preceding group contribution. Replay only this incoming domain.
+            var index: u128 = 0;
+            while (index < sequence.length) : (index += 1) {
+                try engine.state();
+                const value: i64 = @intCast(@as(i128, sequence.start) + @as(i128, @intCast(index)) * sequence.step);
+                try self.addValue(engine, .{ .integer = value }, Count.one);
+            }
+        }
         fn materializeListDomain(self: *StreamingAggregate, engine: *Engine) anyerror!void {
             const domain = self.list_domain orelse return;
             try self.list_domains.put(self.distinct_arena.allocator(), domain, {});
@@ -2993,8 +3012,8 @@ const Engine = struct {
     }
     // Certificates describe successful results, not total evaluation. Original
     // expressions still execute, including parameter, argument and depth errors.
-    // Only primitive variable reads may be elided: entity reads can project
-    // authority and containers must still validate structural depth.
+    // Dead reads require entity-free success results with bounded structural
+    // depth. Producers still execute at their original position.
     const ScalarType = union(enum) {
         primitive,
         primitive_items,
@@ -3033,6 +3052,47 @@ const Engine = struct {
             else => false,
         };
     }
+    const ReadKey = struct { address: usize, length: usize, kind: enum { sequence, record } };
+    fn readDepth(self: *Engine, kind: ScalarType, depth: usize, memo: *std.AutoHashMapUnmanaged(ReadKey, ?usize), work: *value_work.Work) anyerror!?usize {
+        if (depth > 64) return null;
+        try self.state();
+        const key: ?ReadKey = switch (kind) {
+            .sequence => |element| .{ .address = @intFromPtr(element), .length = 1, .kind = .sequence },
+            .record => |fields| .{ .address = @intFromPtr(fields.ptr), .length = fields.len, .kind = .record },
+            else => null,
+        };
+        if (key) |identity| if (memo.get(identity)) |result| return result;
+        const result: ?usize = switch (kind) {
+            .primitive => 0,
+            .primitive_items => 1,
+            .derived => if (try self.plainBinding(kind)) 0 else null,
+            .sequence => |element| if (try self.readDepth(element.*, depth + 1, memo, work)) |inner| inner + 1 else null,
+            .record => |fields| record: {
+                var maximum: usize = 0;
+                for (fields) |field| {
+                    const inner = (try self.readDepth(field.kind orelse break :record null, depth + 1, memo, work)) orelse break :record null;
+                    maximum = @max(maximum, inner + 1);
+                }
+                break :record maximum;
+            },
+            .items, .element => items: {
+                const values = if (kind == .items) kind.items.items else kind.element.items;
+                var maximum: usize = 0;
+                for (values) |value| {
+                    const info = work.info(value) catch |err| {
+                        if (err == error.CypherValueDepthExceeded) break :items null;
+                        return err;
+                    };
+                    if (info.entities) break :items null;
+                    maximum = @max(maximum, info.depth + @as(usize, if (kind == .items) 1 else 0));
+                }
+                break :items maximum;
+            },
+            .collection => null,
+        };
+        if (key) |identity| try memo.put(work.a, identity, result);
+        return result;
+    }
     fn plainBinding(self: *Engine, known: ?ScalarType) !bool {
         const kind = known orelse return false;
         if (kind == .primitive) return true;
@@ -3065,7 +3125,13 @@ const Engine = struct {
             }
             return kind.derived.plain.?;
         }
-        if (kind != .element) return false;
+        if (kind != .element) {
+            var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+            defer scratch.deinit();
+            var memo: std.AutoHashMapUnmanaged(ReadKey, ?usize) = .empty;
+            var work: value_work.Work = .{ .a = scratch.allocator(), .ptr = self, .charge = chargeWork };
+            return if (try self.readDepth(kind, 0, &memo, &work)) |depth| depth <= 64 else false;
+        }
         const certificate = kind.element;
         if (certificate.plain) |certified| return certified;
         const certified = for (certificate.items) |item| {
@@ -3090,7 +3156,16 @@ const Engine = struct {
                 break :blk if (value == .list) try self.listType(value.list) else null;
             },
             .unary, .comparison, .list_predicate, .exists => .primitive,
-            .binary => |b| if (b.op == .add) try self.derivedPrimitive(&.{ b.left, b.right }, types) else .primitive,
+            .binary => |b| if (b.op == .add) addition: {
+                if (try self.derivedPrimitive(&.{ b.left, b.right }, types)) |scalar| break :addition scalar;
+                const left = (try self.scalarType(b.left, types)) orelse break :addition null;
+                const right = (try self.scalarType(b.right, types)) orelse break :addition null;
+                const l = elementType(left);
+                const r = elementType(right);
+                if (l == null and r == null) break :addition null;
+                const element = (try self.joinScalarTypes(&.{ l orelse left, r orelse right })) orelse break :addition null;
+                break :addition try self.sequenceType(element);
+            } else .primitive,
             .index => |index| blk: {
                 const base = try self.scalarType(index.base, types);
                 if (base != null and base.? == .record) {
@@ -3171,7 +3246,7 @@ const Engine = struct {
                 for ([_][]const u8{ "count", "sum", "avg" }) |name| if (std.ascii.eqlIgnoreCase(call_value.name, name)) break :blk .primitive;
                 break :blk null;
             },
-            .list => |items| if (try self.joinExpressionTypes(items, types)) |element| try self.sequenceType(element) else null,
+            .list => |items| if (items.len == 0) .primitive_items else if (try self.joinExpressionTypes(items, types)) |element| try self.sequenceType(element) else null,
             else => null,
         };
     }
@@ -3331,8 +3406,8 @@ const Engine = struct {
         }
         if (output.len == 0 or output[output.len - 1].operation != .project or !output[output.len - 1].operation.project.final) return output;
         // A CALL's internal forwarding columns are not observable outputs.
-        // Prune only primitive variable copies; entity/container reads and
-        // potentially failing scalar expressions execute even when dead.
+        // Prune certified safe variable copies; entities, unknown-depth reads
+        // and potentially failing scalar expressions execute even when dead.
         var required: Names = .empty;
         for (shape) |entry| try required.put(self.a, entry.name, {});
         var cursor = output.len;
@@ -3841,6 +3916,7 @@ const Engine = struct {
     const RangeObserver = struct {
         support: ?*const @import("range_set.zig").Node = null,
         extrema: ?RangeExtrema = null,
+        average: ?@import("arithmetic_average.zig").Sequence = null,
         summary: ?IntegerListSum = .{},
         fn concat(left: @This(), right: @This(), engine: *Engine) !@This() {
             const support = if (left.support) |l| (if (right.support) |r| blk: {
@@ -3851,6 +3927,7 @@ const Engine = struct {
             } else l) else right.support;
             return .{
                 .support = support,
+                .average = if (left.extrema == null) right.average else if (right.extrema == null) left.average else if (left.average != null and right.average != null) left.average.?.concat(right.average.?) else null,
                 .extrema = if (left.extrema) |l| (if (right.extrema) |r| .{ .minimum = @min(l.minimum, r.minimum), .maximum = @max(l.maximum, r.maximum) } else l) else right.extrema,
                 .summary = if (left.summary != null and right.summary != null) left.summary.?.concat(right.summary.?) else null,
             };
@@ -3902,15 +3979,17 @@ const Engine = struct {
         const extrema: RangeExtrema = .{ .minimum = @min(first, end), .maximum = @max(first, end) };
         const support = try self.a.create(@import("range_set.zig").Node);
         support.* = .{ .leaf = .{ .sequence = .{ .start = first, .step = if (form.scale == 0 or sequence.length == 1) 1 else std.math.cast(i64, @as(i128, form.scale) * sequence.step) orelse return null, .length = if (form.scale == 0) 1 else sequence.length } } };
+        const average: @import("arithmetic_average.zig").Sequence = .{ .start = first, .step = if (form.scale == 0) 0 else support.leaf.sequence.step, .length = sequence.length };
         if (form.scale == 0) {
             const total = std.math.mul(i128, first, @intCast(sequence.length)) catch return null;
-            return .{ .support = support, .extrema = extrema, .summary = .{ .total = total, .low = @min(0, total), .high = @max(0, total), .positive = first > 0, .negative = first < 0 } };
+            return .{ .support = support, .average = average, .extrema = extrema, .summary = .{ .total = total, .low = @min(0, total), .high = @max(0, total), .positive = first > 0, .negative = first < 0 } };
         }
         const step = if (sequence.length == 1) @as(i64, 1) else std.math.cast(i64, @as(i128, form.scale) * sequence.step) orelse return null;
-        return .{ .support = support, .extrema = extrema, .summary = IntegerListSum.range(.{ .start = first, .step = step, .length = sequence.length }) };
+        return .{ .support = support, .average = average, .extrema = extrema, .summary = IntegerListSum.range(.{ .start = first, .step = step, .length = sequence.length }) };
     }
     fn reverseObserver(self: *Engine, proof: RangeObserver) !RangeObserver {
         var reversed = proof;
+        reversed.average = if (proof.average) |average| average.reversed() else null;
         reversed.summary = if (proof.summary) |summary| summary.reversed() else null;
         if (proof.support) |child| {
             const node = try self.a.create(@import("range_set.zig").Node);
@@ -3963,6 +4042,7 @@ const Engine = struct {
             } else (if (sequence) |range| try self.observeRange(range, arg, proof.alias) else try self.observeArithmetic(source, row, arg, proof.alias, &cache)) orelse return null;
             if (reversed) observation = try self.reverseObserver(observation);
             if (observation.extrema == null or (std.ascii.eqlIgnoreCase(expression.value.call.name, "sum") and !expression.value.call.distinct and observation.summary == null)) return null;
+            if (std.ascii.eqlIgnoreCase(expression.value.call.name, "avg") and observation.average == null) return null;
             observer.* = observation;
         };
         return result;
@@ -4240,6 +4320,89 @@ const Engine = struct {
             if (fold.record_rows) fold.stage_counts[0] +|= weight;
             return fold.expand(engine, initial, 0);
         }
+        /// A disjoint arithmetic key domain has an exact rank interval. Once
+        /// its complete independent suffix is certified, only SKIP+LIMIT keys
+        /// need reducers. Visit those keys in original encounter order.
+        fn monotoneWindow(fold: *@This(), engine: *Engine, row: Row, index: usize, unwind: @FieldType(@FieldType(ast.Clause, "operation"), "unwind"), source: ListSource) anyerror!bool {
+            const window = fold.group_window orelse return false;
+            if (!engine.read_only or !fold.axis_enabled or !fold.single_seed or index != 0 or !fold.weight.isOne() or fold.consumer != null or fold.continuation != null or fold.active_calls != null or fold.ordered_index != null or fold.groups.items.len != 0 or fold.calls.len == 0 or source.values != .range) return false;
+            const sequence = source.values.range;
+            const keep = @min(sequence.length, window.capacity);
+            if (sequence.length <= keep) return false;
+            var keys: usize = 0;
+            for (fold.projection.items) |item| if (!aggregates(item.expression)) {
+                if (item.expression.value != .variable or !std.mem.eql(u8, item.expression.value.variable, unwind.alias)) return false;
+                keys += 1;
+            };
+            if (keys != 1) return false;
+            // Preserve the key's identity, and never hide correlated scalar
+            // evaluation, joins, filters, or DISTINCT partition membership.
+            for (fold.middle[index + 1 ..]) |clause| switch (clause.operation) {
+                .unwind => |u| if (std.mem.eql(u8, u.alias, unwind.alias) or !independentExpressions(u.expression, unwind.alias)) return false,
+                .project => |step| {
+                    const projection = step.value;
+                    if (projection.distinct or projection.order.len != 0 or projection.skip != null or projection.limit != null or projection.predicate != null) return false;
+                    var forwarded = false;
+                    for (projection.items) |item| {
+                        const name = item.alias orelse try engine.expressionName(item.expression);
+                        if (std.mem.eql(u8, name, unwind.alias)) {
+                            if (item.expression.value != .variable or !std.mem.eql(u8, item.expression.value.variable, unwind.alias)) return false;
+                            forwarded = true;
+                        } else if (!independentExpressions(item.expression, unwind.alias)) return false;
+                    }
+                    if (!forwarded) return false;
+                },
+                else => return false,
+            };
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            const scope = EvalScope.enter(engine, scratch.allocator());
+            defer scope.leave(engine);
+            const initial = try engine.replace(row, unwind.alias, source.at(0));
+            const plan = (try engine.axisPlan(fold, index + 1, initial)) orelse return false;
+            var registered = false;
+            var accepted = false;
+            defer if (!registered) plan.memo.deinit() else if (!accepted) {
+                plan.memo.disabled = true;
+            };
+            if (plan.captures.contains(unwind.alias)) return false;
+            try fold.axis_plans.put(fold.retained, index + 1, plan);
+            registered = true;
+            var key: std.ArrayList(v.Entry) = .empty;
+            for (row) |entry| if (plan.captures.contains(entry.name)) try key.append(engine.a, entry);
+            const packet = engine.computeAxis(fold, plan, key.items) catch |err| {
+                if (StreamingAggregate.consumerFailure(err) or err == error.CypherAxisMemoDeclined) return false;
+                return err;
+            };
+            if (window.extended and !(lookup(packet.rows[0], "window_safe") orelse v.Value{ .boolean = false }).boolean) return false;
+            if (!GroupWindow.permitsPacket(engine, packet, fold.calls.len)) {
+                if (fold.window_retry) return error.CypherGroupWindowDeclined;
+                return false;
+            }
+            plan.memo.put(engine, key.items, null, packet) catch |err| {
+                if (StreamingAggregate.consumerFailure(err)) return false;
+                return err;
+            };
+            if (try plan.memo.find(engine, key.items, null) == null) return false;
+            accepted = true;
+            const ascending = (sequence.step > 0) != source.reversed;
+            const best_first = ascending != fold.projection.order[0].descending;
+            const first = if (best_first) 0 else sequence.length - keep;
+            var ordinal = first;
+            while (ordinal < first + keep) : (ordinal += 1) {
+                try engine.state();
+                const value = sequence.at(if (source.reversed) sequence.length - ordinal - 1 else ordinal);
+                if (!try fold.memoAxis(engine, try engine.replace(row, unwind.alias, value), index + 1)) return error.CypherInvalidBackendPage;
+            }
+            if (fold.record_rows) {
+                const omitted: usize = @intCast(@min(sequence.length - keep, std.math.maxInt(usize)));
+                const extent: usize = @intCast(@min(sequence.length, std.math.maxInt(usize)));
+                fold.stage_counts[index + 1] +|= extent;
+                for (packet.rows[0][1].value.list[1..], index + 1..) |stage_count, offset| fold.stage_counts[offset + 1] +|= omitted *| @as(usize, @intCast(@as(u64, @bitCast(stage_count.integer))));
+                fold.matched.* +|= omitted *| @as(usize, @intCast(packet.weights[0].cap(std.math.maxInt(usize))));
+            }
+            return true;
+        }
         fn expand(fold: *@This(), engine: *Engine, row: Row, index: usize) anyerror!void {
             if (fold.axis_trace) |trace| {
                 for (row) |entry| if ((try engine.values.info(entry.value)).entities) return error.CypherAxisMemoDeclined;
@@ -4317,6 +4480,7 @@ const Engine = struct {
                             return;
                         }
                         var source = (try engine.unwindSource(unwind.expression, row)) orelse return;
+                        if (try fold.monotoneWindow(engine, row, index, unwind, source)) return;
                         const range_proof = if (source.values == .range) try fold.rangeCountProof(engine, unwind.alias, index + 1) else null;
                         const observers = if (range_proof) |proof| try engine.rangeObservers(fold, proof, unwind.expression, row, source.values.range, null, source.reversed) else null;
                         if (fold.window_certificate) |checked| if (observers) |observations| try checked.ranges(engine, fold.calls, observations);
@@ -4657,6 +4821,13 @@ const Engine = struct {
                     continue;
                 };
                 if (fold.range_counts) |slots| if (slots[i]) {
+                    if (std.ascii.eqlIgnoreCase(accumulator.function.name, "avg")) {
+                        accumulator.addAverageSequence(engine, fold.range_observers.?[i].?.average.?) catch |err| {
+                            if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
+                            accumulator.failure = err;
+                        };
+                        continue;
+                    }
                     if (accumulator.function.distinct and (std.ascii.eqlIgnoreCase(accumulator.function.name, "count") or std.ascii.eqlIgnoreCase(accumulator.function.name, "sum"))) {
                         if (!first_domain) continue;
                         accumulator.addIntegerTree(engine, fold.range_observers.?[i].?.support) catch |err| {
@@ -4759,16 +4930,24 @@ const Engine = struct {
                 if (clause.operation != .project) return null;
                 observed_alias = forwardedAxis(clause.operation.project.value, observed_alias) orelse return null;
             }
+            const has_average = for (fold.calls) |expression| {
+                if (std.ascii.eqlIgnoreCase(expression.value.call.name, "avg")) break true;
+            } else false;
+            if (has_average) {
+                if (!fold.weight.isOne()) return null;
+                for (fold.middle[index..]) |clause| if (clause.operation != .project) return null;
+            }
             const counts = try engine.a.alloc(bool, fold.calls.len);
             var observed = false;
             for (fold.calls, counts) |expression, *qualified| {
                 const c = expression.value.call;
-                if (std.ascii.eqlIgnoreCase(c.name, "avg")) return null;
+                const average = std.ascii.eqlIgnoreCase(c.name, "avg");
+                if (average and (c.distinct or c.star or c.args.len != 1 or !rangeArgumentShape(c.args[0], observed_alias))) return null;
                 const sum = std.ascii.eqlIgnoreCase(c.name, "sum");
                 if (sum and (c.star or c.args.len != 1 or !rangeArgumentShape(c.args[0], observed_alias))) return null;
                 const is_count = std.ascii.eqlIgnoreCase(c.name, "count");
                 const extreme = std.ascii.eqlIgnoreCase(c.name, "min") or std.ascii.eqlIgnoreCase(c.name, "max");
-                qualified.* = (is_count or extreme or sum) and !c.star and c.args.len == 1 and rangeArgumentShape(c.args[0], observed_alias) and (sum or !independentExpressions(c.args[0], observed_alias));
+                qualified.* = (is_count or extreme or sum or average) and !c.star and c.args.len == 1 and rangeArgumentShape(c.args[0], observed_alias) and (sum or !independentExpressions(c.args[0], observed_alias));
                 observed = observed or qualified.*;
             }
             if (!observed or !axisExpressions(fold.projection, observed_alias, slots, counts)) return null;

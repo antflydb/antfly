@@ -6657,3 +6657,118 @@ test "symbolic DISTINCT and ordered window snapshots release failed allocations"
         "UNWIND [1,2] AS i UNWIND [0,1,0] AS x WITH i,x ORDER BY x DESC RETURN i,sum(x),avg(x) ORDER BY i LIMIT 1",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
 }
+
+test "arithmetic averages certify exact recurrences without enumerating ranges" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "UNWIND range(1,1000000) AS x RETURN avg(x)",
+        "UNWIND range(1,1000000) AS x RETURN count(x),sum(x),avg(x)",
+        "UNWIND reverse(range(1,1000000)) AS x RETURN avg(x)",
+        "UNWIND range(1,500000)+range(500001,1000000) AS x RETURN avg(x)",
+        "UNWIND range(1,1000000) AS x RETURN avg(x+1)-1",
+        "UNWIND range(1,1000000) AS x RETURN avg(2*x)/2",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(f64, 500000.5), result.rows[0][result.rows[0].len - 1].number);
+    }
+    for ([_][]const u8{ "range(-17,19,3)", "reverse(range(-17,19,3))", "range(1,10)+range(3,8)", "range(9223372036854775780,9223372036854775807)", "range(1,0)", "range(-4,4)+range(5,8)" }) |source| {
+        for ([_][]const u8{ "x", "-x", "2*x-1", "0*x+7", "x/3.0" }) |argument| {
+            const text = try std.fmt.allocPrint(a, "UNWIND [1,2,1] AS g UNWIND {s} AS x RETURN g,avg({s}),count(x) ORDER BY g", .{ source, argument });
+            defer a.free(text);
+            const control = try std.fmt.allocPrint(a, "UNWIND [1,2,1] AS g UNWIND {s} AS x WITH g,x WHERE x IS NOT NULL RETURN g,avg({s}),count(x) ORDER BY g", .{ source, argument });
+            defer a.free(control);
+            try compareReductionPlans(text, control);
+        }
+    }
+}
+
+test "safe unused container captures do not correlate scalar subqueries" {
+    const a = std.testing.allocator;
+    const values = try a.alloc(v.Value, 1000);
+    defer a.free(values);
+    for (values, 0..) |*value, i| value.* = .{ .integer = @intCast(i) };
+    for ([_][]const u8{ "[i]+[]", "{v:i}", "[[i]]", "reverse([i])", "[z IN [i] | [z]]" }) |expression| {
+        const text = try std.fmt.allocPrint(a, "UNWIND range(1,100) AS i WITH i,{s} AS j UNWIND $xs AS x CALL {{WITH j,avg(x) AS y RETURN y}} RETURN i,avg(y) ORDER BY i", .{expression});
+        defer a.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = values } }}, .{ .intermediate_states = 100000, .memory_bytes = 2 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 100), result.rows.len);
+        for (result.rows) |row| try std.testing.expectEqual(@as(f64, 499.5), row[1].number);
+    }
+    try compareReductionPlans("UNWIND [1,2] AS i WITH i,[i] AS j CALL {UNWIND [] AS x WITH j,avg(x) AS y RETURN y} RETURN i,count(*)", "UNWIND [1,2] AS i WITH i,[i] AS j CALL {UNWIND [] AS x WITH i AS keep,j,avg(x) AS y RETURN y} RETURN i,count(*)");
+}
+
+test "monotone numeric group windows select certified rank intervals" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "count(x)", "min(x)", "sum(x)", "avg(x)", "sum(DISTINCT x)", "avg(DISTINCT x)" }) |aggregate| {
+        for ([_][]const u8{ "ASC", "DESC" }) |direction| {
+            const text = try std.fmt.allocPrint(a, "UNWIND range(40000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,{s} ORDER BY i {s} SKIP 2 LIMIT 5", .{ aggregate, direction });
+            defer a.free(text);
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 5), result.rows.len);
+            try std.testing.expectEqual(@as(i64, if (std.mem.eql(u8, direction, "ASC")) 3 else 39998), result.rows[0][0].integer);
+            try std.testing.expect(result.stats.memory_bytes < 200000);
+        }
+    }
+    for ([_][]const u8{ "ASC", "DESC" }) |direction| for ([_][]const u8{ "0", "1", "4" }) |limit| {
+        const text = try std.fmt.allocPrint(a, "UNWIND range(20,-20,-3) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) AS n ORDER BY i {s} SKIP 2 LIMIT {s}", .{ direction, limit });
+        defer a.free(text);
+        const control = try std.fmt.allocPrint(a, "UNWIND range(20,-20,-3) AS i UNWIND [0,1,0] AS x WITH i,avg(x) AS n RETURN i,n ORDER BY i {s} SKIP 2 LIMIT {s}", .{ direction, limit });
+        defer a.free(control);
+        try compareReductionPlans(text, control);
+    };
+    try compareReductionPlans("UNWIND range(20,1,-1) AS i UNWIND [0,1] AS x RETURN i,sum(1/x) ORDER BY i LIMIT 1", "UNWIND range(20,1,-1) AS i UNWIND [0,1] AS x WITH i,sum(1/x) AS n RETURN i,n ORDER BY i LIMIT 1");
+}
+
+test "arithmetic average and monotone window proofs release failed allocations" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, text: []const u8) !void {
+            var callbacks = backing.vtable.*;
+            callbacks.resize = std.mem.Allocator.noResize;
+            callbacks.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &callbacks };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    for ([_][]const u8{
+        "UNWIND range(1,1000) AS x RETURN avg(x),count(x),sum(x)",
+        "UNWIND range(10,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x),sum(x) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i WITH i,[i]+[] AS j UNWIND [1,2] AS x CALL {WITH j,avg(x) AS y RETURN y} RETURN i,avg(y)",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
+}
+
+test "monotone window packet bounds retry exact large averages without eviction" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "avg(0*x)", "count(*)" }) |aggregate| {
+        const text = try std.fmt.allocPrint(a, "UNWIND range(4,1,-1) AS i UNWIND range(1,1000000000000000) AS x RETURN i,{s} ORDER BY i LIMIT 1", .{aggregate});
+        defer a.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 10000, .memory_bytes = 1 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
+        if (std.mem.startsWith(u8, aggregate, "avg")) try std.testing.expectEqual(@as(f64, 0), result.rows[0][1].number) else try std.testing.expectEqual(@as(i64, 1000000000000000), result.rows[0][1].integer);
+    }
+}

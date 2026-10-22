@@ -6747,3 +6747,84 @@ def test_grouped_distinct_ranges_reuse_typed_packets(graph_db, groups, child, wi
         expected.append([2, 1000000, 500000500000])
     assert [[int(cell["value"]) for cell in row] for row in actual["rows"]] == expected
     assert actual["stats"]["memory_bytes"] < 200000
+
+
+@pytest.mark.parametrize(
+    "source", ["range(1,1000000)", "reverse(range(1,1000000))", "range(1,500000)+range(500001,1000000)"]
+)
+@pytest.mark.parametrize("argument", ["x", "2*x", "0*x+7"])
+def test_arithmetic_average_uses_exact_recurrence_certificates(graph_db, source, argument):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND {source} AS x RETURN count(x),sum(x),avg({argument})",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    row = result["rows"][0]
+    assert [int(cell["value"]) for cell in row[:2]] == [1000000, 500000500000]
+    assert row[2]["value"] == {"x": 500000.5, "2*x": 1000001.0, "0*x+7": 7.0}[argument]
+
+
+@pytest.mark.parametrize("capture", ["[i]+[]", "{v:i}", "[[i]]", "reverse([i])", "[z IN [i] | [z]]"])
+def test_safe_unused_container_capture_reuses_child_reduction(graph_db, capture):
+    prefix = f"UNWIND range(1,100) AS i WITH i,{capture} AS j UNWIND $xs AS x "
+    suffix = "RETURN i,avg(y) ORDER BY i"
+    params = {"xs": list(range(1000))}
+    actual = graph_db.cypher_json(
+        "g",
+        {
+            "query": prefix + "CALL {WITH j,avg(x) AS y RETURN y} " + suffix,
+            "parameters": params,
+            "limits": {"intermediate_states": 100000, "memory_bytes": 2 << 20},
+        },
+    )
+    expected = graph_db.cypher_json(
+        "g", {"query": prefix + "CALL {WITH avg(x) AS y RETURN y} " + suffix, "parameters": params}
+    )
+    assert actual["rows"] == expected["rows"]
+    assert actual["stats"]["intermediate_states"] < 100000
+
+
+@pytest.mark.parametrize("aggregate", ["count(x)", "min(x)", "sum(x)", "avg(x)", "sum(DISTINCT x)", "avg(DISTINCT x)"])
+@pytest.mark.parametrize("direction", ["ASC", "DESC"])
+def test_monotone_group_windows_do_not_allocate_evicted_reducers(graph_db, aggregate, direction):
+    actual = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND range(40000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,{aggregate} "
+            f"ORDER BY i {direction} SKIP 2 LIMIT 5",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    groups = list(range(1, 8)) if direction == "ASC" else list(range(40000, 39993, -1))
+    expected = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND $groups AS i UNWIND [0,1,0] AS x RETURN i,{aggregate} "
+            f"ORDER BY i {direction} SKIP 2 LIMIT 5",
+            "parameters": {"groups": groups},
+        },
+    )
+    assert actual["rows"] == expected["rows"]
+    assert actual["stats"]["memory_bytes"] < 200000
+    assert actual["plan"][0]["output_rows"] == 40000
+    assert actual["plan"][1]["output_rows"] == 120000
+
+
+@pytest.mark.parametrize("aggregate", ["avg(0*x)", "count(*)"])
+def test_monotone_window_packet_bounds_retry_large_symbolic_domains(graph_db, aggregate):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(4,1,-1) AS i UNWIND range(1,1000000000000000) AS x "
+            f"RETURN i,{aggregate} ORDER BY i LIMIT 1",
+            "limits": {"intermediate_states": 10000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert len(result["rows"]) == 1
+    assert result["rows"][0][0]["value"] == "1"
+    expected = 0.0 if aggregate.startswith("avg") else "1000000000000000"
+    assert result["rows"][0][1]["value"] == expected
+    assert result["plan"][0]["output_rows"] == 4
+    assert result["plan"][1]["output_rows"] == 4000000000000000
