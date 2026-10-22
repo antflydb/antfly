@@ -407,6 +407,14 @@ def run_clipclap_contract_tests() -> bool:
 
 
 def inference_command() -> list[str]:
+    # Real-model suites can qualify optimized inference independently of the
+    # Debug storage/API executable. Use the same command for serving and pulls.
+    standalone = os.environ.get("ANTFLY_INFERENCE_BIN")
+    if standalone:
+        binary = Path(standalone).expanduser().resolve()
+        if not binary.is_file():
+            raise FileNotFoundError(f"ANTFLY_INFERENCE_BIN does not exist: {binary}")
+        return [str(binary)]
     explicit = os.environ.get("ANTFLY_BIN")
     if explicit:
         return [str(Path(explicit).expanduser().resolve()), "inference"]

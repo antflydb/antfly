@@ -22,6 +22,9 @@ Usage:
     # Start server automatically:
     ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/inference pytest e2e/inference
 
+    # Use the optimized standalone inference executable for real-model tests:
+    ANTFLY_INFERENCE_BIN=./zig-out/bin/antfly-inference uv run --project e2e/inference pytest e2e/inference
+
     # Custom AI and ML directories:
     ANTFLY_INFERENCE_MODELS_DIR=/path/to/models uv run --project e2e/inference pytest e2e/inference
     ANTFLY_INFERENCE_ML_DIR=/path/to/ml uv run --project e2e/inference pytest e2e/inference
