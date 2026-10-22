@@ -4312,6 +4312,54 @@ class CliTests(unittest.TestCase):
         self.assertEqual(actual, [f"Drive/image-{i:04}.png" for i in range(24)])
         self.assertNotIn(b"leaked", err)
 
+    def test_media_output_failure_joins_blocked_borrowers_before_page_retirement(self):
+        config = self.visual_parents(count=8, page_size=16)
+        # A malformed later manifest forces the page-scope deferred drain.
+        # Its first output then fails while other lanes still borrow the page.
+        self.server.index_documents[-1]["_source"].pop("grep")
+        blocked, release = threading.Event(), threading.Event()
+
+        def observe(body):
+            if "image-0000.png" not in json.dumps(body):
+                blocked.set()
+                release.wait(10)
+
+        self.server.observe_provider = observe
+        self.server.barrier = threading.Barrier(7)
+        process = subprocess.Popen(
+            [
+                BINARY,
+                *self.decision_args(),
+                "--media=images",
+                "--json",
+                "--no-cache",
+                "--table-config",
+                str(config),
+                "--decision-concurrency=8",
+                "--decision-transport=single",
+                "--no-rank",
+                "--max-output-bytes=1",
+            ],
+            cwd=self.root,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self.assertTrue(blocked.wait(5))
+            out, err = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 2, err)
+            self.assertIn(b"OutputBudgetExceeded", err)
+            self.assertNotIn(b"leaked", err)
+            for line in out.splitlines():
+                json.loads(line)
+        finally:
+            release.set()
+            self.server.barrier = None
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
     def test_media_memory_admission_preserves_large_transport_waves(self):
         import zlib
 

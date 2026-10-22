@@ -214,8 +214,33 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 self.pool.waitForCompletion();
             }
         }
+        fn discard(self: *@This()) void {
+            // Page-scope cleanup must join borrowers here, before manifest
+            // arenas retire; the outer scheduler destructor is too late.
+            for (self.jobs[0..self.initialized]) |*job| {
+                if (job.lane.handle != null) {
+                    if (job.lane.take(self.root)) |value| {
+                        var result = value;
+                        result.deinit(self.root);
+                    } else |_| {}
+                }
+                if (job.page) |page| {
+                    page.deinit(self.root.a);
+                    job.page = null;
+                }
+            }
+            for (&self.completed) |*slot| if (slot.*) |*entry| {
+                entry.result.deinit(self.root);
+                slot.* = null;
+            };
+            self.next = self.sequence;
+        }
         fn finish(self: *@This()) !void {
-            if (self.failed) return error.Canceled;
+            if (self.failed) {
+                self.discard();
+                return error.Canceled;
+            }
+            errdefer self.discard();
             // Drain by sequence on every normal and error path.
             while (self.next < self.sequence) {
                 try self.emit();
