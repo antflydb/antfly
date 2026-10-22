@@ -745,3 +745,189 @@ describe("AnswerResults", () => {
     });
   });
 });
+
+describe("AnswerResults request ownership", () => {
+  it("keeps a stream alive across incidental prop rerenders and cancels it on unmount", async () => {
+    vi.clearAllMocks();
+    const stream = vi.mocked(utils.streamAnswer);
+    let signal: AbortSignal | undefined;
+    let callbacks: Parameters<typeof utils.streamAnswer>[3] | undefined;
+    stream.mockImplementation(async (_url, _request, _headers, nextCallbacks, options) => {
+      signal = options?.signal;
+      callbacks = nextCallbacks;
+      return new AbortController();
+    });
+    const controller = vi.fn();
+    const contextChanged = vi.fn();
+    const content = () => (
+      <TestWrapper>
+        <QueryBox id="question" mode="submit" />
+        <AnswerResults
+          id="answer"
+          searchBoxId="question"
+          generator={{ ...mockGenerator }}
+          fields={["content"]}
+          onController={controller}
+          onRequestContextChange={() => contextChanged()}
+          onStreamEnd={() => {}}
+        />
+      </TestWrapper>
+    );
+    const { rerender, unmount } = render(content());
+    await userEvent.type(screen.getByPlaceholderText(/ask a question/i), "test question");
+    await userEvent.click(screen.getByRole("button", { name: /submit/i }));
+    await waitFor(() => expect(stream).toHaveBeenCalledOnce());
+    expect(controller).toHaveBeenCalledOnce();
+    expect(signal?.aborted).toBe(false);
+    rerender(content());
+    expect(signal?.aborted).toBe(false);
+    expect(stream).toHaveBeenCalledOnce();
+    expect(contextChanged).not.toHaveBeenCalled();
+    act(() => callbacks?.onGeneration?.("still streaming"));
+    expect(screen.getByText(/still streaming/)).toBeTruthy();
+    unmount();
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("cancels and clears an old stream when the request context changes", async () => {
+    vi.clearAllMocks();
+    const stream = vi.mocked(utils.streamAnswer);
+    let signal: AbortSignal | undefined;
+    let callbacks: Parameters<typeof utils.streamAnswer>[3] | undefined;
+    stream.mockImplementation(async (_url, _request, _headers, nextCallbacks, options) => {
+      signal = options?.signal;
+      callbacks = nextCallbacks;
+      return new AbortController();
+    });
+    const contextChanged = vi.fn();
+    const streamEnd = vi.fn();
+    const content = (table: string) => (
+      <TestWrapper>
+        <QueryBox id="question" mode="submit" />
+        <AnswerResults
+          id="answer"
+          searchBoxId="question"
+          table={table}
+          onRequestContextChange={contextChanged}
+          onStreamEnd={streamEnd}
+          generator={{ ...mockGenerator }}
+          fields={["content"]}
+        />
+      </TestWrapper>
+    );
+    const { rerender } = render(content("docs"));
+    await userEvent.type(screen.getByPlaceholderText(/ask a question/i), "test question");
+    await userEvent.click(screen.getByRole("button", { name: /submit/i }));
+    await waitFor(() => expect(stream).toHaveBeenCalledOnce());
+    act(() => callbacks?.onGeneration?.("old table answer"));
+    expect(screen.getByText("old table answer")).toBeTruthy();
+
+    rerender(content("other"));
+
+    expect(signal?.aborted).toBe(true);
+    expect(contextChanged).toHaveBeenCalledOnce();
+    expect(streamEnd).not.toHaveBeenCalled();
+    expect(screen.queryByText("old table answer")).toBeNull();
+    act(() => callbacks?.onGeneration?.("late old answer"));
+    expect(screen.queryByText("late old answer")).toBeNull();
+    expect(stream).toHaveBeenCalledOnce();
+  });
+
+  it("reports invalidation after completion without starting another request", async () => {
+    vi.clearAllMocks();
+    const stream = vi.mocked(utils.streamAnswer);
+    stream.mockImplementation(async (_url, _request, _headers, callbacks) => {
+      callbacks.onGeneration?.("completed answer");
+      callbacks.onComplete?.();
+      return new AbortController();
+    });
+    const contextChanged = vi.fn();
+    const streamEnd = vi.fn();
+    const content = (limit: number) => (
+      <TestWrapper>
+        <QueryBox id="question" mode="submit" />
+        <AnswerResults
+          id="answer"
+          searchBoxId="question"
+          generator={mockGenerator}
+          limit={limit}
+          onRequestContextChange={contextChanged}
+          onStreamEnd={streamEnd}
+        />
+      </TestWrapper>
+    );
+    const { rerender } = render(content(10));
+    await userEvent.type(screen.getByPlaceholderText(/ask a question/i), "test question");
+    await userEvent.click(screen.getByRole("button", { name: /submit/i }));
+    await waitFor(() => expect(screen.getByText("completed answer")).toBeTruthy());
+    expect(contextChanged).not.toHaveBeenCalled();
+    expect(streamEnd).toHaveBeenCalledOnce();
+    rerender(content(20));
+    expect(contextChanged).toHaveBeenCalledOnce();
+    expect(screen.queryByText("completed answer")).toBeNull();
+    expect(streamEnd).toHaveBeenCalledOnce();
+    expect(stream).toHaveBeenCalledOnce();
+    rerender(content(20));
+    expect(contextChanged).toHaveBeenCalledOnce();
+  });
+
+  it("preserves SSE fields when the terminal result omits them and ends once", async () => {
+    vi.clearAllMocks();
+    const stream = vi.mocked(utils.streamAnswer);
+    stream.mockImplementation(async (_url, _request, _headers, callbacks) => {
+      callbacks.onGeneration?.("streamed answer");
+      callbacks.onHit?.({ _id: "doc-1", _score: 1, _source: { text: "source" } });
+      callbacks.onRetrievalAgentResult?.({} as never);
+      callbacks.onComplete?.();
+      return new AbortController();
+    });
+    const onStreamEnd = vi.fn();
+    const { container } = render(
+      <TestWrapper>
+        <QueryBox id="question" mode="submit" />
+        <AnswerResults
+          id="answer"
+          searchBoxId="question"
+          generator={mockGenerator}
+          fields={["content"]}
+          showHits
+          onStreamEnd={onStreamEnd}
+        />
+      </TestWrapper>
+    );
+    await userEvent.type(screen.getByPlaceholderText(/ask a question/i), "test question");
+    await userEvent.click(screen.getByRole("button", { name: /submit/i }));
+
+    await waitFor(() => expect(container.textContent).toContain("streamed answer"));
+    expect(container.textContent).toContain("source");
+    expect(onStreamEnd).toHaveBeenCalledOnce();
+  });
+
+  it("applies a JSON result and ends once", async () => {
+    vi.clearAllMocks();
+    const stream = vi.mocked(utils.streamAnswer);
+    stream.mockImplementation(async (_url, _request, _headers, callbacks) => {
+      callbacks.onRetrievalAgentResult?.({ generation: "JSON answer" } as never);
+      callbacks.onComplete?.();
+      return new AbortController();
+    });
+    const onStreamEnd = vi.fn();
+    render(
+      <TestWrapper>
+        <QueryBox id="question" mode="submit" />
+        <AnswerResults
+          id="answer"
+          searchBoxId="question"
+          generator={mockGenerator}
+          fields={["content"]}
+          onStreamEnd={onStreamEnd}
+        />
+      </TestWrapper>
+    );
+    await userEvent.type(screen.getByPlaceholderText(/ask a question/i), "test question");
+    await userEvent.click(screen.getByRole("button", { name: /submit/i }));
+
+    await waitFor(() => expect(screen.getByText("JSON answer")).toBeTruthy());
+    expect(onStreamEnd).toHaveBeenCalledOnce();
+  });
+});

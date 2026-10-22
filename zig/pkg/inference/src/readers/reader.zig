@@ -338,6 +338,16 @@ pub const LoadedReader = union(enum) {
         ) };
     }
 
+    /// A reusable model incarnation, when this reader borrows the shared cache.
+    /// Split-component, multistage, and request-owned readers have no aggregate
+    /// cache entry and must not advertise a persistent model instance.
+    pub fn cachedModelHandle(self: *LoadedReader) ?*model_manager_mod.ModelHandle {
+        return switch (self.*) {
+            .vision => |*reader| if (reader.core.loaded_model_handle) |*handle| handle else null,
+            else => null,
+        };
+    }
+
     /// Acquire the minimum lifetime fence needed for safe read microbatching.
     /// Split-component and multistage readers do not yet expose one immutable
     /// aggregate generation, so they bypass cross-request coalescing. The

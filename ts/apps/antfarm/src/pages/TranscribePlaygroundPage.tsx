@@ -5,7 +5,6 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
-  DashboardPage,
   DashboardPageActions,
   DashboardPageDescription,
   DashboardPageHeader,
@@ -37,11 +36,17 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AIWorkflowContextBar,
+  AIWorkflowPage,
+  AIWorkflowSubmitButton,
+} from "@/components/ai-workflow";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import { useApiConfig } from "@/hooks/use-api-config";
-import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
+import { useSelectedInferenceModels } from "@/hooks/use-connections";
+import { useModelSelection } from "@/hooks/use-model-selection";
 import {
   arrayBufferToBase64,
   downsampleBuffer,
@@ -50,7 +55,12 @@ import {
   formatFileSize,
   formatTime,
 } from "@/lib/audio-utils";
-import { fetchWithRetry } from "@/lib/utils";
+import {
+  getMediaChunks,
+  modelsAcceptingInput,
+  reconcileModelSelection,
+} from "@/lib/inference-playground-contracts";
+import { beginAbortableRequest, fetchInferenceJson, finishAbortableRequest } from "@/lib/utils";
 
 interface UploadedAudio {
   name: string;
@@ -62,8 +72,23 @@ interface UploadedAudio {
 
 interface VADChunk {
   data: string;
+  mime_type: string;
   start_time_ms?: number;
   end_time_ms?: number;
+}
+
+interface ChunkResponse {
+  object: "list";
+  data: VADChunk[];
+  model: string;
+}
+
+interface TranscriptionResponse {
+  data: Array<{ text?: string }>;
+}
+
+interface GenerationResponse {
+  choices?: Array<{ message?: { content?: string } }>;
 }
 
 interface VADConfig {
@@ -102,21 +127,38 @@ function selectPlaceholder(loaded: boolean, count: number, typeName: string): st
 
 const TranscribePlaygroundPage: React.FC = () => {
   const { inferenceUrl } = useApiConfig();
-  const { models: connectionTranscribers, loading: transcribersLoading } =
-    useSelectedInferenceModelNames("transcriber");
-  const { models: connectionChunkers, loading: chunkersLoading } =
-    useSelectedInferenceModelNames("chunker");
-  const { models: connectionGenerators, loading: generatorsLoading } =
-    useSelectedInferenceModelNames("generator");
+  const requestEndpoint = inferenceUrl("transcribe");
+  const chunkEndpoint = inferenceUrl("chunk");
+  const generationEndpoint = inferenceUrl("generate");
+  const { models: connectedTranscribers, loading: transcribersLoading } =
+    useSelectedInferenceModels("transcriber");
+  const { models: connectedChunkers, loading: chunkersLoading } =
+    useSelectedInferenceModels("chunker");
+  const connectionChunkers = useMemo(
+    () =>
+      modelsAcceptingInput(connectedChunkers, "audio")
+        .filter((model) => model.inputs !== undefined || model.name.toLowerCase().includes("vad"))
+        .map((model) => model.name),
+    [connectedChunkers]
+  );
+  const { models: connectedGenerators, loading: generatorsLoading } =
+    useSelectedInferenceModels("generator");
+  const connectionTranscribers = useMemo(
+    () => modelsAcceptingInput(connectedTranscribers, "audio").map((model) => model.name),
+    [connectedTranscribers]
+  );
+  const connectionGenerators = useMemo(
+    () => modelsAcceptingInput(connectedGenerators, "text").map((model) => model.name),
+    [connectedGenerators]
+  );
 
   // Models
-  const [availableTranscribers, setAvailableTranscribers] = useState<string[]>([]);
-  const [availableChunkers, setAvailableChunkers] = useState<string[]>([]);
-  const [availableGenerators, setAvailableGenerators] = useState<string[]>([]);
-  const [modelsLoaded, setModelsLoaded] = useState(false);
+  const availableTranscribers = connectionTranscribers;
+  const availableChunkers = connectionChunkers;
+  const availableGenerators = connectionGenerators;
+  const modelsLoaded = !transcribersLoading && !chunkersLoading && !generatorsLoading;
 
   // Config
-  const [selectedTranscriberModel, setSelectedTranscriberModel] = useState("");
   const [selectedChunkerModel, setSelectedChunkerModel] = useState("");
   const [selectedGeneratorModel, setSelectedGeneratorModel] = useState("");
   const [language, setLanguage] = useState("");
@@ -148,6 +190,8 @@ const TranscribePlaygroundPage: React.FC = () => {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const { model: selectedTranscriberModel, setModel: setSelectedTranscriberModel } =
+    useModelSelection({ models: availableTranscribers });
 
   // Refs
   const audioInputRef = useRef<HTMLInputElement>(null);
@@ -187,29 +231,9 @@ const TranscribePlaygroundPage: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    setAvailableTranscribers(connectionTranscribers);
-    setAvailableChunkers(connectionChunkers);
-    setAvailableGenerators(connectionGenerators);
-    setSelectedTranscriberModel((current) =>
-      current && connectionTranscribers.includes(current)
-        ? current
-        : connectionTranscribers[0] || ""
-    );
-    setSelectedChunkerModel((current) =>
-      current && connectionChunkers.includes(current) ? current : connectionChunkers[0] || ""
-    );
-    setSelectedGeneratorModel((current) =>
-      current && connectionGenerators.includes(current) ? current : connectionGenerators[0] || ""
-    );
-    setModelsLoaded(!transcribersLoading && !chunkersLoading && !generatorsLoading);
-  }, [
-    connectionTranscribers,
-    connectionChunkers,
-    connectionGenerators,
-    transcribersLoading,
-    chunkersLoading,
-    generatorsLoading,
-  ]);
+    setSelectedChunkerModel((current) => reconcileModelSelection(current, connectionChunkers));
+    setSelectedGeneratorModel((current) => reconcileModelSelection(current, connectionGenerators));
+  }, [connectionChunkers, connectionGenerators]);
 
   // Audio file handling
   const processAudioFile = useCallback(
@@ -343,6 +367,16 @@ const TranscribePlaygroundPage: React.FC = () => {
     };
   }, [cleanupRecording]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: model/backend identity invalidates in-flight results
+  useEffect(() => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
+    setSegments([]);
+    setError(null);
+    setProcessingTime(null);
+  }, [selectedTranscriberModel, requestEndpoint, chunkEndpoint, generationEndpoint]);
+
   // Update a single segment by index
   const updateSegment = useCallback((index: number, updates: Partial<Segment>) => {
     setSegments((prev) => prev.map((s, idx) => (idx === index ? { ...s, ...updates } : s)));
@@ -362,7 +396,7 @@ const TranscribePlaygroundPage: React.FC = () => {
       updateSegment(index, { status: "transcribing" });
 
       if (signal.aborted) return;
-      const response = await fetchWithRetry(inferenceUrl("transcribe"), {
+      const result = await fetchInferenceJson<TranscriptionResponse>(requestEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -372,8 +406,6 @@ const TranscribePlaygroundPage: React.FC = () => {
         }),
         signal,
       });
-      if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
-      const result = await response.json();
       if (signal.aborted) return;
 
       const rawText = (result.data[0]?.text || "").trim();
@@ -382,7 +414,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         updateSegment(index, { rawText, status: "cleaning" });
 
         try {
-          const resp = await fetchWithRetry(inferenceUrl("generate"), {
+          const genResult = await fetchInferenceJson<GenerationResponse>(generationEndpoint, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -396,11 +428,7 @@ const TranscribePlaygroundPage: React.FC = () => {
             }),
             signal,
           });
-          if (!resp.ok) {
-            const text = await resp.text();
-            throw new Error(text || `LLM cleanup failed: HTTP ${resp.status}`);
-          }
-          const genResult = await resp.json();
+          if (signal.aborted) return;
           const cleaned = (genResult.choices?.[0]?.message?.content || "").trim();
           updateSegment(index, { rawText, cleanedText: cleaned, status: "done" });
         } catch (e) {
@@ -415,7 +443,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         updateSegment(index, { rawText, status: "done" });
       }
     },
-    [inferenceUrl, updateSegment]
+    [requestEndpoint, generationEndpoint, updateSegment]
   );
 
   // Main pipeline
@@ -429,9 +457,8 @@ const TranscribePlaygroundPage: React.FC = () => {
       return;
     }
 
-    if (abortControllerRef.current) abortControllerRef.current.abort();
-    abortControllerRef.current = new AbortController();
-    const { signal } = abortControllerRef.current;
+    const controller = beginAbortableRequest(abortControllerRef);
+    const { signal } = controller;
 
     setIsLoading(true);
     setError(null);
@@ -444,7 +471,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     try {
       if (useVAD && selectedChunkerModel && audioDuration != null && audioDuration > 30) {
         // VAD pipeline: chunk -> transcribe each -> optionally clean up
-        const resp = await fetchWithRetry(inferenceUrl("chunk"), {
+        const chunkResult = await fetchInferenceJson<ChunkResponse>(chunkEndpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -463,12 +490,8 @@ const TranscribePlaygroundPage: React.FC = () => {
           }),
           signal,
         });
-        if (!resp.ok) {
-          const text = await resp.text();
-          throw new Error(text || `VAD chunking failed: HTTP ${resp.status}`);
-        }
-        const chunkResult = await resp.json();
-        const chunks: VADChunk[] = chunkResult.chunks || [];
+        if (abortControllerRef.current !== controller || signal.aborted) return;
+        const chunks = getMediaChunks(chunkResult);
 
         if (chunks.length === 0) {
           setError("No speech detected by VAD");
@@ -519,12 +542,19 @@ const TranscribePlaygroundPage: React.FC = () => {
         );
       }
 
-      setProcessingTime(performance.now() - startTime);
+      if (abortControllerRef.current === controller && !signal.aborted) {
+        setProcessingTime(performance.now() - startTime);
+      }
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") return;
+      if (
+        abortControllerRef.current !== controller ||
+        signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      )
+        return;
       setError(err instanceof Error ? err.message : "Failed to connect to inference");
     } finally {
-      setIsLoading(false);
+      if (finishAbortableRequest(abortControllerRef, controller)) setIsLoading(false);
     }
   }, [
     audioFile,
@@ -537,12 +567,13 @@ const TranscribePlaygroundPage: React.FC = () => {
     useLLMCleanup,
     vadConfig,
     processSegment,
-    inferenceUrl,
+    chunkEndpoint,
   ]);
 
   // Actions
   const handleReset = useCallback(() => {
-    if (abortControllerRef.current) abortControllerRef.current.abort();
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
     if (isRecording) {
       cleanupRecording();
       setIsRecording(false);
@@ -573,7 +604,7 @@ const TranscribePlaygroundPage: React.FC = () => {
   );
 
   return (
-    <DashboardPage className="h-full space-y-3">
+    <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
           <DashboardPageTitle className="font-aeonik">Transcribe Playground</DashboardPageTitle>
@@ -589,13 +620,12 @@ const TranscribePlaygroundPage: React.FC = () => {
           </Button>
         </DashboardPageActions>
       </DashboardPageHeader>
-
-      <BackendInfoBar />
-
+      <AIWorkflowContextBar>
+        <BackendInfoBar />
+      </AIWorkflowContextBar>
       {modelsLoaded && availableTranscribers.length === 0 && (
         <NoModelsGuide modelType="transcriber" typeName="speech-to-text transcriber" soft />
       )}
-
       <div className="space-y-6">
         {/* Configuration */}
         <Card>
@@ -853,33 +883,29 @@ const TranscribePlaygroundPage: React.FC = () => {
             </div>
 
             <FormActions>
-              <Button
+              <AIWorkflowSubmitButton
                 onClick={handleTranscribe}
                 disabled={isLoading || !audioFile || !selectedTranscriberModel}
+                running={isLoading}
+                runningLabel="Processing…"
+                onCancel={() => {
+                  abortControllerRef.current?.abort();
+                  abortControllerRef.current = null;
+                  setIsLoading(false);
+                }}
               >
-                {isLoading ? (
-                  <>
-                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                    Processing...
-                  </>
-                ) : (
-                  <>
-                    <Zap className="h-4 w-4 mr-2" />
-                    Transcribe
-                  </>
-                )}
-              </Button>
+                <Zap className="h-4 w-4 mr-2" />
+                Transcribe
+              </AIWorkflowSubmitButton>
             </FormActions>
           </CardContent>
         </Card>
-
         {/* Error */}
         {error && (
           <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
             {error}
           </div>
         )}
-
         {/* Stats */}
         {doneSegments.length > 0 && (
           <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
@@ -907,7 +933,6 @@ const TranscribePlaygroundPage: React.FC = () => {
             )}
           </DashboardToolbar>
         )}
-
         {/* Side-by-side panels */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Input */}
@@ -1143,7 +1168,6 @@ const TranscribePlaygroundPage: React.FC = () => {
           </Card>
         </div>
       </div>
-
       {/* Help text */}
       <div className="text-xs text-muted-foreground space-y-1">
         <p>
@@ -1153,7 +1177,7 @@ const TranscribePlaygroundPage: React.FC = () => {
           filler words, fixing grammar, and handling self-corrections.
         </p>
       </div>
-    </DashboardPage>
+    </AIWorkflowPage>
   );
 };
 

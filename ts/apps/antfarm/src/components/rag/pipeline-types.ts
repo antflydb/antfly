@@ -14,7 +14,7 @@ export interface PipelineStepState {
 
 export interface PipelineState {
   steps: PipelineStepState[];
-  overallStatus: "idle" | "running" | "complete" | "error";
+  overallStatus: "idle" | "running" | "complete" | "error" | "stopped";
 }
 
 // Step-specific data types
@@ -51,6 +51,7 @@ export type PipelineAction =
   | { type: "STEP_COMPLETE"; stepId: PipelineStepId; data?: unknown }
   | { type: "STEP_ERROR"; stepId: PipelineStepId; error?: string }
   | { type: "STEP_UPDATE"; stepId: PipelineStepId; data: unknown }
+  | { type: "STOP" }
   | { type: "COMPLETE" }
   | { type: "ERROR"; error?: string };
 
@@ -115,6 +116,17 @@ export function pipelineReducer(state: PipelineState, action: PipelineAction): P
       return {
         ...state,
         steps: state.steps.map((s) => (s.id === action.stepId ? { ...s, data: action.data } : s)),
+      };
+
+    case "STOP":
+      return {
+        ...state,
+        overallStatus: "stopped",
+        steps: state.steps.map((step) =>
+          step.status === "running" || step.status === "pending"
+            ? { ...step, status: "skipped", endTime: Date.now() }
+            : step
+        ),
       };
 
     case "COMPLETE":

@@ -5735,6 +5735,10 @@ pub const ConnectedModel = struct {
     dimensions: ?i64 = null,
     /// True when this model is referenced by a configured embedder, generator, reranker, or chunker.
     configured: ?bool = null,
+    /// Inference capabilities advertised by the provider for this model and task.
+    capabilities: ?[]const []const u8 = null,
+    /// Input modalities accepted by the provider's resolved executor.
+    inputs: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -5745,6 +5749,8 @@ pub const ConnectedModel = struct {
         .{ "display_name", "display_name", true },
         .{ "dimensions", "dimensions", true },
         .{ "configured", "configured", true },
+        .{ "capabilities", "capabilities", true },
+        .{ "inputs", "inputs", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -5781,6 +5787,14 @@ pub const ConnectedModel = struct {
         }
         if (self.configured) |value| {
             try jw.objectField("configured");
+            try jw.write(value);
+        }
+        if (self.capabilities) |value| {
+            try jw.objectField("capabilities");
+            try jw.write(value);
+        }
+        if (self.inputs) |value| {
+            try jw.objectField("inputs");
             try jw.write(value);
         }
         try jw.endObject();
@@ -9123,6 +9137,8 @@ pub const DeciderConfig = struct {
     api_key: ?[]const u8 = null,
     max_rows: ?i64 = null,
     max_input_tokens: ?i64 = null,
+    /// Provider/model upper bound on the input-token contribution of one image. Required when sending images through hosted typed deciders, including image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Omit for text-only, native, or generated deciders.
+    max_image_input_tokens: ?i64 = null,
     rate_limit: ?RateLimitConfig = null,
     batch_size: ?i64 = null,
 
@@ -9142,6 +9158,7 @@ pub const DeciderConfig = struct {
         .{ "api_key", "api_key", true },
         .{ "max_rows", "max_rows", true },
         .{ "max_input_tokens", "max_input_tokens", true },
+        .{ "max_image_input_tokens", "max_image_input_tokens", true },
         .{ "rate_limit", "rate_limit", true },
         .{ "batch_size", "batch_size", true },
     };
@@ -9210,6 +9227,10 @@ pub const DeciderConfig = struct {
         }
         if (self.max_input_tokens) |value| {
             try jw.objectField("max_input_tokens");
+            try jw.write(value);
+        }
+        if (self.max_image_input_tokens) |value| {
+            try jw.objectField("max_image_input_tokens");
             try jw.write(value);
         }
         if (self.rate_limit) |value| {
@@ -9305,6 +9326,83 @@ pub const DecisionChoice = struct {
 pub const DecisionChoiceProbability = struct {
     value: []const u8,
     probability: f64,
+};
+
+/// Text or ordered user messages containing text and images. Named OpenAI and Jev deciders accept messages. Native trained, embedding, and generated deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
+pub const DecisionEvidence = std.json.Value;
+
+pub const DecisionEvidenceImage = struct {
+    type: []const u8,
+    /// Base64 data URL (image/png, image/jpeg, image/webp, image/gif), or a public HTTP(S) URL for OpenAI. Antfly never fetches image URLs for decision adapters.
+    image_url: []const u8,
+    detail: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "image_url", "image_url", false },
+        .{ "detail", "detail", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("image_url");
+        try jw.write(self.image_url);
+        if (self.detail) |value| {
+            try jw.objectField("detail");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const DecisionEvidenceMessage = struct {
+    type: ?[]const u8 = null,
+    role: []const u8,
+    content: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", true },
+        .{ "role", "role", false },
+        .{ "content", "content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
+};
+
+pub const DecisionEvidenceText = struct {
+    type: []const u8,
+    text: []const u8,
 };
 
 pub const DecisionInput = struct {
@@ -26955,7 +27053,7 @@ pub const InferenceDecideQuestion = union(enum) {
     }
 };
 
-/// Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB.
+/// Supply exactly one of input (single evidence item) or inputs (text-only Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB.
 pub const InferenceDecideRequest = struct {
     /// Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
     context_version: ?i64 = null,
@@ -26964,7 +27062,7 @@ pub const InferenceDecideRequest = struct {
     model: []const u8,
     /// Pin the exact EmbeddingGemma 2 assets and embedding recipe.
     model_identity: ?[]const u8 = null,
-    input: ?[]const u8 = null,
+    input: ?DecisionEvidence = null,
     inputs: ?[]const DecisionInput = null,
     long_document: ?InferenceDecideLongDocument = null,
     questions: []const InferenceDecideQuestion,
@@ -28993,6 +29091,95 @@ pub const InferenceModelInfo = struct {
         }
         try jw.endObject();
     }
+};
+
+/// One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private.
+pub const InferenceModelInstance = struct {
+    /// Opaque incarnation identifier; changes after eviction and reload.
+    id: []const u8,
+    model: []const u8,
+    tasks: []const InferenceModelKind,
+    state: []const u8,
+    /// Internal owners or loading waiters preventing eviction. This is not a count of HTTP requests.
+    active_handles: i64,
+    startup_managed: bool,
+    /// Whether an unload would be permitted at snapshot time; concurrent use can change this.
+    unloadable: bool,
+    unload_blocked_reason: ?[]const u8 = null,
+    /// Selected execution backend, when known.
+    backend: ?[]const u8 = null,
+    /// Weight residency policy; loaded does not imply full device residency.
+    residency_mode: []const u8,
+    /// Elapsed milliseconds since last use, not a wall-clock timestamp.
+    idle_ms: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "model", "model", false },
+        .{ "tasks", "tasks", false },
+        .{ "state", "state", false },
+        .{ "active_handles", "active_handles", false },
+        .{ "startup_managed", "startup_managed", false },
+        .{ "unloadable", "unloadable", false },
+        .{ "unload_blocked_reason", "unload_blocked_reason", true },
+        .{ "backend", "backend", true },
+        .{ "residency_mode", "residency_mode", false },
+        .{ "idle_ms", "idle_ms", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("tasks");
+        try jw.write(self.tasks);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("active_handles");
+        try jw.write(self.active_handles);
+        try jw.objectField("startup_managed");
+        try jw.write(self.startup_managed);
+        try jw.objectField("unloadable");
+        try jw.write(self.unloadable);
+        if (self.unload_blocked_reason) |value| {
+            try jw.objectField("unload_blocked_reason");
+            try jw.write(value);
+        }
+        if (self.backend) |value| {
+            try jw.objectField("backend");
+            try jw.write(value);
+        }
+        try jw.objectField("residency_mode");
+        try jw.write(self.residency_mode);
+        try jw.objectField("idle_ms");
+        try jw.write(self.idle_ms);
+        try jw.endObject();
+    }
+};
+
+pub const InferenceModelInstanceList = struct {
+    object: []const u8,
+    data: []const InferenceModelInstance,
+};
+
+pub const InferenceModelInstanceLoadRequest = struct {
+    model: []const u8,
+    task: InferenceModelKind,
+};
+
+pub const InferenceModelInstanceUnloadResponse = struct {
+    outcome: []const u8,
 };
 
 /// Model registry kind.

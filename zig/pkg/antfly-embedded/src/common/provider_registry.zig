@@ -226,6 +226,22 @@ pub const Registry = struct {
         return self.decider_configs.get(stripNamespace(resolved, "deciders/")) orelse error.UnknownDecider;
     }
 
+    /// The shared decision contract intersects adapter support with any
+    /// explicit backend declaration. HTTP, SQL and expressions all use this.
+    pub fn getDeciderCapabilities(self: *const Registry, name: []const u8) !decisions.Capabilities {
+        const cfg = try self.getDeciderConfig(name);
+        var caps = cfg.resolvedCapabilities();
+        caps.images = caps.images and cfg.max_image_input_tokens != null;
+        if (!caps.images or self.inference_capabilities.count() == 0) return caps;
+        var buffer: [1024]u8 = undefined;
+        var storage = std.heap.BufferFirstAllocator.init(&buffer, std.heap.smp_allocator);
+        const a = storage.allocator();
+        const id = try std.fmt.allocPrint(a, "deciders/{s}", .{stripNamespace(name, "deciders/")});
+        defer a.free(id);
+        if (self.inference_capabilities.get(id)) |declared| caps.images = caps.images and declared.images == .supported;
+        return caps;
+    }
+
     pub fn registerDeciderConfig(self: *Registry, name: []const u8, cfg: decisions.DeciderConfig) !void {
         try cfg.validate();
         if (name.len == 0) return error.InvalidDeciderConfig;

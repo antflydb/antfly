@@ -13,13 +13,36 @@ export function TableProvider({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
+  const searchParamsRef = useRef(searchParams);
+  searchParamsRef.current = searchParams;
+  const setSearchParamsRef = useRef(setSearchParams);
+  setSearchParamsRef.current = setSearchParams;
+
   const [tables, setTables] = useState<TableStatus[]>([]);
   const [isLoadingTables, setIsLoadingTables] = useState(() => isProductEnabled("antfly"));
   const [embeddingIndexes, setEmbeddingIndexes] = useState<string[]>([]);
   const [graphIndexes, setGraphIndexes] = useState<string[]>([]);
   const [chatIndexes, setChatIndexes] = useState<string[]>([]);
-  const [isLoadingIndexes, setIsLoadingIndexes] = useState(false);
-  const [selectedIndex, setSelectedIndex] = useState("");
+  const [isLoadingIndexes, setIsLoadingIndexes] = useState(() => isProductEnabled("antfly"));
+  const [selectedIndex, setSelectedIndexState] = useState(() => searchParams.get("index") || "");
+  const selectedIndexRef = useRef(selectedIndex);
+  selectedIndexRef.current = selectedIndex;
+  const setSelectedIndex = useCallback((name: string) => {
+    setSelectedIndexState(name);
+    if ((searchParamsRef.current.get("index") || "") === name) return;
+    setSearchParamsRef.current(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (name) next.set("index", name);
+        else next.delete("index");
+        return next;
+      },
+      { replace: true }
+    );
+  }, []);
+  useEffect(() => {
+    setSelectedIndexState(searchParams.get("index") || "");
+  }, [searchParams]);
 
   // Internal state for selected table. URL is synced to/from this.
   const [selectedTable, setSelectedTableState] = useState(() => {
@@ -64,12 +87,14 @@ export function TableProvider({ children }: { children: ReactNode }) {
       setSelectedTableState(name);
       const isOnTablePage = location.pathname.startsWith("/tables/");
       if (isOnTablePage) {
-        navigate(`/tables/${encodeURIComponent(name)}?section=overview`);
+        navigate(name ? `/tables/${encodeURIComponent(name)}?section=overview` : "/");
       } else {
         setSearchParams(
           (prev) => {
-            prev.set("table", name);
-            return prev;
+            const next = new URLSearchParams(prev);
+            if (name) next.set("table", name);
+            else next.delete("table");
+            return next;
           },
           { replace: true }
         );
@@ -78,44 +103,56 @@ export function TableProvider({ children }: { children: ReactNode }) {
     [location.pathname, navigate, setSearchParams]
   );
 
+  const tableRequestId = useRef(0);
+
   // Fetch tables on mount
   const refreshTables = useCallback(async () => {
     if (!isProductEnabled("antfly")) return;
+    const requestId = ++tableRequestId.current;
     setIsLoadingTables(true);
     try {
       const response = await apiClient.tables.list();
-      setTables(normalizeTablesResponse(response));
+      if (requestId === tableRequestId.current) setTables(normalizeTablesResponse(response));
     } catch {
-      setTables([]);
+      if (requestId === tableRequestId.current) setTables([]);
     } finally {
-      setIsLoadingTables(false);
+      if (requestId === tableRequestId.current) setIsLoadingTables(false);
     }
   }, [apiClient]);
 
   useEffect(() => {
-    refreshTables();
+    void refreshTables();
+    return () => {
+      tableRequestId.current++;
+    };
   }, [refreshTables]);
 
-  // Auto-select first table when tables load and none selected
+  // Keep the selection valid after endpoint changes or table deletion.
   useEffect(() => {
-    if (!selectedTable && tables.length > 0) {
-      setSelectedTable(tables[0].name);
-    }
-  }, [tables, selectedTable, setSelectedTable]);
+    if (isLoadingTables || tables.some((table) => table.name === selectedTable)) return;
+    const fallback = tables[0]?.name ?? "";
+    if (fallback !== selectedTable) setSelectedTable(fallback);
+  }, [isLoadingTables, tables, selectedTable, setSelectedTable]);
 
-  // Fetch embedding indexes when table changes
+  // Discard responses from the previous table or API endpoint.
   useEffect(() => {
+    let active = true;
     const fetchIndexes = async () => {
-      if (!selectedTable) {
+      if (!isProductEnabled("antfly") || !selectedTable) {
+        setIsLoadingIndexes(false);
         setEmbeddingIndexes([]);
         setGraphIndexes([]);
         setChatIndexes([]);
         setSelectedIndex("");
         return;
       }
+      setEmbeddingIndexes([]);
+      setChatIndexes([]);
+      setGraphIndexes([]);
       setIsLoadingIndexes(true);
       try {
         const response = await apiClient.indexes.list(selectedTable);
+        if (!active) return;
         const indexes = response || [];
         const embeddingIdxs = indexes
           .filter(
@@ -141,22 +178,24 @@ export function TableProvider({ children }: { children: ReactNode }) {
         setEmbeddingIndexes(embeddingIdxs);
         setGraphIndexes(graphIdxs);
         setChatIndexes(chatIdxs);
-        if (embeddingIdxs.length > 0) {
-          setSelectedIndex(embeddingIdxs[0]);
-        } else {
-          setSelectedIndex("");
-        }
+        const available = [...embeddingIdxs, ...chatIdxs];
+        const requested = selectedIndexRef.current;
+        if (!available.includes(requested)) setSelectedIndex(embeddingIdxs[0] ?? chatIdxs[0] ?? "");
       } catch {
+        if (!active) return;
         setEmbeddingIndexes([]);
         setGraphIndexes([]);
         setChatIndexes([]);
         setSelectedIndex("");
       } finally {
-        setIsLoadingIndexes(false);
+        if (active) setIsLoadingIndexes(false);
       }
     };
-    fetchIndexes();
-  }, [selectedTable, apiClient]);
+    void fetchIndexes();
+    return () => {
+      active = false;
+    };
+  }, [selectedTable, apiClient, setSelectedIndex]);
 
   return (
     <TableContext.Provider

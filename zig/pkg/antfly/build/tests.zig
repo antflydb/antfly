@@ -221,7 +221,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     test_imports.configure(b, functions_test_mod, true, true);
-    const functions_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "decision functions", "function bindings", "decision provider" } });
+    const functions_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "decision functions", "function bindings", "decision provider", "provider quotas" } });
     b.step("functions-test", "Run provider and expression decision function contracts").dependOn(&b.addRunArtifact(functions_tests).step);
 
     // Parser/worker projection contracts need no HTTP server or linked kernel.

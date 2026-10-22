@@ -5,7 +5,6 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
-  DashboardPage,
   DashboardPageActions,
   DashboardPageDescription,
   DashboardPageHeader,
@@ -35,11 +34,14 @@ import {
   Zap,
 } from "lucide-react";
 import type React from "react";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AIWorkflowPage, AIWorkflowSubmitButton } from "@/components/ai-workflow";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
-import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
+import { RetrievalContextBar } from "@/components/retrieval-context";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
 import { useTable } from "@/hooks/use-table";
+import { beginAbortableRequest, fetchInferenceJson, finishAbortableRequest } from "@/lib/utils";
 
 interface ChunkConfig {
   provider: string;
@@ -111,6 +113,12 @@ function extractDocumentText(source: Record<string, unknown>): string {
 const AntflyChunkingPlaygroundPage: React.FC = () => {
   const { client, inferenceUrl } = useApiConfig();
   const { selectedTable, selectedIndex } = useTable();
+  const { models: connectionChunkers, loading: chunkersLoading } =
+    useSelectedInferenceModelNames("chunker");
+  const availableChunkers = useMemo(
+    () => Array.from(new Set(["fixed", ...connectionChunkers])),
+    [connectionChunkers]
+  );
 
   const [config, setConfig] = useState<ChunkConfig>(DEFAULT_CONFIG);
   const [inputText, setInputText] = useState("");
@@ -126,7 +134,43 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
     null
   );
   const [isSearching, setIsSearching] = useState(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const chunkControllerRef = useRef<AbortController | null>(null);
+  const searchControllerRef = useRef<AbortController | null>(null);
+  const documentRequestRef = useRef(0);
+
+  useEffect(() => {
+    setConfig((current) => ({
+      ...current,
+      model: availableChunkers.includes(current.model)
+        ? current.model
+        : (availableChunkers[0] ?? "fixed"),
+    }));
+  }, [availableChunkers]);
+
+  useEffect(
+    () => () => {
+      chunkControllerRef.current?.abort();
+      searchControllerRef.current?.abort();
+      documentRequestRef.current += 1;
+    },
+    []
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: table/model/backend identity invalidates in-flight results
+  useEffect(() => {
+    chunkControllerRef.current?.abort();
+    searchControllerRef.current?.abort();
+    chunkControllerRef.current = null;
+    searchControllerRef.current = null;
+    documentRequestRef.current += 1;
+    setIsLoading(false);
+    setIsSearching(false);
+    setIsFetchingDoc(false);
+    setResult(null);
+    setSearchResults(null);
+    setError(null);
+    setProcessingTime(null);
+  }, [client, selectedTable, selectedIndex, config.model, inferenceUrl]);
 
   const estimateTokens = (text: string): number => {
     return Math.ceil(text.length / 4);
@@ -138,13 +182,17 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
 
     setIsSearching(true);
     setError(null);
+    const controller = beginAbortableRequest(searchControllerRef);
 
     try {
       const queryRequest = selectedIndex
         ? { semantic_search: searchQuery, indexes: [selectedIndex], limit: 5 }
         : { full_text_search: { query: searchQuery }, limit: 5 };
 
-      const response = await client.tables.query(selectedTable, queryRequest);
+      const response = await client.tables.query(selectedTable, queryRequest, {
+        signal: controller.signal,
+      });
+      if (searchControllerRef.current !== controller || controller.signal.aborted) return;
       const hits = response?.responses?.[0]?.hits?.hits || [];
 
       setSearchResults(
@@ -158,9 +206,15 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
         })
       );
     } catch (err) {
+      if (
+        searchControllerRef.current !== controller ||
+        controller.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      )
+        return;
       setError(err instanceof Error ? err.message : "Search failed");
     } finally {
-      setIsSearching(false);
+      if (finishAbortableRequest(searchControllerRef, controller)) setIsSearching(false);
     }
   };
 
@@ -170,9 +224,11 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
 
     setIsFetchingDoc(true);
     setError(null);
+    const requestId = ++documentRequestRef.current;
 
     try {
       const doc = await client.tables.lookup(selectedTable, docId);
+      if (requestId !== documentRequestRef.current) return;
       if (doc) {
         const source = doc as Record<string, unknown>;
         const text = extractDocumentText(source);
@@ -184,9 +240,10 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
         setError(`Document "${docId}" not found`);
       }
     } catch (err) {
+      if (requestId !== documentRequestRef.current) return;
       setError(err instanceof Error ? err.message : "Failed to fetch document");
     } finally {
-      setIsFetchingDoc(false);
+      if (requestId === documentRequestRef.current) setIsFetchingDoc(false);
     }
   };
 
@@ -196,11 +253,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
       return;
     }
 
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-
-    abortControllerRef.current = new AbortController();
+    const controller = beginAbortableRequest(chunkControllerRef);
     setIsLoading(true);
     setError(null);
     setResult(null);
@@ -210,7 +263,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
     try {
       const actualSeparator = config.separator.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
 
-      const response = await fetch(inferenceUrl("chunk"), {
+      const data = await fetchInferenceJson<ChunkResponse>(inferenceUrl("chunk"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -226,22 +279,31 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
             threshold: config.threshold,
           },
         }),
-        signal: abortControllerRef.current.signal,
+        signal: controller.signal,
       });
-      if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
-      const data = (await response.json()) as ChunkResponse;
 
+      if (chunkControllerRef.current !== controller || controller.signal.aborted) return;
       setResult(data);
       setProcessingTime(performance.now() - startTime);
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") return;
+      if (
+        chunkControllerRef.current !== controller ||
+        controller.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      )
+        return;
       setError(err instanceof Error ? err.message : "Failed to connect to inference");
     } finally {
-      setIsLoading(false);
+      if (finishAbortableRequest(chunkControllerRef, controller)) setIsLoading(false);
     }
   };
 
   const handleReset = () => {
+    chunkControllerRef.current?.abort();
+    searchControllerRef.current?.abort();
+    chunkControllerRef.current = null;
+    searchControllerRef.current = null;
+    documentRequestRef.current += 1;
     setConfig(DEFAULT_CONFIG);
     setInputText("");
     setDocumentId("");
@@ -250,6 +312,9 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
     setProcessingTime(null);
     setSearchResults(null);
     setSearchQuery("");
+    setIsLoading(false);
+    setIsSearching(false);
+    setIsFetchingDoc(false);
   };
 
   /** Build the chunker config JSON (for copy-paste into index creation). */
@@ -324,8 +389,8 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
   };
 
   return (
-    <DashboardPage className="h-full space-y-3">
-      <BackendInfoBar />
+    <AIWorkflowPage className="h-full space-y-3">
+      <RetrievalContextBar />
       <DashboardPageHeader>
         <div>
           <DashboardPageTitle className="font-aeonik">Chunking Playground</DashboardPageTitle>
@@ -334,20 +399,35 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
+          {(isLoading || isSearching || isFetchingDoc) && (
+            <Button
+              variant="outline"
+              onClick={() => {
+                chunkControllerRef.current?.abort();
+                searchControllerRef.current?.abort();
+                chunkControllerRef.current = null;
+                searchControllerRef.current = null;
+                documentRequestRef.current += 1;
+                setIsLoading(false);
+                setIsSearching(false);
+                setIsFetchingDoc(false);
+              }}
+            >
+              Stop
+            </Button>
+          )}
           <Button variant="outline" onClick={handleReset}>
             <RotateCcw className="h-4 w-4 mr-2" />
             Reset
           </Button>
         </DashboardPageActions>
       </DashboardPageHeader>
-
       {!selectedTable && (
         <DashboardToolbar className="items-center justify-center border-dashed text-center text-sm text-muted-foreground md:items-center">
           <Database className="h-8 w-8 mx-auto mb-2 opacity-30" />
           Select a table from the sidebar, or paste text directly to experiment with chunking
         </DashboardToolbar>
       )}
-
       {/* Configuration Panel */}
       <Card>
         <CardHeader className="pb-4">
@@ -366,15 +446,17 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
               <Select
                 value={config.model}
                 onValueChange={(value) => setConfig({ ...config, model: value })}
+                disabled={chunkersLoading}
               >
                 <SelectTrigger id="model">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="fixed">Fixed Token Size</SelectItem>
-                  <SelectItem value="chonky-mmbert-small-multilingual-1">
-                    Chonky (ONNX Semantic)
-                  </SelectItem>
+                  {availableChunkers.map((model) => (
+                    <SelectItem key={model} value={model}>
+                      {model === "fixed" ? "Fixed Token Size" : model}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
@@ -476,30 +558,29 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
             </div>
           </div>
           <FormActions>
-            <Button onClick={handleChunk} disabled={isLoading || !inputText.trim()}>
-              {isLoading ? (
-                <>
-                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                  Processing
-                </>
-              ) : (
-                <>
-                  <Scissors className="h-4 w-4 mr-2" />
-                  Chunk
-                </>
-              )}
-            </Button>
+            <AIWorkflowSubmitButton
+              onClick={handleChunk}
+              disabled={isLoading || !inputText.trim()}
+              running={isLoading}
+              runningLabel="Processing"
+              onCancel={() => {
+                chunkControllerRef.current?.abort();
+                chunkControllerRef.current = null;
+                setIsLoading(false);
+              }}
+            >
+              <Scissors className="h-4 w-4 mr-2" />
+              Chunk
+            </AIWorkflowSubmitButton>
           </FormActions>
         </CardContent>
       </Card>
-
       {/* Error Display */}
       {error && (
         <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
-
       {/* Results Stats Bar */}
       {result && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
@@ -525,7 +606,6 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
           )}
         </DashboardToolbar>
       )}
-
       {/* Main Content */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Input Panel */}
@@ -702,7 +782,6 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
           </CardContent>
         </Card>
       </div>
-
       {/* Config JSON preview + help text */}
       <div className="text-xs text-muted-foreground space-y-1">
         <p>
@@ -715,7 +794,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
           chunker_models_dir).
         </p>
       </div>
-    </DashboardPage>
+    </AIWorkflowPage>
   );
 };
 

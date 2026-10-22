@@ -92,6 +92,51 @@ describe("InferenceClient", () => {
 describe("InferenceClient with mock fetch", () => {
   const originalFetch = global.fetch;
 
+  it("uses model-instance resources and preserves structured unload conflicts", async () => {
+    const instance = {
+      id: "incarnation-1",
+      model: "owner/model",
+      tasks: ["generator", "reader"],
+      state: "loaded",
+      active_handles: 0,
+      startup_managed: false,
+      unloadable: true,
+      residency_mode: "streamed",
+      idle_ms: 12,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ object: "list", data: [instance] })))
+      .mockResolvedValueOnce(new Response(JSON.stringify(instance)))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: "INSTANCE_IN_USE",
+            message: "instance has active owners",
+            retryable: true,
+          }),
+          { status: 409 }
+        )
+      );
+    global.fetch = fetchMock;
+    const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+    expect((await client.listModelInstances()).data).toEqual([instance]);
+    expect(await client.loadModelInstance({ model: instance.model, task: "reader" })).toEqual(
+      instance
+    );
+    await expect(client.unloadModelInstance(instance.id)).rejects.toMatchObject({
+      status: 409,
+      code: "INSTANCE_IN_USE",
+      retryable: true,
+    });
+    const requests = fetchMock.mock.calls.map(([request]) => request as Request);
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ["GET", "/ai/v1/models/instances"],
+      ["POST", "/ai/v1/models/instances"],
+      ["DELETE", "/ai/v1/models/instances/incarnation-1"],
+    ]);
+  });
+
   it("decide sends named questions and preserves complete answers", async () => {
     const request = {
       model: "decision-model",

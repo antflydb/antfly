@@ -1631,7 +1631,7 @@ pub const Runtime = struct {
         const inputs = try a.alloc(d.Request, requests.len);
         for (inputs, requests) |*input, request| {
             try validateDecisionInput(a, request);
-            input.* = .{ .decider = "materialized", .questions = parsed.value.questions, .input = request.source_text };
+            input.* = .{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } };
         }
         var execution: @import("functions/runtime.zig").Runtime = .{
             .registry = &registry,
@@ -1686,7 +1686,7 @@ pub const Runtime = struct {
             .antfly_url = self.inference_api_url,
             .source_table = self.execution.routing.source_table,
         };
-        const results = try execution.provider().evaluateBatch(arena.allocator(), &.{.{ .decider = "materialized", .questions = parsed.value.questions, .input = request.source_text }});
+        const results = try execution.provider().evaluateBatch(arena.allocator(), &.{.{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } }});
         var response = results[0];
         var info = try materialization.provenance(arena.allocator(), parsed.value, request.source_fingerprint);
         try d.put(arena.allocator(), &info, "model", response.object.get("model").?);
@@ -7957,7 +7957,7 @@ test "decision functions materialized enrichment records version model and sourc
     };
     var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
     defer client.deinit();
-    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide } });
+    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = undefined, .owns_invocation_admission = true, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide } });
     defer runtime.deinit();
     const specification = "{\"version\":\"v1\",\"decider\":{\"provider\":\"antfly\",\"model\":\"mock\"},\"questions\":[{\"name\":\"refund\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}]}";
     for ([_]?[]const u8{ null, "[{\"type\":\"text\",\"text\":\"refund\"}]", "[{\"type\":\"text\",\"text\":\"ref\"},{\"type\":\"text\",\"text\":\"und\"}]" }) |parts| {

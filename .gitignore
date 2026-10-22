@@ -80,6 +80,7 @@ py/.venv/
 scripts/__pycache__/
 
 # Local package/worktree caches
+/.toolchain/
 .pnpm-store/
 .worktrees/
 .zig-cache/

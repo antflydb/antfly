@@ -41,7 +41,7 @@ import type {
   TranscribeResponse,
   TransientCapacityError,
 } from "./inference-types.js";
-import type { paths } from "./public-api.js";
+import type { components, paths } from "./public-api.js";
 import { parseSSEFrames } from "./sse.js";
 
 const MAX_INFERENCE_JSON_RESPONSE_BYTES = 16 << 20;
@@ -756,6 +756,46 @@ export class InferenceClient {
     const { data, error, response } = await this.client.GET("/ai/v1/models");
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("List models failed: unexpected empty response");
+    return data;
+  }
+
+  /** Inspect the shared model cache without extending idle deadlines. */
+  async listModelInstances(
+    options?: RequestOptions
+  ): Promise<components["schemas"]["InferenceModelInstanceList"]> {
+    const { data, error, response } = await this.client.GET("/ai/v1/models/instances", {
+      signal: options?.signal,
+    });
+    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!data) throw new Error("List model instances failed: unexpected empty response");
+    return data;
+  }
+
+  /** Prepare an instance for a task. Normal eviction remains enabled. */
+  async loadModelInstance(
+    request: components["schemas"]["InferenceModelInstanceLoadRequest"],
+    options?: RequestOptions
+  ): Promise<components["schemas"]["InferenceModelInstance"]> {
+    const { data, error, response } = await this.client.POST("/ai/v1/models/instances", {
+      body: request,
+      signal: options?.signal,
+    });
+    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!data) throw new Error("Load model instance failed: unexpected empty response");
+    return data;
+  }
+
+  /** Evict an exact incarnation; stale IDs never select a replacement. */
+  async unloadModelInstance(
+    instanceId: string,
+    options?: RequestOptions
+  ): Promise<components["schemas"]["InferenceModelInstanceUnloadResponse"]> {
+    const { data, error, response } = await this.client.DELETE(
+      "/ai/v1/models/instances/{instance_id}",
+      { params: { path: { instance_id: instanceId } }, signal: options?.signal }
+    );
+    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!data) throw new Error("Unload model instance failed: unexpected empty response");
     return data;
   }
 

@@ -5329,7 +5329,7 @@ export interface paths {
         put?: never;
         /**
          * Answer named decision questions
-         * @description Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
+         * @description Execute text or multimodal evidence through named deciders, or an Antfly text batch. OpenAI and Jev adapters support images; native deciders require text. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
          */
         post: operations["decide"];
         delete?: never;
@@ -5367,6 +5367,50 @@ export interface paths {
          */
         post: operations["extract"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/models/instances": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List model instances
+         * @description Inspect this inference server's shared model cache without loading models or extending idle eviction deadlines. Each incarnation appears once, even when it supports multiple tasks.
+         */
+        get: operations["listModelInstances"];
+        put?: never;
+        /**
+         * Load a model instance
+         * @description Prepare the instance used by the requested task. Reuses an existing compatible instance. Normal idle eviction still applies; loading does not pin weights or guarantee device residency.
+         */
+        post: operations["loadModelInstance"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/models/instances/{instance_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Unload a model instance
+         * @description Evict one exact incarnation from the shared server cache. A stale ID is an idempotent miss and never evicts a replacement. Loading, busy, and startup-managed instances cannot be unloaded.
+         */
+        delete: operations["unloadModelInstance"];
         options?: never;
         head?: never;
         patch?: never;
@@ -7103,6 +7147,10 @@ export interface components {
             dimensions?: number;
             /** @description True when this model is referenced by a configured embedder, generator, reranker, or chunker. */
             configured?: boolean;
+            /** @description Inference capabilities advertised by the provider for this model and task. */
+            capabilities?: string[];
+            /** @description Input modalities accepted by the provider's resolved executor. */
+            inputs?: string[];
         };
         InferenceConnection: {
             provider: components["schemas"]["InferenceProviderType"];
@@ -16006,6 +16054,11 @@ export interface components {
             max_rows?: number;
             /** @default 1000000 */
             max_input_tokens?: number;
+            /**
+             * Format: int64
+             * @description Provider/model upper bound on the input-token contribution of one image. Required when sending images through hosted typed deciders, including image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Omit for text-only, native, or generated deciders.
+             */
+            max_image_input_tokens?: number;
             rate_limit?: components["schemas"]["RateLimitConfig"];
             /** @default 32 */
             batch_size?: number;
@@ -21225,6 +21278,50 @@ export interface components {
             reason?: string;
             wait?: components["schemas"]["ResolverWait"];
         };
+        /** @description One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private. */
+        InferenceModelInstance: {
+            /** @description Opaque incarnation identifier; changes after eviction and reload. */
+            id: string;
+            model: string;
+            tasks: components["schemas"]["InferenceModelKind"][];
+            /** @enum {string} */
+            state: "loading" | "loaded";
+            /**
+             * Format: int64
+             * @description Internal owners or loading waiters preventing eviction. This is not a count of HTTP requests.
+             */
+            active_handles: number;
+            startup_managed: boolean;
+            /** @description Whether an unload would be permitted at snapshot time; concurrent use can change this. */
+            unloadable: boolean;
+            /** @enum {string} */
+            unload_blocked_reason?: "loading" | "in_use" | "startup_managed";
+            /** @description Selected execution backend, when known. */
+            backend?: string;
+            /**
+             * @description Weight residency policy; loaded does not imply full device residency.
+             * @enum {string}
+             */
+            residency_mode: "backend_managed" | "streamed" | "resident";
+            /**
+             * Format: int64
+             * @description Elapsed milliseconds since last use, not a wall-clock timestamp.
+             */
+            idle_ms: number;
+        };
+        InferenceModelInstanceList: {
+            /** @enum {string} */
+            object: "list";
+            data: components["schemas"]["InferenceModelInstance"][];
+        };
+        InferenceModelInstanceLoadRequest: {
+            model: string;
+            task: components["schemas"]["InferenceModelKind"];
+        };
+        InferenceModelInstanceUnloadResponse: {
+            /** @enum {string} */
+            outcome: "unloaded" | "already_unloaded";
+        };
         InferenceError: {
             /** @description Stable machine-readable error code */
             error: string;
@@ -23354,6 +23451,31 @@ export interface components {
             object: "chunk.embedding.error";
             code: string;
         };
+        DecisionEvidenceText: {
+            /** @enum {string} */
+            type: "input_text";
+            text: string;
+        };
+        DecisionEvidenceImage: {
+            /** @enum {string} */
+            type: "input_image";
+            /** @description Base64 data URL (image/png, image/jpeg, image/webp, image/gif), or a public HTTP(S) URL for OpenAI. Antfly never fetches image URLs for decision adapters. */
+            image_url: string;
+            /**
+             * @default auto
+             * @enum {string}
+             */
+            detail?: "auto" | "low" | "high";
+        };
+        DecisionEvidenceMessage: {
+            /** @enum {string} */
+            type?: "message";
+            /** @enum {string} */
+            role: "user";
+            content: string | (components["schemas"]["DecisionEvidenceText"] | components["schemas"]["DecisionEvidenceImage"])[];
+        };
+        /** @description Text or ordered user messages containing text and images. Named OpenAI and Jev deciders accept messages. Native trained, embedding, and generated deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported. */
+        DecisionEvidence: string | components["schemas"]["DecisionEvidenceMessage"][];
         DecisionInput: {
             id?: string;
             input: string;
@@ -23425,7 +23547,7 @@ export interface components {
              */
             dimensions?: 768 | 512 | 256 | 128;
         };
-        /** @description Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
+        /** @description Supply exactly one of input (single evidence item) or inputs (text-only Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
         InferenceDecideRequest: {
             /**
              * @description Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
@@ -23437,7 +23559,7 @@ export interface components {
             model: string;
             /** @description Pin the exact EmbeddingGemma 2 assets and embedding recipe. */
             model_identity?: string;
-            input?: string;
+            input?: components["schemas"]["DecisionEvidence"];
             inputs?: components["schemas"]["DecisionInput"][];
             long_document?: components["schemas"]["InferenceDecideLongDocument"];
             questions: components["schemas"]["InferenceDecideQuestion"][];
@@ -35928,6 +36050,155 @@ export interface operations {
             };
             /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: components["responses"]["TransientCapacity"];
+        };
+    };
+    listModelInstances: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Loaded and loading model instances */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstanceList"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    loadModelInstance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceModelInstanceLoadRequest"];
+            };
+        };
+        responses: {
+            /** @description Prepared model instance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstance"];
+                };
+            };
+            /** @description Invalid model or unsupported task */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    unloadModelInstance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                instance_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Instance unloaded or already absent */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstanceUnloadResponse"];
+                };
+            };
+            /** @description Malformed instance ID */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Instance is loading, has active owners, or is managed by startup configuration */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
         };
     };
     listModels: {

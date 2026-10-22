@@ -474,9 +474,11 @@ pub fn writeNamespaceToStore(store: *docstore_mod.DocStore, namespace: Namespace
     try txn.commit();
 }
 
-/// Restore compatibility for historical identity images predating ALD1. The
-/// caller exclusively owns an unpublished destination and must validate the
-/// complete image before publication. Normal database reads remain fail closed.
+/// Compatibility for historical identity images predating ALD1, used by
+/// restore and by writable owner open. The caller exclusively owns the store:
+/// an unpublished restore destination, or an owner that has not yet admitted
+/// reads or writes. Restore callers must still validate the complete image
+/// before publication. Normal database reads remain fail closed.
 pub fn upgradeImportedLiveDirectoryAlloc(alloc: Allocator, store: *docstore_mod.DocStore, cancellation: @import("antfly_cancellation").CancellationToken) !void {
     try cancellation.check();
     var read = try store.beginReadTxn();
@@ -536,6 +538,7 @@ pub fn upgradeImportedLiveDirectoryAlloc(alloc: Allocator, store: *docstore_mod.
         rebuild.clear();
         rebuild.writes.deinit(alloc);
     }
+    std.log.info("building live identity directory for an identity image without ALD1", .{});
     const lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_to_doc_kind };
     const upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_to_doc_kind + 1 };
     try store.scanReadTxnWithContext(&read, &lower, &upper, .{}, &rebuild, Rebuild.visit);

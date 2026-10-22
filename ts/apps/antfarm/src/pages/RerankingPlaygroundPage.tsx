@@ -5,7 +5,6 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
-  DashboardPage,
   DashboardPageActions,
   DashboardPageDescription,
   DashboardPageHeader,
@@ -21,19 +20,24 @@ import {
   SelectValue,
   Textarea,
 } from "@antfly/design-system";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import { ArrowUpDown, Clock, Hash, Plus, RotateCcw, Trash2, Zap } from "lucide-react";
 import type React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AIWorkflowContextBar,
+  AIWorkflowPage,
+  AIWorkflowSubmitButton,
+} from "@/components/ai-workflow";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
-import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
-import { fetchWithRetry } from "@/lib/utils";
+import { useSelectedInferenceModels } from "@/hooks/use-connections";
+import { useModelSelection } from "@/hooks/use-model-selection";
+import { modelsAcceptingInput } from "@/lib/inference-playground-contracts";
+import { beginAbortableRequest, fetchInferenceJson, finishAbortableRequest } from "@/lib/utils";
 
 interface RerankResponse {
   model: string;
@@ -67,7 +71,7 @@ const SAMPLE_DATA = {
 
 const RerankingPlaygroundPage: React.FC = () => {
   const { inferenceUrl } = useApiConfig();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const requestEndpoint = inferenceUrl("rerank");
 
   // Restore state from localStorage
   const [query, setQuery] = useState(() => {
@@ -91,7 +95,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     }
     return [""];
   });
-  const [selectedModel, setSelectedModel] = useState(() => {
+  const storedModel = useMemo(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) return JSON.parse(saved).selectedModel || "";
@@ -99,16 +103,25 @@ const RerankingPlaygroundPage: React.FC = () => {
       /* ignore */
     }
     return "";
-  });
+  }, []);
   const [result, setResult] = useState<RerankResponse | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [processingTime, setProcessingTime] = useState<number | null>(null);
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [modelsLoaded, setModelsLoaded] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const { models: connectionModels, loading: modelsLoading } =
-    useSelectedInferenceModelNames("reranker");
+  const { models: connectedModels, loading: modelsLoading } =
+    useSelectedInferenceModels("reranker");
+  const connectionModels = useMemo(
+    () => modelsAcceptingInput(connectedModels, "text").map((model) => model.name),
+    [connectedModels]
+  );
+  const availableModels = connectionModels;
+  const modelsLoaded = !modelsLoading;
+  const { model: selectedModel, setModel: setSelectedModel } = useModelSelection({
+    models: availableModels,
+    defaultModel:
+      storedModel || connectionModels.find((model) => model === "antfly-builtin-reranker"),
+  });
   const docKeyCounterRef = useRef(0);
   const [docKeys, setDocKeys] = useState<string[]>(() => {
     try {
@@ -130,32 +143,16 @@ const RerankingPlaygroundPage: React.FC = () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ query, documents, selectedModel }));
   }, [query, documents, selectedModel]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: model/backend identity invalidates in-flight results
   useEffect(() => {
-    setAvailableModels(connectionModels);
-    setSelectedModel((current: string) =>
-      current && connectionModels.includes(current)
-        ? current
-        : connectionModels.find((model) => model === "antfly-builtin-reranker") ||
-          connectionModels[0] ||
-          ""
-    );
-    setModelsLoaded(!modelsLoading);
-  }, [connectionModels, modelsLoading]);
-
-  // Handle ?model= URL param from Model Directory "Open in Playground"
-  useEffect(() => {
-    const modelParam = searchParams.get("model");
-    if (modelParam && modelsLoaded && availableModels.includes(modelParam)) {
-      setSelectedModel(modelParam);
-      setSearchParams(
-        (prev) => {
-          prev.delete("model");
-          return prev;
-        },
-        { replace: true }
-      );
-    }
-  }, [searchParams, modelsLoaded, availableModels, setSearchParams]);
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
+    setResult(null);
+    setError(null);
+    setProcessingTime(null);
+    return () => abortControllerRef.current?.abort();
+  }, [selectedModel, requestEndpoint]);
 
   const handleRerank = useCallback(async () => {
     const nonEmptyDocs = documents.filter((d) => d.trim());
@@ -175,12 +172,7 @@ const RerankingPlaygroundPage: React.FC = () => {
       return;
     }
 
-    // Cancel any previous request
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-
-    abortControllerRef.current = new AbortController();
+    const controller = beginAbortableRequest(abortControllerRef);
     setIsLoading(true);
     setError(null);
     setResult(null);
@@ -188,7 +180,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     const startTime = performance.now();
 
     try {
-      const response = await fetchWithRetry(inferenceUrl("rerank"), {
+      const data = await fetchInferenceJson<RerankResponse>(requestEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -196,19 +188,17 @@ const RerankingPlaygroundPage: React.FC = () => {
           query: query,
           documents: nonEmptyDocs,
         }),
-        signal: abortControllerRef.current.signal,
+        signal: controller.signal,
       });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(errorText || `HTTP ${response.status}`);
-      }
-
-      const data: RerankResponse = await response.json();
+      if (abortControllerRef.current !== controller || controller.signal.aborted) return;
       setResult(data);
       setProcessingTime(performance.now() - startTime);
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
+      if (
+        abortControllerRef.current !== controller ||
+        controller.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
         return;
       }
       setError(
@@ -217,9 +207,9 @@ const RerankingPlaygroundPage: React.FC = () => {
           : "Failed to connect to Antfly inference. Make sure the runtime is running."
       );
     } finally {
-      setIsLoading(false);
+      if (finishAbortableRequest(abortControllerRef, controller)) setIsLoading(false);
     }
-  }, [query, documents, selectedModel, inferenceUrl]);
+  }, [query, documents, selectedModel, requestEndpoint]);
 
   // Cmd+Enter shortcut
   useEffect(() => {
@@ -239,6 +229,9 @@ const RerankingPlaygroundPage: React.FC = () => {
   };
 
   const handleReset = () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
     setQuery("");
     setDocuments([""]);
     setDocKeys([nextDocKey()]);
@@ -317,7 +310,7 @@ const RerankingPlaygroundPage: React.FC = () => {
   }));
 
   return (
-    <DashboardPage className="h-full space-y-3">
+    <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
           <DashboardPageTitle className="font-aeonik">Reranking Playground</DashboardPageTitle>
@@ -333,13 +326,12 @@ const RerankingPlaygroundPage: React.FC = () => {
           </Button>
         </DashboardPageActions>
       </DashboardPageHeader>
-
-      <BackendInfoBar />
-
+      <AIWorkflowContextBar>
+        <BackendInfoBar />
+      </AIWorkflowContextBar>
       {modelsLoaded && availableModels.length === 0 && (
         <NoModelsGuide modelType="reranker" typeName="reranker" />
       )}
-
       {/* Configuration Panel */}
       <Card>
         <CardHeader className="pb-4">
@@ -388,7 +380,7 @@ const RerankingPlaygroundPage: React.FC = () => {
             </div>
           </div>
           <FormActions>
-            <Button
+            <AIWorkflowSubmitButton
               onClick={handleRerank}
               disabled={
                 isLoading ||
@@ -396,30 +388,26 @@ const RerankingPlaygroundPage: React.FC = () => {
                 !selectedModel ||
                 documents.filter((d) => d.trim()).length === 0
               }
+              running={isLoading}
+              runningLabel="Reranking"
+              onCancel={() => {
+                abortControllerRef.current?.abort();
+                abortControllerRef.current = null;
+                setIsLoading(false);
+              }}
             >
-              {isLoading ? (
-                <>
-                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                  Reranking
-                </>
-              ) : (
-                <>
-                  <ArrowUpDown className="h-4 w-4 mr-2" />
-                  Rerank
-                </>
-              )}
-            </Button>
+              <ArrowUpDown className="h-4 w-4 mr-2" />
+              Rerank
+            </AIWorkflowSubmitButton>
           </FormActions>
         </CardContent>
       </Card>
-
       {/* Error Display */}
       {error && (
         <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
-
       {/* Results Stats Bar */}
       {result && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
@@ -439,7 +427,6 @@ const RerankingPlaygroundPage: React.FC = () => {
           )}
         </DashboardToolbar>
       )}
-
       {/* Main Content - Side by Side */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Input Panel - Documents */}
@@ -525,7 +512,6 @@ const RerankingPlaygroundPage: React.FC = () => {
           </CardContent>
         </Card>
       </div>
-
       {/* Help text */}
       <div className="text-xs text-muted-foreground space-y-1">
         <p>
@@ -538,7 +524,7 @@ const RerankingPlaygroundPage: React.FC = () => {
           are sorted by score in descending order.
         </p>
       </div>
-    </DashboardPage>
+    </AIWorkflowPage>
   );
 };
 

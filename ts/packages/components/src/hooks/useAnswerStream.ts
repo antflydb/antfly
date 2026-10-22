@@ -1,5 +1,5 @@
 import type { QueryHit, RetrievalAgentRequest } from "@antfly/sdk";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { streamAnswer } from "../utils";
 
 /**
@@ -63,6 +63,8 @@ export function useAnswerStream() {
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  useEffect(() => () => abortControllerRef.current?.abort(), []);
+
   /**
    * Start streaming an answer
    */
@@ -90,41 +92,66 @@ export function useAnswerStream() {
         abortControllerRef.current.abort();
       }
 
-      try {
-        const controller = await streamAnswer(url, request, headers, {
-          onClassification: (data) => {
-            setClassification(data);
-          },
-          onHit: (hit) => {
-            setHits((prev) => [...prev, hit]);
-          },
-          onReasoning: (chunk) => {
-            setReasoning((prev) => prev + chunk);
-          },
-          onGeneration: (chunk) => {
-            setAnswer((prev) => prev + chunk);
-          },
-          onFollowup: (question) => {
-            setFollowUpQuestions((prev) => [...prev, question]);
-          },
-          onRetrievalAgentResult: (result) => {
-            setAnswer(result.generation ?? "");
-            setHits(result.hits ?? []);
-            setClassification(result.classification ?? null);
-            setFollowUpQuestions(result.followup_questions ?? []);
-          },
-          onComplete: () => {
-            setIsStreaming(false);
-          },
-          onError: (err) => {
-            const errorObj = err instanceof Error ? err : new Error(String(err));
-            setError(errorObj);
-            setIsStreaming(false);
-          },
-        });
+      const requestController = new AbortController();
+      abortControllerRef.current = requestController;
 
-        abortControllerRef.current = controller;
+      try {
+        const streamController = await streamAnswer(
+          url,
+          request,
+          headers,
+          {
+            onClassification: (data) => {
+              if (!requestController.signal.aborted) setClassification(data);
+            },
+            onHit: (hit) => {
+              if (!requestController.signal.aborted) setHits((prev) => [...prev, hit]);
+            },
+            onReasoning: (chunk) => {
+              if (!requestController.signal.aborted) setReasoning((prev) => prev + chunk);
+            },
+            onGeneration: (chunk) => {
+              if (!requestController.signal.aborted) setAnswer((prev) => prev + chunk);
+            },
+            onFollowup: (question) => {
+              if (!requestController.signal.aborted) {
+                setFollowUpQuestions((prev) => [...prev, question]);
+              }
+            },
+            onRetrievalAgentResult: (result) => {
+              if (requestController.signal.aborted) return;
+              if (result.generation !== undefined) setAnswer(result.generation);
+              if (result.hits !== undefined) setHits(result.hits);
+              if (result.classification !== undefined) {
+                setClassification(result.classification ?? null);
+              }
+              if (result.followup_questions !== undefined) {
+                setFollowUpQuestions(result.followup_questions);
+              }
+            },
+            onComplete: () => {
+              if (!requestController.signal.aborted) setIsStreaming(false);
+            },
+            onError: (err) => {
+              if (requestController.signal.aborted) return;
+              const errorObj = err instanceof Error ? err : new Error(String(err));
+              setError(errorObj);
+              setIsStreaming(false);
+            },
+          },
+          { signal: requestController.signal }
+        );
+        // Keep the adapter's returned controller linked for compatibility with
+        // custom streamAnswer implementations while retaining pre-header
+        // cancellation through requestController.
+        if (requestController.signal.aborted) streamController.abort();
+        else {
+          requestController.signal.addEventListener("abort", () => streamController.abort(), {
+            once: true,
+          });
+        }
       } catch (err) {
+        if (requestController.signal.aborted) return;
         const errorObj = err instanceof Error ? err : new Error(String(err));
         setError(errorObj);
         setIsStreaming(false);

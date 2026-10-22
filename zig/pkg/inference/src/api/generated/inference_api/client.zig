@@ -225,6 +225,37 @@ pub const Client = struct {
         return ApiResponse(types.ModelsResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// List model instances
+    /// GET /models/instances
+    pub fn listModelInstances(self: *@This()) !ApiResponse(types.ModelInstanceList) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/models/instances", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ModelInstanceList).fromResponse(self.allocator, &resp);
+    }
+
+    /// Load a model instance
+    /// POST /models/instances
+    pub fn loadModelInstance(self: *@This(), body: types.ModelInstanceLoadRequest) !ApiResponse(types.ModelInstance) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/models/instances", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ModelInstance).fromResponse(self.allocator, &resp);
+    }
+
+    /// Unload a model instance
+    /// DELETE /models/instances/{instance_id}
+    pub fn unloadModelInstance(self: *@This(), instance_id: []const u8) !ApiResponse(types.ModelInstanceUnloadResponse) {
+        const encoded_instance_id = try httpx.PercentEncoding.encode(self.allocator, instance_id);
+        defer self.allocator.free(encoded_instance_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/models/instances/{s}", .{ self.base_url, encoded_instance_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ModelInstanceUnloadResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Run a traditional ML predictor
     /// POST /predict
     pub fn predict(self: *@This(), body: types.PredictRequest) !ApiResponse(types.PredictResponse) {

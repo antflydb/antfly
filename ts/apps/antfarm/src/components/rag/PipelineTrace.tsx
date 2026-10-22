@@ -34,6 +34,11 @@ export const PipelineTrace: React.FC<PipelineTraceProps> = ({
 
   const statusIndicator = (
     <div className="flex items-center gap-2">
+      {pipeline.overallStatus === "stopped" && (
+        <p role="status" className="text-sm text-muted-foreground">
+          Request stopped. Partial results are preserved.
+        </p>
+      )}
       {pipeline.overallStatus === "running" && (
         <span className="af-status-text-info flex items-center gap-1.5 text-xs">
           <span className="af-status-dot-info w-1.5 h-1.5 rounded-full animate-pulse" />
