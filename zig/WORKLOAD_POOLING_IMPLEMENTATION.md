@@ -23430,3 +23430,47 @@ match the final receipt, with no source changes during validation. The C-entry
 fixture starts an actual merge registration and proves it is joined while the
 DB and retained provider context remain owned. Receipts are preserved under
 `controlled-merge-cancel-final` in the cumulative qualification directory.
+
+
+### Resumable derived finalization under close ownership
+
+Owner close preflight now finalizes idle derived sessions and forced watermarks
+before retiring source publication and retained readers. The executor exposes a
+checked finalization callback in addition to quiescence. Manual execution has
+already closed and durably advanced each successful synchronous pass; its final
+phase validates the original close authority without inventing background work.
+
+Threaded finalization has one exclusive finisher. Contended finisher/metadata
+waits use the original admission port and deadline. Session tokens and cursors
+move into runtime-owned retry state before another checkpoint can reject.
+Callbacks run synchronously outside the metadata guard under running ownership;
+no original port escapes and no replacement execution owner or deadline is
+created. Successful finish and forced-persist receipts are recorded before
+fallible metadata publication. A retry or later physical deinit consumes those
+receipts without repeating completed callbacks.
+
+A finish reporting authoritative durability suppresses generic persistence.
+A failed finish remains an explicit failure and cannot be followed by a watermark
+advance. A deferred forced persistence leaves the prior watermark and may retry.
+Physical teardown uses the same state machine, including after an interrupted
+controlled attempt. Native ABI 84 and storage-owner ABI 142 fence the expanded
+private callback and retained-state layouts.
+
+This qualifies ownership and sequencing, not the cost of opaque callback work.
+Individual finish/persist/cursor I/O, waits and CPU cost still need bounded
+contracts and complete mandatory-completion funding. Sparse compaction, graph
+metrics, backend/cache/IO teardown, transaction pause/cursor serialization,
+parent metadata charges, route coverage, executable recovery funding and full
+linked-owner/cross-engine behavior remain open. Strong required providers remain
+disabled; full GNU/Linux qualification remains waived and Linux requires pinned
+Nix/glibc Zig.
+
+Pinned Darwin Debug validation passes all 71 build steps across derived
+visibility, maintenance shutdown, shared SQL workers and real C-entry close
+preflight. The final changed derived suite passes 54 tests; the other targets
+retain their passing cache evidence. A separate direct current-source run
+passes all 40 threaded-runtime/ownership regressions with no skips or leaks and
+exactly three expected error logs. Separate error ABI (43), released status ABI
+(1) and failure identity (7) checks pass. All 5,506 native/schema inputs remain
+unchanged, with receipts under `controlled-derived-finalization-final` and
+`controlled-derived-finalization-regressions` in the cumulative directory.

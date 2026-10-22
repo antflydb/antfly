@@ -59,6 +59,16 @@ const Worker = struct {
     join_changed: Io.Event = .unset,
     join_generation: std.atomic.Value(u64) = .init(0),
     join_waiters: std.atomic.Value(u32) = .init(0),
+    finalization: struct {
+        started: bool = false,
+        cursor: ?replay_source_mod.MatchingCursor = null,
+        had_session: bool = false,
+        token: CatchUpSessionToken = .{},
+        finish_done: bool = false,
+        finish_failure: ?anyerror = null,
+        durable: bool = false,
+        done: bool = false,
+    } = .{},
     next_delay_ms: ?u64 = 0,
     idle_since_ns: ?u64 = null,
     catch_up_open: bool = false,
@@ -153,6 +163,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             }
         };
         try @import("../../../common/cleanup_wait.zig").until(null, original, self, Ready.get, null);
+    }
+
+    pub fn finalizeWithAdmission(self: *@This(), original: @import("../../../common/read_admission.zig").Port) !void {
+        try self.quiesceWithAdmission(original);
     }
 
     pub fn hasWorkers(_: *@This()) bool {
@@ -277,6 +291,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     workers: std.ArrayListUnmanaged(*Worker) = .empty,
     shutdown: bool = false,
     closing: std.atomic.Value(bool) = .init(false),
+    finalizer_active: std.atomic.Value(bool) = .init(false),
     active_borrows: std.atomic.Value(u32) = .init(0),
     last_error_name: ?[]const u8 = null,
     // Claims exclude duplicate cleanup; completion alone releases backlog credit.
@@ -402,6 +417,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn deinit(self: *DerivedRuntime) void {
         const io = self.ioContext();
+        while (self.finalizer_active.cmpxchgWeak(false, true, .acquire, .monotonic) != null)
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
         self.beginShutdown();
         while (self.active_borrows.load(.acquire) != 0) io.sleep(.fromMilliseconds(1), .awake) catch {};
         self.mutex.lockUncancelable(io);
@@ -409,15 +426,12 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
         for (self.workers.items) |worker| {
             if (worker.future) |*future| _ = future.await(io);
-            _ = closeWorkerCatchUpState(self, worker, worker.applied_sequence, true) catch |err| {
-                std.log.warn("derived worker final catch-up close failed worker={s}: {s}", .{ worker.name, @errorName(err) });
+            self.finalizeWorker(worker, null) catch |err| {
+                std.log.warn("derived worker finalization deferred worker={s}: {s}", .{ worker.name, @errorName(err) });
             };
-            if (worker.applied_sequence > worker.persisted_sequence) {
-                _ = self.persist_fn(self.ctx, worker.name, worker.applied_sequence, true) catch |err| failed: {
-                    std.log.warn("derived worker final applied-sequence persist failed worker={s}: {s}", .{ worker.name, @errorName(err) });
-                    break :failed false;
-                };
-            }
+            // A failed controlled attempt may still own an unclosed cursor.
+            if (worker.finalization.cursor) |*cursor| cursor.deinit(self.alloc);
+            if (worker.replay_cursor) |*cursor| cursor.deinit(self.alloc);
             self.alloc.free(worker.name);
             self.alloc.destroy(worker);
         }
@@ -477,6 +491,102 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             try join.stopWithAdmission(io, original);
         }
         try cleanup.lockIo(&self.mutex, io, original);
+        self.mutex.unlock(io);
+    }
+
+    fn finalizerReady(raw: *anyopaque) anyerror!bool {
+        const self: *DerivedRuntime = @ptrCast(@alignCast(raw));
+        return !self.finalizer_active.load(.acquire);
+    }
+
+    fn finalizationCheckpoint(original: ?@import("../../../common/read_admission.zig").Port) !void {
+        if (original) |control| try control.checkpoint();
+    }
+
+    fn lockFinalizationMetadata(self: *DerivedRuntime, original: ?@import("../../../common/read_admission.zig").Port) !void {
+        const io = self.ioContext();
+        if (original) |control| {
+            try @import("../../../common/cleanup_wait.zig").lockIo(&self.mutex, io, control);
+        } else self.mutex.lockUncancelable(io);
+    }
+
+    /// No original Port escapes this synchronous call. Callback work runs
+    /// with the caller's execution, while only contended guards lend it.
+    /// Callback I/O/cost contracts remain a separate qualification obligation.
+    pub fn finalizeWithAdmission(self: *DerivedRuntime, original: @import("../../../common/read_admission.zig").Port) !void {
+        self.requestShutdown();
+        const io = self.ioContext();
+        const cleanup = @import("../../../common/cleanup_wait.zig");
+        while (true) {
+            try cleanup.until(io, original, self, finalizerReady, null);
+            if (self.finalizer_active.cmpxchgWeak(false, true, .acquire, .monotonic) == null) break;
+        }
+        defer self.finalizer_active.store(false, .release);
+        try self.quiesceWithAdmission(original);
+        for (self.workers.items) |worker| try self.finalizeWorker(worker, original);
+    }
+
+    fn finalizeWorker(self: *DerivedRuntime, worker: *Worker, original: ?@import("../../../common/read_admission.zig").Port) !void {
+        try finalizationCheckpoint(original);
+        const final = &worker.finalization;
+        if (final.done) return;
+        const io = self.ioContext();
+        if (!final.started) {
+            try self.lockFinalizationMetadata(original);
+            if (worker.catch_up_close_failed) {
+                self.mutex.unlock(io);
+                return RuntimeError.AsyncWorkerFailed;
+            }
+            // Transfer into runtime-owned retry state before any subsequent
+            // checkpoint can reject. Never leave a cursor/token on the stack.
+            final.cursor = worker.replay_cursor;
+            final.had_session = worker.catch_up_open;
+            final.token = worker.catch_up_token;
+            final.started = true;
+            worker.replay_cursor = null;
+            worker.replay_cursor_open_sequence = 0;
+            worker.catch_up_open = false;
+            worker.catch_up_token = .{};
+            worker.catch_up_close_requested = false;
+            worker.catch_up_close_active = final.had_session;
+            worker.last_replay_tail_records = 0;
+            self.mutex.unlock(io);
+        }
+        if (final.cursor) |*cursor| {
+            try finalizationCheckpoint(original);
+            cursor.deinit(self.alloc);
+            final.cursor = null;
+        }
+        if (!final.finish_done) {
+            try finalizationCheckpoint(original);
+            if (final.had_session) {
+                if (self.finish_catch_up_fn) |finish| {
+                    const result = finish(self.ctx, worker.kind, final.token, worker.applied_sequence, true) catch |cause| failed: {
+                        final.finish_failure = cause;
+                        break :failed CatchUpFinishResult{};
+                    };
+                    // Record authoritative publication before any fallible
+                    // reentry/guard step. Retrying cannot repeat the callback.
+                    final.durable = result.applied_sequence_persisted;
+                }
+            }
+            final.finish_done = true;
+        }
+        try self.lockFinalizationMetadata(original);
+        worker.catch_up_close_active = false;
+        worker.catch_up_close_failed = final.finish_failure != null;
+        self.cond.broadcast(io);
+        self.mutex.unlock(io);
+        if (final.finish_failure) |cause| return cause;
+        if (worker.applied_sequence > worker.persisted_sequence and !final.durable) {
+            try finalizationCheckpoint(original);
+            if (!try self.persist_fn(self.ctx, worker.name, worker.applied_sequence, true))
+                return RuntimeError.AsyncWorkerFailed;
+            final.durable = true;
+        }
+        try self.lockFinalizationMetadata(original);
+        if (final.durable) worker.persisted_sequence = @max(worker.persisted_sequence, worker.applied_sequence);
+        final.done = true;
         self.mutex.unlock(io);
     }
 
@@ -3416,4 +3526,237 @@ test "controlled derived quiescence preserves idle finalization until physical d
     live = false;
     try std.testing.expectEqual(@as(usize, 1), f.finishes);
     try std.testing.expectEqual(@as(usize, 1), f.persists);
+}
+
+const FinalizationProbe = struct {
+    runtime: *DerivedRuntime = undefined,
+    hold: enum { none, finish, persist } = .none,
+    held: bool = false,
+    finishes: usize = 0,
+    persists: usize = 0,
+    durable_finish: bool = false,
+    fail_finish: bool = false,
+    defer_persist_once: bool = false,
+    block_finish: bool = false,
+    finish_entered: Io.Event = .unset,
+    finish_release: Io.Event = .unset,
+    fn release(self: *@This()) void {
+        if (!self.held) return;
+        self.runtime.mutex.unlock(self.runtime.ioContext());
+        self.held = false;
+    }
+    fn takeGuard(self: *@This()) void {
+        // User callbacks run outside the metadata guard. Keep a peer guard
+        // held on return to force the following publication/reentry wait.
+        std.debug.assert(self.runtime.mutex.tryLock());
+        self.held = true;
+    }
+    fn apply(_: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+        return true;
+    }
+    fn truncate(_: *anyopaque, _: u64) !void {}
+    fn finish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, _: u64, _: bool) !CatchUpFinishResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(token.value == 7);
+        self.finishes += 1;
+        if (self.block_finish) {
+            self.finish_entered.set(self.runtime.ioContext());
+            self.finish_release.waitUncancelable(self.runtime.ioContext());
+        }
+        if (self.hold == .finish) self.takeGuard();
+        if (self.fail_finish) return error.OutOfMemory;
+        return .{ .applied_sequence_persisted = self.durable_finish };
+    }
+    fn persist(raw: *anyopaque, _: []const u8, _: u64, force: bool) !bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(force);
+        self.persists += 1;
+        if (self.hold == .persist) self.takeGuard();
+        if (self.defer_persist_once and self.persists == 1) return false;
+        return true;
+    }
+    fn install(self: *@This(), runtime: *DerivedRuntime) !*Worker {
+        self.runtime = runtime;
+        const alloc = std.testing.allocator;
+        const worker = try alloc.create(Worker);
+        errdefer alloc.destroy(worker);
+        const name = try alloc.dupe(u8, "finalize");
+        errdefer alloc.free(name);
+        worker.* = .{ .runtime = runtime, .name = name, .kind = .{ .name = name, .kind = .dense_vector }, .applied_sequence = 1, .persisted_sequence = 0, .target_sequence = 1, .catch_up_open = true, .catch_up_token = .{ .value = 7 } };
+        try runtime.workers.append(alloc, worker);
+        return worker;
+    }
+};
+
+test "controlled derived finalization retains completed finish and persistence across original guard failures" {
+    const admission = @import("../../../common/read_admission.zig");
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    for ([_]@TypeOf(@as(FinalizationProbe, .{}).hold){ .finish, .persist }) |stage| {
+        for (std.enums.values(Case)) |case| {
+            var probe: FinalizationProbe = .{ .hold = stage };
+            var runtime = try DerivedRuntime.init(std.testing.allocator, undefined, &probe, FinalizationProbe.apply, FinalizationProbe.persist, FinalizationProbe.truncate, null, FinalizationProbe.finish, null, null, null);
+            var live = true;
+            defer if (live) {
+                probe.release();
+                runtime.deinit();
+            };
+            const worker = try probe.install(&runtime);
+            const Control = struct {
+                probe: *FinalizationProbe,
+                case: Case,
+                begins: usize = 0,
+                ends: usize = 0,
+                fn check(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+                }
+                fn deadline(_: *anyopaque) !?u64 {
+                    return 1000;
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.begins += 1;
+                    if (self.case == .begin_failure) return error.NotFound;
+                    if (self.case != .lifetime_in_wait) self.probe.release();
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    self.probe.release();
+                    if (self.case == .end_failure) return error.Canceled;
+                }
+            };
+            var control: Control = .{ .probe = &probe, .case = case };
+            var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+            const result = runtime.finalizeWithAdmission(.init(&payload));
+            if (case == .success) try result else {
+                try std.testing.expectError(switch (case) {
+                    .begin_failure => error.NotFound,
+                    .end_failure => error.Canceled,
+                    .lifetime_in_wait => error.DeadlineExceeded,
+                    .success => unreachable,
+                }, result);
+                try std.testing.expect(worker.finalization.finish_done and !worker.finalization.done);
+                try std.testing.expectEqual(stage == .persist, worker.finalization.durable);
+                try std.testing.expectEqual(@as(u64, 0), worker.persisted_sequence);
+                try std.testing.expect(!runtime.finalizer_active.load(.acquire));
+                probe.release();
+                control.case = .success;
+                try runtime.finalizeWithAdmission(.init(&payload));
+            }
+            try std.testing.expect(worker.finalization.done);
+            try std.testing.expectEqual(@as(u64, 1), worker.persisted_sequence);
+            try runtime.finalizeWithAdmission(.init(&payload));
+            try std.testing.expectEqual(@as(usize, 1), probe.finishes);
+            try std.testing.expectEqual(@as(usize, 1), probe.persists);
+            try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_failure), control.ends);
+            runtime.deinit();
+            live = false;
+            try std.testing.expectEqual(@as(usize, 1), probe.finishes);
+            try std.testing.expectEqual(@as(usize, 1), probe.persists);
+        }
+    }
+}
+
+test "controlled derived finalization preserves authoritative durability and failed or deferred publication" {
+    const admission = @import("../../../common/read_admission.zig");
+    const Case = enum { durable, finish_failure, deferred_persist };
+    for (std.enums.values(Case)) |case| {
+        var probe: FinalizationProbe = .{ .durable_finish = case == .durable, .fail_finish = case == .finish_failure, .defer_persist_once = case == .deferred_persist };
+        var runtime = try DerivedRuntime.init(std.testing.allocator, undefined, &probe, FinalizationProbe.apply, FinalizationProbe.persist, FinalizationProbe.truncate, null, FinalizationProbe.finish, null, null, null);
+        var live = true;
+        defer if (live) runtime.deinit();
+        const worker = try probe.install(&runtime);
+        const Control = struct {
+            fn check(_: *anyopaque) !void {}
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+        };
+        var payload: admission.Payload = .{ .ptr = &probe, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &probe, .begin = Control.check, .end = Control.check } };
+        const result = runtime.finalizeWithAdmission(.init(&payload));
+        switch (case) {
+            .durable => {
+                try result;
+                try std.testing.expectEqual(@as(usize, 0), probe.persists);
+            },
+            .finish_failure => {
+                try std.testing.expectError(error.OutOfMemory, result);
+                try std.testing.expectError(error.OutOfMemory, runtime.finalizeWithAdmission(.init(&payload)));
+                try std.testing.expect(worker.catch_up_close_failed);
+                try std.testing.expectEqual(@as(u64, 0), worker.persisted_sequence);
+                try std.testing.expectEqual(@as(usize, 0), probe.persists);
+            },
+            .deferred_persist => {
+                try std.testing.expectError(RuntimeError.AsyncWorkerFailed, result);
+                try std.testing.expectEqual(@as(u64, 0), worker.persisted_sequence);
+                try runtime.finalizeWithAdmission(.init(&payload));
+                try std.testing.expectEqual(@as(usize, 2), probe.persists);
+            },
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.finishes);
+        if (case != .finish_failure) try std.testing.expectEqual(@as(u64, 1), worker.persisted_sequence);
+        const persists = probe.persists;
+        runtime.deinit();
+        live = false;
+        try std.testing.expectEqual(@as(usize, 1), probe.finishes);
+        try std.testing.expectEqual(persists, probe.persists);
+    }
+}
+
+test "controlled derived finalization serializes competing closers without lending around callbacks" {
+    const admission = @import("../../../common/read_admission.zig");
+    var probe: FinalizationProbe = .{ .block_finish = true };
+    var runtime = try DerivedRuntime.init(std.testing.allocator, undefined, &probe, FinalizationProbe.apply, FinalizationProbe.persist, FinalizationProbe.truncate, null, FinalizationProbe.finish, null, null, null);
+    defer runtime.deinit();
+    _ = try probe.install(&runtime);
+    const Control = struct {
+        reject_begin: bool,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            if (self.reject_begin) return error.NotFound;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+        }
+        fn payload(self: *@This()) admission.Payload {
+            return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .check_lifetime = check, .deadline_ns = deadline }, .execution_wait = .{ .ptr = self, .begin = begin, .end = end } };
+        }
+        fn run(value: *DerivedRuntime, original: admission.Port) !void {
+            try value.finalizeWithAdmission(original);
+        }
+    };
+    var first: Control = .{ .reject_begin = false };
+    var first_payload = first.payload();
+    const io = runtime.ioContext();
+    var future = try io.concurrent(Control.run, .{ &runtime, admission.Port.init(&first_payload) });
+    defer {
+        probe.finish_release.set(io);
+        _ = future.await(io) catch {};
+    }
+    try probe.finish_entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expect(runtime.mutex.tryLock());
+    runtime.mutex.unlock(io);
+    var second: Control = .{ .reject_begin = true };
+    var second_payload = second.payload();
+    try std.testing.expectError(error.NotFound, runtime.finalizeWithAdmission(.init(&second_payload)));
+    try std.testing.expect(runtime.finalizer_active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), second.begins);
+    try std.testing.expectEqual(@as(usize, 0), second.ends);
+    probe.finish_release.set(io);
+    try future.await(io);
+    try std.testing.expectEqual(@as(usize, 0), first.begins);
+    try std.testing.expectEqual(@as(usize, 0), first.ends);
+    second.reject_begin = false;
+    try runtime.finalizeWithAdmission(.init(&second_payload));
+    try std.testing.expectEqual(@as(usize, 1), probe.finishes);
+    try std.testing.expectEqual(@as(usize, 1), probe.persists);
 }

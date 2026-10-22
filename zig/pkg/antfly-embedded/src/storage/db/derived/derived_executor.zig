@@ -55,11 +55,12 @@ pub const Executor = struct {
     callback_dispatch: @import("../../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
     const Control = @import("../../../common/read_admission.zig");
     const Quiesce = *const fn (*anyopaque, Control.Port) anyerror!void;
-    const NativeBoundary = @import("../../named_callback.zig").Boundary(struct { quiesce_with_admission: Quiesce });
+    const NativeBoundary = @import("../../named_callback.zig").Boundary(struct { quiesce_with_admission: Quiesce, finalize_with_admission: Quiesce });
 
     const VTable = struct {
         request_shutdown: ?*const fn (*anyopaque) void = null,
         quiesce_with_admission: ?Quiesce = null,
+        finalize_with_admission: ?Quiesce = null,
         begin_shutdown: *const fn (ptr: *anyopaque) void,
         deinit: *const fn (ptr: *anyopaque, alloc: Allocator) void,
         has_workers: *const fn (ptr: *anyopaque) bool,
@@ -101,6 +102,14 @@ pub const Executor = struct {
         var relay: Control.ExecutionErrorRelay = .{};
         const borrowed = try relay.bind(original);
         NativeBoundary.call("quiesce_with_admission", self.callback_dispatch, callback, .{ self.ptr, borrowed }) catch |cause| return relay.errors.rejection orelse cause;
+        if (relay.errors.rejection) |cause| return cause;
+    }
+
+    pub fn finalizeWithAdmission(self: *Executor, original: Control.Port) !void {
+        const callback = self.vtable.finalize_with_admission orelse return error.ExecutionWaitUnsupported;
+        var relay: Control.ExecutionErrorRelay = .{};
+        const borrowed = try relay.bind(original);
+        NativeBoundary.call("finalize_with_admission", self.callback_dispatch, callback, .{ self.ptr, borrowed }) catch |cause| return relay.errors.rejection orelse cause;
         if (relay.errors.rejection) |cause| return cause;
     }
 
@@ -578,6 +587,7 @@ const manual_vtable = Executor.VTable{
     .begin_shutdown = manualBeginShutdown,
     .request_shutdown = manualBeginShutdown,
     .quiesce_with_admission = manualQuiesce,
+    .finalize_with_admission = manualQuiesce,
     .deinit = manualDeinit,
     .has_workers = manualHasWorkers,
     .fail_if_unhealthy = manualFailIfUnhealthy,
@@ -750,6 +760,7 @@ const io_threaded_vtable = Executor.VTable{
     .begin_shutdown = ioThreadedBeginShutdown,
     .request_shutdown = ioThreadedRequestShutdown,
     .quiesce_with_admission = ioThreadedQuiesce,
+    .finalize_with_admission = ioThreadedFinalize,
     .deinit = ioThreadedDeinit,
     .has_workers = ioThreadedHasWorkers,
     .fail_if_unhealthy = ioThreadedFailIfUnhealthy,
@@ -885,4 +896,9 @@ fn ioThreadedRequestShutdown(ptr: *anyopaque) void {
 fn ioThreadedQuiesce(ptr: *anyopaque, original: @import("../../../common/read_admission.zig").Port) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     try runtime.quiesceWithAdmission(original);
+}
+
+fn ioThreadedFinalize(ptr: *anyopaque, original: @import("../../../common/read_admission.zig").Port) !void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    try runtime.finalizeWithAdmission(original);
 }
