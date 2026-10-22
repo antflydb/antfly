@@ -25,14 +25,14 @@ class InferenceReadResponse:
         object_ (InferenceReadResponseObject): Object type, always "list"
         data (list[InferenceReadObject]): Read result objects, one per input image.
         model (str): Name of model used for reading
-        usage (InferenceGenerateUsage):
+        usage (InferenceGenerateUsage | Unset):
         execution (InferenceBatchExecutionReport | Unset): Observed executor behavior, not a capability prediction.
     """
 
     object_: InferenceReadResponseObject
     data: list[InferenceReadObject]
     model: str
-    usage: InferenceGenerateUsage
+    usage: InferenceGenerateUsage | Unset = UNSET
     execution: InferenceBatchExecutionReport | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -46,7 +46,9 @@ class InferenceReadResponse:
 
         model = self.model
 
-        usage = self.usage.to_dict()
+        usage: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.usage, Unset):
+            usage = self.usage.to_dict()
 
         execution: dict[str, Any] | Unset = UNSET
         if not isinstance(self.execution, Unset):
@@ -59,9 +61,10 @@ class InferenceReadResponse:
                 "object": object_,
                 "data": data,
                 "model": model,
-                "usage": usage,
             }
         )
+        if usage is not UNSET:
+            field_dict["usage"] = usage
         if execution is not UNSET:
             field_dict["execution"] = execution
 
@@ -85,7 +88,12 @@ class InferenceReadResponse:
 
         model = d.pop("model")
 
-        usage = InferenceGenerateUsage.from_dict(d.pop("usage"))
+        _usage = d.pop("usage", UNSET)
+        usage: InferenceGenerateUsage | Unset
+        if isinstance(_usage, Unset):
+            usage = UNSET
+        else:
+            usage = InferenceGenerateUsage.from_dict(_usage)
 
         _execution = d.pop("execution", UNSET)
         execution: InferenceBatchExecutionReport | Unset
