@@ -33110,7 +33110,71 @@ pub const MemoryEntityCandidate = struct {
     view: MemoryEntityView,
     match_score: f64,
     description_score: f64,
+    name_similarity: OpenApiOptionalNullable(f64) = .absent,
+    view_similarity: OpenApiOptionalNullable(f64) = .absent,
+    semantic_discovered: ?bool = null,
     predicates: []const []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "entity", "entity", false },
+        .{ "view", "view", false },
+        .{ "match_score", "match_score", false },
+        .{ "description_score", "description_score", false },
+        .{ "name_similarity", "name_similarity", false },
+        .{ "view_similarity", "view_similarity", false },
+        .{ "semantic_discovered", "semantic_discovered", true },
+        .{ "predicates", "predicates", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("entity");
+        try jw.write(self.entity);
+        try jw.objectField("view");
+        try jw.write(self.view);
+        try jw.objectField("match_score");
+        try jw.write(self.match_score);
+        try jw.objectField("description_score");
+        try jw.write(self.description_score);
+        switch (self.name_similarity) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("name_similarity");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("name_similarity");
+                try jw.write(value);
+            },
+        }
+        switch (self.view_similarity) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("view_similarity");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("view_similarity");
+                try jw.write(value);
+            },
+        }
+        if (self.semantic_discovered) |value| {
+            try jw.objectField("semantic_discovered");
+            try jw.write(value);
+        }
+        try jw.objectField("predicates");
+        try jw.write(self.predicates);
+        try jw.endObject();
+    }
 };
 
 pub const MemoryEntityCandidatePage = struct {
@@ -35275,6 +35339,7 @@ pub const MemorySpaceConfig = struct {
     policy_version: ?[]const u8 = null,
     features: ?std.json.Value = null,
     models: ?std.json.Value = null,
+    semantic_discovery: ?std.json.Value = null,
     ontology_pack: ?[]const u8 = null,
     predicates: ?[]const std.json.Value = null,
     source_rules: ?[]const std.json.Value = null,
@@ -35294,6 +35359,7 @@ pub const MemorySpaceConfig = struct {
         .{ "policy_version", "policy_version", true },
         .{ "features", "features", true },
         .{ "models", "models", true },
+        .{ "semantic_discovery", "semantic_discovery", true },
         .{ "ontology_pack", "ontology_pack", true },
         .{ "predicates", "predicates", true },
         .{ "source_rules", "source_rules", true },
@@ -35344,6 +35410,10 @@ pub const MemorySpaceConfig = struct {
         }
         if (self.models) |value| {
             try jw.objectField("models");
+            try jw.write(value);
+        }
+        if (self.semantic_discovery) |value| {
+            try jw.objectField("semantic_discovery");
             try jw.write(value);
         }
         if (self.ontology_pack) |value| {
@@ -36995,12 +37065,14 @@ pub const Permission = struct {
 pub const PermissionType = enum {
     read,
     write,
+    curator,
     admin,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .read => "read",
             .write => "write",
+            .curator => "curator",
             .admin => "admin",
         };
         try jw.write(s);
@@ -37014,6 +37086,7 @@ pub const PermissionType = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "read", .read },
             .{ "write", .write },
+            .{ "curator", .curator },
             .{ "admin", .admin },
         });
         return map.get(s) orelse error.UnexpectedToken;

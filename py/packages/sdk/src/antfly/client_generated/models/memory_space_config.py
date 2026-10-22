@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.memory_space_config_features import MemorySpaceConfigFeatures
     from ..models.memory_space_config_models import MemorySpaceConfigModels
     from ..models.memory_space_config_predicates_item import MemorySpaceConfigPredicatesItem
+    from ..models.memory_space_config_semantic_discovery import MemorySpaceConfigSemanticDiscovery
     from ..models.memory_space_config_source_rules_item import MemorySpaceConfigSourceRulesItem
 
 
@@ -31,6 +32,7 @@ class MemorySpaceConfig:
         policy_version (str | Unset):
         features (MemorySpaceConfigFeatures | Unset):
         models (MemorySpaceConfigModels | Unset):
+        semantic_discovery (MemorySpaceConfigSemanticDiscovery | Unset):
         ontology_pack (MemorySpaceConfigOntologyPack | Unset):  Default: MemorySpaceConfigOntologyPack.NONE.
         predicates (list[MemorySpaceConfigPredicatesItem] | Unset):
         source_rules (list[MemorySpaceConfigSourceRulesItem] | Unset):
@@ -49,6 +51,7 @@ class MemorySpaceConfig:
     policy_version: str | Unset = UNSET
     features: MemorySpaceConfigFeatures | Unset = UNSET
     models: MemorySpaceConfigModels | Unset = UNSET
+    semantic_discovery: MemorySpaceConfigSemanticDiscovery | Unset = UNSET
     ontology_pack: MemorySpaceConfigOntologyPack | Unset = MemorySpaceConfigOntologyPack.NONE
     predicates: list[MemorySpaceConfigPredicatesItem] | Unset = UNSET
     source_rules: list[MemorySpaceConfigSourceRulesItem] | Unset = UNSET
@@ -80,6 +83,10 @@ class MemorySpaceConfig:
         models: dict[str, Any] | Unset = UNSET
         if not isinstance(self.models, Unset):
             models = self.models.to_dict()
+
+        semantic_discovery: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.semantic_discovery, Unset):
+            semantic_discovery = self.semantic_discovery.to_dict()
 
         ontology_pack: str | Unset = UNSET
         if not isinstance(self.ontology_pack, Unset):
@@ -132,6 +139,8 @@ class MemorySpaceConfig:
             field_dict["features"] = features
         if models is not UNSET:
             field_dict["models"] = models
+        if semantic_discovery is not UNSET:
+            field_dict["semantic_discovery"] = semantic_discovery
         if ontology_pack is not UNSET:
             field_dict["ontology_pack"] = ontology_pack
         if predicates is not UNSET:
@@ -156,6 +165,7 @@ class MemorySpaceConfig:
         from ..models.memory_space_config_features import MemorySpaceConfigFeatures
         from ..models.memory_space_config_models import MemorySpaceConfigModels
         from ..models.memory_space_config_predicates_item import MemorySpaceConfigPredicatesItem
+        from ..models.memory_space_config_semantic_discovery import MemorySpaceConfigSemanticDiscovery
         from ..models.memory_space_config_source_rules_item import MemorySpaceConfigSourceRulesItem
 
         d = dict(src_dict)
@@ -189,6 +199,13 @@ class MemorySpaceConfig:
             models = UNSET
         else:
             models = MemorySpaceConfigModels.from_dict(_models)
+
+        _semantic_discovery = d.pop("semantic_discovery", UNSET)
+        semantic_discovery: MemorySpaceConfigSemanticDiscovery | Unset
+        if isinstance(_semantic_discovery, Unset):
+            semantic_discovery = UNSET
+        else:
+            semantic_discovery = MemorySpaceConfigSemanticDiscovery.from_dict(_semantic_discovery)
 
         _ontology_pack = d.pop("ontology_pack", UNSET)
         ontology_pack: MemorySpaceConfigOntologyPack | Unset
@@ -241,6 +258,7 @@ class MemorySpaceConfig:
             policy_version=policy_version,
             features=features,
             models=models,
+            semantic_discovery=semantic_discovery,
             ontology_pack=ontology_pack,
             predicates=predicates,
             source_rules=source_rules,

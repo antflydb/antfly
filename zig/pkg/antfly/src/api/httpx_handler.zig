@@ -18904,6 +18904,12 @@ test "native memory dedicated MCP and HTTP authorize scoped credentials across c
     defer read_grant.deinit(a);
     var bob = try auth.manager.createUser("memory_bob", "secret", &.{read_grant});
     defer bob.deinit(a);
+    var curator_grant = try usermgr.Permission.initOwned(a, .table, "memory_team", .curator);
+    defer curator_grant.deinit(a);
+    var curator_user = try auth.manager.createUser("memory_curator", "secret", &.{curator_grant});
+    defer curator_user.deinit(a);
+    const curator_authorization = try encodeBasicAuthorization(a, "memory_curator", "secret");
+    defer a.free(curator_authorization);
     const authorization = try encodeBasicAuthorization(a, "memory_alice", "secret");
     defer a.free(authorization);
     const read_authorization = try encodeBasicAuthorization(a, "memory_bob", "secret");
@@ -18989,6 +18995,55 @@ test "native memory dedicated MCP and HTTP authorize scoped credentials across c
     defer reader_tools.deinit();
     try std.testing.expect(std.mem.indexOf(u8, reader_tools.body.?, "memory_get") != null);
     try std.testing.expect(std.mem.indexOf(u8, reader_tools.body.?, "memory_observe") == null);
+    // The shared curator grant is projected across the same catalog aliases.
+    const curator_headers = [_][2][]const u8{ .{ "authorization", curator_authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", session } };
+    var curator_tools = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &curator_headers, 20);
+    defer curator_tools.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_propose_entity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_review_entity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_configure") == null);
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_stage_embeddings") == null);
+    const shared_observation =
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_observe","arguments":{"space":"team","idempotency_key":"shared","body":{"evidence":[{"id":"team-e","source_id":"curator-fixture","source_version":"1","text":"Antfly is AntflyDB","visibility":"team"}],"entities":[{"id":"left","name":"Antfly","visibility":"team","evidence":[{"id":"team-e"}]},{"id":"right","name":"AntflyDB","visibility":"team","evidence":[{"id":"team-e"}]}]}}}}
+    ;
+    var shared = try requestWithRetry(&client, io.io(), .POST, memory_url, shared_observation, &session_headers, 20);
+    defer shared.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, shared.body.?, "\"isError\":true") == null);
+    const candidates_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/entities/left/candidates", .{base});
+    defer a.free(candidates_url);
+    var candidates = try requestWithRetry(&client, io.io(), .POST, candidates_url, "{}", &curator_headers, 20);
+    defer candidates.deinit();
+    try std.testing.expectEqual(@as(u16, 200), candidates.status.code);
+    const proposals_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/entity-proposals", .{base});
+    defer a.free(proposals_url);
+    var proposals = try requestWithRetry(&client, io.io(), .GET, proposals_url, "", &curator_headers, 20);
+    defer proposals.deinit();
+    try std.testing.expectEqual(@as(u16, 200), proposals.status.code);
+    const proposal_headers = curator_headers ++ [_][2][]const u8{.{ "idempotency-key", "curator-proposal" }};
+    var proposed = try requestWithRetry(&client, io.io(), .POST, proposals_url, "{\"expected_revision\":4,\"action\":\"merge\",\"from\":\"left\",\"to\":\"right\"}", &proposal_headers, 20);
+    defer proposed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), proposed.status.code);
+    const receipt = try std.json.parseFromSlice(module.memory.types.OperationStatus, a, proposed.body.?, .{});
+    defer receipt.deinit();
+    const verdict_url = try std.fmt.allocPrint(a, "{s}/{s}/verdict", .{ proposals_url, receipt.value.proposal_id.? });
+    defer a.free(verdict_url);
+    const verdict_headers = curator_headers ++ [_][2][]const u8{.{ "idempotency-key", "curator-review" }};
+    const verdict = try std.fmt.allocPrint(a, "{{\"expected_revision\":{d},\"accept\":true}}", .{receipt.value.revision});
+    defer a.free(verdict);
+    var reviewed = try requestWithRetry(&client, io.io(), .POST, verdict_url, verdict, &verdict_headers, 20);
+    defer reviewed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), reviewed.status.code);
+    inline for (.{ .{ "", httpx.Method.PATCH }, .{ "/forget", httpx.Method.POST }, .{ "/embeddings", httpx.Method.POST } }) |denied_action| {
+        const denied_url = try std.fmt.allocPrint(a, "{s}{s}", .{ inspect_url, denied_action[0] });
+        defer a.free(denied_url);
+        var forbidden = try requestWithRetry(&client, io.io(), denied_action[1], denied_url, "{}", &proposal_headers, 20);
+        defer forbidden.deinit();
+        try std.testing.expectEqual(@as(u16, 403), forbidden.status.code);
+    }
+    try auth.manager.removePermissionFromUser("memory_curator", "memory_team", .table);
+    var revoked = try requestWithRetry(&client, io.io(), .POST, verdict_url, verdict, &verdict_headers, 20);
+    defer revoked.deinit();
+    try std.testing.expectEqual(@as(u16, 403), revoked.status.code);
     // Both endpoint catalogs and their sessions are isolated.
     var wrong_session = try requestWithRetry(&client, io.io(), .POST, database_url, list, &session_headers, 20);
     defer wrong_session.deinit();

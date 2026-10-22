@@ -45,7 +45,10 @@ fn blocked(err: anyerror) bool {
 fn cleanup(backend: m.Backend, a: A, now: i64, state: m.types.State, executor: Executor) !bool {
     const candidate_index = try backend.get(backend.ptr, a, "entity-candidate-index");
     const index_complete = if (candidate_index) |row| (try std.json.parseFromSliceLeaky(struct { cursor: ?[]const u8 = null, complete: bool = false }, a, row.json, .{})).complete else false;
-    if (index_complete and (state.next_resource_check_at == null or state.next_resource_check_at.? > now) and
+    const semantic_row = if (state.config.semantic_discovery.enabled) try backend.get(backend.ptr, a, "entity-semantic-index") else null;
+    const semantic_index = if (semantic_row) |row| try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, row.json, .{}) else m.types.SemanticIndex{};
+    const semantic_ready = !state.config.semantic_discovery.enabled or (semantic_index.complete and semantic_index.generation == state.config.generation and (try backend.scan(backend.ptr, a, "entity-semantic-work/", null, 1)).rows.len == 0);
+    if (semantic_ready and index_complete and (state.next_resource_check_at == null or state.next_resource_check_at.? > now) and
         (state.next_expiry_at == null or state.next_expiry_at.? > now) and
         (try backend.get(backend.ptr, a, "cleanup")) == null and
         (try backend.scan(backend.ptr, a, "dependency/work/", null, 1)).rows.len == 0) return false;

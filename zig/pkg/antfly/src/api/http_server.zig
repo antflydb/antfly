@@ -5491,7 +5491,7 @@ pub const ApiHttpServer = struct {
             if (!std.mem.eql(u8, logical, bound_logical)) return error.StoredDestinationAuthorizationInvalid;
             const payload = try std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.memory.execution.v1", .table = logical, .owner = context.principal }, .{});
             const authority: stored_destination_authorization.Authorizer = .{ .manager = server.cfg.user_manager, .auth_enabled = server.cfg.auth_enabled };
-            try authority.authorize(a, executor, &.{logical}, payload, signature);
+            try authority.authorize(a, executor, &.{}, payload, signature);
             if (std.mem.eql(u8, executor, stored_destination_authorization.auth_disabled_principal)) {
                 context.admin = !server.cfg.auth_enabled;
             } else {
@@ -5509,8 +5509,13 @@ pub const ApiHttpServer = struct {
                 }
                 if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
                 context.admin = permissionsAllow(permissions, .table, logical, .admin);
+                context.curator = permissionsAllow(permissions, .table, logical, .curator);
             }
-            var publication: MemoryPublicationAuthority = .{ .server = server, .alloc = a, .executor = executor, .signature = signature, .payload = payload, .logical = logical, .table = table, .required = if (pending) |item| if (module.memory.operationGrant(item) == .admin) .admin else .write else .admin };
+            var publication: MemoryPublicationAuthority = .{ .server = server, .alloc = a, .executor = executor, .signature = signature, .payload = payload, .logical = logical, .table = table, .required = if (pending) |item| switch (module.memory.operationGrant(item)) {
+                .write => .write,
+                .curator => .curator,
+                .admin => .admin,
+            } else .admin };
             context.grant_ptr = &publication;
             context.require_grant_fn = MemoryPublicationAuthority.requireGrant;
             context.final_check_ptr = &publication;
@@ -21538,7 +21543,11 @@ pub const ApiHttpServer = struct {
         required: usermgr.PermissionType = .write,
         fn requireGrant(ptr: *anyopaque, grant: @import("memory.zig").memory.types.RequiredGrant) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (grant == .admin) self.required = .admin;
+            self.required = switch (grant) {
+                .write => .write,
+                .curator => .curator,
+                .admin => .admin,
+            };
             try check(ptr);
         }
         fn check(ptr: *anyopaque) !void {
@@ -21554,7 +21563,7 @@ pub const ApiHttpServer = struct {
             }
             if (authority.signature.len == 0) return;
             const verifier: stored_destination_authorization.Authorizer = .{ .manager = server.cfg.user_manager, .auth_enabled = server.cfg.auth_enabled };
-            try verifier.authorize(authority.alloc, authority.executor, if (authority.identity != null or authority.required == .read) &.{} else &.{authority.logical}, authority.payload, authority.signature);
+            try verifier.authorize(authority.alloc, authority.executor, &.{}, authority.payload, authority.signature);
             if (std.mem.eql(u8, authority.executor, stored_destination_authorization.auth_disabled_principal)) return;
             const manager = server.cfg.user_manager orelse return error.StoredDestinationAuthorizationRevoked;
             const permissions = if (std.mem.startsWith(u8, authority.executor, "basic:")) try manager.getPermissionsForUser(authority.executor[6..]) else if (std.mem.startsWith(u8, authority.executor, "api-key:")) try manager.effectiveApiKeyPermissions(authority.executor[8..]) else return error.StoredDestinationCredentialUnsupported;
@@ -21580,6 +21589,11 @@ pub const ApiHttpServer = struct {
             const identity: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
             const value = identity.* orelse return true;
             return permissionsAllow(value.permissions, .table, table, .read);
+        }
+        fn curate(ptr: *const anyopaque, table: []const u8) bool {
+            const identity: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
+            const value = identity.* orelse return true;
+            return permissionsAllow(value.permissions, .table, table, .curator);
         }
         fn write(ptr: *const anyopaque, table: []const u8) bool {
             const identity: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
@@ -21617,9 +21631,13 @@ pub const ApiHttpServer = struct {
         request.native_service = .memory;
         request.row_policy_credential = &identity;
         request.table_read_authorization = .{ .ptr = &identity, .allows = MemoryIngressCredential.read };
-        request.table_write_authorization = .{ .ptr = &identity, .allows = MemoryIngressCredential.write };
+        request.table_write_authorization = .{ .ptr = &identity, .allows = if (module.memory.actionGrant(input.action) == .curator) MemoryIngressCredential.curate else MemoryIngressCredential.write };
         request.principal = if (identity) |value| .{ .kind = .user, .subject = value.username } else null;
-        const required: usermgr.PermissionType = if (!module.memory.mutates(input.action)) .read else if (module.memory.actionGrant(input.action) == .admin or (input.action == .advance and input.id.len == 0)) .admin else .write;
+        const required: usermgr.PermissionType = if (input.action == .advance and input.id.len == 0) .admin else switch (module.memory.actionGrant(input.action)) {
+            .admin => .admin,
+            .curator => .curator,
+            .write => if (module.memory.mutates(input.action)) .write else .read,
+        };
         if (input.action == .create) {
             const config = try std.json.parseFromSliceLeaky(module.memory.types.Config, a, try @import("antfly-json").stringifyValueAlloc(a, input.body), .{ .ignore_unknown_fields = false });
             try config.validate();
@@ -21668,6 +21686,7 @@ pub const ApiHttpServer = struct {
             .durable_execution_required = true,
             .principal = owner,
             .admin = if (identity) |value| permissionsAllow(value.permissions, .table, table, .admin) else !self.cfg.auth_enabled,
+            .curator = if (identity) |value| permissionsAllow(value.permissions, .table, table, .curator) else !self.cfg.auth_enabled,
             .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms),
             .check_ptr = &request,
             .check_fn = Check.call,
@@ -28576,7 +28595,7 @@ pub fn permissionsAllow(
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
         const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource) or (resource_type == .table and system_catalog_routes.tableResourceMatches(permission.resource, resource));
         if (!type_match or !resource_match) continue;
-        if (permission.type == .admin or permission.type == permission_type) return true;
+        if (permission.type.allows(permission_type)) return true;
     }
     return false;
 }
@@ -29887,6 +29906,7 @@ fn permissionTypeFromOpenApi(value: usermgr_openapi.PermissionType) usermgr.Perm
     return switch (value) {
         .read => .read,
         .write => .write,
+        .curator => .curator,
         .admin => .admin,
     };
 }
@@ -29907,6 +29927,7 @@ fn permissionTypeToOpenApi(value: usermgr.PermissionType) usermgr_openapi.Permis
     return switch (value) {
         .read => .read,
         .write => .write,
+        .curator => .curator,
         .admin => .admin,
     };
 }

@@ -14104,7 +14104,7 @@ export interface components {
          * @example read
          * @enum {string}
          */
-        PermissionType: "read" | "write" | "admin";
+        PermissionType: "read" | "write" | "curator" | "admin";
         /** @description A table or all tables in an explicit namespace. A missing table selects the namespace; a table named '*' remains literal. */
         CatalogTableScope: {
             /** @default default */
@@ -24044,6 +24044,25 @@ export interface components {
                     dimensions?: number | null;
                 } | null;
             };
+            semantic_discovery?: {
+                /** @default false */
+                enabled?: boolean;
+                /**
+                 * Format: double
+                 * @default 0.8
+                 */
+                name_threshold?: number;
+                /**
+                 * Format: double
+                 * @default 0.85
+                 */
+                view_threshold?: number;
+                /**
+                 * Format: uint32
+                 * @default 32
+                 */
+                neighbors?: number;
+            };
             /**
              * @default none
              * @enum {string}
@@ -24806,6 +24825,18 @@ export interface components {
             match_score: number;
             /** Format: double */
             description_score: number;
+            /**
+             * Format: double
+             * @default null
+             */
+            name_similarity?: number | null;
+            /**
+             * Format: double
+             * @default null
+             */
+            view_similarity?: number | null;
+            /** @default false */
+            semantic_discovered?: boolean;
             predicates: string[];
         };
         MemoryEntityCandidatePage: {
@@ -24829,7 +24860,7 @@ export interface components {
              * @default not_indexed
              * @enum {string}
              */
-            semantic_discovery?: "not_indexed";
+            semantic_discovery?: "not_indexed" | "not_ready" | "indexed";
             /**
              * @default name_matches_description_tiebreaker_not_identity_or_calibrated_confidence
              * @enum {string}
@@ -26294,6 +26325,25 @@ export interface components {
                             dimensions?: number | null;
                         } | null;
                     };
+                    semantic_discovery?: {
+                        /** @default false */
+                        enabled?: boolean;
+                        /**
+                         * Format: double
+                         * @default 0.8
+                         */
+                        name_threshold?: number;
+                        /**
+                         * Format: double
+                         * @default 0.85
+                         */
+                        view_threshold?: number;
+                        /**
+                         * Format: uint32
+                         * @default 32
+                         */
+                        neighbors?: number;
+                    };
                     /**
                      * @default none
                      * @enum {string}
@@ -26432,6 +26482,25 @@ export interface components {
                              */
                             dimensions?: number | null;
                         } | null;
+                    };
+                    semantic_discovery?: {
+                        /** @default false */
+                        enabled?: boolean;
+                        /**
+                         * Format: double
+                         * @default 0.8
+                         */
+                        name_threshold?: number;
+                        /**
+                         * Format: double
+                         * @default 0.85
+                         */
+                        view_threshold?: number;
+                        /**
+                         * Format: uint32
+                         * @default 32
+                         */
+                        neighbors?: number;
                     };
                     /**
                      * @default none

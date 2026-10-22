@@ -23,6 +23,9 @@ if TYPE_CHECKING:
     from ..models.memory_inspection_state_pending_config_type_0_predicates_item import (
         MemoryInspectionStatePendingConfigType0PredicatesItem,
     )
+    from ..models.memory_inspection_state_pending_config_type_0_semantic_discovery import (
+        MemoryInspectionStatePendingConfigType0SemanticDiscovery,
+    )
     from ..models.memory_inspection_state_pending_config_type_0_source_rules_item import (
         MemoryInspectionStatePendingConfigType0SourceRulesItem,
     )
@@ -44,6 +47,7 @@ class MemoryInspectionStatePendingConfigType0:
         policy_version (str | Unset):
         features (MemoryInspectionStatePendingConfigType0Features | Unset):
         models (MemoryInspectionStatePendingConfigType0Models | Unset):
+        semantic_discovery (MemoryInspectionStatePendingConfigType0SemanticDiscovery | Unset):
         ontology_pack (MemoryInspectionStatePendingConfigType0OntologyPack | Unset):  Default:
             MemoryInspectionStatePendingConfigType0OntologyPack.NONE.
         predicates (list[MemoryInspectionStatePendingConfigType0PredicatesItem] | Unset):
@@ -65,6 +69,7 @@ class MemoryInspectionStatePendingConfigType0:
     policy_version: str | Unset = UNSET
     features: MemoryInspectionStatePendingConfigType0Features | Unset = UNSET
     models: MemoryInspectionStatePendingConfigType0Models | Unset = UNSET
+    semantic_discovery: MemoryInspectionStatePendingConfigType0SemanticDiscovery | Unset = UNSET
     ontology_pack: MemoryInspectionStatePendingConfigType0OntologyPack | Unset = (
         MemoryInspectionStatePendingConfigType0OntologyPack.NONE
     )
@@ -98,6 +103,10 @@ class MemoryInspectionStatePendingConfigType0:
         models: dict[str, Any] | Unset = UNSET
         if not isinstance(self.models, Unset):
             models = self.models.to_dict()
+
+        semantic_discovery: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.semantic_discovery, Unset):
+            semantic_discovery = self.semantic_discovery.to_dict()
 
         ontology_pack: str | Unset = UNSET
         if not isinstance(self.ontology_pack, Unset):
@@ -150,6 +159,8 @@ class MemoryInspectionStatePendingConfigType0:
             field_dict["features"] = features
         if models is not UNSET:
             field_dict["models"] = models
+        if semantic_discovery is not UNSET:
+            field_dict["semantic_discovery"] = semantic_discovery
         if ontology_pack is not UNSET:
             field_dict["ontology_pack"] = ontology_pack
         if predicates is not UNSET:
@@ -179,6 +190,9 @@ class MemoryInspectionStatePendingConfigType0:
         )
         from ..models.memory_inspection_state_pending_config_type_0_predicates_item import (
             MemoryInspectionStatePendingConfigType0PredicatesItem,
+        )
+        from ..models.memory_inspection_state_pending_config_type_0_semantic_discovery import (
+            MemoryInspectionStatePendingConfigType0SemanticDiscovery,
         )
         from ..models.memory_inspection_state_pending_config_type_0_source_rules_item import (
             MemoryInspectionStatePendingConfigType0SourceRulesItem,
@@ -215,6 +229,13 @@ class MemoryInspectionStatePendingConfigType0:
             models = UNSET
         else:
             models = MemoryInspectionStatePendingConfigType0Models.from_dict(_models)
+
+        _semantic_discovery = d.pop("semantic_discovery", UNSET)
+        semantic_discovery: MemoryInspectionStatePendingConfigType0SemanticDiscovery | Unset
+        if isinstance(_semantic_discovery, Unset):
+            semantic_discovery = UNSET
+        else:
+            semantic_discovery = MemoryInspectionStatePendingConfigType0SemanticDiscovery.from_dict(_semantic_discovery)
 
         _ontology_pack = d.pop("ontology_pack", UNSET)
         ontology_pack: MemoryInspectionStatePendingConfigType0OntologyPack | Unset
@@ -269,6 +290,7 @@ class MemoryInspectionStatePendingConfigType0:
             policy_version=policy_version,
             features=features,
             models=models,
+            semantic_discovery=semantic_discovery,
             ontology_pack=ontology_pack,
             predicates=predicates,
             source_rules=source_rules,

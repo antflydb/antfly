@@ -48,6 +48,23 @@ fn decodeValue(a: A, value: std.json.Value) ![]const u8 {
     return std.json.Stringify.valueAlloc(a, payload, .{});
 }
 
+fn encodeChange(a: A, path: []const u8, json: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, path, "entity-semantic/")) return encodeRow(a, json);
+    const projection = try std.json.parseFromSliceLeaky(service.types.EntityProjection, a, json, .{});
+    const rest = path["entity-semantic/".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.MemoryCorruptState;
+    var embeddings: std.json.ObjectMap = .empty;
+    try embeddings.put(a, rest[0..slash], try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, projection.embedding, .{}), .{}));
+    return std.fmt.allocPrint(a, "{{\"memory_record_version\":1,\"value\":{s},\"_embeddings\":{s}}}", .{ json, try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = embeddings }, .{}) });
+}
+fn vectorIndexConfig(a: A, dims: u32) ![]const u8 {
+    return std.json.Stringify.valueAlloc(a, .{ .field = "embedding", .dims = dims, .metric = "cosine", .external = true }, .{});
+}
+fn neighborRequest(input: service.NeighborRequest) !db_types.SearchRequest {
+    if (input.limit == 0 or input.limit > 64 or !std.mem.startsWith(u8, input.index, "memory_")) return error.InvalidMemoryRequest;
+    return .{ .index_name = input.index, .query = .{ .dense_knn = .{ .vector = input.vector, .k = input.limit } }, .limit = input.limit, .include_stored = false };
+}
+
 pub const Routed = struct {
     table: []const u8,
     reads: reads_mod.TableReadSource,
@@ -58,7 +75,33 @@ pub const Routed = struct {
     request: @import("../api/operation.zig").RequestContext = .{},
 
     pub fn backend(self: *Routed) service.Backend {
-        return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null };
+        return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex };
+    }
+    fn ensureVectorIndex(ptr: *anyopaque, a: A, name: []const u8, dims: u32) !void {
+        const self: *Routed = @ptrCast(@alignCast(ptr));
+        try self.context.requireGrant(.admin);
+        self.writes.createIndex(a, self.table, name, try std.json.Stringify.valueAlloc(a, .{ .type = "embeddings", .external = true, .dimension = dims, .distance_metric = "cosine" }, .{})) catch |err| switch (err) {
+            error.IndexAlreadyExists => return,
+            else => return err,
+        } orelse return error.MemoryCapabilityUnavailable;
+    }
+    fn neighbors(ptr: *anyopaque, a: A, input: service.NeighborRequest) ![]const service.Neighbor {
+        const self: *Routed = @ptrCast(@alignCast(ptr));
+        try self.context.check();
+        var request = try neighborRequest(input);
+        request.execution_deadline_ns = self.request.deadline_ns;
+        request.cancellation = self.request.cancellation;
+        var response = (try self.reads.query(a, self.table, request, .read_index)) orelse return error.MemoryCapabilityUnavailable;
+        defer response.deinit(a);
+        const Wire = struct { responses: []const struct { hits: struct { hits: []const struct { _id: []const u8, _score: f64 } } } };
+        const value = try std.json.parseFromSliceLeaky(Wire, a, response.json, .{ .ignore_unknown_fields = true });
+        if (value.responses.len != 1) return error.MemoryCorruptState;
+        const hits = value.responses[0].hits.hits;
+        if (hits.len > input.limit) return error.MemoryCorruptState;
+        const result = try a.alloc(service.Neighbor, hits.len);
+        // Parsed strings may borrow the response buffer released on return.
+        for (hits, result) |hit, *out| out.* = .{ .key = try a.dupe(u8, hit._id), .similarity = hit._score };
+        return result;
     }
     fn resource(ptr: *anyopaque, a: A, reference: service.types.provenance.Resource) !service.types.provenance.Snapshot {
         const self: *Routed = @ptrCast(@alignCast(ptr));
@@ -96,9 +139,9 @@ pub const Routed = struct {
         var writes: std.ArrayList(db_types.TransactionWrite) = .empty;
         var deletes: std.ArrayList([]const u8) = .empty;
         for (changes) |change| {
-            if (change.json) |json| try writes.append(a, .{ .key = change.key, .value = try encodeRow(a, json) }) else try deletes.append(a, change.key);
+            if (change.json) |json| try writes.append(a, .{ .key = change.key, .value = try encodeChange(a, change.key, json) }) else try deletes.append(a, change.key);
         }
-        const result = (try self.writes.commitTransactionWithCancellation(a, &.{.{ .table_name = self.table, .writes = writes.items, .deletes = deletes.items, .predicates = &.{.{ .key = "control", .expected_version = if (expected) |row| row.version else 0, .expected_content_digest = if (expected) |row| row.digest else null, .unique_absence = expected == null }} }}, .write, self.request.cancellation)) orelse return error.MemoryCapabilityUnavailable;
+        const result = (try self.writes.commitTransactionWithCancellation(a, &.{.{ .table_name = self.table, .writes = writes.items, .deletes = deletes.items, .predicates = &.{.{ .key = "control", .expected_version = if (expected) |row| row.version else 0, .expected_content_digest = if (expected) |row| row.digest else null, .unique_absence = expected == null }} }}, if (hasProjection(changes)) .full_index else .write, self.request.cancellation)) orelse return error.MemoryCapabilityUnavailable;
         switch (result) {
             .conflict => return error.MemoryRevisionConflict,
             .committed => |committed| if (committed.propagation_pending or committed.visibility_pending) return error.MemoryCommitPending,
@@ -114,7 +157,25 @@ pub fn Native(comptime DB: type) type {
         resource_fn: ?*const fn (*anyopaque, A, service.types.provenance.Resource) anyerror!service.types.provenance.Snapshot = null,
         const Self = @This();
         pub fn backend(self: *Self) service.Backend {
-            return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null };
+            return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex };
+        }
+        fn ensureVectorIndex(ptr: *anyopaque, a: A, name: []const u8, dims: u32) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try self.context.requireGrant(.admin);
+            self.db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = try vectorIndexConfig(a, dims) }) catch |err| switch (err) {
+                error.IndexAlreadyExists => return,
+                else => return err,
+            };
+        }
+        fn neighbors(ptr: *anyopaque, a: A, input: service.NeighborRequest) ![]const service.Neighbor {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try self.context.check();
+            var response = try self.db.search(a, try neighborRequest(input));
+            defer response.deinit();
+            if (response.hits.len > input.limit) return error.MemoryCorruptState;
+            const result = try a.alloc(service.Neighbor, response.hits.len);
+            for (response.hits, result) |hit, *out| out.* = .{ .key = try a.dupe(u8, hit.id), .similarity = hit.score orelse return error.MemoryCorruptState };
+            return result;
         }
         fn resource(ptr: *anyopaque, a: A, reference: service.types.provenance.Resource) !service.types.provenance.Snapshot {
             const self: *Self = @ptrCast(@alignCast(ptr));
@@ -142,9 +203,9 @@ pub fn Native(comptime DB: type) type {
             var writes: std.ArrayList(db_types.BatchWrite) = .empty;
             var deletes: std.ArrayList([]const u8) = .empty;
             for (changes) |change| {
-                if (change.json) |json| try writes.append(a, .{ .key = change.key, .value = try encodeRow(a, json) }) else try deletes.append(a, change.key);
+                if (change.json) |json| try writes.append(a, .{ .key = change.key, .value = try encodeChange(a, change.key, json) }) else try deletes.append(a, change.key);
             }
-            self.db.batch(.{ .writes = writes.items, .deletes = deletes.items, .sync_level = .write, .predicates = &.{.{ .key = "control", .expected_version = if (expected) |row| row.version else 0, .expected_content_digest = if (expected) |row| row.digest else null, .unique_absence = expected == null }} }) catch |err| switch (err) {
+            self.db.batch(.{ .writes = writes.items, .deletes = deletes.items, .sync_level = if (hasProjection(changes)) .full_index else .write, .predicates = &.{.{ .key = "control", .expected_version = if (expected) |row| row.version else 0, .expected_content_digest = if (expected) |row| row.digest else null, .unique_absence = expected == null }} }) catch |err| switch (err) {
                 error.VersionConflict, error.IntentConflict => return error.MemoryRevisionConflict,
                 else => return err,
             };
@@ -152,6 +213,10 @@ pub fn Native(comptime DB: type) type {
     };
 }
 
+fn hasProjection(changes: []const service.Change) bool {
+    for (changes) |change| if (std.mem.startsWith(u8, change.key, "entity-semantic/") or std.mem.eql(u8, change.key, "entity-semantic-index")) return true;
+    return false;
+}
 fn validateCursor(prefix: []const u8, cursor: ?[]const u8) !void {
     if (cursor) |value| if (!std.mem.startsWith(u8, value, prefix)) return error.InvalidMemoryCursor;
 }

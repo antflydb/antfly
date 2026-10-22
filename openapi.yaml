@@ -31916,6 +31916,7 @@ components:
       enum:
         - read
         - write
+        - curator
         - admin
       description: Type of permission.
       example: read
@@ -50804,6 +50805,32 @@ components:
               default: null
               nullable: true
           additionalProperties: false
+        semantic_discovery:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              x-go-type-skip-optional-pointer: false
+            name_threshold:
+              type: number
+              format: double
+              default: 0.8
+              x-go-type-skip-optional-pointer: false
+            view_threshold:
+              type: number
+              format: double
+              default: 0.85
+              x-go-type-skip-optional-pointer: false
+            neighbors:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              format: uint32
+              default: 32
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+          additionalProperties: false
         ontology_pack:
           type: string
           enum:
@@ -52668,6 +52695,22 @@ components:
         description_score:
           type: number
           format: double
+        name_similarity:
+          type: number
+          format: double
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        view_similarity:
+          type: number
+          format: double
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        semantic_discovered:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
         predicates:
           type: array
           items:
@@ -52733,6 +52776,8 @@ components:
           type: string
           enum:
             - not_indexed
+            - not_ready
+            - indexed
           default: not_indexed
           x-go-type-skip-optional-pointer: false
         basis:
@@ -56538,6 +56583,32 @@ components:
                       default: null
                       nullable: true
                   additionalProperties: false
+                semantic_discovery:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
+                    name_threshold:
+                      type: number
+                      format: double
+                      default: 0.8
+                      x-go-type-skip-optional-pointer: false
+                    view_threshold:
+                      type: number
+                      format: double
+                      default: 0.85
+                      x-go-type-skip-optional-pointer: false
+                    neighbors:
+                      type: integer
+                      minimum: 0
+                      maximum: 65535
+                      format: uint32
+                      default: 32
+                      x-go-type-skip-optional-pointer: false
+                      x-go-type: uint32
+                  additionalProperties: false
                 ontology_pack:
                   type: string
                   enum:
@@ -56812,6 +56883,32 @@ components:
                       additionalProperties: false
                       default: null
                       nullable: true
+                  additionalProperties: false
+                semantic_discovery:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
+                    name_threshold:
+                      type: number
+                      format: double
+                      default: 0.8
+                      x-go-type-skip-optional-pointer: false
+                    view_threshold:
+                      type: number
+                      format: double
+                      default: 0.85
+                      x-go-type-skip-optional-pointer: false
+                    neighbors:
+                      type: integer
+                      minimum: 0
+                      maximum: 65535
+                      format: uint32
+                      default: 32
+                      x-go-type-skip-optional-pointer: false
+                      x-go-type: uint32
                   additionalProperties: false
                 ontology_pack:
                   type: string

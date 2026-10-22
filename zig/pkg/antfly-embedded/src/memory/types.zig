@@ -54,6 +54,28 @@ pub const Features = struct {
     reconciliation: Reconciliation = .explicit,
 };
 pub const SourceRule = struct { source_id: []const u8, principal: ?[]const u8 = null, producer: ?[]const u8 = null, authority: u16 = 0 };
+pub const SemanticDiscovery = struct {
+    enabled: bool = false,
+    name_threshold: f64 = 0.80,
+    view_threshold: f64 = 0.85,
+    neighbors: u16 = 32,
+};
+pub const ProjectionKind = enum { names, view };
+pub const EntityProjection = struct {
+    entity_id: []const u8,
+    entity_revision: u64,
+    model: Model,
+    generation: u64,
+    config_generation: u64,
+    owner: []const u8,
+    visibility: Visibility,
+    kind: ProjectionKind,
+    fingerprint: []const u8,
+    dependencies: []const DerivedDependency,
+    text: []const u8,
+    embedding: []const f32,
+};
+pub const SemanticIndex = struct { generation: u64 = 0, cursor: ?[]const u8 = null, backfill_complete: bool = false, complete: bool = false };
 pub const Config = struct {
     version: u32 = schema_version,
     generation: u64 = 1,
@@ -63,6 +85,7 @@ pub const Config = struct {
     policy_version: []const u8 = "memory/v1",
     features: Features = .{},
     models: Models = .{},
+    semantic_discovery: SemanticDiscovery = .{},
     ontology_pack: enum { none, software_team_v1 } = .none,
     predicates: []const Predicate = &.{},
     source_rules: []const SourceRule = &.{},
@@ -75,7 +98,8 @@ pub const Config = struct {
     pub fn validate(self: Config) !void {
         if (self.version != schema_version or self.generation == 0 or self.ontology_version.len == 0 or self.policy_version.len == 0) return error.InvalidMemoryConfig;
         if (self.max_input_bytes == 0 or self.max_input_bytes > 4 * 1024 * 1024 or self.max_output_items == 0 or self.max_output_items > max_items or self.max_attempts == 0 or self.max_attempts > 16 or self.max_recall_tokens == 0 or self.max_recall_tokens > 65536) return error.InvalidMemoryConfig;
-        if (self.features.semantic_recall and self.models.embedder == null) return error.MemoryModelRequired;
+        if (self.semantic_discovery.enabled and (self.semantic_discovery.neighbors == 0 or self.semantic_discovery.neighbors > 64 or !std.math.isFinite(self.semantic_discovery.name_threshold) or !std.math.isFinite(self.semantic_discovery.view_threshold) or self.semantic_discovery.name_threshold <= 0 or self.semantic_discovery.view_threshold <= 0)) return error.InvalidMemoryConfig;
+        if ((self.features.semantic_recall or self.semantic_discovery.enabled) and self.models.embedder == null) return error.MemoryModelRequired;
         if (self.features.entity_extraction and self.models.extractor == null and self.models.generator == null) return error.MemoryModelRequired;
         if ((self.features.assertion_distillation or self.features.summaries) and self.models.generator == null) return error.MemoryModelRequired;
         if (self.features.reconciliation == .model and self.models.decider == null and self.models.generator == null) return error.MemoryModelRequired;
@@ -261,7 +285,7 @@ pub const StoredAssertion = struct {
     config_generation: u64,
 };
 pub const Stage = enum { pending, running, succeeded, failed, cancelled };
-pub const RequiredGrant = enum { write, admin };
+pub const RequiredGrant = enum { write, curator, admin };
 pub const Operation = struct {
     proposal_id: ?[]const u8 = null,
     origin: ?provenance.Origin = null,
@@ -374,7 +398,7 @@ pub const Inspection = struct {
 /// External judges carry attribution and evidence, never executable provider
 /// configuration or credentials. The authenticated principal is server-owned.
 pub const EntityCandidateRequest = struct { kind: enum { identity, relationship } = .identity, cursor: ?[]const u8 = null, limit: u16 = 16 };
-pub const EntityCandidate = struct { entity: EntityRecord, view: EntityView, match_score: f64, description_score: f64, predicates: []const []const u8 };
+pub const EntityCandidate = struct { entity: EntityRecord, view: EntityView, match_score: f64, description_score: f64, name_similarity: ?f64 = null, view_similarity: ?f64 = null, semantic_discovered: bool = false, predicates: []const []const u8 };
 pub const EntityCandidatePage = struct {
     seed: EntityRecord,
     seed_view: EntityView,
@@ -387,7 +411,7 @@ pub const EntityCandidatePage = struct {
     complete: bool,
     omitted: usize,
     retrieval: enum { indexed_lexical, bounded_audience_fallback, bounded_primary_fallback },
-    semantic_discovery: enum { not_indexed } = .not_indexed,
+    semantic_discovery: enum { not_indexed, not_ready, indexed } = .not_indexed,
     basis: enum { name_matches_description_tiebreaker_not_identity_or_calibrated_confidence } = .name_matches_description_tiebreaker_not_identity_or_calibrated_confidence,
 };
 // The resolver owns queue mechanics and their wire shape. Memory adds the

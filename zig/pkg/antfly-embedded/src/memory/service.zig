@@ -74,6 +74,8 @@ pub const InferenceBoundary = struct {
         try self.complete_fn(self.ptr);
     }
 };
+pub const Neighbor = struct { key: []const u8, similarity: f64 };
+pub const NeighborRequest = struct { index: []const u8, vector: []const f32, limit: u16 };
 pub const Backend = struct {
     ptr: *anyopaque,
     get: *const fn (*anyopaque, A, []const u8) anyerror!?Row,
@@ -85,6 +87,9 @@ pub const Backend = struct {
     generate: ?*const fn (*anyopaque, A, t.Config, []const t.StoredEvidence, InferenceBoundary) anyerror!t.Generated = null,
     decide: ?*const fn (*anyopaque, A, t.Config, t.Assertion, []const t.StoredAssertion) anyerror!t.ReconciliationDecision = null,
     embed: ?*const fn (*anyopaque, A, t.Model, []const u8) anyerror![]const f32 = null,
+    embed_document: ?*const fn (*anyopaque, A, t.Model, []const u8) anyerror![]const f32 = null,
+    ensure_vector_index: ?*const fn (*anyopaque, A, []const u8, u32) anyerror!void = null,
+    neighbors: ?*const fn (*anyopaque, A, NeighborRequest) anyerror![]const Neighbor = null,
     validate_models: ?*const fn (*anyopaque, t.Config) anyerror!void = null,
 };
 pub const Context = struct {
@@ -97,6 +102,7 @@ pub const Context = struct {
     durable_execution_required: bool = false,
     principal: []const u8,
     admin: bool = false,
+    curator: bool = false,
     now_ms: i64,
     grant_ptr: ?*anyopaque = null,
     require_grant_fn: ?*const fn (*anyopaque, t.RequiredGrant) anyerror!void = null,
@@ -106,6 +112,7 @@ pub const Context = struct {
     check_fn: ?*const fn (*anyopaque) anyerror!void = null,
     pub fn requireGrant(self: Context, grant: t.RequiredGrant) !void {
         if (grant == .admin and !self.admin) return error.Forbidden;
+        if (grant == .curator and !self.admin and !self.curator) return error.Forbidden;
         if (self.require_grant_fn) |call| try call(self.grant_ptr.?, grant);
     }
     pub fn finish(self: Context) !void {
@@ -167,7 +174,7 @@ pub const Service = struct {
         }
         const fingerprint = try hash(a, .{ .action = action, .id = id, .body = body, .principal = self.context.principal });
         const receipt_key = if (idempotency_key.len > 0) try key(a, "operation", try hash(a, .{ self.context.principal, idempotency_key })) else "";
-        const required_grant = if (mutates(action)) try run.requiredGrant(action, id, body) else null;
+        const required_grant = if (mutates(action)) try run.requiredGrant(action, id, body) else if (actionGrant(action) == .curator) t.RequiredGrant.curator else null;
         if (required_grant) |grant| try self.context.requireGrant(grant);
         if (mutates(action)) {
             if (idempotency_key.len == 0 or idempotency_key.len > 256) return error.MemoryIdempotencyKeyRequired;
@@ -216,6 +223,7 @@ pub const Service = struct {
             .inspect => output = try run.encode(.{ .state = .{ .table_id = run.state.table_id, .database = run.state.database, .namespace = run.state.namespace, .space = run.state.space, .config = run.state.config, .pending_config = run.state.pending_config, .revision = run.state.revision, .owner = run.state.owner, .created_at = run.state.created_at }, .capabilities = .{ .native = true, .model_free = true, .generator_available = self.backend.generate != null, .embedder_available = self.backend.embed != null } }),
             .configure => {
                 try run.requireAdmin();
+                try run.put("entity-semantic-index", t.SemanticIndex{});
                 const request = try parse(operations.Configure, a, body);
                 if (request.expected_revision != run.state.revision - 1) return error.MemoryRevisionConflict;
                 var config = request.config;
@@ -231,8 +239,9 @@ pub const Service = struct {
                 if (config.retention_ms != run.state.config.retention_ms) run.state.next_expiry_at = self.context.now_ms;
                 const previous_model = try run.encode(run.state.config.models.embedder);
                 const replacement_model = try run.encode(config.models.embedder);
-                const rebuild = config.features.semantic_recall and (!run.state.config.features.semantic_recall or !eql(u8, previous_model, replacement_model));
-                config.embedding_generation = if (rebuild) config.generation else run.state.config.embedding_generation;
+                const embedding_changed = (config.features.semantic_recall or config.semantic_discovery.enabled) and (!(run.state.config.features.semantic_recall or run.state.config.semantic_discovery.enabled) or !eql(u8, previous_model, replacement_model));
+                const rebuild = config.features.semantic_recall and (!run.state.config.features.semantic_recall or embedding_changed);
+                config.embedding_generation = if (embedding_changed) config.generation else run.state.config.embedding_generation;
                 try run.configurationTransition(config, false);
                 if (rebuild) {
                     run.state.pending_config = config;
@@ -299,6 +308,7 @@ pub const Service = struct {
             try self.context.finish();
             if (run.inferred) try run.validateResources();
             try self.backend.commit(self.backend.ptr, a, state_row, run.changes.items);
+            try run.finishSemanticPublication();
             output = try run.encode(publicOperation(op));
         } else {
             // Reads spanning pages must not report a mixture of revisions.
@@ -312,10 +322,12 @@ pub const Service = struct {
 
     fn validate(self: Service, config: t.Config) !void {
         try config.validate();
-        if (self.context.durable_execution_required and self.context.execution_signature.len == 0 and (config.features.assertion_distillation or config.features.entity_extraction or config.features.summaries or (config.features.semantic_recall and !eql(u8, config.models.embedder.?.provider, "external")) or config.retention_ms != null)) return error.MemoryExecutionIdentityRequired;
+        if (self.context.durable_execution_required and self.context.execution_signature.len == 0 and (config.features.assertion_distillation or config.features.entity_extraction or config.features.summaries or ((config.features.semantic_recall or config.semantic_discovery.enabled) and !eql(u8, config.models.embedder.?.provider, "external")) or config.retention_ms != null)) return error.MemoryExecutionIdentityRequired;
         if (config.features.assertion_distillation and self.backend.generate == null) return error.MemoryCapabilityUnavailable;
         if (config.features.reconciliation == .model and self.backend.decide == null) return error.MemoryCapabilityUnavailable;
-        if (config.features.semantic_recall and self.backend.embed == null) return error.MemoryCapabilityUnavailable;
+        if (config.semantic_discovery.enabled and eql(u8, config.models.embedder.?.provider, "external")) return error.MemoryModelRequired;
+        if (config.semantic_discovery.enabled and (self.backend.embed_document == null or self.backend.neighbors == null or self.backend.ensure_vector_index == null)) return error.MemoryCapabilityUnavailable;
+        if ((config.features.semantic_recall or config.semantic_discovery.enabled) and self.backend.embed == null) return error.MemoryCapabilityUnavailable;
         if (self.backend.validate_models) |validate_models| try validate_models(self.backend.ptr, config) else {
             if (config.features.entity_extraction or config.features.summaries or config.features.reconciliation == .model) return error.MemoryCapabilityUnavailable;
         }
@@ -342,6 +354,7 @@ const Run = struct {
     retention_maintenance: bool = false,
     resource_states: std.StringHashMapUnmanaged(ResourceRead) = .empty,
     inferred: bool = false,
+    semantic_ready_after_commit: bool = false,
     inference_epoch: u64 = 0,
     capturing_resources: ?*ResourceSet = null,
     processing_failure: ?anyerror = null,
@@ -364,6 +377,17 @@ const Run = struct {
         self.views.clearRetainingCapacity();
         self.historical.clearRetainingCapacity();
         const json = try self.encode(value);
+        if (self.state.config.semantic_discovery.enabled) {
+            if (comptime @TypeOf(value) == t.EntityRecord) {
+                if (std.mem.startsWith(u8, path, "entity/")) try self.semanticDirty(value.entity.id);
+            }
+            if (comptime @TypeOf(value) == t.StoredAssertion) {
+                if (std.mem.startsWith(u8, path, "assertion/")) {
+                    try self.semanticDirty(value.assertion.subject);
+                    if (self.objectTyped(value.assertion.predicate)) try self.semanticDirty(value.assertion.value);
+                }
+            }
+        }
         for (self.changes.items) |*change| if (eql(u8, change.key, path)) {
             change.json = json;
             return;
@@ -1424,12 +1448,12 @@ const Run = struct {
     fn proposalInputsRetained(self: *Run, binding: ProposalBinding) !bool {
         for (binding.entities) |ref| {
             const record = (try self.read(t.EntityRecord, try key(self.a, "entity", ref.id))) orelse return false;
-            try self.authorize(record.owner, record.entity.visibility);
+            self.authorize(record.owner, record.entity.visibility) catch return false;
             if (record.revision != ref.revision or !(if (self.retention_maintenance) try self.entityRetained(record) else try self.entityVisible(record))) return false;
         }
         for (binding.evidence) |ref| {
             const source = (try self.evidence(ref.id)) orelse return false;
-            try self.authorize(source.owner, source.evidence.visibility);
+            self.authorize(source.owner, source.evidence.visibility) catch return false;
             if (!try self.evidenceRetained(source)) return false;
         }
         return true;
@@ -1700,6 +1724,10 @@ const Run = struct {
         try text.appendSlice(self.a, record.entity.name);
         var complete = related.complete;
         for (related.items) |original| {
+            // A shared description has the entity's audience, regardless of
+            // whether an administrator or curator renders it. Private support
+            // cannot flow into a team projection or another owner's identity.
+            if (original.assertion.visibility == .private and (record.entity.visibility == .team or !eql(u8, original.owner, record.owner))) continue;
             const hit = (try self.recallHit(original, filters, null, false)) orelse continue;
             if (dependencies.items.len > request.limit or text.items.len + hit.memory.assertion.statement.len + 2 > 8192) {
                 complete = false;
@@ -1722,7 +1750,7 @@ const Run = struct {
     }
     fn relationshipProposal(self: *Run, id: []const u8) !t.RelationshipProposal {
         var proposal = (try self.read(t.RelationshipProposal, try key(self.a, "relationship-proposal", id))) orelse return error.MemoryNotFound;
-        try self.authorize(proposal.owner, .private);
+        try self.authorize(proposal.owner, proposal.assertion.visibility);
         if (!try self.relationshipRetained(proposal)) return error.MemoryNotFound;
         if (!try self.supportVisible(proposal.assertion.evidence, proposal.assertion.depends_on, 0)) return error.MemoryNotFound;
         for ([_][]const u8{ proposal.assertion.subject, proposal.assertion.value }) |entity_id| {
@@ -1967,6 +1995,174 @@ const Run = struct {
         }
         return .{ .rows = rows.items, .next = if (term < terms.len) try std.fmt.allocPrint(self.a, "{s}{d}/{s}", .{ scope, term, after orelse "" }) else null };
     }
+    const SemanticMatch = struct { id: []const u8, names: ?f64 = null, view: ?f64 = null };
+    const SemanticMatches = struct { items: []const SemanticMatch = &.{}, queries: [2]?[]const f32 = .{ null, null }, self_scores: [2]f64 = .{ 0, 0 }, state: @FieldType(t.EntityCandidatePage, "semantic_discovery") = .not_indexed };
+    fn semanticDirty(self: *Run, id: []const u8) anyerror!void {
+        try self.put(try key(self.a, "entity-semantic-work", id), .{ .id = id });
+        if (try self.canonical(id)) |selected| if (!eql(u8, selected, id)) {
+            try self.put(try key(self.a, "entity-semantic-work", selected), .{ .id = selected });
+        };
+    }
+    fn semanticProjectionKey(self: *Run, record: t.EntityRecord, kind: t.ProjectionKind) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "entity-semantic/{s}/{s}", .{ try self.semanticIndexName(record, kind), try hash(self.a, record.entity.id) });
+    }
+    fn semanticIndexName(self: *Run, record: t.EntityRecord, kind: t.ProjectionKind) ![]const u8 {
+        // Separate native index namespaces enforce the audience before ANN,
+        // without a corpus-sized postfilter or an ordinal membership scan.
+        return std.fmt.allocPrint(self.a, "memory_{s}_{s}", .{ @tagName(kind), try hash(self.a, .{ self.state.config.embedding_generation, self.state.config.models.embedder, record.entity.visibility, if (record.entity.visibility == .private) record.owner else "" }) });
+    }
+    fn semanticView(self: *Run, record: t.EntityRecord) !t.EntityView {
+        // A projection can never acquire the maintenance principal's wider
+        // administrative visibility. Its read audience belongs to the entity.
+        const prior = self.service.context;
+        self.service.context.admin = false;
+        self.service.context.principal = record.owner;
+        defer self.service.context = prior;
+        return self.entityView(record.entity.id, .{});
+    }
+    fn semanticNames(self: *Run, value: t.Entity) ![]const u8 {
+        var text: std.ArrayList(u8) = .empty;
+        try text.appendSlice(self.a, value.name);
+        for (value.aliases) |alias| {
+            try text.append(self.a, '\n');
+            try text.appendSlice(self.a, alias);
+        }
+        return text.items;
+    }
+    fn semanticCurrent(self: *Run, projection: t.EntityProjection, record: t.EntityRecord, view: t.EntityView) !bool {
+        if (projection.entity_revision != record.revision or projection.generation != self.state.config.embedding_generation or projection.config_generation != self.state.config.generation or !eql(u8, projection.entity_id, record.entity.id) or !eql(u8, projection.owner, record.owner) or projection.visibility != record.entity.visibility or !eql(u8, try self.encode(projection.model), try self.encode(self.state.config.models.embedder.?))) return false;
+        if (!eql(u8, projection.fingerprint, view.fingerprint) or !eql(u8, try self.encode(projection.dependencies), try self.encode(view.dependencies))) return false;
+        const text = if (projection.kind == .names) try self.semanticNames(record.entity) else view.description;
+        return eql(u8, projection.text, text);
+    }
+    fn semanticMaintenance(self: *Run) !void {
+        if (!self.state.config.semantic_discovery.enabled) return;
+        try self.requireAdmin();
+        var index = (try self.read(t.SemanticIndex, "entity-semantic-index")) orelse t.SemanticIndex{};
+        if (index.generation != self.state.config.generation) index = .{ .generation = self.state.config.generation };
+        const initial = !index.backfill_complete;
+        index.complete = false;
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, if (initial) "entity/" else "entity-semantic-work/", if (initial) index.cursor else null, 8);
+        for (page.rows) |row| {
+            const record = if (initial) try parse(t.EntityRecord, self.a, row.json) else blk: {
+                const work = try parse(struct { id: []const u8 }, self.a, row.json);
+                break :blk (try self.read(t.EntityRecord, try key(self.a, "entity", work.id))) orelse {
+                    try self.remove(row.key);
+                    continue;
+                };
+            };
+            if (try self.entityVisible(record)) {
+                const canonical_id = try self.canonical(record.entity.id);
+                if (canonical_id != null and eql(u8, canonical_id.?, record.entity.id)) {
+                    const captured = try self.captureResources(semanticView, .{record});
+                    const view = captured.result;
+                    // Rebinding unchanged text is still a derived publication
+                    // and must fence live source dependencies at final commit.
+                    self.inferred = true;
+                    inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
+                        const path = try self.semanticProjectionKey(record, kind);
+                        const existing = try self.read(t.EntityProjection, path);
+                        if (existing == null or !try self.semanticCurrent(existing.?, record, view)) {
+                            const text = if (kind == .names) try self.semanticNames(record.entity) else view.description;
+                            const model = self.state.config.models.embedder.?;
+                            const index_name = try self.semanticIndexName(record, kind);
+                            try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, index_name, model.dimensions.?);
+                            const reusable = if (existing) |prior| prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and eql(u8, prior.text, text) and eql(u8, try self.encode(prior.model), try self.encode(model)) else false;
+                            const embedding = if (reusable) existing.?.embedding else blk: {
+                                const computed = try self.service.backend.embed_document.?(self.service.backend.ptr, self.a, model, text);
+                                try self.inferenceCompleted(captured.resources);
+                                break :blk computed;
+                            };
+                            if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
+                            for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
+                            try self.put(path, t.EntityProjection{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = embedding });
+                        }
+                    }
+                }
+            }
+            try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
+        }
+        if (initial) {
+            index.cursor = page.next;
+            index.backfill_complete = page.next == null;
+        }
+        self.semantic_ready_after_commit = index.backfill_complete;
+        try self.put("entity-semantic-index", index);
+    }
+    fn finishSemanticPublication(self: *Run) !void {
+        if (!self.semantic_ready_after_commit) return;
+        // Phase one committed its durable cursor with complete=false and
+        // waited for full index publication. Only its acknowledged success
+        // authorizes this second CAS. A crash or ambiguous phase-one outcome
+        // leaves a resumable, unready generation, never a false certificate.
+        const backend = self.service.backend;
+        const control = (try backend.get(backend.ptr, self.a, "control")) orelse return error.MemorySpaceNotFound;
+        if (!eql(u8, control.json, try self.encode(self.state))) return;
+        if ((try backend.scan(backend.ptr, self.a, "entity-semantic-work/", null, 1)).rows.len != 0) return;
+        const row = (try backend.get(backend.ptr, self.a, "entity-semantic-index")) orelse return;
+        var index = try parse(t.SemanticIndex, self.a, row.json);
+        if (!index.backfill_complete or index.generation != self.state.config.generation) return;
+        index.complete = true;
+        try self.service.context.requireGrant(.admin);
+        try self.service.context.finish();
+        if (self.inferred) try self.validateResources();
+        try backend.commit(backend.ptr, self.a, control, &.{ .{ .key = "entity-semantic-index", .json = try self.encode(index) }, .{ .key = "control", .json = control.json } });
+    }
+    fn semanticCandidates(self: *Run, input_seed: t.EntityRecord, request: t.EntityCandidateRequest) !SemanticMatches {
+        if (!self.state.config.semantic_discovery.enabled) return .{};
+        var result: SemanticMatches = .{ .state = .not_ready };
+        const selected = (try self.canonical(input_seed.entity.id)) orelse return result;
+        const seed = (try self.read(t.EntityRecord, try key(self.a, "entity", selected))) orelse return result;
+        const index = (try self.read(t.SemanticIndex, "entity-semantic-index")) orelse return result;
+        if (!index.complete or !index.backfill_complete or index.generation != self.state.config.generation) return result;
+        if ((try self.service.backend.scan(self.service.backend.ptr, self.a, "entity-semantic-work/", null, 1)).rows.len != 0) return result;
+        const view = try self.entityView(seed.entity.id, .{});
+        var matches: std.StringHashMapUnmanaged(SemanticMatch) = .empty;
+        inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
+            const projection = (try self.read(t.EntityProjection, try self.semanticProjectionKey(seed, kind))) orelse return result;
+            if (!try self.semanticCurrent(projection, seed, view)) return result;
+            const captured = try self.captureResources(semanticView, .{seed});
+            const query = try self.embed(self.state.config.models.embedder.?, projection.text, captured.resources);
+            const self_score = try cosine(query, projection.embedding);
+            if (!std.math.isFinite(self_score) or self_score <= 0) return result;
+            result.queries[@backingInt(kind)] = query;
+            result.self_scores[@backingInt(kind)] = self_score;
+            // ANN runs once per projection on the first lexical page. Later
+            // pages continue lexical postings without repeating semantic hits.
+            if (request.cursor == null) {
+                const neighbors = self.service.backend.neighbors.?(self.service.backend.ptr, self.a, .{ .index = try self.semanticIndexName(seed, kind), .vector = query, .limit = self.state.config.semantic_discovery.neighbors }) catch |err| switch (err) {
+                    error.IndexNotFound, error.IndexRebuilding, error.Timeout, error.EnrichmentWaitTimeout => return result,
+                    else => return err,
+                };
+                if (neighbors.len > self.state.config.semantic_discovery.neighbors) return error.MemoryCorruptState;
+                for (neighbors) |neighbor| {
+                    if (!std.math.isFinite(neighbor.similarity)) continue;
+                    const similarity = neighbor.similarity / self_score;
+                    const threshold = if (kind == .names) self.state.config.semantic_discovery.name_threshold else self.state.config.semantic_discovery.view_threshold;
+                    if (similarity < threshold) continue;
+                    const other = (try self.read(t.EntityProjection, neighbor.key)) orelse continue;
+                    if (other.kind != kind) continue;
+                    const record = (try self.read(t.EntityRecord, try key(self.a, "entity", other.entity_id))) orelse continue;
+                    self.authorize(record.owner, record.entity.visibility) catch continue;
+                    if (record.entity.visibility != seed.entity.visibility or (record.entity.visibility == .private and !eql(u8, seed.owner, record.owner)) or !try self.entityVisible(record)) continue;
+                    const canonical_id = (try self.canonical(record.entity.id)) orelse continue;
+                    if (!eql(u8, canonical_id, record.entity.id)) continue;
+                    const candidate_view = try self.entityView(record.entity.id, .{});
+                    if (!try self.semanticCurrent(other, record, candidate_view)) continue;
+                    const entry = try matches.getOrPut(self.a, record.entity.id);
+                    if (!entry.found_existing) entry.value_ptr.* = .{ .id = record.entity.id };
+                    if (kind == .names) entry.value_ptr.names = similarity else entry.value_ptr.view = similarity;
+                }
+            }
+        }
+        const items = try self.a.alloc(SemanticMatch, matches.count());
+        var values = matches.valueIterator();
+        var count: usize = 0;
+        while (values.next()) |value| : (count += 1) items[count] = value.*;
+        result.items = items;
+        result.state = .indexed;
+        return result;
+    }
     fn entityCandidates(self: *Run, id: []const u8, request: t.EntityCandidateRequest) ![]const u8 {
         if (request.limit == 0 or request.limit > 64) return error.InvalidMemoryRequest;
         const seed = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
@@ -1974,6 +2170,21 @@ const Run = struct {
         if (!try self.entityVisible(seed)) return error.MemoryNotFound;
         const canonical_seed = (try self.canonical(id)) orelse return error.MemoryEntitySuppressed;
         const page = try self.candidatePage(seed, request);
+        const semantic = try self.semanticCandidates(seed, request);
+        var candidate_rows: std.ArrayList(Row) = .empty;
+        try candidate_rows.appendSlice(self.a, page.rows);
+        for (semantic.items) |item| {
+            const record = (try self.read(t.EntityRecord, try key(self.a, "entity", item.id))) orelse continue;
+            var found = false;
+            for (candidate_rows.items) |row| {
+                const prior = try parse(t.EntityRecord, self.a, row.json);
+                if (eql(u8, prior.entity.id, item.id)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try candidate_rows.append(self.a, .{ .key = try key(self.a, "entity", item.id), .json = try self.encode(record) });
+        }
         const seed_distinctions = try self.declaredDistinct(id);
         const seed_view = try self.entityView(id, .{});
         const seed_terms = try self.candidateTerms(seed.entity);
@@ -1982,7 +2193,7 @@ const Run = struct {
         var description_query = try lexical.PreparedQuery.init(self.lexical_allocator, seed_view.description);
         defer description_query.deinit();
         var matches: std.ArrayList(Candidate) = .empty;
-        for (page.rows) |row| {
+        for (candidate_rows.items) |row| {
             try self.service.context.check();
             const candidate = try parse(t.EntityRecord, self.a, row.json);
             self.authorize(candidate.owner, candidate.entity.visibility) catch continue;
@@ -2007,10 +2218,27 @@ const Run = struct {
             }
             if (request.kind == .identity and !eql(u8, try nameNumbers(self.a, seed.entity.name), try nameNumbers(self.a, candidate.entity.name))) continue;
             const score = candidateNameScore(seed_terms, try self.candidateTerms(candidate.entity));
-            if (score <= 0) continue;
+            var name_similarity: ?f64 = null;
+            var view_similarity: ?f64 = null;
+            var semantic_discovered = false;
+            for (semantic.items) |item| if (eql(u8, item.id, candidate.entity.id)) {
+                name_similarity = item.names;
+                view_similarity = item.view;
+                semantic_discovered = true;
+                break;
+            };
+            if (score <= 0 and name_similarity == null and view_similarity == null) continue;
             const candidate_view = try self.entityView(candidate.entity.id, .{});
             views_complete = views_complete and candidate_view.complete;
-            try matches.append(self.a, .{ .entity = candidate, .view = candidate_view, .match_score = score, .description_score = try description_query.overlap(candidate_view.description), .predicates = predicates });
+            if (semantic.state == .indexed) inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
+                if (try self.read(t.EntityProjection, try self.semanticProjectionKey(candidate, kind))) |projection| {
+                    if (try self.semanticCurrent(projection, candidate, candidate_view)) {
+                        const similarity = (try cosine(semantic.queries[@backingInt(kind)].?, projection.embedding)) / semantic.self_scores[@backingInt(kind)];
+                        if (kind == .names) name_similarity = similarity else view_similarity = similarity;
+                    }
+                }
+            };
+            try matches.append(self.a, .{ .entity = candidate, .view = candidate_view, .match_score = score, .description_score = try description_query.overlap(candidate_view.description), .name_similarity = name_similarity, .view_similarity = view_similarity, .semantic_discovered = semantic_discovered, .predicates = predicates });
         }
         std.mem.sort(Candidate, matches.items, {}, struct {
             fn less(_: void, lhs: Candidate, rhs: Candidate) bool {
@@ -2020,7 +2248,7 @@ const Run = struct {
             }
         }.less);
         const count = @min(matches.items.len, request.limit);
-        return self.encode(t.EntityCandidatePage{ .seed = seed, .seed_view = seed_view, .kind = request.kind, .relationship_predicates = if (self.state.config.ontology_pack == .software_team_v1) &[_][]const u8{ "is_a", "part_of", "alternative_to" } else &[_][]const u8{}, .items = matches.items[0..count], .revision = self.state.revision, .config_generation = self.state.config.generation, .next_cursor = try self.encodeCursor(try self.candidateScope(id, request), page.next), .complete = views_complete and page.next == null and count == matches.items.len, .omitted = matches.items.len - count, .retrieval = if (!((try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{}).complete) .bounded_primary_fallback else if (seed_terms.len > 128) .bounded_audience_fallback else .indexed_lexical });
+        return self.encode(t.EntityCandidatePage{ .seed = seed, .seed_view = seed_view, .kind = request.kind, .relationship_predicates = if (self.state.config.ontology_pack == .software_team_v1) &[_][]const u8{ "is_a", "part_of", "alternative_to" } else &[_][]const u8{}, .items = matches.items[0..count], .revision = self.state.revision, .config_generation = self.state.config.generation, .next_cursor = try self.encodeCursor(try self.candidateScope(id, request), page.next), .complete = views_complete and page.next == null and count == matches.items.len, .omitted = matches.items.len - count, .semantic_discovery = semantic.state, .retrieval = if (!((try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{}).complete) .bounded_primary_fallback else if (seed_terms.len > 128) .bounded_audience_fallback else .indexed_lexical });
     }
     fn proposalOperation(self: *Run, proposal: curation.Proposal, binding: ?ProposalBinding) !prov.Resource {
         if (binding) |value| if (value.operation) |operation| return operation;
@@ -2048,7 +2276,7 @@ const Run = struct {
         try self.put(try key(self.a, "proposal-attempt", receipt.id), ProposalAttempt{ .proposal = proposal, .inputs = binding, .previous = previous });
     }
     fn proposeEntity(self: *Run, request: t.EntityProposalRequest, receipt: *t.Operation) !void {
-        try self.requireAdmin();
+        try self.service.context.requireGrant(.curator);
         if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
         if (try self.read(bool, "forgotten-all") != null) return error.MemoryForgotten;
         if (request.actor.len > 0) try t.validateId(request.actor);
@@ -2059,7 +2287,7 @@ const Run = struct {
         var entities: std.ArrayList(std.meta.Child(@FieldType(ProposalBinding, "entities"))) = .empty;
         for (ids) |id| {
             const entity_record = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
-            try self.authorize(entity_record.owner, .private);
+            try self.authorize(entity_record.owner, entity_record.entity.visibility);
             if (!try self.entityVisible(entity_record)) return error.MemoryForgotten;
             try entities.append(self.a, .{ .id = id, .revision = entity_record.revision });
         }
@@ -2098,7 +2326,7 @@ const Run = struct {
         receipt.proposal_id = proposal_id;
     }
     fn entityProposals(self: *Run, request: operations.Page) ![]const u8 {
-        try self.requireAdmin();
+        try self.service.context.requireGrant(.curator);
         if (request.limit == 0 or request.limit > t.max_items) return error.InvalidMemoryRequest;
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "proposal-input/", try self.decodeCursor("proposal-input/", request.cursor), request.limit);
         const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
@@ -2109,7 +2337,7 @@ const Run = struct {
         return self.encode(t.EntityProposalPage{ .items = proposals.items, .next_cursor = try self.encodeCursor("proposal-input/", page.next), .complete = page.next == null, .revision = self.state.revision });
     }
     fn entityProposal(self: *Run, id: []const u8) ![]const u8 {
-        try self.requireAdmin();
+        try self.service.context.requireGrant(.curator);
         const binding = (try self.read(ProposalBinding, try key(self.a, "proposal-input", id))) orelse return error.MemoryNotFound;
         if (!try self.proposalInputsRetained(binding)) return error.MemoryNotFound;
         const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
@@ -2123,7 +2351,7 @@ const Run = struct {
         return self.encode(t.EntityProposalDetail{ .proposal = proposal, .inputs = binding, .reason = reason, .stale_configuration = binding.config_generation != self.state.config.generation, .revision = self.state.revision });
     }
     fn reviewEntity(self: *Run, id: []const u8, request: t.EntityVerdict, receipt: *t.Operation) !void {
-        try self.requireAdmin();
+        try self.service.context.requireGrant(.curator);
         if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
         if (request.actor.len > 0) try t.validateId(request.actor);
         if (request.reason.len > t.max_text_bytes or request.pin_distinct and request.accept != false) return error.InvalidMemoryRequest;
@@ -2173,16 +2401,16 @@ const Run = struct {
     }
 
     fn curateEntity(self: *Run, request: t.EntityCorrection) !void {
-        try self.requireAdmin();
+        try self.service.context.requireGrant(.curator);
         if (try self.read(bool, "forgotten-all") != null) return error.MemoryForgotten;
         if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
         const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
         const from = (try self.read(t.EntityRecord, try key(self.a, "entity", request.from))) orelse return error.MemoryNotFound;
-        try self.authorize(from.owner, .private);
+        try self.authorize(from.owner, from.entity.visibility);
         if (!try self.entityVisible(from)) return error.MemoryForgotten;
         if (request.to) |target| {
             const to = (try self.read(t.EntityRecord, try key(self.a, "entity", target))) orelse return error.MemoryNotFound;
-            try self.authorize(to.owner, .private);
+            try self.authorize(to.owner, to.entity.visibility);
             if (!try self.entityVisible(to)) return error.MemoryForgotten;
             if (request.action == .distinct and eql(u8, (try self.canonical(request.from)) orelse return error.MemoryEntitySuppressed, (try self.canonical(target)) orelse return error.MemoryEntitySuppressed)) return error.MemoryEntityConflict;
             if (request.action == .merge) {
@@ -2243,6 +2471,10 @@ const Run = struct {
         self.identity_policy = null;
         self.identity_index = null;
         self.suppression_index = null;
+        if (self.state.config.semantic_discovery.enabled) {
+            var names = affected_names.keyIterator();
+            while (names.next()) |name| try self.semanticDirty(name.*);
+        }
         // Reconcile affected belief groups in the redirect transaction.
         // A work-limit rejection publishes neither identity nor partial facts.
         if (request.action != .distinct) {
@@ -2803,6 +3035,7 @@ const Run = struct {
         self.retention_maintenance = true;
         defer self.retention_maintenance = false;
         try self.pollResources();
+        try self.semanticMaintenance();
         var candidate_index = (try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{};
         if (!candidate_index.complete) {
             const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "entity/", candidate_index.cursor, 16);
@@ -2873,6 +3106,10 @@ const Run = struct {
     fn maintainChild(self: *Run, row: Row, item: DependencyWork) anyerror!void {
         const child = try parse(struct { child: []const u8 }, self.a, row.json);
         if (try self.assertion(child.child)) |value| {
+            if (self.state.config.semantic_discovery.enabled) {
+                try self.semanticDirty(value.assertion.subject);
+                if (self.objectTyped(value.assertion.predicate)) try self.semanticDirty(value.assertion.value);
+            }
             var record = value;
             if (!try self.retained(record, 0)) {
                 try self.retireAssertion(child.child);
@@ -2962,6 +3199,26 @@ const Run = struct {
         } else if (std.mem.startsWith(u8, row.key, "generation-input/")) {
             const owner_key = row.key["generation-input/".len..];
             if (try self.read(std.json.Value, owner_key) == null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "entity-semantic/")) {
+            const projection = try parse(t.EntityProjection, self.a, row.json);
+            const record = try self.read(t.EntityRecord, try key(self.a, "entity", projection.entity_id));
+            if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?)) {
+                try self.remove(row.key);
+            } else {
+                const selected = try self.canonical(record.?.entity.id);
+                if (selected == null or !eql(u8, selected.?, record.?.entity.id)) {
+                    try self.remove(row.key);
+                } else {
+                    const view = self.semanticView(record.?) catch |err| switch (err) {
+                        error.MemoryNotFound, error.MemoryEntitySuppressed => return,
+                        else => return err,
+                    };
+                    if (!try self.semanticCurrent(projection, record.?, view)) {
+                        try self.remove(row.key);
+                        try self.semanticDirty(record.?.entity.id);
+                    }
+                }
+            }
         } else if (std.mem.startsWith(u8, row.key, "vector/")) {
             const projection = try parse(VectorProjection, self.a, row.json);
             const record = try self.assertion(projection.assertion_id);
@@ -3911,7 +4168,8 @@ fn relationsMatch(request: t.Recall, claim: t.Assertion) bool {
 }
 pub fn actionGrant(action: Action) t.RequiredGrant {
     return switch (action) {
-        .create, .configure, .curate_entity, .stage_embeddings, .propose_entity, .review_entity, .entity_proposals, .entity_proposal => .admin,
+        .create, .configure, .stage_embeddings => .admin,
+        .curate_entity, .propose_entity, .review_entity, .entity_proposals, .entity_proposal, .propose_relationship, .relationship_proposal, .review_relationship => .curator,
         else => .write,
     };
 }

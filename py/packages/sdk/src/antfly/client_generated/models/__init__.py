@@ -1320,6 +1320,7 @@ from .memory_inspection_state_config_predicates_item_cardinality import (
     MemoryInspectionStateConfigPredicatesItemCardinality,
 )
 from .memory_inspection_state_config_processing import MemoryInspectionStateConfigProcessing
+from .memory_inspection_state_config_semantic_discovery import MemoryInspectionStateConfigSemanticDiscovery
 from .memory_inspection_state_config_source_rules_item import MemoryInspectionStateConfigSourceRulesItem
 from .memory_inspection_state_pending_config_type_0 import MemoryInspectionStatePendingConfigType0
 from .memory_inspection_state_pending_config_type_0_features import MemoryInspectionStatePendingConfigType0Features
@@ -1349,6 +1350,9 @@ from .memory_inspection_state_pending_config_type_0_predicates_item_cardinality 
     MemoryInspectionStatePendingConfigType0PredicatesItemCardinality,
 )
 from .memory_inspection_state_pending_config_type_0_processing import MemoryInspectionStatePendingConfigType0Processing
+from .memory_inspection_state_pending_config_type_0_semantic_discovery import (
+    MemoryInspectionStatePendingConfigType0SemanticDiscovery,
+)
 from .memory_inspection_state_pending_config_type_0_source_rules_item import (
     MemoryInspectionStatePendingConfigType0SourceRulesItem,
 )
@@ -1623,6 +1627,7 @@ from .memory_space_config_ontology_pack import MemorySpaceConfigOntologyPack
 from .memory_space_config_predicates_item import MemorySpaceConfigPredicatesItem
 from .memory_space_config_predicates_item_cardinality import MemorySpaceConfigPredicatesItemCardinality
 from .memory_space_config_processing import MemorySpaceConfigProcessing
+from .memory_space_config_semantic_discovery import MemorySpaceConfigSemanticDiscovery
 from .memory_space_config_source_rules_item import MemorySpaceConfigSourceRulesItem
 from .merge_config import MergeConfig
 from .merge_config_weights import MergeConfigWeights
@@ -3493,6 +3498,7 @@ __all__ = (
     "MemoryInspectionStateConfigPredicatesItem",
     "MemoryInspectionStateConfigPredicatesItemCardinality",
     "MemoryInspectionStateConfigProcessing",
+    "MemoryInspectionStateConfigSemanticDiscovery",
     "MemoryInspectionStateConfigSourceRulesItem",
     "MemoryInspectionStatePendingConfigType0",
     "MemoryInspectionStatePendingConfigType0Features",
@@ -3506,6 +3512,7 @@ __all__ = (
     "MemoryInspectionStatePendingConfigType0PredicatesItem",
     "MemoryInspectionStatePendingConfigType0PredicatesItemCardinality",
     "MemoryInspectionStatePendingConfigType0Processing",
+    "MemoryInspectionStatePendingConfigType0SemanticDiscovery",
     "MemoryInspectionStatePendingConfigType0SourceRulesItem",
     "MemoryObservationRequest",
     "MemoryObservationRequestEntitiesItem",
@@ -3662,6 +3669,7 @@ __all__ = (
     "MemorySpaceConfigPredicatesItem",
     "MemorySpaceConfigPredicatesItemCardinality",
     "MemorySpaceConfigProcessing",
+    "MemorySpaceConfigSemanticDiscovery",
     "MemorySpaceConfigSourceRulesItem",
     "MergeConfig",
     "MergeConfigWeights",

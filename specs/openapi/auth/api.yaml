@@ -77,7 +77,7 @@ components:
 
     PermissionType:
       type: string
-      enum: ["read", "write", "admin"]
+      enum: ["read", "write", "curator", "admin"]
       description: "Type of permission."
       example: "read"
 

@@ -311,43 +311,98 @@ judge accuracy on projected descriptions. Codex must rerun the merge and relatio
 judge evaluation on these projections before switching production retrieval.
 
 The [follow-up integration review](https://github.com/antflydb/antfly/pull/1227#issuecomment-6330615029)
-also requests semantic neighbors. This implementation fixes the full-space scan
-for the normal model-free path, but does **not** implement ANN entity discovery:
-`semantic_discovery: not_indexed` is explicit even when an assertion embedder is
-configured. An assertion embedder does not imply a materialized name/view index,
-and generating every entity embedding during each request would preserve the
-quadratic consolidation cost. Pure semantic synonyms without a shared name, spelling signal or
-alias remain outside lexical discovery.
+adds opt-in semantic discovery to the lexical path. Configure
+`semantic_discovery: {enabled: true, name_threshold: 0.80,
+view_threshold: 0.85, neighbors: 32}` and a qualified native `models.embedder`.
+This feature does not require assertion semantic recall or a generator. An
+external-only embedder cannot materialize these projections. Model identities
+and revisions are pinned through the existing managed inference runtime;
+credentials remain server owned.
 
-The intended ANN extension uses Antfly's shared native vector indexes over two
-derived projections (names/aliases and the exact rendered default view), unioned
-with lexical postings before the existing policy gate. It must retain the entity
-revision, model identity/revision, embedding generation, view fingerprint and
-exact dependency references. Owner/leader work builds projections outside writer
-leases, fences dependencies on publication, and resumes a generation backfill
-before advertising indexed readiness. Invalidation/forgetting must exclude stale
-projections immediately, independent of physical cleanup. Routed and embedded
-adapters must expose the same bounded native neighbor operation and partitions;
-no second vector store, client credentials or table scan disguised as ANN. Name
-and description thresholds must be evaluated on the consumer fixtures rather
-than treating the reported 0.80/0.90 values as universal identity policy. This
-remains an implementation gap, not a claimed result of the indexed lexical fix.
+Each canonical entity has two derived projections: its name and explicit aliases,
+and the exact rendered default `entity_view.description`. Each projection records
+entity revision, model identity/revision, embedding generation, configuration
+generation, view fingerprint, and exact dependency references. The default view
+has the entity's audience: team descriptions exclude private assertions; private
+descriptions exclude another owner's private assertions. Rendering as an admin
+cannot widen the shared projection's audience.
+
+Both projections use Antfly's existing native cosine vector indexes. Index
+namespaces include generation/model and the team or private-owner partition,
+so nearest-neighbor selection cannot spend its result budget on foreign private
+vectors. Routed and embedded adapters use the same bounded native neighbor
+request, with at most 64 neighbors per projection and no primary entity scan.
+The union enters the existing type, visibility, owner, number, canonical-alias,
+suppression and distinct-pin gates. Lexical match and description overlap retain
+their existing meaning; `name_similarity` and `view_similarity` report separate
+semantic scores, including below-threshold scores for indexed lexical hits.
+Candidate items expose `semantic_discovered` separately from their name/view
+similarity values: a lexical hit can have high similarity without belonging to
+the bounded ANN window. Evaluators must use this discovery flag for ANN-only
+admission rather than treating every scored lexical hit as an ANN result.
+Each semantic score is cosine(query, candidate-document) divided by
+cosine(query, seed-document). Document and query embeddings use their respective
+managed roles. Nonpositive or nonfinite self scores fail readiness rather than
+silently changing the threshold's meaning. Similarity never authorizes a merge.
+
+The owner/leader's existing maintenance lane resumes an eight-entity generation
+backfill and then drains durable dirty-entity work. Inference runs through the
+same lease suspension/resumption and causal input fences as other memory model
+work. Publication fences the space control revision, live external dependencies
+and execution grant. Projection batches persist unready progress and wait for
+full index publication.
+Only an acknowledged successful publication permits a second control-row CAS to
+advertise readiness. Ambiguous commits and crashes between phases leave a durable
+unready obligation; recovery repeats the publication barrier before acknowledgment.
+Candidate reads never wait for derived publication while holding a Lite lease.
+Assertion edits dirty their canonical
+entity neighborhoods; curation dirties the affected identity components rather
+than restarting a whole-space backfill. A configuration generation restarts the
+resumable backfill. Candidate reads do not generate stored projections.
+
+Candidate pages report `semantic_discovery: indexed`, `not_ready`, or
+`not_indexed` alongside `retrieval`. Pending backfill/dirty work and a stale seed
+fail readiness; lexical results remain available. Each bounded neighbor is also
+checked against the current entity, model, generation, exact view fingerprint and
+dependencies, so invalidation, source changes, forgetting and curation exclude
+stale projections before physical cleanup. The existing bounded cleanup lane
+removes obsolete projection payloads and their native vector entries. ANN runs
+on the first candidate page; subsequent cursors resume lexical postings without
+repeating semantic hits. One pass over N seeds performs at most 2N bounded
+neighbor calls; additional bounded point reads validate policy and provenance.
+
+The proposed 0.90 view threshold misses knowledge-graph/KG with the qualified
+EmbeddingGemma 2 model (normalized view similarities 0.851/0.865); the evaluated
+default is 0.85, with names remaining 0.80. Thresholds remain configurable and
+require qualification for other models. They are retrieval inputs, not identity policy or a claim
+of model accuracy. The pinned Codex fixture must report lexical, ANN and union
+recall, labelled non-synonym admission, average candidates per seed and the
+pure-semantic description cases with a named, revision-pinned model. Deterministic
+vectors qualify lifecycle and transport mechanics, not semantic accuracy.
 
 Entity proposals use the engine's [shared curation queue (#1233)](https://github.com/antflydb/antfly/pull/1233),
 including stable proposal IDs, irreversible terminal review outcomes, reversible
 merge/unmerge/suppression and reject-with-distinction. Separate service bindings
 pin input entity revisions, configuration and evidence without duplicating
-free-text prompts into the engine queue. Proposal/list/review require admin
-access. On Lite the database owner qualifies. On a remote space, the client
-running proposal listing, background judgment or accept/reject must have the
-existing table-admin permission on that memory space's resolved catalog table.
-Ordinary write permission is insufficient, and the final native publication
-check revalidates the grant. This follows the current shared table authorization
-model: it has read/write/admin, with no narrower curator permission. A future
-space-curator grant must be introduced in that shared model, durable execution
-grants and HTTP/MCP admission together, covering proposal/list/review/curation
-without configuration, source-wide forgetting or embedding publication. It must
-not be simulated by a client-supplied actor or a memory-only authorization bypass.
+free-text prompts into the engine queue.
+
+`curator` is a shared table permission, alongside read, write and admin. It
+implies read and admitted curation, but does not imply arbitrary writes or admin.
+It permits entity candidate discovery, entity proposal/list/get/review, relationship
+proposal/get/review and merge/unmerge/suppress/unsuppress/distinct, subject to the
+same visibility/owner policy. Configuration, ontology changes, source-wide
+forgetting and embedding/generation publication still require admin. Ordinary
+write does not imply curator. API-key upper-bound intersections preserve the
+same permission lattice, including read intersected with curator yielding read.
+
+HTTP and dedicated `/memory/v1/mcp` admission project that shared permission
+through logical-to-physical catalog aliases. MCP discovery exposes the matching
+curation tools. Durable operation receipts retain `required_grant: curator`;
+replay and final publication revalidate it against the live credential, including
+revocation after admission. A caller-supplied actor never grants permission.
+Lite's database owner retains full rights through the same native policy and C
+ABI; embedded request JSON cannot mint a narrower server permission or impersonate
+a remote credential.
 An external verdict carries `accept: true`, `false`, or `null` (defer),
 an expected space revision, declared actor, evidence and optional qualified
 model metadata. The authenticated principal remains the authoritative initiator;

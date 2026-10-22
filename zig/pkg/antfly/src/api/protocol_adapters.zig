@@ -60,6 +60,7 @@ const McpToolPermission = enum {
     none,
     read,
     write,
+    curator,
     admin,
 };
 
@@ -746,7 +747,11 @@ pub fn executeMemoryMcpRequest(server_ptr: anytype, request: McpRequest, authent
     inline for (tools, 0..) |tool, i| {
         const action = comptime @field(memory_api.memory.Action, tool.action);
         contexts[i] = .{ .server = server_ptr, .identity = authenticated_identity, .request = request.context, .action = action };
-        const permission: McpToolPermission = if (memory_api.memory.actionGrant(action) == .admin) .admin else if (!memory_api.memory.mutates(action)) .read else .write;
+        const permission: McpToolPermission = switch (memory_api.memory.actionGrant(action)) {
+            .admin => .admin,
+            .curator => .curator,
+            .write => if (memory_api.memory.mutates(action)) .write else .read,
+        };
         if (mcpPermissionVisibleForIdentity(permission, authenticated_identity)) {
             try protocol_server.addTool(server_ptr.alloc, .{ .name = tool.name, .description = tool.description, .input_schema_json = tool.input_schema_json, .handler = .{ .ptr = &contexts[i], .call_fn = Context.call } });
         }
@@ -831,6 +836,7 @@ fn permissionTypeForMcpTool(permission: McpToolPermission) ?usermgr.PermissionTy
         .none => null,
         .read => .read,
         .write => .write,
+        .curator => .curator,
         .admin => .admin,
     };
 }
@@ -887,7 +893,7 @@ fn identityHasAnyPermission(permissions: []const usermgr.Permission, resource_ty
     for (permissions) |permission| {
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
         if (!type_match) continue;
-        if (permission.type == .admin or permission.type == permission_type) return true;
+        if (permission.type.allows(permission_type)) return true;
     }
     return false;
 }
@@ -902,7 +908,7 @@ fn identityHasPermission(
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
         const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource) or (resource_type == .table and @import("../system_catalog/routes.zig").tableResourceMatches(permission.resource, resource));
         if (!type_match or !resource_match) continue;
-        if (permission.type == .admin or permission.type == permission_type) return true;
+        if (permission.type.allows(permission_type)) return true;
     }
     return false;
 }

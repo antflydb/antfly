@@ -37,7 +37,15 @@ pub const Bridge = struct {
     }
 
     pub fn backend(self: *Bridge) service.Backend {
-        return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .validate_models = validate };
+        return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .embed_document = embedDocument, .neighbors = if (self.base.neighbors != null) neighbors else null, .ensure_vector_index = if (self.base.ensure_vector_index != null) ensureVectorIndex else null, .validate_models = validate };
+    }
+    fn neighbors(ptr: *anyopaque, a: A, request: service.NeighborRequest) ![]const service.Neighbor {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        return self.base.neighbors.?(self.base.ptr, a, request);
+    }
+    fn ensureVectorIndex(ptr: *anyopaque, a: A, name: []const u8, dims: u32) !void {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        return self.base.ensure_vector_index.?(self.base.ptr, a, name, dims);
     }
     fn get(ptr: *anyopaque, a: A, key: []const u8) anyerror!?service.Row {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
@@ -57,7 +65,7 @@ pub const Bridge = struct {
     }
     fn validate(ptr: *anyopaque, config: t.Config) !void {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
-        const needs_inference = config.features.entity_extraction or config.features.assertion_distillation or config.features.summaries or config.features.reconciliation == .model or (config.features.semantic_recall and !std.mem.eql(u8, config.models.embedder.?.provider, "external"));
+        const needs_inference = config.features.entity_extraction or config.features.assertion_distillation or config.features.summaries or config.features.reconciliation == .model or ((config.features.semantic_recall or config.semantic_discovery.enabled) and !std.mem.eql(u8, config.models.embedder.?.provider, "external"));
         if (!needs_inference) return self.validateInner(config);
         try self.before();
         const result = self.validateInner(config);
@@ -75,7 +83,7 @@ pub const Bridge = struct {
                 try checkRevision(model, capabilities.model_revision);
             }
         }
-        if (config.features.semantic_recall and !std.mem.eql(u8, config.models.embedder.?.provider, "external")) {
+        if ((config.features.semantic_recall or config.semantic_discovery.enabled) and !std.mem.eql(u8, config.models.embedder.?.provider, "external")) {
             var embedding_runtime = try self.embedder(self.alloc, config.models.embedder.?);
             defer embedding_runtime.deinit();
             const capabilities = try embedding_runtime.denseInterface().capabilities(self.alloc, "memory");
@@ -153,6 +161,24 @@ pub const Bridge = struct {
     fn embedder(self: *Bridge, a: A, model: t.Model) !managed.ManagedEmbedder {
         const indexes = try std.json.Stringify.valueAlloc(a, .{ .memory = .{ .type = "embeddings", .field = "statement", .dimension = model.dimensions, .embedder = .{ .provider = model.provider, .model = model.model } } }, .{});
         return managed.ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, self.embedding_options);
+    }
+    fn embedDocument(ptr: *anyopaque, a: A, model: t.Model, text: []const u8) ![]const f32 {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        try self.before();
+        const computed = self.documentEmbedding(a, model, text);
+        try self.after();
+        return computed;
+    }
+    fn documentEmbedding(self: *Bridge, a: A, model: t.Model, text: []const u8) ![]const f32 {
+        if (std.mem.eql(u8, model.provider, "external")) return error.MemoryExternalVectorRequired;
+        var provider = try self.embedder(a, model);
+        defer provider.deinit();
+        const interface = provider.denseInterface();
+        const capabilities = try interface.capabilities(a, "memory");
+        try checkRevision(model, capabilities.model_revision);
+        const vector = try interface.embedDense(a, "memory", text, model.dimensions.?);
+        if (vector.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
+        return vector;
     }
     fn embed(ptr: *anyopaque, a: A, model: t.Model, text: []const u8) ![]const f32 {
         const self: *Bridge = @ptrCast(@alignCast(ptr));

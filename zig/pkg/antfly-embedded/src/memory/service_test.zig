@@ -4505,3 +4505,260 @@ test "memory discovery and proposal wire fixtures are actual typed service respo
         try std.testing.expectEqualDeep(expected, actual);
     }
 }
+
+test "memory curator publication and receipt replay revalidate the narrow grant" {
+    var store = Store.init();
+    defer store.deinit();
+    try externalReviewSetup(&store);
+    const a = store.arena.allocator();
+    const Authority = struct {
+        fn require(ptr: *anyopaque, grant: m.types.RequiredGrant) !void {
+            const current: *Store = @ptrCast(@alignCast(ptr));
+            if (grant != .curator or current.public_output) return error.Forbidden;
+            current.required_grant = grant;
+        }
+        fn finish(ptr: *anyopaque) !void {
+            const current: *Store = @ptrCast(@alignCast(ptr));
+            if (current.reject_decision) current.public_output = true;
+            try require(ptr, .curator);
+        }
+    };
+    var curator = store.service("alice", false, 3);
+    curator.context.curator = true;
+    curator.context.grant_ptr = &store;
+    curator.context.require_grant_fn = Authority.require;
+    curator.context.final_check_ptr = &store;
+    curator.context.final_check_fn = Authority.finish;
+    _ = try curator.execute(a, .entity_candidates, "a", "{}", "");
+    const revision = store.revision;
+    const body = try std.fmt.allocPrint(a, "{{\"expected_revision\":{d},\"action\":\"merge\",\"from\":\"a\",\"to\":\"b\",\"evidence\":[{{\"id\":\"e\"}}]}}", .{revision + 1});
+    store.reject_decision = true;
+    try std.testing.expectError(error.Forbidden, curator.execute(a, .propose_entity, "", body, "proposal"));
+    try std.testing.expectEqual(revision, store.revision);
+    store.reject_decision = false;
+    store.public_output = false;
+    const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try curator.execute(a, .propose_entity, "", body, "proposal"), .{});
+    _ = try curator.execute(a, .entity_proposals, "", "{}", "");
+    _ = try curator.execute(a, .entity_proposal, receipt.proposal_id.?, "{}", "");
+    const verdict = try std.fmt.allocPrint(a, "{{\"expected_revision\":{d},\"accept\":true}}", .{store.revision + 1});
+    _ = try curator.execute(a, .review_entity, receipt.proposal_id.?, verdict, "review");
+    try std.testing.expectEqual(m.types.RequiredGrant.curator, store.required_grant);
+    for ([_]struct { action: m.Action, body: []const u8 }{
+        .{ .action = .configure, .body = "{}" },
+        .{ .action = .forget, .body = "{\"source_ids\":[\"fixture\"]}" },
+        .{ .action = .stage_embeddings, .body = "{}" },
+    }) |denied| try std.testing.expectError(error.Forbidden, curator.execute(a, denied.action, "", denied.body, @tagName(denied.action)));
+    store.public_output = true;
+    try std.testing.expectError(error.Forbidden, curator.execute(a, .review_entity, receipt.proposal_id.?, verdict, "review"));
+    try std.testing.expectError(error.Forbidden, curator.execute(a, .entity_proposals, "", "{}", ""));
+}
+
+test "memory curator reviews another owner's team relationship proposal without acquiring private access" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var owner = store.service("alice", true, 1);
+    _ = try owner.execute(a, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create");
+    _ = try owner.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Antfly is a database\",\"visibility\":\"team\"}],\"entities\":[{\"id\":\"a\",\"name\":\"Antfly\",\"visibility\":\"team\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"b\",\"name\":\"database\",\"visibility\":\"team\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    _ = try owner.execute(a, .propose_relationship, "", "{\"id\":\"shared\",\"expected_revision\":3,\"assertion\":{\"id\":\"link\",\"subject\":\"a\",\"predicate\":\"is_a\",\"value\":\"b\",\"statement\":\"Antfly is a database\",\"visibility\":\"team\",\"evidence\":[{\"id\":\"e\"}]}}", "shared");
+    _ = try owner.execute(a, .propose_relationship, "", "{\"id\":\"private\",\"expected_revision\":4,\"assertion\":{\"id\":\"private-link\",\"subject\":\"a\",\"predicate\":\"is_a\",\"value\":\"b\",\"statement\":\"Private proposed relation\",\"evidence\":[{\"id\":\"e\"}]}}", "private");
+    var curator = store.service("bob", false, 2);
+    curator.context.curator = true;
+    _ = try curator.execute(a, .relationship_proposal, "shared", "{}", "");
+    try std.testing.expectError(error.Forbidden, curator.execute(a, .relationship_proposal, "private", "{}", ""));
+    _ = try curator.execute(a, .review_relationship, "shared", "{\"expected_revision\":5,\"accept\":true}", "review");
+    const claim = try curator.execute(a, .get, "link", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, claim, "Antfly is a database") != null);
+}
+
+// A deterministic neighbor source tests policy and fences, not ANN quality or
+// scaling. Native adapter tests exercise the actual vector index separately.
+const SemanticFixture = struct {
+    fn service(store: *Store, now: i64) m.Service {
+        var result = modelService(store, now);
+        result.backend.embed_document = fakeEmbed;
+        result.backend.neighbors = neighbors;
+        result.backend.ensure_vector_index = ensure;
+        return result;
+    }
+    fn ensure(_: *anyopaque, _: A, _: []const u8, _: u32) !void {}
+    fn neighbors(ptr: *anyopaque, a: A, request: m.NeighborRequest) ![]const m.Neighbor {
+        const store: *Store = @ptrCast(@alignCast(ptr));
+        var result: std.ArrayList(m.Neighbor) = .empty;
+        const prefix = try std.fmt.allocPrint(a, "entity-semantic/{s}/", .{request.index});
+        var entries = store.values.iterator();
+        while (entries.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+            // Different embedding roles deliberately have self-similarity 0.8.
+            try result.append(a, .{ .key = entry.key_ptr.*, .similarity = 0.8 });
+            if (result.items.len == request.limit) break;
+        }
+        return result.items;
+    }
+    fn query(_: *anyopaque, a: A, _: m.types.Model, _: []const u8) ![]const f32 {
+        return a.dupe(f32, &.{ 0.8, 0.6 });
+    }
+};
+
+test "memory semantic readiness survives ambiguous publication and fences the readiness acknowledgment" {
+    const Fault = struct {
+        fn commit(ptr: *anyopaque, a: A, expected: ?m.Row, changes: []const m.Change) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            try Store.commit(ptr, a, expected, changes);
+            if (store.failures != 0) {
+                store.failures -= 1;
+                return error.MemoryCommitPending;
+            }
+        }
+        fn finish(ptr: *anyopaque) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (store.reject_decision and store.values.contains("entity-semantic-index")) {
+                store.reject_decision = false;
+                return error.Forbidden;
+            }
+        }
+    };
+    inline for (.{ false, true }) |revoke_ack| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var service = SemanticFixture.service(&store, 1);
+        const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+        _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+        _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Knowledge graph\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+        if (revoke_ack) {
+            store.reject_decision = true;
+            service.context.final_check_ptr = &store;
+            service.context.final_check_fn = Fault.finish;
+        } else {
+            store.failures = 1;
+            service.backend.commit = Fault.commit;
+        }
+        try std.testing.expectError(if (revoke_ack) error.Forbidden else error.MemoryCommitPending, service.execute(a, .advance, "", "{}", "interrupted"));
+        const index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, store.values.get("entity-semantic-index").?, .{});
+        try std.testing.expect(index.backfill_complete);
+        try std.testing.expect(!index.complete);
+        var page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+        try std.testing.expectEqual(.not_ready, page.semantic_discovery);
+        // Replaying the committed operation cannot turn ambiguity into readiness.
+        _ = try service.execute(a, .advance, "", "{}", "interrupted");
+        page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+        try std.testing.expectEqual(.not_ready, page.semantic_discovery);
+        // Fresh owner maintenance republishes the barrier before acknowledging it.
+        _ = try service.execute(a, .advance, "", "{}", "recover");
+        page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+        try std.testing.expectEqual(.indexed, page.semantic_discovery);
+    }
+}
+
+test "memory semantic projections backfill union role-normalized neighbors and invalidate without cleanup" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var service = SemanticFixture.service(&store, 1);
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"A knowledge graph (KG) stores linked facts.\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"kg\",\"name\":\"KG\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    var page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+    try std.testing.expectEqual(.not_ready, page.semantic_discovery);
+    _ = try service.execute(a, .advance, "", "{}", "backfill");
+    service.backend.embed = SemanticFixture.query;
+    page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, page.semantic_discovery);
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectEqualStrings("kg", page.items[0].entity.entity.id);
+    try std.testing.expectEqual(@as(f64, 0), page.items[0].match_score);
+    try std.testing.expect(page.items[0].semantic_discovered);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), page.items[0].name_similarity.?, 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), page.items[0].view_similarity.?, 0.00001);
+    const scans = store.entity_scans;
+    _ = try service.execute(a, .entity_candidates, "graph", "{}", "");
+    try std.testing.expectEqual(scans, store.entity_scans);
+    _ = try service.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"description\",\"subject\":\"graph\",\"predicate\":\"description\",\"value\":\"graph\",\"statement\":\"An edited graph description\",\"evidence\":[{\"id\":\"e\"}]}]}", "description");
+    page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+    try std.testing.expectEqual(.not_ready, page.semantic_discovery);
+    _ = try service.execute(a, .advance, "", "{}", "refresh-description");
+    page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, page.semantic_discovery);
+    try std.testing.expect(std.mem.indexOf(u8, page.seed_view.description, "edited") != null);
+    inline for (.{ .{ "merge", "graph", @as(usize, 0) }, .{ "unmerge", @as(?[]const u8, null), @as(usize, 1) }, .{ "suppress", @as(?[]const u8, null), @as(usize, 0) }, .{ "unsuppress", @as(?[]const u8, null), @as(usize, 1) } }) |transition| {
+        _ = try service.execute(a, .curate_entity, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = (try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{})).revision, .action = transition[0], .from = "kg", .to = transition[1] }, .{}), transition[0]);
+        _ = try service.execute(a, .advance, "", "{}", "refresh-" ++ transition[0]);
+        page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+        try std.testing.expectEqual(.indexed, page.semantic_discovery);
+        try std.testing.expectEqual(transition[2], page.items.len);
+    }
+    _ = try service.execute(a, .curate_entity, "", try std.fmt.allocPrint(a, "{{\"expected_revision\":{d},\"action\":\"distinct\",\"from\":\"graph\",\"to\":\"kg\"}}", .{(try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{})).revision}), "pin");
+    page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 0), page.items.len);
+    _ = try service.execute(a, .forget, "", "{\"source_ids\":[\"s\"]}", "forget");
+    try std.testing.expectError(error.MemoryNotFound, service.execute(a, .entity_candidates, "graph", "{}", ""));
+}
+
+test "memory Codex discovery fixture reports the indexed lexical baseline" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const Case = struct { a: []const u8, b: []const u8, same: bool, a_description: []const u8, b_description: []const u8 };
+    var cases: std.ArrayList(Case) = .empty;
+    var names: std.StringHashMapUnmanaged(usize) = .empty;
+    var entities: std.ArrayList(m.types.Entity) = .empty;
+    var claims: std.ArrayList(m.types.Assertion) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, @embedFile("fixtures/codex-a2d59cfb01/concept_merge.jsonl"), '\n');
+    while (lines.next()) |line| {
+        const row = try std.json.parseFromSliceLeaky(Case, a, line, .{ .ignore_unknown_fields = true });
+        try cases.append(a, row);
+        inline for (.{ .{ row.a, row.a_description }, .{ row.b, row.b_description } }) |concept| {
+            const entry = try names.getOrPut(a, concept[0]);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = entities.items.len;
+                const id = try std.fmt.allocPrint(a, "concept-{d}", .{entities.items.len});
+                try entities.append(a, .{ .id = id, .name = concept[0], .evidence = &.{.{ .id = "fixture" }} });
+                try claims.append(a, .{ .id = id, .subject = id, .predicate = "description", .value = concept[0], .statement = concept[1], .evidence = &.{.{ .id = "fixture" }} });
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 84), entities.items.len);
+    try discard(&store, .create, "", "{\"max_output_items\":256,\"max_input_bytes\":1048576}", "create", 1);
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &[_]m.types.Evidence{.{ .id = "fixture", .source_id = "codex-a2d59cfb01", .source_version = "1", .text = @embedFile("fixtures/codex-a2d59cfb01/concept_merge.jsonl") }}, .entities = entities.items, .assertions = claims.items }, .{}), "fixture", 2);
+    var discovered: [84][84]bool = @splat(@splat(false));
+    var top5: [84][84]bool = @splat(@splat(false));
+    var total: usize = 0;
+    const scans = store.entity_scans;
+    for (entities.items, 0..) |entity, i| {
+        var cursor: ?[]const u8 = null;
+        var first = true;
+        while (true) {
+            const result = try store.service("alice", false, 3).execute(a, .entity_candidates, entity.id, try std.json.Stringify.valueAlloc(a, .{ .cursor = cursor, .limit = @as(u16, 64) }, .{}), "");
+            const page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, result, .{});
+            try std.testing.expectEqual(@as(usize, 0), page.omitted);
+            for (page.items, 0..) |hit, position| {
+                const j = try std.fmt.parseInt(usize, hit.entity.entity.id["concept-".len..], 10);
+                discovered[i][j] = true;
+                if (first and position < 5) top5[i][j] = true;
+            }
+            cursor = page.next_cursor;
+            first = false;
+            if (cursor == null) break;
+        }
+        for (discovered[i]) |found| if (found) {
+            total += 1;
+        };
+    }
+    var recalled: usize = 0;
+    var recalled_top5: usize = 0;
+    var non_synonyms: usize = 0;
+    for (cases.items) |row| {
+        const i = names.get(row.a).?;
+        const j = names.get(row.b).?;
+        const found = discovered[i][j] or discovered[j][i];
+        if (row.same) {
+            if (found) recalled += 1;
+            if (top5[i][j] or top5[j][i]) recalled_top5 += 1;
+        } else if (found) non_synonyms += 1;
+    }
+    try std.testing.expectEqual(scans, store.entity_scans);
+    try std.testing.expect(recalled >= 17 and recalled_top5 >= 17);
+    try std.testing.expect(total < 5 * entities.items.len);
+    std.debug.print("Codex lexical: {d}/18 synonym pairs, {d}/18 top5, {d}/46 labelled non-synonyms, {d:.3} candidates/seed, 0 primary scans\n", .{ recalled, recalled_top5, non_synonyms, @as(f64, @floatFromInt(total)) / 84 });
+}
