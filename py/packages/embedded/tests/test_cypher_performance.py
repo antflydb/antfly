@@ -6581,3 +6581,121 @@ def test_observed_parameter_lists_keep_bag_counts_and_shared_distinct_support(gr
         [7, 2002, 1001, 1001000, 500500],
         [8, 1001, 1001, 500500, 500500],
     ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "range(1,1000000)",
+        "reverse(range(1,500000)+range(500001,1000000))",
+    ],
+)
+def test_affine_observers_compress_expanding_calls_without_enumerating_ranges(graph_db, source):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND {source} AS x CALL {{UNWIND [7,8] AS y RETURN y}} "
+            "RETURN count(x+1),count(DISTINCT x+1),min(x+1),max(x+1),sum(x+1)",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [
+        [2000000, 1000000, 2, 1000001, 1000003000000]
+    ]
+    assert result["stats"]["intermediate_states"] < 1000
+
+
+@pytest.mark.parametrize(
+    "aggregate", ["min(x)", "max(x)", "min(x),max(x)", "sum(x)", "avg(x)", "sum(DISTINCT x)", "avg(DISTINCT x)"]
+)
+@pytest.mark.parametrize("source", ["range(1,40000)", "range(10000,1,-1)"])
+def test_numeric_and_extrema_windows_bound_group_state_through_eviction(graph_db, aggregate, source):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND {source} AS i UNWIND [0,1,0] AS x RETURN i,{aggregate} ORDER BY i LIMIT 5",
+            "limits": {"memory_bytes": 2 << 20},
+        },
+    )
+    expected = graph_db.cypher_json(
+        "g",
+        {"query": f"UNWIND range(1,5) AS i UNWIND [0,1,0] AS x RETURN i,{aggregate} ORDER BY i"},
+    )
+    assert result["rows"] == expected["rows"]
+    assert result["stats"]["memory_bytes"] < 200000
+
+
+def test_unsafe_window_packet_bound_preserves_symbolic_fallback(graph_db):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND [1,2] AS i UNWIND range(1,1000000) AS x RETURN i,sum(x+9000000000000) ORDER BY i LIMIT 1",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 2 << 20},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[1, 9000000500000500000]]
+
+
+@pytest.mark.parametrize("source", ["range(1,1000000)", "reverse(range(1,500000)+range(500001,1000000))", "$xs"])
+@pytest.mark.parametrize("child", ["", "CALL {UNWIND [7,8] AS y RETURN y} "])
+def test_bounded_numeric_windows_preserve_compressed_inner_domains(graph_db, source, child):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND [1,2] AS i UNWIND {source} AS x {child}RETURN i,min(x),max(x),sum(x) ORDER BY i LIMIT 1",
+            "parameters": {"xs": list(range(1, 1001))},
+            "limits": {"intermediate_states": 100000, "memory_bytes": 2 << 20},
+        },
+    )
+    n = 1000 if source == "$xs" else 1000000
+    copies = 2 if child else 1
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[1, 1, n, copies * n * (n + 1) // 2]]
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "({v:i}).v",
+        "({v:i})['v']",
+        "({v:i}).missing",
+        "head([z IN [i] | z])",
+        "head([z IN [i] WHERE z>0 | {v:z}]).v",
+        "head([{v:i}]).v",
+        "({v:{k:[i]}}).v.k[0]",
+    ],
+)
+def test_structured_scalar_results_remove_only_dead_primitive_keys(graph_db, expression):
+    prefix = f"UNWIND range(1,30) AS i WITH i,{expression} AS j UNWIND $xs AS x "
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": prefix + "CALL {WITH j,avg(x) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
+            "parameters": {"xs": list(range(1000))},
+            "limits": {"intermediate_states": 100000},
+        },
+    )
+    expected = graph_db.cypher_json(
+        "g",
+        {
+            "query": prefix + "CALL {WITH avg(x) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
+            "parameters": {"xs": list(range(1000))},
+        },
+    )
+    assert result["rows"] == expected["rows"]
+
+
+@pytest.mark.parametrize("limit", [0, 1])
+@pytest.mark.parametrize(
+    "aggregate,source,error",
+    [
+        ("sum(x)", "[9223372036854775807,1]", "CypherNumericOverflow"),
+        ("sum(x)", "[1,'bad']", "CypherTypeMismatch"),
+        ("avg(x)", "[1,'bad']", "CypherTypeMismatch"),
+    ],
+)
+def test_rejected_numeric_windows_preserve_argument_and_prefix_failures(graph_db, limit, aggregate, source, error):
+    with pytest.raises(af.AntflyError, match=error):
+        graph_db.cypher_json(
+            "g",
+            {"query": f"UNWIND [1,2] AS i UNWIND {source} AS x RETURN i,{aggregate} ORDER BY i LIMIT {limit}"},
+        )

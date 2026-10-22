@@ -6276,7 +6276,7 @@ test "branch and element result certificates preserve entity projection on dead 
             return node;
         }
     };
-    for ([_][]const u8{ "head([i])", "last([i])", "[i][0]", "CASE WHEN true THEN i ELSE null END" }) |expression| {
+    for ([_][]const u8{ "head([i])", "last([i])", "[i][0]", "CASE WHEN true THEN i ELSE null END", "({v:i}).v", "head([z IN [i] | z])", "head([{v:i}]).v" }) |expression| {
         const a = std.testing.allocator;
         const text = try std.fmt.allocPrint(a, "UNWIND $groups AS i WITH {s} AS j UNWIND [1,2] AS x CALL {{WITH j,count(x) AS y RETURN y}} RETURN count(*)", .{expression});
         defer a.free(text);
@@ -6309,4 +6309,248 @@ test "observed immutable parameter lists separate bag counts and shared DISTINCT
     const json = try std.json.Stringify.valueAlloc(a, result.rows, .{});
     defer a.free(json);
     try std.testing.expectEqualStrings("[[7,2002,1001,1001000,500500],[8,1001,1001,500500,500500]]", json);
+}
+
+fn compareReductionPlans(text: []const u8, control: []const u8) !void {
+    const a = std.testing.allocator;
+    var diagnostic: c.Diagnostic = .{};
+    var fast = try c.compile(a, text, .{}, &diagnostic);
+    defer fast.deinit();
+    var slow = try c.compile(a, control, .{}, &diagnostic);
+    defer slow.deinit();
+    var fixture: Fixture = .{};
+    var actual = runtime.execute(a, fixture.backend(), graph, &fast, &.{}, .{}) catch |err| {
+        var expected = runtime.execute(a, fixture.backend(), graph, &slow, &.{}, .{}) catch |other| {
+            if (err != other) std.debug.print("reduction error mismatch: {s}\n", .{text});
+            try std.testing.expectEqual(err, other);
+            return;
+        };
+        defer expected.deinit();
+        std.debug.print("unexpected reduction failure ({s}): {s}\n", .{ @errorName(err), text });
+        return error.TestUnexpectedResult;
+    };
+    defer actual.deinit();
+    var expected = try runtime.execute(a, fixture.backend(), graph, &slow, &.{}, .{});
+    defer expected.deinit();
+    try std.testing.expectEqualDeep(expected.rows, actual.rows);
+}
+
+test "affine observed CALL ranges retain constant work and exact set cardinality" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "UNWIND range(1,1000000) AS x CALL {UNWIND [7,8] AS y RETURN y} RETURN count(x+1),count(DISTINCT x+1),min(x+1),max(x+1),sum(x+1)",
+        "WITH reverse(range(1,500000)+range(500001,1000000)) AS xs UNWIND xs AS x CALL {UNWIND [7,8] AS y RETURN y} RETURN count(x+1),count(DISTINCT x+1),min(x+1),max(x+1),sum(x+1)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 });
+        defer result.deinit();
+        try std.testing.expect(result.stats.intermediate_states < 1000);
+        const json = try std.json.Stringify.valueAlloc(a, result.rows, .{});
+        defer a.free(json);
+        try std.testing.expectEqualStrings("[[2000000,1000000,2,1000001,1000003000000]]", json);
+    }
+    try check("UNWIND range(1,1000000) AS x CALL {UNWIND [7,8] AS y RETURN y} RETURN count(DISTINCT x*0+7),sum(x*0+7),min(-2*x+1),max(-2*x+1)", "[[1,14000000,-1999999,-1]]");
+}
+
+test "affine observed CALL certificates agree with sequential arithmetic and error order" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "range(-3,3)", "reverse(range(-3,3))", "range(-3,3)+range(2,4)", "reverse(range(-3,3)+range(2,4))", "range(9223372036854775805,9223372036854775807)", "range(-9223372036854775808,-9223372036854775806)", "range(1,0)", "range(1,1)" }) |source| {
+        for ([_][]const u8{ "x", "x+1", "-x", "2*x-1", "(x+1)-x+2", "0*x+1", "(x+9223372036854775807)-9223372036854775807", "x*x" }) |argument| {
+            for ([_][]const u8{ "UNWIND [7,8,7] AS y RETURN y", "RETURN 1/0 AS y", "RETURN 7 AS y WHERE false", "UNWIND [] AS y RETURN count(*) AS y", "UNWIND [7,8] AS y RETURN DISTINCT y LIMIT 1" }) |body| {
+                const projection = try std.fmt.allocPrint(a, "count({s}),count(DISTINCT {s}),min({s}),max({s}),sum({s})", .{ argument, argument, argument, argument, argument });
+                defer a.free(projection);
+                const text = try std.fmt.allocPrint(a, "UNWIND {s} AS x CALL {{{s}}} RETURN {s}", .{ source, body, projection });
+                defer a.free(text);
+                const control = try std.fmt.allocPrint(a, "UNWIND {s} AS x CALL {{MATCH (__guard:Document) WHERE __guard.id='a' {s}}} RETURN {s}", .{ source, body, projection });
+                defer a.free(control);
+                try compareReductionPlans(text, control);
+            }
+        }
+    }
+}
+
+test "bounded numeric and extrema windows retain selected state through eviction" {
+    const a = std.testing.allocator;
+    const group_count: usize = if (@import("builtin").mode == .debug) 500 else 10000;
+    for ([_][]const u8{ "min(x)", "max(x)", "min(x),max(x)", "sum(x)", "avg(x)", "sum(DISTINCT x)", "avg(DISTINCT x)" }) |aggregate| {
+        const text = try std.fmt.allocPrint(a, "UNWIND range({d},1,-1) AS i UNWIND [0,1,0] AS x RETURN i,{s} ORDER BY i LIMIT 5", .{ group_count, aggregate });
+        defer a.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 1000000, .memory_bytes = 2 << 20 }) catch |err| {
+            std.debug.print("bounded reducer resource case: {s}\n", .{text});
+            return err;
+        };
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 5), result.rows.len);
+        try std.testing.expect(result.stats.memory_bytes < 200000);
+        for (result.rows, 1..) |row, i| try std.testing.expectEqual(@as(i64, @intCast(i)), row[0].integer);
+    }
+}
+
+test "bounded numeric windows reuse certified complete domains within the ordinary work budget" {
+    const a = std.testing.allocator;
+    const group_count: usize = if (@import("builtin").mode == .debug) 500 else 40000;
+    for ([_][]const u8{ "min(x)", "sum(x)", "avg(x)" }) |aggregate| {
+        const text = try std.fmt.allocPrint(a, "UNWIND range(1,{d}) AS i UNWIND [0,1,0] AS x RETURN i,{s} ORDER BY i LIMIT 5", .{ group_count, aggregate });
+        defer a.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 1000000, .memory_bytes = 2 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 5), result.rows.len);
+        try std.testing.expect(result.stats.memory_bytes < 200000);
+    }
+}
+
+test "bounded reducer packets retain compressed range and immutable list proofs" {
+    const a = std.testing.allocator;
+    var xs: [1000]v.Value = undefined;
+    for (&xs, 0..) |*value, i| value.* = .{ .integer = @intCast(i + 1) };
+    for ([_][]const u8{ "range(1,1000000)", "reverse(range(1,500000)+range(500001,1000000))", "$xs" }) |source| {
+        for ([_][]const u8{ "", "CALL {UNWIND [7,8] AS y RETURN y} " }) |child| {
+            const text = try std.fmt.allocPrint(a, "UNWIND [1,2] AS i UNWIND {s} AS x {s}RETURN i,min(x),max(x),sum(x) ORDER BY i LIMIT 1", .{ source, child });
+            defer a.free(text);
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = &xs } }}, .{ .intermediate_states = 100000, .memory_bytes = 2 << 20 });
+            defer result.deinit();
+            const n: i64 = if (std.mem.eql(u8, source, "$xs")) 1000 else 1000000;
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+            try std.testing.expectEqual(@as(i64, 1), result.rows[0][1].integer);
+            try std.testing.expectEqual(n, result.rows[0][2].integer);
+            try std.testing.expectEqual(@divExact(n * (n + 1), 2) * @as(i64, if (child.len == 0) 1 else 2), result.rows[0][3].integer);
+        }
+    }
+}
+
+test "unsafe compressed packet bounds retry the original symbolic reduction" {
+    const a = std.testing.allocator;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(a, "UNWIND [1,2] AS i UNWIND range(1,1000000) AS x RETURN i,sum(x+9000000000000) ORDER BY i LIMIT 1", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 2 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(i64, 9000000500000500000), result.rows[0][1].integer);
+}
+
+test "bounded reducer certificates preserve rejected argument failures and deferred precedence" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "[1,2,3,4]", "[4,3,2,1]", "[3,1,2,3,4,2,1]" }) |groups| {
+        for ([_][]const u8{ "[null,0,1,0]", "[1,2.5,-3]", "[1,'bad',2]", "[[1],[2],[]]", "[{v:1},{v:2}]", "[9223372036854775807,1]", "[1e308,1e308,-1e308]" }) |source| {
+            for ([_][]const u8{ "min(x)", "max(x)", "sum(x)", "avg(x)", "sum(DISTINCT x)", "avg(DISTINCT x)" }) |aggregate| {
+                const text = try std.fmt.allocPrint(a, "UNWIND {s} AS i UNWIND {s} AS x RETURN i,{s} AS n ORDER BY i SKIP 1 LIMIT 2", .{ groups, source, aggregate });
+                defer a.free(text);
+                const control = try std.fmt.allocPrint(a, "UNWIND {s} AS i UNWIND {s} AS x WITH i,{s} AS n RETURN i,n ORDER BY i SKIP 1 LIMIT 2", .{ groups, source, aggregate });
+                defer a.free(control);
+                try compareReductionPlans(text, control);
+            }
+        }
+    }
+    try compareReductionPlans("UNWIND [1,2] AS i UNWIND [1,'bad'] AS x WITH i,x,1/(2-i) AS z RETURN i,sum(x) AS n ORDER BY i LIMIT 1", "UNWIND [1,2] AS i UNWIND [1,'bad'] AS x WITH i,x,1/(2-i) AS z WITH i,sum(x) AS n RETURN i,n ORDER BY i LIMIT 1");
+    try compareReductionPlans("UNWIND [1,2] AS i UNWIND [9223372036854775807,1] AS x RETURN i,sum(x) AS n ORDER BY i LIMIT 0", "UNWIND [1,2] AS i UNWIND [9223372036854775807,1] AS x WITH i,sum(x) AS n RETURN i,n ORDER BY i LIMIT 0");
+}
+
+test "structured scalar certificates remove dead keys without rescanning each captured domain" {
+    const a = std.testing.allocator;
+    var xs: [1000]v.Value = undefined;
+    for (&xs, 0..) |*value, i| value.* = .{ .integer = @intCast(i) };
+    for ([_][]const u8{ "({v:i}).v", "({v:i})['v']", "({v:i}).missing", "head([z IN [i] | z])", "head([z IN [i] WHERE z>0 | {v:z}]).v", "({v:{k:[i]}}).v.k[0]", "head([{v:i}]).v" }) |expression| {
+        const text = try std.fmt.allocPrint(a, "UNWIND range(1,30) AS i WITH i,{s} AS j UNWIND $xs AS x CALL {{WITH j,avg(x) AS y RETURN y}} RETURN i,avg(y) ORDER BY i", .{expression});
+        defer a.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = &xs } }}, .{ .intermediate_states = 100000, .memory_bytes = 2 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 30), result.rows.len);
+        for (result.rows) |row| try std.testing.expectEqual(@as(f64, 499.5), row[1].number);
+    }
+}
+
+test "observed expression and bounded reducer certificates release failed allocations" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, text: []const u8) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    for ([_][]const u8{
+        "WITH range(1,4) AS xs WITH reverse(xs+xs) AS xs UNWIND xs AS x CALL {UNWIND [7,8] AS y RETURN y} RETURN count(DISTINCT x+1),sum(2*x-1),min(-x)",
+        "UNWIND [4,3,2,1] AS i UNWIND [0,1,0] AS x RETURN i,sum(x),avg(DISTINCT x),min(x) ORDER BY i LIMIT 1",
+        "UNWIND [3,1,2] AS i UNWIND [0,1,0] AS x RETURN i,sum(x) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i UNWIND range(1,4) AS x CALL {UNWIND [7,8] AS y RETURN y} RETURN i,min(x),sum(x) ORDER BY i LIMIT 1",
+        "UNWIND [1,2,3] AS i WITH i,head([{v:i}]).v AS j UNWIND [1,2] AS x CALL {WITH j,avg(x) AS y RETURN y} RETURN i,avg(y)",
+    }) |text| std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text}) catch |err| {
+        std.debug.print("certificate allocation campaign: {s}\n", .{text});
+        return err;
+    };
+}
+
+test "structured certificates preserve map producer and comprehension predicate failures" {
+    for ([_][]const u8{ "({unused:1/0,v:i}).v", "head([z IN [i] WHERE 1/0=0 | z])" }) |expression| {
+        const a = std.testing.allocator;
+        const text = try std.fmt.allocPrint(a, "UNWIND [1,2] AS i WITH i,{s} AS j UNWIND [1,2] AS x CALL {{WITH j,avg(x) AS y RETURN y}} RETURN i,avg(y)", .{expression});
+        defer a.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+    const Host = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn project(_: *anyopaque, _: std.mem.Allocator, _: *const v.Node) anyerror!?*const v.Node {
+            return error.CypherInvalidArgument;
+        }
+    };
+    const a = std.testing.allocator;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(a, "UNWIND $groups AS i WITH ({unused:i,v:1}).v AS j UNWIND [1,2] AS x CALL {WITH j,avg(x) AS y RETURN y} RETURN avg(y)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.checkpoint = Host.checkpoint;
+    callbacks.project_node = Host.project;
+    const backend: b.Backend = .{ .ptr = &fixture, .vtable = &callbacks };
+    try std.testing.expectError(error.CypherInvalidArgument, runtime.execute(a, backend, graph, &compiled, &.{.{ .name = "groups", .value = .{ .list = &.{.{ .node = &Fixture.nodes[0] }} } }}, .{}));
+}
+
+test "bounded numeric windows retain failures in rejected path statistic groups" {
+    const Failure = struct {
+        fn check(text: []const u8, control: []const u8) !void {
+            for ([_][]const u8{ text, control }) |query| {
+                var diagnostic: c.Diagnostic = .{};
+                var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+                defer compiled.deinit();
+                var fixture: Fixture = .{};
+                try std.testing.expectError(error.CypherNumericOverflow, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+            }
+        }
+    };
+    try Failure.check("UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..2]->(a) RETURN g,sum(length(p)*3000000000000000000) AS n ORDER BY g DESC LIMIT 1", "UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..2]->(a) WITH g,sum(length(p)*3000000000000000000) AS n RETURN g,n ORDER BY g DESC LIMIT 1");
+    try Failure.check("UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..2]->(a) RETURN g,sum(length(p)*length(p)*1500000000000000000) AS n ORDER BY g DESC LIMIT 1", "UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..2]->(a) WITH g,sum(length(p)*length(p)*1500000000000000000) AS n RETURN g,n ORDER BY g DESC LIMIT 1");
+    try Failure.check("UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..100]->(b) RETURN g,sum(length(p)*length(p)) AS n ORDER BY g DESC LIMIT 1", "UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..100]->(b) WITH g,sum(length(p)*length(p)) AS n RETURN g,n ORDER BY g DESC LIMIT 1");
+    try Failure.check("UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..3]->(b) RETURN g,sum(length(p)*1000000000000000000) AS n ORDER BY g DESC LIMIT 1", "UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..3]->(b) WITH g,sum(length(p)*1000000000000000000) AS n RETURN g,n ORDER BY g DESC LIMIT 1");
+    try Failure.check("UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..2]->(b) RETURN g,sum(length(p)*length(p)*1000000000000000000) AS n ORDER BY g DESC LIMIT 1", "UNWIND ['c','a'] AS g MATCH REPEATABLE ELEMENTS p=(a:Document {id:g})-[:CITES*0..2]->(b) WITH g,sum(length(p)*length(p)*1000000000000000000) AS n RETURN g,n ORDER BY g DESC LIMIT 1");
 }

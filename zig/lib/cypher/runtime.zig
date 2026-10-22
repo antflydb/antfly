@@ -2374,17 +2374,22 @@ const Engine = struct {
         const Owned = struct { arena: std.heap.ArenaAllocator, rank: []const v.Value, hash: u64, sequence: usize };
         capacity: usize,
         slots: []const usize,
+        extended: bool = false,
         heap: std.ArrayList(usize) = .empty,
         sequence: usize = 0,
-        fn init(engine: *Engine, projection: ast.Projection, scalar: bool) !?@This() {
+        fn init(engine: *Engine, projection: ast.Projection, scalar: bool, extended: bool) !?@This() {
             // DISTINCT with reducers may collapse different complete groups;
             // only a pure DISTINCT key window licenses candidate-local membership.
             if (projection.distinct) for (projection.items) |item| if (aggregates(item.expression) or !reduction_plan.repeatable(item.expression)) return null;
             if (!scalar or @as(u64, engine.limits.intermediate_states) > std.math.maxInt(i64) or projection.predicate != null or projection.order.len == 0 or !engine.boundedGroupWindow(projection)) return null;
             var keys: std.ArrayList(*const ast.Expr) = .empty;
+            var uses_extended = false;
             for (projection.items) |item| {
                 if (aggregates(item.expression)) {
-                    if (item.expression.value != .call or !std.ascii.eqlIgnoreCase(item.expression.value.call.name, "count")) return null;
+                    if (item.expression.value != .call) return null;
+                    const name = item.expression.value.call.name;
+                    uses_extended = uses_extended or !std.ascii.eqlIgnoreCase(name, "count");
+                    if (!std.ascii.eqlIgnoreCase(name, "count") and (!extended or (!std.ascii.eqlIgnoreCase(name, "min") and !std.ascii.eqlIgnoreCase(name, "max") and !std.ascii.eqlIgnoreCase(name, "sum") and !std.ascii.eqlIgnoreCase(name, "avg")))) return null;
                 } else try keys.append(engine.a, item.expression);
             }
             if (keys.items.len == 0) return null;
@@ -2415,7 +2420,27 @@ const Engine = struct {
                 slot.* = found orelse return null;
             }
             const limit = try engine.count(projection.limit.?);
-            return .{ .capacity = if (limit == 0) 0 else (if (projection.skip) |skip| try engine.count(skip) else 0) + limit, .slots = slots };
+            return .{ .capacity = if (limit == 0) 0 else (if (projection.skip) |skip| try engine.count(skip) else 0) + limit, .slots = slots, .extended = uses_extended };
+        }
+        fn validate(self: @This(), engine: *Engine, call_value: ast.Function, value: v.Value, weight: Count) !void {
+            if (!self.extended or value == .null or std.ascii.eqlIgnoreCase(call_value.name, "count")) return;
+            // An evicted group cannot report a later failure. Certify every
+            // contribution, including rejected keys, before forgetting state.
+            if (std.ascii.eqlIgnoreCase(call_value.name, "min") or std.ascii.eqlIgnoreCase(call_value.name, "max")) {
+                if (!primitive(value)) return error.CypherGroupWindowDeclined;
+                return;
+            }
+            if (value != .integer and value != .number) return error.CypherGroupWindowDeclined;
+            const number = try value.numeric();
+            if (!std.math.isFinite(number)) return error.CypherGroupWindowDeclined;
+            if (std.ascii.eqlIgnoreCase(call_value.name, "avg")) {
+                if (@abs(number) > std.math.floatMax(f64) / 4) return error.CypherGroupWindowDeclined;
+                return;
+            }
+            const copies = weight.exact() orelse return error.CypherGroupWindowDeclined;
+            if (value == .integer) {
+                if (copies != 0 and @abs(@as(i128, value.integer)) > contributionLimit(engine) / copies) return error.CypherGroupWindowDeclined;
+            } else if (@as(f128, @abs(number)) * @as(f128, @floatFromInt(copies)) > @as(f128, std.math.floatMax(f64)) / (4 * @as(f128, @floatFromInt(@max(1, engine.limits.intermediate_states))))) return error.CypherGroupWindowDeclined;
         }
         fn contributionLimit(engine: *Engine) u64 {
             return @as(u64, std.math.maxInt(i64)) / @max(1, engine.limits.intermediate_states);
@@ -2459,6 +2484,7 @@ const Engine = struct {
                             if (fold.window_retry and StreamingAggregate.consumerFailure(err)) return error.CypherGroupWindowDeclined;
                             return err;
                         };
+                        try self.validate(engine, expression.value.call, value, fold.weight);
                         if (expression.value.call.distinct and value != .null) {
                             var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
                             defer scratch.deinit();
@@ -2877,12 +2903,14 @@ const Engine = struct {
         primitive,
         primitive_items,
         sequence: *const ScalarType,
+        record: []const ScalarField,
         collection: *const CollectionType,
         items: *ListType,
         element: *ListType,
         derived: *PrimitiveType,
     };
     const CollectionType = struct { input: ?ScalarType, filters: []const ?ScalarType };
+    const ScalarField = struct { name: []const u8, kind: ?ScalarType };
     const PrimitiveType = struct { dependencies: []const ScalarType, plain: ?bool = null };
     const ListType = struct { items: []const v.Value, plain: ?bool = null };
     const ScalarTypes = std.StringHashMapUnmanaged(ScalarType);
@@ -2967,8 +2995,28 @@ const Engine = struct {
             },
             .unary, .comparison, .list_predicate, .exists => .primitive,
             .binary => |b| if (b.op == .add) try self.derivedPrimitive(&.{ b.left, b.right }, types) else .primitive,
-            .index => |index| elementType(try self.scalarType(index.base, types)),
+            .index => |index| blk: {
+                const base = try self.scalarType(index.base, types);
+                if (base != null and base.? == .record) {
+                    const key = self.constant(index.index, &.{}) orelse break :blk null;
+                    break :blk if (key == .string) recordField(base, key.string) else null;
+                }
+                break :blk elementType(base);
+            },
             .slice => |slice| try self.scalarType(slice.base, types),
+            .map => |map_items| blk: {
+                const fields = try self.a.alloc(ScalarField, map_items.len);
+                for (map_items, fields) |entry, *field| field.* = .{ .name = entry.name, .kind = try self.scalarType(entry.value, types) };
+                break :blk .{ .record = fields };
+            },
+            .property => |property| recordField(try self.scalarType(property.base, types), property.name),
+            .comprehension => |comprehension| blk: {
+                const element = elementType(try self.scalarType(comprehension.input, types)) orelse break :blk null;
+                if (comprehension.projection == null) break :blk try self.sequenceType(element);
+                var scope = try types.clone(self.a);
+                try scope.put(self.a, comprehension.alias, element);
+                break :blk if (try self.scalarType(comprehension.projection.?, scope)) |result| try self.sequenceType(result) else null;
+            },
             .case_when => |case| blk: {
                 var branches: std.ArrayList(ScalarType) = .empty;
                 for (case.branches) |branch| try branches.append(self.a, (try self.scalarType(branch.value, types)) orelse break :blk null);
@@ -3039,6 +3087,12 @@ const Engine = struct {
             else => null,
         };
     }
+    fn recordField(known: ?ScalarType, name: []const u8) ?ScalarType {
+        const kind = known orelse return null;
+        if (kind != .record) return null;
+        for (kind.record) |field| if (std.mem.eql(u8, field.name, name)) return field.kind;
+        return .primitive; // A missing field evaluates to NULL.
+    }
     fn sequenceType(self: *Engine, element: ScalarType) !ScalarType {
         if (element == .primitive) return .primitive_items;
         const owned = try self.a.create(ScalarType);
@@ -3051,6 +3105,7 @@ const Engine = struct {
         return self.joinScalarTypes(domains);
     }
     fn joinScalarTypes(self: *Engine, domains: []const ScalarType) anyerror!?ScalarType {
+        if (domains.len == 1) return domains[0];
         var resolved = true;
         var scalar = true;
         var sequence = domains.len != 0;
@@ -3578,6 +3633,13 @@ const Engine = struct {
         for (applies) |*apply| apply.* = .{ .memo = .{ .identity_keys = true, .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) } } };
         defer for (applies) |*apply| apply.memo.deinit();
         var child: StreamFold = .{ .applies = applies, .retained = self.a, .middle = plan.clauses, .projection = projection, .calls = parent.calls, .membership_leaders = parent.membership_leaders, .call_aliases = parent.call_aliases, .top = &top, .groups = &groups, .group_index = &group_index, .stage_counts = counts, .matched = &matched, .distinct = distinct_rows, .has_keys = false, .single_seed = true, .defer_aggregates = true, .record_rows = true, .axis_enabled = false, .axis_trace = &trace };
+        var certificate: WindowAxisCertificate = undefined;
+        if (parent.group_window) |window| if (window.extended) {
+            certificate = .{ .window = window, .integers = try self.a.alloc(u128, parent.calls.len), .numbers = try self.a.alloc(f128, parent.calls.len) };
+            @memset(certificate.integers, 0);
+            @memset(certificate.numbers, 0);
+            child.window_certificate = &certificate;
+        };
         if (plan.ordered) {
             var ordered_rows: []const Row = &.{key};
             for (plan.clauses, 0..) |clause, stage| {
@@ -3593,6 +3655,7 @@ const Engine = struct {
             }
             for (ordered_rows) |row| try child.expand(self, row, plan.clauses.len);
         } else try child.expand(self, key, 0);
+        if (child.window_certificate) |checked| try checked.finish(self, trace.count);
         var rows: std.ArrayList(Row) = .empty;
         try rows.resize(self.a, parent.calls.len + 1 + plan.sample_count);
         @memcpy(rows.items[1 + parent.calls.len ..], trace.samples);
@@ -3614,7 +3677,7 @@ const Engine = struct {
                 try rows.append(self.a, selected.items);
             }
         }
-        rows.items[0] = try self.a.dupe(v.Entry, &.{ .{ .name = "reached", .value = .{ .list = reached } }, .{ .name = "counts", .value = .{ .list = stage_values } }, .{ .name = "domains", .value = .{ .list = domains } } });
+        rows.items[0] = try self.a.dupe(v.Entry, &.{ .{ .name = "reached", .value = .{ .list = reached } }, .{ .name = "counts", .value = .{ .list = stage_values } }, .{ .name = "domains", .value = .{ .list = domains } }, .{ .name = "window_safe", .value = .{ .boolean = child.window_certificate != null } } });
         for (rows.items[1..][0..parent.calls.len], groups.items[0].states) |*row, *state_value| row.* = try self.axisSnapshot(state_value);
         // Clone before reducer arenas close, preserving shared support vectors.
         var copies: v.CloneContext = .{ .a = self.a, .scratch = self.a };
@@ -3623,6 +3686,116 @@ const Engine = struct {
         @memset(weights, Count.one);
         weights[0] = trace.count;
         return .{ .rows = rows.items, .weights = weights };
+    }
+
+    /// A successful affine expression over a complete arithmetic producer.
+    /// Every intermediate interval is checked before any observer is replaced.
+    /// Prefix sums retain producer order, including reversed/concatenated DAGs.
+    const RangeObserver = struct {
+        extrema: ?RangeExtrema = null,
+        summary: ?IntegerListSum = .{},
+        fn concat(left: @This(), right: @This()) @This() {
+            return .{
+                .extrema = if (left.extrema) |l| (if (right.extrema) |r| .{ .minimum = @min(l.minimum, r.minimum), .maximum = @max(l.maximum, r.maximum) } else l) else right.extrema,
+                .summary = if (left.summary != null and right.summary != null) left.summary.?.concat(right.summary.?) else null,
+            };
+        }
+    };
+    fn rangeArgumentShape(expression: *const ast.Expr, alias: []const u8) bool {
+        return switch (expression.value) {
+            .variable => |name| std.mem.eql(u8, name, alias),
+            .literal => |value| value == .integer,
+            .parameter => true,
+            .unary => |u| (u.op == .positive or u.op == .negative) and rangeArgumentShape(u.operand, alias),
+            .binary => |b| (b.op == .add or b.op == .subtract or b.op == .multiply) and rangeArgumentShape(b.left, alias) and rangeArgumentShape(b.right, alias),
+            else => false,
+        };
+    }
+    fn rangeArgument(self: *Engine, expression: *const ast.Expr, alias: []const u8, interval: @import("linear_bounds.zig").Interval) anyerror!?Affine {
+        try self.state();
+        const result: Affine = switch (expression.value) {
+            .variable => |name| if (std.mem.eql(u8, name, alias)) Affine.column(0).bounded(interval) else return null,
+            .literal => |value| if (value == .integer) Affine.literal(value.integer) else return null,
+            .parameter => |name| blk: {
+                const value = lookup(self.parameters, name) orelse return null;
+                break :blk if (value == .integer) Affine.literal(value.integer) else return null;
+            },
+            .unary => |u| blk: {
+                const value = (try self.rangeArgument(u.operand, alias, interval)) orelse return null;
+                break :blk if (u.op == .positive) value else if (u.op == .negative) value.negative() orelse return null else return null;
+            },
+            .binary => |b| blk: {
+                const left = (try self.rangeArgument(b.left, alias, interval)) orelse return null;
+                const right = (try self.rangeArgument(b.right, alias, interval)) orelse return null;
+                break :blk switch (b.op) {
+                    .add => Affine.combine(left, right, .add),
+                    .subtract => Affine.combine(left, right, .subtract),
+                    .multiply => Affine.combine(left, right, .multiply),
+                    else => null,
+                } orelse return null;
+            },
+            else => return null,
+        };
+        return if (result.interval != null) result else null;
+    }
+    fn observeRange(self: *Engine, sequence: @import("range.zig").Range, argument: *const ast.Expr, alias: []const u8) !?RangeObserver {
+        if (sequence.length == 0) return .{};
+        const last = sequence.at(sequence.length - 1).integer;
+        const form = (try self.rangeArgument(argument, alias, .{ .low = @min(sequence.start, last), .high = @max(sequence.start, last) })) orelse return null;
+        const first = std.math.cast(i64, @as(i128, form.scale) * sequence.start + form.offset) orelse return null;
+        const end = std.math.cast(i64, @as(i128, form.scale) * last + form.offset) orelse return null;
+        const extrema: RangeExtrema = .{ .minimum = @min(first, end), .maximum = @max(first, end) };
+        if (form.scale == 0) {
+            const total = std.math.mul(i128, first, @intCast(sequence.length)) catch return null;
+            return .{ .extrema = extrema, .summary = .{ .total = total, .low = @min(0, total), .high = @max(0, total), .positive = first > 0, .negative = first < 0 } };
+        }
+        const step = if (sequence.length == 1) @as(i64, 1) else std.math.cast(i64, @as(i128, form.scale) * sequence.step) orelse return null;
+        return .{ .extrema = extrema, .summary = IntegerListSum.range(.{ .start = first, .step = step, .length = sequence.length }) };
+    }
+    fn observeArithmetic(self: *Engine, expression: *const ast.Expr, row: Row, argument: *const ast.Expr, alias: []const u8, cache: *std.AutoHashMapUnmanaged(usize, ?RangeObserver)) anyerror!?RangeObserver {
+        try self.state();
+        if (expression.execution_list_source) |id| {
+            const source = self.producer_sources.items[id];
+            if (cache.get(id)) |known| return known;
+            const owner = self.local_invariants;
+            const locals = self.projection_locals;
+            self.local_invariants = source.owner;
+            self.projection_locals = source.locals;
+            defer self.local_invariants = owner;
+            defer self.projection_locals = locals;
+            const proof = try self.observeArithmetic(source.expression, source.row, argument, alias, cache);
+            try cache.put(self.scratch_allocator, id, proof);
+            return proof;
+        }
+        if (isRange(expression)) {
+            const sequence = (try self.rangeInput(expression, row, null)) orelse return .{};
+            return self.observeRange(sequence, argument, alias);
+        }
+        if (reduction_plan.reversedList(expression)) |input| {
+            var proof = (try self.observeArithmetic(input, row, argument, alias, cache)) orelse return null;
+            proof.summary = if (proof.summary) |summary| summary.reversed() else null;
+            return proof;
+        }
+        const parts = reduction_plan.concatenatedList(expression) orelse return null;
+        const left = (try self.observeArithmetic(parts.left, row, argument, alias, cache)) orelse return null;
+        const right = (try self.observeArithmetic(parts.right, row, argument, alias, cache)) orelse return null;
+        return left.concat(right);
+    }
+    fn rangeObservers(self: *Engine, fold: *StreamFold, proof: StreamFold.RangeCountProof, source: *const ast.Expr, row: Row, sequence: ?@import("range.zig").Range, reversed: bool) !?[]const ?RangeObserver {
+        const result = try self.a.alloc(?RangeObserver, fold.calls.len);
+        @memset(result, null);
+        for (proof.slots, fold.calls, result) |qualified, expression, *observer| if (qualified) {
+            const arg = expression.value.call.args[0];
+            // One synchronous proof owns its DAG cache. Never retain AST
+            // addresses from recyclable normalization frames across calls.
+            var cache: std.AutoHashMapUnmanaged(usize, ?RangeObserver) = .empty;
+            defer cache.deinit(self.scratch_allocator);
+            var observation = (if (sequence) |range| try self.observeRange(range, arg, proof.alias) else try self.observeArithmetic(source, row, arg, proof.alias, &cache)) orelse return null;
+            if (reversed) observation.summary = if (observation.summary) |summary| summary.reversed() else null;
+            if (observation.extrema == null or (std.ascii.eqlIgnoreCase(expression.value.call.name, "sum") and observation.summary == null)) return null;
+            observer.* = observation;
+        };
+        return result;
     }
 
     const AxisObservation = struct {
@@ -3662,13 +3835,46 @@ const Engine = struct {
                     // Repeat each axis element by the complete child bag's
                     // multiplicity. Replaying the whole axis per child instead
                     // changes integer prefix overflow for mixed-sign domains.
-                    const result = if (self.facts) |facts| state_value.addIntegerListSum(engine, facts, weight) else state_value.addIntegerSummary(engine, summary, weight, self.non_null);
+                    const result = if (self.facts) |facts| state_value.addIntegerListSum(engine, facts, weight) else state_value.addIntegerSummary(engine, if (fold.range_observers) |observers| observers[index].?.summary.? else summary, weight, self.non_null);
                     result catch |err| {
                         if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
                         state_value.failure = err;
                     };
                 }
             }
+        }
+    };
+
+    // A complete axis may be replayed for any selected or forgotten key.
+    // Bound absolute contributions by their peak and the complete emitted bag,
+    // including compressed ranges/lists and expanding child multiplicities.
+    // A cancelling packet must not conceal overflow on repetition.
+    const WindowAxisCertificate = struct {
+        window: *GroupWindow,
+        integers: []u128,
+        numbers: []f128,
+        fn observe(self: *@This(), engine: *Engine, slot: usize, call_value: ast.Function, value: v.Value, weight: Count) !void {
+            self.window.validate(engine, call_value, value, weight) catch |err| {
+                if (err == error.CypherGroupWindowDeclined) return error.CypherAxisMemoDeclined;
+                return err;
+            };
+            if (value == .null or !std.ascii.eqlIgnoreCase(call_value.name, "sum")) return;
+            if (value == .integer) self.integers[slot] = @max(self.integers[slot], @as(u128, @abs(@as(i128, value.integer)))) else self.numbers[slot] = @max(self.numbers[slot], @as(f128, @abs(value.number)));
+        }
+        fn finish(self: *@This(), engine: *Engine, count_value: Count) !void {
+            for (self.integers, self.numbers) |integer, number| {
+                if (integer == 0 and number == 0) continue;
+                const copies = count_value.exact() orelse return error.CypherGroupWindowDeclined;
+                if (copies != 0 and integer > GroupWindow.contributionLimit(engine) / copies) return error.CypherGroupWindowDeclined;
+                if (number * @as(f128, @floatFromInt(copies)) > @as(f128, std.math.floatMax(f64)) / (4 * @as(f128, @floatFromInt(@max(1, engine.limits.intermediate_states))))) return error.CypherGroupWindowDeclined;
+            }
+        }
+        fn ranges(self: *@This(), engine: *Engine, calls: []const *const ast.Expr, observers: []const ?RangeObserver) !void {
+            for (calls, observers, 0..) |expression, observer, slot| if (observer) |proof| {
+                const extrema = proof.extrema.?;
+                const peak = if (@abs(@as(i128, extrema.minimum)) > @abs(@as(i128, extrema.maximum))) extrema.minimum else extrema.maximum;
+                try self.observe(engine, slot, expression.value.call, .{ .integer = peak }, Count.one);
+            };
         }
     };
 
@@ -3681,6 +3887,7 @@ const Engine = struct {
         axis_plans: std.AutoHashMapUnmanaged(usize, ?*AxisPlan) = .empty,
         axis_trace: ?*AxisTrace = null,
         axis_packet: ?[]const Row = null,
+        window_certificate: ?*WindowAxisCertificate = null,
         retained: A,
         middle: []const ast.Clause,
         projection: ast.Projection,
@@ -3712,6 +3919,7 @@ const Engine = struct {
         single_seed: bool = false,
         range_counts: ?[]const bool = null,
         range_extrema: ?RangeExtrema = null,
+        range_observers: ?[]const ?RangeObserver = null,
         range_sum: ?struct { value: IntegerListSum, weight: Count, length: u64 } = null,
         range_distinct_count: ?struct { value: Count, weight: Count } = null,
         list_counts: ?struct { facts: *ListCountFacts, slots: []const bool, weight: Count } = null,
@@ -3791,6 +3999,10 @@ const Engine = struct {
                 if (packet == null) return false;
             }
             const summary = packet.?;
+            if (fold.group_window) |window| if (window.extended and !(lookup(summary.rows[0], "window_safe") orelse v.Value{ .boolean = false }).boolean) {
+                plan.memo.disabled = true;
+                return false;
+            };
             if (fold.group_window != null and !GroupWindow.permitsPacket(engine, summary, fold.calls.len)) {
                 // No group has been published. Retry without eviction when
                 // possible so exact weighted reductions retain their errors.
@@ -3881,11 +4093,17 @@ const Engine = struct {
                         // Composed arithmetic producers carry exact bag and set
                         // domains, independently of their deferred lexical names.
                         if (projectedSource(unwind.expression) and reduction_plan.repeatable(unwind.expression) and arithmeticDomainShape(engine, unwind.expression, 0)) {
-                            if (try fold.rangeCountProof(engine, unwind.alias, index + 1)) |slots| {
+                            if (try fold.rangeCountProof(engine, unwind.alias, index + 1)) |proof| arithmetic: {
+                                const slots = proof.slots;
                                 var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
                                 defer scratch.deinit();
                                 const domain = try engine.arithmeticDomain(unwind.expression, row);
                                 if (domain.null_source or domain.length.cap(1) == 0) return;
+                                const observations = (try engine.rangeObservers(fold, proof, unwind.expression, row, null, false)) orelse break :arithmetic;
+                                if (fold.window_certificate) |checked| try checked.ranges(engine, fold.calls, observations);
+                                const saved_observers = fold.range_observers;
+                                fold.range_observers = observations;
+                                defer fold.range_observers = saved_observers;
                                 var needs_distinct = false;
                                 for (slots, fold.calls) |qualified, call_value| if (qualified and call_value.value.call.distinct and std.ascii.eqlIgnoreCase(call_value.value.call.name, "count")) {
                                     needs_distinct = true;
@@ -3938,7 +4156,10 @@ const Engine = struct {
                             return;
                         }
                         var source = (try engine.unwindSource(unwind.expression, row)) orelse return;
-                        const counts = if (source.values == .range) try fold.rangeCountProof(engine, unwind.alias, index + 1) else null;
+                        const range_proof = if (source.values == .range) try fold.rangeCountProof(engine, unwind.alias, index + 1) else null;
+                        const observers = if (range_proof) |proof| try engine.rangeObservers(fold, proof, unwind.expression, row, source.values.range, source.reversed) else null;
+                        if (fold.window_certificate) |checked| if (observers) |observations| try checked.ranges(engine, fold.calls, observations);
+                        const counts = if (observers != null) range_proof.?.slots else null;
                         const list_counts = if (source.values == .list and !source.reversed) try fold.listCountProof(engine, unwind.alias, index + 1, .{ .list = source.values.list }) else null;
                         // An evaluated list supplies exact bag multiplicity when
                         // its elements are unobserved. Arithmetic ranges also
@@ -3950,6 +4171,9 @@ const Engine = struct {
                             const length = source.length();
                             if (length == 0) return;
                             const cardinality = if (std.math.cast(u64, length)) |n| Count.init(n) else try Count.init(std.math.maxInt(u64)).add(engine.a, Count.one);
+                            const saved_observers = fold.range_observers;
+                            fold.range_observers = observers;
+                            defer fold.range_observers = saved_observers;
                             const previous = fold.weight;
                             const previous_counts = fold.range_counts;
                             const previous_sum = fold.range_sum;
@@ -4225,6 +4449,7 @@ const Engine = struct {
                 engine.distinct_input_token = engine.distinct_sequence;
             }
             const first_domain = if (fold.axis_observation) |observation| try observation.record(engine, found.?, fold.axis_copies) else true;
+            if (fold.window_certificate != null and (engine.statistic_packet != null or fold.moment_direct != null)) return error.CypherAxisMemoDeclined;
             if (engine.statistic_packet) |arguments| {
                 for (arguments) |argument| {
                     if (argument.slot >= fold.calls.len) return error.CypherInvalidBackendPage;
@@ -4264,7 +4489,7 @@ const Engine = struct {
                     }
                     const minimum = std.ascii.eqlIgnoreCase(accumulator.function.name, "min");
                     if (minimum or std.ascii.eqlIgnoreCase(accumulator.function.name, "max")) {
-                        const extrema = fold.range_extrema.?;
+                        const extrema = if (fold.range_observers) |observers| observers[i].?.extrema.? else fold.range_extrema.?;
                         try accumulator.addValue(engine, .{ .integer = if (minimum) extrema.minimum else extrema.maximum }, Count.one);
                         continue;
                     }
@@ -4276,13 +4501,27 @@ const Engine = struct {
                     // additionally proves one disjoint axis in this group scope.
                     if (accumulator.function.distinct) if (fold.range_distinct_count) |packet| {
                         if (!first_domain) continue;
-                        multiplicity = try packet.weight.multiply(engine.a, packet.value);
+                        const domain_count = if (fold.range_observers) |observers| (if (observers[i].?.extrema.?.minimum == observers[i].?.extrema.?.maximum) Count.one else packet.value) else packet.value;
+                        multiplicity = try packet.weight.multiply(engine.a, domain_count);
                     };
                     accumulator.function.star = true;
                     accumulator.function.distinct = false;
                 };
                 defer accumulator.function = saved_function;
-                accumulator.addWeighted(engine, row, multiplicity) catch |err| {
+                const added = blk: {
+                    if (fold.window_certificate) |certificate| {
+                        const value = if (accumulator.function.star) v.Value{ .integer = 1 } else engine.eval(accumulator.function.args[0], row, null) catch |err| break :blk @as(anyerror!void, err);
+                        try certificate.observe(engine, i, accumulator.function, value, multiplicity);
+                        break :blk accumulator.addValue(engine, value, multiplicity);
+                    }
+                    if (fold.group_window) |window| if (window.extended) {
+                        const value = if (accumulator.function.star) v.Value{ .integer = 1 } else engine.eval(accumulator.function.args[0], row, null) catch |err| break :blk @as(anyerror!void, err);
+                        try window.validate(engine, accumulator.function, value, multiplicity);
+                        break :blk accumulator.addValue(engine, value, multiplicity);
+                    };
+                    break :blk accumulator.addWeighted(engine, row, multiplicity);
+                };
+                added catch |err| {
                     if (fold.group_window != null and fold.window_retry and StreamingAggregate.consumerFailure(err)) return error.CypherGroupWindowDeclined;
                     if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
                     accumulator.failure = err;
@@ -4328,7 +4567,8 @@ const Engine = struct {
             }
             return !fold.projection.wildcard and independentExpressions(fold.projection, alias);
         }
-        fn rangeCountProof(fold: *@This(), engine: *Engine, alias: []const u8, index: usize) !?[]const bool {
+        const RangeCountProof = struct { slots: []const bool, alias: []const u8 };
+        fn rangeCountProof(fold: *@This(), engine: *Engine, alias: []const u8, index: usize) !?RangeCountProof {
             if (fold.consumer != null or fold.continuation != null or fold.group_window != null or fold.projection.wildcard or fold.calls.len == 0) return null;
             const slots = fold.call_aliases orelse return null;
             // Identity projections can drop a captured producer scope. Any
@@ -4349,14 +4589,14 @@ const Engine = struct {
                 const c = expression.value.call;
                 if (std.ascii.eqlIgnoreCase(c.name, "avg")) return null;
                 const sum = std.ascii.eqlIgnoreCase(c.name, "sum");
-                if (sum and (c.distinct or c.star or c.args.len != 1 or c.args[0].value != .variable or !std.mem.eql(u8, c.args[0].value.variable, observed_alias))) return null;
+                if (sum and (c.distinct or c.star or c.args.len != 1 or !rangeArgumentShape(c.args[0], observed_alias))) return null;
                 const is_count = std.ascii.eqlIgnoreCase(c.name, "count");
                 const extreme = std.ascii.eqlIgnoreCase(c.name, "min") or std.ascii.eqlIgnoreCase(c.name, "max");
-                qualified.* = (is_count or extreme or sum) and !c.star and (extreme or !c.distinct or unique) and c.args.len == 1 and c.args[0].value == .variable and std.mem.eql(u8, c.args[0].value.variable, observed_alias);
+                qualified.* = (is_count or extreme or sum) and !c.star and (extreme or !c.distinct or unique) and c.args.len == 1 and rangeArgumentShape(c.args[0], observed_alias) and (sum or !independentExpressions(c.args[0], observed_alias));
                 observed = observed or qualified.*;
             }
             if (!observed or !axisExpressions(fold.projection, observed_alias, slots, counts)) return null;
-            return counts;
+            return .{ .slots = counts, .alias = observed_alias };
         }
         const ListCountProof = struct { facts: *ListCountFacts, slots: []const bool };
         fn listCountProof(fold: *@This(), engine: *Engine, alias: []const u8, index: usize, input: v.Value) !?ListCountProof {
@@ -4403,6 +4643,10 @@ const Engine = struct {
             const facts = try engine.listCountFacts(mapped_input) orelse return null;
             for (fold.calls, counts) |expression, qualified| if (qualified and std.ascii.eqlIgnoreCase(expression.value.call.name, "sum")) {
                 if (try engine.listIntegerSum(facts, expression.value.call.distinct) == null) return null;
+            };
+            if (fold.window_certificate) |checked| for (facts.input) |value| {
+                try engine.state();
+                for (fold.calls, counts, 0..) |expression, qualified, slot| if (qualified) try checked.observe(engine, slot, expression.value.call, value, Count.one);
             };
             return .{ .facts = facts, .slots = counts };
         }
@@ -5272,7 +5516,7 @@ const Engine = struct {
             if (StreamingAggregate.consumerFailure(err) or err == error.CypherAxisMemoDeclined) return false;
             return err;
         };
-        if (fold.group_window != null and !GroupWindow.permitsPacket(self, packet, fold.calls.len)) {
+        if (fold.group_window != null and (fold.group_window.?.extended or !GroupWindow.permitsPacket(self, packet, fold.calls.len))) {
             if (fold.window_retry) return error.CypherGroupWindowDeclined;
             return false;
         }
@@ -5466,7 +5710,7 @@ const Engine = struct {
             };
             break :blk true;
         };
-        var group_window = if (grouped and allow_group_window) try GroupWindow.init(self, projection, scalar_groups or (projection.distinct and calls.items.len == 0)) else null;
+        var group_window = if (grouped and allow_group_window) try GroupWindow.init(self, projection, scalar_groups or (projection.distinct and calls.items.len == 0), self.read_only and continuation == null and consumer == null) else null;
         defer if (group_window) |*window| {
             window.heap.deinit(self.scratch_allocator);
             group_index.deinit(self.scratch_allocator);
@@ -6719,7 +6963,7 @@ const Engine = struct {
                         for (bags.weights) |weight| if (!weight.isOne()) break :blk false;
                         break :blk true;
                     };
-                    var group_window = if (grouped) try GroupWindow.init(self, projection, scalar_groups or (projection.distinct and calls.items.len == 0)) else null;
+                    var group_window = if (grouped) try GroupWindow.init(self, projection, scalar_groups or (projection.distinct and calls.items.len == 0), false) else null;
                     defer if (group_window) |*window| {
                         window.heap.deinit(self.scratch_allocator);
                         group_index.deinit(self.scratch_allocator);
@@ -12967,13 +13211,13 @@ const Engine = struct {
         for (projection.items) |item| grouped = grouped or aggregates(item.expression);
         if (grouped and projection.wildcard) return error.CypherAggregateWildcard;
         if (!grouped and projection.distinct and !projection.wildcard) {
-            if (try GroupWindow.init(self, projection, true)) |window| return self.projectBoundedCountGroups(rows, projection, final, window);
+            if (try GroupWindow.init(self, projection, true, false)) |window| return self.projectBoundedCountGroups(rows, projection, final, window);
         }
         if (grouped) bounded: {
             // Materialized reducers normally run group by group. COUNT(*) is
             // total, so switching it to row order cannot reorder argument errors.
             for (projection.items) |item| if (aggregates(item.expression) and (item.expression.value != .call or !item.expression.value.call.star)) break :bounded;
-            if (try GroupWindow.init(self, projection, true)) |window| return self.projectBoundedCountGroups(rows, projection, final, window);
+            if (try GroupWindow.init(self, projection, true, false)) |window| return self.projectBoundedCountGroups(rows, projection, final, window);
         }
         if (!grouped and !projection.distinct and projection.order.len == 0) return self.projectUnordered(rows, projection, final);
         if (!grouped and !projection.distinct and projection.limit != null and projection.order.len != 0) {

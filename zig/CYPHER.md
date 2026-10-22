@@ -1998,6 +1998,11 @@ joins the successful result domains of its branches. List literals, indexing,
 HEAD/LAST, slicing and reversal transfer their element domains through forwarding
 aliases. Private collection summaries retain a separate logical input/window
 certificate, so lowering cannot mistake a summary header for a user element.
+Known map fields carry separate successful result types; property and constant-key
+index reads preserve the selected field's certificate without classifying the
+whole map as primitive. Comprehensions infer their projection in the element's
+lexical scope, including nested records and lists. Entity-valued fields retain
+ordinary reads. All producers, predicates and unused map entries still execute.
 Captured producer proofs use their original lexical frame and statement ownership;
 no certificate borrows a recyclable normalization arena.
 
@@ -2021,6 +2026,13 @@ then applies the axis's ordered prefix bounds with that multiplier. Replaying
 an entire mixed-sign axis per child could hide an intermediate overflow. Existing
 floating accumulators retain sequential list replay. Floating SUM/AVG and
 order-sensitive consumers otherwise retain sequential contributions.
+Integer affine observer arguments share these range certificates. Every
+intermediate arithmetic operation must be total over the actual range interval;
+cancelled dependencies cannot hide an overflowing intermediate. Each aggregate
+retains its own transformed extrema and ordered prefix sum. Reversal and
+concatenation compose those summaries in producer order, while constant affine
+images have one distinct value. A synchronous, charged proof cache shares source
+DAGs without retaining transient AST addresses across normalization frames.
 
 Bounded COUNT group windows accept pure expanding children using dynamic emitted
 weight certificates. Both materialized and streamed child boundaries check the
@@ -2063,6 +2075,23 @@ over failures in RETURN arguments for selected, rejected and LIMIT 0 groups. Fol
 observers retain ordinary contribution execution. Physical work counts alone do
 not certify logical cardinality. This bound covers repeated and evicted keys
 without retaining per-key counts outside the bounded window.
+
+Unpublished read-only folds with no downstream observer also admit key-ranked
+MIN/MAX, SUM and AVG windows. Every selected or rejected argument is evaluated.
+MIN/MAX certify primitive successful values; numeric reducers certify numeric
+types and finite bounds. Integer SUM bounds each weighted contribution by
+`floor(maxInt(i64) / intermediate_states_limit)` so forgotten groups cannot hide
+prefix overflow. Floating SUM reserves finite headroom across all charged
+transitions, and AVG bounds its intermediate mean updates. DISTINCT memberships
+belong only to retained group arenas. Failed certificates retry ordinary deferred
+reduction before publication, preserving invalid types, structural values,
+overflow and later producer errors. Complete reducer packets may be reused only
+after checking every argument and bounding each packet's absolute SUM
+contributions by their peak and complete emitted cardinality, including compressed
+ranges, immutable lists and expanding child bags. Cancellation cannot conceal an
+overflowing prefix when keys repeat or are evicted; unsafe packet bounds retry
+the ordinary symbolic reduction before publication. Unvalidated packets cannot bypass these checks; effectful
+or downstream folds retain their ordinary execution paths.
 
 Pure CALL bodies containing only projections and nested singleton CALLs preserve
 at most one unit output from one unit input, including filters, local DISTINCT,
