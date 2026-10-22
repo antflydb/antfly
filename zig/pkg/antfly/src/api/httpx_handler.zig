@@ -4311,7 +4311,7 @@ pub const AntflyApiHandler = struct {
         if (ctx.h1_stream_sent or ctx.h2_stream_sent or err == error.InferenceResponseCommitted) return err;
         // Stream errors propagate through the boundary once committed.
         const status: u16 = switch (err) {
-            error.InferenceRequestTooLarge => 413,
+            error.InferenceRequestTooLarge, error.ConstrainedInputTooLarge => 413,
             error.ConnectionCapabilityMissing, error.PublicInferenceDisabled => 403,
             error.ModelNotFound, error.ConnectionNotFound, error.InferenceSessionNotFound => 404,
             error.InferenceCapacityUnavailable, error.DecisionRateLimited, error.InferenceUpstreamRateLimited, error.RateLimit, error.AttemptLimitExceeded => 429,
@@ -4320,12 +4320,12 @@ pub const AntflyApiHandler = struct {
             error.Timeout => 504,
             error.EmbeddingIdentityMismatch => 409,
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.InvalidDecisionSpecification, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
+            error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
             else => 502,
         };
         _ = ctx.status(status);
         if (status == 429 or status == 503) try ctx.setHeader("retry-after", "1");
-        return ctx.json(.{ .@"error" = .{ .message = @errorName(err), .type = if (status == 400) "invalid_request_error" else if (err == error.DecisionRefused) "refusal_error" else "inference_error", .code = @errorName(err) } });
+        return ctx.json(.{ .@"error" = .{ .message = @errorName(err), .type = if (status == 400 or status == 413) "invalid_request_error" else if (err == error.DecisionRefused) "refusal_error" else "inference_error", .code = @errorName(err) } });
     }
 
     pub fn invokeInferenceConnection(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id: []const u8, operation: []const u8) !httpx.Response {
@@ -18050,6 +18050,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
             } else {
                 const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
                 defer parsed.deinit();
+                if (parsed.value.object.get("input").? == .string) return;
                 const content = parsed.value.object.get("input").?.array.items[0].object.get("content").?.array.items;
                 try std.testing.expectEqualStrings("Inspect", content[0].object.get("text").?.string);
                 try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgo=", content[1].object.get("image_url").?.string);
@@ -18076,8 +18077,8 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
     try config.registry.registerEmbedderConfig("dense", .{ .provider = .openai, .model = "backend", .url = upstream.baseUrl(), .api_key = "gateway-test-key", .dimensions = 2 });
     const hosted_url = try std.fmt.allocPrint(alloc, "{s}/v1", .{upstream.baseUrl()});
     defer alloc.free(hosted_url);
-    try config.registry.registerDeciderConfig("visual-openai", .{ .provider = .openai, .model = "backend", .max_image_input_tokens = 8192, .url = hosted_url, .api_key = "gateway-test-key" });
-    try config.registry.registerDeciderConfig("visual-jev", .{ .provider = .jev, .model = "jev-preview", .max_image_input_tokens = 8192, .url = upstream.baseUrl(), .api_key = "gateway-test-key" });
+    try config.registry.registerDeciderConfig("visual-openai", .{ .provider = .openai, .model = "backend", .max_image_input_tokens = 8192, .batch_size = 1, .url = hosted_url, .api_key = "gateway-test-key" });
+    try config.registry.registerDeciderConfig("visual-jev", .{ .provider = .jev, .model = "jev-preview", .max_image_input_tokens = 8192, .batch_size = 1, .url = upstream.baseUrl(), .api_key = "gateway-test-key" });
     try config.connections.put(alloc, try alloc.dupe(u8, "vendor"), .{
         .kind = .inference,
         .capabilities = try alloc.dupe([]u8, &.{try alloc.dupe(u8, "models.decide")}),
@@ -18112,6 +18113,10 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 .{ "{\"model\":\"deciders/visual-openai\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
                 .{ "{\"model\":\"connections/vendor/models/backend\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
                 .{ "{\"model\":\"deciders/visual-jev\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
+                .{ "{\"model\":\"deciders/visual-openai\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}],\"inputs\":[{\"id\":\"first\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]},{\"id\":\"second\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]}]}", "0.9" },
+                .{ "{\"model\":\"deciders/visual-jev\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}],\"inputs\":[{\"id\":\"first\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]},{\"id\":\"second\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]}]}", "0.9" },
+                .{ "{\"model\":\"connections/vendor/models/backend\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}],\"inputs\":[{\"id\":\"first\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]},{\"id\":\"second\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]}]}", "0.9" },
+                .{ "{\"model\":\"deciders/triage\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}],\"inputs\":[{\"id\":\"first\",\"input\":\"refund\"},{\"id\":\"second\",\"input\":\"refund\"}]}", "0.9" },
             };
             inline for (requests, 0..) |item, i| {
                 var req = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/test");
@@ -18121,7 +18126,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 defer ctx.deinit();
                 var response = try h.gatewayRequest(&ctx, switch (i) {
                     0 => .generate,
-                    1, 5, 6, 7 => .decide,
+                    1, 5, 6, 7, 8, 9, 10, 11 => .decide,
                     2 => .read,
                     else => .embed,
                 });
@@ -18129,6 +18134,18 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 if (response.status.code != 200) std.debug.print("gateway response: {s}\n", .{response.body orelse ""});
                 try std.testing.expectEqual(@as(u16, 200), response.status.code);
                 try std.testing.expect(std.mem.indexOf(u8, response.body.?, item[1]) != null);
+                if (i >= 8) {
+                    var typed = try std.json.parseFromSlice(@import("inference_api").DecideResponse, a, response.body.?, .{});
+                    defer typed.deinit();
+                    const envelope = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+                    defer envelope.deinit();
+                    const data = envelope.value.object.get("data").?.array.items;
+                    try std.testing.expectEqual(@as(usize, 2), data.len);
+                    try std.testing.expectEqualStrings("first", data[0].object.get("id").?.string);
+                    try std.testing.expectEqualStrings("second", data[1].object.get("id").?.string);
+                    try std.testing.expectEqual(@as(i64, 1), data[1].object.get("input_index").?.integer);
+                    try std.testing.expectEqual(@as(i64, 4), envelope.value.object.get("usage").?.object.get("input_tokens").?.integer);
+                }
             }
         }
     };
@@ -18136,7 +18153,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
     var failure: ?anyerror = null;
     try group.concurrent(io, Fiber.run, .{ alloc, io, &handler, &failure });
     defer group.cancel(io);
-    for (0..8) |_| try upstream.handleOne();
+    for (0..16) |_| try upstream.handleOne();
     try group.await(io);
     if (failure) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), api_server.inferenceAdmissionStats().in_flight);
@@ -19411,4 +19428,72 @@ test "httpx inference gateway request errors remain client errors without reclas
         try std.testing.expectEqual(@as(u16, 502), response.status.code);
     }
     try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+}
+
+test "httpx inference gateway generated image preflight reports client errors and preserves batch siblings" {
+    const a = std.testing.allocator;
+    const Work = @import("antfly_inference_work");
+    const Execution = @import("antfly_inference_execution_context");
+    const Fake = struct {
+        pixels: u64 = 1,
+        encoded_bytes: ?usize = null,
+        calls: usize = 0,
+        fn caps(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: Work.Task) !Work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .generate, .input_modalities = .{ .text = true, .image = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true, .batch = .{ .max_media_parts_per_item = 8, .max_decoded_pixels = self.pixels, .max_encoded_media_bytes = self.encoded_bytes } };
+        }
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: ?Execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return alloc.dupe(u8, "{\"choices\":[{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"item\\\":1,\\\"value\\\":{\\\"answer\\\":true}}]}\"}}]}");
+        }
+    };
+    const image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    const malformed = "data:image/png;base64,iVBORw0KGgo=";
+    const cases = [_]struct { url: []const u8, pixels: u64, encoded_bytes: ?usize = null, expected: u16, code: []const u8, batch: bool = false }{
+        .{ .url = malformed, .pixels = 1, .expected = 400, .code = "InvalidInferenceMedia" },
+        .{ .url = image, .pixels = 0, .expected = 413, .code = "ConstrainedInputTooLarge" },
+        .{ .url = image, .pixels = 1, .encoded_bytes = 1, .expected = 413, .code = "ConstrainedInputTooLarge" },
+        .{ .url = malformed, .pixels = 1, .expected = 200, .code = "InvalidInferenceMedia", .batch = true },
+    };
+    for (cases) |case| {
+        var config = try common_config.Config.parseFromSlice(a, "{}");
+        defer config.deinit();
+        config.public_inference.enabled = true;
+        try config.registry.registerDeciderConfig("vision", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only, .max_image_input_tokens = 100 });
+        var source = AuthStatusSource{};
+        var server = ApiHttpServer.init(a, .{ .node_config = &config }, source.iface(), null, null);
+        defer server.deinit();
+        var fake = Fake{ .pixels = case.pixels, .encoded_bytes = case.encoded_bytes };
+        server.antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate, .model_capabilities = Fake.caps };
+        var handler = AntflyApiHandler{ .api_server = &server };
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/decisions");
+        defer request.deinit();
+        const input = try std.fmt.allocPrint(a, "[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\"{s}\"}}]}}]", .{case.url});
+        defer a.free(input);
+        const field = if (case.batch) try std.fmt.allocPrint(a, "\"inputs\":[{{\"input\":{s}}},{{\"input\":\"valid sibling\"}}]", .{input}) else try std.fmt.allocPrint(a, "\"input\":{s}", .{input});
+        defer a.free(field);
+        const body = try std.fmt.allocPrint(a, "{{\"model\":\"deciders/vision\",{s},\"questions\":[{{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Present?\"}}]}}", .{field});
+        defer a.free(body);
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.gatewayRequest(&ctx, .decide);
+        defer response.deinit();
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        if (case.batch) {
+            const data = parsed.value.object.get("data").?.array.items;
+            try std.testing.expectEqualStrings(case.code, data[0].object.get("error").?.string);
+            try std.testing.expectEqual(@as(usize, 1), data[1].object.get("answers").?.array.items.len);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        } else {
+            try std.testing.expectEqualStrings(case.code, parsed.value.object.get("error").?.object.get("code").?.string);
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            try std.testing.expectEqualStrings("invalid_request_error", parsed.value.object.get("error").?.object.get("type").?.string);
+        }
+        try std.testing.expectEqual(case.expected, response.status.code);
+        try std.testing.expect(response.header("retry-after") == null);
+        try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+    }
 }

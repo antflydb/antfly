@@ -20504,9 +20504,11 @@ pub const Node = struct {
             try c.put(a, &schema, "schema", invocation.schema);
             try c.put(a, &format, "json_schema", schema);
             try c.put(a, &body, "response_format", format);
-            const input = try std.json.Stringify.valueAlloc(a, .{ .instructions = invocation.instructions, .items = invocation.items, .validation_error = invocation.validation_error }, .{ .emit_null_optional_fields = false });
             const system = try std.fmt.allocPrint(a, "Return one structured result per input. Preserve item IDs. JSON schema: {s}", .{try std.json.Stringify.valueAlloc(a, invocation.schema, .{})});
-            try c.put(a, &body, "messages", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .{ .role = "system", .content = system }, .{ .role = "user", .content = input } }, .{}), .{}));
+            const messages = try c.evidenceMessages(a, invocation, system, false);
+            const wire = try c.chatRequestJsonWithOptionsAlloc(a, self.model, messages, .termite_native, .{});
+            const message_envelope = try std.json.parseFromSliceLeaky(std.json.Value, a, wire, .{});
+            try c.put(a, &body, "messages", message_envelope.object.get("messages").?);
             var request = try httpx.Request.init(a, .POST, "/generate");
             defer request.deinit();
             request.body = try std.json.Stringify.valueAlloc(a, body, .{});
@@ -20516,14 +20518,19 @@ pub const Node = struct {
             ctx.cancellation_probe = .{ .ptr = self, .is_cancelled = cancelled };
             var response = try self.node.generateContent(&ctx);
             defer response.deinit();
+            const bytes = response.body orelse return error.InvalidConstrainedOutput;
+            if (bytes.len > 1024 * 1024) return error.ResponseTooLarge;
+            const result = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .allocate = .alloc_always }) catch |err| {
+                if (!response.ok()) return c.localGenerationStatusError(a, response.status.code, response.body);
+                return err;
+            };
+            if (invocation.usage) |usage| usage.recordResponse(result);
             try self.control.check();
             if (!response.ok()) {
                 const failure = c.localGenerationStatusError(a, response.status.code, response.body);
                 if (failure == error.InvalidStructuredOutput) return .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"items\":[]}", .{}) };
                 return failure;
             }
-            if ((response.body orelse return error.InvalidConstrainedOutput).len > 1024 * 1024) return error.ResponseTooLarge;
-            const result = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body orelse return error.InvalidConstrainedOutput, .{ .allocate = .alloc_always });
             const choices = result.object.get("choices") orelse return error.InvalidConstrainedOutput;
             if (choices != .array or choices.array.items.len != 1) return error.InvalidConstrainedOutput;
             const raw = choices.array.items[0].object.get("message").?.object.get("content").?;
@@ -20537,7 +20544,7 @@ pub const Node = struct {
         }
     };
 
-    fn admitStructuredGenerator(self: *Node, a: std.mem.Allocator, io: std.Io, generator: std.json.Value, output: @import("antfly_structured").Output, probabilities: @import("antfly_structured").Probabilities) !@import("antfly_structured").Output {
+    fn admitStructuredGenerator(self: *Node, a: std.mem.Allocator, io: std.Io, generator: std.json.Value, output: @import("antfly_structured").Output, probabilities: @import("antfly_structured").Probabilities, images: bool) !@import("antfly_structured").Capabilities {
         const c = @import("antfly_structured");
         var parsed = try std.json.parseFromValue(c.extraction.GeneratorConfig, a, generator, .{ .allocate = .alloc_always });
         defer parsed.deinit();
@@ -20547,7 +20554,11 @@ pub const Node = struct {
         var manifest = try manifest_mod.loadListingFromDir(a, path);
         defer manifest.deinit();
         const native = resolvedExecutorKind("generate", &manifest) == .native_generation;
-        return (c.Capabilities{ .grammar = native, .token_logprobs = native }).select(output, probabilities);
+        const contract = try resolvedInferenceExecutorContract(self, "generate", &manifest);
+        if (images and !contract.accepts_image) return error.UnsupportedInferenceFeature;
+        const caps = c.Capabilities{ .grammar = native, .token_logprobs = native, .images = contract.accepts_image, .limits = c.Limits.fromNativeBatch(contract.batch) };
+        _ = try caps.select(output, probabilities);
+        return caps;
     }
 
     fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl) ![]u8 {
@@ -20580,7 +20591,8 @@ pub const Node = struct {
         };
         const io = self.inferenceIo(a, control.io, &owned_io);
         const generator = config_value.object.get("generator").?;
-        const mode = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities);
+        const caps = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities, false);
+        const mode = try caps.select(config.output, config.probabilities);
         var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs };
         var validation = extractor.Validation{ .config = config };
         const Combined = struct {
@@ -20616,7 +20628,13 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*value| value.deinit();
         const io = self.inferenceIo(a, if (control) |effective| effective.io else null, &owned_io);
-        const mode = try self.admitStructuredGenerator(a, io, request.generator, request.output, request.probabilities);
+        var images = false;
+        for (request.inputs) |item| {
+            const input = try contract.evidence.Input.fromJson(item.input);
+            images = images or input.imageCount() > 0;
+        }
+        const caps = try self.admitStructuredGenerator(a, io, request.generator, request.output, request.probabilities, images);
+        const mode = try caps.select(request.output, request.probabilities);
         const options = generated.Options{ .model = request.model, .probabilities = request.probabilities };
         const Validation = struct {
             options: generated.Options,
@@ -20648,9 +20666,9 @@ pub const Node = struct {
             }
         };
         var combined = Combined{ .backend = &backend, .validation = &validation };
-        const inputs = try a.alloc([]const u8, request.inputs.len);
+        const inputs = try a.alloc(std.json.Value, request.inputs.len);
         for (inputs, request.inputs) |*input, item| input.* = item.input;
-        const result = try c.execute(a, .{ .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try generated.questionSchema(a, request.questions), request.instructions, request.batch, inputs);
+        const result = try c.executeEvidence(a, .{ .limits = caps.limits, .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try generated.questionSchema(a, request.questions), request.instructions, request.batch, inputs);
         var root = c.object();
         try c.put(a, &root, "model", .{ .string = request.model });
         try c.put(a, &root, "usage", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .input_tokens = result.input_tokens, .output_tokens = result.output_tokens }, .{}), .{}));
@@ -21064,6 +21082,7 @@ pub const Node = struct {
             error.InvalidGeneratorConfig,
             error.InvalidConstrainedGenerationConfig,
             error.UnsupportedConstrainedOutput,
+            error.UnsupportedInferenceFeature,
             error.UnsupportedConstrainedProbabilities,
             error.UnexpectedToken,
             error.UnknownField,
@@ -40180,6 +40199,13 @@ test "generated constrained public routes admit native models and reject proxy c
         \\{"decision_method":"generated","generator":{"provider":"antfly","model":"missing-generated-fixture-1187"},"probabilities":"verdict_only","instructions":"Rate the statement between zero and one.","input":"source","questions":[{"name":"score","type":"score"}]}
     ;
     try std.testing.expectError(error.ModelNotFound, node.decideDirectJsonWithControl(a, score, null));
+    const unsupported_image =
+        \\{"decision_method":"generated","generator":{"provider":"antfly","model":"vision"},"probabilities":"verdict_only","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/image.png"}]}],"questions":[{"name":"answer","type":"predicate","instructions":"Present?"}]}
+    ;
+    try std.testing.expectError(error.UnsupportedInferenceFeature, node.decideDirectJsonWithControl(a, unsupported_image, null));
+    var image_failure = try Node.decideFailureResponse(&ctx, error.UnsupportedInferenceFeature);
+    defer image_failure.deinit();
+    try std.testing.expectEqual(@as(u16, 400), image_failure.status.code);
     const extraction =
         \\{"method":"generated","generator":{"provider":"openai","model":"gpt-4.1"},"probabilities":"verdict_only","inputs":[{"content":"Éva"}],"schema":{"entities":["person"]}}
     ;

@@ -367,7 +367,7 @@ test "decision functions provider preflight treats aggregation names and literal
     defer arena.deinit();
     const a = arena.allocator();
     const Missing = struct {
-        fn validate(_: *anyopaque, _: []const u8, _: Json) !void {
+        fn validate(_: *anyopaque, _: []const u8, _: Json, _: []const u8) !void {
             return error.UnknownDecider;
         }
         fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const d.Request) ![]const Json {

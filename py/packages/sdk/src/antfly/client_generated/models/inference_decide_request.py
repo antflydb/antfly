@@ -24,9 +24,10 @@ T = TypeVar("T", bound="InferenceDecideRequest")
 
 @_attrs_define
 class InferenceDecideRequest:
-    """Supply exactly one of input (single evidence item) or inputs (text-only Antfly batch extension). Question names must
-    be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text
-    input and string choice values. Request bodies are bounded at 16 MiB.
+    """Supply exactly one of input (single evidence item) or inputs (ordered Antfly batch extension; hosted typed deciders
+    also accept multimodal evidence per item). Question names must be unique. Single text and named question arrays
+    follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are
+    bounded at 16 MiB.
 
         Attributes:
             model (str):
@@ -38,10 +39,11 @@ class InferenceDecideRequest:
                 context_version 1. Total expanded input bytes are limited to 16 MiB.
             model_identity (str | Unset): Pin the exact EmbeddingGemma 2 assets and embedding recipe.
             input_ (list[DecisionEvidenceMessage] | str | Unset): Text or ordered user messages containing text and images.
-                Named OpenAI and Jev deciders accept messages. Native trained, embedding, and generated deciders require text.
-                At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail
-                auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are
-                unsupported.
+                Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a
+                model that supports both images and constrained output; native, Gemini, and Vertex generators require inline
+                images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of
+                serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public
+                HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
             inputs (list[DecisionInput] | Unset):
             long_document (InferenceDecideLongDocument | Unset): Explicit windowing for qualified boundary decision models.
                 Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text.

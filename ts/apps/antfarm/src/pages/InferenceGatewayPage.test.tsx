@@ -500,3 +500,36 @@ it.each([
   fireEvent.change(screen.getByLabelText("Operation"), { target: { value: "decisions" } });
   expect(screen.queryByRole("button", { name: "Use image example" })).toBeNull();
 });
+
+it.each([
+  "supported",
+  "unsupported",
+])("runs an ordered decision batch with image support %s", async (images) => {
+  const id = "deciders/batch";
+  client.inference.models.mockResolvedValue({
+    data: [{ id, task: "decide", gateway_capabilities: { images } }],
+  });
+  client.inference.invoke.mockResolvedValue(
+    new Response("{}", { headers: { "content-type": "application/json" } })
+  );
+  render(
+    <MemoryRouter>
+      <InferenceGatewayPage />
+    </MemoryRouter>
+  );
+  await waitFor(() => expect(document.querySelector(`option[value="${id}"]`)).not.toBeNull());
+  fireEvent.change(screen.getByLabelText("Model"), { target: { value: id } });
+  fireEvent.click(screen.getByRole("button", { name: "Use batch example" }));
+  const request = JSON.parse((screen.getByLabelText("JSON request") as HTMLTextAreaElement).value);
+  expect(request.input).toBeUndefined();
+  expect(request.inputs.map((item: { id: string }) => item.id)).toEqual(["first", "second"]);
+  expect(Array.isArray(request.inputs[0].input)).toBe(images === "supported");
+  fireEvent.click(screen.getByRole("button", { name: "Run" }));
+  await waitFor(() =>
+    expect(client.inference.invoke).toHaveBeenCalledWith(
+      "decisions",
+      { model: id, ...request },
+      expect.any(AbortSignal)
+    )
+  );
+});

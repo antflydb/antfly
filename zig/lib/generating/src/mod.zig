@@ -19,6 +19,12 @@ const json = @import("antfly-json");
 const openapi = @import("antfly_generating_openapi");
 pub const apple_native = @import("antfly_apple_native");
 
+const chat_wire = @import("chat_wire.zig");
+pub const ChatWireFlavor = chat_wire.ChatWireFlavor;
+pub const ChatRequestOptions = chat_wire.ChatRequestOptions;
+pub const chatRequestJsonAlloc = chat_wire.chatRequestJsonAlloc;
+pub const chatRequestJsonWithOptionsAlloc = chat_wire.chatRequestJsonWithOptionsAlloc;
+
 pub const Role = enum {
     system,
     user,
@@ -37,6 +43,7 @@ pub const Role = enum {
 
 pub const ImageURL = struct {
     url: []const u8,
+    detail: ?[]const u8 = null,
 };
 
 pub const MediaContent = struct {
@@ -318,6 +325,9 @@ pub const AntflyConfig = struct {
 };
 
 pub const GeneratorConfig = struct {
+    /// Request-owned media reservation supplied by the decision adapter.
+    /// Never parsed from or serialized into generator configuration.
+    image_input_token_bound: ?u64 = null,
     rate_limit: ?openapi.RateLimitConfig = null,
     provider: Provider,
     model: []const u8,
