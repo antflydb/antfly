@@ -9628,7 +9628,7 @@ fn feedForward(
             defer cb.free(down_w);
             // Both integrated OCR decoders have qualified gate/up + SiLU
             // kernels. Keep the paired projection fallback on other profiles.
-            if (total == 1 and config.hasQwen35VisionArchitectureContract() and
+            if ((total == 1 or (total >= 4 and total <= 8)) and config.hasQwen35VisionArchitectureContract() and
                 ((hidden_size == 1024 and inter_size == 3584 and config.num_hidden_layers == 24) or
                     (hidden_size == 2560 and inter_size == 9216 and config.num_hidden_layers == 32)))
             {

@@ -545,8 +545,9 @@ prefill convolution. F32 projection activations, accumulation and outputs are
 preserved. Large qualified F16 encoder projections, including Florence's
 vision/BART shapes, use TensorOps with fused bias and retain MPS fallbacks.
 
-On the shared M4 Max, 29 of 30 representative projection cases measured within
-20% of MLX or faster. This excludes the vocabulary head and does not establish
+In the earlier separate-process M4 Max sweep, 29 of 30 representative
+projection cases measured within 20% of MLX or faster. The paired follow-up
+below provides stronger evidence and exposes additional cache-sensitive gaps. This excludes the vocabulary head and does not establish
 whole-reader parity. The final Florence repeat reached 4.63 pages/s against
 4.68 for MLX-VLM; native uses Q4_K weights with F16 encoder mirrors while the
 reference uses original FP16 weights and a different generation policy.
@@ -570,3 +571,45 @@ Additional rollback switches are
 Full measurements, negative ablations, precision differences, source/binary
 hashes and 73 passing focused GPU tests are retained in
 `zig/pkg/inference/scripts/lightonocr3/results/projection_parity_m4_max/README.md`.
+
+### Recurrent prefill and cohort kernel follow-up
+
+The next pass fuses small-cohort gate/up plus SiLU × up, distributes recurrent
+prefill across four value columns per SIMD group, and retains wide normalization
+inputs in registers across the F32 reduction. It also uses narrower split-K tiles
+for qualified four-row projections and a more parallel single-token 0.8B down
+projection. Existing frame-owned scratch is reused. Projection activations,
+accumulation, outputs and recurrent state retain F32 precision.
+
+A new regression test invokes the Zig batch gate/up wrapper: an earlier guard
+rejected small batches despite successful direct C kernel tests. The final
+runtime removes that guard and delegates qualification to the C selector.
+
+A stronger paired benchmark alternates native and MLX in one process, reverses
+trial order, checks every output and records every sample. In the final resident
+sweep, 38 of 43 cases are within 20% of MLX or faster; five remain 22–34% slower.
+The 25-case cold-cache sweep puts every case within 20%. Recurrent prefill is
+1.6–1.8× faster than MLX on the two tested head counts; F32 normalization is at
+parity or faster. Native projection/recurrent tensors remain F32 while MLX uses
+BF16 storage/output, so this is not fully precision-matched operator parity.
+These paired results supersede the earlier separate-process projection summary
+as the stronger evidence; cache effects materially change small-matrix results.
+
+On the same shared machine, final 16-page reader runs measured 1.079/0.339
+pages/s for native LightOn 0.8B/4B versus refreshed vLLM results of 2.553/0.647.
+New-feature rollbacks measured 1.001/0.337: 0.8B improved in this run, while 4B
+was effectively tied. Florence measured 3.546 versus 3.849 for refreshed MLX-VLM.
+These successive runs remain sensitive to machine load. Whole-reader LightOn
+parity is unfinished; cohorts averaged about 3.5 active pages out of eight as
+short pages finished. Continuous refill and batched vision/prefill remain open.
+
+Additional rollback switches are
+`TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_GATE_UP=1`,
+`TERMITE_METAL_DISABLE_QWEN35_PREFILL_COLUMNS=1`,
+`TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_NORM=1`,
+`TERMITE_METAL_DISABLE_LIGHTONOCR3_SINGLE_DOWN_TILE=1`, and
+`TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_SPLIT=1`.
+The concurrency benchmark exposes corresponding `--disable-*` switches.
+Final reader measurements, numerical checks, build provenance, and the rejected
+candidates are retained in
+`zig/pkg/inference/scripts/lightonocr3/results/kernel_saturation_m4_max/README.md`.

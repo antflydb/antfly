@@ -1,0 +1,430 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Alternate production native kernels and MLX in one process.
+
+Compile the benchmark-only bridge with --compile-native-library. Both runtimes
+synchronize every sample; trial order alternates. This isolates kernels, not
+page throughput. Native projection/recurrent tensors remain F32; MLX uses BF16.
+Normalization compares F32 against F32. Both use the same numeric input values.
+"""
+
+import argparse
+import ctypes
+import hashlib
+import json
+import os
+import statistics
+import subprocess
+from datetime import datetime, timezone
+from importlib.metadata import version
+from functools import partial
+from pathlib import Path
+
+from benchmark_mlx_projections import weights
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def build_bridge(path, bridge, runtime):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "clang",
+            "-O2",
+            "-dynamiclib",
+            "-fobjc-arc",
+            "-framework",
+            "Foundation",
+            "-framework",
+            "Metal",
+            "-framework",
+            "MetalPerformanceShaders",
+            "-framework",
+            "Accelerate",
+            f'-DOCR_PAIR_RUNTIME_SHA="{digest(runtime)}"',
+            f'-DOCR_PAIR_BRIDGE_SHA="{digest(bridge)}"',
+            str(bridge),
+            "-o",
+            str(path),
+        ],
+        check=True,
+    )
+
+
+def summary(samples):
+    return {
+        "mean_us": statistics.mean(samples),
+        "median_us": statistics.median(samples),
+        "min_us": min(samples),
+        "max_us": max(samples),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--native-library", type=Path, required=True)
+    parser.add_argument("--compile-native-library", action="store_true")
+    parser.add_argument("--timing-library", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--suite", choices=["quick", "full"], default="full")
+    parser.add_argument(
+        "--variant",
+        choices=[
+            "production",
+            "qkv16",
+            "down4",
+            "normsg",
+            "segment8",
+            "segment16",
+            "gemv1",
+            "splitgate",
+            "splitprojections",
+        ],
+        default="production",
+    )
+    parser.add_argument("--warmup", type=int, default=8)
+    parser.add_argument("--trials", type=int, default=30)
+    args = parser.parse_args()
+    if args.warmup < 1 or args.trials < 2:
+        parser.error("positive warmup and at least two trials required")
+    here = Path(__file__).resolve().parent
+    runtime = here.parent.parent / "src/backends/metal_kernels.m"
+    bridge = here / "metal_pair_benchmark.m"
+    native_path = args.native_library.resolve()
+    if args.compile_native_library:
+        build_bridge(native_path, bridge, runtime)
+    for key in list(os.environ):
+        if key.startswith(
+            (
+                "TERMITE_METAL_DISABLE_LIGHTONOCR3",
+                "TERMITE_METAL_DISABLE_QWEN35",
+                "TERMITE_METAL_LIGHTONOCR3_",
+            )
+        ):
+            os.environ.pop(key)
+    os.environ["TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY"] = "1"
+    native = ctypes.CDLL(str(native_path))
+    native.ocr_pair_runtime_sha.restype = ctypes.c_char_p
+    native.ocr_pair_bridge_sha.restype = ctypes.c_char_p
+    if native.ocr_pair_runtime_sha().decode() != digest(
+        runtime
+    ) or native.ocr_pair_bridge_sha().decode() != digest(bridge):
+        parser.error(
+            "Native bridge source changed; rebuild with --compile-native-library"
+        )
+    native.ocr_pair_create.argtypes = [ctypes.c_size_t] * 4 + [ctypes.c_void_p] * 4
+    native.ocr_pair_create.restype = ctypes.c_void_p
+    native.ocr_pair_set_variant.argtypes = [ctypes.c_size_t]
+    native.ocr_pair_set_variant(
+        [
+            "production",
+            "qkv16",
+            "down4",
+            "normsg",
+            "segment8",
+            "segment16",
+            "gemv1",
+            "splitgate",
+            "splitprojections",
+        ].index(args.variant)
+    )
+    native.ocr_pair_candidate_applies.argtypes = [ctypes.c_void_p]
+    native.ocr_pair_candidate_applies.restype = ctypes.c_size_t
+    native.ocr_pair_run.argtypes = [ctypes.c_void_p]
+    native.ocr_pair_run.restype = ctypes.c_uint64
+    native.ocr_pair_output.argtypes = [ctypes.c_void_p]
+    native.ocr_pair_output.restype = ctypes.POINTER(ctypes.c_float)
+    native.ocr_pair_release.argtypes = [ctypes.c_void_p]
+    timer_path = args.timing_library.resolve()
+    timer = ctypes.CDLL(str(timer_path))
+    timer.ocr_timing_end.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+    timer.ocr_timing_end.restype = ctypes.c_uint64
+    timer.ocr_timing_empty_count.restype = ctypes.c_uint64
+    if timer.ocr_timing_init() or timer.ocr_timing_self_test():
+        raise RuntimeError("Metal timing observer failed qualification")
+    import mlx.core as mx
+    import mlx.nn as nn
+    import numpy as np
+    from mlx_lm.models.gated_delta import gated_delta_kernel
+
+    def bf16_values(value):
+        bits = value.view(np.uint32)
+        return (((bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)) >> 16) << 16).view(
+            np.float32
+        )
+
+    wired = int(mx.device_info()["max_recommended_working_set_size"])
+    mx.set_wired_limit(wired)
+    report = {
+        "created_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017
+        "device": mx.device_info(),
+        "mlx": version("mlx"),
+        "mlx_lm": version("mlx-lm"),
+        "runtime_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "runtime_source_diff_sha256": hashlib.sha256(
+            subprocess.check_output(
+                ["git", "diff", "HEAD", "--", "zig/pkg/inference/src"]
+            )
+        ).hexdigest(),
+        "runtime_source_sha256": digest(runtime),
+        "runner_sha256": digest(Path(__file__)),
+        "bridge_source_sha256": digest(bridge),
+        "native_library_sha256": digest(native_path),
+        "observer_sha256": digest(timer_path),
+        "observer_self_test": "passed",
+        "mlx_wired_limit_bytes": wired,
+        "native_weight_residency": True,
+        "native_weight_storage": "page-aligned shared no-copy, matching model weights",
+        "scope": "One process; synchronize both runtimes; alternate trial order. Native F32 projection/recurrent input storage/output versus MLX BF16; identical numeric BF16-representable input values and BF16 weight bits. Norm compares F32/F32. Recurrent state/gates F32; native interleaved versus MLX separate QKV. Not page-throughput or all-operator parity proof.",
+        "warmup": args.warmup,
+        "trials": args.trials,
+        "suite": args.suite,
+        "variant": args.variant,
+        "status": "running",
+        "results": [],
+    }
+
+    def matrix(a, g):
+        return a @ g.T
+
+    shapes = [
+        (1024, 6144),
+        (1024, 3584),
+        (3584, 1024),
+        (2560, 8192),
+        (2560, 9216),
+        (9216, 2560),
+    ]
+    cases = [
+        (0, b, k, n)
+        for k, n in shapes
+        for b in ([1, 4, 8, 128, 512] if args.suite == "full" else [4, 8])
+    ]
+    if args.suite == "full":
+        cases += [(0, b, k, 248320) for k in [1024, 2560] for b in [1, 4, 8]]
+    cases += [(1, 554, k, k) for k in [1024, 2560]] + [
+        (2, 554, (32 + h) * 128, h) for h in [16, 32]
+    ]
+    cases += [(3, 8, 1024, 3584), (3, 4, 2560, 9216), (3, 8, 2560, 9216)]
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        for kind, rows, k, n in cases:
+            handle = None
+            arrays = []
+            x_np = (
+                np.sin(np.arange(rows * k, dtype=np.float32) * np.float32(0.013))
+                * np.float32(0.1)
+            ).reshape(rows, k)
+            if kind != 1:
+                x_np = bf16_values(x_np)
+            x = mx.array(x_np, dtype=mx.float32 if kind == 1 else mx.bfloat16)
+            wp = normp = gatep = None
+            w_np = norm_np = gate_np = None
+            if kind in (0, 3):
+                first = weights(k, n)
+                w_np = (
+                    np.concatenate([first, -np.roll(first, 1, axis=0)], axis=0)
+                    if kind == 3
+                    else first
+                )
+                bits = (w_np.view(np.uint32) >> 16).astype(np.uint16)
+                wp = bits.ctypes.data
+                w = mx.array(first, dtype=mx.bfloat16)
+                arrays += [w]
+                if kind == 3:
+                    up = mx.array(w_np[n:], dtype=mx.bfloat16)
+                    arrays += [up]
+
+                    @mx.compile
+                    def fused(a, g, u):
+                        return nn.silu(a @ g.T) * (a @ u.T)
+
+                    function = partial(fused, x, w, up)
+                else:
+                    function = partial(matrix, x, w)
+            elif kind == 1:
+                norm_np = (
+                    np.cos(np.arange(k, dtype=np.float32) * np.float32(0.01))
+                    * np.float32(0.5)
+                ).astype(np.float32)
+                normp = norm_np.ctypes.data
+                norm = mx.array(norm_np)
+                arrays += [norm]
+                function = partial(mx.fast.rms_norm, x, norm, 1e-6)
+            else:
+                mixed = x.reshape(1, rows, k)
+                q = mx.contiguous(mixed[..., :2048].reshape(1, rows, 16, 128))
+                key = mx.contiguous(mixed[..., 2048:4096].reshape(1, rows, 16, 128))
+                value = mx.contiguous(mixed[..., 4096:].reshape(1, rows, n, 128))
+                ids = np.arange(rows * n, dtype=np.float32)
+                gate_np = np.stack(
+                    [
+                        np.float32(0.97)
+                        + np.cos(ids * np.float32(0.1)) * np.float32(0.02),
+                        np.float32(0.3)
+                        + np.sin(ids * np.float32(0.02)) * np.float32(0.1),
+                    ],
+                    axis=-1,
+                ).astype(np.float32)
+                gatep = gate_np.ctypes.data
+                decay = mx.array(gate_np[:, 0].copy().reshape(1, rows, n))
+                beta = mx.array(gate_np[:, 1].copy().reshape(1, rows, n))
+                state = mx.zeros((1, n, 128, 128), dtype=mx.float32)
+                arrays += [q, key, value, decay, beta, state]
+                function = partial(
+                    gated_delta_kernel, q, key, value, decay, beta, state
+                )
+            mx.eval(x, *arrays)
+            handle = native.ocr_pair_create(
+                kind, rows, k, n, wp, x_np.ctypes.data, normp, gatep
+            )
+            if not handle:
+                raise RuntimeError(f"Native case unavailable: {kind, rows, k, n}")
+
+            def mlx_run(operation=function):
+                result = operation()
+                result = result if isinstance(result, (list, tuple)) else (result,)
+                mx.eval(*result)
+                return result
+
+            for _ in range(args.warmup):
+                if not native.ocr_pair_run(handle):
+                    raise RuntimeError("Native warmup failed")
+                mlx_run()
+            samples = {"native": [], "mlx": []}
+            empty = []
+            for trial in range(args.trials):
+                for participant in (
+                    ["native", "mlx"] if trial % 2 == 0 else ["mlx", "native"]
+                ):
+                    if participant == "native":
+                        nanos = native.ocr_pair_run(handle)
+                    else:
+                        timer.ocr_timing_begin()
+                        result = mlx_run()
+                        count = ctypes.c_uint64()
+                        nanos = timer.ocr_timing_end(ctypes.byref(count))
+                        if not count.value:
+                            raise RuntimeError("No MLX GPU work observed")
+                        empty.append(timer.ocr_timing_empty_count())
+                    if not nanos:
+                        raise RuntimeError(f"Missing {participant} GPU timestamps")
+                    samples[participant].append(nanos / 1000)
+            size = rows * (k if kind == 1 else n * 128 if kind == 2 else n)
+            actual = np.ctypeslib.as_array(
+                native.ocr_pair_output(handle), shape=(size,)
+            ).copy()
+            reference = np.array(result[0].astype(mx.float32)).reshape(-1)
+            if not np.isfinite(actual).all() or not np.isfinite(reference).all():
+                raise RuntimeError("Nonfinite output")
+            cpu_error = 0.0
+            if kind in (0, 1, 3):
+                for rr in [0, rows - 1]:
+                    for cc in [0, (k if kind == 1 else n) - 1]:
+                        if kind == 1:
+                            want = (
+                                float(x_np[rr, cc])
+                                / float(
+                                    np.sqrt(
+                                        np.mean(x_np[rr].astype(np.float64) ** 2) + 1e-6
+                                    )
+                                )
+                                * float(norm_np[cc])
+                            )
+                        else:
+                            want = float(
+                                x_np[rr].astype(np.float64)
+                                @ w_np[cc].astype(np.float64)
+                            )
+                            if kind == 3:
+                                upper = float(
+                                    x_np[rr].astype(np.float64)
+                                    @ w_np[n + cc].astype(np.float64)
+                                )
+                                want = want / (1 + np.exp(-want)) * upper
+                        got = float(actual[rr * (k if kind == 1 else n) + cc])
+                        cpu_error = max(cpu_error, abs(got - want))
+                        if abs(got - want) > 2e-4 + abs(want) * 2e-5:
+                            raise RuntimeError(
+                                f"Native CPU oracle mismatch: {kind, rows, k, n, rr, cc, got, want}"
+                            )
+            tolerance = (
+                (2e-5 + 2e-5 * np.abs(reference))
+                if kind == 1
+                else (3e-5 + (0.025 if kind == 3 else 0.005) * np.abs(reference))
+            )
+            if not np.all(np.abs(actual - reference) <= tolerance):
+                raise RuntimeError(f"Cross-runtime output mismatch: {kind, rows, k, n}")
+            row = {
+                "cpu_sample_max_abs": cpu_error if kind != 2 else None,
+                "cross_runtime_output_tolerance": "f32/f32 2e-5; BF16 reference 0.5%+3e-5 (gate/up 2.5%+3e-5)",
+                "candidate_applied": bool(native.ocr_pair_candidate_applies(handle)),
+                "operation": ["projection", "rmsnorm", "recurrent", "gate_up"][kind],
+                "rows": rows,
+                "in": k,
+                "out": n,
+                "native": summary(samples["native"]),
+                "mlx": summary(samples["mlx"]),
+                "samples_us": samples,
+                "max_abs_output_difference": float(np.max(np.abs(actual - reference))),
+                "mlx_empty_command_counts": sorted(set(empty)),
+                "input_sha256": hashlib.sha256(x_np.tobytes()).hexdigest(),
+            }
+            row["median_native_over_mlx"] = (
+                row["native"]["median_us"] / row["mlx"]["median_us"]
+            )
+            row["native_over_mlx"] = row["native"]["mean_us"] / row["mlx"]["mean_us"]
+            if w_np is not None:
+                row["expanded_weight_sha256"] = hashlib.sha256(
+                    w_np.tobytes()
+                ).hexdigest()
+            report["results"].append(row)
+            print(
+                json.dumps(
+                    {key: value for key, value in row.items() if key != "samples_us"}
+                ),
+                flush=True,
+            )
+            native.ocr_pair_release(handle)
+            handle = None
+            del function, arrays, x, result, reference, actual
+            if kind in (0, 3):
+                del w, bits, first
+                if kind == 3:
+                    del up, fused
+            elif kind == 1:
+                del norm
+            else:
+                del q, key, value, decay, beta, state, mixed, ids
+            del x_np, w_np, norm_np, gate_np
+            mx.clear_cache()
+        report["status"] = "ok"
+    except Exception as error:
+        report.update(status="failed", error=str(error))
+        raise
+    finally:
+        if handle:
+            native.ocr_pair_release(handle)
+        native.ocr_pair_shutdown()
+        args.output.write_text(json.dumps(report, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

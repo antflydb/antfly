@@ -1,0 +1,10 @@
+fast_default=1 forced_diagnostics=0
+n=16 frame_mode=production wall_us=506.36 gpu_us=267.71
+n=16 frame_mode=tensor8x32 wall_us=457.22 gpu_us=264.60
+n=32 frame_mode=production wall_us=442.94 gpu_us=276.00
+n=32 frame_mode=tensor8x32 wall_us=497.31 gpu_us=332.19
+n=64 frame_mode=production wall_us=425.46 gpu_us=279.89
+n=64 frame_mode=tensor8x32 wall_us=677.09 gpu_us=488.55
+n=128 frame_mode=production wall_us=409.31 gpu_us=271.77
+n=128 frame_mode=tensor8x32 wall_us=953.45 gpu_us=819.62
+fast_calls=0 fallback_calls=0

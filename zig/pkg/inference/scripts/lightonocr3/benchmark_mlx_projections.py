@@ -76,6 +76,11 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--trials", type=int, default=30)
+    parser.add_argument(
+        "--wire-weights",
+        action="store_true",
+        help="Use vLLM Metal's recommended-working-set wired limit",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.warmup < 1 or args.trials < 2 or any(row < 1 for row in args.rows):
@@ -90,14 +95,25 @@ def main():
     timer = ctypes.CDLL(str(library))
     timer.ocr_timing_end.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
     timer.ocr_timing_end.restype = ctypes.c_uint64
+    timer.ocr_timing_empty_count.restype = ctypes.c_uint64
     if timer.ocr_timing_init() != 0:
         raise RuntimeError("Metal command-buffer observer initialization failed")
+    if timer.ocr_timing_self_test() != 0:
+        raise RuntimeError("Metal timing observer self-test failed")
     import mlx.core as mx
 
+    wired_limit = (
+        int(mx.device_info()["max_recommended_working_set_size"])
+        if args.wire_weights
+        else 0
+    )
+    mx.set_wired_limit(wired_limit)
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017
         "mlx": version("mlx"),
         "device": mx.device_info(),
+        "wired_limit_bytes": wired_limit,
+        "observer_self_test": "passed",
         "observer_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
         "scope": "Isolated random-weight matrices, not checkpoint or page throughput; one GPU process at a time. GPU times sum committed command buffers. Native checker uses the same LCG/BF16 weight bits; inputs/outputs differ in precision.",
         "activation": "bf16",
@@ -123,7 +139,7 @@ def main():
                 mx.eval(x)
                 for _ in range(args.warmup):
                     mx.eval(x @ w.T)
-                gpu, wall, command_counts = [], [], []
+                gpu, wall, command_counts, empty_counts = [], [], [], []
                 for _ in range(args.trials):
                     timer.ocr_timing_begin()
                     begin = time.perf_counter_ns()
@@ -138,6 +154,7 @@ def main():
                         )
                     gpu.append(nanos / 1000)
                     command_counts.append(count.value)
+                    empty_counts.append(timer.ocr_timing_empty_count())
                     del y
                 row = {
                     "rows": rows,
@@ -150,6 +167,7 @@ def main():
                     "gpu_max_us": max(gpu),
                     "wall_mean_us": statistics.mean(wall),
                     "command_counts": sorted(set(command_counts)),
+                    "empty_command_counts": sorted(set(empty_counts)),
                 }
                 report["results"].append(row)
                 print(json.dumps(row), flush=True)

@@ -1,0 +1,73 @@
+1/112 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...LIGHTONOCR3 admission_items=1 host_scratch=80543616 backend_scratch=381284352 kv=138412032 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 tokens prompt=432 completion=21
+LIGHTONOCR3 phases vision_prepare=1271 runtime_prepare=0 prefill=6845 decode=704 total=8820
+LIGHTONOCR3 memory device_allocated=8520482816 bf16_weights=8409579520 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4251444 tracked=8449695540 scratch_pool=0 tensor_live=59787264 observed_owned=100941624 observed_alias=8409579520 frame_gpu_ms=1184
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=11769 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+LIGHTONOCR3 admission_items=1 host_scratch=80543616 backend_scratch=381284352 kv=138412032 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 tokens prompt=432 completion=21
+LIGHTONOCR3 phases vision_prepare=831 runtime_prepare=0 prefill=861 decode=696 total=2388
+LIGHTONOCR3 memory device_allocated=8520482816 bf16_weights=8409579520 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4251444 tracked=8449695540 scratch_pool=0 tensor_live=59787264 observed_owned=100941624 observed_alias=8409579520 frame_gpu_ms=1124
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+OCR_REFERENCE {"image_index":0,"text":"Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"}
+LIGHTONOCR3 admission_items=1 host_scratch=88417792 backend_scratch=541442048 kv=161480704 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 tokens prompt=554 completion=201
+LIGHTONOCR3 phases vision_prepare=637 runtime_prepare=0 prefill=994 decode=6556 total=8187
+LIGHTONOCR3 memory device_allocated=8529330176 bf16_weights=8409579520 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4284212 tracked=8458518324 scratch_pool=0 tensor_live=59787264 observed_owned=109788984 observed_alias=8409579520 frame_gpu_ms=5900
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+OCR_REFERENCE {"image_index":1,"text":"# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"}
+LIGHTONOCR3 admission_items=1 host_scratch=95398912 backend_scratch=708657152 kv=182452224 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 tokens prompt=662 completion=59
+LIGHTONOCR3 phases vision_prepare=761 runtime_prepare=0 prefill=835 decode=1935 total=3531
+LIGHTONOCR3 memory device_allocated=8536768512 bf16_weights=8409579520 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4284212 tracked=8465973044 scratch_pool=0 tensor_live=59787264 observed_owned=117227320 observed_alias=8409579520 frame_gpu_ms=2541
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+OCR_REFERENCE {"image_index":2,"text":"# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY"}
+LIGHTONOCR3 admission_items=8 host_scratch=697682048 backend_scratch=1709854720 kv=1264582656 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 tokens prompt=432 completion=21
+LIGHTONOCR3 phases vision_prepare=6198 runtime_prepare=0 prefill=1475 decode=4355 total=12030
+LIGHTONOCR3 tokens prompt=432 completion=21
+LIGHTONOCR3 phases vision_prepare=4912 runtime_prepare=0 prefill=4642 decode=2531 total=12086
+LIGHTONOCR3 tokens prompt=432 completion=21
+LIGHTONOCR3 phases vision_prepare=3357 runtime_prepare=0 prefill=5259 decode=3470 total=12086
+LIGHTONOCR3 tokens prompt=662 completion=59
+LIGHTONOCR3 phases vision_prepare=1023 runtime_prepare=0 prefill=6236 decode=6722 total=13981
+LIGHTONOCR3 tokens prompt=662 completion=59
+LIGHTONOCR3 phases vision_prepare=2848 runtime_prepare=0 prefill=7328 decode=3805 total=13981
+LIGHTONOCR3 tokens prompt=554 completion=201
+LIGHTONOCR3 phases vision_prepare=4284 runtime_prepare=0 prefill=4858 decode=10408 total=19552
+LIGHTONOCR3 tokens prompt=554 completion=201
+LIGHTONOCR3 phases vision_prepare=5649 runtime_prepare=0 prefill=2555 decode=11385 total=19589
+LIGHTONOCR3 tokens prompt=554 completion=201
+LIGHTONOCR3 phases vision_prepare=1901 runtime_prepare=0 prefill=8808 decode=8912 total=19621
+LIGHTONOCR3 memory device_allocated=9106554880 bf16_weights=8409579520 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4373104 tracked=8617056880 scratch_pool=0 tensor_live=478298112 observed_owned=686903924 observed_alias=8409579520 frame_gpu_ms=13109
+LIGHTONOCR3 cohort_items=8 decode_steps=205 batched_steps=204 singleton_steps=1 decode_items=784
+LIGHTONOCR3 admission_items=8 host_scratch=704663168 backend_scratch=1726885888 kv=1285554176 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 tokens prompt=432 completion=21
+LIGHTONOCR3 phases vision_prepare=5805 runtime_prepare=0 prefill=4233 decode=1673 total=11712
+LIGHTONOCR3 tokens prompt=432 completion=21
+LIGHTONOCR3 phases vision_prepare=1266 runtime_prepare=0 prefill=8350 decode=2095 total=11712
+LIGHTONOCR3 tokens prompt=432 completion=21
+LIGHTONOCR3 phases vision_prepare=3477 runtime_prepare=0 prefill=6988 decode=1300 total=11765
+LIGHTONOCR3 tokens prompt=662 completion=59
+LIGHTONOCR3 phases vision_prepare=2948 runtime_prepare=0 prefill=4448 decode=6188 total=13584
+LIGHTONOCR3 tokens prompt=662 completion=59
+LIGHTONOCR3 phases vision_prepare=4406 runtime_prepare=0 prefill=3618 decode=5560 total=13584
+LIGHTONOCR3 tokens prompt=662 completion=59
+LIGHTONOCR3 phases vision_prepare=2109 runtime_prepare=0 prefill=6545 decode=4929 total=13584
+LIGHTONOCR3 tokens prompt=554 completion=201
+LIGHTONOCR3 phases vision_prepare=773 runtime_prepare=0 prefill=5996 decode=11985 total=18755
+LIGHTONOCR3 tokens prompt=554 completion=201
+LIGHTONOCR3 phases vision_prepare=5273 runtime_prepare=0 prefill=3922 decode=9560 total=18755
+LIGHTONOCR3 memory device_allocated=9134555136 bf16_weights=8409579520 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4373104 tracked=8644844144 scratch_pool=0 tensor_live=478298112 observed_owned=714904180 observed_alias=8409579520 frame_gpu_ms=12975
+LIGHTONOCR3 cohort_items=8 decode_steps=201 batched_steps=201 singleton_steps=0 decode_items=642
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=38537 pages_per_second=0.4152 p50_ms=19701 p95_ms=19701 native_items=16 parity=true
+metal_ocr_weight_residency: sets=20 allocations=0 peak_bytes=8409579520 current_bytes=0 released=1
+OK
+1 selected; 1 passed; 0 skipped.

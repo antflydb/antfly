@@ -90,6 +90,16 @@ def run(args, model, label, mode, concurrency, output):
         env["TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP"] = "1"
     if args.disable_ocr_attention:
         env["TERMITE_METAL_DISABLE_LIGHTONOCR3_GQA_SPLIT"] = "1"
+    if args.disable_batch_gate_up:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_GATE_UP"] = "1"
+    if args.disable_prefill_columns:
+        env["TERMITE_METAL_DISABLE_QWEN35_PREFILL_COLUMNS"] = "1"
+    if args.disable_single_down_tile:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_SINGLE_DOWN_TILE"] = "1"
+    if args.disable_four_row_split:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_SPLIT"] = "1"
+    if args.disable_prefill_norm:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_NORM"] = "1"
     if args.disable_prefill_conv_vec4:
         env["TERMITE_METAL_DISABLE_QWEN35_PREFILL_CONV_VEC4"] = "1"
     if args.weight_residency:
@@ -298,6 +308,11 @@ def main():
     parser.add_argument("--disable-f16-encoder-mpp", action="store_true")
     parser.add_argument("--weight-residency", action="store_true")
     parser.add_argument("--disable-prefill-conv-vec4", action="store_true")
+    parser.add_argument("--disable-batch-gate-up", action="store_true")
+    parser.add_argument("--disable-prefill-columns", action="store_true")
+    parser.add_argument("--disable-single-down-tile", action="store_true")
+    parser.add_argument("--disable-four-row-split", action="store_true")
+    parser.add_argument("--disable-prefill-norm", action="store_true")
     parser.add_argument("--disable-ocr-attention", action="store_true")
     parser.add_argument("--disable-florence-window-softmax", action="store_true")
     parser.add_argument("--disable-ocr-ffn-fusion", action="store_true")

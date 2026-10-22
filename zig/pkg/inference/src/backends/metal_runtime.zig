@@ -10850,7 +10850,8 @@ pub fn decoderRuntimeTryApplyBf16GateUp(self: anytype, request: anytype) !?Metal
         getenvFlagEnabled("TERMITE_METAL_DISABLE_BF16_MM") or
         getenvFlagEnabled("TERMITE_METAL_DISABLE_BF16_TILED")) return null;
     if (request.activation != .silu or !request.input.isDevice() or request.input.ndim() != 2) return null;
-    if ((request.input.dim(0) != 1 and request.input.dim(0) < 32) or request.input.dim(1) <= 0 or
+    // The C selector admits qualified OCR cohorts and declines unsupported rows.
+    if (request.input.dim(0) <= 0 or request.input.dim(1) <= 0 or
         @as(usize, @intCast(request.input.dim(1))) != request.in_dim) return null;
     const runtime = self.raw_decode_runtime orelse return null;
     const rows: usize = @intCast(request.input.dim(0));
@@ -46979,6 +46980,52 @@ test "metal native decoder runtime bf16 multi-row linear matches identity projec
         for (0..out_dim) |col| {
             try std.testing.expectApproxEqAbs(input_data[row * hidden_size + col], actual[row * out_dim + col], 1e-3);
         }
+    }
+}
+
+test "LightOnOCR3 batched gate up wrapper reaches qualified device kernel" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    termite_metal_decode_runtime_set_lightonocr3_projections(runtime, 1);
+    const allocator = std.testing.allocator;
+    const Case = struct { rows: usize, hidden: usize, intermediate: usize };
+    for ([_]Case{ .{ .rows = 8, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 4, .hidden = 2560, .intermediate = 9216 } }) |case| {
+        const weights = try allocator.alloc(u16, case.hidden * case.intermediate);
+        defer allocator.free(weights);
+        const bias = try allocator.alloc(f32, case.intermediate);
+        defer allocator.free(bias);
+        @memset(weights, 0);
+        @memset(bias, 0);
+        for (0..case.intermediate) |col| weights[col * case.hidden + col % case.hidden] = 0x3f80;
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_bf16(runtime, 0, std.mem.sliceAsBytes(weights).ptr, weights.len * 2, bias.ptr, case.hidden, case.intermediate));
+        @memset(weights, 0);
+        for (0..case.intermediate) |col| weights[col * case.hidden + (col + 1) % case.hidden] = 0x3f00;
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_bf16(runtime, 1, std.mem.sliceAsBytes(weights).ptr, weights.len * 2, bias.ptr, case.hidden, case.intermediate));
+        if (termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, case.rows, case.hidden, case.intermediate) == 0) return error.SkipZigTest;
+        const input = try allocator.alloc(f32, case.rows * case.hidden);
+        defer allocator.free(input);
+        for (input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 97)) - 48)) * 0.01;
+        var device_input = try testDeviceTensorFromSlice(runtime, input, &.{ @intCast(case.rows), @intCast(case.hidden) });
+        defer device_input.deinit();
+        var output = (try decoderRuntimeTryApplyBf16GateUp(&provider, .{
+            .gate_slot = @as(usize, 0),
+            .up_slot = @as(usize, 1),
+            .input = device_input,
+            .in_dim = case.hidden,
+            .out_dim = case.intermediate,
+            .activation = ops.DecoderRuntimeActivationKind.silu,
+        })) orelse return error.UnexpectedNull;
+        defer output.deinit();
+        const actual = try tensorHostSlice(&output);
+        try std.testing.expectEqual(case.rows * case.intermediate, actual.len);
+        for (0..case.rows) |row| for (0..case.intermediate) |col| {
+            const gate = input[row * case.hidden + col % case.hidden];
+            const up = input[row * case.hidden + (col + 1) % case.hidden] * 0.5;
+            try std.testing.expectApproxEqAbs(gate / (1 + @exp(-gate)) * up, actual[row * case.intermediate + col], 2e-6);
+        };
     }
 }
 
