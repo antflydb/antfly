@@ -62,7 +62,7 @@ separate; see [licensing maintenance](licensing.md).
 
 ## Embedded releases
 
-`embedded-release-publish.yml` runs after successful tagged release builds on main. It accepts stable and RC release requests; nightlies only build artifacts. Manual dispatch with an immutable tag and build run ID is the recovery path. All publishers verify the source commit and package digests before writing registry versions. npm publication is serialized and refuses to move `latest` or `next` backward; retry the newest release if an older build finishes late.
+`embedded-release-publish.yml` runs after successful tagged release builds on main. It accepts stable and RC release requests; nightlies only build artifacts. The `workflow_run` entry point authenticates the producer and immutable release source, then dispatches the publisher on `main`. Registry OIDC jobs run only under `workflow_dispatch`, because crates.io rejects `workflow_run` tokens. Manual dispatch with an immutable tag and build run ID is the recovery path. All publishers verify the source commit and package digests before writing registry versions. npm publication is serialized and refuses to move `latest` or `next` backward; retry the newest release if an older build finishes late.
 
 The Rust crates are published in dependency order: `antfly-embedded-sys`, then `antfly-embedded`, with matching release versions and an exact sys dependency. Consumers install the native library from the corresponding Apache archive; the crates do not bundle an ELv2 server.
 

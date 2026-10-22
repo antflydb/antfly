@@ -447,8 +447,11 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_extracting_mod.addImport("antfly_extraction_openapi", api.extraction);
     const wasm_structured_mod = b.createModule(.{ .root_source_file = b.path("lib/structured/root.zig"), .target = wasm_target, .optimize = optimize });
     wasm_structured_mod.addImport("antfly_jsonschema", wasm_schema_mod);
+    wasm_structured_mod.addImport("antfly_image", wasm_image_mod);
     wasm_structured_mod.addImport("antfly_generating", wasm_generating_mod);
     wasm_structured_mod.addImport("antfly_extracting", wasm_extracting_mod);
+    const structured_boundary = @import("embedded_boundary.zig").add(b, wasm_structured_mod);
+    b.step("embedded-wasm-structured-boundary-check", "Resolve constrained generation browser module dependencies").dependOn(&structured_boundary.step);
     wasm_decisions_mod.addImport("antfly_structured", wasm_structured_mod);
     embedded_support_wasm_mod.addImport("antfly_generating", wasm_generating_mod);
     embedded_support_wasm_mod.addImport("antfly_structured", wasm_structured_mod);

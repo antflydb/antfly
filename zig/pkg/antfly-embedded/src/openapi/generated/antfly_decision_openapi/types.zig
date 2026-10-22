@@ -386,7 +386,7 @@ pub const DecideQuestion = union(enum) {
     }
 };
 
-/// Supply exactly one of input (single evidence item) or inputs (text-only Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB.
+/// Supply exactly one of input (single evidence item) or inputs (ordered Antfly batch extension; hosted typed deciders also accept multimodal evidence per item). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB.
 pub const DecideRequest = struct {
     /// Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
     context_version: ?i64 = null,
@@ -460,7 +460,7 @@ pub const DecideRequest = struct {
     }
 };
 
-/// Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage.
+/// Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage including reported usage from failed items. Named gateway batches identify the configured model at the top level and resolved models per successful item.
 pub const DecideResponse = struct {
     model: []const u8,
     model_identity: ?[]const u8 = null,
@@ -516,8 +516,10 @@ pub const DecideResponse = struct {
 pub const DecisionBatchItem = struct {
     input_index: i64,
     id: ?[]const u8 = null,
-    /// Generated batches preserve valid siblings; a failed item has an empty answers array and this error code.
+    /// Named gateway and generated batches preserve valid siblings; a failed item has an empty answers array and this error code. Invalid input or request budgets fail validation before dispatch.
     @"error": ?[]const u8 = null,
+    /// Resolved model reported for a successful named gateway batch item.
+    model: ?[]const u8 = null,
     answers: []const DecideAnswer,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -525,6 +527,7 @@ pub const DecisionBatchItem = struct {
         .{ "input_index", "input_index", false },
         .{ "id", "id", true },
         .{ "error", "error", true },
+        .{ "model", "model", true },
         .{ "answers", "answers", false },
     };
 
@@ -546,6 +549,10 @@ pub const DecisionBatchItem = struct {
         }
         if (self.@"error") |value| {
             try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
             try jw.write(value);
         }
         try jw.objectField("answers");
@@ -596,7 +603,7 @@ pub const DecisionChoiceProbability = struct {
     probability: f64,
 };
 
-/// Text or ordered user messages containing text and images. Named OpenAI and Jev deciders accept messages. Native trained, embedding, and generated deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
+/// Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
 pub const DecisionEvidence = std.json.Value;
 
 pub const DecisionEvidenceImage = struct {
@@ -675,8 +682,8 @@ pub const DecisionEvidenceText = struct {
 
 pub const DecisionInput = struct {
     id: ?[]const u8 = null,
-    input: []const u8,
-    /// Index into request contexts. Requires context_version 1. Effective input is context, newline, then input; the 1 MiB input limit applies after expansion.
+    input: DecisionEvidence,
+    /// Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native trained and embedding deciders require text. Generated deciders accept image evidence when the selected generator supports images and constrained output.
     context_index: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -1208,7 +1215,7 @@ pub const GeneratedDecideQuestion = union(enum) {
 pub const GeneratedDecideRequest = struct {
     decision_method: []const u8,
     generator: antfly_generating_openapi.GeneratorConfig,
-    input: ?[]const u8 = null,
+    input: ?DecisionEvidence = null,
     inputs: ?[]const DecisionInput = null,
     questions: []const GeneratedDecideQuestion,
     instructions: ?[]const u8 = null,

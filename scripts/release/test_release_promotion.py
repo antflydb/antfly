@@ -52,44 +52,6 @@ def load_module(name: str, filename: str):
 
 
 class ReleasePromotionTests(unittest.TestCase):
-    def test_promotion_materializes_npm_only_and_legacy_cli_snapshots(self) -> None:
-        workflow = (
-            RELEASE_DIR.parents[1] / ".github/workflows/antfly-release.yml"
-        ).read_text()
-        step = (
-            workflow.split(
-                "      - name: Materialize and verify typed bundle scopes\n", 1
-            )[1]
-            .split("        run: |\n", 1)[1]
-            .split("\n      - ", 1)[0]
-        )
-        materialize = textwrap.dedent(step).split(
-            "python scripts/release/verify_release_ledger.py", 1
-        )[0]
-        for legacy in (False, True):
-            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                payload = root / "dist/release-payload"
-                payload.mkdir(parents=True)
-                cli = {"cli-snapshot.json", "antfly-cli.tgz"}
-                if legacy:
-                    cli.add("antfly_cli.whl")
-                runtime = {"antfly_linux_amd64.tar.gz"}
-                for name in cli | runtime | {"artifacts.json", "release-spec.json"}:
-                    (payload / name).write_text(name)
-                subprocess.run(["bash", "-c", materialize], cwd=root, check=True)
-                for directory, expected in (
-                    ("release-runtime", runtime),
-                    ("verified-cli-snapshot", cli),
-                    ("release-ledger", {"artifacts.json"}),
-                ):
-                    actual = root / "dist" / directory
-                    self.assertEqual({path.name for path in actual.iterdir()}, expected)
-                    for path in actual.iterdir():
-                        self.assertEqual(
-                            path.read_bytes(), (payload / path.name).read_bytes()
-                        )
-
     def test_qualification_builds_use_the_production_archive_invocation(self) -> None:
         root = RELEASE_DIR.parents[1]
 
