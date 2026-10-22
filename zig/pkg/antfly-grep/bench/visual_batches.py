@@ -17,13 +17,17 @@
 
 import argparse
 import base64
+import copy
 import hashlib
 import importlib.util
 import json
 import platform
 import statistics
+import struct
+import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 
@@ -38,11 +42,28 @@ def main():
     parser.add_argument("--fixture-library", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--units", type=int, default=8)
+    parser.add_argument("--parents", type=int, default=1)
+    parser.add_argument("--page-size", type=int, default=16)
+    parser.add_argument("--image-bytes", type=int, default=0)
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="disable ranking to measure first streaming output",
+    )
     parser.add_argument("--delay-ms", type=float, default=20)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.rounds < 1 or not 1 <= args.units <= 16 or args.delay_ms < 0:
-        parser.error("positive rounds, 1..16 units, nonnegative delay required")
+    if (
+        args.rounds < 1
+        or not 1 <= args.units <= 16
+        or not 1 <= args.parents <= 64
+        or not 1 <= args.page_size <= 1000
+        or not 0 <= args.image_bytes <= 500000
+        or args.delay_ms < 0
+    ):
+        parser.error(
+            "positive rounds, 1..16 units, 1..64 parents, 1..1000 page size, nonnegative delay required"
+        )
     binaries = {"baseline": args.baseline.resolve(), "candidate": args.binary.resolve()}
     spec = importlib.util.spec_from_file_location(
         "visual_fixture", Path(__file__).resolve().parents[1] / "tests/test_cli.py"
@@ -78,26 +99,53 @@ def main():
                     case.env["ANTFLY_GREP_TOKEN"] = "visual-fixture"
                     case.server.allow_asset_order = variant == "baseline"
                     config = case.visual_document(units=args.units)
-                    row = case.server.index_documents[0]["_source"]
-                    # Distinct images/fields, rather than measuring only dedup
-                    # of repeated references to one small image.
-                    for i, unit in enumerate(row["grep"]["evidence"]):
-                        image = case.image_fixture(width=i + 2, height=3)
-                        field = f"preview{i}"
-                        row["payloads"][field] = (
-                            "data:image/png;base64," + base64.b64encode(image).decode()
+                    template = case.server.index_documents[0]
+                    case.server.index_documents = []
+                    for parent in range(args.parents):
+                        entry = copy.deepcopy(template)
+                        entry["_id"] = f"{parent:04}"
+                        entry["_sort"] = [entry["_id"]]
+                        entry["_source"]["grep"]["path"] = (
+                            f"Drive/file-{parent:04}.slides"
                         )
-                        unit["asset"].update(
-                            field=f"payloads.{field}",
-                            sha256=hashlib.sha256(image).hexdigest(),
-                            byte_length=len(image),
-                        )
+                        # Distinct valid images for every parent and unit;
+                        # equal projection shapes do not imply equal content.
+                        for i, unit in enumerate(entry["_source"]["grep"]["evidence"]):
+                            image = case.image_fixture(
+                                width=i + 2 + parent * 17, height=3
+                            )
+                            if args.image_bytes > len(image) + 20:
+                                payload = b"padding\0" + b"x" * (
+                                    args.image_bytes - len(image) - 20
+                                )
+                                chunk = (
+                                    struct.pack(">I", len(payload))
+                                    + b"tEXt"
+                                    + payload
+                                    + struct.pack(">I", zlib.crc32(b"tEXt" + payload))
+                                )
+                                image = image[:-12] + chunk + image[-12:]
+                            field = f"preview{i}"
+                            entry["_source"]["payloads"][field] = (
+                                "data:image/png;base64,"
+                                + base64.b64encode(image).decode()
+                            )
+                            unit["asset"].update(
+                                field=f"payloads.{field}",
+                                sha256=hashlib.sha256(image).hexdigest(),
+                                byte_length=len(image),
+                            )
+                        case.server.index_documents.append(entry)
+                    settings = json.loads(Path(config).read_text())
+                    settings["page_size"] = args.page_size
+                    Path(config).write_text(json.dumps(settings))
                     case.server.delay = args.delay_ms / 1000
                     for phase in ("cold", "warm"):
                         case.server.requests.clear()
                         case.server.index_requests.clear()
                         start = time.monotonic_ns()
-                        result = case.raw_cli(
+                        process_report = case.root / "child-usage.json"
+                        command = [
                             *case.decision_args(),
                             "--media=images",
                             "--json",
@@ -105,8 +153,33 @@ def main():
                             config,
                             "--batch-size=8",
                             "--decision-concurrency=8",
+                            "--decision-batch-wait-ms=20",
+                        ]
+                        if args.stream:
+                            command.append("--no-rank")
+                        result = subprocess.run(
+                            [
+                                sys.executable,
+                                str(
+                                    Path(__file__)
+                                    .with_name("measure_process.py")
+                                    .resolve()
+                                ),
+                                "--report",
+                                str(process_report),
+                                "--",
+                                str(binaries[variant]),
+                                *command,
+                            ],
+                            cwd=case.root,
+                            env=case.env,
+                            capture_output=True,
+                            timeout=30,
                         )
-                        elapsed = time.monotonic_ns() - start
+                        if result.returncode != 0:
+                            raise AssertionError(result.stderr.decode())
+                        usage = json.loads(process_report.read_text())
+                        harness_elapsed = time.monotonic_ns() - start
                         events = [
                             json.loads(line) for line in result.stdout.splitlines()
                         ]
@@ -116,11 +189,14 @@ def main():
                                 for r in events
                                 if r["type"] == "evidence"
                             ],
-                            key=lambda r: r[0]["unit"],
+                            key=lambda r: (r[0]["path"], r[0]["unit"]),
                         )
                         if canonical is None:
                             canonical = evidence
-                        if evidence != canonical or len(evidence) != args.units:
+                        if (
+                            evidence != canonical
+                            or len(evidence) != args.units * args.parents
+                        ):
                             raise AssertionError("baseline/candidate output differs")
                         requests = case.server.requests
                         samples.append(
@@ -128,7 +204,8 @@ def main():
                                 "variant": variant,
                                 "round": round_id,
                                 "phase": phase,
-                                "elapsed_ns": elapsed,
+                                **usage,
+                                "harness_elapsed_ns": harness_elapsed,
                                 "provider_requests": len(requests),
                                 "index_requests": len(case.server.index_requests),
                                 "logical_provider_json_bytes": sum(
@@ -163,6 +240,10 @@ def main():
                         key: statistics.median(r[key] for r in selected)
                         for key in (
                             "elapsed_ns",
+                            "first_stdout_ns",
+                            "user_cpu_ns",
+                            "system_cpu_ns",
+                            "peak_rss_bytes",
                             "provider_requests",
                             "index_requests",
                             "logical_provider_json_bytes",
@@ -177,6 +258,10 @@ def main():
         "platform": platform.platform(),
         "machine": platform.machine(),
         "units": args.units,
+        "parents": args.parents,
+        "page_size": args.page_size,
+        "requested_image_bytes": args.image_bytes,
+        "ranked": not args.stream,
         "rounds": args.rounds,
         "per_request_delay_ms": args.delay_ms,
         "binaries": {

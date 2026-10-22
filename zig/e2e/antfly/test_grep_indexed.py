@@ -2467,8 +2467,9 @@ def test_logical_retained_page_profile(stateful_api):
 
 
 @pytest.mark.parametrize("change", [None, "revision", "permissions"])
+@pytest.mark.parametrize("parents", [1, 8])
 def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
-    stateful_api, tmp_path, change
+    stateful_api, tmp_path, change, parents
 ):
     """Real query server; only inference is a fixed-answer local fixture."""
     import hashlib
@@ -2499,7 +2500,14 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
         "image": "data:image/png;base64," + base64.b64encode(image).decode(),
         "unrelated": "x" * 262144,
     }
-    stateful_api.batch_write(table, inserts={"source": item}, sync_level="full_index")
+    import copy
+
+    identities = [f"source-{i}" for i in range(parents)]
+    documents = {identity: copy.deepcopy(item) for identity in identities}
+    for i, value in enumerate(documents.values()):
+        value["grep"]["path"] = f"Drive/chart{i}.png"
+    item = documents[identities[0]]
+    stateful_api.batch_write(table, inserts=documents, sync_level="full_index")
     seen, responses, provider_calls = [], [], []
 
     class QueryProxy(BaseHTTPRequestHandler):
@@ -2528,7 +2536,7 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
                 else:
                     item["grep"]["permissions"] = {"public": False, "readers": []}
                 stateful_api.batch_write(
-                    table, inserts={"source": item}, sync_level="full_index"
+                    table, inserts={identities[0]: item}, sync_level="full_index"
                 )
             self.send_response(response.status_code)
             self.send_header("Content-Length", str(len(response.content)))
@@ -2574,13 +2582,15 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
             f"http://127.0.0.1:{provider.server_port}/decisions",
             "--no-cache",
             "--json",
-            page_size=8,
+            "--decision-concurrency=8",
+            "--decision-batch-wait-ms=20",
+            page_size=16,
         )
         assert len(seen) == 2, (seen, result.stderr.decode())
         assert seen[0]["order_by"] == [{"field": "_id", "desc": False}]
         assert responses[0]["responses"][0]["remote_snapshot"]
         point = seen[1]
-        assert point["query"] == {"bool": {"filter": {"ids": ["source"]}}}
+        assert point["query"] == {"bool": {"filter": {"ids": identities}}}
         assert "execution" not in point
         assert not {"order_by", "search_after", "remote_snapshot"} & point.keys()
         assert set(point["fields"]) == {
@@ -2592,7 +2602,8 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
         assert not responses[1]["responses"][0].get("remote_snapshot")
         if change:
             assert result.returncode == 2, result.stdout
-            assert not provider_calls
+            assert "Drive/chart0.png" not in json.dumps(provider_calls)
+            assert sum(len(call["inputs"]) for call in provider_calls) == parents - 1
             expected = (
                 b"EvidenceRevisionChanged"
                 if change == "revision"
@@ -2602,6 +2613,7 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
         else:
             assert result.returncode == 0, result.stderr.decode()
             assert len(provider_calls) == 1
+            assert len(provider_calls[0]["inputs"]) == parents
             assert json.loads(result.stdout.splitlines()[0])["type"] == "evidence"
     finally:
         for server, thread in zip((query, provider), threads, strict=True):

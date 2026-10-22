@@ -25,12 +25,20 @@ pub fn Registry(comptime Content: type) type {
         const Self = @This();
         pub const Facts = struct { content: Content, timestamp: u64 };
         pub const capacity = 4096;
+        const Entry = struct { facts: Facts, slot: usize, referenced: bool = true };
         mutex: std.Io.Mutex = .init,
         nonce: u64 = 0,
         epoch: u64 = 0,
         writers: usize = 0,
         disabled: bool = false,
-        entries: std.AutoHashMapUnmanaged([32]u8, Facts) = .empty,
+        entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
+        slots: std.ArrayList(?[32]u8) = .empty,
+        hand: usize = 0,
+        fn clear(self: *Self) void {
+            self.entries.clearRetainingCapacity();
+            self.slots.clearRetainingCapacity();
+            self.hand = 0;
+        }
         fn io() std.Io {
             return if (@import("builtin").os.tag == .freestanding) .failing else std.Io.Threaded.global_single_threaded.io();
         }
@@ -69,17 +77,69 @@ pub fn Registry(comptime Content: type) type {
         pub fn get(self: *Self, token: ?Token, key: [32]u8) ?Facts {
             self.lock();
             defer self.unlock();
-            return if (self.valid(token)) self.entries.get(key) else null;
+            return if (self.valid(token)) self.getLocked(key) else null;
+        }
+        fn getLocked(self: *Self, key: [32]u8) ?Facts {
+            const entry = self.entries.getPtr(key) orelse return null;
+            entry.referenced = true;
+            return entry.facts;
+        }
+        pub fn getMany(self: *Self, token: ?Token, keys: []const [32]u8, output: []?Facts) void {
+            std.debug.assert(keys.len == output.len);
+            self.lock();
+            defer self.unlock();
+            if (!self.valid(token)) {
+                @memset(output, null);
+                return;
+            }
+            for (keys, output) |key, *out| out.* = self.getLocked(key);
         }
         pub fn put(self: *Self, a: std.mem.Allocator, token: ?Token, key: [32]u8, facts: Facts) void {
             self.lock();
             defer self.unlock();
             if (!self.valid(token)) return;
-            // Fixed entry admission; no unbounded registration fan-out or
-            // per-source allocation. Pressure evicts facts, never correctness.
-            if (self.entries.count() >= capacity and !self.entries.contains(key)) self.entries.clearRetainingCapacity();
-            self.entries.put(a, key, facts) catch {};
+            self.putLocked(a, key, facts);
         }
+        fn putLocked(self: *Self, a: std.mem.Allocator, key: [32]u8, facts: Facts) void {
+            if (self.entries.getPtr(key)) |entry| {
+                entry.facts = facts;
+                entry.referenced = true;
+                return;
+            }
+            // Allocate before eviction. OOM never discards an unrelated hit.
+            self.entries.ensureUnusedCapacity(a, 1) catch return;
+            var slot: usize = undefined;
+            if (self.slots.items.len < capacity) {
+                slot = self.slots.items.len;
+                self.slots.append(a, null) catch return;
+            } else {
+                // CLOCK: at most two bounded rotations, amortized O(1), no
+                // whole-cache cliff when a single cold identity is admitted.
+                while (true) {
+                    slot = self.hand;
+                    self.hand = (self.hand + 1) % capacity;
+                    const prior = self.slots.items[slot] orelse break;
+                    const entry = self.entries.getPtr(prior).?;
+                    if (self.entries.count() < capacity) continue;
+                    if (entry.referenced) {
+                        entry.referenced = false;
+                        continue;
+                    }
+                    _ = self.entries.remove(prior);
+                    break;
+                }
+            }
+            self.slots.items[slot] = key;
+            self.entries.putAssumeCapacity(key, .{ .facts = facts, .slot = slot });
+        }
+        pub fn putMany(self: *Self, a: std.mem.Allocator, token: ?Token, keys: []const [32]u8, facts: []const ?Facts) void {
+            std.debug.assert(keys.len == facts.len);
+            self.lock();
+            defer self.unlock();
+            if (!self.valid(token)) return;
+            for (keys, facts) |key, fact| if (fact) |value| self.putLocked(a, key, value);
+        }
+
         fn advance(self: *Self) void {
             if (self.epoch == std.math.maxInt(u64)) self.disabled = true else self.epoch += 1;
         }
@@ -89,18 +149,20 @@ pub fn Registry(comptime Content: type) type {
             self.advance();
             self.writers += 1;
             if (changed.count() > capacity) {
-                self.entries.clearRetainingCapacity();
+                self.clear();
                 return;
             }
             var it = changed.keyIterator();
-            while (it.next()) |key| _ = self.entries.remove(key.*[key.len - 32 ..].*);
+            while (it.next()) |key| {
+                if (self.entries.fetchRemove(key.*[key.len - 32 ..].*)) |entry| self.slots.items[entry.value.slot] = null;
+            }
         }
         pub fn beginReplacement(self: *Self) void {
             self.lock();
             defer self.unlock();
             self.advance();
             self.writers += 1;
-            self.entries.clearRetainingCapacity();
+            self.clear();
         }
         pub fn end(self: *Self) void {
             self.lock();
@@ -111,6 +173,7 @@ pub fn Registry(comptime Content: type) type {
         }
         pub fn deinit(self: *Self, a: std.mem.Allocator) void {
             self.entries.deinit(a);
+            self.slots.deinit(a);
             self.* = .{};
         }
     };
@@ -213,4 +276,39 @@ test "source certificates concurrent registration cannot cross a mutation fence"
     try std.testing.expect(r.capture() == null);
     r.put(std.testing.allocator, token, key, .{ .content = 999, .timestamp = 0 });
     try std.testing.expect(r.get(token, key) == null);
+}
+
+test "source certificates CLOCK retains the hot working set and reuses mutation holes" {
+    const R = Registry(u64);
+    const a = std.testing.allocator;
+    var r: R = .{};
+    defer r.deinit(a);
+    const Keys = struct {
+        fn key(n: u64) [32]u8 {
+            var k: [32]u8 = @splat(0);
+            std.mem.writeInt(u64, k[0..8], n, .little);
+            return k;
+        }
+    };
+    const token = r.capture();
+    for (0..R.capacity) |i| r.put(a, token, Keys.key(i), .{ .content = i, .timestamp = 0 });
+    r.put(a, token, Keys.key(R.capacity), .{ .content = 42, .timestamp = 0 });
+    var hits: usize = 0;
+    for (0..R.capacity) |i| hits += @intFromBool(r.get(token, Keys.key(i)) != null);
+    try std.testing.expectEqual(R.capacity - 1, hits);
+    var changed: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer changed.deinit(a);
+    try changed.put(a, Keys.key(1), {});
+    r.begin(&changed);
+    r.end();
+    const fresh = r.capture();
+    r.put(a, fresh, Keys.key(R.capacity + 1), .{ .content = 43, .timestamp = 0 });
+    try std.testing.expectEqual(R.capacity, r.entries.count());
+    const keys = [_][32]u8{ Keys.key(2), Keys.key(R.capacity + 1) };
+    var facts: [2]?R.Facts = undefined;
+    r.getMany(fresh, &keys, &facts);
+    try std.testing.expectEqual(@as(u64, 2), facts[0].?.content);
+    try std.testing.expectEqual(@as(u64, 43), facts[1].?.content);
+    r.getMany(token, &keys, &facts);
+    try std.testing.expect(facts[0] == null and facts[1] == null);
 }

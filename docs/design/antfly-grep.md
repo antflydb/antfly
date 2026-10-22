@@ -329,6 +329,61 @@ The byte/round-trip fixture compares the previous binary and this implementation
 using identical image units and fixed-score local servers. It cannot establish
 live relevance, token prices or a universal throughput ratio. Batching primarily
 removes HTTP overhead and enables the gateway's bounded provider fan-out; it does
-not imply reduced model tokens per image. Cross-parent scheduling is separate
-from same-parent unit batching and must preserve each parent's authorization,
-revision, result ownership and budgets.
+not imply reduced model tokens per image. The cross-parent scheduler below
+preserves each parent's authorization, revision, result ownership and budgets.
+
+
+### Bounded cross-parent pipeline (2026-10-22)
+
+Indexed visual search uses at most eight persistent worker lanes, further bounded
+by provider concurrency. Lanes borrow manifest page data; every lane is joined
+before either its materialized asset page or manifest arena can be released.
+Each lane owns mutable matcher and decision state and shares the invocation's
+atomic budgets, cancellation, HTTP pools, score store and synchronized ranking or
+spill owner. Lane output is charged to the common pending-output budget and
+published in discovery order; ranked results retain their existing stable order.
+Compatible model work coalesces across parents with unique wire IDs. A
+single-parent window retains intra-document provider parallelism.
+
+An asset window contains at most eight parents and 8 MiB conservative evidence.
+Only equal image-field projection shapes are grouped. Unioning unrelated fields
+would overfetch those fields on every row. A group is one current ID-filtered
+query, with no ordering or retained pagination state. Each returned parent
+independently checks access and revision before its payloads are validated.
+Missing/denied/changed parents do not authorize their image bytes or score reuse.
+The asset page is immutable and pinned until all lanes finish; validated URL
+views can borrow that page without a second base64-string copy. The grant covers
+one wave only: later waves fetch and authorize current parent state again.
+
+Response-size/HTTP-413/memory rejection of a parent group falls back to bounded
+individual parent reads. Oversized same-parent projections split the image-field
+group recursively; each partition preserves credentials/filter/revision checks,
+request accounting and validated siblings. One oversized field fails explicitly
+rather than causing repeated identical subdivision attempts. Ordered manifest
+pagination may shrink its page size; an unordered multi-ID projection must never
+silently shrink its limit and omit requested parents.
+
+Explicit finite request budgets, finite source/evaluation budgets and early file
+selection retain ordered serial admission. The default 1,000-attempt safety cap
+continues to apply to actual HTTP requests across all lanes; parallelism does not
+turn it into an unlimited allowance. Groups respect per-document selection limits
+and the remaining indexed-document quota. Active lanes, borrowed pages and output
+are bounded independently of corpus size. This is a latency/throughput tradeoff:
+more active parents may raise RSS even while reducing requests and CPU.
+
+The benchmark driver includes multi-page/multi-parent cases and large encoded
+images. Its Unix child wrapper records child wall/CPU time, first stdout byte and
+peak RSS without charging the Python harness to the CLI. Reports retain exact
+binary hashes, alternating trial order, output equivalence and fixture delays.
+First stdout in the ranked fixture follows ranking completion; it is not a
+claim of streaming an early unranked hit. Live providers and real Cloud ACLs
+remain separate qualification.
+
+Warm scores still require fresh authorized asset validation. Avoiding those image
+bytes requires a generic server-owned source/asset identity contract: an identity
+must bind the exact stored bytes at the authorized read cut, survive only valid
+immutable revisions, and be distinct from caller-supplied revision or digest
+metadata. A trusted identity may select a previously verified score; absent or
+changed identity must materialize and validate bytes. No caller-written manifest,
+TTL, cached permission result or segment ID establishes that guarantee. The CLI
+retains full validation until that server contract exists.

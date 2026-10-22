@@ -706,7 +706,7 @@ pub const Search = struct {
             (self.options.ask != null and !self.options.ranked and !self.options.jev_mode and
                 (self.options.sort == null or std.mem.eql(u8, self.options.sort.?, "none")) and
                 !self.options.quiet and !self.options.inventory and !self.hasStdinPath());
-        if (self.discovery_stream and (self.single_source or self.options.triage or self.options.max_files == std.math.maxInt(usize))) {
+        if (self.discovery_stream and (self.options.table_config == null or self.options.paths.items.len != 0) and (self.single_source or self.options.triage or self.options.max_files == std.math.maxInt(usize))) {
             self.file_path_triage = self.options.triage or (self.single_source and 1 > self.options.max_files);
             self.pipeline = try Pipeline.start(self);
         }
@@ -1630,6 +1630,71 @@ pub const Search = struct {
             !self.options.count and !self.options.count_matches and !self.options.files_with_matches and
             !self.options.files_without_match and self.output_bytes > 0) try self.write("\n");
     }
+    /// Page-owned indexed inputs remain borrowed until their lane is joined.
+    /// Each lane owns mutable matcher/transport state; only budgets, immutable
+    /// programs, score stores and the synchronized ranking/spill are shared.
+    pub const IndexedLane = struct {
+        search: Search,
+        output: std.Io.Writer.Allocating,
+        handle: ?@import("worker_pool.zig").Handle = null,
+        doc: @import("document.zig").Document = undefined,
+        failure: ?anyerror = null,
+        pub fn init(root: *Search) !*IndexedLane {
+            const lane = try root.a.create(IndexedLane);
+            errdefer root.a.destroy(lane);
+            lane.* = .{ .search = try Search.initShared(root), .output = .init(root.a) };
+            lane.search.shared_limits = &root.limits;
+            lane.search.decider.limits = &root.limits;
+            lane.search.decider.shared_http = root.decider.shared_http orelse &root.decider.http;
+            lane.search.decider.allow_parallel = false;
+            lane.search.decider.coalescer = &root.coalescer;
+            lane.search.sink = &lane.output.writer;
+            lane.search.retaining_output = true;
+            return lane;
+        }
+        pub fn run(self: *IndexedLane) void {
+            self.search.indexDocument(self.doc) catch |err| {
+                self.search.reportError(self.doc.path, err) catch |failure| {
+                    self.failure = failure;
+                };
+            };
+        }
+        pub fn finish(self: *IndexedLane, root: *Search) !void {
+            if (self.handle) |handle| handle.join() else return;
+            self.handle = null;
+            const child = &self.search;
+            defer {
+                _ = root.limits.pending_output.fetchSub(child.reserved_output, .monotonic);
+                child.reserved_output = 0;
+                self.output.clearRetainingCapacity();
+            }
+            inline for (@typeInfo(Summary).@"struct".field_names) |name| {
+                if (comptime @TypeOf(@field(child.summary, name)) == usize) @field(root.summary, name) += @field(child.summary, name);
+            }
+            root.summary.complete = root.summary.complete and child.summary.complete;
+            root.summary.occurrences_exact = root.summary.occurrences_exact and child.summary.occurrences_exact;
+            inline for (.{ "requests", "cache_hits", "input_tokens", "output_tokens", "request_bytes", "request_inputs" }) |field| {
+                @field(root.decider, field) += @field(child.decider, field);
+                @field(child.decider, field) = 0;
+            }
+            root.decider.peak_request_bytes = @max(root.decider.peak_request_bytes, child.decider.peak_request_bytes);
+            child.decider.peak_request_bytes = 0;
+            root.stop = root.stop or child.stop;
+            child.summary = .{};
+            try root.tasks.ensureUnusedCapacity(root.a, child.tasks.items.len);
+            for (child.tasks.items) |task| root.tasks.appendAssumeCapacity(task);
+            child.tasks.clearRetainingCapacity();
+            try root.write(self.output.written());
+            if (!root.options.ranked and !root.options.block_buffered) try root.flushOutput();
+            if (self.failure) |err| return err;
+        }
+        pub fn deinit(self: *IndexedLane, root: *Search) void {
+            std.debug.assert(self.handle == null);
+            self.search.deinit();
+            self.output.deinit();
+            root.a.destroy(self);
+        }
+    };
     pub fn indexDocument(self: *Search, doc: @import("document.zig").Document) !void {
         if (doc.content.len > self.options.max_file_bytes) {
             if (self.options.skip_oversize) {
@@ -1648,7 +1713,8 @@ pub const Search = struct {
             const worker = try self.a.create(Search);
             errdefer self.a.destroy(worker);
             worker.* = try Search.initShared(self);
-            worker.decider.coalescer = null;
+            worker.decider.coalescer = self.decider.coalescer;
+            worker.decider.allow_parallel = self.decider.allow_parallel;
             self.index_worker = worker;
             break :blk worker;
         };
@@ -1678,6 +1744,7 @@ pub const Search = struct {
         local.replacement_file_context = false;
         local.color_enabled = self.options.color == .always or (self.options.color == .auto and self.stdout_tty);
         local.decider.cache_scope = doc.cache_scope;
+        local.decider.allow_parallel = self.decider.allow_parallel;
         local.decider.requests = 0;
         local.decider.cache_hits = 0;
         local.decider.input_tokens = 0;
@@ -1690,8 +1757,8 @@ pub const Search = struct {
             local.sink = null;
         }
         local.collecting = false;
-        local.shared_limits = &self.limits;
-        local.decider.limits = &self.limits;
+        local.shared_limits = self.shared_limits orelse &self.limits;
+        local.decider.limits = local.shared_limits;
         local.decider.shared_local = self.decider.shared_local orelse self.decider.local;
         local.provenance = doc.provenance;
         local.render_filename = self.options.filename orelse true;
@@ -1721,7 +1788,7 @@ pub const Search = struct {
             local.summary.files += 1;
             local.summary.matches += 1;
         } else {
-            if (self.options.ask == null and !self.options.multiline and !Limits.reserve(&self.limits.source_bytes, doc.content.len, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
+            if (self.options.ask == null and !self.options.multiline and !Limits.reserve(&(self.shared_limits orelse &self.limits).source_bytes, doc.content.len, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
             if (self.options.media == .images) {
                 local.mediaDocument(doc) catch |err| try local.reportStagedError(doc.path, err);
             } else local.processBytes(doc.path, doc.content) catch |err| try local.reportStagedError(doc.path, err);
@@ -1729,7 +1796,7 @@ pub const Search = struct {
             local.jsonEnd(doc.path, .{}) catch |err| try local.reportStagedError(doc.path, err);
         }
         if (self.ranking) |ranking| {
-            _ = self.limits.pending_output.fetchSub(local.reserved_output - reserved_before, .monotonic);
+            _ = (self.shared_limits orelse &self.limits).pending_output.fetchSub(local.reserved_output - reserved_before, .monotonic);
             try self.write(output.written());
             if (local.deferred_candidate) |candidate| {
                 local.deferred_candidate = null;
@@ -1741,7 +1808,7 @@ pub const Search = struct {
         }
         if (self.spill) |spill| {
             try spill.add(doc.path, local.best_probability, local.result_ordinal, output.written());
-            _ = self.limits.pending_output.fetchSub(local.reserved_output - reserved_before, .monotonic);
+            _ = (self.shared_limits orelse &self.limits).pending_output.fetchSub(local.reserved_output - reserved_before, .monotonic);
             return;
         }
         if (!ranked) {
@@ -1856,7 +1923,7 @@ pub const Search = struct {
             const limits = self.shared_limits orelse &self.limits;
             while (end < doc.evidence.len and end - offset < cap) {
                 const unit = doc.evidence[end];
-                const bytes = unit.asset.byte_length *| 2 +| unit.text.len *| 6 +| doc.path.len *| 6 +| 65536;
+                const bytes = unit.asset.byte_length *| 2 +| unit.text.len *| 8 +| doc.path.len *| 8 +| 65536;
                 if (end > offset and bytes > 8 * 1024 * 1024 -| estimated) break;
                 if (!Limits.reserve(&limits.regions, 1, self.options.max_regions)) {
                     failure = error.RegionBudgetExceeded;
@@ -1892,7 +1959,8 @@ pub const Search = struct {
                 self.summary.bytes += image.bytes;
                 const listing = try std.json.Stringify.valueAlloc(a, .{ .path = doc.path, .id = unit.id, .kind = unit.kind, .location = unit.location, .text = unit.text, .label = unit.label, .asset = unit.asset }, .{ .emit_null_optional_fields = false });
                 inputs[count] = .{ .id = unit.id, .input = try std.fmt.allocPrint(a, "TARGET visual evidence unit (image is authoritative; text is context):\n{s}", .{listing}), .image = image };
-                if (try inputs[count].evidenceBytes() > 1024 * 1024) {
+                inputs[count].serialized_evidence_bytes = try inputs[count].evidenceBytes();
+                if (inputs[count].serialized_evidence_bytes.? > 1024 * 1024) {
                     failure = failure orelse error.DecisionLimitExceeded;
                     continue;
                 }

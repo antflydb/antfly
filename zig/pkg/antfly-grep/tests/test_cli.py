@@ -186,7 +186,7 @@ class DecisionHandler(BaseHTTPRequestHandler):
             self.server.active += 1
             self.server.peak = max(self.server.peak, self.server.active)
         try:
-            if self.server.barrier:
+            if self.server.barrier and not self.path.startswith("/api/v1/tables/"):
                 try:
                     self.server.barrier.wait(timeout=3)
                 except threading.BrokenBarrierError:
@@ -228,6 +228,20 @@ class DecisionHandler(BaseHTTPRequestHandler):
             )
         ):
             self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if asset_read and (
+            (
+                getattr(self.server, "asset_mode", None) == "oversized_fields"
+                and sum(f.startswith("payloads.") for f in body.get("fields", [])) > 1
+            )
+            or (
+                getattr(self.server, "asset_mode", None) == "oversized_parent_group"
+                and body["limit"] > 1
+            )
+        ):
+            self.send_response(413)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -380,6 +394,11 @@ class DecisionHandler(BaseHTTPRequestHandler):
             (self.path, self.headers.get("Authorization"), body)
         )
         self.server.client_ports.append(self.client_address[1])
+        with self.server.lock:
+            hook = getattr(self.server, "on_provider", None)
+            self.server.on_provider = None
+        if hook:
+            hook()
         single = "input" in body
         visual = single and isinstance(body["input"], list)
         if single:
@@ -1973,6 +1992,9 @@ class CliTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # The fixture must not turn an eight-lane client into a five-connection
+        # SYN-backlog benchmark. Real provider work is bounded separately.
+        ThreadingHTTPServer.request_queue_size = 256
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), DecisionHandler)
         cls.server.daemon_threads = True
         cls.server.lock = threading.Lock()
@@ -2000,6 +2022,7 @@ class CliTests(unittest.TestCase):
         self.env["HOME"] = str(self.root)
         self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
         self.server.asset_mode = None
+        self.server.on_provider = None
         self.server.allow_asset_order = False
         self.server.requests = []
         self.server.client_ports = []
@@ -3833,6 +3856,321 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(self.server.requests), 8)
         self.assertGreater(self.server.peak, 1)
         self.assertLessEqual(self.server.peak, 4)
+
+    def test_media_asset_projection_splits_response_and_server_limits(self):
+        import zlib
+
+        config = Path(self.visual_document(units=2))
+        row = self.server.index_documents[0]["_source"]
+        png = self.image_fixture()
+        payload = b"padding\0" + b"x" * 180000
+        chunk = (
+            struct.pack(">I", len(payload))
+            + b"tEXt"
+            + payload
+            + struct.pack(">I", zlib.crc32(b"tEXt" + payload))
+        )
+        png = png[:-12] + chunk + png[-12:]
+        row["payloads"] = {}
+        for i, unit in enumerate(row["grep"]["evidence"]):
+            field = f"preview{i}"
+            row["payloads"][field] = (
+                "data:image/png;base64," + base64.b64encode(png).decode()
+            )
+            unit["asset"].update(
+                field="payloads." + field,
+                sha256=hashlib.sha256(png).hexdigest(),
+                byte_length=len(png),
+            )
+        settings = json.loads(config.read_text())
+        for mode in ("response_limit", "oversized_fields"):
+            with self.subTest(mode=mode):
+                self.server.index_requests.clear()
+                self.server.requests.clear()
+                self.server.asset_mode = None if mode == "response_limit" else mode
+                settings["max_response_bytes"] = (
+                    350000 if mode == "response_limit" else 32 * 1024 * 1024
+                )
+                config.write_text(json.dumps(settings))
+                result = self.raw_cli(
+                    *self.decision_args(),
+                    "--media=images",
+                    "--json",
+                    "--no-cache",
+                    "--table-config",
+                    str(config),
+                    "--batch-size=8",
+                    "--decision-concurrency=1",
+                )
+                self.assertEqual(
+                    sum(
+                        json.loads(line)["type"] == "evidence"
+                        for line in result.stdout.splitlines()
+                    ),
+                    2,
+                )
+                self.assertEqual(len(self.server.index_requests), 4)
+                self.assertEqual(len(self.server.requests), 1)
+                for _, _, point in self.server.index_requests[1:]:
+                    self.assertNotIn("remote_snapshot", point)
+                    self.assertNotIn("order_by", point)
+
+    def visual_parents(self, count=8, page_size=16, units=1):
+        import copy
+
+        self.visual_document(units=units)
+        original = copy.deepcopy(self.server.index_documents[0]["_source"])
+        docs = []
+        for i in range(count):
+            doc = copy.deepcopy(original["grep"])
+            doc["path"] = f"Drive/image-{i:04}.png"
+            docs.append(doc)
+        config = self.table_config(docs, page_size=page_size)
+        for i, row in enumerate(self.server.index_documents):
+            row["_id"] = f"{i:04}"
+            row["_sort"] = [row["_id"]]
+            row["_source"]["payloads"] = copy.deepcopy(original["payloads"])
+            for j, unit in enumerate(row["_source"]["grep"]["evidence"]):
+                image = self.image_fixture(width=i * 17 + j + 2, height=3)
+                field = "preview" if units == 1 else f"preview{j}"
+                row["_source"]["payloads"][field] = (
+                    "data:image/png;base64," + base64.b64encode(image).decode()
+                )
+                unit["asset"].update(
+                    field="payloads." + field,
+                    sha256=hashlib.sha256(image).hexdigest(),
+                    byte_length=len(image),
+                )
+        return config
+
+    def test_media_cross_parent_projection_coalescing_and_stable_delivery(self):
+        config = self.visual_parents(count=20)
+        args = [
+            *self.decision_args(),
+            "--media=images",
+            "--json",
+            "--no-cache",
+            "--table-config",
+            config,
+            "--decision-concurrency=8",
+            "--decision-batch-wait-ms=20",
+        ]
+        result = self.raw_cli(*args)
+        evidence = [
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if json.loads(line)["type"] == "evidence"
+        ]
+        self.assertEqual(len(evidence), 20)
+        self.assertEqual(
+            [r["data"]["path"] for r in evidence],
+            sorted(r["data"]["path"] for r in evidence),
+        )
+        self.assertEqual(
+            len(self.server.index_requests), 5
+        )  # two manifest pages, three parent groups
+        self.assertLess(len(self.server.requests), 20)
+        self.assertEqual(
+            sum(len(body["inputs"]) for _, _, body in self.server.requests), 20
+        )
+        self.server.requests.clear()
+        self.server.index_requests.clear()
+        self.server.delay = 0.02
+        try:
+            streamed = self.raw_cli(*args, "--decision-transport=single", "--no-rank")
+        finally:
+            self.server.delay = 0
+        streamed_paths = [
+            json.loads(line)["data"]["path"]
+            for line in streamed.stdout.splitlines()
+            if json.loads(line)["type"] == "evidence"
+        ]
+        self.assertEqual(streamed_paths, sorted(streamed_paths))
+        self.assertGreater(self.server.peak, 1)
+        self.assertLessEqual(self.server.peak, 8)
+
+    def test_media_adaptive_parent_windows_cover_the_complete_first_wave(self):
+        config = self.visual_parents(units=16)
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--media=images",
+            "--json",
+            "--no-cache",
+            "--table-config",
+            config,
+            "--decision-concurrency=8",
+        )
+        self.assertEqual(
+            sum(
+                json.loads(line)["type"] == "evidence"
+                for line in result.stdout.splitlines()
+            ),
+            128,
+        )
+        # The conservative byte bound admits seven 16-unit parents together,
+        # then the last parent. No unused eight-field preload is issued.
+        self.assertEqual(len(self.server.index_requests), 3)
+        self.assertEqual(self.server.index_requests[1][2]["limit"], 7)
+        self.assertEqual(self.server.index_requests[2][2]["limit"], 1)
+
+    def test_media_shared_provider_pool_honors_requested_concurrency(self):
+        config = self.visual_parents()
+        self.server.barrier = threading.Barrier(8)
+        self.server.measure_provider_work = True
+        try:
+            self.raw_cli(
+                *self.decision_args(),
+                "--media=images",
+                "--no-cache",
+                "--table-config",
+                config,
+                "--decision-concurrency=8",
+                "--decision-transport=single",
+            )
+        finally:
+            self.server.barrier = None
+        self.assertEqual(self.server.peak, 8)
+
+    def test_media_unranked_output_arrives_before_the_next_parent_completes(self):
+        config = self.visual_parents(count=2, page_size=1)
+        blocked = threading.Event()
+        release = threading.Event()
+
+        def second():
+            blocked.set()
+            release.wait(10)
+
+        def first():
+            self.server.on_provider = second
+
+        self.server.on_provider = first
+        process = subprocess.Popen(
+            [
+                BINARY,
+                *self.decision_args(),
+                "--media=images",
+                "--json",
+                "--no-cache",
+                "--table-config",
+                config,
+                "--decision-concurrency=8",
+                "--decision-transport=single",
+                "--no-rank",
+            ],
+            cwd=self.root,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self.assertTrue(blocked.wait(10))
+            self.assertTrue(
+                select.select([process.stdout], [], [], 1)[0],
+                "first parent stayed buffered while the second provider call was blocked",
+            )
+            record = json.loads(process.stdout.readline())
+            self.assertEqual(record["type"], "evidence")
+            self.assertEqual(record["data"]["path"], "Drive/image-0000.png")
+        finally:
+            release.set()
+            out, err = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, err)
+        self.assertNotIn(b"leaked", err)
+
+    def test_media_parent_group_respects_document_and_pending_output_budgets(self):
+        config = self.visual_parents()
+        args = [
+            *self.decision_args(),
+            "--media=images",
+            "--json",
+            "--no-cache",
+            "--table-config",
+            config,
+            "--decision-concurrency=8",
+        ]
+        result = self.raw_cli(*args, "--max-index-documents=2", code=2)
+        records = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(sum(row["type"] == "evidence" for row in records), 2)
+        self.assertEqual(
+            self.server.index_requests[1][2]["query"],
+            {"bool": {"filter": {"ids": ["0000", "0001"]}}},
+        )
+        self.assertIn(b"IndexDocumentBudgetExceeded", result.stderr)
+        self.server.requests.clear()
+        self.server.index_requests.clear()
+        result = self.raw_cli(*args, "--max-pending-output=1", code=2)
+        self.assertIn(b"partial", result.stderr)
+        for line in result.stdout.splitlines():
+            json.loads(line)
+
+    def test_media_group_authority_is_not_reused_for_a_later_wave(self):
+        import copy
+
+        config = self.visual_parents()
+        row = self.server.index_documents[0]["_source"]["grep"]
+        first = row["evidence"][0]
+        row["evidence"] = []
+        for i in range(17):
+            unit = copy.deepcopy(first)
+            unit["id"] = f"unit-{i:02}"
+            row["evidence"].append(unit)
+        self.server.on_provider = lambda: row.update(
+            permissions={"public": False, "readers": []}
+        )
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--media=images",
+            "--json",
+            "--no-cache",
+            "--table-config",
+            config,
+            "--decision-concurrency=8",
+            code=2,
+        )
+        evidence = [
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if json.loads(line)["type"] == "evidence"
+        ]
+        self.assertEqual(len(evidence), 23)
+        self.assertNotIn("unit-16", json.dumps(self.server.requests))
+        self.assertIn(b"IndexAuthorizationFailed", result.stderr)
+
+    def test_media_parent_group_size_failure_falls_back_and_explicit_budget_is_ordered(
+        self,
+    ):
+        config = self.visual_parents()
+        self.server.asset_mode = "oversized_parent_group"
+        args = [
+            *self.decision_args(),
+            "--media=images",
+            "--json",
+            "--no-cache",
+            "--table-config",
+            config,
+            "--decision-concurrency=8",
+        ]
+        result = self.raw_cli(*args)
+        self.assertEqual(
+            sum(
+                json.loads(line)["type"] == "evidence"
+                for line in result.stdout.splitlines()
+            ),
+            8,
+        )
+        self.server.index_requests.clear()
+        self.server.requests.clear()
+        self.server.asset_mode = None
+        result = self.raw_cli(*args, "--max-requests=4", code=2)
+        evidence = [
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if json.loads(line)["type"] == "evidence"
+        ]
+        self.assertEqual(
+            [r["data"]["path"] for r in evidence], ["Drive/image-0000.png"]
+        )
+        self.assertEqual(len(self.server.index_requests) + len(self.server.requests), 4)
 
     def test_media_batch_refusal_preserves_and_caches_valid_siblings(self):
         config = self.visual_document(units=3)

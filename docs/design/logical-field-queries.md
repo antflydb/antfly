@@ -855,3 +855,20 @@ cuts, unrelated writes, rejected registration, overlapping writers, ambiguous
 attempt retirement, allocation failure, capacity and epoch exhaustion; native
 DocStore/DB tests cover transaction/batch invalidation, delete/recreate, pinned
 readers and the actual original-value loading path.
+
+
+### Proof-cache admission under pressure (2026-10-22)
+
+The original-value registry uses lazy bounded CLOCK admission instead of clearing
+all facts on the first cold insertion at capacity. One insertion into a full
+4,096-entry registry evicts one entry; unrelated warm proofs remain available.
+Reads mark their slot referenced, mutation invalidation frees its slot, and
+subsequent admission reuses holes without evicting an unrelated fact. Whole-owner
+replacement and excessive mutation fan-out still clear all entries deliberately.
+Ring and directory storage are lazy and bounded; allocation failure remains a
+miss and cannot discard unrelated entries before admission capacity is available.
+A logical-source window checks up to 64 proof identities under one lock and
+registers fetched proofs under one lock, with epoch validity rechecked after I/O.
+Owner/nonce/epoch/publication rules are unchanged. This cache stores scalar source
+facts; it does not establish complete cross-write predicate membership or bypass
+current authorization, selected-range digests or original-byte work budgets.

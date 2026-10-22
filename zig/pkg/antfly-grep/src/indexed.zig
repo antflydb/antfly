@@ -65,7 +65,7 @@ pub fn run(search: anytype) !void {
     const original_source = search.provenance;
     defer search.provenance = original_source;
     search.provenance = .{ .backend = .antfly, .freshness = .indexed };
-    var http = httpx.Client.initWithConfig(search.a, search.io, .{ .max_response_size = config.max_response_bytes });
+    var http = httpx.Client.initWithConfig(search.a, search.io, .{ .max_response_size = config.max_response_bytes, .pool_max_per_host = @intCast(@max(@as(usize, 5), @min(@as(usize, 8), search.options.providerJobs()) + 1)) });
     defer http.deinit();
     var count: usize = 0;
     for (config.tables) |table| {
@@ -117,6 +117,22 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     const overlap = config.prefetch and !budgeted_decisions and !search.options.quiet and search.options.max_count == std.math.maxInt(usize);
     if (overlap) fetcher.thread = try std.Thread.spawn(.{}, Fetch.worker, .{&fetcher});
     defer fetcher.finish();
+    const Search = @typeInfo(@TypeOf(search)).pointer.child;
+    const Lane = Search.IndexedLane;
+    const Job = struct { lane: *Lane, resolver: AssetResolver(@TypeOf(search)) = undefined };
+    // Finite evaluation budgets and early-selection modes retain discovery order.
+    const parallel = search.options.media == .images and (!budgeted_decisions or !search.options.max_requests_explicit) and
+        search.options.max_regions == std.math.maxInt(usize) and search.options.max_source_bytes == std.math.maxInt(usize) and
+        !search.options.quiet and !search.options.files and !search.options.files_with_matches and !search.options.files_without_match;
+    const lane_count = if (parallel) @min(@as(usize, 8), search.options.providerJobs()) else 1;
+    var pool: @import("worker_pool.zig").Pool = .{ .io = search.io };
+    defer pool.deinit();
+    var jobs: [8]Job = undefined;
+    var initialized: usize = 0;
+    defer for (jobs[0..initialized]) |*job| {
+        job.lane.finish(search) catch {};
+        job.lane.deinit(search);
+    };
     var page_size = config.page_size;
     var pending = false;
     while (!search.stopped()) {
@@ -168,7 +184,32 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             fetcher.submit(.{ .cursor = cursor, .snapshot = snapshot, .page_size = page_size });
             pending = true;
         }
-        for (hits.array.items) |hit| {
+        var submitted: usize = 0;
+        var materialized: ?Materialized = null;
+        var window_end: usize = 0;
+        var window_width: usize = 1;
+        defer if (materialized) |group| group.page.deinit(search.a);
+        // Drain every borrowed page before its arena is released, including
+        // cancellation, projection failures and output-budget errors.
+        defer for (jobs[0..initialized]) |*job| {
+            job.lane.finish(search) catch {};
+        };
+        for (hits.array.items, 0..) |hit, hit_index| {
+            if (search.stopped()) return;
+            if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
+            if (lane_count > 1 and hit_index == window_end) {
+                for (0..@min(submitted, lane_count)) |i| {
+                    const index = if (submitted < lane_count) i else (submitted + i) % lane_count;
+                    try jobs[index].lane.finish(search);
+                }
+                submitted = 0;
+                if (materialized) |group| group.page.deinit(search.a);
+                materialized = null;
+                window_end = @min(hits.array.items.len, hit_index + @min(lane_count, search.options.max_index_documents - count.*));
+                materialized = try prefetchAssets(search, http, config, table, url, user_filter, a, hits.array.items[hit_index..window_end], &discovery);
+                if (materialized) |group| window_end = hit_index + group.covered_hits;
+                window_width = window_end - hit_index;
+            }
             if (search.stopped()) return;
             if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
             count.* += 1;
@@ -215,11 +256,106 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 if (units) |raw| doc.evidence = try @import("antfly_source_evidence").parseUnits(a, raw);
                 doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany };
             }
-            search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
+            if (lane_count > 1) {
+                const slot = submitted % lane_count;
+                if (slot == initialized) {
+                    jobs[slot].lane = try Lane.init(search);
+                    initialized += 1;
+                }
+                const job = &jobs[slot];
+                try job.lane.finish(search);
+                job.resolver = resolver;
+                job.resolver.materialized = materialized;
+                job.resolver.search = &job.lane.search;
+                doc.evidence_loader = .{ .ctx = &job.resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany };
+                job.lane.search.decider.allow_parallel = window_width == 1;
+                job.lane.search.next_ordinal = search.next_ordinal;
+                search.next_ordinal += 1;
+                job.lane.doc = doc;
+                job.lane.failure = null;
+                job.lane.handle = try pool.launch(Lane.run, job.lane);
+                submitted += 1;
+            } else search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
         }
+        // Stable draining order is also the discovery order after ring wrap.
+        if (initialized > 0) for (0..@min(submitted, lane_count)) |i| {
+            const index = if (submitted < lane_count) i else (submitted + i) % lane_count;
+            try jobs[index].lane.finish(search);
+        };
         if (!has_next) return;
     }
 }
+const Materialized = struct { page: *Page, fields: []const []const u8, covered_hits: usize };
+
+/// Group only equal projection shapes. Unioning unrelated per-parent fields
+/// would multiply payloads on every row and defeat the byte bound.
+fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: Table, url: []const u8, filter: ?std.json.Value, a: A, hits: []const std.json.Value, discovery: anytype) !?Materialized {
+    const media = @import("antfly_source_evidence");
+    if (search.options.max_count == 0 or search.options.max_regions_per_file == 0) return null;
+    var ids: std.ArrayList([]const u8) = .empty;
+    var shape: std.ArrayList([]const u8) = .empty;
+    var estimated: usize = 0;
+    var covered_hits = hits.len;
+    for (hits, 0..) |hit, hit_index| {
+        const source = document.field(hit, "_source") orelse return null;
+        const value = document.at(source, table.document_field) orelse return null;
+        if (!document.allowed(value, config.principals)) continue;
+        const id = try document.string(hit, "_id");
+        const listing = document.Document.parseListing(value, table.name, id, "", 0) catch return null;
+        const path = listing.path;
+        if (!(discovery.indexedAllowed(path) catch return null)) continue;
+        const raw = document.field(value, "evidence") orelse return null;
+        if (raw != .array or raw.array.items.len > media.max_units) return null;
+        if (raw.array.items.len == 0) continue;
+        var fields: std.ArrayList([]const u8) = .empty;
+        var bytes: usize = 65536;
+        var wave: usize = 0;
+        const width = @min(raw.array.items.len, @min(@as(usize, 16), @min(search.options.decisionBatchSize() *| search.options.providerJobs(), @min(search.options.max_count, search.options.max_regions_per_file))));
+        for (raw.array.items[0..width]) |entry| {
+            // Admission needs only one wave. Full manifest validation happens
+            // once in the foreground before a parent can be scheduled.
+            const unit = media.Unit.parse(a, entry) catch return null;
+            if (unit.asset.byte_length > search.options.max_image_bytes) return null;
+            const cost = unit.asset.byte_length *| 2 +| unit.text.len *| 8 +| path.len *| 8 +| 65536;
+            if (wave > 0 and cost > 8 * 1024 * 1024 -| bytes) break;
+            bytes +|= cost;
+            wave += 1;
+            const present = for (fields.items) |field| {
+                if (std.mem.eql(u8, field, unit.asset.field)) break true;
+            } else false;
+            if (!present) try fields.append(a, unit.asset.field);
+        }
+        if (ids.items.len == 0) try shape.appendSlice(a, fields.items) else {
+            const equal = if (shape.items.len == fields.items.len) for (shape.items, fields.items) |old, current| {
+                if (!std.mem.eql(u8, old, current)) break false;
+            } else true else false;
+            if (!equal) {
+                covered_hits = hit_index;
+                break;
+            }
+        }
+        if (bytes > @min(@as(usize, 8 * 1024 * 1024), config.max_response_bytes) -| estimated) {
+            covered_hits = hit_index;
+            break;
+        }
+        estimated +|= bytes;
+        try ids.append(a, id);
+    }
+    if (ids.items.len < 2) return null;
+    var fields: std.ArrayList([]const u8) = .empty;
+    try fields.append(a, try std.fmt.allocPrint(a, "{s}.revision", .{table.document_field}));
+    try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{table.document_field}));
+    try fields.appendSlice(a, shape.items);
+    const encoded = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = ids.items } } }, .{});
+    var fetch: Fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false };
+    defer search.summary.index_requests += fetch.summary.index_requests;
+    const page = fetch.load(.{ .cursor = null, .snapshot = null, .page_size = ids.items.len }) catch |err| switch (err) {
+        error.ResponseTooLarge, error.IndexPageMemoryExceeded, error.IndexProjectionTooLarge => return null,
+        else => return err,
+    };
+    return .{ .page = page, .fields = shape.items, .covered_hits = covered_hits };
+}
+
 const Page = struct {
     memory: @import("antfly_regex").Budget,
     arena: std.heap.ArenaAllocator,
@@ -346,7 +482,7 @@ const Fetch = struct {
                 if (!Limits.reserve(&self.limits.requests, 1, self.options.max_requests)) return error.RequestBudgetExceeded;
                 self.summary.index_requests += 1;
                 var response = self.http.post(self.url, .{ .json = body, .headers = headers, .timeout_ms = self.options.timeout_ms, .max_response_size = self.config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .cancellation = httpx.CancellationToken.fromCallback(self, Fetch.cancelled) }) catch |err| {
-                    if (err == error.ResponseTooLarge and page_size.* > 1) {
+                    if (self.ordered and err == error.ResponseTooLarge and page_size.* > 1) {
                         page_size.* = @max(1, page_size.* / 2);
                         continue :resize;
                     }
@@ -357,6 +493,7 @@ const Fetch = struct {
                 };
                 defer response.deinit();
                 const status = response.status.code;
+                if (status == 413 and !self.ordered) return error.IndexProjectionTooLarge;
                 if (status == 413 and page_size.* > 1) {
                     page_size.* = @max(1, page_size.* / 2);
                     continue :resize;
@@ -371,7 +508,7 @@ const Fetch = struct {
                     continue;
                 }
                 const decoded = std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.EmptyIndexResponse, .{ .allocate = .alloc_always }) catch |err| {
-                    if (memory.denied and page_size.* > 1) {
+                    if (self.ordered and memory.denied and page_size.* > 1) {
                         page_size.* = @max(1, page_size.* / 2);
                         continue :resize;
                     }
@@ -380,6 +517,7 @@ const Fetch = struct {
                 const envelope = document.field(decoded.value, "responses") orelse return error.InvalidIndexResponse;
                 if (envelope != .array or envelope.array.items.len != 1) return error.InvalidIndexResponse;
                 const result_status = document.integer(document.field(envelope.array.items[0], "status")) orelse return error.InvalidIndexResponse;
+                if (result_status == 413 and !self.ordered) return error.IndexProjectionTooLarge;
                 if (result_status == 413 and page_size.* > 1) {
                     page_size.* = @max(1, page_size.* / 2);
                     continue :resize;
@@ -547,6 +685,7 @@ fn AssetResolver(comptime SearchType: type) type {
         id: []const u8,
         revision: []const u8,
         filter: ?std.json.Value,
+        materialized: ?Materialized = null,
         const media = @import("antfly_source_evidence");
         fn load(raw: *anyopaque, a: A, unit: media.Unit) !media.Image {
             var result: [1]media.Loaded = undefined;
@@ -558,8 +697,28 @@ fn AssetResolver(comptime SearchType: type) type {
         }
         fn loadMany(raw: *anyopaque, a: A, units: []const media.Unit, output: []media.Loaded) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            // A grouped current-row read authorizes one wave only. Later
+            // waves must observe fresh parent permissions and revision.
+            defer self.materialized = null;
             std.debug.assert(units.len == output.len and units.len <= 16);
             if (self.search.stopped()) return error.Canceled;
+            loadGroup(self, a, units, output) catch |err| {
+                const distinct_fields = for (units[1..]) |unit| {
+                    if (!std.mem.eql(u8, unit.asset.field, units[0].asset.field)) break true;
+                } else false;
+                if (distinct_fields and (err == error.ResponseTooLarge or err == error.IndexPageMemoryExceeded or err == error.IndexProjectionTooLarge)) {
+                    const half = units.len / 2;
+                    // Each partition reauthorizes the same expected revision.
+                    // Independent failures cannot erase validated siblings.
+                    try loadMany(raw, a, units[0..half], output[0..half]);
+                    try loadMany(raw, a, units[half..], output[half..]);
+                    return;
+                }
+                if (err == error.Canceled or err == error.OutOfMemory or err == error.RequestBudgetExceeded or err == error.IndexAuthorizationFailed or err == error.EvidenceRevisionChanged) return err;
+                for (output) |*item| item.* = .{ .failed = err };
+            };
+        }
+        fn loadGroup(self: *@This(), a: A, units: []const media.Unit, output: []media.Loaded) !void {
             var fields: std.ArrayList([]const u8) = .empty;
             try fields.append(a, try std.fmt.allocPrint(a, "{s}.revision", .{self.table.document_field}));
             try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{self.table.document_field}));
@@ -584,8 +743,17 @@ fn AssetResolver(comptime SearchType: type) type {
             defer self.search.summary.index_requests += fetch.summary.index_requests;
             // Point reads deliberately omit ordering/cursors. They reauthorize
             // current rows without creating a durable pagination snapshot.
-            const page = try fetch.load(.{ .cursor = null, .snapshot = null, .page_size = 1 });
-            defer page.deinit(self.search.a);
+            const borrowed = if (self.materialized) |group| blk: {
+                for (fields.items[2..]) |field| {
+                    const present = for (group.fields) |projected| {
+                        if (std.mem.eql(u8, field, projected)) break true;
+                    } else false;
+                    if (!present) break :blk false;
+                }
+                break :blk true;
+            } else false;
+            const page = if (borrowed) self.materialized.?.page else try fetch.load(.{ .cursor = null, .snapshot = null, .page_size = 1 });
+            defer if (!borrowed) page.deinit(self.search.a);
             const responses = document.field(page.parsed.value, "responses") orelse return error.InvalidIndexResponse;
             if (responses != .array or responses.array.items.len != 1) return error.InvalidIndexResponse;
             const result = responses.array.items[0];
@@ -594,8 +762,13 @@ fn AssetResolver(comptime SearchType: type) type {
             if (status < 200 or status >= 300 or document.field(result, "error") != null and document.field(result, "error").? != .null) return error.IndexQueryFailed;
             const hits = document.field(result, "hits") orelse return error.InvalidIndexResponse;
             const list = document.field(hits, "hits") orelse return error.InvalidIndexResponse;
-            if (list != .array or list.array.items.len != 1) return error.IndexAuthorizationFailed;
-            const hit = list.array.items[0];
+            if (list != .array or (!borrowed and list.array.items.len != 1)) return error.IndexAuthorizationFailed;
+            var found: ?std.json.Value = null;
+            for (list.array.items) |item| if (std.mem.eql(u8, try document.string(item, "_id"), self.id)) {
+                if (found != null) return error.InvalidEvidenceParent;
+                found = item;
+            };
+            const hit = found orelse return error.IndexAuthorizationFailed;
             if (!std.mem.eql(u8, try document.string(hit, "_id"), self.id)) return error.InvalidEvidenceParent;
             const source = document.field(hit, "_source") orelse return error.InvalidIndexResponse;
             const parent = document.at(source, self.table.document_field) orelse return error.InvalidIndexResponse;
@@ -619,7 +792,9 @@ fn AssetResolver(comptime SearchType: type) type {
                     item.* = .{ .failed = err };
                     continue;
                 };
-                image.data_url = try a.dupe(u8, image.data_url);
+                // Group pages are pinned until every lane joins. Point pages
+                // retire here, so only those require a retained URL copy.
+                if (!borrowed) image.data_url = try a.dupe(u8, image.data_url);
                 item.* = .{ .image = image };
             }
         }

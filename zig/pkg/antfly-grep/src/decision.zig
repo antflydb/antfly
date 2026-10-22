@@ -31,6 +31,9 @@ pub const Input = struct {
     input: []const u8,
     context: []const u8 = "",
     image: ?@import("antfly_source_evidence").Image = null,
+    // Effective evidence is immutable for a wave. Reuse its measured wire size
+    // across cache lookup, coalescing and transport admission; IDs are external.
+    serialized_evidence_bytes: ?usize = null,
     context_hash: ?[32]u8 = null,
     derived_key: ?[64]u8 = null,
     deferred: ?Deferred = null,
@@ -81,6 +84,7 @@ pub const Input = struct {
         try json.endArray();
     }
     pub fn evidenceBytes(self: Input) !usize {
+        if (self.serialized_evidence_bytes) |bytes| return bytes;
         var buffer: [512]u8 = undefined;
         var counter: std.Io.Writer.Discarding = .init(&buffer);
         var json: std.json.Stringify = .{ .writer = &counter.writer };
@@ -135,7 +139,8 @@ pub const Client = struct {
     // before per-target bytes; preserve every existing on-disk key exactly.
     key_prefix: ?struct { parts: [11][]const u8, hash: std.crypto.hash.sha2.Sha256 } = null,
     pub fn init(a: Allocator, io: std.Io, options: *const Options) Client {
-        return .{ .a = a, .http = httpx.Client.init(a, io), .options = options, .io = io };
+        const lanes: u32 = @intCast(@min(@as(usize, 256), @max(@as(usize, 1), options.providerJobs())));
+        return .{ .a = a, .http = httpx.Client.initWithConfig(a, io, .{ .pool_max_connections = @max(20, lanes), .pool_max_per_host = @max(5, lanes) }), .options = options, .io = io };
     }
     pub fn deinit(self: *Client) void {
         if (self.pool) |pool| pool.deinit();
@@ -789,13 +794,7 @@ pub const Client = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        for (inputs) |input| if (input.image != null) {
-            var buffer: [512]u8 = undefined;
-            var counter: std.Io.Writer.Discarding = .init(&buffer);
-            var json: std.json.Stringify = .{ .writer = &counter.writer };
-            try input.writeEvidence(&json);
-            if (counter.fullCount() > 1024 * 1024) return error.DecisionLimitExceeded;
-        };
+        for (inputs) |input| if (input.image != null and try input.evidenceBytes() > 1024 * 1024) return error.DecisionLimitExceeded;
         const query_count = 1 + (if (self.query == null) self.options.queries.items.len else @as(usize, 0));
         const policy_count = if (self.query == null and self.stage != .directory) self.options.filters.items.len + self.options.only.items.len + self.options.not.items.len else 0;
         const count = query_count + policy_count;

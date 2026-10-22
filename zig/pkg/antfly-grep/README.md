@@ -4503,5 +4503,23 @@ and warm requests from 9 to 2 with no inference. Median elapsed time was
 468 to 108 ms cold / 232 to 66 ms warm on macOS, and 389 to 78 ms cold /
 224 to 49 ms warm in the two-CPU, 1-GiB ARM64 Linux VM. These synthetic delays
 measure transport shape, not live-provider speed or model-token savings.
-Cross-parent scheduling is still serial. Reproduce with
-`bench/visual_batches.py --help`; raw trial reports remain in ignored `output/`.
+That historical qualification uses one parent. The follow-up below adds
+cross-parent scheduling. Reproduce with `bench/visual_batches.py --help`; raw trial reports remain in ignored `output/`.
+
+
+Cross-parent visual search now groups up to eight equal-shape parent projections,
+coalesces Decisions across bounded worker lanes, and retains ordered output and
+per-parent authorization/revision/digest checks. Asset-size rejection falls back
+to individual parents; oversized per-parent field groups split adaptively. A
+borrowed asset page covers one evaluation wave, then later waves authorize again.
+Explicit finite budgets and early-selection modes retain serial admission; the
+default request safety cap remains shared across every HTTP attempt. Active
+parents can increase RSS: concurrency is a latency/throughput tradeoff, not a
+claim that every workload uses less memory.
+
+`bench/visual_batches.py --parents 8 --units 1` measures separate documents;
+`--parents 20 --units 8` crosses pages and windows, and `--image-bytes 262144`
+adds valid PNG payloads to exercise larger transfers. Five alternating paired
+trials record exact output equivalence, HTTP counts, child CPU/wall time, first
+stdout and peak RSS. Use pinned baseline/current binaries and write raw reports
+to ignored `output/`. Live model tokens, prices and relevance remain unmeasured.

@@ -232,7 +232,7 @@
         "schema/document-v2.json",
         "README.md"
       ],
-      "limits": "Explicit --media images evaluates local images and indexed same-parent page/slide/image units through common Decisions messages. Fresh authorized asset reads, revision/digest/MIME/size checks precede score reuse. Bounded header inspection, bounded Antfly multimodal batches/shared contexts and shared named questions; ranked/partial output, valid siblings, rejected partitions, point projections, file-size admission and quiet selection have fixtures. Local PDF rendering, audio/video, workspace media and Cloud connectors/materializers are not implemented. Fixtures do not establish live visual-model relevance or token cost."
+      "limits": "Explicit --media images evaluates local images and indexed same-parent page/slide/image units through common Decisions messages. Fresh authorized asset reads, revision/digest/MIME/size checks precede score reuse. Bounded header inspection, bounded Antfly multimodal batches/shared contexts and shared named questions; ranked/partial output, valid siblings, rejected partitions, adaptive field splitting, bounded cross-parent projections/coalescing, later-wave authorization, file-size admission and quiet selection have fixtures. Local PDF rendering, audio/video, workspace media and Cloud connectors/materializers are not implemented. Fixtures do not establish live visual-model relevance or token cost."
     }
   ]
 }

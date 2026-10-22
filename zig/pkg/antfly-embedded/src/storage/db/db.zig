@@ -132122,9 +132122,15 @@ const StoredLogicalSources = struct {
             var names: [64][]const u8 = undefined;
             var indices: [64]usize = undefined;
             var count: usize = 0;
-            for (physical, ids, 0..) |row, id, i| {
+            var identities: [64][32]u8 = undefined;
+            var cached: [64]?@TypeOf(registry.*).Facts = undefined;
+            for (physical, 0..) |row, i| {
                 const key = revisions.keyForPhysical(row) orelse return error.InvalidArgument;
-                if (registry.get(self.owner.proof_token, key[key.len - 32 ..].*)) |facts| {
+                identities[i] = key[key.len - 32 ..].*;
+            }
+            registry.getMany(self.owner.proof_token, identities[0..physical.len], cached[0..physical.len]);
+            for (physical, ids, 0..) |row, id, i| {
+                if (cached[i]) |facts| {
                     if (facts.content.kind == row[row.len - 1]) {
                         proofs[i] = facts.content;
                         timestamps[i] = facts.timestamp;
@@ -132141,14 +132147,15 @@ const StoredLogicalSources = struct {
             var fetched: [64]?revisions.Content = @splat(null);
             var times: [64]u64 = @splat(0);
             if (count > 0) try revisions.loadWindow(self.upstream, a, missing[0..count], names[0..count], fetched[0..count], times[0..count]);
+            var registrations: [64]?@TypeOf(registry.*).Facts = @splat(null);
             for (indices[0..count], fetched[0..count], times[0..count]) |i, proof, timestamp| {
                 proofs[i] = proof;
                 timestamps[i] = timestamp;
                 if (proof) |content| {
-                    const key = revisions.keyForPhysical(physical[i]).?;
-                    registry.put(self.owner.db.core.store.alloc, self.owner.proof_token, key[key.len - 32 ..].*, .{ .content = content, .timestamp = timestamp });
+                    registrations[i] = .{ .content = content, .timestamp = timestamp };
                 }
             }
+            if (count > 0) registry.putMany(self.owner.db.core.store.alloc, self.owner.proof_token, identities[0..physical.len], registrations[0..physical.len]);
         }
     };
     fn load(raw: *anyopaque, alloc: Allocator, ids: []const []const u8, roots: []const []const u8) anyerror![]db_query_search.LogicalSourceRow {
