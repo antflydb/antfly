@@ -43,6 +43,7 @@ pub const Owner = struct {
     bound: bool = false,
     lifecycle_mutex: std.atomic.Mutex = .unlocked,
     worker_running: std.atomic.Value(bool) = .init(false),
+    in_flight: std.atomic.Value(u32) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     jitter_salt: u64 = 0,
     launch_failure_streak: u32 = 0,
@@ -64,6 +65,14 @@ pub const Owner = struct {
         };
     }
     pub fn start(self: *Owner, port: Port) void {
+        lockAtomic(&self.lifecycle_mutex);
+        if (self.stopping.load(.acquire) or self.in_flight.load(.monotonic) == std.math.maxInt(u32)) {
+            self.lifecycle_mutex.unlock();
+            return;
+        }
+        _ = self.in_flight.fetchAdd(1, .acquire);
+        self.lifecycle_mutex.unlock();
+        defer _ = self.in_flight.fetchSub(1, .release);
         if (port.before_start) |hook| hook(port.ptr);
         _ = lockAtomic(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
@@ -177,7 +186,7 @@ pub const Owner = struct {
 
         // The owner-scoped worker publishes completion. Wait outside the
         // lifecycle mutex so its final handshake cannot deadlock shutdown.
-        while (self.worker_running.load(.acquire)) {
+        while (self.worker_running.load(.acquire) or self.in_flight.load(.acquire) != 0) {
             const io = port.runtime.io() orelse std.Options.debug_io;
             io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
@@ -187,6 +196,20 @@ pub const Owner = struct {
         _ = lockAtomic(&self.lifecycle_mutex);
         std.debug.assert(!self.worker_running.load(.acquire));
         self.lifecycle_mutex.unlock();
+    }
+
+    pub fn stopWithAdmission(self: *Owner, port: Port, original: @import("../../common/read_admission.zig").Port) !void {
+        lockAtomic(&self.lifecycle_mutex);
+        if (self.bound and (self.port.ptr != port.ptr or self.port.runtime != port.runtime or self.port.owner_id != port.owner_id)) {
+            self.lifecycle_mutex.unlock();
+            return error.InvalidBackgroundOwner;
+        }
+        self.stopping.store(true, .release);
+        self.lifecycle_mutex.unlock();
+        // The dedicated owner counts both claimed probes and the worker's
+        // final lifecycle handshake; quiescence never closes backend work.
+        try port.runtime.durable_jobs.quiesceOwnerWithAdmission(port.owner_id, original);
+        try runtime_mod.waitForDirectAdmissionsWithAdmission(port.runtime, &self.in_flight, original);
     }
 
     pub fn portableActivationRetryDelayNs(path: []const u8, jitter_salt: u64, failure_streak: u32) u64 {
@@ -366,4 +389,110 @@ test "portable activation finite recovery retains backoff and executes under ord
     try std.testing.expectEqual(@as(u64, 0), fixture.due());
     try std.testing.expectEqual(@as(u32, 0), fixture.streak());
     try std.testing.expectEqual(@as(u32, 4), fixture.attempts.load(.acquire));
+}
+
+test "maintenance runtime portable activation stop retains retry and direct-start borrows after interruption" {
+    const admission = @import("../../common/read_admission.zig");
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    for ([_]bool{ false, true }) |direct_start| for (std.enums.values(Case)) |case| {
+        var backend = try runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+        defer backend.deinit();
+        const id = try backend.ptr().allocOwnerId();
+        const io = backend.ptr().io().?;
+        var owner: Owner = .{};
+        const F = struct {
+            owner: *Owner,
+            backend: *runtime_mod.BackendRuntime,
+            id: u64,
+            io: std.Io,
+            direct: bool,
+            entered: std.Io.Event = .unset,
+            release: std.Io.Event = .unset,
+            pending: std.atomic.Value(bool) = .init(true),
+            attempts: usize = 0,
+            fn retry(raw: *anyopaque) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.attempts += 1;
+                self.entered.set(self.io);
+                self.release.waitUncancelable(self.io);
+                self.pending.store(false, .release);
+                return true;
+            }
+            fn before(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (!self.direct) return;
+                self.entered.set(self.io);
+                self.release.waitUncancelable(self.io);
+            }
+            fn now(_: *anyopaque) u64 {
+                return 1;
+            }
+            fn port(self: *@This()) Owner.Port {
+                return .{ .ptr = self, .path = "controlled-activation", .runtime = self.backend, .owner_id = self.id, .pending = &self.pending, .retry = retry, .before_start = before, .now = now };
+            }
+            fn start(self: *@This()) void {
+                self.owner.start(self.port());
+            }
+        };
+        const Control = struct {
+            f: *F,
+            case: Case,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case != .lifetime_in_wait) self.f.release.set(self.f.io);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                self.f.release.set(self.f.io);
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        var f: F = .{ .owner = &owner, .backend = backend.ptr(), .id = id, .io = io, .direct = direct_start };
+        var thread: ?std.Thread = null;
+        defer {
+            f.release.set(io);
+            if (thread) |active| active.join();
+            owner.stop(f.port());
+            backend.ptr().durable_jobs.closeOwner(id);
+        }
+        if (direct_start) thread = try std.Thread.spawn(.{}, F.start, .{&f}) else {
+            owner.next_attempt_ns = 1;
+            f.start();
+        }
+        try f.entered.wait(io);
+        var control: Control = .{ .f = &f, .case = case };
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const result = owner.stopWithAdmission(f.port(), .init(&payload));
+        if (case == .success) try result else try std.testing.expectError(switch (case) {
+            .begin_failure => error.NotFound,
+            .end_failure => error.Canceled,
+            .lifetime_in_wait => error.DeadlineExceeded,
+            .success => unreachable,
+        }, result);
+        try std.testing.expectError(error.BackgroundOwnerIdExhausted, backend.ptr().durable_jobs.reopenOwner(id));
+        f.release.set(io);
+        if (thread) |active| active.join();
+        thread = null;
+        owner.stop(f.port());
+        backend.ptr().durable_jobs.drainOwner(id);
+        f.start();
+        try std.testing.expect(owner.stopping.load(.acquire));
+        try std.testing.expect(!owner.worker_running.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), owner.in_flight.load(.acquire));
+        try std.testing.expectEqual(@as(usize, if (direct_start) 0 else 1), f.attempts);
+        try std.testing.expectEqual(@as(usize, 1), control.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .begin_failure) 0 else 1), control.ends);
+    };
 }

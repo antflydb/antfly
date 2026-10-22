@@ -93,34 +93,7 @@ pub const Owner = struct {
         self.stopping.store(true, .release);
         self.mutex.unlock();
         try self.runtime.durable_jobs.quiesceOwnerWithAdmission(self.owner_id, original);
-        var trace: @import("../../common/read_admission.zig").RejectionTrace = .{};
-        const control = trace.bind(original).?;
-        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
-        while (true) {
-            try control.checkpoint();
-            if (self.in_flight.load(.acquire) == 0) return;
-            try boundary.beginWait();
-            var failure: ?anyerror = null;
-            while (self.in_flight.load(.acquire) != 0) {
-                control.checkLifetime() catch |cause| {
-                    failure = trace.failure orelse cause;
-                    break;
-                };
-                const io = self.runtime.io() orelse self.runtime.filesystemIo() orelse {
-                    failure = error.BackendRuntimeUnavailable;
-                    break;
-                };
-                io.sleep(.fromMilliseconds(1), .awake) catch |cause| {
-                    failure = cause;
-                    break;
-                };
-            }
-            boundary.endWait() catch |cause| {
-                if (failure) |first| return first;
-                return trace.failure orelse cause;
-            };
-            if (failure) |cause| return cause;
-        }
+        try background.waitForDirectAdmissionsWithAdmission(self.runtime, &self.in_flight, original);
     }
     fn cast(ptr: *anyopaque) *Owner {
         return @ptrCast(@alignCast(ptr));

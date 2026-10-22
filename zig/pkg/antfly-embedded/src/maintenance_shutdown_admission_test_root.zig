@@ -23,4 +23,6 @@ test {
     _ = @import("storage/db/quarantine_recovery.zig");
     _ = @import("storage/db/native_query_warming.zig");
     _ = @import("storage/db/publication_recovery_owner.zig");
+    _ = @import("storage/db/schema_reconcile_owner.zig");
+    _ = @import("storage/db/portable_activation_recovery.zig");
 }

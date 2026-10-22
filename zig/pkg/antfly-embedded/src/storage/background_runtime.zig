@@ -758,6 +758,40 @@ pub const DurableJobLane = struct {
     }
 };
 
+/// Synchronous producers can retain a context outside the durable job count.
+/// This borrow never escapes; only the original execution wait is lent.
+pub fn waitForDirectAdmissionsWithAdmission(runtime: *BackendRuntime, count: *const std.atomic.Value(u32), original: @import("../common/read_admission.zig").Port) !void {
+    var trace: @import("../common/read_admission.zig").RejectionTrace = .{};
+    const control = trace.bind(original).?;
+    const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+    _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+    while (true) {
+        try control.checkpoint();
+        if (count.load(.acquire) == 0) return;
+        try boundary.beginWait();
+        var failure: ?anyerror = null;
+        while (count.load(.acquire) != 0) {
+            control.checkLifetime() catch |cause| {
+                failure = trace.failure orelse cause;
+                break;
+            };
+            const io = runtime.io() orelse runtime.filesystemIo() orelse {
+                failure = error.BackendRuntimeUnavailable;
+                break;
+            };
+            io.sleep(.fromMilliseconds(1), .awake) catch |cause| {
+                failure = cause;
+                break;
+            };
+        }
+        boundary.endWait() catch |cause| {
+            if (failure) |first| return first;
+            return trace.failure orelse cause;
+        };
+        if (failure) |cause| return cause;
+    }
+}
+
 pub const Job = struct {
     const NativeCallbacks = struct { run: @FieldType(Job, "run") };
     const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);

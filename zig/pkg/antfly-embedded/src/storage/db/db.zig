@@ -3133,6 +3133,8 @@ pub const DB = struct {
     backend_runtime: *background_runtime_mod.BackendRuntime,
     index_repair_clock: ?platform_clock.Clock = null,
     backend_owner_id: u64,
+    schema_reconcile_owner_id: u64 = 0,
+    portable_activation_owner_id: u64 = 0,
     status_owner_epoch: u64 = 0,
     status_publication_mutex: std.atomic.Mutex = .unlocked,
     status_publication_revision: u64 = 0,
@@ -3980,6 +3982,14 @@ pub const DB = struct {
             var repair_cleanup_owner_transferred = false;
             errdefer if (!repair_cleanup_owner_transferred)
                 backend_runtime.durable_jobs.closeOwner(repair_cleanup_owner_id);
+            const schema_reconcile_owner_id = try backend_runtime.allocOwnerId();
+            var schema_reconcile_owner_transferred = false;
+            errdefer if (!schema_reconcile_owner_transferred)
+                backend_runtime.durable_jobs.closeOwner(schema_reconcile_owner_id);
+            const portable_activation_owner_id = try backend_runtime.allocOwnerId();
+            var portable_activation_owner_transferred = false;
+            errdefer if (!portable_activation_owner_transferred)
+                backend_runtime.durable_jobs.closeOwner(portable_activation_owner_id);
             var publication_recovery = try @import("publication_recovery_owner.zig").Owner.init(backend_runtime);
             var publication_recovery_transferred = false;
             errdefer if (!publication_recovery_transferred)
@@ -4174,6 +4184,8 @@ pub const DB = struct {
                 .async_context = async_context,
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
+                .schema_reconcile_owner_id = schema_reconcile_owner_id,
+                .portable_activation_owner_id = portable_activation_owner_id,
                 .status_owner_epoch = @import("publication.zig").allocateOwnerEpoch(),
                 .repair_cleanup_owner_id = repair_cleanup_owner_id,
                 .publication_recovery = publication_recovery,
@@ -4211,6 +4223,8 @@ pub const DB = struct {
             };
             core_owner_transferred = true;
             backend_owner_transferred = true;
+            schema_reconcile_owner_transferred = true;
+            portable_activation_owner_transferred = true;
             repair_cleanup_owner_transferred = true;
             publication_recovery_transferred = true;
             var executor_ready = false;
@@ -6207,6 +6221,8 @@ pub const DB = struct {
         try self.quarantine_recovery.stopWithAdmission(self.backend_runtime, original);
         try self.graph_cleanup_owner.stopWithAdmission(self.backend_runtime.io(), original);
         try self.publication_recovery.stopWithAdmission(original);
+        try self.portable_activation_recovery.stopWithAdmission(self.portableActivationRecoveryPort(), original);
+        try self.local_execution.schema_reconcile.stopWithAdmission(self.backend_runtime, self.schema_reconcile_owner_id, original);
     }
 
     fn stopRetainedPreparations(self: *DB) void {
@@ -6227,10 +6243,12 @@ pub const DB = struct {
         self.async_context.background_closing.store(true, .release);
         self.native_query_warming.stop(self.backend_runtime);
         self.local_execution.schema_reconcile.stop();
+        self.backend_runtime.durable_jobs.closeOwner(self.schema_reconcile_owner_id);
         self.stopArtifactRepairMetadataWorker();
         self.clearGraphReplacementManager();
         self.artifact_producer_scheduler.deinit(self.alloc);
         self.stopPortableActivationRetryWorker();
+        self.backend_runtime.durable_jobs.closeOwner(self.portable_activation_owner_id);
         self.stopQuarantineRetryWorker();
         self.group_source_owner.stop(self.backend_runtime.io());
         self.stopGraphEndpointCleanupWorker();
@@ -23416,7 +23434,7 @@ pub const DB = struct {
         self.local_execution.schema_reconcile.schedule(.{
             .ptr = self,
             .lane = self.backend_runtime.durable_jobs,
-            .owner_id = self.backend_owner_id,
+            .owner_id = self.schema_reconcile_owner_id,
             .stable_address = self.stable_address,
             .closing = &self.async_context.background_closing,
             .pass = reconcileSchemaPass,
@@ -33555,7 +33573,7 @@ pub const DB = struct {
             .ptr = self,
             .path = self.core.path,
             .runtime = self.backend_runtime,
-            .owner_id = self.backend_owner_id,
+            .owner_id = self.portable_activation_owner_id,
             .pending = &self.async_context.portable_runtime_activation_pending,
             .retry = retryPortableActivationFromOwner,
             .before_start = if (builtin.is_test) portableActivationBeforeStartForTest else null,
@@ -64643,6 +64661,9 @@ test "db close retires runtime owners for memory primary backend" {
     });
     const backend_owner_id = db.backend_owner_id;
     const repair_cleanup_owner_id = db.repair_cleanup_owner_id;
+    const schema_owner = db.schema_reconcile_owner_id;
+    const activation_owner = db.portable_activation_owner_id;
+    try std.testing.expect(schema_owner != activation_owner and schema_owner != backend_owner_id and activation_owner != backend_owner_id);
     db.close();
 
     const Fns = struct {
@@ -64650,6 +64671,7 @@ test "db close retires runtime owners for memory primary backend" {
         pub fn deinit(_: *anyopaque) void {}
     };
     var ctx: u8 = 0;
+    for ([_]u64{ schema_owner, activation_owner }) |owner_id| try std.testing.expectError(error.BackgroundOwnerClosed, runtime.ptr().durable_jobs.submit(.{ .owner_id = owner_id, .class = .maintenance, .ptr = &ctx, .run = Fns.run, .deinit = Fns.deinit }));
     try std.testing.expectError(error.BackgroundOwnerClosed, runtime.ptr().durable_jobs.submit(.{
         .owner_id = backend_owner_id,
         .class = .maintenance,
@@ -66983,7 +67005,7 @@ test "owned db reconciles published schema indexes on its durable worker lane" {
     defer db.closeOwned();
     try db.addIndex(.{ .name = "ft_schema", .kind = .full_text, .config_json = "{}" });
     try db.setSchema(.{ .version = 1 });
-    db.backend_runtime.durable_jobs.drainOwner(db.backend_owner_id);
+    db.backend_runtime.durable_jobs.drainOwner(db.schema_reconcile_owner_id);
 
     try std.testing.expectEqual(table_catalog_mod.IndexState.ready, db.core.table_catalog.index_state);
     try std.testing.expectEqual(@as(u8, 0), db.local_execution.schema_reconcile.state.load(.acquire));

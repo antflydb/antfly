@@ -23289,3 +23289,46 @@ on macOS (9.67 GB measured). Its macOS compile reservation is now 12 GiB; runtim
 limits are unchanged, and the final run has no reservation overrun. Embedded
 boundary, generated errors, control catalog, formatting and whitespace checks
 pass. Remaining shutdown and full cross-engine execution behavior are unqualified.
+
+### Separate schema and activation close ownership
+
+DB construction registers dedicated durable owner IDs for schema reconciliation
+and portable activation. Open failure closes every untransferred owner; normal
+teardown retires the dedicated owners after their producers stop. Backend/LSM
+work and serving snapshot owner identity retain the backend owner. This lets
+serving close preflight quiesce schema and activation without fencing backend
+capacity that later shutdown work may still need.
+
+Both producers fence direct admission under their lifecycle mutex and count
+callers through submission, inline work and prelaunch hooks. The original close
+control waits first for accepted lane callbacks and then for any direct borrows.
+Direct-borrow waits sleep between original lifetime checks; they preserve failed
+begin/reentry/lifetime causes, retain the same context on interruption, and do
+not renew the deadline. Already admitted schema passes finish before the context
+retires, while queued reruns and new activation launches stop. Compatibility
+cleanup still requires quiesced execution ownership.
+
+Native ABI 77 and storage-owner ABI 135 fence the DB and producer layouts.
+Durable formats, reader floors and defaults are unchanged. Remaining group/source
+publication and retained readers, derived runtime joins, backend/cache/IO teardown,
+callback costs, parent metadata charges, routes, executable recovery funding and
+complete mandatory completion remain open. Strong required providers stay off;
+full Linux qualification remains waived and uses pinned Nix/glibc Zig.
+
+Pinned Debug validation passes 99/99 build steps and 69/69 reported tests,
+including the real-DB C-entry preflight and separate shared-service provider.
+Direct runs pass all 45 maintenance cases and 18 shared-service cases by name.
+The producer interruption matrices cover both queued and inline schema work,
+activation retry work and a direct start paused before launch, preserving
+original begin/reentry/lifetime failures. Eight existing DB activation cases
+pass, including the worker's final handshake and a claimed maintenance probe
+racing close. Real DB cases verify durable schema reconciliation on its dedicated
+lane and retirement of both new owners for a memory primary backend. The C-entry
+fixture confirms that backend work can still execute after the dedicated producer
+owners quiesce. These checks do not qualify the remaining physical joins.
+
+All 5,503 native/schema inputs match controlled-close-producers-v1. Source
+snapshots and hashes are in controlled-close-producers-verified.json in the
+cumulative receipts. Error/identity companions, five native ABI cases, embedded
+boundary, control catalog, generated errors, formatting and whitespace checks
+pass. The full scheduler design remains incomplete.

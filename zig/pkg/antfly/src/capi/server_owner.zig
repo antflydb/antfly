@@ -7021,6 +7021,22 @@ test "controlled owner close preflight C entry drains a real DB with the origina
     try std.testing.expect(handle.db.quarantine_recovery.joined.isSet());
     try std.testing.expect(handle.db.graph_cleanup_owner.joined.isSet());
     try std.testing.expect(handle.db.publication_recovery.stopping.load(.acquire));
+    try std.testing.expect(handle.db.portable_activation_recovery.stopping.load(.acquire));
+    try std.testing.expect(handle.db.local_execution.schema_reconcile.stopping.load(.acquire));
+    try std.testing.expect(handle.db.portable_activation_owner_id != handle.db.backend_owner_id and handle.db.schema_reconcile_owner_id != handle.db.backend_owner_id and handle.db.portable_activation_owner_id != handle.db.schema_reconcile_owner_id);
+    for ([_]u64{ handle.db.portable_activation_owner_id, handle.db.schema_reconcile_owner_id }) |id_to_check| try std.testing.expectError(error.BackgroundOwnerIdExhausted, handle.db.backend_runtime.durable_jobs.reopenOwner(id_to_check));
+    const BackendProbe = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn run(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .release);
+        }
+        fn deinit(_: *anyopaque) void {}
+    };
+    var backend_probe: BackendProbe = .{};
+    try handle.db.backend_runtime.durable_jobs.submit(.{ .owner_id = handle.db.backend_owner_id, .class = .maintenance, .ptr = &backend_probe, .run = BackendProbe.run, .deinit = BackendProbe.deinit });
+    handle.db.backend_runtime.durable_jobs.drainOwner(handle.db.backend_owner_id);
+    try std.testing.expectEqual(@as(usize, 1), backend_probe.calls.load(.acquire));
     try std.testing.expect(!handle.db.publication_recovery.retired.load(.acquire));
     try std.testing.expectError(error.BackgroundOwnerIdExhausted, handle.db.backend_runtime.durable_jobs.reopenOwner(handle.db.publication_recovery.owner_id));
     try std.testing.expect(try handle.db.backend_runtime.durable_jobs.quiesceOwner(handle.db.publication_recovery.owner_id));
