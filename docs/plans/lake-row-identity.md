@@ -306,7 +306,10 @@ fragment identifiers as source object paths. Invalid/missing identity evidence
 or exhausted optional construction admission selects complete physical rebuilding.
 
 Only retained aggregate declarations keep prior contribution roots live; replaced
-roots retire through counted ownership. Aggregate deltas require each declaration seed's original authenticated input
+roots retire through counted ownership. Unchanged aggregate graphs stay rooted
+across unrelated index-definition changes in the same logical namespace, even
+when the global desired fingerprint changes. Aggregate deltas require each
+declaration seed's original authenticated input
 census, including its source, schema, snapshot, file count and content cut. The
 publication owner binds these proofs before parallel reducers start. An aggregate
 retained across unrelated updates can therefore use a delta against its own older

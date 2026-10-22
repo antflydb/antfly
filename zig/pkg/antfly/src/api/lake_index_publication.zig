@@ -446,15 +446,17 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
         const projection = try replay_api.columnsForBuild(a, na, table, native_provider, base_source);
         fragment_replay = replay_api.Replay.init(a, native_provider, projection);
         native_provider.replay = &fragment_replay.?;
-        // The retained native state owns logical contributions, so only a
-        // predecessor carrying the same durable logical census is eligible.
-        if (value.prior_navigation != null and previous_identity != null and previous_identity.?.native_space != null and current.value.published != null and std.mem.eql(u8, &previous_identity.?.values_recipe, &value.root.values_recipe)) {
+        // Contribution ownership follows the logical namespace, independently
+        // of changes to the table-wide desired fingerprint. Each reducer still
+        // requires its own exact predecessor census before applying a delta.
+        if (previous_identity != null and previous_identity.?.native_space != null and current.value.published != null and std.mem.eql(u8, &previous_identity.?.namespace, &value.root.namespace)) {
             published_candidates = current.value.published.?.declarations;
             contribution_index.deinit();
             const previous = current.value.published.?;
             const root = if (previous.contribution_index) |bytes| try std.json.parseFromSliceLeaky(@import("../serverless/graph_segment/page_tree.zig").Ref, na, bytes, .{}) else null;
             try contribution_index.init(a, scoped, root, cancellation);
             contribution_index.counted = true;
+            contribution_index.migrating = root != null and previous.contribution_ownership_version == 0;
             contribution_index.prior_roots = previous.contribution_roots;
             // Bind each reduction to its original authenticated input census.
             // Retained aggregates can legitimately own different older cuts.
@@ -1028,6 +1030,7 @@ test "external lake logical identity publishes native indexes once across reorde
     var namespace_schema: ?[]u8 = null;
     defer if (namespace_schema) |bytes_| a.free(bytes_);
     var original_namespace: ?catalog.Digest = null;
+    var original_contribution: ?catalog.Digest = null;
     var original_snapshot: ?[]u8 = null;
     defer if (original_snapshot) |bytes_| a.free(bytes_);
     var original_location: ?local.storage_rowsource_types.RowRef = null;
@@ -1036,6 +1039,11 @@ test "external lake logical identity publishes native indexes once across reorde
     const names: []const []const u8 = &.{ "old.parquet", "new.parquet", "third.parquet", "updated.parquet", "append.parquet", "removed.parquet", "namespace.parquet", "duplicate.parquet" };
     for (0..8) |step| {
         marker.now = 101 + step * 100;
+        if (step == 3) {
+            // Changing one definition must keep the unchanged aggregate's
+            // original counted contribution graph, as well as its artifact.
+            table.indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":false},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]}}";
+        }
         if (step == 6) {
             namespace_schema = try std.mem.replaceOwned(u8, a, schema_json, "\"key_columns\":[\"id\"]", "\"key_columns\":[\"body\"]");
             table.schema_json = namespace_schema.?;
@@ -1077,7 +1085,9 @@ test "external lake logical identity publishes native indexes once across reorde
         try std.testing.expectEqual(@as(u64, if (step == 4) 4 else if (step == 5 or step == 6) 2 else 3), root.current.rows);
         try std.testing.expectEqual(@as(usize, 1), publication.contribution_roots.len);
         if (step == 6) try std.testing.expect(!std.mem.eql(u8, &original_namespace.?, &root.namespace));
+        if (step == 3) try std.testing.expectEqualSlices(u8, &original_contribution.?, &publication.contribution_roots[0]);
         if (step == 0) {
+            original_contribution = publication.contribution_roots[0];
             original_namespace = root.namespace;
             original_directory = try a.dupe(u8, publication.directory.?.artifact_id);
             original_snapshot = try a.dupe(u8, source.inventory.snapshot_id);
