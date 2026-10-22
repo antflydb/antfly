@@ -6994,7 +6994,7 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         defer directory.cleanup();
         const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/close-db", .{directory.sub_path});
         defer a.free(path);
-        var db = try db_mod.DB.open(a, path, .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+        var db = try db_mod.DB.open(a, path, .{ .start_index_workers = true, .start_optional_runtimes = false, .start_independent_maintenance = false });
         const handle = a.create(Handle) catch |cause| {
             db.close();
             return cause;
@@ -7034,13 +7034,15 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         try handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = .{ .ptr = &dense_probe, .dense_embed_fn = DenseProbe.embed, .deinit_fn = DenseProbe.deinit } });
         const enrichment = handle.db.enrichment_runtime.?;
         const enrichment_context = handle.db.enrichment_append_context.?;
-        try enrichment.start();
-        try std.testing.expect(enrichment.future != null);
         try handle.db.initResolutionRuntime();
         try handle.db.initPromotionRuntime();
         const resolution = handle.db.resolution_runtime.?;
         const promotion = handle.db.promotion_runtime.?;
         const resolution_context = handle.db.resolution_append_context.?;
+        try handle.db.initOptionalTextMergeRuntime(.{ .enabled = true });
+        const text_merge = handle.db.text_merge_runtime.?;
+        try enrichment.start();
+        try std.testing.expect(enrichment.future != null);
         try resolution.start();
         try promotion.start();
         const owner = state.port();
@@ -7055,6 +7057,11 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         const request: kernel_owner_abi.CloseDrainRequest = .{ .deadline_ns = deadline, .execution_runnable = &borrow, .clock_io = &clock };
         try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerDrainClose(id, &request));
         try std.testing.expect(!handle.db.isClosed());
+        try std.testing.expect(text_merge.producer_closing.load(.acquire));
+        try std.testing.expectError(error.TextMergeRuntimeShutdown, text_merge.acquireProducerPermit("late", 1, 1));
+        try std.testing.expectError(error.Canceled, text_merge.start());
+        try std.testing.expectError(error.WorkerStopping, handle.db.executor.addWorker("late", .{ .name = "late", .kind = .full_text }, 0));
+        try std.testing.expectError(error.WorkerStopping, handle.db.executor.waitForAll(1));
         try std.testing.expect(handle.db.propagation_closing.load(.acquire));
         try std.testing.expect(handle.db.resolution_runtime.? == resolution and handle.db.promotion_runtime.? == promotion);
         try std.testing.expect(handle.db.resolution_append_context.? == resolution_context);

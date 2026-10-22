@@ -21,4 +21,5 @@ test {
     _ = @import("storage/db/propagation_lifecycle.zig");
     _ = @import("storage/db/derived/runtime_types.zig");
     _ = @import("storage/db/derived/io_threaded_runtime.zig");
+    _ = @import("storage/db/maintenance/text_merge_runtime.zig");
 }

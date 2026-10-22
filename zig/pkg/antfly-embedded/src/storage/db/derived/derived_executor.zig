@@ -52,8 +52,14 @@ pub const Config = struct {
 pub const Executor = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    callback_dispatch: @import("../../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+    const Control = @import("../../../common/read_admission.zig");
+    const Quiesce = *const fn (*anyopaque, Control.Port) anyerror!void;
+    const NativeBoundary = @import("../../named_callback.zig").Boundary(struct { quiesce_with_admission: Quiesce });
 
     const VTable = struct {
+        request_shutdown: ?*const fn (*anyopaque) void = null,
+        quiesce_with_admission: ?Quiesce = null,
         begin_shutdown: *const fn (ptr: *anyopaque) void,
         deinit: *const fn (ptr: *anyopaque, alloc: Allocator) void,
         has_workers: *const fn (ptr: *anyopaque) bool,
@@ -82,6 +88,20 @@ pub const Executor = struct {
     /// publisher may currently be waiting on.
     pub fn beginShutdown(self: *Executor) void {
         self.vtable.begin_shutdown(self.ptr);
+    }
+
+    /// Nonblocking fence, published before closing producer dependencies.
+    pub fn requestShutdown(self: *Executor) !void {
+        const request = self.vtable.request_shutdown orelse return error.ExecutionWaitUnsupported;
+        request(self.ptr);
+    }
+
+    pub fn quiesceWithAdmission(self: *Executor, original: Control.Port) !void {
+        const callback = self.vtable.quiesce_with_admission orelse return error.ExecutionWaitUnsupported;
+        var relay: Control.ExecutionErrorRelay = .{};
+        const borrowed = try relay.bind(original);
+        NativeBoundary.call("quiesce_with_admission", self.callback_dispatch, callback, .{ self.ptr, borrowed }) catch |cause| return relay.errors.rejection orelse cause;
+        if (relay.errors.rejection) |cause| return cause;
     }
 
     pub fn deinit(self: *Executor, alloc: Allocator) void {
@@ -219,6 +239,7 @@ const ManualWorker = struct {
 
 const ManualRuntime = struct {
     alloc: Allocator,
+    closing: std.atomic.Value(bool) = .init(false),
     replay_source: replay_source_mod.Source,
     ctx: *anyopaque,
     apply_fn: ApplyFn,
@@ -247,6 +268,7 @@ const ManualRuntime = struct {
     fn failIfUnhealthy(_: *ManualRuntime) !void {}
 
     fn addWorker(self: *ManualRuntime, name: []const u8, kind: index_manager_mod.ManagedIndexRef, applied_sequence: u64) !void {
+        if (self.closing.load(.acquire)) return error.WorkerStopping;
         try self.workers.append(self.alloc, .{
             .name = try self.alloc.dupe(u8, name),
             .kind = .{
@@ -396,6 +418,10 @@ const ManualRuntime = struct {
     }
 
     fn waitForAll(self: *ManualRuntime, sequence: u64, wait: VisibilityWait) !void {
+        if (self.closing.load(.acquire)) {
+            try wait.check();
+            return error.WorkerStopping;
+        }
         for (self.workers.items) |*worker| {
             worker.target_sequence = @max(worker.target_sequence, sequence);
             if (worker.target_sequence <= worker.applied_sequence) continue;
@@ -445,6 +471,10 @@ const ManualRuntime = struct {
 
     fn waitForIndexes(self: *ManualRuntime, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) !void {
         if (index_names.len == 0) return;
+        if (self.closing.load(.acquire)) {
+            try wait.check();
+            return error.WorkerStopping;
+        }
         for (self.workers.items) |*worker| {
             if (!indexNameInList(worker.name, index_names)) continue;
             worker.target_sequence = @max(worker.target_sequence, sequence);
@@ -546,6 +576,8 @@ fn initManual(
 
 const manual_vtable = Executor.VTable{
     .begin_shutdown = manualBeginShutdown,
+    .request_shutdown = manualBeginShutdown,
+    .quiesce_with_admission = manualQuiesce,
     .deinit = manualDeinit,
     .has_workers = manualHasWorkers,
     .fail_if_unhealthy = manualFailIfUnhealthy,
@@ -568,7 +600,19 @@ const manual_vtable = Executor.VTable{
     .wait_for_indexes = manualWaitForIndexes,
 };
 
-fn manualBeginShutdown(_: *anyopaque) void {}
+fn manualBeginShutdown(ptr: *anyopaque) void {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    runtime.closing.store(true, .release);
+}
+fn manualQuiesce(ptr: *anyopaque, original: @import("../../../common/read_admission.zig").Port) !void {
+    manualBeginShutdown(ptr);
+    const Ready = struct {
+        fn get(_: *anyopaque) anyerror!bool {
+            return true;
+        }
+    };
+    try @import("../../../common/cleanup_wait.zig").until(null, original, ptr, Ready.get, null);
+}
 
 fn manualDeinit(ptr: *anyopaque, alloc: Allocator) void {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
@@ -704,6 +748,8 @@ fn initIoThreaded(
 
 const io_threaded_vtable = Executor.VTable{
     .begin_shutdown = ioThreadedBeginShutdown,
+    .request_shutdown = ioThreadedRequestShutdown,
+    .quiesce_with_admission = ioThreadedQuiesce,
     .deinit = ioThreadedDeinit,
     .has_workers = ioThreadedHasWorkers,
     .fail_if_unhealthy = ioThreadedFailIfUnhealthy,
@@ -830,4 +876,13 @@ fn ioThreadedWaitForAll(ptr: *anyopaque, sequence: u64, wait: VisibilityWait) !v
 fn ioThreadedWaitForIndexes(ptr: *anyopaque, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return try runtime.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
+}
+
+fn ioThreadedRequestShutdown(ptr: *anyopaque) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.requestShutdown();
+}
+fn ioThreadedQuiesce(ptr: *anyopaque, original: @import("../../../common/read_admission.zig").Port) !void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    try runtime.quiesceWithAdmission(original);
 }

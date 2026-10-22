@@ -53,6 +53,12 @@ const Worker = struct {
     paused: bool = false,
     dispatch_active: bool = false,
     future: ?Scheduler.Handle = null,
+    join_mutex: std.atomic.Mutex = .unlocked,
+    join_finisher: bool = false,
+    joined: Io.Event = .unset,
+    join_changed: Io.Event = .unset,
+    join_generation: std.atomic.Value(u64) = .init(0),
+    join_waiters: std.atomic.Value(u32) = .init(0),
     next_delay_ms: ?u64 = 0,
     idle_since_ns: ?u64 = null,
     catch_up_open: bool = false,
@@ -139,6 +145,15 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn beginShutdown(_: *@This()) void {}
+    pub fn requestShutdown(_: *@This()) void {}
+    pub fn quiesceWithAdmission(self: *@This(), original: @import("../../../common/read_admission.zig").Port) !void {
+        const Ready = struct {
+            fn get(_: *anyopaque) anyerror!bool {
+                return true;
+            }
+        };
+        try @import("../../../common/cleanup_wait.zig").until(null, original, self, Ready.get, null);
+    }
 
     pub fn hasWorkers(_: *@This()) bool {
         return false;
@@ -261,6 +276,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     cond: Io.Condition = .init,
     workers: std.ArrayListUnmanaged(*Worker) = .empty,
     shutdown: bool = false,
+    closing: std.atomic.Value(bool) = .init(false),
+    active_borrows: std.atomic.Value(u32) = .init(0),
     last_error_name: ?[]const u8 = null,
     // Claims exclude duplicate cleanup; completion alone releases backlog credit.
     last_claimed_truncate_sequence: u64 = 0,
@@ -386,6 +403,9 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn deinit(self: *DerivedRuntime) void {
         const io = self.ioContext();
         self.beginShutdown();
+        while (self.active_borrows.load(.acquire) != 0) io.sleep(.fromMilliseconds(1), .awake) catch {};
+        self.mutex.lockUncancelable(io);
+        self.mutex.unlock(io);
 
         for (self.workers.items) |worker| {
             if (worker.future) |*future| _ = future.await(io);
@@ -411,7 +431,57 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         self.* = undefined;
     }
 
+    pub fn requestShutdown(self: *DerivedRuntime) void {
+        self.closing.store(true, .release);
+    }
+
+    fn admitBorrow(self: *DerivedRuntime) !void {
+        if (self.closing.load(.acquire)) return error.WorkerStopping;
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.closing.load(.acquire)) return error.WorkerStopping;
+        if (self.active_borrows.load(.monotonic) == std.math.maxInt(u32)) return error.ResourceLimitExceeded;
+        _ = self.active_borrows.fetchAdd(1, .acquire);
+    }
+
+    fn noBorrows(raw: *anyopaque) anyerror!bool {
+        const self: *DerivedRuntime = @ptrCast(@alignCast(raw));
+        return self.active_borrows.load(.acquire) == 0;
+    }
+
+    /// The coordinator closes producer dependencies before this join. Retain
+    /// worker/session arrays and idle finalization for physical teardown.
+    pub fn quiesceWithAdmission(self: *DerivedRuntime, original: @import("../../../common/read_admission.zig").Port) !void {
+        self.requestShutdown();
+        const io = self.ioContext();
+        const cleanup = @import("../../../common/cleanup_wait.zig");
+        try cleanup.lockIo(&self.mutex, io, original);
+        self.shutdown = true;
+        self.cond.broadcast(io);
+        self.mutex.unlock(io);
+        try cleanup.until(io, original, self, noBorrows, null);
+        // Every admitted add/remove/pause or foreground persistence callback
+        // has exited. New topology operations reject before touching arrays.
+        for (self.workers.items) |worker| {
+            const join: @import("../maintenance_stop.zig").Borrowed = .{
+                .mutex = &worker.join_mutex,
+                .registration = &worker.future,
+                .stopping = &self.closing,
+                .finisher = &worker.join_finisher,
+                .joined = &worker.joined,
+                .changed = &worker.join_changed,
+                .generation = &worker.join_generation,
+                .waiters = &worker.join_waiters,
+            };
+            try join.stopWithAdmission(io, original);
+        }
+        try cleanup.lockIo(&self.mutex, io, original);
+        self.mutex.unlock(io);
+    }
+
     pub fn beginShutdown(self: *DerivedRuntime) void {
+        self.requestShutdown();
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         self.shutdown = true;
@@ -436,6 +506,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn addWorker(self: *DerivedRuntime, name: []const u8, kind: index_manager_mod.ManagedIndexRef, applied_sequence: u64) !void {
+        try self.admitBorrow();
+        defer _ = self.active_borrows.fetchSub(1, .release);
         const io = self.ioContext();
 
         const worker = try self.alloc.create(Worker);
@@ -485,6 +557,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     /// Dispatch admission and pause share the runtime mutex; after the drain
     /// only this structural owner may touch the worker's retained session.
     pub fn pauseWorker(self: *DerivedRuntime, name: []const u8) !bool {
+        try self.admitBorrow();
+        defer _ = self.active_borrows.fetchSub(1, .release);
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         const worker = for (self.workers.items) |candidate| {
@@ -507,7 +581,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         // slot. Keep this paused worker in the retention set until completion.
         while (true) {
             self.mutex.lockUncancelable(io);
-            const stopping = self.shutdown or worker.stop;
+            const stopping = self.closing.load(.acquire) or self.shutdown or worker.stop;
             const pending = self.computeMinPersistedLocked() > self.last_truncated_sequence;
             const delay = self.truncate_retry_not_before_ns -| platform_time.monotonicNs();
             self.mutex.unlock(io);
@@ -531,6 +605,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn resumeWorker(self: *DerivedRuntime, name: []const u8) void {
+        self.admitBorrow() catch return;
+        defer _ = self.active_borrows.fetchSub(1, .release);
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -545,6 +621,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn removeWorker(self: *DerivedRuntime, name: []const u8) void {
+        self.admitBorrow() catch return;
+        defer _ = self.active_borrows.fetchSub(1, .release);
         const io = self.ioContext();
 
         self.mutex.lockUncancelable(io);
@@ -728,6 +806,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         wait: runtime_types.VisibilityWait,
     ) !void {
         try wait.check();
+        try self.admitBorrow();
+        defer _ = self.active_borrows.fetchSub(1, .release);
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -738,6 +818,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         self.signalWorkers(io);
 
         while (true) {
+            if (self.closing.load(.acquire)) {
+                try self.checkVisibilityWaitUnlocked(io, wait);
+                return error.WorkerStopping;
+            }
             if (self.last_error_name != null) return RuntimeError.AsyncWorkerFailed;
 
             var all_applied = true;
@@ -838,6 +922,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     ) !void {
         if (index_names.len == 0) return;
         try wait.check();
+        try self.admitBorrow();
+        defer _ = self.active_borrows.fetchSub(1, .release);
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -851,6 +937,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         if (changed) self.signalWorkers(io);
 
         while (true) {
+            if (self.closing.load(.acquire)) {
+                try self.checkVisibilityWaitUnlocked(io, wait);
+                return error.WorkerStopping;
+            }
             if (self.last_error_name != null) return RuntimeError.AsyncWorkerFailed;
 
             var all_applied = true;
@@ -984,7 +1074,7 @@ fn workerStep(worker: *Worker) ?u64 {
     const runtime = worker.runtime;
     const io = runtime.ioContext();
     runtime.mutex.lockUncancelable(io);
-    if (worker.paused) {
+    if (worker.paused or runtime.closing.load(.acquire)) {
         runtime.mutex.unlock(io);
         return null;
     }
@@ -1017,14 +1107,14 @@ fn workerMain(worker: *Worker) void {
     for (0..1) |_| {
         runtime.mutex.lockUncancelable(io);
         const retry_remaining = if (worker.retry_not_before_ns == 0) 0 else worker.retry_not_before_ns -| platform_time.monotonicNs();
-        if (!runtime.shutdown and !worker.stop and !worker.paused and runtime.last_error_name == null and worker.last_error_name == null and retry_remaining > 0) {
+        if (!runtime.closing.load(.acquire) and !runtime.shutdown and !worker.stop and !worker.paused and runtime.last_error_name == null and worker.last_error_name == null and retry_remaining > 0) {
             // Foreground notifications may wake a delayed registration. Preserve
             // its retry deadline instead of letting hot writers defeat backoff.
             worker.next_delay_ms = @max(1, (retry_remaining +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
             runtime.mutex.unlock(io);
             return;
         }
-        if (!runtime.shutdown and !worker.stop and !worker.paused and runtime.last_error_name == null and worker.last_error_name == null and worker.target_sequence <= worker.applied_sequence) {
+        if (!runtime.closing.load(.acquire) and !runtime.shutdown and !worker.stop and !worker.paused and runtime.last_error_name == null and worker.last_error_name == null and worker.target_sequence <= worker.applied_sequence) {
             if (worker.applied_sequence > worker.persisted_sequence or
                 (runtime.truncates_in_flight == 0 and runtime.computeMinPersistedLocked() > runtime.last_claimed_truncate_sequence))
             {
@@ -1082,7 +1172,7 @@ fn workerMain(worker: *Worker) void {
             worker.next_delay_ms = null;
             return;
         }
-        if (runtime.shutdown or worker.stop or worker.paused or runtime.last_error_name != null or worker.last_error_name != null) {
+        if (runtime.closing.load(.acquire) or runtime.shutdown or worker.stop or worker.paused or runtime.last_error_name != null or worker.last_error_name != null) {
             runtime.mutex.unlock(io);
             return;
         }
@@ -1525,7 +1615,7 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
 fn workerIsStopping(runtime: *DerivedRuntime, worker: *const Worker, io: Io) bool {
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
-    return runtime.shutdown or worker.stop or worker.paused or runtime.last_error_name != null or worker.last_error_name != null;
+    return runtime.closing.load(.acquire) or runtime.shutdown or worker.stop or worker.paused or runtime.last_error_name != null or worker.last_error_name != null;
 }
 
 fn scheduleRecoverableCatchUpRetry(worker: *Worker, err: anyerror) void {
@@ -1551,7 +1641,7 @@ fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence:
     var waited_ns: u64 = 0;
     while (true) {
         runtime.mutex.lockUncancelable(io);
-        const shutdown = runtime.shutdown or worker.stop or worker.paused or runtime.last_error_name != null or worker.last_error_name != null;
+        const shutdown = runtime.closing.load(.acquire) or runtime.shutdown or worker.stop or worker.paused or runtime.last_error_name != null or worker.last_error_name != null;
         const target = worker.target_sequence;
         const pending_records = target -| from_sequence;
         const force_sequence = runtime.force_catch_up_sequence;
@@ -3171,4 +3261,159 @@ test "controlled derived visibility polling lends CPU and fences original owner 
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     };
+}
+
+test "controlled derived quiescence retains callbacks foreground persistence and detached removals across original failures" {
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    const Mode = enum { scheduled, foreground_persist, detached_remove };
+    for (std.enums.values(Case)) |case| for (std.enums.values(Mode)) |mode| {
+        const F = struct {
+            runtime: *DerivedRuntime = undefined,
+            mode: Mode,
+            io: Io = undefined,
+            entered: Io.Event = .unset,
+            release: Io.Event = .unset,
+            fn block(self: *@This()) void {
+                std.debug.assert(self.runtime.mutex.tryLock());
+                self.runtime.mutex.unlock(self.io);
+                self.entered.set(self.io);
+                self.release.waitUncancelable(self.io);
+            }
+            fn step(self: *@This()) ?u64 {
+                self.block();
+                return null;
+            }
+            fn apply(_: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+                return true;
+            }
+            fn persist(raw: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.mode == .foreground_persist) self.block();
+                return true;
+            }
+            fn truncate(_: *anyopaque, _: u64) !void {}
+            fn finish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken, _: u64, _: bool) !CatchUpFinishResult {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.mode == .detached_remove) self.block();
+                return .{};
+            }
+            fn direct(self: *@This()) void {
+                if (self.mode == .detached_remove) self.runtime.removeWorker("worker") else self.runtime.waitForAll(1) catch |cause| {
+                    if (cause != error.WorkerStopping) @panic("unexpected visibility failure");
+                };
+            }
+        };
+        var fixture: F = .{ .mode = mode };
+        var runtime = try DerivedRuntime.init(std.testing.allocator, undefined, &fixture, F.apply, F.persist, F.truncate, null, F.finish, null, null, null);
+        defer runtime.deinit();
+        const io = runtime.ioContext();
+        fixture.runtime = &runtime;
+        fixture.io = io;
+        const worker = try std.testing.allocator.create(Worker);
+        const name = try std.testing.allocator.dupe(u8, "worker");
+        worker.* = .{ .runtime = &runtime, .name = name, .kind = .{ .name = name, .kind = .full_text }, .applied_sequence = 1, .persisted_sequence = 0, .target_sequence = 1, .catch_up_open = mode == .detached_remove, .catch_up_token = .{ .value = 7 } };
+        try runtime.workers.append(std.testing.allocator, worker);
+        var direct: ?Io.Future(void) = null;
+        defer {
+            fixture.release.set(io);
+            if (direct) |*future| future.await(io);
+        }
+        if (mode == .scheduled) {
+            runtime.scheduler = try Scheduler.create(std.testing.allocator, io, 4);
+            runtime.owns_scheduler = true;
+            worker.future = try runtime.scheduler.?.registerClass(.derived, &fixture, F.step);
+        } else direct = try io.concurrent(F.direct, .{&fixture});
+        try fixture.entered.wait(io);
+        const Control = struct {
+            fixture: *F,
+            case: Case,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case != .lifetime_in_wait) self.fixture.release.set(self.fixture.io);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                self.fixture.release.set(self.fixture.io);
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        const admission = @import("../../../common/read_admission.zig");
+        var control: Control = .{ .fixture = &fixture, .case = case };
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const result = runtime.quiesceWithAdmission(.init(&payload));
+        if (case == .success) try result else {
+            try std.testing.expectError(switch (case) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .lifetime_in_wait => error.DeadlineExceeded,
+                .success => unreachable,
+            }, result);
+            try std.testing.expect(runtime.closing.load(.acquire));
+            if (mode == .scheduled) try std.testing.expect(worker.future != null);
+            fixture.release.set(io);
+            control.case = .success;
+            try runtime.quiesceWithAdmission(.init(&payload));
+        }
+        try std.testing.expectEqual(@as(u32, 0), runtime.active_borrows.load(.acquire));
+        try std.testing.expectError(error.WorkerStopping, runtime.addWorker("late", .{ .name = "late", .kind = .full_text }, 0));
+        try std.testing.expectError(error.WorkerStopping, runtime.waitForAll(1));
+        if (mode == .detached_remove) try std.testing.expectEqual(@as(usize, 0), runtime.workers.items.len) else try std.testing.expect(worker.future == null and worker.joined.isSet());
+        try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_failure), control.ends);
+    };
+}
+
+test "controlled derived quiescence preserves idle finalization until physical deinit" {
+    const F = struct {
+        finishes: usize = 0,
+        persists: usize = 0,
+        fn apply(_: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+            return true;
+        }
+        fn persist(raw: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.persists += 1;
+            return true;
+        }
+        fn truncate(_: *anyopaque, _: u64) !void {}
+        fn finish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, _: u64, _: bool) !CatchUpFinishResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(token.value == 7);
+            self.finishes += 1;
+            return .{};
+        }
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+    };
+    var f: F = .{};
+    var runtime = try DerivedRuntime.init(std.testing.allocator, undefined, &f, F.apply, F.persist, F.truncate, null, F.finish, null, null, null);
+    var live = true;
+    defer if (live) runtime.deinit();
+    const worker = try std.testing.allocator.create(Worker);
+    const name = try std.testing.allocator.dupe(u8, "idle");
+    worker.* = .{ .runtime = &runtime, .name = name, .kind = .{ .name = name, .kind = .full_text }, .applied_sequence = 1, .persisted_sequence = 0, .target_sequence = 1, .catch_up_open = true, .catch_up_token = .{ .value = 7 } };
+    try runtime.workers.append(std.testing.allocator, worker);
+    const admission = @import("../../../common/read_admission.zig");
+    var payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.check, .end = F.check } };
+    try runtime.quiesceWithAdmission(.init(&payload));
+    try std.testing.expectEqual(@as(usize, 0), f.finishes);
+    try std.testing.expectEqual(@as(usize, 0), f.persists);
+    try std.testing.expect(worker.catch_up_open and worker.catch_up_token.value == 7);
+    runtime.deinit();
+    live = false;
+    try std.testing.expectEqual(@as(usize, 1), f.finishes);
+    try std.testing.expectEqual(@as(usize, 1), f.persists);
 }

@@ -96,6 +96,14 @@ const UnsupportedTextMergeRuntime = struct {
     pub fn stop(_: *@This()) bool {
         return false;
     }
+    pub fn closeProducerAdmissionWithAdmission(self: *@This(), original: @import("../../../common/read_admission.zig").Port) !void {
+        const Ready = struct {
+            fn get(_: *anyopaque) anyerror!bool {
+                return true;
+            }
+        };
+        try @import("../../../common/cleanup_wait.zig").until(null, original, self, Ready.get, null);
+    }
 
     pub fn pause(_: *@This()) bool {
         return false;
@@ -191,7 +199,8 @@ const PlatformTextMergeRuntime = struct {
     producer_wait_epoch: std.atomic.Value(u32) = .init(0),
     producer_admission_head: ?*ProducerAdmissionWaiter = null,
     producer_admission_tail: ?*ProducerAdmissionWaiter = null,
-    admission_closed: bool = false,
+    admission_closed: std.atomic.Value(bool) = .init(false),
+    producer_closing: std.atomic.Value(bool) = .init(false),
     fd_retry_epoch: ?u32 = null,
     future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
@@ -286,13 +295,35 @@ const PlatformTextMergeRuntime = struct {
     }
 
     pub fn start(self: *TextMergeRuntime) !void {
+        if (self.producer_closing.load(.acquire)) return error.Canceled;
         if (!self.config.enabled) return;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
+        if (self.producer_closing.load(.acquire)) return error.Canceled;
         self.desired_running = true;
         self.paused = false;
         self.setAdmissionClosedLocked(false);
         try self.startLocked();
+    }
+
+    /// Wake blocked publishers before the executor joins them. The merge
+    /// registration and reservation maps remain owned until physical teardown.
+    pub fn closeProducerAdmissionWithAdmission(self: *TextMergeRuntime, original: @import("../../../common/read_admission.zig").Port) !void {
+        self.producer_closing.store(true, .release);
+        self.signalProducerAdmissionChanged();
+        const Ready = struct {
+            fn get(_: *anyopaque) anyerror!bool {
+                return true;
+            }
+        };
+        const cleanup = @import("../../../common/cleanup_wait.zig");
+        try cleanup.until(self.io, original, self, Ready.get, null);
+        if (self.io) |io| {
+            try cleanup.lockIo(&self.mutex, io, original);
+            self.admission_closed.store(true, .release);
+            self.cond.broadcast(io);
+            self.mutex.unlock(io);
+        }
     }
 
     /// Gracefully drains the active merge, if any, and stops the worker.
@@ -322,9 +353,11 @@ const PlatformTextMergeRuntime = struct {
     }
 
     pub fn resumeAfterPause(self: *TextMergeRuntime) !void {
+        if (self.producer_closing.load(.acquire)) return error.Canceled;
         if (!self.config.enabled) return;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
+        if (self.producer_closing.load(.acquire)) return error.Canceled;
         self.paused = false;
         if (self.desired_running) try self.startLocked();
     }
@@ -333,6 +366,7 @@ const PlatformTextMergeRuntime = struct {
     /// currently owns the pause; true means the runtime is running or no
     /// longer desires a worker.
     pub fn ensureRunning(self: *TextMergeRuntime) !bool {
+        if (self.producer_closing.load(.acquire)) return false;
         if (!self.config.enabled) return true;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
@@ -349,8 +383,10 @@ const PlatformTextMergeRuntime = struct {
     }
 
     fn startLocked(self: *TextMergeRuntime) !void {
+        if (self.producer_closing.load(.acquire)) return error.Canceled;
         if (self.future != null or self.paused or !self.desired_running) return;
         const io = self.io orelse return error.MissingBackendRuntimeIo;
+        if (self.producer_closing.load(.acquire)) return error.TextMergeRuntimeShutdown;
         if (builtin.is_test and consumeTestStartFailure()) return error.TestTransientMaintenanceRestart;
         self.mutex.lockUncancelable(io);
         self.shutdown = false;
@@ -649,7 +685,7 @@ const PlatformTextMergeRuntime = struct {
             }
             const io = self.io.?;
             self.mutex.lockUncancelable(io);
-            if (self.admission_closed) {
+            if (self.producer_closing.load(.acquire) or self.admission_closed.load(.acquire)) {
                 self.mutex.unlock(io);
                 return error.TextMergeRuntimeShutdown;
             }
@@ -689,7 +725,7 @@ const PlatformTextMergeRuntime = struct {
             self.apply_mutex.unlockShared();
 
             self.mutex.lockUncancelable(io);
-            if (self.admission_closed) {
+            if (self.producer_closing.load(.acquire) or self.admission_closed.load(.acquire)) {
                 self.mutex.unlock(io);
                 return error.TextMergeRuntimeShutdown;
             }
@@ -816,7 +852,7 @@ const PlatformTextMergeRuntime = struct {
     fn setAdmissionClosedLocked(self: *TextMergeRuntime, closed: bool) void {
         const io = self.io orelse return;
         self.mutex.lockUncancelable(io);
-        self.admission_closed = closed;
+        self.admission_closed.store(closed, .release);
         self.cond.broadcast(io);
         self.mutex.unlock(io);
         self.signalProducerAdmissionChanged();
@@ -890,10 +926,7 @@ const PlatformTextMergeRuntime = struct {
     }
 
     fn isAdmissionClosed(self: *TextMergeRuntime) bool {
-        const io = self.io orelse return self.admission_closed;
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return self.admission_closed;
+        return self.producer_closing.load(.acquire) or self.admission_closed.load(.acquire);
     }
 
     pub fn stats(self: *TextMergeRuntime) types.TextMergeStats {
@@ -1107,4 +1140,99 @@ test "text merge publication handoff releases index lease before global contenti
     try std.testing.expect(!global.tryLockExclusive());
     global.unlockExclusive();
     lease.?.unlock();
+}
+
+test "controlled text merge producer close wakes publishers before interrupted state publication" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    for (std.enums.values(Case)) |case| {
+        const io = std.testing.io;
+        var runtime: TextMergeRuntime = .{ .alloc = std.testing.allocator, .io = io, .native_storage_pool = undefined, .index_manager = undefined, .apply_mutex = undefined, .config = .{ .enabled = true } };
+        const F = struct {
+            runtime: *TextMergeRuntime,
+            done: Io.Event = .unset,
+            failure: ?anyerror = null,
+            fn run(self: *@This()) void {
+                var permit = self.runtime.acquireProducerPermit("held", 1, 1) catch |cause| {
+                    self.failure = cause;
+                    self.done.set(self.runtime.io.?);
+                    return;
+                };
+                permit.release();
+                self.failure = error.TestUnexpectedResult;
+                self.done.set(self.runtime.io.?);
+            }
+        };
+        test_wait_for_producer_shutdown.store(true, .release);
+        test_producer_shutdown_wait_entered.store(false, .release);
+        defer test_wait_for_producer_shutdown.store(false, .release);
+        var f: F = .{ .runtime = &runtime };
+        var future = try io.concurrent(F.run, .{&f});
+        const Control = struct {
+            runtime: *TextMergeRuntime,
+            case: Case,
+            unlocked: bool = true,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn release(self: *@This()) void {
+                if (self.unlocked) return;
+                self.runtime.mutex.unlock(self.runtime.io.?);
+                self.unlocked = true;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case != .lifetime_in_wait) self.release();
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                self.release();
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        var control: Control = .{ .runtime = &runtime, .case = case };
+        defer {
+            control.release();
+            runtime.producer_closing.store(true, .release);
+            runtime.signalProducerAdmissionChanged();
+            future.await(io);
+            runtime.deinit();
+        }
+        const deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(5), .clock = .awake });
+        while (!test_producer_shutdown_wait_entered.load(.acquire)) {
+            if (Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        runtime.mutex.lockUncancelable(io);
+        control.unlocked = false;
+        const admission = @import("../../../common/read_admission.zig");
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const result = runtime.closeProducerAdmissionWithAdmission(.init(&payload));
+        if (case == .success) try result else try std.testing.expectError(switch (case) {
+            .begin_failure => error.NotFound,
+            .end_failure => error.Canceled,
+            .lifetime_in_wait => error.DeadlineExceeded,
+            .success => unreachable,
+        }, result);
+        // Even failed mutex wait entry must wake the publisher immediately,
+        // without borrowing a caller grant or waiting for the peer guard.
+        try f.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        try std.testing.expectEqual(error.TextMergeRuntimeShutdown, f.failure.?);
+        control.release();
+        control.case = .success;
+        try runtime.closeProducerAdmissionWithAdmission(.init(&payload));
+        try std.testing.expectError(error.Canceled, runtime.start());
+        try std.testing.expectError(error.TextMergeRuntimeShutdown, runtime.acquireProducerPermit("late", 1, 1));
+        try std.testing.expect(!try runtime.ensureRunning());
+        try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_failure), control.ends);
+    }
 }
