@@ -195,12 +195,12 @@ pub const Runtime = struct {
     pub fn provider(self: *@This()) decisions.DecisionProvider {
         return .{ .ptr = self, .validate_fn = validate, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint, .capabilities_fn = resolvedCapabilities };
     }
-    fn resolvedCapabilities(ptr: *anyopaque, name: []const u8) !decisions.Capabilities {
+    fn resolvedCapabilities(ptr: *anyopaque, name: []const u8, source_table: []const u8) !decisions.Capabilities {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         var result = try self.registry.getDeciderCapabilities(name);
         const cfg = try self.registry.getDeciderConfig(name);
         if (cfg.decision_method == .generated and cfg.generator.?.provider == .antfly and result.images) {
-            result.images = (try self.resolveGenerator(name, self.source_table)).capabilities.images;
+            result.images = (try self.resolveGenerator(name, if (source_table.len > 0) source_table else self.source_table)).capabilities.images;
         }
         return result;
     }
@@ -208,7 +208,7 @@ pub const Runtime = struct {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         if (self.context) |ctx| try ctx.check();
     }
-    fn validate(ptr: *anyopaque, name: []const u8, questions: decisions.Json) !void {
+    fn validate(ptr: *anyopaque, name: []const u8, questions: decisions.Json, source_table: []const u8) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         const cfg = try self.registry.getDeciderConfig(name);
         try cfg.validate();
@@ -217,7 +217,7 @@ pub const Runtime = struct {
         if (cfg.decision_method == .generated) {
             var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
             defer arena.deinit();
-            const resolved = try self.resolveGenerator(name, self.source_table);
+            const resolved = try self.resolveGenerator(name, if (source_table.len > 0) source_table else self.source_table);
             const generator = resolved.generator;
             const mode = try resolved.capabilities.select(cfg.output, cfg.probabilities);
             try @import("antfly_structured").validateProviderSchema(generator, mode, try generated.questionSchema(arena.allocator(), questions));
@@ -242,7 +242,7 @@ pub const Runtime = struct {
     pub fn evaluateGeneratedPartial(self: *Runtime, a: std.mem.Allocator, name: []const u8, requests: []const decisions.Request) !GeneratedBatch {
         if (requests.len == 0) return error.InvalidDecisionSpecification;
         try self.provider().validateRequests(a, requests);
-        try validate(self, name, requests[0].questions);
+        try self.provider().withSourceTable(requests[0].source_table).validate(name, requests[0].questions);
         const cfg = try self.registry.getDeciderConfig(name);
         if (cfg.decision_method != .generated) return error.InvalidDeciderConfig;
         var lease = admission.tryAcquireLease() orelse return error.DecisionRateLimited;
@@ -1798,4 +1798,87 @@ test "decision functions generated statement renews revoked leases without chang
         group.cancel(io);
         if (failure) |err| return err;
     }
+}
+
+test "decision functions scoped generated image validation and execution share a route" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Fixture = struct {
+        var routes: []httpx.testing_mod.Route = undefined;
+        var vision_catalog: []const u8 = undefined;
+        const text_catalog =
+            \\{"generators":{"vision":{"model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","inputs":["text"],"inference_capabilities":{"version":3,"task":"generate","input_modalities":["text"],"accepted_mime_types":["text/plain"],"input_granularity":"item","output":"generated_text","result_cardinality":"one_per_item","prompt_policy":"explicit","borrowed_attachments":false,"numeric_responses_v1":false,"rerank_documents_v1":false,"generation_grammar_v1":true,"batch":{"mode":"none","preferred_items":1,"max_items":1,"max_encoded_media_bytes":null,"max_decoded_pixels":null,"max_media_parts_per_item":0,"per_item_failures":false}}}}}
+        ;
+        fn catalog(req: httpx.testing_mod.RequestInfo) !void {
+            const table = req.header("X-Antfly-Source-Table") orelse return error.MissingScope;
+            try std.testing.expectEqualStrings("model=vision&task=generate&operation=generate", req.query);
+            routes[0].respond.body = if (std.mem.eql(u8, table, "photos")) vision_catalog else text_catalog;
+        }
+        fn generate(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("photos", req.header("X-Antfly-Source-Table") orelse return error.MissingScope);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "iVBORw0KGgo=") != null);
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            while (true) server.handleOne() catch |err| {
+                if (err != error.Canceled and err != error.Cancelled) failure.* = err;
+                return;
+            };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var vision_catalog = try std.mem.replaceOwned(u8, alloc, Fixture.text_catalog, "[\"text\"]", "[\"text\",\"image\"]");
+    vision_catalog = try std.mem.replaceOwned(u8, alloc, vision_catalog, "[\"text/plain\"]", "[\"text/plain\",\"image/png\"]");
+    Fixture.vision_catalog = try std.mem.replaceOwned(u8, alloc, vision_catalog, "\"max_media_parts_per_item\":0", "\"max_media_parts_per_item\":8");
+    var routes = [_]httpx.testing_mod.Route{
+        .{ .path = "/ai/v1/models", .assert_request = Fixture.catalog },
+        .{ .method = .POST, .path = "/generate", .assert_request = Fixture.generate, .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"item\\\":0,\\\"value\\\":{\\\"answer\\\":\\\"same\\\"}}]}\"}}]}" } },
+    };
+    Fixture.routes = &routes;
+    var server = try httpx.TestServer.start(a, io, &routes);
+    defer server.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{ &server, &failure });
+    var client = httpx.Client.initWithConfig(a, io, .{ .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("judge", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only, .max_image_input_tokens = 8192 });
+    // SQL keeps a statement-wide runtime and puts each bound table on the
+    // provider. Its default must not supply discovery for another table.
+    var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = io, .antfly_url = server.baseUrl(), .source_table = "default" };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+        \\{"answer":{"type":"choice","instructions":"Compare","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    const input = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]
+    , .{}));
+    const request = decisions.Request{ .decider = "judge", .questions = questions, .input = input };
+    const first = try runtime.provider().withSourceTable("photos").evaluateBatch(alloc, &.{request});
+    try std.testing.expectEqualStrings("same", first[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
+    try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(1));
+    try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.provider().withSourceTable("text_docs").evaluateBatch(alloc, &.{request}));
+    try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(1));
+    // Internal batches can carry per-item scopes without a provider override.
+    var scoped = request;
+    scoped.source_table = "photos";
+    const partial = try runtime.evaluatePartial(alloc, &.{scoped});
+    try std.testing.expect(partial.values[0] != null);
+    try std.testing.expect(partial.failures[0] == null);
+    // The bound provider remains authoritative over an item's inherited scope.
+    scoped.source_table = "text_docs";
+    _ = try runtime.provider().withSourceTable("photos").evaluateBatch(alloc, &.{scoped});
+    try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(1));
+    try std.testing.expectEqualStrings("default", runtime.source_table);
+    group.cancel(io);
+    if (failure) |err| return err;
 }

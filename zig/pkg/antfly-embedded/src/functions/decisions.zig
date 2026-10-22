@@ -645,10 +645,10 @@ test "decision provider embeddinggemma2 provider wrapper retains the trusted sim
     const a = arena.allocator();
     const Mock = struct {
         response: Json,
-        fn validate(_: *anyopaque, _: []const u8, questions: Json) !void {
+        fn validate(_: *anyopaque, _: []const u8, questions: Json, _: []const u8) !void {
             try validateQuestions(questions, (DeciderConfig{ .provider = .antfly, .decision_method = .embedding_similarity }).resolvedCapabilities());
         }
-        fn caps(_: *anyopaque, _: []const u8) !Capabilities {
+        fn caps(_: *anyopaque, _: []const u8, _: []const u8) !Capabilities {
             return (DeciderConfig{ .provider = .antfly, .decision_method = .embedding_similarity }).resolvedCapabilities();
         }
         fn evaluate(raw: *anyopaque, alloc: std.mem.Allocator, _: []const Request) ![]const Json {
@@ -667,9 +667,10 @@ pub const DecisionProvider = struct {
     /// Trusted routing scope borrowed from the bound statement, never public JSON.
     source_table: []const u8 = "",
     ptr: *anyopaque,
-    validate_fn: *const fn (*anyopaque, []const u8, Json) anyerror!void,
+    /// Both callbacks use the same trusted table scope as execution.
+    validate_fn: *const fn (*anyopaque, []const u8, Json, []const u8) anyerror!void,
     evaluate_batch_fn: *const fn (*anyopaque, std.mem.Allocator, []const Request) anyerror![]const Json,
-    capabilities_fn: ?*const fn (*anyopaque, []const u8) anyerror!Capabilities = null,
+    capabilities_fn: ?*const fn (*anyopaque, []const u8, []const u8) anyerror!Capabilities = null,
     checkpoint_fn: ?*const fn (*anyopaque) anyerror!void = null,
     pub fn withSourceTable(self: @This(), table: []const u8) @This() {
         var scoped = self;
@@ -680,14 +681,18 @@ pub const DecisionProvider = struct {
         if (self.checkpoint_fn) |f| try f(self.ptr);
     }
     pub fn validate(self: @This(), decider: []const u8, questions: Json) !void {
-        try self.validate_fn(self.ptr, decider, questions);
+        try self.validate_fn(self.ptr, decider, questions, self.source_table);
+    }
+    fn requestSourceTable(self: @This(), request: Request) []const u8 {
+        return if (self.source_table.len > 0) self.source_table else request.source_table;
     }
     pub fn validateRequests(self: @This(), a: std.mem.Allocator, requests: []const Request) !void {
         try self.checkpoint();
         for (requests) |request| {
-            try self.validate(request.decider, request.questions);
+            const table = self.requestSourceTable(request);
+            try self.validate_fn(self.ptr, request.decider, request.questions, table);
             try request.input.validate();
-            const caps = if (self.capabilities_fn) |f| try f(self.ptr, request.decider) else Capabilities{ .max_levels = 64 };
+            const caps = if (self.capabilities_fn) |f| try f(self.ptr, request.decider, self.requestSourceTable(request)) else Capabilities{ .max_levels = 64 };
             if (!caps.messages) _ = try request.input.requireText();
             if (!caps.images and request.input.imageCount() != 0) return error.UnsupportedInferenceFeature;
             try request.input.checkLimit(a, caps.max_input_bytes);
@@ -704,7 +709,7 @@ pub const DecisionProvider = struct {
         if (results.len != requests.len) return error.InvalidDecisionOutput;
         const out = try a.alloc(Json, results.len);
         for (requests, results, out) |request, result, *value| {
-            const caps = if (self.capabilities_fn) |f| try f(self.ptr, request.decider) else Capabilities{ .max_levels = 64 };
+            const caps = if (self.capabilities_fn) |f| try f(self.ptr, request.decider, self.requestSourceTable(request)) else Capabilities{ .max_levels = 64 };
             value.* = try normalizeResponseWithCapabilities(a, request.questions, result, caps);
         }
         try self.checkpoint();
