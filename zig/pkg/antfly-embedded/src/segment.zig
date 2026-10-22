@@ -4838,9 +4838,14 @@ fn buildExternalSortedMergePlan(alloc: Allocator, inputs: []const MergeInput, fi
         }
     }
     try sorter.push(chunk.items);
-    chunk.clearRetainingCapacity();
+    // The final merge reads sealed runs. Release input decoding and chunk
+    // storage before allocating merge cursors and output buffers.
+    chunk.deinit(alloc);
+    chunk = .empty;
     chunk_payloads.deinit();
     chunk_payloads = @import("segment_source.zig").Scratch.init(alloc, scratch.external_sort_chunk_bytes);
+    reads.deinit();
+    reads = TypedReadScope.init(alloc);
     const range = try sorter.finish();
     var first: []SegmentSortValue = &.{};
     errdefer deinitSortKeys(alloc, first);
