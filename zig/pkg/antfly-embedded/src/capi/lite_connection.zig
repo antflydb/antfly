@@ -470,7 +470,9 @@ pub fn testPathReplacementAdmission() !void {
     const Replacement = struct {
         acquired: bool = false,
         failure: ?anyerror = null,
+        finished: std.Io.Event = .unset,
         fn run(self: *@This(), target: []const u8, expected: *PathGate) void {
+            defer self.finished.set(h.handleLockIo());
             const replacement = acquirePathReplacement(target) catch |err| {
                 self.failure = err;
                 return;
@@ -487,6 +489,9 @@ pub fn testPathReplacementAdmission() !void {
         const queued = held.gate.mutex.next == 2;
         held.gate.mutex.state.unlock(io);
         if (queued) break;
+        // A failed registration or a different canonical gate must fail the
+        // regression instead of leaving it waiting for an impossible ticket.
+        try std.testing.expect(!replacement.finished.isSet());
         std.Thread.yield() catch {};
     }
     held.release();

@@ -35,6 +35,10 @@ from conftest import (
 )
 from helpers import wait_until
 
+# These tests construct their servers directly, outside the process-owning
+# fixtures that the scheduler can infer. Reserve their actual process capacity.
+pytestmark = pytest.mark.e2e_resource("antfly_process")
+
 
 class DenseEmbeddingServer(InferenceEmbeddingServer):
     @staticmethod

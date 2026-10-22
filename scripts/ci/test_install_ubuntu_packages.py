@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -16,10 +15,10 @@
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("install_ubuntu_packages.sh")
 
