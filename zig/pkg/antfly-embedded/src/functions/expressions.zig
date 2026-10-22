@@ -182,7 +182,7 @@ const Validator = struct {
         });
         try self.expression(obj.get("input") orelse return error.InvalidFunctionExpression, depth + 1);
         const input_type = expressionType(obj.get("input").?, self.bindings, 0);
-        if (input_type != .text and input_type != .dynamic and input_type != .null_value) return error.FunctionTypeMismatch;
+        if (input_type != .text and input_type != .json and input_type != .dynamic and input_type != .null_value) return error.FunctionTypeMismatch;
         _ = try d.text(obj.get("decider") orelse return error.InvalidFunctionExpression);
         const args = try callArgs(self.a, desc.function, obj, .null);
         const questions = try d.questionsFor(self.a, desc.function, args);
@@ -273,7 +273,7 @@ fn evalExpressions(a: std.mem.Allocator, provider: d.DecisionProvider, expr: Jso
     for (inputs, values, 0..) |input, *value, i| {
         value.* = .null;
         if (input == .null) continue;
-        try requests.append(a, .{ .input = try d.text(input), .questions = questions, .decider = decider });
+        try requests.append(a, .{ .input = try d.Input.fromJson(input), .questions = questions, .decider = decider });
         try indexes.append(a, i);
     }
     if (requests.items.len > 0) {
@@ -428,4 +428,17 @@ test "decision functions Boolean waves retain SQL unknown through OR and NOT" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), provider.calls);
+}
+
+test "decision functions expressions preserve literal multimodal evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var provider: @import("../sql/decision_eval.zig").testing.Provider = .{ .expect_messages = true };
+    const plan = try Plan.parse(a, try std.json.parseFromSliceLeaky(Json, a,
+        \\{"scope":"candidates","candidate_count":1,"compute":{"damaged":{"call":"ai_probability","input":{"literal":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]},"statement":"Damaged?","decider":"vision"}}}
+    , .{}));
+    const rows = try evaluateBatch(a, plan, provider.provider(), &.{d.jsonObject()});
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), rows[0].computed.object.get("damaged").?.float, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
 }

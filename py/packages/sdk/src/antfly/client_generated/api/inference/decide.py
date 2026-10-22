@@ -92,9 +92,10 @@ def sync_detailed(
 ) -> Response[InferenceDecideResponse | InferenceError | InferenceTransientCapacityError]:
     """Answer named decision questions
 
-     Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
-    trained decision models support choice, score and predicate. Answer variants distinguish trained
-    probabilities from raw cosine similarities.
+     Execute text or multimodal evidence through named deciders, or an Antfly text batch. OpenAI and Jev
+    adapters support images; native deciders require text. Embedding similarity supports choice and
+    multi_choice; trained decision models support choice, score and predicate. Answer variants
+    distinguish trained probabilities from raw cosine similarities.
 
     Args:
         body (GeneratedDecideRequest | InferenceDecideRequest): A trained decider request or a
@@ -126,9 +127,10 @@ def sync(
 ) -> InferenceDecideResponse | InferenceError | InferenceTransientCapacityError | None:
     """Answer named decision questions
 
-     Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
-    trained decision models support choice, score and predicate. Answer variants distinguish trained
-    probabilities from raw cosine similarities.
+     Execute text or multimodal evidence through named deciders, or an Antfly text batch. OpenAI and Jev
+    adapters support images; native deciders require text. Embedding similarity supports choice and
+    multi_choice; trained decision models support choice, score and predicate. Answer variants
+    distinguish trained probabilities from raw cosine similarities.
 
     Args:
         body (GeneratedDecideRequest | InferenceDecideRequest): A trained decider request or a
@@ -155,9 +157,10 @@ async def asyncio_detailed(
 ) -> Response[InferenceDecideResponse | InferenceError | InferenceTransientCapacityError]:
     """Answer named decision questions
 
-     Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
-    trained decision models support choice, score and predicate. Answer variants distinguish trained
-    probabilities from raw cosine similarities.
+     Execute text or multimodal evidence through named deciders, or an Antfly text batch. OpenAI and Jev
+    adapters support images; native deciders require text. Embedding similarity supports choice and
+    multi_choice; trained decision models support choice, score and predicate. Answer variants
+    distinguish trained probabilities from raw cosine similarities.
 
     Args:
         body (GeneratedDecideRequest | InferenceDecideRequest): A trained decider request or a
@@ -187,9 +190,10 @@ async def asyncio(
 ) -> InferenceDecideResponse | InferenceError | InferenceTransientCapacityError | None:
     """Answer named decision questions
 
-     Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
-    trained decision models support choice, score and predicate. Answer variants distinguish trained
-    probabilities from raw cosine similarities.
+     Execute text or multimodal evidence through named deciders, or an Antfly text batch. OpenAI and Jev
+    adapters support images; native deciders require text. Embedding similarity supports choice and
+    multi_choice; trained decision models support choice, score and predicate. Answer variants
+    distinguish trained probabilities from raw cosine similarities.
 
     Args:
         body (GeneratedDecideRequest | InferenceDecideRequest): A trained decider request or a
