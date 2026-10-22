@@ -31,6 +31,7 @@ pub const Owner = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     stop_started: bool = false,
     joined: std.Io.Event = .unset,
+    stop_progress: std.Io.Event = .unset,
     finished: std.atomic.Value(bool) = .init(false),
     start_address_for_test: usize = 0,
 
@@ -70,32 +71,15 @@ pub const Owner = struct {
         };
     }
 
-    pub fn stop(self: *Owner, runtime: *runtime_mod.BackendRuntime) void {
-        const io = runtime.io();
-        self.lock();
-        if (self.stop_started) {
-            self.lifecycle_mutex.unlock();
-            // Detachment transfers join ownership; it does not retire the
-            // callback. Every shutdown caller waits for the same physical join.
-            if (io) |lane| self.joined.waitUncancelable(lane) else std.debug.assert(self.joined.isSet());
-            return;
-        }
-        self.stop_started = true;
-        self.stopping.store(true, .release);
-        var task = self.registration;
-        self.registration = null;
-        if (task == null) {
-            if (io) |lane| self.joined.set(lane) else @atomicStore(std.Io.Event, &self.joined, .is_set, .release);
-            self.lifecycle_mutex.unlock();
-            return;
-        }
-        self.lifecycle_mutex.unlock();
-        // Final callback handshakes may take this lifecycle lock. Its joining
-        // caller must release the lock and retain the context until retirement.
-        task.?.await(io orelse @panic("maintenance registration outlived runtime I/O"));
-        self.joined.set(io.?);
+    fn shutdown(self: *Owner) @import("maintenance_stop.zig").Borrowed {
+        return .{ .mutex = &self.lifecycle_mutex, .registration = &self.registration, .stopping = &self.stopping, .finisher = &self.stop_started, .joined = &self.joined, .changed = &self.stop_progress };
     }
-
+    pub fn stop(self: *Owner, runtime: *runtime_mod.BackendRuntime) void {
+        self.shutdown().stop(runtime.io(), false);
+    }
+    pub fn stopWithAdmission(self: *Owner, runtime: *runtime_mod.BackendRuntime, original: @import("../../common/read_admission.zig").Port) !void {
+        try self.shutdown().stopWithAdmission(runtime.io(), original);
+    }
     fn step(self: *Owner) ?u64 {
         const delay_ms: u64 = 10 * 1000;
         if (self.stopping.load(.acquire)) {

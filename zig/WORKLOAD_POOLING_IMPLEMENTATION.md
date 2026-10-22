@@ -23202,3 +23202,37 @@ whitespace checks pass. The registry retry fixture stubs physical close; the
 separate real-DB fixture exercises preflight and leaves final destruction to its
 quiesced owner. Full linked-owner and cross-engine shutdown qualification remain
 open.
+
+### Recurring worker close dependencies
+
+Serving close preflight also stops independent artifact maintenance, quarantine
+recovery and graph cleanup with the original cleanup capsule and deadline. All
+four recurring owners share a synchronous lifecycle helper; it borrows their
+existing registration, mutex and stop state without retaining execution controls.
+A controlled attempt keeps its registration attached until physical retirement
+succeeds. Interrupted attempts release the finisher claim and signal a separate
+progress event, allowing competing quiesced callers to retry without reporting
+the callback as joined. Compatibility joins retain their existing await/cancel
+policy and run outside the lifecycle mutex.
+
+Native ABI 75 and storage-owner ABI 133 fence the additional lifecycle event in
+the owner layouts. Durable formats and default activation are unchanged. Durable
+job lanes, portable activation, source publication, derived runtime executors,
+cache/IO teardown and callback cost/funding remain outside this preflight phase.
+Full shutdown and the full scheduler design remain incomplete; strong required
+providers remain disabled and full Linux qualification remains waived.
+
+Pinned Debug validation passes 89/89 build steps and 54/54 reported tests, plus
+the shared-service, lifetime and error/identity custom-runner suites and five
+native ABI cases. A direct run of the maintenance binary passes all 31 tests
+and explicitly includes the four-owner interruption matrix and abandoned
+finisher handoff. The matrix exercises success, failed begin, failed reentry and
+expired lifetime while retaining the original registration on failure. The
+concurrent test observes a real competing progress-event waiter before the
+controlled finisher gives up. The real-DB C-entry fixture verifies all four
+recurring owners joined while the physical DB remains live. All 5,503 native
+and schema inputs match controlled-close-workers-v1; source hashes and snapshots
+are in controlled-close-workers-verified.json in the cumulative receipts.
+Embedded boundary (1,035 sources), generated errors, control catalog, formatting
+and whitespace checks pass. These checks do not qualify the remaining shutdown
+phases or full cross-engine execution behavior.

@@ -98,6 +98,7 @@ pub const Owner = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     stop_started: bool = false,
     joined: std.Io.Event = .unset,
+    stop_progress: std.Io.Event = .unset,
     failures: u32 = 0,
     pub const Port = struct { ptr: *anyopaque, runtime: *runtime.BackendRuntime, turn: *const fn (*anyopaque, *const Pass) anyerror!bool };
     fn lock(self: *Owner) void {
@@ -115,95 +116,14 @@ pub const Owner = struct {
         self.port = port;
         self.registration = scheduler.registerClass(.maintenance, self, step) catch null;
     }
-    fn completeStop(self: *Owner, io: ?std.Io) void {
-        self.lock();
-        defer self.mutex.unlock();
-        self.registration = null;
-        self.stop_started = false;
-        if (io) |lane| self.joined.set(lane) else @atomicStore(std.Io.Event, &self.joined, .is_set, .release);
+    fn shutdown(self: *Owner) @import("maintenance_stop.zig").Borrowed {
+        return .{ .mutex = &self.mutex, .registration = &self.registration, .stopping = &self.stopping, .finisher = &self.stop_started, .joined = &self.joined, .changed = &self.stop_progress };
     }
-    fn stopAvailable(self: *Owner) bool {
-        self.lock();
-        defer self.mutex.unlock();
-        return self.joined.isSet() or !self.stop_started;
-    }
-    /// Quiesced compatibility join. A controlled attempt may abandon its
-    /// finisher after an original-control failure, so followers recheck the
-    /// claim rather than waiting forever for that attempt to publish joined.
     pub fn stop(self: *Owner, backend: *runtime.BackendRuntime) void {
-        const io = backend.io();
-        while (true) {
-            self.lock();
-            self.stopping.store(true, .release);
-            if (self.joined.isSet()) {
-                self.mutex.unlock();
-                return;
-            }
-            if (self.stop_started) {
-                self.mutex.unlock();
-                @import("antfly_platform").time.yieldNow();
-                continue;
-            }
-            self.stop_started = true;
-            var registration = self.registration;
-            self.mutex.unlock();
-            if (registration) |*handle| handle.cancel(io orelse @panic("native warming registration outlived runtime I/O"));
-            self.completeStop(io);
-            return;
-        }
+        self.shutdown().stop(backend.io(), true);
     }
-    /// Keep the same registration/context after every failed begin, lifetime
-    /// or reentry check. No callback can restart once stopping is fenced.
     pub fn stopWithAdmission(self: *Owner, backend: *runtime.BackendRuntime, original: @import("../../common/read_admission.zig").Port) !void {
-        self.stopping.store(true, .release);
-        var trace: @import("../../common/read_admission.zig").RejectionTrace = .{};
-        const control = trace.bind(original).?;
-        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
-        _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
-        while (true) {
-            try control.checkpoint();
-            self.lock();
-            if (self.joined.isSet()) {
-                self.mutex.unlock();
-                return;
-            }
-            if (!self.stop_started) {
-                self.stop_started = true;
-                var registration = self.registration;
-                self.mutex.unlock();
-                if (registration) |*handle| {
-                    const io = backend.io() orelse {
-                        self.lock();
-                        self.stop_started = false;
-                        self.mutex.unlock();
-                        return error.BackendRuntimeUnavailable;
-                    };
-                    handle.cancelWithAdmission(io, control) catch |cause| {
-                        self.lock();
-                        self.stop_started = false;
-                        self.mutex.unlock();
-                        return trace.failure orelse cause;
-                    };
-                }
-                self.completeStop(backend.io());
-                return;
-            }
-            self.mutex.unlock();
-            try boundary.beginWait();
-            var failure: ?anyerror = null;
-            while (!self.stopAvailable()) {
-                control.checkLifetime() catch |cause| {
-                    failure = trace.failure orelse cause;
-                    break;
-                };
-                @import("antfly_platform").time.yieldNow();
-            }
-            boundary.endWait() catch |cause| {
-                if (failure) |first| return first;
-                return trace.failure orelse cause;
-            };
-            if (failure) |cause| return cause;
-        }
+        try self.shutdown().stopWithAdmission(backend.io(), original);
     }
     fn cancelled(raw: *const anyopaque) bool {
         const self: *const Owner = @ptrCast(@alignCast(raw));

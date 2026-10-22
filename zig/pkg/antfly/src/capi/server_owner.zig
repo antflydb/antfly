@@ -7017,6 +7017,9 @@ test "controlled owner close preflight C entry drains a real DB with the origina
     try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerDrainClose(id, &request));
     try std.testing.expect(!handle.db.isClosed());
     try std.testing.expect(handle.db.native_query_warming.joined.isSet());
+    try std.testing.expect(handle.db.independent_maintenance.joined.isSet());
+    try std.testing.expect(handle.db.quarantine_recovery.joined.isSet());
+    try std.testing.expect(handle.db.graph_cleanup_owner.joined.isSet());
     try std.testing.expect(handle.db.local_execution.retained_preparation_owner.?.closed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().cleanup_operations);
 }

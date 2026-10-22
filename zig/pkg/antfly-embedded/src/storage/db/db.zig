@@ -6203,6 +6203,9 @@ pub const DB = struct {
         if (self.closed) return;
         try self.drainPreparedAssembliesWithAdmission(original);
         try self.native_query_warming.stopWithAdmission(self.backend_runtime, original);
+        try self.independent_maintenance.stopWithAdmission(self.backend_runtime, original);
+        try self.quarantine_recovery.stopWithAdmission(self.backend_runtime, original);
+        try self.graph_cleanup_owner.stopWithAdmission(self.backend_runtime.io(), original);
     }
 
     fn stopRetainedPreparations(self: *DB) void {

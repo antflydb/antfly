@@ -44,6 +44,7 @@ pub const Owner = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     stop_started: bool = false,
     joined: std.Io.Event = .unset,
+    stop_progress: std.Io.Event = .unset,
     repair_retry_after_ns: u64 = 0,
     pub const idle_poll_ns: u64 = 5 * std.time.ns_per_s;
     pub const active_poll_ns: u64 = 100 * std.time.ns_per_ms;
@@ -65,32 +66,14 @@ pub const Owner = struct {
             return;
         };
     }
+    fn shutdown(self: *Owner) @import("maintenance_stop.zig").Borrowed {
+        return .{ .mutex = &self.lifecycle_mutex, .registration = &self.future, .stopping = &self.stopping, .finisher = &self.stop_started, .joined = &self.joined, .changed = &self.stop_progress };
+    }
     pub fn stop(self: *Owner, runtime: *runtime_mod.BackendRuntime) void {
-        const io = runtime.io();
-        self.lock();
-        if (self.stop_started) {
-            self.lifecycle_mutex.unlock();
-            // Detaching a future transfers its join, not its completed state.
-            // Every shutdown caller must observe physical callback retirement.
-            if (io) |lane| self.joined.waitUncancelable(lane) else std.debug.assert(self.joined.isSet());
-            return;
-        }
-        self.stop_started = true;
-        self.stopping.store(true, .release);
-        var future = self.future;
-        self.future = null;
-        if (future == null) {
-            // A runtime without an I/O lane cannot have a callback future.
-            // Complete this no-work shutdown before releasing admission.
-            if (io) |lane| self.joined.set(lane) else @atomicStore(std.Io.Event, &self.joined, .is_set, .release);
-            self.lifecycle_mutex.unlock();
-            return;
-        }
-        self.lifecycle_mutex.unlock();
-        // The callback may invoke another local lifecycle operation. Join
-        // outside admission so its completion cannot deadlock shutdown.
-        future.?.await(io orelse @panic("maintenance future outlived its runtime I/O lane"));
-        self.joined.set(io.?);
+        self.shutdown().stop(runtime.io(), false);
+    }
+    pub fn stopWithAdmission(self: *Owner, runtime: *runtime_mod.BackendRuntime, original: @import("../../common/read_admission.zig").Port) !void {
+        try self.shutdown().stopWithAdmission(runtime.io(), original);
     }
     fn scheduledStep(self: *Owner) ?u64 {
         return self.step(self.port);
@@ -414,12 +397,12 @@ test "independent maintenance concurrent shutdown callers both join physical cal
     const second_thread = try std.Thread.spawn(.{}, Stopper.stop, .{&second});
     defer second_thread.join();
     defer fixture.release.set(io);
-    while (@atomicLoad(std.Io.Event, &owner.joined, .acquire) != .waiting and
+    while (@atomicLoad(std.Io.Event, &owner.stop_progress, .acquire) != .waiting and
         !second.returned.load(.acquire) and @import("antfly_platform").time.monotonicNs() < deadline)
         io.sleep(.fromMilliseconds(1), .awake) catch {};
     // The second caller really reached the retirement wait; this is not an
     // inference from an arbitrary sleep while a thread might be unscheduled.
-    try std.testing.expectEqual(std.Io.Event.waiting, @atomicLoad(std.Io.Event, &owner.joined, .acquire));
+    try std.testing.expectEqual(std.Io.Event.waiting, @atomicLoad(std.Io.Event, &owner.stop_progress, .acquire));
     try std.testing.expect(!first.returned.load(.acquire));
     try std.testing.expect(!second.returned.load(.acquire));
     try std.testing.expect(!fixture.retired.load(.acquire));

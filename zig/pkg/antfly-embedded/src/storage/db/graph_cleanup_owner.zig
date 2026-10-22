@@ -52,6 +52,7 @@ pub const Owner = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     stop_started: bool = false,
     joined: std.Io.Event = .unset,
+    stop_progress: std.Io.Event = .unset,
     fn lock(self: *Owner) void {
         while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
@@ -69,31 +70,15 @@ pub const Owner = struct {
             return;
         };
     }
-    pub fn stop(self: *Owner, io: ?std.Io) void {
-        self.lock();
-        if (self.stop_started) {
-            self.mutex.unlock();
-            // Detachment transfers join ownership; it does not retire the
-            // callback. Every shutdown caller waits for the same physical join.
-            if (io) |lane| self.joined.waitUncancelable(lane) else std.debug.assert(self.joined.isSet());
-            return;
-        }
-        self.stop_started = true;
-        self.stopping.store(true, .release);
-        var task = self.registration;
-        self.registration = null;
-        if (task == null) {
-            if (io) |lane| self.joined.set(lane) else @atomicStore(std.Io.Event, &self.joined, .is_set, .release);
-            self.mutex.unlock();
-            return;
-        }
-        self.mutex.unlock();
-        // Final callback handshakes may take this lifecycle lock. Its joining
-        // caller must release the lock and retain the context until retirement.
-        task.?.await(io orelse @panic("maintenance registration outlived runtime I/O"));
-        self.joined.set(io.?);
+    fn shutdown(self: *Owner) @import("maintenance_stop.zig").Borrowed {
+        return .{ .mutex = &self.mutex, .registration = &self.registration, .stopping = &self.stopping, .finisher = &self.stop_started, .joined = &self.joined, .changed = &self.stop_progress };
     }
-
+    pub fn stop(self: *Owner, io: ?std.Io) void {
+        self.shutdown().stop(io, false);
+    }
+    pub fn stopWithAdmission(self: *Owner, io: ?std.Io, original: @import("../../common/read_admission.zig").Port) !void {
+        try self.shutdown().stopWithAdmission(io, original);
+    }
     fn scheduledStep(self: *Owner) ?u64 {
         return self.step(self.port);
     }
