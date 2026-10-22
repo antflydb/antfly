@@ -1241,7 +1241,8 @@ pub fn applySorted(alloc: Allocator, store: Store, prior: ?Ref, source: anytype)
         if (item == null and change == null) break;
         if (change != null and (item == null or !less(item.?.first, change.?.key))) {
             if (item != null and std.mem.eql(u8, item.?.first, change.?.key)) {
-                if (item.?.ref != null) {
+                if (item.?.ref) |ref| {
+                    if (ref.height == 0) builder.target_bytes = @max(builder.target_bytes, packingTarget(ref.bytes));
                     try old.expand();
                     continue;
                 }
@@ -1253,7 +1254,10 @@ pub fn applySorted(alloc: Allocator, store: Store, prior: ?Ref, source: anytype)
             if (change == null or (if (item.?.end) |end| !less(change.?.key, end) else false)) {
                 try builder.addSubtree(item.?.first, item.?.end, ref, item.?.aggregate);
                 old.consume();
-            } else try old.expand();
+            } else {
+                if (ref.height == 0) builder.target_bytes = @max(builder.target_bytes, packingTarget(ref.bytes));
+                try old.expand();
+            }
         } else {
             try builder.add(item.?.first, item.?.value);
             old.consume();
@@ -3531,6 +3535,15 @@ test "serverless graph streamed mutations retain untouched branches and match ba
     }
     try std.testing.expect((try right.next()) == null);
     try std.testing.expectEqual(@as(u64, 10000), prior.records);
+    // Keep the original bulk leaf size class on an incremental rewrite. A
+    // local delta must not turn one 256 KiB leaf into eight ordinary leaves.
+    var bulk_input: Input = .{};
+    const bulk = (try buildSortedWithOptions(a, memory.store(), &bulk_input, .{ .target_bytes = bulk_target_page_bytes })).?;
+    var bulk_stream: Stream = .{ .remaining = &edits };
+    memory.writes = 0;
+    const bulk_result = (try applySorted(a, memory.store(), bulk, &bulk_stream)).?;
+    try std.testing.expect(memory.writes < 4);
+    try std.testing.expectEqual(result.records, bulk_result.records);
     var bad: Stream = .{ .remaining = &.{ edits[1], edits[0] } };
     try std.testing.expectError(error.UnsortedGraphPageMutations, applySorted(a, memory.store(), prior, &bad));
     var empty: Stream = .{ .remaining = &.{} };

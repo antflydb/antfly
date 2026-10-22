@@ -260,6 +260,7 @@
     "streamed_mutation_page_reads_less_than": 40,
     "streamed_mutation_page_writes_less_than": 40,
     "replay_capture_owner": "retained reference through spool teardown",
-    "range_flights": "shared containing immutable physical intervals without requiring residency"
+    "range_flights": "shared containing immutable physical intervals without requiring residency",
+    "bulk_leaf_delta_page_writes_less_than": 4
   }
 }

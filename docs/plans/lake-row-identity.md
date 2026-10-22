@@ -536,7 +536,10 @@ file rewrites.
 Native metadata mutations consume one validated ordered stream against a lazy
 old-tree frontier. Unaffected half-open routing intervals retain their existing
 page references; intersecting leaves and routing boundaries flow through one
-bounded sorted builder. There is no mutation-count threshold that forces a full
+bounded sorted builder. Touched bulk leaves retain their larger packing size
+class instead of splitting into ordinary small pages. Page arenas and reusable
+order-check storage avoid per-record allocation/free traffic. There is no
+mutation-count threshold that forces a full
 old-tree replay, and no repeated publication of a root for each 256 changes.
 The old root stays authoritative until the existing publication CAS succeeds.
 Producer errors, duplicate/out-of-order edits, cancellation and upload failures
