@@ -20,6 +20,11 @@ tags: [lite, embedded, local-first, backup, migration]
 
 Antfly Lite is Antfly in one file. Documents, schemas, indexes, enrichments, and query-visible artifacts live in a local `.aflite` database that an application opens directly, with no server process. Choose Lite for development, desktop apps, edge workers, tests, and single-user deployments. Choose a normal instance when you need replication, shard placement, multi-node scaling, or cluster metadata. Everything else, from the index model to the query API, is the same code.
 
+Embedded storage query execution rejects non-null `evaluate`; use the
+[supported embedded API surface](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfly-embedded/WASM.md#hosted-entry-points)
+for local queries. The file-format revision below is independent of the Antfly
+release version.
+
 ```bash
 antfly-lite lite init app.aflite
 antfly-lite lite status app.aflite
@@ -32,7 +37,7 @@ antfly-lite lite status app.aflite
   "storage": {
     "format": "aflite",
     "engine": "native_single_file",
-    "format_version": 2
+    "format_version": 4
   },
   "inference": {
     "mode": "caller_supplied_or_disabled",

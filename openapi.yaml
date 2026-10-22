@@ -2955,6 +2955,14 @@ paths:
 
         If all versions match, writes are executed atomically via 2PC.
 
+        A 409 with diagnostic code `transaction_outcome_unknown` is different
+
+        from an aborted optimistic conflict: it may already have committed and
+
+        MUST NOT be replayed. A committed 202 result requires observation or
+
+        repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
+
 
         Stateless clients manage their own read set. For server-managed
 
@@ -34467,7 +34475,7 @@ components:
             and readiness are local to each owning shard, not client-writable.
         default_type:
           type: string
-          description: Default type to use from the document_types.
+          description: Default type to use from the document_schemas.
         enforce_types:
           type: boolean
           description: >
@@ -48065,7 +48073,12 @@ components:
           description: Zero for classifiers, which generate no tokens.
   responses:
     CommittedMutationAccepted:
-      description: Mutation committed with pending visibility or explicit repair debt
+      description: >
+        Mutation committed with pending visibility or explicit repair debt.
+
+        This is a committed result: observe recovery/repair rather than replaying
+
+        the business mutation. See https://antfly.io/docs/reference/transaction-outcomes.
       content:
         application/json:
           schema:

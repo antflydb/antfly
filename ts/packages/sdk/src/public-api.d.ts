@@ -476,6 +476,10 @@ export interface paths {
          *     response containing details about which key conflicted.
          *
          *     If all versions match, writes are executed atomically via 2PC.
+         *     A 409 with diagnostic code `transaction_outcome_unknown` is different
+         *     from an aborted optimistic conflict: it may already have committed and
+         *     MUST NOT be replayed. A committed 202 result requires observation or
+         *     repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
          *
          *     Stateless clients manage their own read set. For server-managed
          *     read-modify-write workflows, use the transaction session endpoints.
@@ -16785,7 +16789,7 @@ export interface components {
              *     and readiness are local to each owning shard, not client-writable.
              */
             relational_indexes?: components["schemas"]["RelationalIndexDefinition"][];
-            /** @description Default type to use from the document_types. */
+            /** @description Default type to use from the document_schemas. */
             default_type?: string;
             /**
              * @description Whether to enforce that documents must match one of the provided document types.
@@ -23823,7 +23827,11 @@ export interface components {
         };
     };
     responses: {
-        /** @description Mutation committed with pending visibility or explicit repair debt */
+        /**
+         * @description Mutation committed with pending visibility or explicit repair debt.
+         *     This is a committed result: observe recovery/repair rather than replaying
+         *     the business mutation. See https://antfly.io/docs/reference/transaction-outcomes.
+         */
         CommittedMutationAccepted: {
             headers: {
                 [name: string]: unknown;

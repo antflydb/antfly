@@ -11923,7 +11923,10 @@ components:
             navigate into decoded JSONB columns.
   responses: # Add reusable responses
     CommittedMutationAccepted:
-      description: Mutation committed with pending visibility or explicit repair debt
+      description: |
+        Mutation committed with pending visibility or explicit repair debt.
+        This is a committed result: observe recovery/repair rather than replaying
+        the business mutation. See https://antfly.io/docs/reference/transaction-outcomes.
       content:
         application/json:
           schema:
@@ -13053,6 +13056,10 @@ paths:
         response containing details about which key conflicted.
 
         If all versions match, writes are executed atomically via 2PC.
+        A 409 with diagnostic code `transaction_outcome_unknown` is different
+        from an aborted optimistic conflict: it may already have committed and
+        MUST NOT be replayed. A committed 202 result requires observation or
+        repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
 
         Stateless clients manage their own read set. For server-managed
         read-modify-write workflows, use the transaction session endpoints.
