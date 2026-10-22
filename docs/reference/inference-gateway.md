@@ -224,6 +224,8 @@ validation. Remote execution leases can renew independently: an authoritative
 stale-lease response triggers one rediscovery and retry if the model revision and
 capabilities still match. Changed model facts fail closed; a discovery outage
 cannot restore a revoked lease. A new request resolves its own model facts.
+Revocation targets the rejected attempt's token and descriptor revision. Delayed
+stale responses preserve replacement leases and discovery started after revocation.
 Configure the generator's `rate_limit` for generated calls; each attempt
 reserves its image allowances and serialized non-image bytes against that shared
 quota. Aggregate usage includes provider-reported tokens from failed attempts and

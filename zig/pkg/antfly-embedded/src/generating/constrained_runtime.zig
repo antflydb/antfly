@@ -145,7 +145,7 @@ pub const Runtime = struct {
     fn invalidateExecutionLease(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig) !void {
         const headers = try self.remoteHeaders(a, cfg);
         defer headers.deinit(a);
-        try self.cache.invalidate(cfg.url, cfg.model, .generate, headers.entries[0..headers.count]);
+        try self.cache.invalidateLease(cfg.url, cfg.model, .generate, headers.entries[0..headers.count], try remote.LeaseIdentity.init(cfg.capability_token, cfg.capability_revision));
     }
 
     pub fn execute(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig, mode: constrained.Output, schema: Json, instructions: []const u8, batch: constrained.Batch, inputs: []const []const u8) !constrained.Result {

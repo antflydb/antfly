@@ -1882,3 +1882,116 @@ test "decision functions scoped generated image validation and execution share a
     group.cancel(io);
     if (failure) |err| return err;
 }
+
+test "decision functions late stale responses preserve a renewed execution lease during discovery outage" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Fixture = struct {
+        var server_io: std.Io = undefined;
+        var revoked: bool = false;
+        var old_inflight: std.Io.Event = .unset;
+        var replacement_ready: std.Io.Event = .unset;
+        var routes: []httpx.testing_mod.Route = undefined;
+        const revision = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const answer = "{\"choices\":[{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"item\\\":0,\\\"value\\\":{\\\"answer\\\":\\\"same\\\"}}]}\"}}]}";
+        fn authority(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer fixture", req.header("Authorization") orelse return error.MissingAuthorization);
+            try std.testing.expectEqualStrings("docs", req.header("X-Antfly-Source-Table") orelse return error.MissingScope);
+        }
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try authority(req);
+            const token = req.header("X-Antfly-Capability-Token") orelse return error.MissingToken;
+            const descriptor = req.header("X-Antfly-Capability-Revision") orelse return error.MissingRevision;
+            if (revoked and std.mem.eql(u8, token, "old-token") and std.mem.eql(u8, descriptor, revision)) {
+                old_inflight.set(server_io);
+                try replacement_ready.wait(server_io);
+                routes[1].respond = .{ .status = 409, .headers = &.{.{ .name = "X-Antfly-Capability-Stale", .value = "true" }}, .body = "{\"error\":\"old lease revoked\"}" };
+            } else routes[1].respond = .{ .body = answer };
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            while (true) server.handleOne() catch |err| {
+                if (err != error.Canceled and err != error.Cancelled) failure.* = err;
+                return;
+            };
+        }
+        fn run(runtime: *Runtime, alloc: std.mem.Allocator, requests: []const decisions.Request, failure: *?anyerror) void {
+            _ = runtime.provider().evaluateBatch(alloc, requests) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    const catalog =
+        \\{"generators":{"vision":{"model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","inputs":["text"],"inference_capabilities":{"version":3,"task":"generate","input_modalities":["text"],"accepted_mime_types":["text/plain"],"input_granularity":"item","output":"generated_text","result_cardinality":"one_per_item","prompt_policy":"explicit","borrowed_attachments":false,"numeric_responses_v1":false,"rerank_documents_v1":false,"generation_grammar_v1":true,"batch":{"mode":"none","preferred_items":1,"max_items":1,"max_encoded_media_bytes":null,"max_decoded_pixels":null,"max_media_parts_per_item":0,"per_item_failures":false}}}}}
+    ;
+    for ([_]bool{ false, true }) |rotate_revision_only| {
+        var routes = [_]httpx.testing_mod.Route{
+            .{ .path = "/ai/v1/models", .assert_request = Fixture.authority, .respond = .{ .body = catalog, .headers = &.{ .{ .name = "X-Antfly-Capability-Token", .value = "old-token" }, .{ .name = "X-Antfly-Capability-Revision", .value = Fixture.revision } } } },
+            .{ .method = .POST, .path = "/generate", .assert_request = Fixture.request },
+        };
+        Fixture.routes = &routes;
+        Fixture.server_io = io;
+        Fixture.revoked = false;
+        Fixture.old_inflight = .unset;
+        Fixture.replacement_ready = .unset;
+        var server = try httpx.TestServer.start(a, io, &routes);
+        defer server.deinit();
+        var server_failure: ?anyerror = null;
+        var servers = std.Io.Group.init;
+        defer servers.cancel(io);
+        try servers.concurrent(io, Fixture.serve, .{ &server, &server_failure });
+        var client = httpx.Client.initWithConfig(a, io, .{ .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        var registry = registry_mod.Registry.init(a);
+        defer registry.deinit();
+        try registry.registerDeciderConfig("judge", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only });
+        var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = io, .source_table = "docs", .antfly_url = server.baseUrl(), .antfly_api_key = "fixture" };
+        defer runtime.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const questions = try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+            \\{"answer":{"type":"choice","instructions":"Compare","criteria":{"same":"Same","different":"Different"}}}
+        , .{});
+        const requests = [_]decisions.Request{.{ .decider = "judge", .questions = questions, .input = .{ .text = "A B" } }};
+        _ = try runtime.provider().evaluateBatch(alloc, &requests);
+        Fixture.revoked = true;
+        var client_failure: ?anyerror = null;
+        var calls = std.Io.Group.init;
+        defer calls.cancel(io);
+        defer Fixture.replacement_ready.set(io);
+        try calls.concurrent(io, Fixture.run, .{ &runtime, alloc, &requests, &client_failure });
+        try Fixture.old_inflight.wait(io);
+        // A second caller revokes the old tuple and resolves a replacement
+        // while the first invocation's stale response is still in flight.
+        try servers.concurrent(io, Fixture.serve, .{ &server, &server_failure });
+        const cache = &runtime.resolved_generators.items[0].cache;
+        const headers: []const [2][]const u8 = &.{ .{ "Authorization", "Bearer fixture" }, .{ "X-Antfly-Source-Table", "docs" } };
+        try cache.invalidateLease(server.baseUrl(), "vision", .generate, headers, try remote_capabilities.LeaseIdentity.init("old-token", Fixture.revision));
+        const replacement_token = if (rotate_revision_only) "old-token" else "new-token";
+        const replacement_revision = if (rotate_revision_only) "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" else Fixture.revision;
+        const replacement_headers = [_]httpx.testing_mod.HeaderPair{
+            .{ .name = "X-Antfly-Capability-Token", .value = replacement_token },
+            .{ .name = "X-Antfly-Capability-Revision", .value = replacement_revision },
+        };
+        routes[0].respond.headers = &replacement_headers;
+        const lease = try cache.getOrDiscoverLeaseWithContext(&client, server.baseUrl(), "vision", .generate, headers, .{});
+        try std.testing.expectEqualStrings(replacement_token, lease.routing_token.?.slice());
+        try std.testing.expectEqualStrings(replacement_revision, lease.descriptor_revision.?.slice());
+        // Discovery is now unavailable. The delayed rejection must use the
+        // cached replacement for retry, and keep it for subsequent windows.
+        routes[0].respond.status = 503;
+        Fixture.replacement_ready.set(io);
+        try calls.await(io);
+        if (client_failure) |err| return err;
+        _ = try runtime.provider().evaluateBatch(alloc, &requests);
+        try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+        try std.testing.expectEqual(@as(usize, 4), server.routeHitCount(1));
+        const retained = try cache.routingToken(server.baseUrl(), "vision", .generate, headers);
+        try std.testing.expectEqualStrings(replacement_token, retained.?.slice());
+        servers.cancel(io);
+        if (server_failure) |err| return err;
+    }
+}
