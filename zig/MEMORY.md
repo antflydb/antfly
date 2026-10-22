@@ -389,13 +389,25 @@ projection generations resume a bounded backfill to install deadline coverage;
 unchanged text reuses its existing embedding.
 
 A durable per-entity manifest records the current serving projection keys and the
-external resource identities in the evaluated support closure. Reverse dependency
-postings include redacted branches and transitive parents. Every observed source
+external resource identities and hashed internal assertion identities in the
+evaluated support closure. Reverse dependency postings include redacted branches,
+transitive parents and related assertions read before view admission. Every observed source
 state transition, including access denial and restoration, enters the existing
 durable dependency frontier; each quantum fans out to at most 64 affected entities
 before admitting projection work. This also refreshes previously ready views that
 have no timer. Source changes never require a primary entity scan. The scheduler
 version backfill installs these manifests and postings on existing generations.
+
+Internal assertion corrections, reconciliation updates and retirement use the same
+bounded refresh frontier. Each projection links directly to every internal
+assertion read during view evaluation, so a transitive change reaches its affected
+entities without expanding every path through the assertion graph. New assertions
+without derived consumers create no empty refresh obligations. Projection refresh
+does not retract or mark dependent facts stale: it re-evaluates their current
+support, and restores their descriptions if a premise becomes active again.
+Scheduler version three installs these internal bindings through a resumable
+backfill, reusing unchanged embeddings before acknowledging indexed readiness.
+Bindings are retired with their entity or when discovery is disabled.
 
 Dirty maintenance retires serving projections for merged, suppressed and
 currently ineligible entities. Native index deletion uses the same full-index
@@ -422,7 +434,13 @@ entire lexical continuation. Later lexical windows skip these ANN identities;
 draining the pending union never loses their discovery provenance or emits them
 again. Cursor size and identity lengths are checked, and duplicate identities
 within each cursor set are rejected. Each continuation retains the existing
-principal and space-revision binding. One pass over N seeds performs at most 2N bounded neighbor calls,
+principal and space-revision binding. The `union/v2` cursor uses URL-safe base64
+rather than hexadecimal JSON. Encoder and decoder share a budget derived from
+192 pending identities, 128 ANN identities, the maximum escaped ID length and a
+separately bounded 512-byte lexical frontier. Valid generated continuations fit
+the admission budget even for maximum-length IDs containing JSON escapes. Invalid
+or oversized payloads fail before unbounded allocation; older cursor versions
+must restart their candidate iteration. One pass over N seeds performs at most 2N bounded neighbor calls,
 independent of the requested page size; additional bounded point reads validate
 policy and provenance without repeating ANN.
 

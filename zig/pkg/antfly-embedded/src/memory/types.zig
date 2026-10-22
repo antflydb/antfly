@@ -19,6 +19,7 @@ const std = @import("std");
 pub const provenance = @import("../common/provenance.zig");
 pub const schema_version: u32 = 1;
 pub const max_items = 256;
+pub const max_id_bytes = 256;
 pub const max_text_bytes = 64 * 1024;
 pub const Mode = enum { external, managed, hybrid };
 pub const Role = enum { reported, observed, inferred, hypothesized };
@@ -75,7 +76,7 @@ pub const EntityProjection = struct {
     text: []const u8,
     embedding: []const f32,
 };
-pub const semantic_index_version: u32 = 2;
+pub const semantic_index_version: u32 = 3;
 pub const SemanticIndex = struct { version: u32 = 0, generation: u64 = 0, cursor: ?[]const u8 = null, work_cursor: ?[]const u8 = null, backfill_complete: bool = false, complete: bool = false };
 pub const Config = struct {
     version: u32 = schema_version,
@@ -315,7 +316,7 @@ pub const ReconciliationDecision = struct { supersedes: []const []const u8 = &.{
 pub const Generated = struct { assertions: []const Assertion = &.{}, entities: []const Entity = &.{}, mentions: []const EntityMention = &.{} };
 
 pub fn validateId(value: []const u8) !void {
-    if (value.len == 0 or value.len > 256) return error.InvalidMemoryId;
+    if (value.len == 0 or value.len > max_id_bytes) return error.InvalidMemoryId;
     for (value) |ch| if (ch < 0x20 or ch == 0x7f) return error.InvalidMemoryId;
     if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidMemoryId;
 }

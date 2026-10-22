@@ -377,6 +377,70 @@ test "capi native memory projection manifests survive reopen and retire curation
     }
 }
 
+test "capi native memory internal assertion refresh survives reopen and preserves facts" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("memory-semantic-assertions");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    const Fixture = struct {
+        fn embed(_: *anyopaque, allocator: std.mem.Allocator, _: memory.types.Model, _: []const u8) ![]const f32 {
+            return allocator.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    for (0..3) |phase| {
+        var id: ?*anyopaque = null;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, if (phase == 0) api.antfly_lite_create(path, &id) else api.antfly_lite_open(path, &id));
+        defer api.antfly_db_close(id);
+        var guard = api.enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const root = guard.handle.parent_handle orelse guard.handle;
+        if (phase == 0) try @import("tables.zig").create(root, "memory_internal", "{}", true);
+        const db = try @import("tables.zig").get(root, "memory_internal");
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const context: memory.Context = .{ .principal = "owner", .admin = true, .now_ms = @intCast(phase + 1), .table_id = db.core.identity_namespace.table_id, .space = "internal" };
+        var native: engine.Native(h.db_mod.DB) = .{ .db = db, .context = context };
+        var backend = native.backend();
+        backend.embed = Fixture.embed;
+        backend.embed_document = Fixture.embed;
+        const service: memory.Service = .{ .backend = backend, .context = context };
+        if (phase == 0) {
+            const config: memory.types.Config = .{ .models = .{ .embedder = .{ .provider = "fixture", .model = "internal", .revision = "v1", .dimensions = 2 } }, .semantic_discovery = .{ .enabled = true } };
+            _ = try service.execute(alloc, .create, "", try std.json.Stringify.valueAlloc(alloc, config, .{}), "create");
+            _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}],\"assertions\":[{\"id\":\"root\",\"subject\":\"other\",\"predicate\":\"p\",\"value\":\"root\",\"statement\":\"Root premise\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"middle\",\"subject\":\"other\",\"predicate\":\"p\",\"value\":\"middle\",\"statement\":\"Middle premise\",\"depends_on\":[\"root\"],\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"description\",\"subject\":\"graph\",\"predicate\":\"p\",\"value\":\"graph\",\"statement\":\"Derived graph description\",\"depends_on\":[\"middle\"],\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+        } else {
+            try std.testing.expectEqual(@as(usize, 3), (try backend.scan(backend.ptr, alloc, "dependency/semantic-assertion/", null, 8)).rows.len);
+            const claims = try backend.scan(backend.ptr, alloc, "assertion/", null, 8);
+            for (claims.rows) |row| {
+                const claim = try std.json.parseFromSliceLeaky(memory.types.StoredAssertion, alloc, row.json, .{});
+                if (!std.mem.eql(u8, claim.assertion.id, "root")) continue;
+                const correction: memory.types.Correction = .{ .id = "root", .expected_revision = claim.revision, .lifecycle = if (phase == 1) .retracted else .active, .reason = "Review premise", .evidence = &.{.{ .id = "e" }} };
+                _ = try service.execute(alloc, .correct, "", try std.json.Stringify.valueAlloc(alloc, correction, .{}), try std.fmt.allocPrint(alloc, "correct-{d}", .{phase}));
+            }
+        }
+        for (0..24) |i| {
+            _ = try service.execute(alloc, .advance, "", "{}", try std.fmt.allocPrint(alloc, "phase-{d}-{d}", .{ phase, i }));
+            const page = try std.json.parseFromSliceLeaky(memory.types.EntityCandidatePage, alloc, try service.execute(alloc, .entity_candidates, "graph", "{}", ""), .{});
+            if (page.semantic_discovery == .indexed) {
+                try std.testing.expectEqual(phase != 1, std.mem.indexOf(u8, page.seed_view.description, "Derived graph") != null);
+                break;
+            }
+        } else return error.TestUnexpectedResult;
+        const claims = try backend.scan(backend.ptr, alloc, "assertion/", null, 8);
+        try std.testing.expectEqual(@as(usize, 3), claims.rows.len);
+        for (claims.rows) |row| {
+            const claim = try std.json.parseFromSliceLeaky(memory.types.StoredAssertion, alloc, row.json, .{});
+            if (std.mem.eql(u8, claim.assertion.id, "root")) continue;
+            try std.testing.expectEqual(@as(u64, 2), claim.revision);
+            try std.testing.expectEqual(memory.types.Lifecycle.active, claim.lifecycle);
+        }
+    }
+}
+
 // This qualification isolates retrieval cost from model latency and import.
 // Projection fixtures use the exact native view contract and real vector indexes.
 fn qualifyAnnScale(allocator: std.mem.Allocator, native: *engine.Native(h.db_mod.DB), service: memory.Service, prototypes: []const memory.Row) !void {

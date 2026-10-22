@@ -357,6 +357,7 @@ const Run = struct {
     inferred: bool = false,
     semantic_ready_after_commit: bool = false,
     temporal_tracking: bool = false,
+    semantic_assertions: ResourceSet = .empty,
     temporal_boundary: ?i64 = null,
     temporal_denied: bool = false,
     inference_epoch: u64 = 0,
@@ -388,6 +389,7 @@ const Run = struct {
             if (comptime @TypeOf(value) == t.StoredAssertion) {
                 if (std.mem.startsWith(u8, path, "assertion/")) {
                     try self.semanticDirty(value.assertion.subject);
+                    try self.semanticInvalidateAssertion(value.assertion.id);
                     if (self.objectTyped(value.assertion.predicate)) try self.semanticDirty(value.assertion.value);
                 }
             }
@@ -424,6 +426,7 @@ const Run = struct {
     fn parseRead(self: *Run, comptime T: type, json: []const u8) !T {
         const value = try parse(T, self.a, json);
         if (comptime T == t.StoredAssertion) {
+            if (self.temporal_tracking) try self.semantic_assertions.put(self.a, try hash(self.a, value.assertion.id), {});
             self.trackTime(value.assertion.valid_from);
             self.trackTime(value.assertion.valid_to);
             self.trackTime(value.superseded_valid_at);
@@ -2080,11 +2083,19 @@ const Run = struct {
     // A per-entity manifest makes serving retirement and source fanout point
     // operations. Resource identities include every evaluated support branch,
     // including currently redacted branches and transitive parents.
-    const SemanticBinding = struct { id: []const u8, projections: []const []const u8 = &.{}, resources: []const []const u8 = &.{} };
+    const SemanticBinding = struct { id: []const u8, projections: []const []const u8 = &.{}, resources: []const []const u8 = &.{}, assertions: []const []const u8 = &.{} };
     fn semanticResourceId(self: *Run, reference: prov.Resource) ![]const u8 {
         return hash(self.a, reference.identity());
     }
-    fn semanticBindings(self: *Run, id: []const u8, resources: ResourceSet, projections: []const []const u8) !void {
+    fn semanticInvalidateAssertion(self: *Run, id: []const u8) anyerror!void {
+        if (!self.state.config.semantic_discovery.enabled) return;
+        const input = try hash(self.a, id);
+        const prefix = try std.fmt.allocPrint(self.a, "dependency/semantic-assertion/{s}/", .{try hash(self.a, input)});
+        // A fresh import with no derived consumers creates no empty work queue.
+        // Existing consumers include the full evaluated transitive read closure.
+        if ((try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, null, 1)).rows.len != 0) try self.invalidate("semantic-assertion", input);
+    }
+    fn semanticBindings(self: *Run, id: []const u8, resources: ResourceSet, projections: []const []const u8, assertion_inputs: ResourceSet) !void {
         const path = try key(self.a, "entity-semantic-binding", id);
         const prior = (try self.read(SemanticBinding, path)) orelse SemanticBinding{ .id = id };
         var current: std.StringHashMapUnmanaged(void) = .empty;
@@ -2107,7 +2118,16 @@ const Run = struct {
             try self.put(try dependencyKey(self.a, "semantic-resource", resource.*, id), .{ .child = id });
         }
         std.mem.sort([]const u8, ids, {}, stringLess);
-        if (ids.len == 0 and projections.len == 0) try self.remove(path) else try self.put(path, SemanticBinding{ .id = id, .resources = ids, .projections = projections });
+        for (prior.assertions) |assertion_id| if (!assertion_inputs.contains(assertion_id)) try self.remove(try dependencyKey(self.a, "semantic-assertion", assertion_id, id));
+        const assertion_ids = try self.a.alloc([]const u8, assertion_inputs.count());
+        var assertion_iterator = assertion_inputs.keyIterator();
+        i = 0;
+        while (assertion_iterator.next()) |assertion_id| : (i += 1) {
+            assertion_ids[i] = assertion_id.*;
+            try self.put(try dependencyKey(self.a, "semantic-assertion", assertion_id.*, id), .{ .child = id });
+        }
+        std.mem.sort([]const u8, assertion_ids, {}, stringLess);
+        if (ids.len == 0 and projections.len == 0 and assertion_ids.len == 0) try self.remove(path) else try self.put(path, SemanticBinding{ .id = id, .resources = ids, .projections = projections, .assertions = assertion_ids });
     }
     fn retireSemantic(self: *Run, record: t.EntityRecord) !void {
         // Also cover projections predating the manifest's bounded backfill.
@@ -2155,7 +2175,7 @@ const Run = struct {
             const record = if (initial) try parse(t.EntityRecord, self.a, row.json) else blk: {
                 const work = try parse(struct { id: []const u8 }, self.a, row.json);
                 break :blk (try self.read(t.EntityRecord, try key(self.a, "entity", work.id))) orelse {
-                    try self.semanticBindings(work.id, .empty, &.{});
+                    try self.semanticBindings(work.id, .empty, &.{}, .empty);
                     try self.scheduleSemanticTimer(work.id, null);
                     try self.remove(try key(self.a, "entity-semantic-blocked", work.id));
                     try self.remove(row.key);
@@ -2163,20 +2183,19 @@ const Run = struct {
                 };
             };
             self.temporal_tracking = true;
+            self.semantic_assertions.clearRetainingCapacity();
             self.temporal_boundary = null;
             self.temporal_denied = false;
             defer self.temporal_tracking = false;
             const captured = try self.captureResources(semanticSnapshot, .{record});
+            self.temporal_tracking = false;
             // Eligibility, dependency bindings and serving retirement are also
             // derived publications, including a currently unavailable branch.
             self.inferred = true;
             if (captured.result.view) |view| {
                 const paths = try self.a.alloc([]const u8, 2);
                 inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }, 0..) |kind, i| paths[i] = try self.semanticProjectionKey(record, kind);
-                try self.semanticBindings(record.entity.id, captured.resources, paths);
-                // Rebinding unchanged text is still a derived publication
-                // and must fence live source dependencies at final commit.
-                self.inferred = true;
+                try self.semanticBindings(record.entity.id, captured.resources, paths, self.semantic_assertions);
                 inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
                     const path = try self.semanticProjectionKey(record, kind);
                     const existing = try self.read(t.EntityProjection, path);
@@ -2201,7 +2220,7 @@ const Run = struct {
                 try self.retireSemantic(record);
                 const retained_entity = try self.entityRetained(record);
                 const revisit = retained_entity and captured.result.canonical;
-                try self.semanticBindings(record.entity.id, if (revisit) captured.resources else .empty, &.{});
+                try self.semanticBindings(record.entity.id, if (revisit) captured.resources else .empty, &.{}, if (revisit) self.semantic_assertions else .empty);
                 if (revisit) {
                     if (self.temporal_denied) {
                         // Preserve readiness debt separately from runnable work.
@@ -2247,6 +2266,12 @@ const Run = struct {
         if (self.inferred) try self.validateResources();
         try backend.commit(backend.ptr, self.a, control, &.{ .{ .key = "entity-semantic-index", .json = try self.encode(index) }, .{ .key = "control", .json = control.json } });
     }
+    const candidate_pending_limit = 3 * 64;
+    const candidate_semantic_limit = 2 * 64;
+    // Lexical positions contain only fixed prefixes, hashes and a term number.
+    const candidate_lexical_limit = 512;
+    const candidate_json_limit = candidate_pending_limit * (2 * t.max_id_bytes + 32) + candidate_semantic_limit * (2 * t.max_id_bytes + 3) + 2 * candidate_lexical_limit + 128;
+    const candidate_cursor_limit = std.base64.url_safe_no_pad.Encoder.calcSize(candidate_json_limit) + 256;
     const CandidateRef = struct { id: []const u8, semantic: bool = false };
     const CandidateContinuation = struct { pending: []const CandidateRef = &.{}, lexical: ?[]const u8 = null, semantic: []const []const u8 = &.{} };
     fn semanticCandidates(self: *Run, input_seed: t.EntityRecord, request: t.EntityCandidateRequest, pending: []const CandidateRef) !SemanticMatches {
@@ -2320,20 +2345,22 @@ const Run = struct {
         if (!try self.entityVisible(seed)) return error.MemoryNotFound;
         const canonical_seed = (try self.canonical(id)) orelse return error.MemoryEntitySuppressed;
         const lexical_scope = try self.candidateScope(id, request);
-        const union_scope = try std.fmt.allocPrint(self.a, "{s}union/", .{lexical_scope});
+        const union_scope = try std.fmt.allocPrint(self.a, "{s}union/v2/", .{lexical_scope});
         var continuation: CandidateContinuation = .{};
         if (request.cursor) |cursor_value| {
-            if (cursor_value.len > 262144) return error.InvalidMemoryCursor;
+            if (cursor_value.len > candidate_cursor_limit) return error.InvalidMemoryCursor;
             const position = (try self.decodeCursor(union_scope, cursor_value)).?;
             const bytes = position[union_scope.len..];
-            if (bytes.len % 2 != 0) return error.InvalidMemoryCursor;
-            const json = try self.a.alloc(u8, bytes.len / 2);
-            _ = std.fmt.hexToBytes(json, bytes) catch return error.InvalidMemoryCursor;
+            const decoder = std.base64.url_safe_no_pad.Decoder;
+            const length = decoder.calcSizeForSlice(bytes) catch return error.InvalidMemoryCursor;
+            if (length > candidate_json_limit) return error.InvalidMemoryCursor;
+            const json = try self.a.alloc(u8, length);
+            decoder.decode(json, bytes) catch return error.InvalidMemoryCursor;
             continuation = parse(CandidateContinuation, self.a, json) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidMemoryCursor,
             };
-            if (continuation.pending.len > 192 or continuation.semantic.len > 128) return error.InvalidMemoryCursor;
+            if (continuation.pending.len > candidate_pending_limit or continuation.semantic.len > candidate_semantic_limit) return error.InvalidMemoryCursor;
             var semantic_seen: std.StringHashMapUnmanaged(void) = .empty;
             for (continuation.semantic) |semantic_id| {
                 t.validateId(semantic_id) catch return error.InvalidMemoryCursor;
@@ -2346,7 +2373,7 @@ const Run = struct {
                 if (seen.contains(ref.id)) return error.InvalidMemoryCursor;
                 try seen.put(self.a, ref.id, {});
             }
-            if (continuation.lexical) |position_value| if (!std.mem.startsWith(u8, position_value, lexical_scope)) return error.InvalidMemoryCursor;
+            if (continuation.lexical) |position_value| if (position_value.len > candidate_lexical_limit or !std.mem.startsWith(u8, position_value, lexical_scope)) return error.InvalidMemoryCursor;
         }
         var lexical_request = request;
         lexical_request.cursor = try self.encodeCursor(lexical_scope, continuation.lexical);
@@ -2450,13 +2477,12 @@ const Run = struct {
         var next: ?[]const u8 = null;
         if (pending.len != 0 or page.next != null) {
             const json = try self.encode(CandidateContinuation{ .pending = pending, .lexical = page.next, .semantic = semantic_ids.items });
-            const encoded = try self.a.alloc(u8, json.len * 2);
-            const hex = "0123456789abcdef";
-            for (json, 0..) |byte, i| {
-                encoded[2 * i] = hex[byte >> 4];
-                encoded[2 * i + 1] = hex[byte & 15];
-            }
+            if (json.len > candidate_json_limit) return error.MemoryCorruptState;
+            const encoder = std.base64.url_safe_no_pad.Encoder;
+            const encoded = try self.a.alloc(u8, encoder.calcSize(json.len));
+            _ = encoder.encode(encoded, json);
             next = try self.encodeCursor(union_scope, try std.fmt.allocPrint(self.a, "{s}{s}", .{ union_scope, encoded }));
+            if (next.?.len > candidate_cursor_limit) return error.MemoryCorruptState;
         }
         return self.encode(t.EntityCandidatePage{ .seed = seed, .seed_view = seed_view, .kind = request.kind, .relationship_predicates = if (self.state.config.ontology_pack == .software_team_v1) &[_][]const u8{ "is_a", "part_of", "alternative_to" } else &[_][]const u8{}, .items = matches.items[0..count], .revision = self.state.revision, .config_generation = self.state.config.generation, .next_cursor = next, .complete = views_complete and next == null, .omitted = 0, .semantic_discovery = semantic.state, .retrieval = if (!((try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{}).complete) .bounded_primary_fallback else if (seed_terms.len > 128) .bounded_audience_fallback else .indexed_lexical });
     }
@@ -3194,6 +3220,7 @@ const Run = struct {
         try self.put(path, pending.*);
     }
     fn retireAssertion(self: *Run, id: []const u8) !void {
+        try self.semanticInvalidateAssertion(id);
         // Retirement is irreversible physical cleanup, not a belief revision.
         // Fence identity reuse before dropping payload and generation metadata.
         try self.put(try key(self.a, "forgotten-assertion", id), true);
@@ -3317,7 +3344,7 @@ const Run = struct {
     }
     fn maintainChild(self: *Run, row: Row, item: DependencyWork) anyerror!void {
         const child = try parse(struct { child: []const u8 }, self.a, row.json);
-        if (eql(u8, item.kind, "semantic-resource")) {
+        if (eql(u8, item.kind, "semantic-resource") or eql(u8, item.kind, "semantic-assertion")) {
             if (self.state.config.semantic_discovery.enabled and try self.read(t.EntityRecord, try key(self.a, "entity", child.child)) != null) try self.semanticDirty(child.child) else try self.remove(row.key);
             return;
         }
@@ -3438,7 +3465,7 @@ const Run = struct {
         } else if (std.mem.startsWith(u8, row.key, "entity-semantic-binding/")) {
             const binding = try parse(SemanticBinding, self.a, row.json);
             const record = try self.read(t.EntityRecord, try key(self.a, "entity", binding.id));
-            if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?)) try self.semanticBindings(binding.id, .empty, &.{});
+            if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?)) try self.semanticBindings(binding.id, .empty, &.{}, .empty);
         } else if (std.mem.startsWith(u8, row.key, "entity-semantic-timer/")) {
             const timer = try parse(SemanticTimer, self.a, row.json);
             const record = try self.read(t.EntityRecord, try key(self.a, "entity", timer.id));
