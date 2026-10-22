@@ -1064,8 +1064,19 @@ static int down_split_frame_check(termite_metal_decode_runtime *r, size_t in, si
     termite_metal_paged_attention_params p = {.q_len=1,.kv_tokens=192,.num_heads=8,.num_kv_heads=2,.head_dim=256,
         .key_row_bytes=1024,.base_key_row_bytes=1024,.query_position_offset=191,.v_row_stride=512,
         .page_size=256,.block_count=1,.format=3,.v_element_bytes=2};
+    // Produce the input in a planned encoder, then consume it in a split
+    // encoder. This catches real reader dispatch and transition ordering.
+    id<MTLBuffer> source = [r->device newBufferWithBytes:x.contents length:x.length options:MTLResourceStorageModeShared];
+    id<MTLBuffer> zero = [r->device newBufferWithLength:x.length options:MTLResourceStorageModeShared];
+    if (!source || !zero) return 40;
+    memset(zero.contents, 0, zero.length);
+    memset(x.contents, 0, x.length);
     if (termite_metal_decode_runtime_begin_frame(r)) return 4;
+    if (termite_metal_decode_runtime_begin_planned_compute_scope(r, TERMITE_METAL_COMPUTE_SOURCE_FFN, TERMITE_METAL_COMPUTE_REGION_FFN)) return 41;
+    if (termite_metal_decode_runtime_apply_add_device(r, (__bridge void *)source, 16, (__bridge void *)zero, 16, rows * in, (__bridge void *)x, 16)) return 42;
+    if (r->active_planned_compute_encoder == nil) return 43;
     if (termite_metal_try_lightonocr3_down_split(r, 0, x, 16, rows, in, out, y[0], 16) != 1) return 5;
+    if (r->active_planned_compute_encoder != nil || termite_metal_decode_runtime_end_planned_compute_scope(r)) return 44;
     termite_metal_decode_gqa_split_launch launch;
     id<MTLBuffer> scratch = nil; bool strict = false;
     if (!termite_metal_decode_gqa_split_eligible(r,r,3,1,192,0,8,2,256,1024,512,256,0,0,NULL,&scratch,&launch,&strict) || strict) return 6;
@@ -1094,6 +1105,32 @@ static int down_split_frame_check(termite_metal_decode_runtime *r, size_t in, si
         for (size_t i = count + 4; i < count + 12; i++) if (raw[i] != 0xdeadbeefu) return 15;
     }
     for (size_t i = 0; i < attn.length / 4; i++) if (!isfinite(((float *)attn.contents)[i]) || fabsf(((float *)attn.contents)[i] - 1.25f) > 1e-5f) return 16;
+    if(in==3584 && out==1024 && rows>=5 && rows<=7) {
+        const size_t prior_bytes=8*rows*out*4;
+        const size_t saved_capacity=r->attention_decode_gqa_split_scratch_capacity;
+        id<MTLBuffer> saved_base=r->attention_decode_gqa_split_scratch_buffer;
+        id<MTLBuffer> saved_alt=r->attention_decode_gqa_split_scratch_buffer_alt;
+        id<MTLBuffer> bounded=[r->device newBufferWithLength:prior_bytes options:MTLResourceStorageModePrivate];
+        if(!bounded)return 21;
+        for(size_t mode=0;mode<3;mode++) {
+            if(termite_metal_decode_runtime_begin_frame(r))return 22;
+            if(mode==0)r->attention_decode_gqa_split_scratch_capacity=prior_bytes;
+            if(mode==1){r->attention_decode_gqa_split_scratch_buffer=bounded;r->attention_decode_gqa_split_scratch_buffer_alt=bounded;}
+            if(mode==2)setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_DOWN_SPLIT","1",1);
+            if(termite_metal_try_lightonocr3_down_split(r,0,x,16,rows,in,out,y[0],16)!=1)return 23;
+            if(termite_metal_decode_runtime_submit_frame(r)||termite_metal_decode_runtime_wait_frame(r))return 24;
+            r->attention_decode_gqa_split_scratch_capacity=saved_capacity;
+            r->attention_decode_gqa_split_scratch_buffer=saved_base;
+            r->attention_decode_gqa_split_scratch_buffer_alt=saved_alt;
+            unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_DOWN_SPLIT");
+            for(size_t i=0;i<count;i++)if(!isfinite(((float*)y[0].contents)[i+4])||fabsf(((float*)y[0].contents)[i+4]-gold[i])>2e-4f)return 25;
+        }
+    }
+    if(in==1024 && out==6144 && rows>=5 && rows<=7) {
+        setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT","1",1);
+        if(termite_metal_try_lightonocr3_down_split(r,0,x,16,rows,in,out,y[0],16)!=0)return 26;
+        unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT");
+    }
     // Every optional dependency must decline before encoding any GPU work.
     id<MTLComputePipelineState> saved_stage = r->lightonocr3_down_split32_pipeline;
     id<MTLComputePipelineState> saved_stage64 = r->lightonocr3_down_split64_pipeline;
@@ -1109,7 +1146,133 @@ static int down_split_frame_check(termite_metal_decode_runtime *r, size_t in, si
         r->lightonocr3_down_split_reduce_pipeline = saved_reduce; r->attention_decode_gqa_split_scratch_buffer = saved_scratch;
     }
     unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT");
-    fprintf(stderr,"down_split_frame_check in=%zu out=%zu partial_scratch_interleaving=pass overlapping_frames=pass max_abs=%g\n",in,out,worst);
+    // The tail rollback must retain a numerically correct public fallback.
+    setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_TAIL_SPLIT", "1", 1);
+    int rollback_rc = termite_metal_decode_runtime_apply_linear_multi_row_device(r, 0, (__bridge void *)x, 16, rows, in, out, (__bridge void *)y[0], 16);
+    unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_TAIL_SPLIT");
+    if (rollback_rc) return 45;
+    for (size_t i = 0; i < count; i++) {
+        float got = ((float *)y[0].contents)[i + 4];
+        if (!isfinite(got) || fabsf(got - gold[i]) > 2e-4f) return 46;
+    }
+    fprintf(stderr,"down_split_frame_check in=%zu out=%zu planned_producer_transition=pass partial_scratch_interleaving=pass overlapping_frames=pass max_abs=%g\n",in,out,worst);
+    free(gold);
+    return worst > 2e-4f ? 18 : 0;
+}
+
+static int gate_split_frame_check(termite_metal_decode_runtime *r, size_t in, size_t out, size_t rows) {
+    const size_t count = rows * out;
+    uint16_t *weights = malloc(in * out * 2);
+    float *bias = calloc(out, 4), *gold = malloc(count * 4);
+    id<MTLBuffer> x = [r->device newBufferWithLength:(rows * in + 4) * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> y[3];
+    for (size_t j = 0; j < 3; j++) {
+        y[j] = [r->device newBufferWithLength:(count + 12) * 4 options:MTLResourceStorageModeShared];
+        uint32_t *raw = y[j].contents;
+        for (size_t i = 0; i < count + 12; i++) raw[i] = 0xdeadbeefu;
+    }
+    if (!weights || !bias || !gold || !x || !y[0] || !y[1] || !y[2]) return 1;
+    uint32_t rng = 123;
+    for (size_t i = 0; i < in * out; i++) {
+        rng = rng * 1664525u + 1013904223u;
+        weights[i] = round_bf16(((int)(rng >> 16) - 32768) * .000001f);
+    }
+    for (size_t i = 0; i < rows * in; i++) ((float *)x.contents)[i + 4] = sinf(i * .01f);
+    if (termite_metal_decode_runtime_prepare_linear_bf16(r, 0, (uint8_t *)weights, in * out * 2, bias, in, out)) return 2;
+    for(size_t i=0;i<in*out;i++) weights[i]=round_bf16(cosf(i*.023f)*.03f);
+    for(size_t i=0;i<out;i++) bias[i]=sinf(i*.01f)*.1f;
+    if(termite_metal_decode_runtime_prepare_linear_bf16(r,1,(uint8_t*)weights,in*out*2,bias,in,out))return 2;
+    free(weights); free(bias);
+    setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_GATE_UP_SPLIT", "1", 1);
+    if(termite_metal_decode_runtime_can_apply_bf16_gate_up(r,0,1,rows,in,out)) {
+    if (termite_metal_decode_runtime_apply_bf16_gate_up_device(r, 0, 1, (__bridge void *)x, 16, rows, in, out, (__bridge void *)y[0], 16)) return 3;
+    } else {
+        id<MTLBuffer> gate=[r->device newBufferWithLength:count*4 options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> up=[r->device newBufferWithLength:count*4 options:MTLResourceStorageModePrivate];
+        if(!gate||!up||termite_metal_decode_runtime_apply_linear_multi_row_device(r,0,(__bridge void*)x,16,rows,in,out,(__bridge void*)gate,0)||
+            termite_metal_decode_runtime_apply_linear_multi_row_device(r,1,(__bridge void*)x,16,rows,in,out,(__bridge void*)up,0)||
+            termite_metal_decode_runtime_apply_activation_multiply_device(r,2,(__bridge void*)gate,0,(__bridge void*)up,0,rows,out,(__bridge void*)y[0],16))return 3;
+    }
+    memcpy(gold, (float *)y[0].contents + 4, count * 4);
+    unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_GATE_UP_SPLIT");
+    // Constant attention has an independent exact result, while using the
+    // same physical split scratch between two down-projection dispatches.
+    id<MTLBuffer> q = [r->device newBufferWithLength:8 * 256 * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> k = [r->device newBufferWithLength:256 * 2 * 256 * 2 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> v = [r->device newBufferWithLength:k.length options:MTLResourceStorageModeShared];
+    id<MTLBuffer> blocks = [r->device newBufferWithLength:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> attn = [r->device newBufferWithLength:q.length options:MTLResourceStorageModeShared];
+    memset(q.contents, 0, q.length); memset(k.contents, 0, k.length); *(uint32_t *)blocks.contents = 0;
+    for (size_t i = 0; i < v.length / 2; i++) ((uint16_t *)v.contents)[i] = 0x3d00;
+    termite_metal_paged_attention_params p = {.q_len=1,.kv_tokens=192,.num_heads=8,.num_kv_heads=2,.head_dim=256,
+        .key_row_bytes=1024,.base_key_row_bytes=1024,.query_position_offset=191,.v_row_stride=512,
+        .page_size=256,.block_count=1,.format=3,.v_element_bytes=2};
+    // Produce the input in a planned encoder, then consume it in a split
+    // encoder. This catches real reader dispatch and transition ordering.
+    id<MTLBuffer> source = [r->device newBufferWithBytes:x.contents length:x.length options:MTLResourceStorageModeShared];
+    id<MTLBuffer> zero = [r->device newBufferWithLength:x.length options:MTLResourceStorageModeShared];
+    if (!source || !zero) return 40;
+    memset(zero.contents, 0, zero.length);
+    memset(x.contents, 0, x.length);
+    if (termite_metal_decode_runtime_begin_frame(r)) return 4;
+    if (termite_metal_decode_runtime_begin_planned_compute_scope(r, TERMITE_METAL_COMPUTE_SOURCE_FFN, TERMITE_METAL_COMPUTE_REGION_FFN)) return 41;
+    if (termite_metal_decode_runtime_apply_add_device(r, (__bridge void *)source, 16, (__bridge void *)zero, 16, rows * in, (__bridge void *)x, 16)) return 42;
+    if (r->active_planned_compute_encoder == nil) return 43;
+    if (termite_metal_try_lightonocr3_gate_split(r, 0, 1, x, 16, rows, in, out, y[0], 16) != 1) return 5;
+    if (r->active_planned_compute_encoder != nil || termite_metal_decode_runtime_end_planned_compute_scope(r)) return 44;
+    termite_metal_decode_gqa_split_launch launch;
+    id<MTLBuffer> scratch = nil; bool strict = false;
+    if (!termite_metal_decode_gqa_split_eligible(r,r,3,1,192,0,8,2,256,1024,512,256,0,0,NULL,&scratch,&launch,&strict) || strict) return 6;
+    id<MTLComputeCommandEncoder> enc = termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
+    [enc setBuffer:q offset:0 atIndex:0]; [enc setBuffer:k offset:0 atIndex:1]; [enc setBuffer:v offset:0 atIndex:2];
+    [enc setBuffer:blocks offset:0 atIndex:3]; [enc setBuffer:q offset:0 atIndex:4];
+    if (termite_metal_encode_decode_gqa_split_dispatch(r,r,enc,&p,scratch,&launch,attn,0,attn.length,-1)) return 7;
+    [enc endEncoding];
+    if (termite_metal_try_lightonocr3_gate_split(r,0,1,x,16,rows,in,out,y[1],16) != 1) return 8;
+    if (termite_metal_decode_runtime_submit_frame(r)) return 9;
+    id<MTLBuffer> submitted_scratch = r->submitted_frame_decode_gqa_split_scratch_slot == 0
+        ? r->attention_decode_gqa_split_scratch_buffer : r->attention_decode_gqa_split_scratch_buffer_alt;
+    if (termite_metal_decode_runtime_begin_frame(r)) return 10;
+    if (termite_metal_decode_gqa_split_scratch_for_encoding(r) == submitted_scratch) return 11;
+    if (termite_metal_try_lightonocr3_gate_split(r,0,1,x,16,rows,in,out,y[2],16) != 1) return 12;
+    if (termite_metal_decode_runtime_wait_frame(r) || termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r)) return 13;
+    float worst = 0;
+    for (size_t j = 0; j < 3; j++) {
+        uint32_t *raw = y[j].contents;
+        for (size_t i = 0; i < count; i++) {
+            const float got = ((float *)y[j].contents)[i + 4];
+            if (!isfinite(got)) return 19;
+            worst = fmaxf(worst,fabsf(gold[i] - got));
+        }
+        for (size_t i = 0; i < 4; i++) if (raw[i] != 0xdeadbeefu) return 14;
+        for (size_t i = count + 4; i < count + 12; i++) if (raw[i] != 0xdeadbeefu) return 15;
+    }
+    for (size_t i = 0; i < attn.length / 4; i++) if (!isfinite(((float *)attn.contents)[i]) || fabsf(((float *)attn.contents)[i] - 1.25f) > 1e-5f) return 16;
+    // Dependency failures decline while a valid frame is being encoded.
+    if(termite_metal_decode_runtime_begin_frame(r))return 17;
+    id<MTLComputePipelineState> saved_stage=r->lightonocr3_gate_up_split16_pipeline;
+    id<MTLComputePipelineState> saved_reduce=r->lightonocr3_gate_up_split_reduce_pipeline;
+    size_t capacity=r->attention_decode_gqa_split_scratch_capacity;
+    id<MTLBuffer> saved_scratch=r->attention_decode_gqa_split_scratch_buffer;
+    id<MTLBuffer> saved_alt=r->attention_decode_gqa_split_scratch_buffer_alt;
+    for(size_t mode=0;mode<6;mode++) {
+        if(mode==0)r->lightonocr3_gate_up_split16_pipeline=nil;
+        if(mode==1)r->lightonocr3_gate_up_split_reduce_pipeline=nil;
+        if(mode==2)r->attention_decode_gqa_split_scratch_capacity=1;
+        if(mode==3)setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_GATE_UP_SPLIT","1",1);
+        if(mode==4){r->attention_decode_gqa_split_scratch_buffer=x;r->attention_decode_gqa_split_scratch_buffer_alt=x;}
+        if(mode==5){r->attention_decode_gqa_split_scratch_buffer=y[0];r->attention_decode_gqa_split_scratch_buffer_alt=y[0];}
+        if(termite_metal_try_lightonocr3_gate_split(r,0,1,x,16,rows,in,out,y[0],16)!=0)return 18;
+        r->lightonocr3_gate_up_split16_pipeline=saved_stage;
+        r->lightonocr3_gate_up_split_reduce_pipeline=saved_reduce;
+        r->attention_decode_gqa_split_scratch_capacity=capacity;
+        r->attention_decode_gqa_split_scratch_buffer=saved_scratch;
+        r->attention_decode_gqa_split_scratch_buffer_alt=saved_alt;
+        unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_GATE_UP_SPLIT");
+    }
+    if(termite_metal_decode_runtime_submit_frame(r)||termite_metal_decode_runtime_wait_frame(r))return 20;
+    if(termite_metal_try_lightonocr3_gate_split(r,0,1,x,16,rows,in,out,y[0],16)!=0)return 21;
+    fprintf(stderr,"gate_split_frame_check in=%zu out=%zu planned_producer_transition=pass partial_scratch_interleaving=pass overlapping_frames=pass max_abs=%g\n",in,out,worst);
     free(gold);
     return worst > 2e-4f ? 18 : 0;
 }
@@ -1304,7 +1467,7 @@ static int batch_gate_up_check(termite_metal_decode_runtime *r, size_t rows, siz
         float *xs = (float *)x.contents + 4;
         for (size_t i = 0; i < rows * in; i++)
             xs[i] = sinf(i * .01f);
-        bool qualified = (in == 1024 && rows >= 7 && rows <= 8) || (in == 2560 && rows >= 4 && rows <= 8);
+        bool qualified = (in == 1024 && rows >= 5 && rows <= 8) || (in == 2560 && rows >= 4 && rows <= 8);
         if ((termite_metal_decode_runtime_should_apply_bf16_gate_up(r, 0, 1, 16, rows, in, out) != 0) !=
             qualified)
             return 4;
@@ -1533,7 +1696,16 @@ int main(int argc, const char **argv) {
             if (prefill_conv_check(r,conv_seqs[i],vh,init != 0,conv_benchmark && conv_seqs[i] == 554)) return 112;
         if (conv_benchmark) return 0;
         if (!r->lightonocr3_down_split32_pipeline || !r->lightonocr3_down_split64_pipeline || !r->lightonocr3_down_split_reduce_pipeline) return 107;
-        if (down_split_frame_check(r,3584,1024,8) || down_split_frame_check(r,9216,2560,8) || down_split_frame_check(r,1024,6144,4) || down_split_frame_check(r,1024,3584,4) || down_split_frame_check(r,2560,8192,4) || down_split_frame_check(r,2560,9216,4) || down_split_frame_check(r,9216,2560,4)) return 108;
+        if(gate_split_frame_check(r,1024,3584,2)||gate_split_frame_check(r,1024,3584,3)||gate_split_frame_check(r,1024,3584,4)||gate_split_frame_check(r,2560,9216,2)||gate_split_frame_check(r,2560,9216,3)||gate_split_frame_check(r,1024,3584,5)||gate_split_frame_check(r,1024,3584,6)||gate_split_frame_check(r,1024,3584,7)||gate_split_frame_check(r,1024,3584,8)||gate_split_frame_check(r,2560,9216,4)||gate_split_frame_check(r,2560,9216,5)||gate_split_frame_check(r,2560,9216,6)||gate_split_frame_check(r,2560,9216,7))return 123;
+        if (down_split_frame_check(r,3584,1024,5) || down_split_frame_check(r,3584,1024,6) || down_split_frame_check(r,3584,1024,7) || down_split_frame_check(r,1024,6144,5) || down_split_frame_check(r,1024,6144,6) || down_split_frame_check(r,1024,6144,7) || down_split_frame_check(r,3584,1024,8) || down_split_frame_check(r,9216,2560,8) || down_split_frame_check(r,1024,6144,4) || down_split_frame_check(r,1024,3584,4) || down_split_frame_check(r,2560,8192,4) || down_split_frame_check(r,2560,9216,4) || down_split_frame_check(r,9216,2560,4)) return 108;
+        const size_t qualified_tails[][3] = {
+            {1024,6144,3}, {1024,3584,3}, {1024,3584,5}, {1024,3584,6}, {1024,3584,7},
+            {2560,8192,2}, {2560,8192,3}, {2560,8192,5}, {2560,8192,6}, {2560,8192,7},
+            {2560,9216,2}, {2560,9216,3}, {2560,9216,5}, {2560,9216,6}, {2560,9216,7},
+            {9216,2560,3}, {9216,2560,5}, {9216,2560,6}, {9216,2560,7},
+        };
+        for (size_t i = 0; i < sizeof(qualified_tails) / sizeof(qualified_tails[0]); i++)
+            if (down_split_frame_check(r, qualified_tails[i][0], qualified_tails[i][1], qualified_tails[i][2])) return 124;
         for (size_t rows = 2; rows <= 8; rows++) {
             if (projection(r,rows,3584,1024,4) || projection(r,rows,9216,2560,4)) return 109;
         }
@@ -1606,7 +1778,7 @@ int main(int argc, const char **argv) {
             termite_metal_decode_runtime_destroy(r);
             return rc;
         }
-        const size_t cases[][4] = {{5,1024,3584,0},{6,1024,3584,0},{7,1024,3584,0},{4,2560,9216,0},{5,2560,9216,0},{6,2560,9216,0},{7,2560,9216,0},{6, 1024, 6144, 0}, {7, 2560, 8192, 0}, {2, 9216, 2560, 0}, {3, 9216, 2560, 0}, {4, 2560, 9216, 0}, {5, 1024, 6144, 0}, {5, 2560, 248320, 0}, {8, 1024, 248320, 0}, {8, 1024, 3584, 0}, {8, 1024, 6144, 0}, {8, 2560, 8192, 0}, {8, 2560, 9216, 0}, {8, 9216, 2560, 0}, {1, 1024, 16, 0}, {1, 1024, 512, 0}, {1, 1024, 6144, 0}, {1, 3584, 1024, 0}, {1, 2048, 1024, 0}, {1, 1024, 248320, 0}, {33, 768, 2304, 0}, {33, 768, 3072, 0}, {33, 3072, 768, 0}, {33, 3072, 3072, 0}, {33, 3072, 1024, 0}, {33, 1024, 3584, 0}, {33, 3584, 1024, 0}, {8, 2560, 248320, 0}, {2, 1024, 3584, 0}, {3, 1024, 128, 4}, {4, 3584, 1024, 0},
+        const size_t cases[][4] = {{2216,768,2304,0},{4096,1024,4096,0},{8192,768,768,4},{16384,768,768,0},{5,1024,3584,0},{6,1024,3584,0},{7,1024,3584,0},{4,2560,9216,0},{5,2560,9216,0},{6,2560,9216,0},{7,2560,9216,0},{6, 1024, 6144, 0}, {7, 2560, 8192, 0}, {2, 9216, 2560, 0}, {3, 9216, 2560, 0}, {4, 2560, 9216, 0}, {5, 1024, 6144, 0}, {5, 2560, 248320, 0}, {8, 1024, 248320, 0}, {8, 1024, 3584, 0}, {8, 1024, 6144, 0}, {8, 2560, 8192, 0}, {8, 2560, 9216, 0}, {8, 9216, 2560, 0}, {1, 1024, 16, 0}, {1, 1024, 512, 0}, {1, 1024, 6144, 0}, {1, 3584, 1024, 0}, {1, 2048, 1024, 0}, {1, 1024, 248320, 0}, {33, 768, 2304, 0}, {33, 768, 3072, 0}, {33, 3072, 768, 0}, {33, 3072, 3072, 0}, {33, 3072, 1024, 0}, {33, 1024, 3584, 0}, {33, 3584, 1024, 0}, {8, 2560, 248320, 0}, {2, 1024, 3584, 0}, {3, 1024, 128, 4}, {4, 3584, 1024, 0},
                                    {5, 2560, 1024, 0}, {8, 4096, 2560, 4}, {4, 2560, 64, 0},
                                    {4, 1024, 3584, 1}, {1, 2560, 32, 0},    {1, 2560, 64, 0},    {1, 2560, 1024, 0},  {1, 4096, 2560, 4},
                                    {1, 9216, 2560, 0},  {1, 2560, 1024, 1},  {33, 2560, 1024, 0}, {65, 4096, 2560, 4},

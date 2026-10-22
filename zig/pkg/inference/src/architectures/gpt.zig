@@ -7957,7 +7957,7 @@ pub fn qwen35LinearAttention(
     decode_context: ?*const DecodeContext,
     name_buf: *[256]u8,
 ) !CT {
-    if (batch > 1 and (seq_len != 1 or decode_context == null or
+    if (batch > 1 and (decode_context == null or
         decode_context.?.qwen35_linear_batch == null or decode_context.?.qwen35_linear_batch.?.len != batch))
         return error.UnsupportedQwen35LinearAttentionBatch;
     if (config.qwen35_linear_conv_kernel_dim == 0 or
@@ -7969,6 +7969,10 @@ pub fn qwen35LinearAttention(
         return error.InvalidQwen35LinearAttentionConfig;
     }
 
+    if (batch > 1 and seq_len > 1) if (decode_context.?.kv_batch) |views| for (views) |view| {
+        // A padded query must never advance another page's recurrent history.
+        if (view.per_item_query_len != 0 and view.per_item_query_len != seq_len) return error.UnsupportedQwen35LinearAttentionBatch;
+    };
     if (batch > 1) for (decode_context.?.qwen35_linear_batch.?) |cache| {
         if (cache == null) return error.InvalidQwen35LinearAttentionConfig;
     };
@@ -8039,7 +8043,7 @@ pub fn qwen35LinearAttention(
     var core_count: usize = 0;
     defer for (cores[0..core_count]) |core| cb.free(core);
     const parallel_cores = if (comptime build_options.enable_metal)
-        if (key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
+        if (seq_len == 1 and key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
             try metal_compute_mod.MetalCompute.beginQwen35LinearBatch(cb, batch)
         else
             false
@@ -9628,7 +9632,7 @@ fn feedForward(
             defer cb.free(down_w);
             // Both integrated OCR decoders have qualified gate/up + SiLU
             // kernels. Keep the paired projection fallback on other profiles.
-            if ((total == 1 or (total >= 4 and total <= 8)) and config.hasQwen35VisionArchitectureContract() and
+            if ((total >= 1 and total <= 8) and config.hasQwen35VisionArchitectureContract() and
                 ((hidden_size == 1024 and inter_size == 3584 and config.num_hidden_layers == 24) or
                     (hidden_size == 2560 and inter_size == 9216 and config.num_hidden_layers == 32)))
             {
@@ -12903,20 +12907,35 @@ test "LightOnOCR3 batched DeltaNet projections match independent histories acros
     for (&views, 0..) |*view, row| view.* = .{ .kv_manager = &manager, .kv_cache = .{ .sequence_id = @intCast(row), .pool_id = 0, .logical_block_count = 0, .tail_tokens = 0 } };
     const batch_caches = [_]?*Qwen35LinearCache{ &caches[2], &caches[3] };
     var name: [256]u8 = undefined;
-    // Distinct prefixes populate each history before joining a cohort.
-    for (0..4) |row| {
-        const values = [_]f32{ @as(f32, @floatFromInt(row % 2)) + 0.1, -0.2, 0.3, 0.4 };
-        const input = try cb.fromFloat32Shape(&values, &.{ 1, 4 });
+    // Equal-length prefill batches must preserve each page's complete history.
+    const prefix_len = 3;
+    for (&views) |*view| view.per_item_query_len = prefix_len;
+    const prefix_values = [_]f32{ 0.1, -0.2, 0.3, 0.4, 0.3, 0.8, -0.4, 0.2, 0.9, -0.5, 0.1, 0.6, 1.1, -0.2, 0.3, 0.4, -0.7, 0.2, 0.8, 0.1, 0.4, 0.3, -0.6, 0.9 };
+    const prefix_input = try cb.fromFloat32Shape(&prefix_values, &.{ 6, 4 });
+    defer cb.free(prefix_input);
+    const prefix_context = DecodeContext{ .total_sequence_len = prefix_len, .query_sequence_len = prefix_len, .kv_sequence_len = 0, .kv_batch = &views, .qwen35_linear_batch = &batch_caches };
+    const prefix_batch = try qwen35LinearAttention(&cb, a, cfg, prefix_input, 2, prefix_len, 0, &prefix_context, &name);
+    defer cb.free(prefix_batch);
+    const prefix_actual = try cb.toFloat32(prefix_batch, a);
+    defer a.free(prefix_actual);
+    for (0..2) |row| {
+        const input = try cb.fromFloat32Shape(prefix_values[row * 12 ..][0..12], &.{ 3, 4 });
         defer cb.free(input);
-        const context = DecodeContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 0, .qwen35_linear_cache = &caches[row] };
-        const output = try qwen35LinearAttention(&cb, a, cfg, input, 1, 1, 0, &context, &name);
-        cb.free(output);
+        const context = DecodeContext{ .total_sequence_len = prefix_len, .query_sequence_len = prefix_len, .kv_sequence_len = 0, .qwen35_linear_cache = &caches[row] };
+        const output = try qwen35LinearAttention(&cb, a, cfg, input, 1, prefix_len, 0, &context, &name);
+        defer cb.free(output);
+        const expected = try cb.toFloat32(output, a);
+        defer a.free(expected);
+        for (expected, prefix_actual[row * 12 ..][0..12]) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
+        for (caches[row].layers[0].recurrent, caches[row + 2].layers[0].recurrent) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+        for (caches[row].layers[0].conv, caches[row + 2].layers[0].conv) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
     }
+    for (&views) |*view| view.per_item_query_len = 1;
     for (0..4) |step| {
         const values = [_]f32{ 0.2, @as(f32, @floatFromInt(step)) * 0.1, -0.1, 0.8, 0.7, 0.3, -0.2, 0.4 };
         const input = try cb.fromFloat32Shape(&values, &.{ 2, 4 });
         defer cb.free(input);
-        const context = DecodeContext{ .total_sequence_len = step + 2, .query_sequence_len = 1, .kv_sequence_len = step + 1, .kv_batch = &views, .qwen35_linear_batch = &batch_caches };
+        const context = DecodeContext{ .total_sequence_len = step + prefix_len + 1, .query_sequence_len = 1, .kv_sequence_len = step + prefix_len, .kv_batch = &views, .qwen35_linear_batch = &batch_caches };
         const batch = try qwen35LinearAttention(&cb, a, cfg, input, 2, 1, 0, &context, &name);
         defer cb.free(batch);
         const actual = try cb.toFloat32(batch, a);
@@ -12924,13 +12943,14 @@ test "LightOnOCR3 batched DeltaNet projections match independent histories acros
         for (0..2) |row| {
             const single_input = try cb.fromFloat32Shape(values[row * 4 ..][0..4], &.{ 1, 4 });
             defer cb.free(single_input);
-            const single_context = DecodeContext{ .total_sequence_len = step + 2, .query_sequence_len = 1, .kv_sequence_len = step + 1, .qwen35_linear_cache = &caches[row] };
+            const single_context = DecodeContext{ .total_sequence_len = step + prefix_len + 1, .query_sequence_len = 1, .kv_sequence_len = step + prefix_len, .qwen35_linear_cache = &caches[row] };
             const single = try qwen35LinearAttention(&cb, a, cfg, single_input, 1, 1, 0, &single_context, &name);
             defer cb.free(single);
             const expected = try cb.toFloat32(single, a);
             defer a.free(expected);
             for (expected, actual[row * 4 ..][0..4]) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
             for (caches[row].layers[0].recurrent, caches[row + 2].layers[0].recurrent) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+            for (caches[row].layers[0].conv, caches[row + 2].layers[0].conv) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
         }
     }
     // Retiring/resetting one page must leave its peer's history intact.

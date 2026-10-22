@@ -1,0 +1,93 @@
+CUDA artifact source policy passes: /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu (15 compiler-managed dev-only runtime-wired candidates included)
+quant kernel generated sources check: 67 files + Metal/CUDA runtime regions
+inference-test
++- run test w
+1/117 server.server.test.LightOnOCR3 continuous controls isolate canceled and expired pages...OK
+2/117 server.server.test.LightOnOCR3 read routing preserves image-only and grounding prompts...OK
+3/117 server.server.test.LightOnOCR3 HTTP read rejects untrained prompts before loading weights...OK
+4/117 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...SKIP
+5/117 server.server.test.LightOnOCR3 page template preserves exact image-only and grounding framing...OK
+6/117 server.server.test.LightOnOCR3 execution counters distinguish fused pages and singleton tails...OK
+7/117 server.server.test.LightOnOCR3 cohorts reserve one serialized vision peak and every retained page state...OK
+8/117 pipelines.laya_tree.test.laya tree split undoes coalesce...OK
+9/117 pipelines.laya_packed_test.test.laya multi-row coalescing isolates independent states and matches running them alone...Laya multi-row batching {"mode":"question"}: isolation and exactness max error=0.0000021457672
+Laya multi-row batching {"mode":"candidate"}: isolation and exactness max error=0.0000038146973
+OK
+10/117 pipelines.laya_packed_test.test.laya multi-row coalescing holds exactly with a dozen near-identical states...Laya multi-row batching, 12 near-identical states: max error=0.00000333786
+OK
+11/117 execution_control.test.execution lane removes cancelled and expired waiters without ticket holes...OK
+12/117 execution_control.test.execution lane gives queued batches FIFO ownership...OK
+13/117 execution_control.test.execution lane prioritizes queries with bounded background fairness...OK
+14/117 execution_control.test.execution lane wakes a query ahead of queued enrichment...OK
+15/117 server.executor_microbatch.test.microbatch concurrent array tails coalesce without item workers...OK
+16/117 server.executor_microbatch.test.microbatch broker never coalesces republished model generations...OK
+17/117 registry.registry.test.LightOnOCR3 pulled manifest preserves OCR identity when tasks are overridden...OK
+18/117 architectures.qwen3vl_projector.test.LightOnOCR3 resident vision uses learned positions without DeepStack...OK
+19/117 architectures.gpt.test.LightOnOCR3 Metal recurrent core matches CPU prefill continuation and reset without readbacks...SKIP
+20/117 architectures.gpt.test.LightOnOCR3 SIMD recurrent update matches scalar reference with tails and cached state...OK
+21/117 architectures.gpt.test.LightOnOCR3 DeltaNet gated norm uses its scale directly without a plus-one shift...OK
+22/117 architectures.gpt.test.LightOnOCR3 batched DeltaNet projections match independent histories across decode and retirement...OK
+23/117 architectures.gpt.test.LightOnOCR3 page cache initialization releases every earlier layer on allocation failure...OK
+24/117 architectures.florence.test.Florence cache preparation cancels between layers and releases partial tensors...OK
+25/117 architectures.florence.test.Florence compaction publishes active shapes and preserves borrowed backing through repeated EOS...OK
+26/117 architectures.florence.test.Florence text layer cancellation releases its owned input...OK
+27/117 architectures.florence.test.Florence GELU preserves exact-erf values without approximate fallback...OK
+28/117 ops.cuda.video.test.embeddinggemma2 video staging fences coalesce repeats and drain consumer errors...OK
+29/117 server.model_manager.test.projector residency follows its request-scoped lifecycle...OK
+30/117 server.model_manager.test.LightOnOCR3 integrated vision scratch is admitted without charging resident weights again...OK
+31/117 readers.reader.test.LoadedReader options reject zero tokens and Florence cache dtypes...OK
+32/117 readers.lightonocr3.test.LightOnOCR3 uses image-only transcription and the trained grounding prompt...OK
+33/117 readers.lightonocr3.test.LightOnOCR3 installs its reader profile only for the canonical integrated checkpoint...OK
+34/117 ops.native_compute.test.Florence native row gather preserves row identity and independent storage...OK
+35/117 ops.native_compute.test.LightOnOCR3 partial M-RoPE rotates each head prefix and preserves its tail...OK
+36/117 ops.native_compute.test.LightOnOCR3 query gate projection splits within each attention head...OK
+37/117 backends.metal_runtime.test.decode GQA split policy keeps AUTO stable and bounds compact schedules...OK
+38/117 backends.metal_runtime.test.metal native q4_k gated ffn keeps planned frame coalesced...SKIP
+39/117 backends.metal_runtime.test.LightOnOCR3 batched gate up wrapper reaches qualified device kernel...SKIP
+40/117 ops.metal_compute.test.metal_compute: scaled dot product attention handles Florence window layout...SKIP
+41/117 ops.metal_compute.test.LightOnOCR3 Metal partial M-RoPE preserves unrotated head channels...SKIP
+42/117 ops.metal_audio_execution.test.embeddinggemma2 audio arena splits and coalesces expired lifetimes...OK
+43/117 models.gpt.test.LightOnOCR3 official 0.8B config has partial M-RoPE and no DeepStack...OK
+44/117 models.gpt.test.LightOnOCR3 official 4B config uses grouped recurrent heads and larger vision tower...OK
+45/117 ops.binary_broadcast.test.selection plan coalesces maps and preserves explicit permutations...OK
+46/117 ops.binary_broadcast.test.broadcast plan coalesces contiguous axes and validates dimensions...OK
+47/117 ops.slice_plan.test.typed slice plan validates and coalesces signed affine maps...OK
+48/117 models.manifest.test.managed Florence variants do not require unreceipted declaration metadata...OK
+49/117 models.manifest.test.LightOnOCR3 reader identity requires explicit metadata and the Qwen3.5 architecture...OK
+50/117 pipelines.generation.test.cuda prefill first token coalesces only short eligible legacy prompts...OK
+51/117 pipelines.generation.test.owned batch decode context captures per-item kv bindings...OK
+52/117 pipelines.generation.test.mixed batch decode context captures per-item overrides...OK
+53/117 pipelines.generation.test.mixed batch decode context keeps single item on direct kv cache path...OK
+54/117 pipelines.generation.test.LightOnOCR3 decoder cohorts preserve page caches and heterogeneous image positions...OK
+55/117 architectures.session_factory.test.LightOnOCR3 4B budget covers both weight domains and preserves explicit limits...OK
+56/117 models.florence.test.isFlorenceModel...OK
+57/117 runtime.scheduler.native_generate.test.decode coalescing skips a sole request and records a two-item batch...OK
+58/117 runtime.scheduler.native_generate.test.rollout cap disables pointless decode coalescing...OK
+59/117 runtime.scheduler.native_generate.test.mixed position decode coalesces a peer returning from its previous step...OK
+60/117 runtime.scheduler.native_generate.test.LightOnOCR3 cohort coalescing blocks followers until the full decoder step is ready...OK
+61/117 runtime.scheduler.native_generate.test.LightOnOCR3 cohort coalescing bounds sparse waits and shrinks after page retirement...OK
+62/117 models.compatibility.test.LightOnOCR3 compatibility enables only the explicit safetensors reader profile...OK
+63/117 extractors.extractor.test.canonical model names coalesce prefixes and variants...OK
+64/117 pipelines.encoder_decoder.test.findEncoderDecoderPaths falls back to native Florence decoder...OK
+65/117 pipelines.reading.test.Florence defaults an empty read prompt to OCR...OK
+66/117 pipelines.reading.test.Florence batch decode preserves row lengths across mixed EOS...OK
+67/117 pipelines.reading.test.Florence device-selected batch tokens preserve mixed EOS state...OK
+68/117 pipelines.reading.test.Florence compacted active rows preserve original result identity...OK
+69/117 pipelines.reading.test.Florence prompt tensor cleanup survives encoder admission denial...OK
+70/117 pipelines.reading.test.Florence fallback policy exposes unsupported native CPU paths...OK
+71/117 pipelines.reading.test.native Florence admission covers batched encoder logits and retained KV...OK
+72/117 pipelines.reading.test.native Florence direct admission denies before execution and recovers without leaked leases...[default] (warn): test-only forced inference run admission denial
+[default] (warn): test-only forced inference run admission denial
+[default] (warn): test-only forced inference run admission denial
+[default] (warn): test-only forced inference run admission denial
+[default] (warn): test-only forced inference run admission denial
+[default] (warn): test-only forced inference run admission denial
+OK
+73/117 backends.session.test.session output admission coalesces cache column callbacks...OK
+74/117 server.reader_execution_pool.test.LightOnOCR3 shared reader pool refills before the longest page retires...OK
+75/117 server.reader_execution_pool.test.LightOnOCR3 shared reader pool rejects canceled joins and unwinds failed creation...OK
+76/117 server.reader_execution_pool.test.LightOnOCR3 shared vision peak preserves caps and reservations across page retirement...OK
+77/117 extractors.embedding_prototypes.test.embeddinggemma2 concurrent prototype waiters coalesce and cancel independently...OK
+78/117 readers.vision_reader.test.vision reader supports gguf-backed native Florence directories...OK
+78 selected; 72 passed; 6 skipped.
+failed command: cd pkg/inference/. && ./../../.zig-cache/o/866f7e0d65c8428f2c3b9e7e56ba01ba/test --test-filter LightOnOCR3 --test-filter "batch decode context" --test-filter "execution lane" --test-filter "projector residency" --test-filter "executor batch" --test-filter coalesc --test-filter Florence --test-filter "shared native provider" --test-filter "dynamic linear slot" --test-filter "decode GQA split" --test-filter LightOnOCR3 --test-filter "batch decode context" --test-filter "execution lane" --test-filter "projector residency" --test-filter "executor batch" --test-filter coalesc --test-filter Florence --test-filter "shared native provider" --test-filter "dynamic linear slot" --test-filter "decode GQA split"

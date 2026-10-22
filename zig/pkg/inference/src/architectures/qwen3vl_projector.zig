@@ -671,6 +671,125 @@ fn encodeProjectedImagesFromStoreQualified(
 /// reside on the model compute backend. This is the BF16 counterpart of the
 /// split GGUF projector path and deliberately shares the exact preprocessing,
 /// M-RoPE, DeepStack, and decoder-injection graph.
+/// Exact resized geometry for a bounded, independent-image vision batch.
+pub fn residentBatchGeometryKey(config: gpt_config.Config, bytes: []const u8, limits: Limits) !u64 {
+    try limits.validate();
+    if (bytes.len == 0 or bytes.len > limits.max_encoded_image_bytes) return error.VisionAdmissionExceeded;
+    const cfg = try configFromResidentModel(config);
+    const info = try image.inspectEncodedForInference(bytes, null);
+    if (try admissionMul(info.width, info.height) > limits.max_decoded_pixels) return error.VisionAdmissionExceeded;
+    const geometry = try targetGeometry(cfg, info.width, info.height, limits);
+    if (geometry.patchCount() > 4096) return error.UnsupportedBatchedVision;
+    return (@as(u64, @intCast(geometry.width)) << 32) | @as(u64, @intCast(geometry.height));
+}
+
+/// Caller admits the sum of the per-image working sets before invoking this
+/// route. Every image occupies its own attention batch lane; positions reset
+/// per image. The ordinary projector remains the singleton fallback.
+pub fn encodeProjectedImagesResidentBatched(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: gpt_config.Config,
+    images: []const []const u8,
+    limits: Limits,
+) ![]ProjectedImages {
+    try limits.validate();
+    if (images.len == 0 or images.len > 4 or images.len > limits.max_images) return error.ImageLimitExceeded;
+    const cfg = try configFromResidentModel(config);
+    if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or cb.kind() != .metal) return error.UnsupportedBatchedVision;
+    const key = try residentBatchGeometryKey(config, images[0], limits);
+    for (images[1..]) |bytes| if (try residentBatchGeometryKey(config, bytes, limits) != key) return error.VisionBatchGeometryMismatch;
+    const output = try allocator.alloc(ProjectedImages, images.len);
+    var completed: usize = 0;
+    errdefer {
+        for (output[0..completed]) |*item| item.deinit();
+        allocator.free(output);
+    }
+    if (images.len == 1) {
+        output[0] = try encodeProjectedImagesResident(cb, allocator, config, images, limits);
+        return output;
+    }
+    var weights = WeightCache.initResident(allocator, cb, cfg);
+    defer weights.deinit();
+    var hidden: ?CT = null;
+    defer if (hidden) |value| cb.free(value);
+    var geometry: Geometry = undefined;
+    for (images, 0..) |bytes, index| {
+        try cb.checkExecutionControl();
+        const decoded = try image.decode(allocator, bytes);
+        defer decoded.deinit(allocator);
+        if (try admissionMul(decoded.width, decoded.height) > limits.max_decoded_pixels) return error.VisionAdmissionExceeded;
+        const current = try targetGeometry(cfg, decoded.width, decoded.height, limits);
+        if (index != 0 and (current.width != geometry.width or current.height != geometry.height)) return error.VisionBatchGeometryMismatch;
+        if (index == 0) geometry = current;
+        const pixels = try image.preprocessDecodedRectScaledWithResample(allocator, decoded, @intCast(current.width), @intCast(current.height), cfg.image_mean, cfg.image_std, 1.0 / 255.0, .pillow_bicubic);
+        defer allocator.free(pixels);
+        const patches = try extractPatchesMergeMajor(allocator, pixels, cfg, current);
+        defer allocator.free(patches);
+        const patch_dim = cfg.patch_size * cfg.patch_size * 3;
+        const input = try cb.fromFloat32Shape(patches, &.{ @intCast(current.patchCount()), @intCast(patch_dim) });
+        defer cb.free(input);
+        const w0 = try weights.patch("v.patch_embd.weight", cfg);
+        const w1 = try weights.patch("v.patch_embd.weight.1", cfg);
+        const bias = try weights.weight("v.patch_embd.bias");
+        const temporal0 = try cb.linear(input, w0, bias, current.patchCount(), patch_dim, cfg.vision_hidden);
+        defer cb.free(temporal0);
+        const temporal1 = try cb.linearNoBias(input, w1, current.patchCount(), patch_dim, cfg.vision_hidden);
+        defer cb.free(temporal1);
+        const embedded = try cb.add(temporal0, temporal1);
+        defer cb.free(embedded);
+        const positioned = try addInterpolatedPositionsTensor(cb, allocator, &weights, embedded, cfg, current);
+        defer cb.free(positioned);
+        const converted = try cb.ensureDeviceResident(positioned);
+        defer if (converted) |value| cb.free(value);
+        const resident = converted orelse positioned;
+        if (hidden) |old| {
+            const joined = try cb.concatRows2D(allocator, old, resident, index * current.patchCount(), current.patchCount(), cfg.vision_hidden);
+            cb.free(old);
+            hidden = joined;
+        } else hidden = try cb.sliceRows2D(allocator, resident, 0, current.patchCount(), cfg.vision_hidden);
+    }
+    const per_image = geometry.patchCount();
+    const rows = try admissionMul(per_image, images.len);
+    const positions_one = try visionPositions(allocator, geometry, cfg.spatial_merge);
+    defer allocator.free(positions_one);
+    const positions = try allocator.alloc(u32, rows * 2);
+    defer allocator.free(positions);
+    for (0..2) |axis| for (0..images.len) |index| {
+        @memcpy(positions[axis * rows + index * per_image ..][0..per_image], positions_one[axis * per_image ..][0..per_image]);
+    };
+    for (0..cfg.block_count) |layer| {
+        try cb.checkExecutionControl();
+        var owns_frame = !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
+        defer if (owns_frame) cb.decoderRuntimeCancelFrame() catch {};
+        const next = try encoderBlock(cb, allocator, &weights, cfg, hidden.?, positions, rows, layer, images.len);
+        errdefer cb.free(next);
+        if (owns_frame) {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            owns_frame = false;
+        }
+        cb.free(hidden.?);
+        hidden = next;
+    }
+    const normalized = try layerNormNamed(cb, allocator, &weights, hidden.?, "v.post_ln", cfg.vision_hidden, cfg.layer_norm_eps);
+    defer cb.free(normalized);
+    for (output, 0..) |*value, index| {
+        const slice = try cb.sliceRows2D(allocator, normalized, index * per_image, per_image, cfg.vision_hidden);
+        defer cb.free(slice);
+        const projected = try mergeProjectedNamed(cb, allocator, &weights, cfg, slice, geometry, "mm.0", "mm.2");
+        defer cb.free(projected);
+        const embeddings = try cb.toFloat32(projected, allocator);
+        errdefer allocator.free(embeddings);
+        const counts = try allocator.dupe(usize, &.{geometry.tokenCount()});
+        errdefer allocator.free(counts);
+        const grids = try allocator.dupe(qwen3vl_plan.VisionGrid, &.{.{ .temporal = 1, .height = @intCast(geometry.grid_y), .width = @intCast(geometry.grid_x) }});
+        errdefer allocator.free(grids);
+        value.* = .{ .allocator = allocator, .embeddings = embeddings, .tokens_per_image = counts, .grids = grids, .deepstack_embeddings = &.{}, .preprocess_evidence = &.{}, .preprocess_spatial_patches = &.{}, .hidden_size = cfg.text_hidden, .deepstack_layer_count = 0 };
+        completed += 1;
+    }
+    return output;
+}
+
 pub fn encodeProjectedImagesResident(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1142,7 +1261,7 @@ fn encodeSingleImage(
             !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
         defer if (owns_frame) cb.decoderRuntimeCancelFrame() catch {};
         const block_started_at = if (profile) monotonicNowNs() else 0;
-        const next = (encoderBlock(cb, allocator, weights, cfg, hidden, positions, geometry.patchCount(), layer) catch |zig017_err| {
+        const next = (encoderBlock(cb, allocator, weights, cfg, hidden, positions, geometry.patchCount(), layer, 1) catch |zig017_err| {
             zig017_return_error = zig017_err;
             return zig017_err;
         });
@@ -1277,6 +1396,7 @@ fn encoderBlock(
     positions: []const u32,
     token_count: usize,
     layer: usize,
+    image_batch: usize,
 ) !CT {
     var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
@@ -1298,7 +1418,7 @@ fn encoderBlock(
     defer cb.free(normed1);
     const ln1_ns = profileLap(profile, &stage_started_at);
     failed_stage = "attention";
-    const attn = (visionAttention(cb, allocator, weights, cfg, normed1, positions, token_count, layer) catch |zig017_err| {
+    const attn = (visionAttention(cb, allocator, weights, cfg, normed1, positions, token_count, layer, image_batch) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
@@ -1390,6 +1510,7 @@ fn visionAttention(
     positions: []const u32,
     token_count: usize,
     layer: usize,
+    image_batch: usize,
 ) !CT {
     var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
@@ -1453,7 +1574,7 @@ fn visionAttention(
     // all-ones mask only adds a device upload and blocks specialized unmasked
     // SDPA routes without changing the mathematical result.
     failed_stage = "sdpa";
-    const attended = (cb.scaledDotProductAttentionQwen3VlVision(q, k, v, 1, token_count, cfg.head_count, cfg.headDim()) catch |zig017_err| {
+    const attended = (cb.scaledDotProductAttentionQwen3VlVision(q, k, v, image_batch, token_count / image_batch, cfg.head_count, cfg.headDim()) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
@@ -2178,7 +2299,7 @@ test "Qwen3-VL projector cancellation unwinds live vision intermediates with cac
         .layer_norm_eps = 1e-5,
         .image_mean = .{ 0, 0, 0 },
         .image_std = .{ 1, 1, 1 },
-    }, input, &.{ 0, 0 }, 1, 0));
+    }, input, &.{ 0, 0 }, 1, 0, 1));
     try std.testing.expectEqual(@as(usize, 3), probe.checks);
 }
 

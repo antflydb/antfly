@@ -81,7 +81,9 @@ def main():
     parser.add_argument("--compile-native-library", action="store_true")
     parser.add_argument("--timing-library", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--suite", choices=["quick", "full"], default="full")
+    parser.add_argument(
+        "--suite", choices=["quick", "full", "all-rows"], default="full"
+    )
     parser.add_argument(
         "--variant",
         choices=[
@@ -101,17 +103,34 @@ def main():
             "streamexact",
             "batch4vec",
             "streambfloat",
+            "packedwarps",
+            "gate8",
+            "gate32",
+            "gate64",
+            "projection16",
+            "projection32",
+            "streamgate4",
+            "gate16",
+            "split16projections",
+            "split32projections",
+            "vec2",
+            "vec3",
+            "splitgate8",
+            "splittails",
         ],
         default="production",
     )
     parser.add_argument("--cache-flush-mib", type=int, default=0)
     parser.add_argument("--only-candidates", action="store_true")
+    parser.add_argument("--compare-production", action="store_true")
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--trials", type=int, default=30)
     args = parser.parse_args()
     if not 0 <= args.cache_flush_mib <= 512:
         parser.error("cache flush must be 0..512 MiB")
-    if args.only_candidates and args.variant == "production":
+    if (
+        args.only_candidates or args.compare_production
+    ) and args.variant == "production":
         parser.error("--only-candidates requires a candidate variant")
     if args.warmup < 1 or args.trials < 2:
         parser.error("positive warmup and at least two trials required")
@@ -143,26 +162,39 @@ def main():
     native.ocr_pair_create.argtypes = [ctypes.c_size_t] * 4 + [ctypes.c_void_p] * 4
     native.ocr_pair_create.restype = ctypes.c_void_p
     native.ocr_pair_set_variant.argtypes = [ctypes.c_size_t]
-    native.ocr_pair_set_variant(
-        [
-            "production",
-            "qkv16",
-            "down4",
-            "normsg",
-            "segment8",
-            "segment16",
-            "gemv1",
-            "splitgate",
-            "splitprojections",
-            "norm64",
-            "norm128",
-            "norm256",
-            "normcached",
-            "streamexact",
-            "batch4vec",
-            "streambfloat",
-        ].index(args.variant)
-    )
+    variant_id = [
+        "production",
+        "qkv16",
+        "down4",
+        "normsg",
+        "segment8",
+        "segment16",
+        "gemv1",
+        "splitgate",
+        "splitprojections",
+        "norm64",
+        "norm128",
+        "norm256",
+        "normcached",
+        "streamexact",
+        "batch4vec",
+        "streambfloat",
+        "packedwarps",
+        "gate8",
+        "gate32",
+        "gate64",
+        "projection16",
+        "projection32",
+        "streamgate4",
+        "gate16",
+        "split16projections",
+        "split32projections",
+        "vec2",
+        "vec3",
+        "splitgate8",
+        "splittails",
+    ].index(args.variant)
+    native.ocr_pair_set_variant(variant_id)
     native.ocr_pair_candidate_applies.argtypes = [ctypes.c_void_p]
     native.ocr_pair_candidate_applies.restype = ctypes.c_size_t
     native.ocr_pair_flush.argtypes = [ctypes.c_size_t]
@@ -221,6 +253,7 @@ def main():
         "variant": args.variant,
         "cache_flush_mib": args.cache_flush_mib,
         "only_candidates": args.only_candidates,
+        "compare_production": args.compare_production,
         "status": "running",
         "results": [],
     }
@@ -239,20 +272,45 @@ def main():
     cases = [
         (0, b, k, n)
         for k, n in shapes
-        for b in ([1, 4, 8, 128, 512] if args.suite == "full" else [1, 4, 8])
+        for b in (
+            list(range(1, 9)) + [128, 512]
+            if args.suite == "all-rows"
+            else [1, 4, 8, 128, 512]
+            if args.suite == "full"
+            else [1, 4, 8]
+        )
     ]
-    if args.suite == "full":
+    if args.suite in ("full", "all-rows"):
         cases += [(0, b, k, 248320) for k in [1024, 2560] for b in [1, 4, 8]]
     cases += [(1, 554, k, k) for k in [1024, 2560]] + [
         (2, 554, (32 + h) * 128, h) for h in [16, 32]
     ]
-    cases += [(3, 8, 1024, 3584), (3, 4, 2560, 9216), (3, 8, 2560, 9216)]
+    cases += [
+        (3, 4, 1024, 3584),
+        (3, 5, 1024, 3584),
+        (3, 6, 1024, 3584),
+        (3, 7, 1024, 3584),
+        (3, 8, 1024, 3584),
+        (3, 4, 2560, 9216),
+        (3, 8, 2560, 9216),
+    ]
+    if args.suite == "all-rows":
+        cases = [case for case in cases if case[0] != 3]
+        cases += [
+            (3, rows, hidden, intermediate)
+            for hidden, intermediate in [(1024, 3584), (2560, 9216)]
+            for rows in range(1, 9)
+        ]
     if args.only_candidates:
 
         def applies(case):
             kind, rows, k, n = case
             return {
-                "qkv16": kind == 0 and rows == 4 and k == 1024 and n == 6144,
+                "qkv16": kind == 0
+                and (
+                    (2 <= rows <= 3 and n <= 9216)
+                    or (rows == 4 and k == 1024 and n == 6144)
+                ),
                 "down4": kind == 0 and rows == 4 and k == 3584,
                 "normsg": kind == 1,
                 "norm64": kind == 1,
@@ -266,18 +324,55 @@ def main():
                 "segment8": kind == 0 and rows == 4 and k == 1024 and n == 3584,
                 "segment16": kind == 0 and rows == 4 and k == 1024 and n == 3584,
                 "batch4vec": kind == 0 and rows == 4,
+                "packedwarps": kind == 0 and rows == 4 and n % 8 == 0,
+                "projection16": kind == 0
+                and (
+                    (rows == 4 and k == 3584 and n == 1024)
+                    or (rows == 8 and n == 248320)
+                ),
+                "projection32": kind == 0
+                and (
+                    (rows == 4 and k == 3584 and n == 1024)
+                    or (rows == 8 and n == 248320)
+                ),
+                "gate16": kind == 3 and 4 <= rows <= 8 and k == 1024,
+                "streamgate4": kind == 3 and rows == 4 and k == 1024,
+                "gate8": kind == 3,
+                "gate32": kind == 3,
+                "gate64": kind == 3,
                 "streambfloat": kind == 0
                 and rows == 4
                 and k == 1024
                 and n in (3584, 6144),
                 "gemv1": kind == 0 and rows == 1 and k == 3584,
-                "splitgate": kind == 3 and (k == 1024 or rows == 4),
-                "splitprojections": kind == 0 and rows == 4,
+                "splitgate": kind == 3
+                and ((k == 1024 and 2 <= rows <= 8) or (k == 2560 and 2 <= rows <= 7)),
+                "splitgate8": kind == 3
+                and ((k == 1024 and 2 <= rows <= 8) or (k == 2560 and 2 <= rows <= 3)),
+                "splittails": kind == 0 and 2 <= rows <= 7 and n <= 9216,
+                "vec2": kind == 0 and rows == 2 and n <= 9216,
+                "vec3": kind == 0 and rows == 3 and n <= 9216,
+                "splitprojections": kind == 0
+                and (
+                    (rows == 4 and n <= 9216)
+                    or (5 <= rows <= 7 and k == 1024 and n == 6144)
+                ),
+                "split16projections": kind == 0
+                and 4 <= rows <= 8
+                and k == 3584
+                and n == 1024,
+                "split32projections": kind == 0
+                and 4 <= rows <= 8
+                and k == 3584
+                and n == 1024,
             }[args.variant]
 
         cases = [case for case in cases if applies(case)]
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    handle = None
     try:
+        if not cases:
+            raise RuntimeError("No benchmark cases selected")
         for kind, rows, k, n in cases:
             handle = None
             arrays = []
@@ -362,16 +457,32 @@ def main():
                     raise RuntimeError("Native warmup failed")
                 mlx_run()
             samples = {"native": [], "mlx": []}
+            if args.compare_production:
+                samples["production"] = []
+                native.ocr_pair_set_variant(0)
+                for _ in range(args.warmup):
+                    if not native.ocr_pair_run(handle):
+                        raise RuntimeError("Production warmup failed")
+                native.ocr_pair_set_variant(variant_id)
             empty = []
             for trial in range(args.trials):
-                for participant in (
+                participants = (
                     ["native", "mlx"] if trial % 2 == 0 else ["mlx", "native"]
-                ):
+                )
+                if args.compare_production:
+                    players = ["native", "production", "mlx"]
+                    participants = players[trial % 3 :] + players[: trial % 3]
+                    if (trial // 3) % 2:
+                        participants.reverse()
+                for participant in participants:
                     if args.cache_flush_mib and native.ocr_pair_flush(
                         args.cache_flush_mib
                     ):
                         raise RuntimeError("GPU cache flush failed")
-                    if participant == "native":
+                    if participant != "mlx":
+                        native.ocr_pair_set_variant(
+                            variant_id if participant == "native" else 0
+                        )
                         nanos = native.ocr_pair_run(handle)
                     else:
                         timer.ocr_timing_begin()
@@ -385,9 +496,24 @@ def main():
                         raise RuntimeError(f"Missing {participant} GPU timestamps")
                     samples[participant].append(nanos / 1000)
             size = rows * (k if kind == 1 else n * 128 if kind == 2 else n)
+            production_output = None
+            if args.compare_production:
+                native.ocr_pair_set_variant(0)
+                if not native.ocr_pair_run(handle):
+                    raise RuntimeError("Production output check failed")
+                production_output = np.ctypeslib.as_array(
+                    native.ocr_pair_output(handle), shape=(size,)
+                ).copy()
+                native.ocr_pair_set_variant(variant_id)
+                if not native.ocr_pair_run(handle):
+                    raise RuntimeError("Candidate output check failed")
             actual = np.ctypeslib.as_array(
                 native.ocr_pair_output(handle), shape=(size,)
             ).copy()
+            if production_output is not None and not np.allclose(
+                actual, production_output, atol=2e-4, rtol=2e-5
+            ):
+                raise RuntimeError("Candidate differs from production output")
             reference = np.array(result[0].astype(mx.float32)).reshape(-1)
             if not np.isfinite(actual).all() or not np.isfinite(reference).all():
                 raise RuntimeError("Nonfinite output")
@@ -448,6 +574,14 @@ def main():
                 row["native"]["median_us"] / row["mlx"]["median_us"]
             )
             row["native_over_mlx"] = row["native"]["mean_us"] / row["mlx"]["mean_us"]
+            if args.compare_production:
+                row["production"] = summary(samples["production"])
+                row["median_native_over_production"] = (
+                    row["native"]["median_us"] / row["production"]["median_us"]
+                )
+                row["production_output_max_abs_difference"] = float(
+                    np.max(np.abs(actual - production_output))
+                )
             if w_np is not None:
                 row["expanded_weight_sha256"] = hashlib.sha256(
                     w_np.tobytes()

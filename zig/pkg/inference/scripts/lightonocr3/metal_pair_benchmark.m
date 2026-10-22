@@ -91,9 +91,14 @@ void *ocr_pair_create(size_t kind, size_t rows, size_t in_dim, size_t out_dim, c
             free(bias);
             if (rc)
                 return NULL;
-            if (kind == 3 &&
-                !termite_metal_decode_runtime_should_apply_bf16_gate_up(r, 0, 1, 0, rows, in_dim, out_dim))
-                return NULL;
+            if (kind == 3) {
+                c->gates = [r->device newBufferWithLength:rows * out_dim * 4
+                                                  options:MTLResourceStorageModePrivate];
+                c->state = [r->device newBufferWithLength:rows * out_dim * 4
+                                                  options:MTLResourceStorageModePrivate];
+                if (!c->gates || !c->state)
+                    return NULL;
+            }
         } else if (kind == 1) {
             if (!norm || termite_metal_decode_runtime_prepare_rms_norm(r, 0, norm, in_dim))
                 return NULL;
@@ -208,6 +213,33 @@ static NSString *ocr_pair_variant_source(void) {
             "sg[[simdgroup_index_in_threadgroup]],uint "
             "group[[threadgroup_position_in_grid]]){pair_exact_body<4,4>(x,w,bias,y,p,lane,sg,group);}\n"
             "\n"
+            "kernel void pair_packed(device const float*x[[buffer(0)]],device const "
+            "ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant "
+            "P&p[[buffer(4)]],uint lane[[thread_index_in_simdgroup]],uint "
+            "sg[[simdgroup_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) {\n"
+            " uint first=(group*4+sg)*2;float accum[4][2];\n"
+            " #pragma unroll\n"
+            " for(uint b=0;b<4;b++) {\n"
+            "  #pragma unroll\n"
+            "  for(uint c=0;c<2;c++)accum[b][c]=0;\n"
+            " }\n"
+            " for(uint i=lane*4;i<p.in_dim;i+=128){float4 weights[2];\n"
+            "  #pragma unroll\n"
+            "  for(uint c=0;c<2;c++)weights[c]=as_type<float4>(uint4(*((device const "
+            "ushort4*)(w+(first+c)*p.in_dim+i)))<<16);\n"
+            "  #pragma unroll\n"
+            "  for(uint b=0;b<4;b++){float4 v=*((device const float4*)(x+b*p.in_dim+i));\n"
+            "   #pragma unroll\n"
+            "   for(uint c=0;c<2;c++)accum[b][c]+=dot(v,weights[c]);\n"
+            "  }\n"
+            " }\n"
+            " #pragma unroll\n"
+            " for(uint b=0;b<4;b++) {\n"
+            "  #pragma unroll\n"
+            "  for(uint c=0;c<2;c++){float "
+            "value=simd_sum(accum[b][c]);if(lane==0)y[b*p.out_dim+first+c]=value+bias[first+c];}\n"
+            " }\n"
+            "}\n"
             "[[max_total_threads_per_threadgroup(128)]] kernel void pair_stream_bfloat(device const "
             "float4*x[[buffer(0)]],device const "
             "bfloat4*w[[buffer(1)]],device const float*bias[[buffer(2)]],device "
@@ -259,9 +291,45 @@ static NSString *ocr_pair_split_source(void) {
            @"j=0;j<p.pad;j++){g+=s[j*count+i];u+=s[(p.pad+j)*count+i];}g+=gb[i%p.out_dim];u+=ub[i%p.out_dim];"
            @"y[i]=(g/(1.0f+exp(-g)))*u;}\n";
 }
+static NSString *ocr_pair_stream_gate_source(void) {
+    return @"#include <metal_stdlib>\nusing namespace metal;\nstruct P { uint rows, in_dim, out_dim, pad; "
+           @"};\nkernel void gate4(device const float4*x[[buffer(0)]],device const "
+           @"ushort4*gw[[buffer(1)]],device const ushort4*uw[[buffer(2)]],device const "
+           @"float*gb[[buffer(3)]],device const float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant "
+           @"P&p[[buffer(6)]],uint col[[threadgroup_position_in_grid]],uint "
+           @"lane[[thread_index_in_simdgroup]]) {\n    float4 g[4],u[4];\n    for(uint "
+           @"r=0;r<4;r++){g[r]=0;u[r]=0;}\n    uint stride=p.in_dim/4;\n    for(uint "
+           @"k=lane;k<stride;k+=32){\n        float4 wg=as_type<float4>(uint4(gw[col*stride+k])<<16);\n      "
+           @"  float4 wu=as_type<float4>(uint4(uw[col*stride+k])<<16);\n        #pragma unroll\n        "
+           @"for(uint r=0;r<4;r++) {\n            float4 "
+           @"a=x[r*stride+k];g[r]=fma(a,wg,g[r]);u[r]=fma(a,wu,u[r]);\n        }\n    }\n    #pragma "
+           @"unroll\n    for(uint r=0;r<4;r++) {\n        float gs=simd_sum(dot(g[r],float4(1)))+gb[col];\n  "
+           @"      float us=simd_sum(dot(u[r],float4(1)))+ub[col];\n        "
+           @"if(lane==0)y[r*p.out_dim+col]=(gs/(1+exp(-gs)))*us;\n    }\n}\ntemplate<uint R> inline void "
+           @"pair_partial_vec_body(device const float*x,device const ushort*w,device const float*bias,device "
+           @"float*y,constant P&p,uint col,uint lane){\n    float4 acc[R];\n    #pragma unroll\n    for(uint "
+           @"r=0;r<R;r++)acc[r]=0;\n    for(uint k=lane*4;k<p.in_dim;k+=128){\n        float4 "
+           @"weight=as_type<float4>(uint4(*((device const ushort4*)(w+col*p.in_dim+k)))<<16);\n        "
+           @"#pragma unroll\n        for(uint r=0;r<R;r++)acc[r]=fma(*((device const "
+           @"float4*)(x+r*p.in_dim+k)),weight,acc[r]);\n    }\n    #pragma unroll\n    for(uint "
+           @"r=0;r<R;r++){\n        float sum=simd_sum(dot(acc[r],float4(1)));\n        "
+           @"if(lane==0)y[r*p.out_dim+col]=sum+bias[col];\n    }\n}\nkernel void pair_vec2(device const "
+           @"float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const "
+           @"float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant P&p[[buffer(4)]],uint "
+           @"col[[threadgroup_position_in_grid]],uint "
+           @"lane[[thread_index_in_simdgroup]]){pair_partial_vec_body<2>(x,w,bias,y,p,col,lane);}\nkernel "
+           @"void pair_vec3(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device "
+           @"const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant P&p[[buffer(4)]],uint "
+           @"col[[threadgroup_position_in_grid]],uint "
+           @"lane[[thread_index_in_simdgroup]]){pair_partial_vec_body<3>(x,w,bias,y,p,col,lane);}\n";
+}
+static id<MTLLibrary> pair_stream_gate_library;
+static id<MTLComputePipelineState> pair_stream_gate, pair_vec2, pair_vec3;
 static size_t pair_variant;
-static id<MTLLibrary> pair_variant_library, pair_split_library;
-static id<MTLComputePipelineState> pair_cached1024, pair_cached2560, pair_exact, pair_stream_bfloat;
+static id<MTLLibrary> pair_variant_library, pair_split_library, pair_gate_library;
+static id<MTLComputePipelineState> pair_gate8, pair_gate64;
+static id<MTLComputePipelineState> pair_cached1024, pair_cached2560, pair_exact, pair_stream_bfloat,
+    pair_packed;
 static id<MTLComputePipelineState> pair_norm, pair_segment8, pair_segment16, pair_gate_split,
     pair_gate_reduce;
 void ocr_pair_set_variant(size_t variant) { pair_variant = variant; }
@@ -271,7 +339,8 @@ size_t ocr_pair_candidate_applies(void *handle) {
         return 0;
     switch (pair_variant) {
     case 1:
-        return c->kind == 0 && c->rows == 4 && c->in_dim == 1024 && c->out_dim == 6144;
+        return c->kind == 0 && ((c->rows >= 2 && c->rows <= 3 && c->out_dim <= 9216) ||
+                                (c->rows == 4 && c->in_dim == 1024 && c->out_dim == 6144));
     case 2:
         return c->kind == 0 && c->rows == 4 && c->in_dim == 3584 && c->out_dim == 1024;
     case 3:
@@ -281,10 +350,23 @@ size_t ocr_pair_candidate_applies(void *handle) {
         return c->kind == 0 && c->rows == 4 && c->in_dim == 1024 && c->out_dim == 3584;
     case 6:
         return c->kind == 0 && c->rows == 1 && c->in_dim == 3584 && c->out_dim == 1024;
+    case 28:
+        return c->kind == 3 && ((c->in_dim == 1024 && c->rows >= 2 && c->rows <= 8) ||
+                                (c->in_dim == 2560 && c->rows >= 2 && c->rows <= 3));
     case 7:
-        return c->kind == 3 && ((c->in_dim == 1024 && c->rows == 8) || (c->in_dim == 2560 && c->rows == 4));
+        return c->kind == 3 && ((c->in_dim == 1024 && c->rows >= 2 && c->rows <= 8) ||
+                                (c->in_dim == 2560 && c->rows >= 2 && c->rows <= 7));
+    case 29:
+        return c->kind == 0 && c->rows >= 2 && c->rows <= 7 && c->out_dim <= 9216;
     case 8:
-        return c->kind == 0 && c->rows == 4 && c->out_dim <= 9216;
+        return c->kind == 0 && ((c->rows == 4 && c->out_dim <= 9216) ||
+                                (c->rows >= 5 && c->rows <= 7 && c->in_dim == 1024 && c->out_dim == 6144));
+    case 26:
+    case 27:
+        return c->kind == 0 && c->rows == (pair_variant == 26 ? 2 : 3) && c->out_dim <= 9216;
+    case 24:
+    case 25:
+        return c->kind == 0 && c->rows >= 4 && c->rows <= 8 && c->in_dim == 3584 && c->out_dim == 1024;
     case 9:
     case 10:
     case 11:
@@ -296,6 +378,20 @@ size_t ocr_pair_candidate_applies(void *handle) {
                (c->out_dim == 3584 || c->out_dim == 6144);
     case 14:
         return c->kind == 0 && c->rows == 4;
+    case 23:
+        return c->kind == 3 && c->rows >= 4 && c->rows <= 8 && c->in_dim == 1024 && c->out_dim == 3584;
+    case 22:
+        return c->kind == 3 && c->rows == 4 && c->in_dim == 1024 && c->out_dim == 3584;
+    case 20:
+    case 21:
+        return c->kind == 0 && ((c->rows == 4 && c->in_dim == 3584 && c->out_dim == 1024) ||
+                                (c->rows == 8 && c->out_dim == 248320));
+    case 17:
+    case 18:
+    case 19:
+        return c->kind == 3;
+    case 16:
+        return c->kind == 0 && c->rows == 4 && c->out_dim % 8 == 0;
     case 15:
         return c->kind == 0 && c->rows == 4 && c->in_dim == 1024 &&
                (c->out_dim == 3584 || c->out_dim == 6144);
@@ -305,8 +401,24 @@ size_t ocr_pair_candidate_applies(void *handle) {
 }
 static int ocr_pair_encode_candidate(OCRPairCase *c) {
     termite_metal_decode_runtime *r = pair_runtime;
+    if ((pair_variant == 22 || pair_variant == 26 || pair_variant == 27) && !pair_stream_gate_library) {
+        MTLCompileOptions *options = [MTLCompileOptions new];
+        options.mathMode = MTLMathModeFast;
+        options.languageVersion = MTLLanguageVersion4_0;
+        NSError *error = nil;
+        pair_stream_gate_library = [r->device newLibraryWithSource:ocr_pair_stream_gate_source()
+                                                           options:options
+                                                             error:&error];
+        if (!pair_stream_gate_library) {
+            fprintf(stderr, "stream gate: %s\n", error.localizedDescription.UTF8String);
+            return -1;
+        }
+        pair_stream_gate = termite_metal_make_pipeline(r->device, pair_stream_gate_library, @"gate4");
+        pair_vec2 = termite_metal_make_pipeline(r->device, pair_stream_gate_library, @"pair_vec2");
+        pair_vec3 = termite_metal_make_pipeline(r->device, pair_stream_gate_library, @"pair_vec3");
+    }
     if (pair_variant == 3 || pair_variant == 4 || pair_variant == 5 || pair_variant == 12 ||
-        pair_variant == 13 || pair_variant == 15) {
+        pair_variant == 13 || pair_variant == 15 || pair_variant == 16) {
         if (!pair_variant_library) {
             MTLCompileOptions *opt = [MTLCompileOptions new];
             opt.mathMode = MTLMathModeFast;
@@ -324,6 +436,32 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
             pair_segment16 = termite_metal_make_pipeline(r->device, pair_variant_library, @"segment_16");
         }
     }
+    if ((pair_variant == 17 || pair_variant == 19) && !pair_gate_library) {
+        MTLCompileOptions *options = [MTLCompileOptions new];
+        options.languageVersion = MTLLanguageVersion4_0;
+        options.mathMode = MTLMathModeSafe;
+        NSString *extra =
+            @"\n#define G(N) kernel void pair_gate##N(device float*x[[buffer(0)]],device "
+            @"bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device "
+            @"float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 "
+            @"group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<N>(x,g,u,gb,ub,y,"
+            @"p,group); }\nG(8) G(64)\n";
+        extra = [extra stringByReplacingOccurrencesOfString:@"G(8) G(64)"
+                                                 withString:pair_variant == 17 ? @"G(8)" : @"G(64)"];
+        NSError *error = nil;
+        pair_gate_library = [r->device
+            newLibraryWithSource:[termite_metal_lightonocr3_tensor_source() stringByAppendingString:extra]
+                         options:options
+                           error:&error];
+        if (!pair_gate_library) {
+            fprintf(stderr, "gate candidate: %s\n", error.localizedDescription.UTF8String);
+            return -1;
+        }
+        if (pair_variant == 17)
+            pair_gate8 = termite_metal_make_pipeline(r->device, pair_gate_library, @"pair_gate8");
+        else
+            pair_gate64 = termite_metal_make_pipeline(r->device, pair_gate_library, @"pair_gate64");
+    }
     if (pair_variant == 12) {
         if (!pair_cached1024)
             pair_cached1024 =
@@ -332,12 +470,14 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
             pair_cached2560 =
                 termite_metal_make_pipeline(r->device, pair_variant_library, @"pair_cached_2560");
     }
+    if (pair_variant == 16 && !pair_packed)
+        pair_packed = termite_metal_make_pipeline(r->device, pair_variant_library, @"pair_packed");
     if (pair_variant == 13 && !pair_exact)
         pair_exact = termite_metal_make_pipeline(r->device, pair_variant_library, @"pair_exact");
     if (pair_variant == 15 && !pair_stream_bfloat)
         pair_stream_bfloat =
             termite_metal_make_pipeline(r->device, pair_variant_library, @"pair_stream_bfloat");
-    if (pair_variant == 7 && !pair_split_library) {
+    if ((pair_variant == 7 || pair_variant == 28) && !pair_split_library) {
         MTLCompileOptions *opt = [MTLCompileOptions new];
         opt.languageVersion = MTLLanguageVersion4_0;
         opt.mathMode = MTLMathModeSafe;
@@ -354,38 +494,62 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
     }
     if ((pair_variant == 15 && !pair_stream_bfloat) ||
         (pair_variant == 12 && (!pair_cached1024 || !pair_cached2560)) ||
-        (pair_variant == 13 && !pair_exact) || (pair_variant == 7 && (!pair_gate_split || !pair_gate_reduce)))
+        (pair_variant == 13 && !pair_exact) ||
+        ((pair_variant == 7 || pair_variant == 28) && (!pair_gate_split || !pair_gate_reduce)))
         return -1;
     // Experimental launches also fail before opening an encoder if a PSO is unavailable.
-    id<MTLComputePipelineState> selected =
-        pair_variant == 1                          ? r->lightonocr3_mpp_four_row_pipeline
-        : (pair_variant == 2 || pair_variant == 8) ? r->lightonocr3_down_split32_pipeline
-        : pair_variant == 3                        ? pair_norm
-        : pair_variant == 4                        ? pair_segment8
-        : pair_variant == 5                        ? pair_segment16
-        : pair_variant == 6                        ? r->lightonocr3_gemv_pipeline
-        : pair_variant == 7                        ? pair_gate_split
-        : pair_variant == 12                       ? (c->in_dim == 1024 ? pair_cached1024 : pair_cached2560)
-        : pair_variant == 13                       ? pair_exact
-        : pair_variant == 14                       ? r->lightonocr3_batch4_pipeline
-        : pair_variant == 15                       ? pair_stream_bfloat
-                                                   : r->rms_norm_rows_simd4_reduce_pipeline;
+    id<MTLComputePipelineState> selected = pair_variant == 26   ? pair_vec2
+                                           : pair_variant == 27 ? pair_vec3
+                                           : pair_variant == 23 ? r->lightonocr3_gate_up_small16_pipeline
+                                           : pair_variant == 22 ? pair_stream_gate
+                                           : pair_variant == 20 ? r->lightonocr3_mpp_four_row_pipeline
+                                           : pair_variant == 21 ? r->lightonocr3_mpp_small_tile_pipeline
+                                           : pair_variant == 17 ? pair_gate8
+                                           : pair_variant == 18 ? r->lightonocr3_gate_up_small32_pipeline
+                                           : pair_variant == 19 ? pair_gate64
+                                           : pair_variant == 16 ? pair_packed
+                                           : pair_variant == 1  ? r->lightonocr3_mpp_four_row_pipeline
+                                           : (pair_variant == 2 || pair_variant == 8 || pair_variant == 29 ||
+                                              pair_variant == 24 || pair_variant == 25)
+                                               ? r->lightonocr3_down_split32_pipeline
+                                           : pair_variant == 3 ? pair_norm
+                                           : pair_variant == 4 ? pair_segment8
+                                           : pair_variant == 5 ? pair_segment16
+                                           : pair_variant == 6 ? r->lightonocr3_gemv_pipeline
+                                           : (pair_variant == 7 || pair_variant == 28) ? pair_gate_split
+                                           : pair_variant == 12
+                                               ? (c->in_dim == 1024 ? pair_cached1024 : pair_cached2560)
+                                           : pair_variant == 13 ? pair_exact
+                                           : pair_variant == 14 ? r->lightonocr3_batch4_pipeline
+                                           : pair_variant == 15 ? pair_stream_bfloat
+                                                                : r->rms_norm_rows_simd4_reduce_pipeline;
     const size_t required_threads = pair_variant == 11 ? 256
                                     : (pair_variant == 3 || pair_variant == 10 || pair_variant == 12 ||
-                                       pair_variant == 13 || pair_variant == 15)
+                                       pair_variant == 13 || pair_variant == 15 || pair_variant == 16)
                                         ? 128
                                     : pair_variant == 9 ? 64
                                                         : 32;
     if (!selected || selected.threadExecutionWidth != 32 ||
         selected.maxTotalThreadsPerThreadgroup < required_threads ||
-        ((pair_variant == 2 || pair_variant == 8) && !r->lightonocr3_down_split_reduce_pipeline))
+        ((pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
+          pair_variant == 25) &&
+         !r->lightonocr3_down_split_reduce_pipeline))
         return -1;
-    id<MTLBuffer> scratch = ((pair_variant == 2 || pair_variant == 8) || pair_variant == 7)
+    id<MTLBuffer> scratch = ((pair_variant == 2 || pair_variant == 8 || pair_variant == 29 ||
+                              pair_variant == 24 || pair_variant == 25) ||
+                             (pair_variant == 7 || pair_variant == 28))
                                 ? termite_metal_decode_gqa_split_scratch_for_encoding(r)
                                 : nil;
-    size_t splits = (pair_variant == 2 || pair_variant == 8) ? 8 : 4;
-    if (((pair_variant == 2 || pair_variant == 8) || pair_variant == 7) &&
-        (!scratch || scratch.length < splits * c->rows * c->out_dim * 4 * (pair_variant == 7 ? 2 : 1)))
+    size_t splits = pair_variant == 28                                               ? 8
+                    : pair_variant == 24                                             ? 16
+                    : pair_variant == 25                                             ? 32
+                    : (pair_variant == 2 || pair_variant == 8 || pair_variant == 29) ? 8
+                                                                                     : 4;
+    if (((pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
+          pair_variant == 25) ||
+         (pair_variant == 7 || pair_variant == 28)) &&
+        (!scratch || scratch.length < splits * c->rows * c->out_dim * 4 *
+                                          ((pair_variant == 7 || pair_variant == 28) ? 2 : 1)))
         return -1;
     id<MTLComputeCommandEncoder> e = termite_metal_tracked_compute_command_encoder_for(
         r->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER);
@@ -393,8 +557,50 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
         return -1;
     termite_metal_linear_params p = {(uint32_t)c->rows, (uint32_t)c->in_dim, (uint32_t)c->out_dim,
                                      (uint32_t)splits};
-    if (pair_variant == 3 || pair_variant == 9 || pair_variant == 10 || pair_variant == 11 ||
-        pair_variant == 12) {
+    if (pair_variant == 26 || pair_variant == 27) {
+        [e setComputePipelineState:selected];
+        [e setBuffer:c->input offset:0 atIndex:0];
+        [e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];
+        [e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];
+        [e setBuffer:c->output offset:0 atIndex:3];
+        [e setBytes:&p length:sizeof(p) atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake(c->out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    } else if (pair_variant == 20 || pair_variant == 21) {
+        [e setComputePipelineState:selected];
+        [e setBuffer:c->input offset:0 atIndex:0];
+        [e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];
+        [e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];
+        [e setBuffer:c->output offset:0 atIndex:3];
+        [e setBytes:&p length:sizeof(p) atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake(c->out_dim / (pair_variant == 20 ? 16 : 32), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    } else if ((pair_variant >= 17 && pair_variant <= 19) || pair_variant == 22 || pair_variant == 23) {
+        [e setComputePipelineState:selected];
+        [e setBuffer:c->input offset:0 atIndex:0];
+        [e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];
+        [e setBuffer:r->linear_weight_buffers[1] offset:0 atIndex:2];
+        [e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:3];
+        [e setBuffer:r->linear_bias_buffers[1] offset:0 atIndex:4];
+        [e setBuffer:c->output offset:0 atIndex:5];
+        [e setBytes:&p length:sizeof(p) atIndex:6];
+        size_t columns = pair_variant == 23   ? 16
+                         : pair_variant == 22 ? 1
+                         : pair_variant == 17 ? 8
+                         : pair_variant == 18 ? 32
+                                              : 64;
+        [e dispatchThreadgroups:MTLSizeMake(c->out_dim / columns, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    } else if (pair_variant == 16) {
+        [e setComputePipelineState:pair_packed];
+        [e setBuffer:c->input offset:0 atIndex:0];
+        [e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];
+        [e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];
+        [e setBuffer:c->output offset:0 atIndex:3];
+        [e setBytes:&p length:sizeof(p) atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake(c->out_dim / 8, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else if (pair_variant == 3 || pair_variant == 9 || pair_variant == 10 || pair_variant == 11 ||
+               pair_variant == 12) {
         termite_metal_apply_row_norm_params np = {(uint32_t)c->rows, (uint32_t)c->in_dim, 1e-6f};
         [e setComputePipelineState:pair_variant == 12
                                        ? (c->in_dim == 1024 ? pair_cached1024 : pair_cached2560)
@@ -429,7 +635,7 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
         [e setBytes:&p length:sizeof(p) atIndex:4];
         [e dispatchThreadgroups:MTLSizeMake(c->out_dim / (pair_variant == 14 ? 1 : 4), 1, 1)
             threadsPerThreadgroup:MTLSizeMake(pair_variant == 14 ? 32 : 128, 1, 1)];
-    } else if (pair_variant == 7) {
+    } else if ((pair_variant == 7 || pair_variant == 28)) {
         [e setComputePipelineState:pair_gate_split];
         [e setBuffer:c->input offset:0 atIndex:0];
         [e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];
@@ -438,7 +644,7 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
         [e setBuffer:r->linear_bias_buffers[1] offset:0 atIndex:4];
         [e setBuffer:scratch offset:0 atIndex:5];
         [e setBytes:&p length:sizeof(p) atIndex:6];
-        [e dispatchThreadgroups:MTLSizeMake(c->out_dim / 16, 4, 1)
+        [e dispatchThreadgroups:MTLSizeMake(c->out_dim / 16, splits, 1)
             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [e setComputePipelineState:pair_gate_reduce];
@@ -450,35 +656,48 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
         [e dispatchThreads:MTLSizeMake(c->rows * c->out_dim, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else {
-        id<MTLComputePipelineState> pipeline = pair_variant == 1 ? r->lightonocr3_mpp_four_row_pipeline
-                                               : (pair_variant == 2 || pair_variant == 8)
-                                                   ? r->lightonocr3_down_split32_pipeline
-                                               : pair_variant == 4 ? pair_segment8
-                                               : pair_variant == 5 ? pair_segment16
-                                                                   : r->lightonocr3_gemv_pipeline;
+        id<MTLComputePipelineState> pipeline =
+            pair_variant == 1 ? r->lightonocr3_mpp_four_row_pipeline
+            : (pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
+               pair_variant == 25)
+                ? r->lightonocr3_down_split32_pipeline
+            : pair_variant == 4 ? pair_segment8
+            : pair_variant == 5 ? pair_segment16
+                                : r->lightonocr3_gemv_pipeline;
         [e setComputePipelineState:pipeline];
         [e setBuffer:c->input offset:0 atIndex:0];
         [e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];
-        [e setBuffer:(pair_variant == 2 || pair_variant == 8) ? scratch : r->linear_bias_buffers[0]
+        [e setBuffer:(pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
+                      pair_variant == 25)
+                         ? scratch
+                         : r->linear_bias_buffers[0]
               offset:0
              atIndex:2];
         [e setBuffer:c->output offset:0 atIndex:3];
         if (pair_variant == 6) {
             termite_metal_apply_linear_params sp = {(uint32_t)c->in_dim, (uint32_t)c->out_dim};
             [e setBytes:&sp length:sizeof(sp) atIndex:4];
-        } else if ((pair_variant == 2 || pair_variant == 8))
+        } else if ((pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
+                    pair_variant == 25))
             [e setBytes:&p length:sizeof(p) atIndex:3];
         else
             [e setBytes:&p length:sizeof(p) atIndex:4];
-        size_t columns = pair_variant == 1                          ? 16
-                         : (pair_variant == 2 || pair_variant == 8) ? 32
-                         : pair_variant == 4                        ? 4
-                         : pair_variant == 5                        ? 2
-                                                                    : 1;
+        size_t columns = pair_variant == 1 ? 16
+                         : (pair_variant == 2 || pair_variant == 8 || pair_variant == 29 ||
+                            pair_variant == 24 || pair_variant == 25)
+                             ? 32
+                         : pair_variant == 4 ? 4
+                         : pair_variant == 5 ? 2
+                                             : 1;
         [e dispatchThreadgroups:MTLSizeMake(c->out_dim / columns,
-                                            (pair_variant == 2 || pair_variant == 8) ? 8 : 1, 1)
+                                            (pair_variant == 2 || pair_variant == 8 || pair_variant == 29 ||
+                                             pair_variant == 24 || pair_variant == 25)
+                                                ? splits
+                                                : 1,
+                                            1)
             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        if ((pair_variant == 2 || pair_variant == 8)) {
+        if ((pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
+             pair_variant == 25)) {
             [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [e setComputePipelineState:r->lightonocr3_down_split_reduce_pipeline];
             [e setBuffer:scratch offset:0 atIndex:0];
@@ -562,11 +781,26 @@ uint64_t ocr_pair_run(void *handle) {
         else if (c->kind == 1)
             rc = termite_metal_decode_runtime_apply_rms_norm_rows_device(
                 r, 0, (__bridge void *)c->input, 0, c->rows, c->in_dim, 1e-6f, (__bridge void *)c->output, 0);
-        else if (c->kind == 3)
-            rc = termite_metal_decode_runtime_apply_bf16_gate_up_device(r, 0, 1, (__bridge void *)c->input, 0,
-                                                                        c->rows, c->in_dim, c->out_dim,
-                                                                        (__bridge void *)c->output, 0);
-        else {
+        else if (c->kind == 3) {
+            if (termite_metal_decode_runtime_should_apply_bf16_gate_up(r, 0, 1, 0, c->rows, c->in_dim,
+                                                                       c->out_dim))
+                rc = termite_metal_decode_runtime_apply_bf16_gate_up_device(
+                    r, 0, 1, (__bridge void *)c->input, 0, c->rows, c->in_dim, c->out_dim,
+                    (__bridge void *)c->output, 0);
+            else {
+                rc = termite_metal_decode_runtime_apply_linear_multi_row_device(
+                    r, 0, (__bridge void *)c->input, 0, c->rows, c->in_dim, c->out_dim,
+                    (__bridge void *)c->gates, 0);
+                if (!rc)
+                    rc = termite_metal_decode_runtime_apply_linear_multi_row_device(
+                        r, 1, (__bridge void *)c->input, 0, c->rows, c->in_dim, c->out_dim,
+                        (__bridge void *)c->state, 0);
+                if (!rc)
+                    rc = termite_metal_decode_runtime_apply_activation_multiply_device(
+                        r, 2, (__bridge void *)c->gates, 0, (__bridge void *)c->state, 0, c->rows, c->out_dim,
+                        (__bridge void *)c->output, 0);
+            }
+        } else {
             // Same production kernel and launch used by the qualified prefill
             // selector; compare the recurrent stage independently of its core.
             uint32_t p[6] = {(uint32_t)c->rows, 16, (uint32_t)c->out_dim, 128, 4, 0};

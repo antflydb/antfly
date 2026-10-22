@@ -50,6 +50,12 @@ def run(args, model, label, mode, concurrency, output):
             "ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE",
             "ANTFLY_FLORENCE2_BATCH_WAIT_US",
             "ANTFLY_INFERENCE_READ_PROFILE",
+            "ANTFLY_LIGHTONOCR3_CONTINUOUS",
+            "ANTFLY_LIGHTONOCR3_VISION_BATCH",
+            "ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK",
+            "ANTFLY_LIGHTONOCR3_PREFILL_BATCH",
+            "ANTFLY_LIGHTONOCR3_VISION_WAIT_US",
+            "ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US",
             "TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION",
             "TERMITE_METAL_ENABLE_QWEN3VL_PREFILL_SG_ATTENTION",
             "TERMITE_METAL_DISABLE_QWEN3VL_PREFILL_SG_ATTENTION",
@@ -77,6 +83,17 @@ def run(args, model, label, mode, concurrency, output):
         env["TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION"] = "1"
     if args.prefill_direct_kv:
         env["TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD"] = "1"
+    env["ANTFLY_LIGHTONOCR3_VISION_WAIT_US"] = str(args.vision_wait_us)
+    env["ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US"] = str(args.prefill_wait_us)
+    if args.prefill_batch:
+        env["ANTFLY_LIGHTONOCR3_PREFILL_BATCH"] = "1"
+    if args.disable_shared_vision_peak:
+        env["ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK"] = "1"
+    if args.vision_batch:
+        env["ANTFLY_LIGHTONOCR3_VISION_BATCH"] = "1"
+    env["ANTFLY_LIGHTONOCR3_CONTINUOUS"] = "1" if args.continuous else "0"
+    if args.require_small_tail_fusion:
+        env["TERMITE_METAL_TRACE_DENSE_LINEAR_SHAPES"] = "1"
     if args.profile_reader:
         env["ANTFLY_INFERENCE_READ_PROFILE"] = "1"
     env["ANTFLY_FLORENCE2_BATCH_WAIT_US"] = str(args.florence_batch_wait_us)
@@ -90,6 +107,14 @@ def run(args, model, label, mode, concurrency, output):
         env["TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP"] = "1"
     if args.disable_ocr_attention:
         env["TERMITE_METAL_DISABLE_LIGHTONOCR3_GQA_SPLIT"] = "1"
+    if args.disable_tail_split:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_TAIL_SPLIT"] = "1"
+    if args.disable_partial_qkv_split:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT"] = "1"
+    if args.disable_partial_down_split:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_DOWN_SPLIT"] = "1"
+    if args.disable_gate_up_split:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_GATE_UP_SPLIT"] = "1"
     if args.disable_batch_gate_up:
         env["TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_GATE_UP"] = "1"
     if args.disable_prefill_columns:
@@ -221,6 +246,15 @@ def run(args, model, label, mode, concurrency, output):
             }
         )
         result.update(status="ok", serial_reference_parity=True)
+        if args.require_small_tail_fusion:
+            dispatches = re.findall(
+                r"site=bf16_gate_up_device[^\n]*rows=([234])[^\n]*variant=lightonocr3_gate_up_split(?:\s|$)",
+                text,
+            )
+            result["small_tail_fusion_dispatches_including_warmup"] = len(dispatches)
+            if not dispatches:
+                result["status"] = "missing_small_tail_fusion"
+
         result["references"] = [
             json.loads(row) for row in re.findall(r"OCR_REFERENCE (.+)", text)
         ]
@@ -281,11 +315,16 @@ def main():
     parser.add_argument("--pages-per-request", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--admission-units", type=int, default=256)
-    parser.add_argument("--batch-rows", type=int, default=4)
+    parser.add_argument("--batch-rows", type=int, default=8)
     parser.add_argument("--batch-window", type=int, default=8)
     parser.add_argument("--batch-wait-us", type=int, default=5000)
     parser.add_argument("--florence-batch-wait-us", type=int, default=5000)
     parser.add_argument("--profile-reader", action="store_true")
+    parser.add_argument(
+        "--require-small-tail-fusion",
+        action="store_true",
+        help="Require an actual two-/three-/four-row split FFN dispatch (includes warmup)",
+    )
     parser.add_argument("--prefill-sg-attention", action="store_true")
     parser.add_argument("--bf16-prefill-inputs", action="store_true")
     parser.add_argument("--prefill-direct-kv", action="store_true")
@@ -308,6 +347,20 @@ def main():
     parser.add_argument("--disable-f16-encoder-mpp", action="store_true")
     parser.add_argument("--weight-residency", action="store_true")
     parser.add_argument("--disable-prefill-conv-vec4", action="store_true")
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Use refill; otherwise force fixed waves as the benchmark control",
+    )
+    parser.add_argument("--vision-batch", action="store_true")
+    parser.add_argument("--disable-shared-vision-peak", action="store_true")
+    parser.add_argument("--prefill-batch", action="store_true")
+    parser.add_argument("--vision-wait-us", type=int, default=2000)
+    parser.add_argument("--prefill-wait-us", type=int, default=5000)
+    parser.add_argument("--disable-tail-split", action="store_true")
+    parser.add_argument("--disable-partial-qkv-split", action="store_true")
+    parser.add_argument("--disable-partial-down-split", action="store_true")
+    parser.add_argument("--disable-gate-up-split", action="store_true")
     parser.add_argument("--disable-batch-gate-up", action="store_true")
     parser.add_argument("--disable-prefill-columns", action="store_true")
     parser.add_argument("--disable-single-down-tile", action="store_true")
@@ -358,6 +411,13 @@ def main():
         help="Saved binary/source fingerprints for the tested build",
     )
     args = parser.parse_args()
+    if (
+        not 0 <= args.vision_wait_us <= 100000
+        or not 0 <= args.prefill_wait_us <= 100000
+    ):
+        parser.error("vision/prefill collection waits must be 0..100000 microseconds")
+    if (args.vision_batch or args.prefill_batch) and not args.continuous:
+        parser.error("vision/prefill batching requires --continuous")
     if args.prefill_direct_kv and not args.prefill_sg_attention:
         parser.error("direct KV prefill requires --prefill-sg-attention")
     if args.requests < 1 or any(c < 1 or c > 16 for c in args.concurrency):

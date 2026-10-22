@@ -376,240 +376,137 @@ samples, and logs are retained in
 
 ## Concurrent reader throughput
 
-Single-page latency and saturated serving throughput measure different things.
-The earlier serial comparison above does not measure Antfly under concurrent
-load. Use the concurrency runner to compare the serial implementation with
-native batching on the same checkpoint, pages, output budget, and machine:
+The native Metal reader supports concurrent `/read` calls and the linked
+encoded-image API. Single-page latency and saturated serving throughput measure
+different things. Whole-reader vLLM parity remains unfinished for LightOn.
+
+Qualified M4 readers refill finished page slots while peers keep decoding. Each
+page owns its KV, recurrent history, image positions, deadline and cancellation.
+The default active window and decode-row cap are eight; the window is bounded
+to sixteen and each shared reader epoch to sixty-four page admissions. Pages
+queue before per-run GPU allocation. Hard memory limits remain authoritative;
+transient page admission pressure retries for at most thirty seconds without a
+resource lease. Full multimodal prefill must fit its admitted prompt envelope.
+`/generate` and `/generate/batch` retain their existing scheduling behavior.
+
+### Settings
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `ANTFLY_LIGHTONOCR3_BATCH` | `1` | Set `0` for the serial reader implementation. |
+| `ANTFLY_LIGHTONOCR3_CONTINUOUS` | Qualified M4: `1`; otherwise `0` | Refill completed slots; `0` restores fixed waves. |
+| `ANTFLY_LIGHTONOCR3_BATCH_ROWS` | Qualified M4: `8`; otherwise `4` | Maximum pages sharing a decode step; clamped to 1–8. |
+| `ANTFLY_LIGHTONOCR3_BATCH_WINDOW` | `8` | Maximum active pages; clamped to 1–16. |
+| `ANTFLY_LIGHTONOCR3_BATCH_WAIT_US` | `5000` | Fixed-wave collection wait; capped at 20000 microseconds, with the node wait as a floor. |
+| `ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK` | `0` | Set to `1` to restore per-page vision peak reservations; experimental batched vision always keeps those reservations. |
+| `ANTFLY_LIGHTONOCR3_DECODE_WAIT_US` | Node setting, normally `1000` | Decoder collection wait; capped at 10000 microseconds. |
+| `TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY` | `0` | Wire existing admitted dense weights before preparation, without copies; bounded to 12 GiB and 32 sets. |
+| `ANTFLY_LIGHTONOCR3_VISION_BATCH` | `0` | Experimental grouping of up to four pages with equal resized geometry. |
+| `ANTFLY_LIGHTONOCR3_PREFILL_BATCH` | `0` | Experimental grouping of up to four equal-length prepared prompts. |
+| `ANTFLY_LIGHTONOCR3_VISION_WAIT_US` | `2000` | Experimental vision collection wait; capped at 100000 microseconds. |
+| `ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US` | `5000` | Experimental prefill collection wait; capped at 100000 microseconds. |
+
+The measured throughput configuration uses eight rows, an eight-page window and
+opt-in weight residency. A sixteen-page window was slower in its trial. Larger
+collection windows can form fuller batches at higher request latency. Tune on
+representative pages rather than assuming more concurrency is faster.
+
+```bash
+export ANTFLY_LIGHTONOCR3_BATCH_ROWS=8
+export ANTFLY_LIGHTONOCR3_BATCH_WINDOW=8
+export TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY=1
+```
+
+Batched vision keeps attention lanes separate and splits projected embeddings
+back to their page owners. Prepared-prompt batching carries complete axis-major
+M-RoPE positions and independent KV/recurrent states; it does not pad queries.
+The short default waits often formed singleton batches. Longer experimental
+waits have separate measurements and remain explicit options.
+
+### Measurement
+
+Build the inference test executable with Zig 0.17, `-Doptimize=ReleaseFast`,
+`-Dstrip=true` and `-Dtest-filter=LightOnOCR3`, then use:
 
 ```bash
 python3 zig/pkg/inference/scripts/lightonocr3/benchmark_concurrency.py \
   --native-test /path/to/compiled/inference-test \
   --model lighton08=/path/to/LightOnOCR-3-0.8B \
-  --model lighton4=/path/to/LightOnOCR-3-4B \
   --images zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png \
     zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png \
     zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png \
-  --max-tokens 256 --requests 16 --concurrency 1 2 4 8 \
-  --batch-rows 4 --batch-window 8 \
+  --max-tokens 256 --requests 16 --concurrency 8 --modes batch \
+  --continuous --batch-rows 8 --batch-window 8 --weight-residency \
+  --memory-gib 24 --shared-memory-gib 28 --backend-memory-gib 16 \
+  --kv-memory-gib 4 --scratch-memory-gib 4 \
   --output-dir /tmp/lighton-concurrency
 ```
 
-Build the native test executable with Zig 0.17, `-Doptimize=ReleaseFast`,
-`-Dstrip=true`, and `-Dtest-filter=LightOnOCR3`. The runner launches one Node
-per setting and submits concurrent requests to that resident Node. Loading and
-serial reference reads finish before the timed region. Every timed output
-must match its same-model serial reference exactly. The JSON report includes
-wall-clock pages/s, request p50/p95 latency, actual batching counts, model sizes,
-image and executable hashes, hardware, and raw logs. It excludes HTTP, PDF
-rendering, and indexing. Other machine workloads are uncontrolled.
+Add `--require-small-tail-fusion` to assert actual two-/three-/four-row fused
+FFN dispatches, including warmup; tracing affects timing. Without `--continuous`,
+the harness forces fixed waves as a control. Add
+`--vision-batch --prefill-batch --vision-wait-us 100000 --prefill-wait-us 100000`
+to measure the longer experimental windows. Change the model path to test 4B.
 
-On the qualified M4 Max, small decoder batches also use vectorized BF16
-projection kernels that reuse weights across two to eight rows. Inputs,
-accumulation, and recurrent state remain F32. Small 0.8B batches use parallel
-normalization reductions. Other devices, missing pipelines, and unsupported
-alignment retain the existing dispatcher. For a kernel-only ablation, pass
-`--disable-batch-projections` to the runner or set
-`TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS=1` in the server.
+The runner launches one resident Node per setting. Loading and serial reference
+reads precede timing. Each timed output must match its own serial result
+exactly. Reports contain pages/s, p50/p95 latency, batching counters, checkpoint,
+image and executable fingerprints, hardware and raw logs. Native timing covers
+preprocessing, queueing, inference and text decoding; it excludes HTTP, PDF
+rendering and indexing. vLLM reference timing also includes loopback HTTP.
+Reference prefix and processor caches are disabled.
 
-The Metal reader enables batching by default. Server process settings:
+Measurements use a shared M4 Max with 36 GiB unified memory, sixteen repeated
+pages and greedy generation with a 256-token ceiling. Machine load changes
+substantially between runs. The three synthetic fixtures test consistency,
+not real-document OCR accuracy. Native LightOn retains F32 activations,
+accumulation, outputs and recurrent state with original BF16 weights; MLX uses
+BF16 activation/output storage. Native Florence uses Q4_K weights and F16 encoder
+mirrors with no-repeat n-gram size three; its MLX reference uses original FP16
+and its greedy policy. These are not fully precision-matched comparisons.
 
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| `ANTFLY_LIGHTONOCR3_BATCH` | `1` | Set `0` for the serial implementation. |
-| `ANTFLY_LIGHTONOCR3_BATCH_ROWS` | `4` | Maximum pages sharing a decoder step; clamped to 1–8. |
-| `ANTFLY_LIGHTONOCR3_BATCH_WINDOW` | `8` | Maximum resident pages in one cohort; clamped to 1–16. |
-| `ANTFLY_LIGHTONOCR3_BATCH_WAIT_US` | `5000` | Coalescing window in microseconds; capped at 20000, with the node microbatch wait as a floor. |
-| `ANTFLY_LIGHTONOCR3_DECODE_WAIT_US` | Node decode wait (normally `1000`) | Bounded wait for a full decoder step; capped at 10000. Set `0` for eager partial steps. |
+### Kernel qualification
 
-The broker groups only the same loaded model generation, prompt, and output
-budget. It honors configured media limits and waits up to the configured
-coalescing window for compatible pages. Admission accounts every page's KV, recurrent history, retained prompt, and
-decoder scratch, plus one serialized vision working set. A capacity failure, including live-memory pressure, splits the cohort before
-execution. The decoder coalescing gate applies to every participant, so a follower
-cannot bypass the wait and launch a partial step. The target shrinks as pages
-finish. These are bounded cohorts: completed pages do not admit replacement
-pages until the entire cohort retires. Waiting cohorts queue before taking memory leases. Existing process limits
-and live-memory checks remain authoritative. Larger cohorts may require a
-larger explicit process envelope and can increase request latency. Sweep both
-batch rows and concurrency on representative pages to select the best setting.
+The production path uses model-scoped projections, fused gate/up and SiLU × up,
+frame-owned split scratch, SIMD recurrent decode, four-column recurrent prefill
+and register-cached F32 normalization. Qualified partial QKV/down projections
+use finer K splits while retaining the earlier split if scratch is smaller.
+Unsupported dimensions, offsets and missing pipelines retain working fallbacks.
+Eligible split dispatches close a planned encoder only after validating its
+resources, preserving producer ordering and the outer scope lifetime. The optimizations allocate no additional persistent scratch.
 
-`/generate` and `/generate/batch` retain their existing scheduling behavior;
-these reader optimizations apply to `/read` and its linked encoded-image API.
+The paired benchmark alternates native and MLX in one process, synchronizes
+every sample and checks full outputs plus independent CPU samples. Candidate
+comparisons balance all six candidate/production/MLX trial orders. The
+`--suite all-rows` sweep covers decoder row counts one through eight for
+projections and gate/up, vocabulary heads at one/four/eight rows, and the two
+normalization/recurrent-prefill geometries. This broader coverage exposes gaps
+missed by the earlier one/four/eight-row suite. Primitive results do not prove
+whole-reader parity.
 
+Useful rollback switches, set to `1`, include:
 
-The recurrent decode kernels also distribute Q/K and gated RMS normalization
-across a SIMD group on the qualified M4 Max. Set
-`TERMITE_METAL_DISABLE_QWEN35_CORE_PARALLEL_NORM=1` to restore the scalar
-normalizations. Multi-page recurrence shares five encoder stages while keeping
-all page histories independent; its rollback is
-`TERMITE_METAL_DISABLE_QWEN35_CORE_BATCH=1`. Qualified decoder shapes also reuse input vectors across two or four output
-columns, with an exact shader specialization for each batch size from two to
-eight. `TERMITE_METAL_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS=1` restores the earlier
-vector kernels. Selected eight-row shapes retain the existing F32-input
-TensorOps path ahead of tiling; other qualified shapes can use it as a fallback; `TERMITE_METAL_DISABLE_LIGHTONOCR3_SMALL_MPP=1` disables
-that fallback. `TERMITE_METAL_LIGHTONOCR3_SMALL_MPP=1` forces an experimental
-small-row TensorOps comparison.
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_GATE_UP_SPLIT`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_TAIL_SPLIT`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_DOWN_SPLIT`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_LARGE_MPP`
+- `TERMITE_METAL_DISABLE_QWEN35_CORE_BATCH`
+- `TERMITE_METAL_DISABLE_QWEN35_PREFILL_COLUMNS`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_NORM`
+- `TERMITE_METAL_DISABLE_F16_ENCODER_MPP`
 
-Florence-2 Metal readers now queue cohorts before memory admission and provider
-acquisition. On qualified M4 devices, encoders prepare bounded F16 mirrors
-of quantized linear weights (32 MiB per weight) from the first request. This
-throughput policy can increase single-page latency and memory use. Incremental
-decoding keeps its existing policy. Set `TERMITE_METAL_FLORENCE2_ENCODER_MIRRORS=0` to roll
-back this encoder optimization. Operator memory limits still apply. An eight-page
-Florence batch can need a larger scratch reservation than four pages because
-admission also covers the full-prefix decoder fallback.
+Existing individual projection/precision rollbacks remain available. The
+concurrency runner exposes matching `--disable-*` options for measured features.
+On qualified M4 hardware, Florence collects compatible pages for up to five
+milliseconds; `ANTFLY_FLORENCE2_BATCH_WAIT_US=0` restores the generic wait.
 
-### Comparison with vLLM Metal
-
-The comparison harness starts a fresh vLLM Metal server per checkpoint, disables
-prefix/processor caches, and gives every image a unique media UUID to avoid
-encoder reuse. It measures completed requests, checks serial-reference output,
-and saves exact versions, checkpoint metadata, image hashes, output and raw server logs.
-Use `benchmark_vllm_metal.py --python /path/to/isolated/python` with matching
-vLLM and vllm-metal releases. Native `benchmark_concurrency.py --reference-report`
-also checks content against the saved cross-runtime references.
-
-The installed vLLM Metal 0.32.0 supports the LightOn models but does not expose a
-Florence-2 adapter. Florence therefore uses a separate MLX-VLM reference. Native
-Florence uses Q4_K weights while that reference uses FP16; this is not a matched
-precision comparison. The current measurements do **not** establish parity for
-all three readers. Earlier complete tuned runs reached about 0.96/0.28/3.20
-pages/s for LightOn 0.8B, LightOn 4B and Florence, against reference runs at
-2.80/0.81/4.90 pages/s. Later adjacent runs under heavier shared-machine load
-measured 0.37 native versus 0.85 vLLM for 0.8B, 0.065 versus 0.27 vLLM for
-4B, and 1.16 versus 1.54 MLX for Florence. The final 4B run completed all
-16 pages with matching content, but later cohorts slowed substantially inside
-GPU execution. This remains unresolved. These are exploratory runs with differing runtime precision,
-not a controlled performance guarantee. Continuous cohort refill and batched
-vision/prefill remain unimplemented. Complete settings, gaps and rejected experiments are retained
-in `zig/pkg/inference/scripts/lightonocr3/results/concurrent_readers_m4_max/README.md`.
-
-### Kernel optimization follow-up
-
-Qualified M4 kernels now fuse single-token recurrent convolution, normalization,
-gates, state update and output normalization. Request-owned recurrent history
-and side weights use fresh storage so small persistent tensors cannot retain
-oversized prefill buffers. The 0.8B decoder also calls the single-token FFN
-fusion. Smaller F32-input TensorOps tiles cover gate/up projections at seven/eight
-rows for 0.8B and four through eight rows for 4B, plus both models' QKV
-projections at four through eight rows. Florence channel-score reductions and
-window softmax distribute work across SIMD groups.
-
-Global LightOn decode attention uses a separate split-K SIMD matrix path for
-head dimension 256, the supported 8/2 and 16/4 query/KV head counts, and contexts
-192–2048. This path rounds query/probability tiles to F16, with F32 accumulation
-and output. Recurrent state and projection activations remain F32 by default.
-Unsupported geometry, hardware or missing pipelines keep the previous paths.
-These isolated kernel gains do not establish whole-page parity.
-
-Measurements, checkpoint hashes, ablations and reproduction instructions are in
-`zig/pkg/inference/scripts/lightonocr3/results/kernel_parity_m4_max/README.md`.
-The final follow-up runs reached 1.58/0.49/3.71 pages/s for 0.8B/4B/Florence,
-versus refreshed references of 2.99/0.85/5.12. Parity remains unfinished.
-These are successive runs on a busy machine with differing precision and
-Florence generation policies, not controlled paired comparisons.
-Three synthetic fixtures check output consistency; they do not establish OCR
-accuracy across real documents. Live-memory admission remains active, including
-for the successful 4B throughput runs.
-
-Kernel rollback switches are:
-
-- `TERMITE_METAL_DISABLE_QWEN35_FUSED_DECODE=1`
-- `TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP=1`
-- `TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE=1`
-- `TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE=1`
-- `TERMITE_METAL_DISABLE_LIGHTONOCR3_GQA_SPLIT=1`
-- `TERMITE_METAL_DISABLE_FLORENCE2_CHANNEL_REDUCTION=1`
-- `TERMITE_METAL_DISABLE_FLORENCE2_WINDOW_SOFTMAX=1`
-
-The concurrency runner exposes matching ablation arguments. Its experimental
-`--prefill-sg-attention` selects the existing F16-tiled prefill kernel;
-`--bf16-prefill-inputs` rounds only bulk projection inputs (32 or more rows),
-while preserving the small-row F32 decode kernels. These options are opt-in;
-validate throughput and output on representative documents before selecting them.
-
-On qualified M4 hardware, Florence readers collect compatible pages for up to
-5 ms before acquiring the provider. A full cohort executes immediately.
-`ANTFLY_FLORENCE2_BATCH_WAIT_US=0` restores the configured generic collection
-window (normally 200 µs); explicit reader overrides are capped at 20 ms.
-This adds a small bounded wait to sparse requests and reduces underfilled
-cohorts under concurrent load. `benchmark_concurrency.py --florence-batch-wait-us`
-controls this independently of the LightOn window. `--profile-reader` enables
-reader phase logs in the opt-in checkpoint test.
-
-### Projection and encoder follow-up
-
-The next M4 Max kernel pass adds split-K down projections using existing
-frame-owned scratch, narrower four-row gate/up and QKV tiles, and vectorized
-prefill convolution. F32 projection activations, accumulation and outputs are
-preserved. Large qualified F16 encoder projections, including Florence's
-vision/BART shapes, use TensorOps with fused bias and retain MPS fallbacks.
-
-In the earlier separate-process M4 Max sweep, 29 of 30 representative
-projection cases measured within 20% of MLX or faster. The paired follow-up
-below provides stronger evidence and exposes additional cache-sensitive gaps. This excludes the vocabulary head and does not establish
-whole-reader parity. The final Florence repeat reached 4.63 pages/s against
-4.68 for MLX-VLM; native uses Q4_K weights with F16 encoder mirrors while the
-reference uses original FP16 weights and a different generation policy.
-LightOn remains behind: opt-in residency runs reached 1.31/0.44 pages/s for
-0.8B/4B against 2.72/0.76 for vLLM Metal. Successive runs under uncontrolled
-machine load are exploratory comparisons. The earlier projection-only
-ablations did not establish page-throughput gains.
-
-`TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY=1`, set before preparing the
-model, wires already-admitted dense weights without copying them. It is off
-by default, bounded to 12 GiB and 32 residency sets, and releases cleared slots
-and runtime allocations. The benchmark exposes `--weight-residency`. Existing
-memory admission still applies; qualify this option under your workload's
-memory pressure before selecting it.
-
-Additional rollback switches are
-`TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT=1`,
-`TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE=1`,
-`TERMITE_METAL_DISABLE_QWEN35_PREFILL_CONV_VEC4=1`, and
-`TERMITE_METAL_DISABLE_F16_ENCODER_MPP=1`.
-Full measurements, negative ablations, precision differences, source/binary
-hashes and 73 passing focused GPU tests are retained in
-`zig/pkg/inference/scripts/lightonocr3/results/projection_parity_m4_max/README.md`.
-
-### Recurrent prefill and cohort kernel follow-up
-
-The next pass fuses small-cohort gate/up plus SiLU × up, distributes recurrent
-prefill across four value columns per SIMD group, and retains wide normalization
-inputs in registers across the F32 reduction. It also uses narrower split-K tiles
-for qualified four-row projections and a more parallel single-token 0.8B down
-projection. Existing frame-owned scratch is reused. Projection activations,
-accumulation, outputs and recurrent state retain F32 precision.
-
-A new regression test invokes the Zig batch gate/up wrapper: an earlier guard
-rejected small batches despite successful direct C kernel tests. The final
-runtime removes that guard and delegates qualification to the C selector.
-
-A stronger paired benchmark alternates native and MLX in one process, reverses
-trial order, checks every output and records every sample. In the final resident
-sweep, 38 of 43 cases are within 20% of MLX or faster; five remain 22–34% slower.
-The 25-case cold-cache sweep puts every case within 20%. Recurrent prefill is
-1.6–1.8× faster than MLX on the two tested head counts; F32 normalization is at
-parity or faster. Native projection/recurrent tensors remain F32 while MLX uses
-BF16 storage/output, so this is not fully precision-matched operator parity.
-These paired results supersede the earlier separate-process projection summary
-as the stronger evidence; cache effects materially change small-matrix results.
-
-On the same shared machine, final 16-page reader runs measured 1.079/0.339
-pages/s for native LightOn 0.8B/4B versus refreshed vLLM results of 2.553/0.647.
-New-feature rollbacks measured 1.001/0.337: 0.8B improved in this run, while 4B
-was effectively tied. Florence measured 3.546 versus 3.849 for refreshed MLX-VLM.
-These successive runs remain sensitive to machine load. Whole-reader LightOn
-parity is unfinished; cohorts averaged about 3.5 active pages out of eight as
-short pages finished. Continuous refill and batched vision/prefill remain open.
-
-Additional rollback switches are
-`TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_GATE_UP=1`,
-`TERMITE_METAL_DISABLE_QWEN35_PREFILL_COLUMNS=1`,
-`TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_NORM=1`,
-`TERMITE_METAL_DISABLE_LIGHTONOCR3_SINGLE_DOWN_TILE=1`, and
-`TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_SPLIT=1`.
-The concurrency benchmark exposes corresponding `--disable-*` switches.
-Final reader measurements, numerical checks, build provenance, and the rejected
-candidates are retained in
-`zig/pkg/inference/scripts/lightonocr3/results/kernel_saturation_m4_max/README.md`.
+Current measurements, source/binary manifests, numerical checks, failed
+admission attempts and rejected candidates are retained in
+`zig/pkg/inference/scripts/lightonocr3/results/throughput_refill_m4_max/README.md`.
+Earlier rounds remain archived under `kernel_saturation_m4_max`,
+`projection_parity_m4_max` and `concurrent_readers_m4_max` in the same results
+folder. Installed vLLM Metal lacks a Florence adapter, so the Florence reference
+uses MLX-VLM's supported serial path; its batch-eight attempt failed in that
+adapter and is recorded separately.

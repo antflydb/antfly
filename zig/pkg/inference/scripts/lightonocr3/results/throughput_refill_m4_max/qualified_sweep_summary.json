@@ -1,0 +1,201 @@
+{
+  "scope": "Selected primitive shapes; median and mean latencies reported separately. Not whole-model or all-operator parity.",
+  "sweeps": [
+    {
+      "report": "tail_qualified_all_rows_resident.json",
+      "report_sha256": "11cb1d543a017e994736477a130144be010b2a7f5aa631fd938571ade3d1ad35",
+      "cases": 86,
+      "median_within_20_percent": 75,
+      "mean_within_20_percent": 74,
+      "median_gaps": [
+        {
+          "operation": "projection",
+          "rows": 2,
+          "in": 1024,
+          "out": 6144,
+          "median_native_over_mlx": 1.2228032748278777,
+          "native_over_mlx": 1.2059782209407968
+        },
+        {
+          "operation": "projection",
+          "rows": 2,
+          "in": 1024,
+          "out": 3584,
+          "median_native_over_mlx": 1.2205682361157055,
+          "native_over_mlx": 1.2258965932323214
+        },
+        {
+          "operation": "projection",
+          "rows": 3,
+          "in": 1024,
+          "out": 3584,
+          "median_native_over_mlx": 1.295837085267022,
+          "native_over_mlx": 1.2692750797589507
+        },
+        {
+          "operation": "projection",
+          "rows": 4,
+          "in": 3584,
+          "out": 1024,
+          "median_native_over_mlx": 1.2454582390156133,
+          "native_over_mlx": 1.2822590093594006
+        },
+        {
+          "operation": "projection",
+          "rows": 6,
+          "in": 3584,
+          "out": 1024,
+          "median_native_over_mlx": 1.3374138512699407,
+          "native_over_mlx": 1.3363510994401353
+        },
+        {
+          "operation": "projection",
+          "rows": 2,
+          "in": 2560,
+          "out": 8192,
+          "median_native_over_mlx": 1.4005420408163265,
+          "native_over_mlx": 1.4653087618921987
+        },
+        {
+          "operation": "projection",
+          "rows": 2,
+          "in": 2560,
+          "out": 9216,
+          "median_native_over_mlx": 1.231955952509057,
+          "native_over_mlx": 1.2088024274868423
+        },
+        {
+          "operation": "projection",
+          "rows": 3,
+          "in": 9216,
+          "out": 2560,
+          "median_native_over_mlx": 1.2083877278790573,
+          "native_over_mlx": 1.209068149893248
+        },
+        {
+          "operation": "gate_up",
+          "rows": 2,
+          "in": 1024,
+          "out": 3584,
+          "median_native_over_mlx": 1.4139495587959197,
+          "native_over_mlx": 1.1289808054367028
+        },
+        {
+          "operation": "gate_up",
+          "rows": 3,
+          "in": 1024,
+          "out": 3584,
+          "median_native_over_mlx": 1.3610048219007622,
+          "native_over_mlx": 1.123313083498778
+        },
+        {
+          "operation": "gate_up",
+          "rows": 2,
+          "in": 2560,
+          "out": 9216,
+          "median_native_over_mlx": 1.2526557104728981,
+          "native_over_mlx": 1.2186959407379447
+        }
+      ],
+      "median_at_least_as_fast_as_mlx": 40
+    },
+    {
+      "report": "tail_qualified_all_rows_cold64.json",
+      "report_sha256": "309f31a0fa9ad8472feadaf2b1e51d16a636e8398018b29c4f954be5488dfe7d",
+      "cases": 86,
+      "median_within_20_percent": 75,
+      "mean_within_20_percent": 73,
+      "median_gaps": [
+        {
+          "operation": "projection",
+          "rows": 3,
+          "in": 1024,
+          "out": 6144,
+          "median_native_over_mlx": 1.251249429234455,
+          "native_over_mlx": 1.2547792251041925
+        },
+        {
+          "operation": "projection",
+          "rows": 3,
+          "in": 1024,
+          "out": 3584,
+          "median_native_over_mlx": 1.2289867374005303,
+          "native_over_mlx": 1.229300077225705
+        },
+        {
+          "operation": "projection",
+          "rows": 4,
+          "in": 1024,
+          "out": 3584,
+          "median_native_over_mlx": 1.2164039906223796,
+          "native_over_mlx": 1.1533252420266842
+        },
+        {
+          "operation": "projection",
+          "rows": 4,
+          "in": 3584,
+          "out": 1024,
+          "median_native_over_mlx": 1.2340818475240347,
+          "native_over_mlx": 1.2811027291045358
+        },
+        {
+          "operation": "projection",
+          "rows": 6,
+          "in": 3584,
+          "out": 1024,
+          "median_native_over_mlx": 1.357636543158551,
+          "native_over_mlx": 1.3395398802416087
+        },
+        {
+          "operation": "projection",
+          "rows": 2,
+          "in": 2560,
+          "out": 8192,
+          "median_native_over_mlx": 1.3561158061949588,
+          "native_over_mlx": 1.4452814274964325
+        },
+        {
+          "operation": "projection",
+          "rows": 3,
+          "in": 2560,
+          "out": 8192,
+          "median_native_over_mlx": 1.2552311557788944,
+          "native_over_mlx": 1.2657623628669417
+        },
+        {
+          "operation": "projection",
+          "rows": 3,
+          "in": 2560,
+          "out": 9216,
+          "median_native_over_mlx": 1.2065070153830744,
+          "native_over_mlx": 1.2652479622276245
+        },
+        {
+          "operation": "projection",
+          "rows": 3,
+          "in": 9216,
+          "out": 2560,
+          "median_native_over_mlx": 1.2439166388887624,
+          "native_over_mlx": 1.208368287779946
+        },
+        {
+          "operation": "gate_up",
+          "rows": 2,
+          "in": 2560,
+          "out": 9216,
+          "median_native_over_mlx": 1.2390488094109933,
+          "native_over_mlx": 1.3221238878931547
+        },
+        {
+          "operation": "gate_up",
+          "rows": 3,
+          "in": 2560,
+          "out": 9216,
+          "median_native_over_mlx": 1.2186239285691893,
+          "native_over_mlx": 1.1580090666078762
+        }
+      ],
+      "median_at_least_as_fast_as_mlx": 34
+    }
+  ]
+}

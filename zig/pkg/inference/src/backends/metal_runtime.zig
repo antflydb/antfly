@@ -46992,7 +46992,7 @@ test "LightOnOCR3 batched gate up wrapper reaches qualified device kernel" {
     termite_metal_decode_runtime_set_lightonocr3_projections(runtime, 1);
     const allocator = std.testing.allocator;
     const Case = struct { rows: usize, hidden: usize, intermediate: usize };
-    for ([_]Case{ .{ .rows = 8, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 4, .hidden = 2560, .intermediate = 9216 } }) |case| {
+    for ([_]Case{ .{ .rows = 2, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 3, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 4, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 2, .hidden = 2560, .intermediate = 9216 }, .{ .rows = 3, .hidden = 2560, .intermediate = 9216 }, .{ .rows = 5, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 6, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 8, .hidden = 1024, .intermediate = 3584 }, .{ .rows = 4, .hidden = 2560, .intermediate = 9216 } }) |case| {
         const weights = try allocator.alloc(u16, case.hidden * case.intermediate);
         defer allocator.free(weights);
         const bias = try allocator.alloc(f32, case.intermediate);
@@ -47004,12 +47004,20 @@ test "LightOnOCR3 batched gate up wrapper reaches qualified device kernel" {
         @memset(weights, 0);
         for (0..case.intermediate) |col| weights[col * case.hidden + (col + 1) % case.hidden] = 0x3f00;
         try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_bf16(runtime, 1, std.mem.sliceAsBytes(weights).ptr, weights.len * 2, bias.ptr, case.hidden, case.intermediate));
-        if (termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, case.rows, case.hidden, case.intermediate) == 0) return error.SkipZigTest;
         const input = try allocator.alloc(f32, case.rows * case.hidden);
         defer allocator.free(input);
         for (input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 97)) - 48)) * 0.01;
         var device_input = try testDeviceTensorFromSlice(runtime, input, &.{ @intCast(case.rows), @intCast(case.hidden) });
         defer device_input.deinit();
+        var frame = false;
+        if ((case.hidden == 1024 and case.rows < 5) or (case.hidden == 2560 and case.rows < 4)) {
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_begin_frame(runtime));
+            frame = true;
+        }
+        defer if (frame) {
+            _ = termite_metal_decode_runtime_cancel_frame(runtime);
+        };
+        try std.testing.expect(termite_metal_decode_runtime_can_apply_bf16_gate_up(runtime, 0, 1, case.rows, case.hidden, case.intermediate) != 0);
         var output = (try decoderRuntimeTryApplyBf16GateUp(&provider, .{
             .gate_slot = @as(usize, 0),
             .up_slot = @as(usize, 1),
@@ -47019,6 +47027,11 @@ test "LightOnOCR3 batched gate up wrapper reaches qualified device kernel" {
             .activation = ops.DecoderRuntimeActivationKind.silu,
         })) orelse return error.UnexpectedNull;
         defer output.deinit();
+        if (frame) {
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_submit_frame(runtime));
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_wait_frame(runtime));
+            frame = false;
+        }
         const actual = try tensorHostSlice(&output);
         try std.testing.expectEqual(case.rows * case.intermediate, actual.len);
         for (0..case.rows) |row| for (0..case.intermediate) |col| {

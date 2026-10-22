@@ -1,0 +1,52 @@
+{
+  "scope": "Cache-enabled experimental reader logs. Counters include warmup; no counters means reuse was not demonstrated. Prototype removed after no throughput benefit.",
+  "runs": [
+    {
+      "model": "08",
+      "log": "native_08_binding_on/lighton08-batch-c8.txt",
+      "original_log_sha256": "3e2d14752de82016a1157c9a591a8c230a8b99b884fd7d43156398fb4ef3f844",
+      "flag_enabled": true,
+      "observed_model_cache_reuse": true,
+      "counters_including_untimed_warmup": [
+        {
+          "initial_entries": 0,
+          "entries": 4,
+          "bytes": 16842752,
+          "hits": 84
+        },
+        {
+          "initial_entries": 4,
+          "entries": 4,
+          "bytes": 16842752,
+          "hits": 172
+        },
+        {
+          "initial_entries": 4,
+          "entries": 4,
+          "bytes": 16842752,
+          "hits": 980
+        },
+        {
+          "initial_entries": 4,
+          "entries": 4,
+          "bytes": 16842752,
+          "hits": 1232
+        },
+        {
+          "initial_entries": 4,
+          "entries": 4,
+          "bytes": 16842752,
+          "hits": 2460
+        }
+      ]
+    },
+    {
+      "model": "4b",
+      "log": "native_4b_binding_on/lighton4b-batch-c8.txt",
+      "original_log_sha256": "62f9bf957d7390c11419509eee99eaccdae3c4ad4b50a8160b438f31dc7271ec",
+      "flag_enabled": true,
+      "observed_model_cache_reuse": false,
+      "counters_including_untimed_warmup": []
+    }
+  ]
+}

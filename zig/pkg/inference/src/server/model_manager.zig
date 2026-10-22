@@ -2556,6 +2556,7 @@ pub const LoadedModel = struct {
     /// Queue OCR cohorts before taking their memory leases. Waiting groups
     /// must not reserve decoder state that only one GPU cohort can use.
     native_reader_execution_lane: execution_control_mod.ExecutionLane = .{},
+    native_reader_stream: @import("reader_execution_pool.zig").Pool = .{},
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
     sp_tok: ?*sentencepiece.Processor,
@@ -3361,6 +3362,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn deinit(self: *LoadedModel) void {
+        std.debug.assert(self.native_reader_stream.context == null and self.native_reader_stream.users == 0);
         if (self.embedding_prototype_cache) |cache| self.allocator.destroy(cache);
         if (self.embedding_prototype_cache_lease) |*lease| lease.release();
         if (self.projector_store) |store| {

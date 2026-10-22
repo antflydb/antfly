@@ -26697,8 +26697,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn gatedFfnNoBiasOp(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const lighton = self.lightonocr3_projections and request.rows >= 1 and request.rows <= 8 and
-            ((request.hidden_size == 2560 and request.intermediate_size == 9216 and (request.rows == 1 or request.rows >= 4)) or
-                (request.hidden_size == 1024 and request.intermediate_size == 3584 and (request.rows == 1 or request.rows >= 7))) and request.activation == .silu;
+            ((request.hidden_size == 2560 and request.intermediate_size == 9216) or
+                (request.hidden_size == 1024 and request.intermediate_size == 3584)) and request.activation == .silu;
         if (!lighton and (self.data.a4b_inference == null or
             request.rows != 1 or
             !a4bHighMemoryFeatureEnabled(

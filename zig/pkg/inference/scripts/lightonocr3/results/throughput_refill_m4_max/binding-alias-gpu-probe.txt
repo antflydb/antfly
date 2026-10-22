@@ -1,0 +1,2 @@
+1/118 ops.metal_compute.test.LightOnOCR3 immutable BF16 bindings survive requests and release source pins on unload...OK
+1 selected; 1 passed; 0 skipped.

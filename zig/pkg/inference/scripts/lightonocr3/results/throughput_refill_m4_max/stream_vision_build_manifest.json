@@ -1,0 +1,16 @@
+{
+  "runtime_commit": "b13fcdb53c4b62ff7045d4131be04316cf734d7c",
+  "runtime_source_diff_sha256": "ee52f0e4f956e34413ac8775c1d9df2880e36a296d30a67c7691ee7a2973d647",
+  "binary_sha256": "6f0e3454c6fc0f739f9b9e3e2b82cd0dcc9b71677639b73f6eb8f7b2a866de32",
+  "runtime_files_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "7accf7f3b847f98b18734e58fde1f4517d070fa12aeab69126aaf9a3abbabc62",
+    "zig/pkg/inference/src/backends/metal_runtime.zig": "7a5414db890b19ae42d7a9ebfde4470fec5356ae36d41bf0a0580c532881839b",
+    "zig/pkg/inference/src/architectures/gpt.zig": "3a8efcd3be5a05991adb4a11beab3815a9827131c623ca662b6a27d9e81e03d4",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "d2d28f33c1471198ba304565e8588b488c529c37c716c08b9a8312522338b6cb",
+    "zig/pkg/inference/src/server/server.zig": "7a28e7cbca674631b0f429bf39acd0ab3c0b93e54ca5d0bd542b07691042acbd",
+    "zig/pkg/inference/src/server/model_manager.zig": "b005bcdea0a92419fa61d7db09786344c22a0b8b1a40ae1ad99297bfe1b744fc",
+    "zig/pkg/inference/src/server/reader_execution_pool.zig": "81a015852ae7da54a827c56010bfab61d70945fa4423722a6778f3ea65437896",
+    "zig/pkg/inference/src/architectures/qwen3vl_projector.zig": "4ddc043823482aa2ee028698c510dd3b7d09526812cfb0a1d097345ee9453ec2",
+    "zig/pkg/inference/src/pipelines/generation.zig": "507a2fa93ae96ca514f783bcd3cb4929694aa5280e4b9f54809680f0f229f91d"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "scope": "Exact runner/bridge bytes used for the final 86-case paired sweeps. Restore at the original paths to reproduce; runtime source is identified separately.",
+  "files": [
+    {
+      "path": "benchmark_metal_pair.py",
+      "original_path": "zig/pkg/inference/scripts/lightonocr3/benchmark_metal_pair.py",
+      "sha256": "919bb025dbe4a370f74f37feb211bd8ad91301cba2580ccc59c57d770c5c7141"
+    },
+    {
+      "path": "metal_pair_benchmark.m",
+      "original_path": "zig/pkg/inference/scripts/lightonocr3/metal_pair_benchmark.m",
+      "sha256": "8730cecf205b4d1311328b11a8c97b6fb9308bd5f7f771f3702ba63831c7405e"
+    }
+  ]
+}

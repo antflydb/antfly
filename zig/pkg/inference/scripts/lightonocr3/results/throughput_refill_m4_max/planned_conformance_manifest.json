@@ -1,0 +1,5 @@
+{
+  "zig/pkg/inference/src/backends/metal_kernels.m": "815d50403f6a89539a8ca833f80a8e95ef4dded6f3823c97d2c6cce0adb0f277",
+  "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "96970d9b6c3f76e6876f4ff2a163ffde25a1b366d321a24b58f7a08b08f411f1",
+  ".venv-lighton-vllm-metal/bin/check-planned-transition": "0b07681f9dc2117a95940551c9119cfe5347d01801f9ba0b1c2847f225db2d0e"
+}
