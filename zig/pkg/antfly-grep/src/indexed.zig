@@ -209,6 +209,12 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 scope.final(&scope_digest);
                 doc.cache_scope = scope_digest;
             }
+            var resolver: AssetResolver(@TypeOf(search)) = .{ .search = search, .http = http, .config = config, .table = table, .url = url, .id = id, .revision = doc.provenance.revision.?, .filter = user_filter };
+            if (search.options.media == .images) {
+                const units = document.field(value, "evidence");
+                if (units) |raw| doc.evidence = try @import("antfly_source_evidence").parseUnits(a, raw);
+                doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load };
+            }
             search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
         }
         if (!has_next) return;
@@ -419,7 +425,7 @@ fn contentQuery(a: A, search: anytype, table: Table) !?std.json.Value {
     return try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
 }
 fn canPrune(o: *const @import("options.zig").Options) bool {
-    return !((o.ask != null and (o.patterns.items.len == 0 or o.jev_mode)) or o.files or o.invert or o.files_without_match or o.include_zero or o.passthru or o.json or o.stats or o.null_data or (!std.mem.eql(u8, o.encoding, "auto") and !std.mem.eql(u8, o.encoding, "none")));
+    return o.media == .text and !((o.ask != null and (o.patterns.items.len == 0 or o.jev_mode)) or o.files or o.invert or o.files_without_match or o.include_zero or o.passthru or o.json or o.stats or o.null_data or (!std.mem.eql(u8, o.encoding, "auto") and !std.mem.eql(u8, o.encoding, "none")));
 }
 fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.Value) !?std.json.Value {
     const index = table.candidate_index orelse return user_filter;
@@ -468,7 +474,7 @@ fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.V
 }
 
 fn metadataListing(o: *const @import("options.zig").Options) bool {
-    return o.files and !o.json and !o.stats and o.max_file_bytes == std.math.maxInt(usize) and !o.skip_oversize;
+    return o.media == .images or (o.files and !o.json and !o.stats and o.max_file_bytes == std.math.maxInt(usize) and !o.skip_oversize);
 }
 fn projectionFields(a: A, o: *const @import("options.zig").Options, field: []const u8) ![]const []const u8 {
     // Project the complete v1 contract, not arbitrary sibling payloads. Keep
@@ -478,6 +484,7 @@ fn projectionFields(a: A, o: *const @import("options.zig").Options, field: []con
     for ([_][]const u8{ "version", "path", "uri", "revision", "indexed_at", "permissions", "modified_at", "created_at", "accessed_at" }) |suffix|
         try fields.append(a, try std.fmt.allocPrint(a, "{s}.{s}", .{ field, suffix }));
     if (!metadataListing(o)) try fields.append(a, try std.fmt.allocPrint(a, "{s}.content", .{field}));
+    if (o.media == .images) try fields.append(a, try std.fmt.allocPrint(a, "{s}.evidence", .{field}));
     if (o.json or o.ask != null or o.stats) for ([_][]const u8{ "metadata", "regions" }) |suffix| {
         try fields.append(a, try std.fmt.allocPrint(a, "{s}.{s}", .{ field, suffix }));
     };
@@ -525,4 +532,56 @@ test "prefetch completion preserves errors and transfers page ownership" {
     fetch.result = &page;
     try std.testing.expect(try fetch.take() == &page);
     try std.testing.expect(fetch.result == null);
+}
+
+/// Existing authenticated query API, exact parent ID, narrowly selected fields.
+/// Every load is a fresh authorization check, even for warmed decision scores.
+fn AssetResolver(comptime SearchType: type) type {
+    return struct {
+        search: SearchType,
+        http: *httpx.Client,
+        config: Config,
+        table: Table,
+        url: []const u8,
+        id: []const u8,
+        revision: []const u8,
+        filter: ?std.json.Value,
+        fn load(raw: *anyopaque, a: A, unit: @import("antfly_source_evidence").Unit) !@import("antfly_source_evidence").Image {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.search.stopped()) return error.Canceled;
+            try unit.validate();
+            if (unit.asset.byte_length > self.search.options.max_image_bytes) return error.ImageByteBudgetExceeded;
+            const fields = [_][]const u8{
+                try std.fmt.allocPrint(a, "{s}.revision", .{self.table.document_field}),
+                try std.fmt.allocPrint(a, "{s}.permissions", .{self.table.document_field}),
+                unit.asset.field,
+            };
+            const ids = try std.json.Stringify.valueAlloc(a, .{ .ids = .{self.id} }, .{});
+            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = &fields };
+            defer self.search.summary.index_requests += fetch.summary.index_requests;
+            const page = try fetch.load(.{ .cursor = null, .snapshot = null, .page_size = 1 });
+            defer page.deinit(self.search.a);
+            const responses = document.field(page.parsed.value, "responses") orelse return error.InvalidIndexResponse;
+            if (responses != .array or responses.array.items.len != 1) return error.InvalidIndexResponse;
+            const result = responses.array.items[0];
+            const status = document.integer(document.field(result, "status")) orelse return error.InvalidIndexResponse;
+            if (status == 401 or status == 403) return error.IndexAuthorizationFailed;
+            if (status < 200 or status >= 300 or document.field(result, "error") != null and document.field(result, "error").? != .null) return error.IndexQueryFailed;
+            const hits = document.field(result, "hits") orelse return error.InvalidIndexResponse;
+            const list = document.field(hits, "hits") orelse return error.InvalidIndexResponse;
+            if (list != .array or list.array.items.len != 1) return error.IndexAuthorizationFailed;
+            const hit = list.array.items[0];
+            if (!std.mem.eql(u8, try document.string(hit, "_id"), self.id)) return error.InvalidEvidenceParent;
+            const source = document.field(hit, "_source") orelse return error.InvalidIndexResponse;
+            const parent = document.at(source, self.table.document_field) orelse return error.InvalidIndexResponse;
+            if (!document.allowed(parent, self.config.principals)) return error.IndexAuthorizationFailed;
+            if (!std.mem.eql(u8, try document.string(parent, "revision"), self.revision)) return error.EvidenceRevisionChanged;
+            const payload = document.at(source, unit.asset.field) orelse return error.MissingEvidenceAsset;
+            if (payload != .string) return error.InvalidEvidenceAsset;
+            var image = try @import("antfly_source_evidence").Image.fromDataUrl(a, payload.string, unit.asset, self.search.options.max_image_bytes, self.search.options.max_image_pixels);
+            // Transfer only one bounded inline image from the temporary response.
+            image.data_url = try a.dupe(u8, image.data_url);
+            return image;
+        }
+    };
 }

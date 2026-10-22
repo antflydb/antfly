@@ -152,6 +152,8 @@ SOURCE_MODULES = {
     "antfly_embedded_db": ("zig/pkg/antfly-embedded/src/engine/db.zig",),
     "antfly_embeddings": ("zig/lib/embeddings/src/mod.zig",),
     "antfly_predicate_client": ("zig/lib/decisions/predicate_client.zig",),
+    "antfly_decision_evidence": ("zig/lib/decisions/evidence.zig",),
+    "antfly_source_evidence": ("zig/lib/source_evidence/root.zig",),
     "antfly_decisions": ("zig/lib/decisions/root.zig",),
     "antfly_structured": ("zig/lib/structured/root.zig",),
     "antfly_decision_openapi": (

@@ -34,6 +34,13 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     const compress = b.createModule(.{ .root_source_file = b.path("lib/compress/src/mod.zig"), .target = target, .optimize = optimize });
     compress.addImport("antfly_hash", hash);
     lib.addImport("antfly_predicate_client", b.createModule(.{ .root_source_file = b.path("lib/decisions/predicate_client.zig"), .target = target, .optimize = optimize }));
+    const image = @import("../../lib/image/build_support.zig").createModule(b, b.path("lib/image"), target, optimize, hash);
+    const decision_evidence = b.createModule(.{ .root_source_file = b.path("lib/decisions/evidence.zig"), .target = target, .optimize = optimize });
+    const source_evidence = b.createModule(.{ .root_source_file = b.path("lib/source_evidence/root.zig"), .target = target, .optimize = optimize });
+    source_evidence.addImport("antfly_decision_evidence", decision_evidence);
+    source_evidence.addImport("antfly_image", image);
+    lib.addImport("antfly_source_evidence", source_evidence);
+    lib.addImport("antfly_decision_evidence", decision_evidence);
     lib.addImport("antfly_hash", hash);
     lib.addImport("antfly_compress", compress);
     const syntax = b.createModule(.{ .root_source_file = b.path("lib/syntax/src/root.zig"), .target = target, .optimize = optimize });
@@ -106,12 +113,18 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     bench.addPassthruArgs();
     b.step("grep-bench", "Benchmark grep throughput and peak RSS against optional ripgrep").dependOn(&bench.step);
     const tests = b.addTest(.{ .name = "antfly-grep-unit-test", .root_module = lib });
-    b.step("grep-unit-build", "Build portable package unit tests without executing them").dependOn(&b.addInstallArtifact(tests, .{}).step);
+    const unit_build = b.step("grep-unit-build", "Build portable package unit tests without executing them");
+    unit_build.dependOn(&b.addInstallArtifact(tests, .{}).step);
     const test_run = b.addRunArtifact(tests);
     const test_step = b.step("grep-test", "Run native grep unit and integration tests");
     const unit_step = b.step("grep-unit", "Run native grep, regex, grammar and dictionary unit tests");
     test_step.dependOn(unit_step);
     unit_step.dependOn(&test_run.step);
+    for ([_]*std.Build.Module{ decision_evidence, source_evidence }, [_][]const u8{ "antfly-grep-decision-evidence-test", "antfly-grep-source-evidence-test" }) |module, name| {
+        const evidence_tests = b.addTest(.{ .name = name, .root_module = module });
+        unit_step.dependOn(&b.addRunArtifact(evidence_tests).step);
+        unit_build.dependOn(&b.addInstallArtifact(evidence_tests, .{}).step);
+    }
     const predicate_tests = b.addTest(.{ .root_module = lib.import_table.get("antfly_predicate_client").? });
     unit_step.dependOn(&b.addRunArtifact(predicate_tests).step);
     const search_mod = b.createModule(.{ .root_source_file = b.path("lib/regex/src/search.zig"), .target = target, .optimize = optimize, .link_libc = true });

@@ -176,6 +176,9 @@ pub const Options = struct {
     max_count: usize = std.math.maxInt(usize),
     max_file_bytes: usize = std.math.maxInt(usize),
     ask: ?[]const u8 = null,
+    media: enum { text, images } = .text,
+    max_image_bytes: usize = 512 * 1024,
+    max_image_pixels: u64 = 16 * 1024 * 1024,
     endpoint: []const u8 = "http://127.0.0.1:8080/ai/v1/decisions",
     model: ?[]const u8 = null,
     backend: enum { http, local } = .http,
@@ -239,7 +242,7 @@ pub const Options = struct {
         if (self.backend != .local and self.decision_transport == .single and self.decision_context == .shared_v1) return error.SharedContextRequiresAntflyBatch;
     }
     pub fn decisionBatchSize(self: *const Options) usize {
-        return if (self.backend == .local or self.decision_transport == .antfly_batch) self.batch_size else 1;
+        return if (self.media != .text) 1 else if (self.backend == .local or self.decision_transport == .antfly_batch) self.batch_size else 1;
     }
     pub fn selectProvider(self: *Options, name: []const u8) !void {
         const profiles = @import("providers.zig");
@@ -636,6 +639,12 @@ pub const Options = struct {
                     if (self.retries > 10) return error.InvalidNumber;
                 } else if (std.mem.eql(u8, name, "--engine")) {
                     self.engine = std.meta.stringToEnum(@TypeOf(self.engine), value) orelse return error.InvalidEngine;
+                } else if (std.mem.eql(u8, name, "--media")) {
+                    self.media = std.meta.stringToEnum(@TypeOf(self.media), value) orelse return error.UnsupportedSearchMedia;
+                } else if (std.mem.eql(u8, name, "--max-image-bytes")) {
+                    self.max_image_bytes = try size(value);
+                } else if (std.mem.eql(u8, name, "--max-image-pixels")) {
+                    self.max_image_pixels = try number(value);
                 } else if (std.mem.eql(u8, name, "--provider")) {
                     const model = self.model;
                     const endpoint = self.endpoint;
@@ -816,6 +825,11 @@ pub const Options = struct {
         try self.paths.appendSlice(a, positional.items);
         if (self.help or self.version or self.generate != null or self.pcre2_version) return;
         if (self.ask != null and self.model == null) return error.DecisionModelRequired;
+        if (self.media != .text) {
+            if (self.ask == null) return error.MediaRequiresDecision;
+            if (self.backend == .local or self.decision_context != .legacy or self.pre != null or self.patterns.items.len > 0 or self.pattern_files.items.len > 0 or self.triage or self.workspace_watch) return error.ConflictingMediaOptions;
+            if (self.max_image_bytes == 0 or self.max_image_bytes > 768 * 1024 or self.max_image_pixels == 0) return error.InvalidImageLimit;
+        }
         if (!std.math.isFinite(self.threshold) or self.threshold < 0 or self.threshold > 1 or self.chunk_lines == 0 or self.batch_size == 0 or self.batch_size > 128 or self.decision_batch_wait_ms > 1000 or self.timeout_ms == 0 or (self.max_file_bytes == 0 and !self.skip_oversize)) return error.InvalidNumber;
         if (self.cached_only and (self.ask == null or self.no_cache or self.cache_ttl_seconds == 0 or self.table_config != null or self.pre != null or self.hostname_bin != null)) return error.ConflictingCachedOnlyFlags;
         if (self.files and (self.patterns.items.len > 0 or self.ask != null)) return error.ConflictingFlags;

@@ -89,6 +89,8 @@ complete -c antfly-grep -l max-dictionary-size -r
 complete -c antfly-grep -l max-file-size -r
 complete -c antfly-grep -l max-files -r
 complete -c antfly-grep -l max-filesize -r
+complete -c antfly-grep -l max-image-bytes -r
+complete -c antfly-grep -l max-image-pixels -r
 complete -c antfly-grep -l max-index-documents -r
 complete -c antfly-grep -l max-output-bytes -r
 complete -c antfly-grep -l max-pending-output -r
@@ -97,6 +99,7 @@ complete -c antfly-grep -l max-requests -r -f -a 'unlimited'
 complete -c antfly-grep -l max-result-files -r
 complete -c antfly-grep -l max-source-bytes -r
 complete -c antfly-grep -l max-spill-bytes -r
+complete -c antfly-grep -l media -r -f -a 'text images'
 complete -c antfly-grep -l messages
 complete -c antfly-grep -l mmap
 complete -c antfly-grep -l model -r

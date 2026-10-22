@@ -91,6 +91,7 @@ const EvidenceView = struct {
 };
 const RenderRow = struct { raw: []const u8, length: usize, line: usize, offset: usize, matched: bool, probability: f64, independent: bool, gap: bool };
 const Candidate = struct {
+    rendered: ?[]const u8 = null,
     materialized: bool = true,
     a: Allocator,
     budget: @import("antfly_regex").Budget,
@@ -117,6 +118,7 @@ const Candidate = struct {
     }
 };
 const SavedCandidate = struct {
+    rendered: ?[]const u8 = null,
     materialized: bool = true,
     payload: ?*CachedPayload = null,
     path: []const u8,
@@ -622,6 +624,7 @@ pub const Search = struct {
         var phases = @import("workspace_profile.zig").Phases.init(self.io, "run");
         defer phases.finish();
         errdefer self.flushOutput() catch {};
+        if (self.options.media == .images and (self.hasStdinPath() or (self.options.paths.items.len == 0 and self.options.table_config == null and !(try std.Io.File.stdin().isTty(self.io))))) return error.MediaStdinUnsupported;
         const started = std.Io.Clock.awake.now(self.io);
         if (self.options.debug or self.options.trace) std.debug.print("antfly-grep: engine={s} threads={d} encoding={s} multiline={}\n", .{ @tagName(self.options.engine), if (self.options.files) self.options.jobs else self.fileJobs(), self.options.encoding, self.options.multiline });
         if (self.options.debug or self.options.trace) {
@@ -1719,7 +1722,9 @@ pub const Search = struct {
             local.summary.matches += 1;
         } else {
             if (self.options.ask == null and !self.options.multiline and !Limits.reserve(&self.limits.source_bytes, doc.content.len, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
-            local.processBytes(doc.path, doc.content) catch |err| try local.reportStagedError(doc.path, err);
+            if (self.options.media == .images) {
+                local.mediaDocument(doc) catch |err| try local.reportStagedError(doc.path, err);
+            } else local.processBytes(doc.path, doc.content) catch |err| try local.reportStagedError(doc.path, err);
             if (local.matcher.failure) |err| try local.reportStagedError(doc.path, err);
             local.jsonEnd(doc.path, .{}) catch |err| try local.reportStagedError(doc.path, err);
         }
@@ -1753,7 +1758,141 @@ pub const Search = struct {
         errdefer self.a.free(result);
         try self.tasks.append(self.a, .{ .path = path, .display = display, .filename = true, .prepared = true, .result = result, .score = local.best_probability, .timestamp = timestamp });
     }
+    fn readImage(self: *Search, path: []const u8, display: []const u8) !void {
+        const media = @import("antfly_source_evidence");
+        const extension = std.fs.path.extension(path);
+        var recognized = false;
+        for ([_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp" }) |ext| if (std.ascii.eqlIgnoreCase(extension, ext)) {
+            recognized = true;
+            break;
+        };
+        if (!recognized and !self.explicit_file) {
+            self.skipped();
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(extension, ".pdf")) return error.MediaRenderingRequired;
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(self.options.max_image_bytes));
+        const image = try media.Image.fromBytes(a, bytes, self.options.max_image_bytes, self.options.max_image_pixels);
+        const format = image.mime_type;
+        const digest = try a.dupe(u8, &std.fmt.bytesToHex(image.sha256, .lower));
+        const unit: media.Unit = .{ .id = "image", .kind = .image, .asset = .{ .field = "content", .mime_type = format, .sha256 = digest, .recipe = "original-v1", .byte_length = image.bytes } };
+        const Local = struct {
+            image: media.Image,
+            fn load(raw: *anyopaque, _: Allocator, _: media.Unit) !media.Image {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.image;
+            }
+        };
+        var source: Local = .{ .image = image };
+        const previous = self.provenance;
+        defer self.provenance = previous;
+        self.provenance.revision = digest;
+        try self.mediaDocument(.{ .path = display, .content = "", .provenance = self.provenance, .evidence = &.{unit}, .evidence_loader = .{ .ctx = &source, .load = Local.load } });
+    }
+    fn mediaDocument(self: *Search, doc: @import("document.zig").Document) !void {
+        if (doc.evidence.len == 0) {
+            self.skipped();
+            return;
+        }
+        const loader = doc.evidence_loader orelse return error.MissingEvidenceResolver;
+        self.summary.files += 1;
+        const previous_stage = self.decider.stage;
+        self.decider.stage = .target;
+        defer self.decider.stage = previous_stage;
+        var output: std.Io.Writer.Allocating = .init(self.a);
+        const previous_sink = self.sink;
+        var candidate: ?*Candidate = null;
+        var committed: usize = 0;
+        var selected: usize = 0;
+        if (self.ranking != null) {
+            const c = try self.a.create(Candidate);
+            c.* = .{ .a = self.a, .budget = .{ .backing = self.a, .limit = self.options.max_pending_output }, .arena = undefined };
+            c.arena = std.heap.ArenaAllocator.init(c.budget.allocator());
+            errdefer c.deinit();
+            c.path = try c.arena.allocator().dupe(u8, doc.path);
+            c.provenance = try retainedClone(@import("document.zig").Provenance, c.arena.allocator(), doc.provenance, 0);
+            c.before = self.file_before;
+            c.filename = self.render_filename;
+            c.ordinal = self.result_ordinal;
+            candidate = c;
+            output = .init(c.arena.allocator());
+            self.sink = &output.writer;
+        }
+        defer {
+            self.sink = previous_sink;
+            if (candidate) |c| {
+                if (selected > 0 and self.ranking.?.consider(self.best_probability, doc.path, self.result_ordinal)) {
+                    // The arena retains complete records only, including a
+                    // successfully evaluated prefix if a later unit failed.
+                    c.rendered = output.written()[0..committed];
+                    c.score = self.best_probability;
+                    self.deferred_candidate = c;
+                } else c.deinit();
+            } else output.deinit();
+        }
+        for (doc.evidence) |unit| {
+            if (self.stopped()) return;
+            if (selected >= @min(self.options.max_count, self.options.max_regions_per_file)) break;
+            self.summary.regions_considered += 1;
+            const limits = self.shared_limits orelse &self.limits;
+            if (!Limits.reserve(&limits.regions, 1, self.options.max_regions)) return error.RegionBudgetExceeded;
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            // Resolver authorization and immutable digest checks precede score
+            // cache access; a warm cache never grants access to private assets.
+            const image = try loader.load(loader.ctx, a, unit);
+            if (!Limits.reserve(&limits.source_bytes, image.bytes, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
+            self.summary.bytes += image.bytes;
+            const listing = try std.json.Stringify.valueAlloc(a, .{ .path = doc.path, .id = unit.id, .kind = unit.kind, .location = unit.location, .text = unit.text, .label = unit.label, .asset = unit.asset }, .{ .emit_null_optional_fields = false });
+            const prompt = try std.fmt.allocPrint(a, "TARGET visual evidence unit (image is authoritative; text is context):\n{s}", .{listing});
+            var scores: [1]f64 = undefined;
+            try self.decider.search(&.{.{ .id = unit.id, .input = prompt, .image = image }}, &scores);
+            self.summary.regions_evaluated += 1;
+            const score = scores[0];
+            if (score < 0 or ((score >= self.options.threshold) == self.options.invert)) continue;
+            selected += 1;
+            if (!self.options.files_without_match) self.summary.matches += 1;
+            self.summary.occurrences += 1;
+            self.best_probability = @max(self.best_probability, score);
+            if (selected == 1) self.summary.files_with_matches += 1;
+            if (self.options.quiet) {
+                self.stop = true;
+                return;
+            }
+            if (self.options.files_without_match) continue;
+            if (self.options.files_with_matches) {
+                try self.write(doc.path);
+                try self.write(if (self.options.null_paths) "\x00" else "\n");
+                committed = output.written().len;
+                return;
+            }
+            if (self.options.count or self.options.count_matches) continue;
+            if (self.options.json) {
+                try self.json(.{ .type = "evidence", .data = .{ .path = doc.path, .unit = unit.id, .kind = unit.kind, .location = unit.location, .label = unit.label, .sha256 = unit.asset.sha256, .recipe = unit.asset.recipe, .width = image.width, .height = image.height }, .probability = score, .scope = @tagName(unit.kind) });
+            } else {
+                const location = if (unit.location.page) |page| try std.fmt.allocPrint(a, "#page={d}", .{page}) else if (unit.location.slide) |slide| try std.fmt.allocPrint(a, "#slide={d}", .{slide}) else "";
+                const row = try std.fmt.allocPrint(a, "{s}{s}  probability={d:.3}  unit={s}\n", .{ doc.path, location, score, unit.id });
+                try self.write(row);
+            }
+            committed = output.written().len;
+        }
+        if (self.options.files_without_match and selected == 0) {
+            self.summary.matches += 1;
+            try self.write(doc.path);
+            try self.write(if (self.options.null_paths) "\x00" else "\n");
+        } else if ((self.options.count or self.options.count_matches) and (selected > 0 or self.options.include_zero)) {
+            const row = try std.fmt.allocPrint(self.a, "{s}:{d}\n", .{ doc.path, selected });
+            defer self.a.free(row);
+            try self.write(row);
+        }
+        committed = output.written().len;
+    }
     fn readFile(self: *Search, path_name: []const u8, display: []const u8) !void {
+        if (self.options.media == .images) return self.readImage(path_name, display);
         if (self.workspace_entry) |entry| {
             if (entry.bytes().len > self.options.max_file_bytes) {
                 if (self.options.skip_oversize) return;
@@ -2699,7 +2838,9 @@ pub const Search = struct {
             renderer.file_output_start = 0;
             renderer.output_bytes = 0;
             renderer.json_started = false;
-            if (c.view) |view| {
+            if (c.rendered) |rendered| {
+                try renderer.write(rendered);
+            } else if (c.view) |view| {
                 var arena = std.heap.ArenaAllocator.init(self.a);
                 defer arena.deinit();
                 renderer.renderEvidenceView(arena.allocator(), c.path, view) catch |err| return forward.failure orelse err;
@@ -3256,6 +3397,7 @@ pub const Search = struct {
         return !preview_rejected;
     }
     fn queryReuseKey(self: *Search) ?[32]u8 {
+        if (self.options.media != .text) return null;
         if (self.reuse == null or self.reuse_identity == null or !self.query_reuse_eligible or self.options.no_cache or self.options.cache_dir == null or self.options.cache_ttl_seconds == 0) return null;
         const generation = self.workspace_generation orelse return null;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});

@@ -112,7 +112,8 @@ and paired HTTP profiles; they do not imply a local CLI speedup over ripgrep.
 ## Common Decisions client and gateway ownership (2026-10-21)
 
 Grep speaks the public named-question Decisions contract. The common denominator
-is one textual `input`, a model, and predicate questions; multiple questions share
+is one `input` (text or ordered user messages containing text and images), a model,
+and predicate questions; multiple questions share
 one source serialization. The OpenAI profile uses its canonical `/v1/decisions`
 endpoint. Antfly's `/ai/v1/decisions` gateway owns provider routing, including Jev's
 private state/question protocol. Grep no longer carries provider-specific Jev
@@ -148,3 +149,146 @@ questions, bounded concurrency, warm-cache request elimination, refusal/abstenti
 malformed answers, and credential routing. These checks establish protocol and
 orchestration behavior, not live-provider relevance or token cost. The CLI's
 compatibility baseline is Decisions, not Chat Completions or Structured Outputs.
+
+
+## Multimodal source evidence and Cloud boundary (2026-10-21)
+
+PR [#1252](https://github.com/antflydb/antfly/pull/1252) supplies the common
+Decisions message contract. Grep uses it with `--media images --ask QUESTION`:
+one visual unit and its descriptive text per request, with all requested questions
+sharing that image upload. `--media text` remains the default. This is visual
+question evaluation, not a claim of OCR, object detection, or model relevance.
+
+### Versioned units and storage
+
+[Document v2](../../zig/pkg/antfly-grep/schema/document-v2.json) extends the
+existing source row without changing the query API. The table still declares just
+its logical `document_field`. The v1 text contract stays readable. V2 permits
+empty extracted content for image-only documents and an optional `evidence`
+manifest, with at most 4,096 uniquely named units per parent revision:
+
+```json
+{
+  "id": "slide-7",
+  "kind": "slide",
+  "location": {"slide": 7},
+  "text": "Optional slide transcript",
+  "label": "Checkout flow",
+  "asset": {
+    "field": "payloads.slide7",
+    "mime_type": "image/png",
+    "sha256": "<64 lowercase hex characters>",
+    "byte_length": 65536,
+    "recipe": "slides-render-150dpi-v1"
+  }
+}
+```
+
+Kinds are `image` (whole image), `page`, and `slide`; page/slide numbers are
+one-based. The asset field is an ordinary logical field **on the same parent
+row**, containing an inline image data URL. It is never a provider URL, arbitrary
+fetch target, private key, or cross-document reference. Parent content, manifest,
+image fields, permissions, and revision must be published atomically. A rendering
+recipe identifies all pixel-affecting settings and its version. The digest binds
+the actual materialized image bytes, independently of the source/export digest.
+Canonical `uri` identifies the source; it must not become a data URL or a signed
+materialization URL. The source revision binds provider revision and export
+identity. Metadata-only, move, export, render, and permission changes all need an
+explicit revision/publication policy.
+
+`zig/lib/source_evidence` owns native manifest validation and bounded encoded-image
+inspection. `zig/lib/decisions/evidence.zig` is the shared server/client message
+validator, replacing a server-private copy. DocsAF's `ToEvidenceRecord` builds
+v2 rows from a source document with explicit access metadata. Its optional
+`PreferProviderID` keeps Drive IDs stable across renames/moves, while retaining
+canonical URI separately from inline/private materialization URLs. The Drive
+source records provider version; connectors still own export and ACL completeness.
+The adapter does not render documents or infer public access from OAuth consent.
+
+### Retrieval, authorization and cost
+
+Grep first enumerates projected metadata/manifests through the existing ascending-ID
+snapshot query. It fetches each image separately with an ID-constrained projected
+query against the **current** parent row, retaining table filters, table token,
+and server row authorization. It checks parent identity, client permission
+intersection, captured revision, declared length/MIME/digest, actual encoded
+format, and image dimensions before any decision-cache lookup. Missing or denied
+rows fail; revision changes and corrupt assets fail explicitly. It neither
+restarts silently nor evaluates mismatched revisions. The configured principal
+list is only an additional intersection; authenticated server row filters are the
+security boundary (see [authorization](../reference/auth.md)).
+
+The initial storage path is same-parent inline payloads, supported by existing
+logical projections. Keep payload fields stored-only rather than indexing base64
+as text; ingestion must bound total render count/size as well as individual units. A Cloud object-store materializer is future work: it must
+preserve these same ownership, authorization and revision checks behind a generic
+asset boundary. There is no new `grep_scan`, Drive-download endpoint, or public
+media URL requirement. Fresh asset reads must reauthorize even when a decision
+score is cached. Snapshot membership alone must never be treated as an enduring
+permission grant; Cloud must specify and test revocation/current-auth fences.
+
+Processing retains one bounded image per active evaluation, inspects headers
+without allocating a decoded raster, base64-encodes local bytes once, and checks
+the 1 MiB serialized Decisions evidence limit with a counting writer. Defaults
+are 512 KiB per encoded image and 16,777,216 pixels; `--max-image-bytes` (up to
+768 KiB) and `--max-image-pixels` tune admission. Metadata/page memory, source bytes,
+request count, evaluation count, deadlines, cancellation, retries and retained
+ranked-output limits continue to apply. Image evaluation uses single-input
+requests even on the Antfly batch profile: `inputs` and shared-context extensions
+are text-only. The gateway admits image-capable deciders and reserves image-token
+budgets; unsupported/text-only adapters reject rather than discard media.
+
+Decision keys bind image digest/MIME, unit metadata (including recipe/location),
+questions, model/transport, and existing authorization/revision scope. Persistent
+score records contain scores, not images. A warm score avoids provider inference,
+not asset authorization, image validation, index HTTP, or all CPU work. Zero total
+cost is impossible. Cost reductions come from explicit scope filters, stable
+exports/rendering, bounded thumbnails, shared questions, persistent connections,
+and safe score reuse. Neither resizing nor PDF/slide rendering happens inside
+this initial grep path. Local PNG/JPEG/WebP/GIF files work directly; PDF/pages
+need indexed renderings. Stdin and workspace media queries are rejected until
+captured media lifetimes can preserve snapshot semantics.
+
+### Search and result semantics
+
+Image mode evaluates every visual unit in the explicitly filtered source scope,
+subject to visible budgets/partial results. It rejects lexical prefilters,
+repository triage and text-only shared contexts, avoiding false negatives when
+an answer exists only in pixels. Text mode and visual mode are explicit choices;
+automatic modality selection is not inferred from the question. Future semantic
+candidate retrieval must be an explicit ranked/approximate mode with candidate
+limits and coverage, separate from exhaustive visual evaluation. A lexical or
+embedding candidate set cannot silently stand in for exhaustive visual search.
+
+Ranked files retain complete evidence records within the existing output budget.
+JSON `type: evidence` carries source/table/document/revision provenance, unit ID,
+kind, page/slide location, image digest/recipe/dimensions, and model probability.
+Text output uses `path#page=N` / `path#slide=N`. Results never invent source line
+numbers, bounding boxes, OCR precision, or detection confidence. Model scores are
+relevance estimates, not proof. In image mode counts refer to matching units.
+An error after a successful unit preserves its completed output as partial results.
+
+### Colony / Antfly Cloud delivery
+
+Cloud work is specified in [Colony #790](https://github.com/antflydb/colony/issues/790),
+not implemented in this repository. Colony owns OAuth/refresh secrets, Drive change
+cursors, effective ACL normalization, group membership, sync/reconciliation,
+private original/export/render storage, atomic publication and deletion/retention.
+`antfly-cloud` owns login, connections, source discovery and short-lived scoped
+sessions; `antfly-grep` consumes those authorized tables and the inference gateway.
+Users should not copy Drive tokens or manually reconstruct table schemas.
+
+Drive stable file IDs survive moves. A source revision must bind the native
+provider version and exact exported bytes; derived pages/slides bind renderer
+recipe and image digest. Drive links, original/export payloads, text, and visual
+units share the parent source identity and effective access. No assumption that
+successful ingestion grants every organization user access is permitted. Recheck
+current access before returning private assets or using cached answers. Never
+publish a new visible manifest before all required assets and ACL state are ready.
+
+Fixture tests qualify wire shape, cache scope, narrow projection, authorization
+failures, revision/digest failures, limits and partial output. They do not qualify
+live provider relevance or image token prices. Cloud acceptance additionally
+requires real Drive ACL/group/revocation scenarios, concurrent revisions,
+rendering failure recovery, lifecycle cleanup, cross-tenant isolation and labeled
+visual-question quality/cost evaluation. These remain issue deliverables.

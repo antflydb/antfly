@@ -96,6 +96,9 @@ const help =
     \\      --triage              Enable model-based directory pruning
     \\      --max-requests N      Request budget: N or unlimited (default 1000)
     \\      --model MODEL         Decision model (or ANTFLY_GREP_MODEL)
+    \\      --media text|images   Text regions or whole image/page/slide evidence
+    \\      --max-image-bytes N   Encoded image bytes (512K; maximum 768K)
+    \\      --max-image-pixels N  Image pixel admission (16777216)
     \\      --provider NAME       antfly, openai, custom, local
     \\      --decision-transport single|antfly-batch  Provider capability
     \\      --endpoint URL        Full URL (or ANTFLY_GREP_ENDPOINT)
@@ -307,6 +310,7 @@ fn run(init: std.process.Init) !u8 {
         var glob = try grep.discovery.glob(a, if (std.mem.startsWith(u8, raw, "!")) raw[1..] else raw);
         glob.deinit();
     }
+    if (workspace_service and o.media != .text) return error.UnsupportedWorkspaceMedia;
     if (workspace_service) return grep.workspace.serve(grep.Search, a, init.io, &o);
     var search = try grep.Search.init(a, init.io, &o);
     defer search.deinit();

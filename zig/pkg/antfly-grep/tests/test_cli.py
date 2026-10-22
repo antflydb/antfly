@@ -218,6 +218,20 @@ class DecisionHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        asset_read = any(
+            field.startswith("payloads.") for field in body.get("fields", [])
+        )
+        if asset_read and getattr(self.server, "asset_mode", None):
+            mode = self.server.asset_mode
+            if mode == "revoked":
+                self.send_response(403)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if mode == "revision":
+                self.server.index_documents[0]["_source"]["grep"]["revision"] = (
+                    "changed"
+                )
         mode = self.server.index_mode
         if body.get("search_after"):
             self.server.index_next.set()
@@ -258,6 +272,8 @@ class DecisionHandler(BaseHTTPRequestHandler):
         def candidate_matches(query, doc):
             if not query:
                 return True
+            if "ids" in query:
+                return doc["_id"] in query["ids"]
             if "disjuncts" in query:
                 return any(candidate_matches(q, doc) for q in query["disjuncts"])
             if "must_not" in query:
@@ -353,9 +369,16 @@ class DecisionHandler(BaseHTTPRequestHandler):
         )
         self.server.client_ports.append(self.client_address[1])
         single = "input" in body
+        visual = single and isinstance(body["input"], list)
         if single:
             assert "inputs" not in body and "context_version" not in body
-            body = {**body, "inputs": [{"id": "single", "input": body["input"]}]}
+            text = body["input"]
+            if visual:
+                parts = [p for message in body["input"] for p in message["content"]]
+                assert [p["type"] for p in parts] == ["input_text", "input_image"]
+                assert parts[1]["image_url"].startswith("data:image/")
+                text = "TARGET 1: STOP\n" + parts[0]["text"]
+            body = {**body, "inputs": [{"id": "single", "input": text}]}
         if body.get("context_version") == 1:
             body = json.loads(json.dumps(body))
             for item in body["inputs"]:
@@ -1949,6 +1972,7 @@ class CliTests(unittest.TestCase):
         }
         self.env["HOME"] = str(self.root)
         self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
+        self.server.asset_mode = None
         self.server.requests = []
         self.server.client_ports = []
         self.server.index_requests = []
@@ -3442,6 +3466,243 @@ class CliTests(unittest.TestCase):
             if any(i["id"].startswith("refine-") for i in body.get("inputs", []))
         ]
         self.assertEqual(sum(len(b["inputs"]) for b in refined), 3)
+
+    def image_fixture(self, width=2, height=3):
+        # Valid image bytes, not a live visual-model relevance fixture.
+        import zlib
+
+        def chunk(kind, payload):
+            return (
+                struct.pack(">I", len(payload))
+                + kind
+                + payload
+                + struct.pack(">I", zlib.crc32(kind + payload))
+            )
+
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress((b"\0" + b"\xff\0\0" * width) * height))
+            + chunk(b"IEND", b"")
+        )
+
+    def visual_document(self, *, units=1):
+        image = self.image_fixture()
+        digest = hashlib.sha256(image).hexdigest()
+        evidence = [
+            {
+                "id": f"slide-{i + 1}",
+                "kind": "slide",
+                "location": {"slide": i + 1},
+                "asset": {
+                    "field": "payloads.preview",
+                    "mime_type": "image/png",
+                    "sha256": digest,
+                    "recipe": "slide-render-v1",
+                    "byte_length": len(image),
+                },
+            }
+            for i in range(units)
+        ]
+        doc = {
+            "version": 2,
+            "path": "Drive/pricing.slides",
+            "uri": "https://drive.google.com/file/d/stable/view",
+            "content": "",
+            "revision": "drive-7:export-sha",
+            "indexed_at": 100,
+            "permissions": {"public": True, "readers": []},
+            "evidence": evidence,
+        }
+        config = self.table_config([doc], page_size=8)
+        self.server.index_documents[0]["_source"]["payloads"] = {
+            "preview": "data:image/png;base64," + base64.b64encode(image).decode()
+        }
+        return config
+
+    def test_media_local_images_send_ordered_evidence_and_cache_scores(self):
+        image = self.image_fixture()
+        self.write("checkout.png", image)
+        args = [*self.decision_args(), "--media", "images", "--json", "checkout.png"]
+        result = self.raw_cli(*args)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        match = next(row for row in rows if row["type"] == "evidence")
+        self.assertEqual(match["data"]["kind"], "image")
+        self.assertEqual((match["data"]["width"], match["data"]["height"]), (2, 3))
+        self.assertNotIn("line_number", match["data"])
+        self.assertEqual(match["source"]["revision"], hashlib.sha256(image).hexdigest())
+        self.assertIsInstance(self.server.requests[0][2]["input"], list)
+        self.assertEqual(len(self.server.requests), 1)
+        self.server.requests.clear()
+        self.raw_cli(*args)
+        self.assertEqual(self.server.requests, [])
+        self.write("checkout.png", self.image_fixture(3, 2))
+        self.raw_cli(*args)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_media_indexed_assets_are_projected_authorized_and_digest_checked(self):
+        config = self.visual_document()
+        args = [
+            *self.decision_args(),
+            "--media=images",
+            "--table-config",
+            config,
+            "--json",
+            "--table-filter",
+            '{"ids":["0"]}',
+        ]
+        result = self.raw_cli(*args)
+        record = next(
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if json.loads(line)["type"] == "evidence"
+        )
+        self.assertEqual(record["data"]["location"], {"slide": 1})
+        self.assertEqual(record["source"]["revision"], "drive-7:export-sha")
+        self.assertEqual(
+            record["source"]["uri"], "https://drive.google.com/file/d/stable/view"
+        )
+        fields = [body["fields"] for _, _, body in self.server.index_requests]
+        self.assertNotIn("payloads.preview", fields[0])
+        self.assertNotIn("grep.content", fields[0])
+        self.assertIn("payloads.preview", fields[1])
+        for _, authorization, body in self.server.index_requests:
+            self.assertEqual(authorization, "Bearer independent-table-token")
+            self.assertEqual(body["filter_query"], {"ids": ["0"]})
+        self.assertEqual(len(self.server.requests), 1)
+        self.server.requests.clear()
+        self.server.index_requests.clear()
+        self.raw_cli(*args)
+        self.assertEqual(self.server.requests, [])
+        self.assertTrue(
+            any(
+                "payloads.preview" in body["fields"]
+                for _, _, body in self.server.index_requests
+            )
+        )
+        self.server.asset_mode = "revoked"
+        result = self.raw_cli(*args, code=2)
+        self.assertIn(b"IndexAuthorizationFailed", result.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_media_revision_and_corruption_fail_before_provider(self):
+        for mode in ["revision", "digest", "field", "duplicate", "oversize"]:
+            with self.subTest(mode=mode):
+                config = self.visual_document()
+                self.server.asset_mode = None
+                doc = self.server.index_documents[0]["_source"]["grep"]
+                if mode == "revision":
+                    self.server.asset_mode = "revision"
+                if mode == "digest":
+                    doc["evidence"][0]["asset"]["sha256"] = "0" * 64
+                if mode == "field":
+                    doc["evidence"][0]["asset"]["field"] = (
+                        "https://private.invalid/file"
+                    )
+                if mode == "duplicate":
+                    doc["evidence"].append(doc["evidence"][0])
+                if mode == "oversize":
+                    doc["evidence"][0]["asset"]["byte_length"] = 2**30
+                self.server.requests.clear()
+                self.raw_cli(
+                    *self.decision_args(),
+                    "--media=images",
+                    "--table-config",
+                    config,
+                    code=2,
+                )
+                self.assertEqual(self.server.requests, [])
+
+    def test_media_limits_and_rejected_combinations(self):
+        self.write("a.png", self.image_fixture())
+        for flags in [
+            ["--max-image-pixels", "5"],
+            ["--max-image-bytes", "4"],
+            ["--decision-context", "shared-v1"],
+            ["--backend", "local"],
+            ["--triage"],
+            ["-e", "STOP"],
+        ]:
+            with self.subTest(flags=flags):
+                self.raw_cli(
+                    *self.decision_args(), "--media=images", *flags, "a.png", code=2
+                )
+        self.assertEqual(self.server.requests, [])
+
+    def test_media_ranking_multiquestion_and_partial_records(self):
+        for name in ["c.png", "b.png", "a.png"]:
+            self.write(name, self.image_fixture())
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--media=images",
+            "--query",
+            "second visual question",
+            "--max-result-files=2",
+            "--json",
+            "--no-cache",
+            "-j1",
+            ".",
+        )
+        records = [json.loads(line) for line in result.stdout.splitlines()]
+        evidence = [row for row in records if row["type"] == "evidence"]
+        self.assertEqual(len(evidence), 2)
+        self.assertEqual(
+            [row["data"]["path"] for row in evidence], ["./a.png", "./b.png"]
+        )
+        self.assertEqual(len(self.server.requests), 3)
+        for _, _, body in self.server.requests:
+            self.assertEqual(len(body["questions"]), 2)
+            self.assertEqual(len(body["input"][0]["content"]), 2)
+            self.assertNotIn("inputs", body)
+        self.server.requests.clear()
+        config = self.visual_document(units=2)
+        self.server.index_documents[0]["_source"]["grep"]["evidence"][1]["asset"][
+            "sha256"
+        ] = "0" * 64
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--media=images",
+            "--no-cache",
+            "--json",
+            "--table-config",
+            config,
+            code=2,
+        )
+        records = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(
+            [r["data"]["unit"] for r in records if r["type"] == "evidence"], ["slide-1"]
+        )
+        self.assertIn(b"EvidenceDigestMismatch", result.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_media_refusal_is_incomplete_and_stdin_is_rejected(self):
+        self.write("a.png", self.image_fixture())
+        self.server.mode = "refusal"
+        result = self.raw_cli(
+            *self.decision_args(), "--media=images", "--no-cache", "a.png", code=2
+        )
+        self.assertNotIn(b"unit=image", result.stdout)
+        self.server.requests.clear()
+        result = self.raw_cli(*self.decision_args(), "--media=images", "-", code=2)
+        self.assertIn(b"MediaStdinUnsupported", result.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_media_unit_counts_and_request_budget(self):
+        config = self.visual_document(units=2)
+        args = [
+            *self.decision_args(),
+            "--media=images",
+            "--no-cache",
+            "--table-config",
+            config,
+        ]
+        result = self.raw_cli(*args, "--count")
+        self.assertIn(b"Drive/pricing.slides:2", result.stdout)
+        self.server.requests.clear()
+        result = self.raw_cli(*args, "--json", "--max-requests=2", code=2)
+        records = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertFalse(any(row["type"] == "evidence" for row in records))
+        self.assertEqual(self.server.requests, [])
 
     def test_shared_refinement_retains_all_targets(self):
         self.write("a.txt", "STOP one\nnoise\nSTOP two\nnoise\n")

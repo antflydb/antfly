@@ -4443,3 +4443,41 @@ request bodies from 10,548,999 to 1,412,265 bytes (86.6%) with 65 requests;
 common single-input Decisions needs 513 requests. Warmed caches require zero
 provider requests in both protocols. These are protocol byte/request measurements,
 not provider token costs or a claim that complete searches are free.
+
+
+## Visual decision search
+
+Use the same Decisions endpoint and credentials with explicit image mode:
+
+```sh
+antfly-grep --provider antfly --model VISION_DECIDER \
+  --media images --ask 'Does this show a failed checkout?' --json ./screenshots
+antfly-grep --provider antfly --model VISION_DECIDER \
+  --media images --ask 'Which slide shows declining revenue?' --table-config tables.json
+```
+
+Local PNG/JPEG/WebP/GIF files are whole-image units. Indexed
+[document v2](schema/document-v2.json) adds page/slide/image manifests and
+revision-bound inline image fields on the same parent row. The configured
+`document_field` selects v1 or v2 sources; text mode remains the default. DocsAF
+`ToEvidenceRecord` can construct v2 source records with explicit ACL metadata.
+PDF/slide rendering and Cloud Drive synchronization belong to ingestion.
+
+Visual mode sends one ordered text/image evidence message per unit, with multiple
+questions sharing that image. JSON evidence records identify the unit, page/slide,
+source revision, image digest and recipe; they contain no invented line numbers
+or bounding boxes. Counts refer to matching visual units. The provider must
+support image Decisions; native text-only models, text batch/shared contexts,
+lexical prefilters, triage, stdin and workspace media are rejected.
+
+Default image limits are 512 KiB and 16,777,216 pixels. Adjust
+`--max-image-bytes SIZE` (maximum 768 KiB) / `--max-image-pixels N`; the 1 MiB
+serialized Decisions evidence cap still applies. Images are inspected without
+raster decoding. Budget errors retain completed partial results and exit 2.
+Cached scores avoid repeat inference; indexed media is freshly authorized and
+validated before every cache lookup. Grep never fetches arbitrary provider URLs.
+See the [design](../../../docs/design/antfly-grep.md#multimodal-source-evidence-and-cloud-boundary-2026-10-21)
+and [Cloud delivery issue](https://github.com/antflydb/colony/issues/790) for the
+private asset, ACL and connector lifecycle requirements. Cloud connector work is
+not included in this CLI implementation; fixture tests do not establish visual
+model quality.

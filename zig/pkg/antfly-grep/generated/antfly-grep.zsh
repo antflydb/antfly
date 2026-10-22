@@ -89,6 +89,8 @@ _arguments -s \
  '--max-file-size[max-file-size]:value:' \
  '--max-files[max-files]:value:' \
  '--max-filesize[max-filesize]:value:' \
+ '--max-image-bytes[max-image-bytes]:value:' \
+ '--max-image-pixels[max-image-pixels]:value:' \
  '--max-index-documents[max-index-documents]:value:' \
  '--max-output-bytes[max-output-bytes]:value:' \
  '--max-pending-output[max-pending-output]:value:' \
@@ -97,6 +99,7 @@ _arguments -s \
  '--max-result-files[max-result-files]:value:' \
  '--max-source-bytes[max-source-bytes]:value:' \
  '--max-spill-bytes[max-spill-bytes]:value:' \
+ '--media[media]:value:(text images)' \
  '--messages[messages]' \
  '--mmap[mmap]' \
  '--model[model]:value:' \

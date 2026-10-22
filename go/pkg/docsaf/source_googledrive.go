@@ -233,7 +233,7 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 		call := s.service.Files.List().
 			Q(query).
 			OrderBy("name").
-			Fields("nextPageToken, files(id, name, mimeType, size, modifiedTime, md5Checksum, webViewLink)").
+			Fields("nextPageToken, files(id, name, mimeType, size, modifiedTime, md5Checksum, webViewLink, version)").
 			PageSize(1000)
 
 		if s.includeSharedDrives() {
@@ -343,6 +343,7 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 						Metadata: map[string]any{
 							"source_type":   "google_drive",
 							"drive_file_id": f.Id,
+							"version":       fmt.Sprint(f.Version),
 							"etag":          f.Md5Checksum,
 							"file_size":     f.Size,
 							"mime_type":     f.MimeType,

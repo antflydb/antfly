@@ -30,6 +30,7 @@ pub const Input = struct {
     id: []const u8,
     input: []const u8,
     context: []const u8 = "",
+    image: ?@import("antfly_source_evidence").Image = null,
     context_hash: ?[32]u8 = null,
     derived_key: ?[64]u8 = null,
     deferred: ?Deferred = null,
@@ -57,8 +58,27 @@ pub const Input = struct {
         try json.objectField("id");
         try json.write(self.id);
         try json.objectField("input");
+        try self.writeEvidence(json);
+        try json.endObject();
+    }
+    fn writeEvidence(self: Input, json: *std.json.Stringify) !void {
+        const image = self.image orelse return self.writeText(json);
+        try json.beginArray();
+        try json.beginObject();
+        try json.objectField("role");
+        try json.write("user");
+        try json.objectField("content");
+        try json.beginArray();
+        try json.beginObject();
+        try json.objectField("type");
+        try json.write("input_text");
+        try json.objectField("text");
         try self.writeText(json);
         try json.endObject();
+        try json.write(.{ .type = "input_image", .image_url = image.data_url, .detail = "auto" });
+        try json.endArray();
+        try json.endObject();
+        try json.endArray();
     }
     fn writeText(self: Input, json: *std.json.Stringify) !void {
         try json.beginWriteRaw();
@@ -491,6 +511,11 @@ pub const Client = struct {
             hash.update(&len);
             hash.update(part);
         }
+        if (input.image) |image| {
+            hash.update("image-evidence-v1");
+            hash.update(&image.sha256);
+            hash.update(image.mime_type);
+        }
         if (self.query == null) for (self.options.queries.items) |question| {
             var len: [8]u8 = undefined;
             std.mem.writeInt(u64, &len, question.len, .little);
@@ -704,6 +729,7 @@ pub const Client = struct {
                 if (self.last_status == 413 or self.last_status == 422 or err == error.DecisionRequestTooLarge) {
                     if (inputs.len == 1) {
                         const input = inputs[0];
+                        if (input.image != null) return error.DecisionImageTooLarge;
                         const split = subdivisionPoint(input.input) orelse return err;
                         const left = Input{ .id = input.id, .input = input.input[0..split], .context = input.context, .context_hash = input.context_hash };
                         const right = Input{ .id = input.id, .input = input.input[split..], .context = input.context, .context_hash = input.context_hash };
@@ -748,6 +774,7 @@ pub const Client = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
+        for (inputs) |input| if (input.image != null and inputs.len != 1) return error.MultimodalBatchUnsupported;
         const query_count = 1 + (if (self.query == null) self.options.queries.items.len else @as(usize, 0));
         const policy_count = if (self.query == null and self.stage != .directory) self.options.filters.items.len + self.options.only.items.len + self.options.not.items.len else 0;
         const count = query_count + policy_count;
@@ -781,11 +808,12 @@ pub const Client = struct {
         // entire expanded request (including JSON escaping and shared state).
         var body_budget = @import("antfly_regex").Budget{ .backing = self.a, .limit = 32 * 1024 * 1024 };
         const body_a = body_budget.allocator();
-        const body = (if (self.options.backend != .local and self.options.decision_transport == .single) singleBody(body_a, inputs, questions, self.options.model.?) else if (self.options.decision_context == .shared_v1) sharedBody(body_a, inputs, questions, self.options.model.?) else std.json.Stringify.valueAlloc(body_a, .{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{})) catch |err| {
+        const body = (if (self.options.backend != .local and (self.options.decision_transport == .single or inputs[0].image != null)) singleBody(body_a, inputs, questions, self.options.model.?) else if (self.options.decision_context == .shared_v1) sharedBody(body_a, inputs, questions, self.options.model.?) else std.json.Stringify.valueAlloc(body_a, .{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{})) catch |err| {
             return if (body_budget.denied) error.DecisionRequestTooLarge else err;
         };
         defer body_a.free(body);
         if (body.len > 16 * 1024 * 1024) return error.DecisionRequestTooLarge;
+
         const auth = if (self.options.token) |token| try std.fmt.allocPrint(self.a, "Bearer {s}", .{token}) else null;
         defer if (auth) |h| self.a.free(h);
         const headers: []const [2][]const u8 = if (auth) |h| &.{.{ "Authorization", h }} else &.{};
@@ -991,6 +1019,13 @@ fn sharedBody(a: Allocator, inputs: []const Input, questions: anytype, model: []
 }
 fn singleBody(a: Allocator, inputs: []const Input, questions: anytype, model: []const u8) ![]u8 {
     if (inputs.len != 1) return error.InvalidDecisionBatch;
+    if (inputs[0].image != null) {
+        var buffer: [512]u8 = undefined;
+        var counter: std.Io.Writer.Discarding = .init(&buffer);
+        var json: std.json.Stringify = .{ .writer = &counter.writer };
+        try inputs[0].writeEvidence(&json);
+        if (counter.fullCount() > 1024 * 1024) return error.DecisionLimitExceeded;
+    }
     // Reuse Input's streaming JSON string encoder, avoiding a copy of context.
     const Wire = struct {
         model: []const u8,
@@ -1001,7 +1036,7 @@ fn singleBody(a: Allocator, inputs: []const Input, questions: anytype, model: []
             try json.objectField("model");
             try json.write(self.model);
             try json.objectField("input");
-            try self.input.writeText(json);
+            try self.input.writeEvidence(json);
             try json.objectField("questions");
             try json.write(self.questions);
             try json.endObject();

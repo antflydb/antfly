@@ -39,6 +39,7 @@ pub fn prepare(a: std.mem.Allocator, base: *const Options, args: []const []const
     inline for (.{ "hidden", "no_ignore", "no_ignore_vcs", "no_ignore_global", "no_ignore_parent", "no_ignore_dot", "no_ignore_exclude", "no_ignore_files", "follow", "one_file_system", "max_depth", "max_files", "include_dependencies", "include_sensitive" }) |name| {
         if (@field(o, name) != @field(defaults, name)) return error.UnsupportedWorkspaceQueryOptions;
     }
+    if (o.media != .text) return error.UnsupportedWorkspaceMedia;
     // The protocol always carries ordinary JSON result events. Discovery
     // filters belong to capture; queries cannot silently read the live tree.
     o.json = true;
