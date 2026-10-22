@@ -7278,3 +7278,63 @@ def test_symbolic_set_reducers_and_weighted_cohort_windows_stay_bounded(graph_db
     assert result["rows"] == expected["rows"]
     assert result["stats"]["intermediate_states"] < 2000
     assert result["stats"]["memory_bytes"] < 1 << 20
+
+
+@pytest.mark.parametrize(
+    ("query", "control", "states"),
+    [
+        (
+            "UNWIND range(1,1300000,2)+range(2,1300000,2) AS x WITH x ORDER BY x RETURN avg(x)",
+            "UNWIND range(1,1300000) AS x RETURN avg(x)",
+            2000,
+        ),
+        (
+            "UNWIND range(1,1300000,2)+range(2,1300000,2) AS x WITH x ORDER BY x LIMIT 650000 RETURN avg(x)",
+            "UNWIND range(1,650000) AS x RETURN avg(x)",
+            2000,
+        ),
+        (
+            "UNWIND range(1,1300000) AS x WITH x%10 AS g ORDER BY g LIMIT 650000 RETURN count(*),sum(g)",
+            "UNWIND range(0,4) AS g RETURN 650000,sum(g)*130000",
+            2000,
+        ),
+        (
+            "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY x LIMIT 5 RETURN avg(g)",
+            "UNWIND range(1,5) AS g RETURN avg(g)",
+            2000,
+        ),
+        (
+            "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY x DESC LIMIT 5 RETURN avg(g)",
+            "UNWIND [0,9,8,7,6] AS g RETURN avg(g)",
+            2000,
+        ),
+        (
+            "UNWIND range(1,1300000,3)+range(1,1300000) AS x WITH DISTINCT x AS y ORDER BY 0 LIMIT 5 RETURN avg(y)",
+            "UNWIND range(1,13,3) AS y RETURN avg(y)",
+            2000,
+        ),
+        (
+            "UNWIND [7,8] AS z WITH z+1 AS k UNWIND range(1300000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5",
+            "UNWIND [8,9] AS k UNWIND range(1300000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5",
+            2000,
+        ),
+        (
+            "UNWIND range(1,1300000) AS x RETURN x%65 AS g,count(*) ORDER BY g",
+            "UNWIND range(0,64) AS g RETURN g,20000",
+            3000,
+        ),
+        (
+            "UNWIND range(1,1300000) AS x WITH x,x%10 AS g RETURN g,count(*) ORDER BY g",
+            "UNWIND range(0,9) AS g RETURN g,130000",
+            2000,
+        ),
+    ],
+)
+def test_retained_ordered_domains_stay_compressed_through_reducers_and_ranking(graph_db, query, control, states):
+    result = graph_db.cypher_json(
+        "g", {"query": query, "limits": {"intermediate_states": states, "memory_bytes": 1 << 20}}
+    )
+    expected = graph_db.cypher_json("g", {"query": control})
+    assert result["rows"] == expected["rows"]
+    assert result["stats"]["intermediate_states"] < states
+    assert result["stats"]["memory_bytes"] < 1 << 20

@@ -2096,13 +2096,21 @@ reached pre-window expression must be checked before publication; unsupported
 scopes and fallible expressions retain ordinary execution. For interleaving
 lattices, exact bag-rank searches locate a finite page, followed by a stable
 merge of just the retained values. DISTINCT pages use exact union cardinalities
-for the rank search and advance duplicate cursors together. Retained output and
-merge work use the query budgets rather than a fixed 128-row page cutoff.
+for the rank search and advance duplicate cursors together. Stable DISTINCT
+pages with constant order keys use novel-prefix measures to skip prior support
+and retain the requested source encounters without subtracting every lattice gap.
+A checked, injective lattice union whose cardinality fills its complete envelope
+is one ordered arithmetic run; interleaved lanes can therefore feed unbounded
+or large-page scalar reducers without emitting each represented row. Retained
+output and merge work use query budgets rather than a fixed page-size cutoff.
 Duplicate bag occurrences remain in source order. Invariant integer AVG arguments use the
 same zero-stride observer certificate.
 
-Small constant modulo periods (bounded at 64) partition an arithmetic producer
-into signed remainder cohorts. Divisors resolve through checked lexical stage
+Checked constant modulo periods partition an arithmetic producer into signed
+remainder cohorts. Discovery is bounded by remaining query work and memory;
+there is no fixed period-64 cutoff. Only remainder signs reached by the source
+are considered. Whole-domain sign predicates use checked endpoint bounds,
+leaving crossing intervals to charged binary searches. Divisors resolve through checked lexical stage
 bindings, including parameters and projected scalar aliases. Unknown outputs
 never become fabricated constants. Cohort stages advance in lockstep: DISTINCT
 shares membership across cohorts and selects the first surviving source ordinal.
@@ -2110,10 +2118,16 @@ Global ORDER BY/SKIP/LIMIT barriers apply once to the combined bag. Small bags
 use point ranking. Large bags with checked constant cohort order keys form
 weighted rank buckets, skipping complete buckets arithmetically. Within ties,
 selection follows the original source runs and preserves repeated occurrences.
+Stable rank-prefix counts select slices in each run and retain its cohort owner;
+reducers receive compressed slices rather than one context per retained row.
+Common checked affine order keys rank directly across the combined cohort bag.
 The reconstructed multiplicity must match the certified bag before publication;
-a previous reorder or unsupported varying order key keeps ordinary execution.
+unsupported order keys and scope histories keep ordinary execution.
 
 All cohort programs and observer packets are checked before publishing groups.
+Collision-checked hashing collects cohort summaries once per final group;
+merge certification is linear in packets and observers rather than pairwise in
+retained rows. Ordered point contributions preserve their encounter sequence.
 Colliding group keys require a per-observer merge certificate: COUNT and extrema
 commute, SUM also needs one sign across the colliding domains, and AVG requires
 ordered point contributions or an identical constant sample. DISTINCT collection
@@ -2129,8 +2143,10 @@ suffix packet proves identical contributions for every candidate key. Both
 aggregate aliases and structurally equal aggregate ORDER BY expressions use
 this certificate. A finite independent outer list or range can move inside an
 injective key axis while preserving each group's exact contribution sequence.
-Checked scope-restoring projections may separate the axes: the outer identity
-and independent bindings cross with the key retained explicitly. Sources keep
+Checked scope-restoring projections may separate the axes. Bounded derived
+outer aliases retain their lexical dependencies and execute in the complete
+suffix packet, with the key identity preserved explicitly. Grouping keys and
+the inner source must remain independent of those outer dependencies. Sources keep
 their captured lexical frame, and WITH siblings evaluate in the same input
 scope. The complete suffix proof validates every outer value before pruning
 keys. Dependent projections, scope barriers, and failed proofs keep ordinary

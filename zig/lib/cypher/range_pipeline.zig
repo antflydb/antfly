@@ -23,6 +23,55 @@ const Range = @import("range.zig").Range;
 pub const Form = @import("integer_affine.zig").Form;
 pub const Known = union(enum) { integer: Form, scalar: v.Value };
 pub const Binding = struct { name: []const u8, value: Known };
+
+test "rank slices retain stable source ownership across duplicate and extreme values" {
+    const Host = struct {
+        states: usize = 0,
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.states += amount;
+            if (self.states > 2000) return error.TestRankBudgetExceeded;
+        }
+    };
+    const Cell = struct {
+        value: i64,
+        source: usize,
+        fn less(ascending: bool, left: @This(), right: @This()) bool {
+            if (left.value != right.value) return if (ascending) left.value < right.value else left.value > right.value;
+            return left.source < right.source;
+        }
+    };
+    for ([_][]const Range{
+        &.{ .{ .start = 1, .step = 1, .length = 5 }, .{ .start = 5, .step = -1, .length = 5 }, .{ .start = 3, .step = 1, .length = 5 } },
+        &.{ .{ .start = std.math.minInt(i64), .step = 1, .length = 3 }, .{ .start = std.math.maxInt(i64), .step = -1, .length = 3 } },
+    }) |ranges| for ([_]bool{ true, false }) |ascending| {
+        var expected: std.ArrayList(Cell) = .empty;
+        defer expected.deinit(std.testing.allocator);
+        for (ranges, 0..) |part, source| {
+            var position: u128 = 0;
+            while (position < part.length) : (position += 1) try expected.append(std.testing.allocator, .{ .value = part.at(position).integer, .source = source });
+        }
+        std.mem.sort(Cell, expected.items, ascending, Cell.less);
+        for (0..expected.items.len + 2) |skip| for (0..5) |limit| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var host: Host = .{};
+            var context = try Context.init(a, ranges[0], &.{}, "x", &.{}, &host, Host.charge);
+            context.setRanges(ranges);
+            const selected = (try context.rankedRanges(ascending, .{ .skip = skip, .limit = limit })).?;
+            var actual: std.ArrayList(Cell) = .empty;
+            for (selected) |selection| {
+                var position: u128 = 0;
+                while (position < selection.sequence.length) : (position += 1) try actual.append(a, .{ .value = selection.sequence.at(position).integer, .source = selection.source });
+            }
+            std.mem.sort(Cell, actual.items, ascending, Cell.less);
+            const start = @min(skip, expected.items.len);
+            try std.testing.expectEqualSlices(Cell, expected.items[start .. start + @min(limit, expected.items.len - start)], actual.items);
+        };
+    };
+}
+
 pub const Context = struct {
     a: std.mem.Allocator,
     sequence: Range,
@@ -157,10 +206,120 @@ pub const Context = struct {
         self.parts = output.items;
     }
     pub const Page = struct { skip: u128 = 0, limit: ?u128 = null };
+    pub const RankedRun = struct { source: usize, sequence: Range };
+    /// Count a stable sorted prefix in each source run. Equal raw values keep
+    /// source-run order. No retained row is enumerated during rank selection.
+    fn rankPrefix(self: *Context, ascending: bool, amount: u128) ![]u128 {
+        const counts = try self.a.alloc(u128, self.ranges().len);
+        @memset(counts, 0);
+        const length = self.domainLength();
+        if (amount == 0) return counts;
+        if (amount >= length) {
+            for (counts, self.ranges()) |*size, part| size.* = part.length;
+            return counts;
+        }
+        var low: i128 = std.math.maxInt(i64);
+        var high: i128 = std.math.minInt(i64);
+        for (self.ranges()) |part| if (part.length != 0) {
+            const end = part.at(part.length - 1).integer;
+            low = @min(low, @min(part.start, end));
+            high = @max(high, @max(part.start, end));
+        };
+        const rank = if (ascending) amount else length - amount + 1;
+        while (low < high) {
+            const middle = low + @divTrunc(high - low, 2);
+            var size: u128 = 0;
+            for (self.ranges()) |part| {
+                try self.charge(self.ptr, 1);
+                size += countBelow(part, middle);
+            }
+            if (size < rank) low = middle + 1 else high = middle;
+        }
+        var before: u128 = 0;
+        for (counts, self.ranges()) |*size, part| {
+            size.* = if (ascending) countBelow(part, low - 1) else part.length - countBelow(part, low);
+            before += size.*;
+        }
+        var ties = amount - before;
+        for (counts, self.ranges()) |*size, part| {
+            try self.charge(self.ptr, 1);
+            if (ties != 0 and part.contains(.{ .integer = @intCast(low) }).boolean) {
+                size.* += 1;
+                ties -= 1;
+            }
+        }
+        return counts;
+    }
+    pub fn rankedRanges(self: *Context, ascending: bool, page: Page) !?[]RankedRun {
+        const length = self.domainLength();
+        const skip = @min(page.skip, length);
+        const keep = @min(page.limit orelse length, length - skip);
+        const first = try self.rankPrefix(ascending, skip);
+        const last = try self.rankPrefix(ascending, skip + keep);
+        var output: std.ArrayList(RankedRun) = .empty;
+        for (self.ranges(), first, last, 0..) |incoming, start, end, source| {
+            if (end == start) continue;
+            var part = incoming;
+            if (part.length > 1 and (part.step > 0) != ascending) {
+                part.start = part.at(part.length - 1).integer;
+                part.step = std.math.negate(part.step) catch return null;
+            }
+            try output.append(self.a, .{ .source = source, .sequence = subrange(part, start, end - start) });
+        }
+        return output.items;
+    }
+    pub fn rankBefore(self: *Context, value: i64, ascending: bool) !u128 {
+        var result: u128 = 0;
+        for (self.ranges()) |part| {
+            try self.charge(self.ptr, 1);
+            result += if (ascending) countBelow(part, @as(i128, value) - 1) else part.length - countBelow(part, value);
+        }
+        return result;
+    }
+    /// Stable DISTINCT pagination uses novel-prefix measures, retaining only
+    /// requested cells when subtracting prior lattices would fragment a run.
+    fn distinctPage(self: *Context, page: Page) !bool {
+        var remaining = page.limit orelse return false;
+        var skip = page.skip;
+        var seen: @import("range_set.zig").Set = .{};
+        var output: std.ArrayList(Range) = .empty;
+        for (self.ranges()) |part| {
+            const novel = (try seen.novelMeasure(self.a, part, self.ptr, self.charge)) orelse return false;
+            if (skip >= novel.count) skip -= novel.count else {
+                const keep = @min(remaining, novel.count - skip);
+                if (seen.ranges.items.len == 0 or novel.count == part.length) {
+                    if (keep != 0) try output.append(self.a, subrange(part, skip, keep));
+                } else {
+                    var ordinal = skip;
+                    while (ordinal < skip + keep) : (ordinal += 1) {
+                        var low: u128 = 1;
+                        var high = part.length;
+                        while (low < high) {
+                            try self.charge(self.ptr, 1);
+                            const middle = low + (high - low) / 2;
+                            const prefix = (try seen.novelMeasure(self.a, subrange(part, 0, middle), self.ptr, self.charge)) orelse return false;
+                            if (prefix.count <= ordinal) low = middle + 1 else high = middle;
+                        }
+                        try output.append(self.a, subrange(part, low - 1, 1));
+                    }
+                }
+                remaining -= keep;
+                skip = 0;
+            }
+            if (remaining == 0) break;
+            _ = (try seen.insert(self.a, self.a, part, self.ptr, self.charge)) orelse return false;
+        }
+        self.setRanges(output.items);
+        return true;
+    }
     /// Select the page's first value by exact bag rank, then merge only the
     /// bounded retained rows. Duplicate values retain segment encounter order.
     pub fn orderedPage(self: *Context, ascending: bool, page: Page, distinct: bool) !bool {
         const limit = page.limit orelse return false;
+        if (!distinct and try self.orderRanges(ascending)) {
+            try self.paginate(page.skip, limit);
+            return true;
+        }
         const length = if (distinct) (try @import("range.zig").distinctCardinalityWork(self.a, self.ranges(), self.ptr, self.charge)) orelse return false else self.domainLength();
         if (page.skip >= length or limit == 0) {
             self.setRanges(&.{});
@@ -237,6 +396,32 @@ pub const Context = struct {
     /// Sort disjoint monotone runs without enumerating their values. General
     /// interleaving lattices retain ordinary replay rather than losing order.
     fn orderRanges(self: *Context, ascending: bool) !bool {
+        // A lattice union whose bag cardinality equals its complete envelope,
+        // and whose support is injective, is exactly one arithmetic run. This
+        // proves interleaved lanes without merging their represented cells.
+        const length = self.domainLength();
+        if (length != 0 and self.ranges().len > 1) {
+            var low: i128 = std.math.maxInt(i64);
+            var high: i128 = std.math.minInt(i64);
+            var stride: u64 = 0;
+            var anchor: ?i64 = null;
+            for (self.ranges()) |part| if (part.length != 0) {
+                try self.charge(self.ptr, 1);
+                const end = part.at(part.length - 1).integer;
+                low = @min(low, @min(part.start, end));
+                high = @max(high, @max(part.start, end));
+                if (part.length > 1) stride = std.math.gcd(stride, @as(u64, @intCast(@abs(@as(i128, part.step)))));
+                if (anchor) |first| stride = std.math.gcd(stride, @as(u64, @intCast(@abs(@as(i128, part.start) - first)))) else anchor = part.start;
+            };
+            if (stride != 0 and @divExact(high - low, stride) + 1 == length and try self.injective()) {
+                if (std.math.cast(i64, @as(i128, stride) * @as(i128, if (ascending) 1 else -1))) |step| {
+                    const single = try self.a.alloc(Range, 1);
+                    single[0] = .{ .start = @intCast(if (ascending) low else high), .step = step, .length = length };
+                    self.setRanges(single);
+                    return true;
+                }
+            }
+        }
         const runs = try self.a.dupe(Range, self.ranges());
         for (runs) |*part| if (part.length > 1 and (part.step > 0) != ascending) {
             const step = std.math.negate(part.step) catch return false;
@@ -450,7 +635,7 @@ pub const Context = struct {
             }
             if (varying) {
                 if (self.periodic) return false;
-                if (projection.order.len != 0 and page != null and page.?.limit != null) symbolic_distinct = true else if (!try self.deduplicate()) return false;
+                if (page != null and page.?.limit != null) symbolic_distinct = true else if (!try self.deduplicate()) return false;
             } else {
                 const selected = try self.a.alloc(Range, 1);
                 selected[0] = .{ .start = self.firstValue().?.integer, .step = 1, .length = 1 };
@@ -474,7 +659,7 @@ pub const Context = struct {
                 }
             }
         }
-        if (symbolic_distinct and !try self.deduplicate()) return false;
+        if (symbolic_distinct) return self.distinctPage(page.?);
         if (page) |window_page| try self.paginate(window_page.skip, window_page.limit);
         return true;
     }
@@ -500,7 +685,35 @@ pub const Context = struct {
     }
     fn compare(self: *Context, left: Form, right: Form, operation: ast.Binary) !bool {
         if (self.sequence.length == 0) return true;
-        const descending = self.difference(left, right, 0) > self.difference(left, right, self.sequence.length - 1);
+        try self.charge(self.ptr, 1);
+        const first = self.difference(left, right, 0);
+        const last = self.difference(left, right, self.sequence.length - 1);
+        const minimum = @min(first, last);
+        const maximum = @max(first, last);
+        const all = switch (operation) {
+            .lt => maximum < 0,
+            .lte => maximum <= 0,
+            .gt => minimum > 0,
+            .gte => minimum >= 0,
+            .eq => minimum == 0 and maximum == 0,
+            .neq => minimum > 0 or maximum < 0,
+            else => return false,
+        };
+        if (all) return true;
+        const none = switch (operation) {
+            .lt => minimum >= 0,
+            .lte => minimum > 0,
+            .gt => maximum <= 0,
+            .gte => maximum < 0,
+            .eq => minimum > 0 or maximum < 0,
+            .neq => minimum == 0 and maximum == 0,
+            else => unreachable,
+        };
+        if (none) {
+            self.sequence.length = 0;
+            return true;
+        }
+        const descending = first > last;
         const low = try self.boundary(left, right, descending, false);
         const high = try self.boundary(left, right, descending, true);
         const op = if (descending) switch (operation) {

@@ -45,6 +45,7 @@ test {
     _ = @import("unicode_string.zig");
     _ = @import("string_work.zig");
     _ = @import("numbers.zig");
+    _ = @import("range_pipeline.zig");
     _ = @import("mutation_test.zig");
     _ = @import("native_test.zig");
     _ = @import("postimage_policy_test.zig");
