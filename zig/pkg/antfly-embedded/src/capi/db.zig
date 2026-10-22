@@ -10394,3 +10394,47 @@ test "capi native memory indexed candidates retain production views across reope
         }
     }
 }
+
+test "capi native memory accepted judgment context and forgetting survive reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-judgment-context");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const memory = @import("../memory/service.zig");
+    const temporary = arena.allocator();
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .create, memory.types.Config{ .ontology_pack = .software_team_v1 }, "create", "");
+    const observation: memory.types.ObservationRequest = .{
+        .evidence = &.{
+            .{ .id = "base", .source_id = "concepts", .source_version = "1", .text = "Antfly and database" },
+            .{ .id = "context", .source_id = "description", .source_version = "1", .text = "Antfly is a database" },
+        },
+        .entities = &.{ .{ .id = "a", .name = "Antfly", .evidence = &.{.{ .id = "base" }} }, .{ .id = "b", .name = "database", .evidence = &.{.{ .id = "base" }} } },
+        .assertions = &.{.{ .id = "description", .subject = "a", .predicate = "description", .value = "database", .statement = "Antfly is a database", .evidence = &.{.{ .id = "context" }} }},
+    };
+    const observed = try std.json.parseFromSliceLeaky(memory.types.OperationStatus, temporary, try nativeMemoryTestCall(id, temporary, "alice", .observe, observation, "observe", ""), .{});
+    const request: memory.types.RelationshipProposalRequest = .{ .id = "proposal", .expected_revision = observed.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "Accepted relation", .evidence = &.{.{ .id = "base" }} } };
+    const proposed = try std.json.parseFromSliceLeaky(memory.types.OperationStatus, temporary, try nativeMemoryTestCall(id, temporary, "alice", .propose_relationship, request, "propose", ""), .{});
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .review_relationship, memory.types.EntityVerdict{ .expected_revision = proposed.revision, .accept = true }, "accept", "proposal");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .get, .{}, "", "link");
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .forget, memory.types.Forget{ .evidence_ids = &.{"context"} }, "forget", "");
+    for (0..2) |attempt| {
+        const result = try std.json.parseFromSliceLeaky(memory.types.RecallResult, temporary, try nativeMemoryTestCall(id, temporary, "alice", .recall, memory.types.Recall{ .token_budget = 8192 }, "", ""), .{});
+        try std.testing.expectEqual(@as(usize, 0), result.items.len);
+        if (attempt == 0) {
+            for (0..16) |i| _ = try nativeMemoryTestCall(id, temporary, "alice", .advance, .{}, try std.fmt.allocPrint(temporary, "cleanup-{d}", .{i}), "");
+            antfly_db_close(id);
+            id = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        }
+    }
+}

@@ -5939,3 +5939,149 @@ test "memory reindex checkpoints retain source grant revision and foreground dea
         try std.testing.expectEqual(@as(u8, 0), operation.attempts);
     }
 }
+
+test "memory accepted relationships retain judged description context after verdict" {
+    for (0..4) |mode| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const svc = store.service("alice", true, 10);
+        _ = try svc.execute(a, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create");
+        _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"base\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Two concepts\"},{\"id\":\"judgment\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"entities\":[{\"id\":\"a\",\"name\":\"Antfly\",\"evidence\":[{\"id\":\"base\"}]},{\"id\":\"b\",\"name\":\"Database\",\"evidence\":[{\"id\":\"base\"}]}],\"assertions\":[{\"id\":\"description\",\"subject\":\"a\",\"predicate\":\"description\",\"value\":\"database\",\"statement\":\"Antfly is a database\",\"evidence\":[{\"id\":\"judgment\"}]}]}", "observe");
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        const request: m.types.RelationshipProposalRequest = .{ .id = "relation", .expected_revision = state.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "Antfly is a database", .evidence = &.{.{ .id = "base" }} } };
+        const proposed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, request, .{}), "propose"), .{});
+        _ = try svc.execute(a, .review_relationship, "relation", try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposed.revision, .accept = true }, .{}), "accept");
+        _ = try svc.execute(a, .get, "link", "{}", "");
+        switch (mode) {
+            0 => _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"judgment\"]}", "forget"),
+            1 => _ = try svc.execute(a, .forget, "", "{\"assertion_ids\":[\"description\"]}", "forget"),
+            2 => store.resource_state = .denied,
+            3 => store.resource_revision += 1,
+            else => unreachable,
+        }
+        try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .get, "link", "{}", ""));
+    }
+}
+test "memory dense descriptions stop support traversal once full and finish semantic indexing" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = SemanticFixture.service(&store, 1);
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    const evidence = try a.alloc(m.types.Evidence, 256);
+    const refs = try a.alloc(m.types.EvidenceRef, 256);
+    for (evidence, refs, 0..) |*e, *ref, i| {
+        const id = try std.fmt.allocPrint(a, "e-{d}", .{i});
+        e.* = .{ .id = id, .source_id = "s", .source_version = "1", .text = "Fact" };
+        ref.* = .{ .id = id };
+    }
+    const observation: m.types.ObservationRequest = .{ .evidence = evidence, .entities = &.{ .{ .id = "a", .name = "Dense", .evidence = refs[0..1] }, .{ .id = "b", .name = "Healthy", .evidence = refs[0..1] } } };
+    _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, observation, .{}), "observe");
+    const rows = try Store.scan(&store, a, "entity/", null, 2);
+    const first = try std.json.parseFromSliceLeaky(m.types.EntityRecord, a, rows.rows[0].json, .{});
+    for (0..140) |i| {
+        const id = try std.fmt.allocPrint(a, "claim-{d}", .{i});
+        const request: m.types.AssertionRequest = .{ .assertions = &.{.{ .id = id, .subject = first.entity.id, .predicate = "description", .value = "fact", .statement = "A description", .evidence = refs }} };
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, request, .{}), id);
+    }
+    for (0..3) |i| {
+        _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "advance-{d}", .{i}));
+    }
+    const projections = try Store.scan(&store, a, "entity-semantic/", null, 100);
+    try std.testing.expectEqual(@as(usize, 4), projections.rows.len);
+    const index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, store.values.get("entity-semantic-index").?, .{});
+    try std.testing.expect(index.complete and index.backfill_complete);
+    const view = try std.json.parseFromSliceLeaky(m.types.EntityView, a, try svc.execute(a, .entity_view, first.entity.id, "{}", ""), .{});
+    try std.testing.expect(!view.complete);
+    try std.testing.expectEqual(@as(usize, 17), view.dependencies.len);
+}
+
+test "memory semantic rendering failures defer durably and healthy entities progress" {
+    const Fault = struct {
+        fn resource(ptr: *anyopaque, a: A, reference: m.types.provenance.Resource) !m.types.provenance.Snapshot {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (store.failures != 0) {
+                store.failures -= 1;
+                return error.MemoryWorkLimit;
+            }
+            return Store.resource(ptr, a, reference);
+        }
+    };
+    for ([_]bool{ false, true }) |dirty| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var svc = SemanticFixture.service(&store, 1);
+        const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+        _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+        _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"base\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Concepts\"},{\"id\":\"external\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"entities\":[{\"id\":\"a\",\"name\":\"First\",\"evidence\":[{\"id\":\"base\"}]},{\"id\":\"b\",\"name\":\"Second\",\"evidence\":[{\"id\":\"base\"}]}]}", "observe");
+        const rows = try svc.backend.scan(svc.backend.ptr, a, "entity/", null, 8);
+        const first = try std.json.parseFromSliceLeaky(m.types.EntityRecord, a, rows.rows[0].json, .{});
+        const second = try std.json.parseFromSliceLeaky(m.types.EntityRecord, a, rows.rows[1].json, .{});
+        const description: m.types.AssertionRequest = .{ .assertions = &.{.{ .id = "description", .subject = first.entity.id, .predicate = "description", .value = "concept", .statement = "An external description", .evidence = &.{.{ .id = "external" }} }} };
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, description, .{}), "describe");
+        if (dirty) {
+            for (0..3) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "warm-{d}", .{i}));
+            // Queue both entities in the same order as the original backfill.
+            for ([_][]const u8{ first.entity.id, second.entity.id }) |id| try store.values.put(a, try fixtureKey(a, "entity-semantic-work", id), try std.json.Stringify.valueAlloc(a, .{ .id = id }, .{}));
+        }
+        store.failures = 1;
+        svc.backend.resource = Fault.resource;
+        _ = try svc.execute(a, .advance, "", "{}", "defer");
+        try std.testing.expect(store.values.contains(try fixtureKey(a, "entity-semantic-failure", first.entity.id)));
+        // Reconstruct from durable state. The deferred entity is not retried
+        // before its deadline and cannot pin backfill or the dirty-work queue.
+        var reopened = SemanticFixture.service(&store, 1);
+        reopened.backend.resource = Fault.resource;
+        for (0..5) |i| _ = try reopened.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "healthy-{d}", .{i}));
+        const projections = try reopened.backend.scan(reopened.backend.ptr, a, "entity-semantic/", null, 8);
+        try std.testing.expectEqual(@as(usize, 2), projections.rows.len);
+        for (projections.rows) |row| {
+            const projection = try std.json.parseFromSliceLeaky(m.types.EntityProjection, a, row.json, .{});
+            try std.testing.expectEqualStrings(second.entity.id, projection.entity_id);
+        }
+        const unready = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, store.values.get("entity-semantic-index").?, .{});
+        try std.testing.expect(unready.backfill_complete and !unready.complete);
+        store.failures = 0;
+        reopened.context.now_ms = 3000;
+        for (0..5) |i| _ = try reopened.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "recover-{d}", .{i}));
+        const ready = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, store.values.get("entity-semantic-index").?, .{});
+        try std.testing.expect(ready.complete);
+        try std.testing.expect(!store.values.contains(try fixtureKey(a, "entity-semantic-failure", first.entity.id)));
+        try std.testing.expectEqual(@as(usize, 4), (try reopened.backend.scan(reopened.backend.ptr, a, "entity-semantic/", null, 8)).rows.len);
+    }
+}
+
+test "memory judgment context pins transitive selected support without alternative substitution" {
+    for ([_]bool{ false, true }) |forget_parent| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const svc = store.service("alice", true, 10);
+        _ = try svc.execute(a, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create");
+        _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"base\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Concepts\"},{\"id\":\"original\",\"source_id\":\"premise\",\"source_version\":\"1\",\"text\":\"Original context\"},{\"id\":\"alternative\",\"source_id\":\"premise\",\"source_version\":\"2\",\"text\":\"Independent context\"}],\"entities\":[{\"id\":\"a\",\"name\":\"Antfly\",\"evidence\":[{\"id\":\"base\"}]},{\"id\":\"b\",\"name\":\"Database\",\"evidence\":[{\"id\":\"base\"}]}],\"assertions\":[{\"id\":\"premise\",\"subject\":\"other\",\"predicate\":\"p\",\"value\":\"context\",\"statement\":\"A premise\",\"evidence\":[{\"id\":\"original\"}],\"support_sets\":[{\"evidence\":[{\"id\":\"alternative\"}]}]},{\"id\":\"description\",\"subject\":\"a\",\"predicate\":\"description\",\"value\":\"database\",\"statement\":\"Antfly is a database\",\"evidence\":[{\"id\":\"base\"}],\"depends_on\":[\"premise\"]}]}", "observe");
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        const request: m.types.RelationshipProposalRequest = .{ .id = "relation", .expected_revision = state.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "Antfly is a database", .evidence = &.{.{ .id = "base" }} } };
+        const proposed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, request, .{}), "propose"), .{});
+        _ = try svc.execute(a, .review_relationship, "relation", try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposed.revision, .accept = true }, .{}), "accept");
+        // A second verdict consumes a view containing the first accepted
+        // assertion, inheriting its immutable judgment context as well.
+        const current = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        var next = request;
+        next.id = "relation-2";
+        next.assertion.id = "link-2";
+        next.expected_revision = current.revision;
+        const proposed2 = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, next, .{}), "propose-2"), .{});
+        _ = try svc.execute(a, .review_relationship, "relation-2", try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposed2.revision, .accept = true }, .{}), "accept-2");
+        _ = try svc.execute(a, .get, "link-2", "{}", "");
+        _ = try svc.execute(a, .forget, "", if (forget_parent) "{\"assertion_ids\":[\"premise\"]}" else "{\"evidence_ids\":[\"original\"]}", "forget");
+        if (!forget_parent) {
+            _ = try svc.execute(a, .get, "premise", "{}", "");
+            _ = try svc.execute(a, .get, "description", "{}", "");
+        }
+        try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .get, "link", "{}", ""));
+        try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .get, "link-2", "{}", ""));
+    }
+}

@@ -36,7 +36,15 @@ const DecisionInput = struct { id: []const u8, revision: u64, reasons: ReasonBin
 const DecisionProvenance = struct { principal: []const u8, recorded_at: i64, config_generation: u64, assertion_id: []const u8, evidence_ids: []const []const u8, inputs: []const DecisionInput, incoming_reason: ?[]const u8 = null };
 // Causal inference inputs are conjunctive retention/authorization dependencies,
 // independent of the alternative factual support selected by a producer.
-const GenerationProvenance = struct { operation_id: []const u8, config_generation: u64, evidence_ids: []const []const u8 };
+const GenerationProvenance = struct {
+    operation_id: []const u8,
+    config_generation: u64,
+    evidence_ids: []const []const u8,
+    // Frozen, selected support closure of external judgment context. Reads do
+    // not follow mutable assertion parents or substitute alternative support.
+    context: []const t.DerivedDependency = &.{},
+    views: []const t.EntityViewInput = &.{},
+};
 const ExplainedRecord = struct { resource: prov.Resource, record: std.json.Value, links: []const prov.Link };
 const StoredOutcome = struct { outcome: t.Outcome, owner: []const u8, recorded_at: i64, revision: u64 = 0 };
 const DependencyWork = struct { kind: []const u8, id: []const u8, revision: u64, cursor: ?[]const u8 = null };
@@ -600,7 +608,6 @@ const Run = struct {
         if (!reference.external()) return error.InvalidResourceReference;
         if (!eql(u8, reference.database, self.state.database)) return error.Forbidden;
         const cache_key = try hash(self.a, .{ reference, self.service.context.principal });
-        if (self.capturing_resources) |inputs| try inputs.put(self.a, cache_key, {});
         if (self.resource_states.getPtr(cache_key)) |value| {
             // Another invocation may have released the lease since this input
             // was checked. Validate before exposing it to a later invocation.
@@ -608,12 +615,16 @@ const Run = struct {
                 try self.validateResource(value.*);
                 value.epoch = self.inference_epoch;
             }
+            if (self.capturing_resources) |inputs| try inputs.put(self.a, cache_key, {});
             self.trackResource(value.snapshot);
             return value.snapshot;
         }
         const resolve = self.service.backend.resource orelse return error.MemoryCapabilityUnavailable;
         const value = try resolve(self.service.backend.ptr, self.a, reference);
         try self.cacheResource(reference, value);
+        // Failed reads have no admitted snapshot to fence. Partial captures
+        // contain only resources actually consumed before the failure.
+        if (self.capturing_resources) |inputs| try inputs.put(self.a, cache_key, {});
         self.trackResource(value);
         return value;
     }
@@ -637,12 +648,15 @@ const Run = struct {
     // decision lineage cannot disappear from a later invocation's read set.
     fn captureResources(self: *Run, comptime handler: anytype, args: anytype) !Captured(handler) {
         var inputs: ResourceSet = .empty;
+        const result = try self.captureResourcesInto(handler, args, &inputs);
+        return .{ .resources = inputs, .result = result };
+    }
+    fn captureResourcesInto(self: *Run, comptime handler: anytype, args: anytype, inputs: *ResourceSet) !@FieldType(Captured(handler), "result") {
         std.debug.assert(self.capturing_resources == null);
-        self.capturing_resources = &inputs;
+        self.capturing_resources = inputs;
         defer self.capturing_resources = null;
         self.views.clearRetainingCapacity();
-        const result = try @call(.auto, handler, .{self} ++ args);
-        return .{ .resources = inputs, .result = result };
+        return @call(.auto, handler, .{self} ++ args);
     }
     fn validateResource(self: *Run, input: ResourceRead) !void {
         try self.service.context.check();
@@ -725,7 +739,7 @@ const Run = struct {
             self.authorize(source.owner, source.evidence.visibility) catch return false;
             if (!try self.evidenceRetained(source)) return false;
         }
-        return true;
+        return self.causalContextAvailable(inputs.context, false);
     }
     fn entityRetained(self: *Run, record: t.EntityRecord) !bool {
         return try self.retainedSupport(record.entity.evidence, &.{}, 0) and try self.generationRetained("entity", record.entity.id);
@@ -734,6 +748,28 @@ const Run = struct {
         const provenance = (try self.read(GenerationProvenance, try self.generationKey(kind, id))) orelse return true;
         for (provenance.evidence_ids) |input| {
             if (!try self.supportVisible(&.{.{ .id = input }}, &.{}, 0)) return false;
+        }
+        return self.causalContextAvailable(provenance.context, true);
+    }
+    // Context snapshots carry their complete causal closure, so checking them
+    // is bounded and cannot create cycles through later assertion revisions.
+    fn causalContextAvailable(self: *Run, inputs: []const t.DerivedDependency, visible: bool) !bool {
+        for (inputs) |input| {
+            try self.supportStep();
+            const ref = input.resource;
+            if (ref.kind == .assertion) {
+                if (try self.read(bool, try key(self.a, "forgotten-assertion", ref.id)) != null) return false;
+                const record = (try self.read(t.StoredAssertion, try historyKey(self.a, ref.id, ref.revision))) orelse return false;
+                self.authorize(record.owner, record.assertion.visibility) catch return false;
+            } else if (ref.kind == .entity) {
+                if (try self.read(bool, try key(self.a, "forgotten-entity", ref.id)) != null) return false;
+                const record = (try self.read(t.EntityRecord, try key(self.a, "entity", ref.id))) orelse return false;
+                if (record.revision != ref.revision) return false;
+                self.authorize(record.owner, record.entity.visibility) catch return false;
+            } else return error.MemoryCorruptState;
+            if (visible) {
+                if (!try self.supportVisible(input.evidence, &.{}, 0)) return false;
+            } else if (!try self.retainedSupport(input.evidence, &.{}, 0)) return false;
         }
         return true;
     }
@@ -1592,6 +1628,50 @@ const Run = struct {
         };
         return true;
     }
+    const JudgmentContext = struct {
+        dependencies: std.ArrayList(t.DerivedDependency) = .empty,
+        seen: ResourceSet = .empty,
+        evidence: ResourceSet = .empty,
+    };
+    fn captureJudgmentDependency(self: *Run, context: *JudgmentContext, input: t.DerivedDependency, audience: t.Visibility, depth: u8) anyerror!void {
+        if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
+        try self.supportStep();
+        const path = try hash(self.a, input.resource);
+        if (context.seen.contains(path)) return;
+        try context.seen.put(self.a, path, {});
+        try context.dependencies.append(self.a, input);
+        const ref = input.resource;
+        var parents: []const []const u8 = &.{};
+        if (ref.kind == .assertion) {
+            const record = (try self.read(t.StoredAssertion, try historyKey(self.a, ref.id, ref.revision))) orelse return error.MemoryResourceChanged;
+            if (audience == .team and record.assertion.visibility == .private) return error.MemoryVisibilityConflict;
+            const selected = try self.visibleSupport(record.assertion, null, self.service.context.now_ms);
+            parents = selected.depends_on;
+        } else if (ref.kind == .entity) {
+            const record = (try self.read(t.EntityRecord, try key(self.a, "entity", ref.id))) orelse return error.MemoryResourceChanged;
+            if (audience == .team and record.entity.visibility == .private) return error.MemoryVisibilityConflict;
+        } else return error.MemoryCorruptState;
+        for (input.evidence) |source| try context.evidence.put(self.a, source.id, {});
+        if (try self.read(GenerationProvenance, try self.generationKey(@tagName(ref.kind), ref.id))) |generation| {
+            for (generation.evidence_ids) |source| try context.evidence.put(self.a, source, {});
+            // Ancestors already froze their selected transitive closure. Copy
+            // it directly, never resolve those inputs against today's parents.
+            for (generation.context) |dependency| {
+                const inherited_path = try hash(self.a, dependency.resource);
+                if (!context.seen.contains(inherited_path)) {
+                    try self.supportStep();
+                    try context.seen.put(self.a, inherited_path, {});
+                    try context.dependencies.append(self.a, dependency);
+                    for (dependency.evidence) |source| try context.evidence.put(self.a, source.id, {});
+                }
+            }
+        }
+        for (parents) |id| {
+            const parent = (try self.assertion(id)) orelse return error.MemoryResourceChanged;
+            const selected = try self.visibleSupport(parent.assertion, null, self.service.context.now_ms);
+            try self.captureJudgmentDependency(context, .{ .resource = try self.resourceRef(.assertion, id, parent.revision), .evidence = selected.evidence }, audience, depth + 1);
+        }
+    }
     fn reviewEvidence(self: *Run, refs: []const t.EvidenceRef) !void {
         if (refs.len > t.max_items) return error.MemoryInputTooLarge;
         for (refs) |ref| {
@@ -1858,6 +1938,18 @@ const Run = struct {
         try text.appendSlice(self.a, record.entity.name);
         var complete = related.complete;
         for (related.items) |original| {
+            // Once full, older rows cannot contribute to this rendering. Do
+            // not traverse their support merely to discard their text.
+            if (dependencies.items.len > request.limit) {
+                complete = false;
+                break;
+            }
+            // Historical rendering must size the selected historical row,
+            // rather than reject it using today's statement length.
+            if (request.known_at == null and text.items.len + original.assertion.statement.len + 2 > 8192) {
+                complete = false;
+                continue;
+            }
             // A shared description has the entity's audience, regardless of
             // whether an administrator or curator renders it. Private support
             // cannot flow into a team projection or another owner's identity.
@@ -1940,12 +2032,24 @@ const Run = struct {
                 }
                 // All external review context is a conjunctive causal input
                 // of the accepted assertion, independent of factual support.
-                const evidence_ids = try self.a.alloc([]const u8, request.evidence.len);
-                for (request.evidence, evidence_ids) |ref, *input| input.* = ref.id;
+                var context: JudgmentContext = .{};
+                for (request.evidence) |ref| try context.evidence.put(self.a, ref.id, {});
+                const views = proposal.views orelse return error.MemoryResourceChanged;
+                for (views) |view| for (view.dependencies) |dependency| try self.captureJudgmentDependency(&context, dependency, proposal.assertion.visibility, 0);
+                const evidence_ids = try self.a.alloc([]const u8, context.evidence.count());
+                var sources = context.evidence.keyIterator();
+                var i: usize = 0;
+                while (sources.next()) |source| : (i += 1) {
+                    evidence_ids[i] = source.*;
+                    const context_source = (try self.evidence(source.*)) orelse return error.MemoryForgotten;
+                    if (proposal.assertion.visibility == .team and context_source.evidence.visibility == .private) return error.MemoryVisibilityConflict;
+                }
+                std.mem.sort([]const u8, evidence_ids, {}, stringLess);
                 if (try self.assertion(proposal.assertion.id) != null) return error.MemoryAssertionConflict;
-                try self.put(try self.generationKey("assertion", proposal.assertion.id), GenerationProvenance{ .operation_id = receipt.id, .config_generation = self.state.config.generation, .evidence_ids = evidence_ids });
+                try self.put(try self.generationKey("assertion", proposal.assertion.id), GenerationProvenance{ .operation_id = receipt.id, .config_generation = self.state.config.generation, .evidence_ids = evidence_ids, .context = context.dependencies.items, .views = views });
                 try self.assertions(&.{proposal.assertion}, false);
                 for (evidence_ids) |input| try self.put(try dependencyKey(self.a, "evidence", input, proposal.assertion.id), .{ .child = proposal.assertion.id });
+                for (context.dependencies.items) |input| try self.put(try dependencyKey(self.a, @tagName(input.resource.kind), input.resource.id, proposal.assertion.id), .{ .child = proposal.assertion.id });
             }
             proposal.state = if (accept) .accepted else .rejected;
         }
@@ -2360,7 +2464,18 @@ const Run = struct {
         self.temporal_boundary = null;
         self.temporal_denied = false;
         defer self.temporal_tracking = false;
-        const captured = try self.captureResources(semanticSnapshot, .{record});
+        var resources: ResourceSet = .empty;
+        const snapshot = self.captureResourcesInto(semanticSnapshot, .{record}, &resources) catch |err| {
+            // Rendering shares the same fair scheduling contract as embedding.
+            // Yield cumulative exhaustion after progress; an entity that also
+            // exhausts a fresh quantum becomes durable, timed readiness debt.
+            if (!isProcessingTimeout(err) and err != error.MemoryWorkLimit) return err;
+            if (progressed.*) return err;
+            try self.retireSemantic(record);
+            try self.deferSemanticFailure(record, err, resources);
+            unreachable;
+        };
+        const captured = .{ .result = snapshot, .resources = resources };
         self.temporal_tracking = false;
         // Eligibility, dependency bindings and serving retirement are also
         // derived publications, including a currently unavailable branch.

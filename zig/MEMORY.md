@@ -528,8 +528,14 @@ revalidates ontology and evidence and admits the assertion through ordinary
 native policy in the verdict transaction. Reject leaves the claim unpublished;
 defer leaves the proposal open. Additional judge-context evidence is conjunctive
 causal provenance of an accepted assertion; losing it prevents disclosure even
-if the original factual support survives. Rejection does not imply identity
-separation: typed relationship review rejects `pin_distinct`. Attribution and
+if the original factual support survives. Accepted relationships persist the
+exact judged view pins plus a deduplicated, immutable closure of their selected
+support, including transitive assertion revisions, generated context, entity
+references and source evidence. Both source evidence and assertion/entity
+forgetting fence reads immediately; dependency postings drive physical cleanup.
+Later support alternatives or mutable parent revisions cannot replace the
+context that was actually judged. Private view inputs cannot publish a team
+assertion. Rejection does not imply identity separation: typed relationship review rejects `pin_distinct`. Attribution and
 review reasons are retained only while their own evidence permits disclosure.
 None of these contracts accepts a hosted client, credential or prompt to execute.
 
@@ -843,14 +849,19 @@ embeddings. Partial entities retain dependency bindings and timers, and generati
 readiness remains false until every obligation is complete. Background owners
 may open one fresh five-second publication window, without further inference;
 publication still rechecks leadership, live grants, the memory revision and every
-captured source. Foreground deadlines cannot be extended. A provider failure on the first unfinished entity instead persists a durable
-per-entity failure obligation (configuration generation, attempt count, error code,
-and retry deadline), removes that entity from the runnable queue, and advances
+captured source. Foreground deadlines cannot be extended. Default description
+rendering stops traversing support once its statement limit is full and skips
+text that cannot fit the byte budget before evaluating its support. Rendering
+work exhaustion or timeouts on the first unfinished entity, like provider
+failures, persist a durable per-entity failure obligation (configuration generation, attempt count, error code,
+and retry deadline), remove that entity from the runnable queue, and advance
 the scan. Ordered timers retry it with exponential backoff capped at five minutes;
 healthy entities can finish while the failed obligation keeps indexed readiness
 false. Successful retries reuse partial projections and retire the failure row.
-Leadership, grant, source and revision failures still abort publication. Foreground
-expiry cannot be renewed to persist retry metadata.
+Rendering failures retire existing serving projections and fence retry metadata
+against every successfully captured source. Leadership, grant, source and
+revision failures still abort publication. Foreground expiry cannot be renewed
+to persist retry metadata.
 
 Assertion embedding reindexing checkpoints completed vectors and its last finished
 assertion cursor under the same bounded publication window. Retries reuse staged
