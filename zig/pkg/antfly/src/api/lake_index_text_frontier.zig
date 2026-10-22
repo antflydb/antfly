@@ -311,13 +311,12 @@ fn check(self: *Self) !void {
     try self.token.check();
     try self.cached.context.ensureActive();
 }
-fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: Id, token: Token, budget: *u64) ![]u8 {
+fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: Id, token: Token, budget: *u64) ![]u8 {
     const self: *Self = @ptrCast(@alignCast(raw));
     try self.check();
-    if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
     try stores.chargeReadBudget(budget, length);
     self.charged_bytes += length;
-    return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+    return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.cached);
 }
 const Range = struct {
     owner: *Self,

@@ -1872,17 +1872,18 @@ pub const NativeKeyPredicate = struct {
 
     ptr: *anyopaque,
     allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+    allows_many: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
     select_dense: ?*const fn (*anyopaque, Allocator) anyerror!?DenseIdSelection = null,
     /// Changes only when exact query-owned constraints become materialized.
     constraint_revision: ?*const fn (*anyopaque) u64 = null,
     select_constraints: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?SparseOrdinalSelection = null,
     select_range: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup, u32, u32) anyerror!?SparseOrdinalSelection = null,
     select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
-    const NativeCallbacks = struct { allows: @FieldType(NativeKeyPredicate, "allows"), select_dense: @FieldType(NativeKeyPredicate, "select_dense"), select_constraints: @FieldType(NativeKeyPredicate, "select_constraints"), select_range: @FieldType(NativeKeyPredicate, "select_range"), select_ordinals: @FieldType(NativeKeyPredicate, "select_ordinals") };
+    const NativeCallbacks = struct { allows_many: @FieldType(NativeKeyPredicate, "allows_many"), allows: @FieldType(NativeKeyPredicate, "allows"), select_dense: @FieldType(NativeKeyPredicate, "select_dense"), select_constraints: @FieldType(NativeKeyPredicate, "select_constraints"), select_range: @FieldType(NativeKeyPredicate, "select_range"), select_ordinals: @FieldType(NativeKeyPredicate, "select_ordinals") };
     const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
     /// The proxy is synchronous and must never escape the storage call.
     pub fn receiver(self: *const NativeKeyPredicate) NativeKeyPredicate {
-        return .{ .ptr = @ptrCast(@constCast(self)), .allows = receivedAllows, .select_dense = if (self.select_dense != null) receivedDense else null, .constraint_revision = if (self.constraint_revision != null) receivedRevision else null, .select_constraints = if (self.select_constraints != null) receivedConstraints else null, .select_range = if (self.select_range != null) receivedRange else null, .select_ordinals = if (self.select_ordinals != null) receivedOrdinals else null };
+        return .{ .ptr = @ptrCast(@constCast(self)), .allows = receivedAllows, .allows_many = if (self.allows_many != null) receivedMany else null, .select_dense = if (self.select_dense != null) receivedDense else null, .constraint_revision = if (self.constraint_revision != null) receivedRevision else null, .select_constraints = if (self.select_constraints != null) receivedConstraints else null, .select_range = if (self.select_range != null) receivedRange else null, .select_ordinals = if (self.select_ordinals != null) receivedOrdinals else null };
     }
     fn source(ptr: *anyopaque) *const NativeKeyPredicate {
         return @ptrCast(@alignCast(ptr));
@@ -1890,6 +1891,10 @@ pub const NativeKeyPredicate = struct {
     fn receivedAllows(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self = source(ptr);
         return NativeBoundary.call("allows", self.callback_dispatch, self.allows, .{ self.ptr, key });
+    }
+    fn receivedMany(ptr: *anyopaque, keys: []const []const u8, output: []bool) anyerror!void {
+        const self = source(ptr);
+        return NativeBoundary.call("allows_many", self.callback_dispatch, self.allows_many.?, .{ self.ptr, keys, output });
     }
     fn receivedDense(ptr: *anyopaque, alloc: Allocator) anyerror!?DenseIdSelection {
         const self = source(ptr);

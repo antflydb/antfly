@@ -114,12 +114,119 @@ pub fn selectedBytes(batch: rows.ColumnBatch, selection: []const usize) !usize {
     return bytes;
 }
 
+/// Bounded external clustering rewrites typed payloads into their consumption
+/// order. Indirect sorting is deliberately disabled: sorting only offsets would
+/// leave every logical window reopening unrelated physical producer pages.
+pub const Cluster = struct {
+    sort: spill.Sort,
+    width: usize,
+    count: u64 = 0,
+    pub fn init(a: A, manager: *spill.Manager, width: usize) Cluster {
+        var sort = spill.Sort.init(a, manager, &.{.{}}, 4 * 1024 * 1024);
+        sort.allow_indirect = false;
+        sort.parallel_runs = false;
+        sort.encoded_bytes = true;
+        sort.shared_runs = true;
+        return .{ .sort = sort, .width = width };
+    }
+    pub fn deinit(self: *Cluster) void {
+        self.sort.deinit();
+    }
+    pub fn add(self: *Cluster, a: A, source: []const rows.ColumnVector, keys: []const []const u8, selected: []const usize, sizing: Sizer) !void {
+        const Datum = local.sql_scalar.Datum;
+        if (keys.len != selected.len) return error.InvalidLogicalRowIdentity;
+        const sizes = try a.alloc(i64, selected.len);
+        for (sizes, selected) |*size, row| size.* = std.math.cast(i64, try sizing.selected(&.{row})) orelse return error.SqlProgramLimitExceeded;
+        const Reader = @import("lake_index_build_replay.zig").Replay.CaptureBatch;
+        var adapter: Reader = .{ .vectors = source };
+        const input: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &adapter, .read = Reader.cell, .read_physical = Reader.physical, .read_identity = Reader.identity, .count = sizing.sizes.len, .width = source.len } };
+        const Sized = struct {
+            input: local.sql_execution_batch.Batch,
+            sizes: []const i64,
+            fn cell(raw: *anyopaque, alloc: A, row: usize, column: usize) !Datum {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                if (column == self_.input.width()) return .{ .value = .{ .integer = self_.sizes[row] }, .sql_null = false };
+                return self_.input.cell(alloc, row, column);
+            }
+            fn physical(raw: *anyopaque, alloc: A, column: usize) !?local.sql_execution_batch.PhysicalColumn {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                if (column == self_.input.width()) return .{ .vector = .{ .name = "_capture_bytes", .values = .{ .i64 = self_.sizes } }, .range = .{ .count = self_.sizes.len }, .kind = .integer };
+                return self_.input.physicalColumn(alloc, column);
+            }
+        };
+        var sized: Sized = .{ .input = try input.select(a, selected), .sizes = sizes };
+        const values: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &sized, .read = Sized.cell, .read_physical = Sized.physical, .count = selected.len, .width = source.len + 1 } };
+        const datums = try a.alloc(Datum, keys.len);
+        const order = try a.alloc([]const Datum, keys.len);
+        const ordinals = try a.alloc(u64, keys.len);
+        for (keys, datums, order, ordinals, 0..) |key, *datum, *slice, *ordinal, i| {
+            datum.* = .{ .value = .{ .string = key }, .sql_null = false };
+            slice.* = datum[0..1];
+            ordinal.* = self.count + i;
+        }
+        try self.sort.addBatch(values, order, ordinals);
+        self.count += selected.len;
+    }
+    pub fn finish(self: *Cluster, payloads: *spill.JoinPayloads, edits: *Mutations) !void {
+        const View = struct {
+            leases: []const spill.Sort.RowLease,
+            fn cell(raw: *anyopaque, _: A, row: usize, column: usize) !local.sql_scalar.Datum {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                return self_.leases[row].cell(column);
+            }
+        };
+        var pending: ?spill.Sort.RowLease = null;
+        defer if (pending) |lease| lease.release();
+        var previous: [32]u8 = undefined;
+        var previous_len: usize = 0;
+        while (true) {
+            var leases: [spill.JoinPayloads.page_rows]spill.Sort.RowLease = undefined;
+            var count: usize = 0;
+            defer for (leases[0..count]) |lease| lease.release();
+            var bytes: usize = 0;
+            while (count < leases.len) {
+                const lease = if (pending) |value| value else (try self.sort.nextLeased()) orelse break;
+                pending = null;
+                errdefer lease.release();
+                const size = try lease.cell(self.width);
+                if (size.sql_null or size.value != .integer or size.value.integer < 0) return error.InvalidSqlSpill;
+                const cost: usize = @intCast(size.value.integer);
+                if (count != 0 and cost > 8 * 1024 * 1024 -| bytes) {
+                    pending = lease;
+                    break;
+                }
+                leases[count] = lease;
+                count += 1;
+                bytes +|= cost;
+            }
+            if (count == 0) break;
+            var view: View = .{ .leases = leases[0..count] };
+            const batch: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &view, .read = View.cell, .count = count, .width = self.width } };
+            const offset = try payloads.appendBatch(batch);
+            for (leases[0..count], 0..) |lease, row| {
+                const key = try lease.keyCell(0);
+                if (key.sql_null or key.value != .string or key.value.string.len > previous.len) return error.InvalidLogicalRowIdentity;
+                if (previous_len != 0 and std.mem.order(u8, previous[0..previous_len], key.value.string) != .lt) return error.InvalidLogicalRowIdentity;
+                previous_len = key.value.string.len;
+                @memcpy(previous[0..previous_len], key.value.string);
+                const size = try lease.cell(self.width);
+                var value: [24]u8 = undefined;
+                std.mem.writeInt(u64, value[0..8], offset, .big);
+                std.mem.writeInt(u64, value[8..16], row, .big);
+                std.mem.writeInt(u64, value[16..24], @intCast(size.value.integer), .big);
+                try edits.addRecord(key.value.string, &value);
+            }
+        }
+    }
+};
+
 pub const Capture = struct {
     const workspace_bytes = 64 * 1024 * 1024;
     a: A,
     budget: local.sql_memory_budget,
     manager: spill.Manager = undefined,
     payloads: spill.JoinPayloads = undefined,
+    cluster: ?Cluster = null,
     routes: PrivatePages = undefined,
     edits: ?Mutations = null,
     route_store: tree.Store = undefined,
@@ -163,6 +270,7 @@ pub const Capture = struct {
         self.routes = .{ .manager = &self.manager, .domain = scope.domain, .attempt = scope.attempt, .phase = store.io_phase };
         self.payloads = try spill.JoinPayloads.init(&self.manager);
         self.initialized = true;
+        self.cluster = Cluster.init(ca, &self.manager, columns.len);
         self.route_store = try PrivatePages.beginRun(&self.routes);
         self.edits = Mutations.init(ca, &self.manager, self.route_store);
         self.edits.?.private_pages.phase = store.io_phase;
@@ -171,6 +279,7 @@ pub const Capture = struct {
         try @as(*Capture, @ptrCast(@alignCast(raw))).context.ensureActive();
     }
     pub fn deinit(self: *Capture) void {
+        if (self.cluster) |*cluster| cluster.deinit();
         if (self.edits) |*edits| edits.deinit();
         if (self.initialized) {
             self.payloads.close();
@@ -197,32 +306,24 @@ pub const Capture = struct {
         defer sizing.deinit();
         const bound_vectors = try vectors(ca, batch, self.columns, self.specs, self.bound);
         self.bound = true;
-        var adapter: @import("lake_index_build_replay.zig").Replay.CaptureBatch = .{ .vectors = bound_vectors };
-        const Reader = @import("lake_index_build_replay.zig").Replay.CaptureBatch;
-        const borrowed: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &adapter, .read = Reader.cell, .read_physical = Reader.physical, .read_identity = Reader.identity, .count = batch.rowCount(), .width = self.columns.len } };
-        var begin: usize = 0;
-        while (begin < batch.rowCount()) {
-            var selection: [spill.JoinPayloads.page_rows]usize = undefined;
-            var take = @min(selection.len, batch.rowCount() - begin);
-            for (&selection, begin..) |*row, i| row.* = i;
-            while (take > 1 and try sizing.selected(selection[0..take]) > 8 * 1024 * 1024) take = @max(1, take / 2);
-            var phase = try store.beginIo(1);
-            defer phase.abort();
-            const offset = self.payloads.appendBatch(try borrowed.select(ca, selection[0..take])) catch |err| return phase.failed(err);
-            try phase.finish();
-            for (selection[0..take], 0..) |row, ordinal| {
-                var value: [24]u8 = undefined;
-                std.mem.writeInt(u64, value[0..8], offset, .big);
-                std.mem.writeInt(u64, value[8..16], ordinal, .big);
-                std.mem.writeInt(u64, value[16..24], try sizing.selected(&.{row}), .big);
-                try self.edits.?.addRecord(&ids[row], &value);
-                self.rows += 1;
-            }
-            begin += take;
+        const keys = try ca.alloc([]const u8, ids.len);
+        const selected = try ca.alloc(usize, ids.len);
+        for (ids, keys, selected, 0..) |*id, *key, *row, i| {
+            key.* = id;
+            row.* = i;
         }
+        var phase = try store.beginIo(1);
+        defer phase.abort();
+        self.cluster.?.add(ca, bound_vectors, keys, selected, sizing) catch |err| return phase.failed(err);
+        try phase.finish();
+        self.rows += ids.len;
     }
+
     pub fn finish(self: *Capture, expected_rows: u64) !void {
         if (self.rows != expected_rows) return error.InvalidLogicalRowIdentity;
+        try self.cluster.?.finish(&self.payloads, &self.edits.?);
+        self.cluster.?.deinit();
+        self.cluster = null;
         self.route_root = try self.edits.?.finish(null);
         if ((if (self.route_root) |root| root.records else 0) != expected_rows) return error.InvalidLogicalRowIdentity;
         self.edits.?.deinit();
@@ -246,4 +347,49 @@ test "external lake payload sizing validates dictionary once and retains linear 
     const first = try sizing.selected(&.{0});
     for (0..4096) |row| try std.testing.expectEqual(first, try sizing.selected(&.{row}));
     try std.testing.expectError(error.RowSourceDictionaryIndexOutOfBounds, Sizer.bind(a, batch));
+}
+
+test "external lake clustered payloads retain exact decimal and raw JSON through allocation failures" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("clustered-payload-ownership");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(37), 1, std.testing.io);
+    const Run = struct {
+        fn run(alloc: A, artifacts_: *stores.ArtifactStore) !void {
+            var provider: @import("lake_index_row_source.zig").Provider = .{ .source = undefined, .context = .{ .io = std.testing.io } };
+            const capture = (try Capture.start(alloc, &provider, artifacts_, &.{ "exact", "json" })).?;
+            defer capture.deinit();
+            const batch: rows.ColumnBatch = .{ .snapshot = .{ .table_id = "source", .snapshot_id = "snapshot" }, .external_span = .{ .first = .{ .source_id = "source", .snapshot_id = "snapshot", .file_id = "part", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = 3 }, .columns = &.{
+                .{ .name = "exact", .values = .{ .decimal128 = .{ .precision = 38, .scale = 3, .values = &.{ 9007199254740993123, -9007199254740993123, 0 } } } },
+                .{ .name = "json", .values = .{ .json = &.{ "{\"n\":9007199254740993123}", "[null,1.2300]", "null" } } },
+            } };
+            var ids: [3][32]u8 = @splat(@splat(0));
+            ids[0][0] = 3;
+            ids[1][0] = 1;
+            ids[2][0] = 2;
+            try capture.add(batch, &ids, artifacts_);
+            try capture.finish(3);
+            try std.testing.expectEqual(rows.ColumnKind.decimal128, capture.specs[0].kind);
+            try std.testing.expectEqual(rows.ColumnKind.json, capture.specs[1].kind);
+            var cursor = try tree.Cursor.init(alloc, capture.route_store, capture.route_root, "", null);
+            defer cursor.deinit();
+            for ([_]usize{ 1, 2, 0 }) |physical| {
+                const entry = (try cursor.next()).?;
+                try std.testing.expectEqualSlices(u8, &ids[physical], entry.key);
+                const offset = std.mem.readInt(u64, entry.value[0..8], .big);
+                const row: usize = @intCast(std.mem.readInt(u64, entry.value[8..16], .big));
+                const block = try capture.payloads.read(offset);
+                defer block.release();
+                const decimal = try block.cell(row, 0);
+                try std.testing.expectEqual(batch.columns[0].values.decimal128.values[physical], std.mem.readInt(i128, decimal.value.string[0..16], .big));
+                const json = try block.cell(row, 1);
+                try std.testing.expectEqualStrings(batch.columns[1].values.json[physical], json.value.string);
+            }
+            try std.testing.expect((try cursor.next()) == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{&store});
 }

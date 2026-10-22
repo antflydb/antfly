@@ -969,12 +969,11 @@ pub const Resolver = struct {
         if (self.page_cache == null) self.page_cache = .{ .alloc = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .underlying = self.pages.store(), .max_bytes = self.page_cache_limit };
         return self.page_cache.?.store();
     }
-    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, _: [32]u8, token: Token, budget: *u64) ![]u8 {
+    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, page_digest: [32]u8, token: Token, budget: *u64) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         try self.cached.context.ensureActive();
         try stores.chargeReadBudget(budget, length);
-        if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeFileState;
-        return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, page_digest, token, self.cached);
     }
     fn point(self: *@This(), a: A, root: ?tree.Ref, id: []const u8) !?[]u8 {
         var ref = root orelse return null;

@@ -172,10 +172,13 @@ allocator failures, source failures and corrupt authenticated evidence still
 propagate. These limits are separate from SQL query limits.
 
 Full verification of at least 128 rows can also capture the projected typed
-payloads in private compressed spill pages during that same source pass. Once
-keys, duplicates and root admission are verified, construction merges the captured
-logical-ID/offset stream directly with the native ID census and sorts only final
-fragment coordinate/offset routes. Adjacent selected radix leaves coalesce into
+payloads during that same source pass. A bounded native external sort clusters
+those payloads by logical ID before writing private compressed 64-row pages.
+The sort keeps typed payloads inline through its spill/merge passes: an indirect
+offset-only sort would preserve physical scan order and defeat read locality.
+Once keys, duplicates and root admission are verified, construction merges the
+captured logical-ID/offset stream directly with the native ID census and sorts
+only the final fragment coordinate/offset routes. Adjacent selected radix leaves coalesce into
 half-open joins; untouched ranges are never scanned again during adoption. The
 capture first certifies its complete route count, and every selected range checks
 matching IDs, exact native coordinates and expected row counts. The selective
@@ -324,8 +327,9 @@ rehash the affected ranges conservatively.
 Construction chooses between two bounded source paths. Selective changes use
 256-row physical gathers and the existing projected replay. When at least one
 eighth of a source with 128 or more rows needs rebuilding, one delete-aware
-projected physical pass writes typed payload pages once and partitions compact
-logical-coordinate references into private spill trees. A complete verification
+projected physical pass clusters typed payloads by logical coordinate with the
+same bounded external sorter, then partitions compact references into private
+spill trees. A complete verification
 capture already owns those payloads, so any nonempty changed selection can reuse
 it without another physical pass, including selections below the broad-spool
 threshold. Independent builders then
@@ -393,12 +397,43 @@ hashed vector ID. Verification uses one pinned native read transaction and a sor
 batch metadata lookup, with exact key comparison before accepting each ID.
 Partial plans retain the exact residual predicate; declined
 translations never reinterpret current coordinates as historical native addresses.
-Broad selections keep bounded candidate membership evaluation.
+Broad selections keep their compressed include/exclude masks. Native HBC
+filters metadata in 128-candidate tiles, translating each tile through the
+per-index resolver before exact membership evaluation. File lookup is shared
+inside each tile, while the legacy scalar callback remains available to older
+owners and singleton paths. There is no archive-sized dense ID expansion.
+Cancellation and translation failures abort the search rather than publishing a
+partial selection.
 
 Real Parquet and Iceberg E2Es exercise append, removal, per-index input changes,
 mixed original spaces, forward/backward pages and restart against fresh-build
 oracles. These are correctness qualifications, not archive-scale throughput or
 live-cloud retention measurements.
+
+## Packed immutable navigation
+
+Reader protocol 74 permits native lake publication builders to concatenate up
+to eight navigation pages into one immutable object (at most 8 MiB). Each page
+reference still commits its own digest, byte length, record count, height and
+attempt, and additionally binds the pack digest, object length and range offset.
+Sorted builders upload a complete batch and install its locators before encoding
+parents. Failed or interrupted uploads expose no partial root; standalone writes
+and old references keep their previous representation. Copy-on-write changes can
+reuse packed siblings without rewriting their containing object.
+
+Cold point reads fetch only the authenticated page range. Shared memory/disk
+cache keys include the object identity, offset, length and individual page digest;
+decoded-page keys include the complete locator. Packing reduces publication
+object and PUT fan-out. It does not by itself guarantee fewer GETs for unrelated
+point seeks, and no network-latency claim is based on local measurements.
+
+Collectors retain the complete containing object but expand each logical page
+independently. Resumable marks distinguish page digest, offset and interpretation,
+so visiting one packed sibling cannot hide another sibling's payload dependencies.
+Cloud generation maps record actual pack uploads, and publication-bound retention
+certificates audit that same closure. Reader leases keep old packs reachable until
+their last retained publication retires. Graph topology/document-fact writers
+continue using their standalone-page publication path.
 
 ## Staged extensions
 

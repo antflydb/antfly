@@ -37,21 +37,41 @@ const header_bytes = 56;
 const ref_bytes = 61;
 const magic = "AFGPT003";
 
+pub const max_pack_bytes = max_page_bytes * max_write_batch;
+pub const Pack = struct { digest: [32]u8, bytes: u32, offset: u32 };
+
 pub const Ref = struct {
     digest: [32]u8,
     attempt: [16]u8 = @splat(0),
     bytes: u32,
     height: u8,
     records: u64,
-
+    /// The page digest authenticates this exact range independently of its pack.
+    pack: ?Pack = null,
+    pub fn jsonStringify(self: Ref, writer: anytype) !void {
+        if (self.pack != null) return writer.write(.{ .digest = self.digest, .attempt = self.attempt, .bytes = self.bytes, .height = self.height, .records = self.records, .pack = self.pack });
+        return writer.write(.{ .digest = self.digest, .attempt = self.attempt, .bytes = self.bytes, .height = self.height, .records = self.records });
+    }
+    pub fn artifactDigest(self: Ref) [32]u8 {
+        return if (self.pack) |pack_| pack_.digest else self.digest;
+    }
+    pub fn artifactBytes(self: Ref) u32 {
+        return if (self.pack) |pack_| pack_.bytes else self.bytes;
+    }
+    pub fn offset(self: Ref) u32 {
+        return if (self.pack) |pack_| pack_.offset else 0;
+    }
     pub fn eql(a: Ref, b: Ref) bool {
         return a.bytes == b.bytes and a.height == b.height and a.records == b.records and
-            std.mem.eql(u8, &a.digest, &b.digest) and std.mem.eql(u8, &a.attempt, &b.attempt);
+            std.mem.eql(u8, &a.digest, &b.digest) and std.mem.eql(u8, &a.attempt, &b.attempt) and std.meta.eql(a.pack, b.pack);
     }
 
     pub fn validate(self: Ref) !void {
         if (self.bytes < header_bytes or self.bytes > max_page_bytes or
             self.height > max_height or self.records == 0) return error.InvalidGraphPage;
+        if (self.pack) |pack_| {
+            if (pack_.bytes > max_pack_bytes or pack_.bytes < self.bytes or pack_.offset > pack_.bytes - self.bytes or std.mem.allEqual(u8, &pack_.digest, 0)) return error.InvalidGraphPage;
+        }
     }
 };
 
@@ -86,6 +106,9 @@ pub const Store = struct {
     /// Persist the entire bounded batch before returning. On failure no root
     /// escapes the private sorted builder; scoped orphans remain collectible.
     put_many: ?*const fn (*anyopaque, []const Write) anyerror!void = null,
+    /// Upload a bounded pack and bind its immutable locators before parent
+    /// serialization. Only SortedBuilder uses this mutable private capability.
+    pack_many: ?*const fn (*anyopaque, []Write) anyerror!void = null,
     check: *const fn (*anyopaque) anyerror!void,
     /// Pure bounded reduction, authenticated in the page and parent routing entry.
     /// Existing trees retain their original wire representation when absent.
@@ -116,7 +139,7 @@ pub const Cache = struct {
     }
 
     pub fn store(self: *Cache) Store {
-        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .prefix_keys = self.underlying.prefix_keys, .decoded_page = self.underlying.decoded_page, .read_many = self.underlying.read_many, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .check = check, .reduce = self.underlying.reduce };
+        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .prefix_keys = self.underlying.prefix_keys, .decoded_page = self.underlying.decoded_page, .read_many = self.underlying.read_many, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .pack_many = if (self.underlying.pack_many != null) packMany else null, .check = check, .reduce = self.underlying.reduce };
     }
 
     fn check(ptr: *anyopaque) !void {
@@ -167,6 +190,10 @@ pub const Cache = struct {
         const self: *Cache = @ptrCast(@alignCast(ptr));
         try self.underlying.put(self.underlying.ptr, ref, bytes);
     }
+    fn packMany(ptr: *anyopaque, writes: []Write) !void {
+        const self: *Cache = @ptrCast(@alignCast(ptr));
+        try self.underlying.pack_many.?(self.underlying.ptr, writes);
+    }
     fn putMany(ptr: *anyopaque, writes: []const Write) !void {
         const self: *Cache = @ptrCast(@alignCast(ptr));
         try self.underlying.put_many.?(self.underlying.ptr, writes);
@@ -186,7 +213,7 @@ pub const Entry = struct {
     aggregate: []const u8 = "",
 
     fn size(self: Entry) usize {
-        return 8 + self.key.len + if (self.child != null) ref_bytes + self.aggregate.len else self.value.len;
+        return 8 + self.key.len + if (self.child != null) ref_bytes + 1 + @as(usize, if (self.child.?.pack != null) 40 else 0) + self.aggregate.len else self.value.len;
     }
 };
 
@@ -426,7 +453,7 @@ fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
     if (!std.mem.eql(u8, &digest, &ref.digest)) return error.ArtifactIntegrityMismatch;
     if (!std.mem.eql(u8, bytes[24..56], &store.domain)) return error.GraphPageDomainMismatch;
     if (!std.mem.eql(u8, bytes[0..8], magic) or bytes[8] != ref.height or
-        bytes[9] & ~@as(u8, 3) != 0 or readU64(bytes, 16) != ref.records)
+        bytes[9] & ~@as(u8, 7) != 0 or readU64(bytes, 16) != ref.records)
         return error.InvalidGraphPage;
     const aggregate_len = std.mem.readInt(u16, bytes[10..12], .little);
     if (aggregate_len > max_aggregate_bytes or aggregate_len > bytes.len - header_bytes or
@@ -478,19 +505,31 @@ fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
             entry.value = value;
             records += 1;
         } else {
-            if (value_len < ref_bytes or value_len > ref_bytes + max_aggregate_bytes or (bytes[9] & 1 == 0 and value_len != ref_bytes)) return error.InvalidGraphPage;
-            const child: Ref = .{
+            if (value_len < ref_bytes or value_len > ref_bytes + 41 + max_aggregate_bytes) return error.InvalidGraphPage;
+            var child: Ref = .{
                 .digest = value[0..32].*,
                 .bytes = readU32(value, 32),
                 .height = value[36],
                 .records = readU64(value, 37),
                 .attempt = value[45..61].*,
             };
+            var child_end: usize = ref_bytes;
+            if (bytes[9] & 4 != 0) {
+                if (value_len <= child_end or value[child_end] > 1) return error.InvalidGraphPage;
+                const is_packed = value[child_end] == 1;
+                child_end += 1;
+                if (is_packed) {
+                    if (value_len - child_end < 40) return error.InvalidGraphPage;
+                    child.pack = .{ .digest = value[child_end..][0..32].*, .bytes = readU32(value, child_end + 32), .offset = readU32(value, child_end + 36) };
+                    child_end += 40;
+                }
+            }
+            if (value_len - child_end > max_aggregate_bytes or (bytes[9] & 1 == 0 and value_len != child_end)) return error.InvalidGraphPage;
             try child.validate();
             if (child.height + 1 != ref.height) return error.InvalidGraphPage;
             records = std.math.add(u64, records, child.records) catch return error.InvalidGraphPage;
             entry.child = child;
-            entry.aggregate = value[ref_bytes..];
+            entry.aggregate = value[child_end..];
         }
         if (entry.size() > max_record_bytes) return error.InvalidGraphPage;
     }
@@ -515,10 +554,13 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
     const aggregate = if (store.reduce) |reduce| try reduce(alloc, entries, height) else try alloc.alloc(u8, 0);
     errdefer alloc.free(aggregate);
     if (aggregate.len > max_aggregate_bytes or (store.reduce != null and aggregate.len == 0)) return error.InvalidGraphPage;
+    const packed_children = for (entries) |entry| {
+        if (entry.child) |child| if (child.pack != null) break true;
+    } else false;
     var size: usize = header_bytes + aggregate.len;
     var records: u64 = 0;
     for (entries) |entry| {
-        size += entry.size() - (if (entry.child != null and store.reduce == null) entry.aggregate.len else 0);
+        size += entry.size() - (if (entry.child != null and store.reduce == null) entry.aggregate.len else 0) - @as(usize, if (entry.child != null and !packed_children) 1 else 0);
         records = try std.math.add(u64, records, if (entry.child) |child| child.records else 1);
     }
     if (size > max_page_bytes) return error.GraphPageTooLarge;
@@ -539,7 +581,7 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
     @memcpy(bytes[0..8], magic);
     @memcpy(bytes[24..56], &store.domain);
     bytes[8] = height;
-    bytes[9] = @as(u8, if (aggregate.len == 0) 0 else 1) | @as(u8, if (prefix == 0) 0 else 2);
+    bytes[9] = @as(u8, if (aggregate.len == 0) 0 else 1) | @as(u8, if (prefix == 0) 0 else 2) | @as(u8, if (packed_children) 4 else 0);
     std.mem.writeInt(u16, bytes[10..12], @intCast(aggregate.len), .little);
     writeU32(bytes, 12, entries.len);
     writeU64(bytes, 16, records);
@@ -555,7 +597,8 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
     for (entries) |entry| {
         writeU32(bytes, offset, entry.key.len - prefix);
         const child_aggregate = if (store.reduce != null) entry.aggregate else "";
-        writeU32(bytes, offset + 4, if (entry.child != null) ref_bytes + child_aggregate.len else entry.value.len);
+        const locator_bytes: usize = if (entry.child) |child| (if (packed_children) @as(usize, 1) + @as(usize, if (child.pack != null) 40 else 0) else 0) else 0;
+        writeU32(bytes, offset + 4, if (entry.child != null) ref_bytes + locator_bytes + child_aggregate.len else entry.value.len);
         offset += 8;
         @memcpy(bytes[offset..][0 .. entry.key.len - prefix], entry.key[prefix..]);
         offset += entry.key.len - prefix;
@@ -565,8 +608,19 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
             bytes[offset + 36] = child.height;
             writeU64(bytes, offset + 37, child.records);
             @memcpy(bytes[offset + 45 ..][0..16], &child.attempt);
-            @memcpy(bytes[offset + ref_bytes ..][0..child_aggregate.len], child_aggregate);
-            offset += ref_bytes + child_aggregate.len;
+            offset += ref_bytes;
+            if (packed_children) {
+                bytes[offset] = if (child.pack != null) 1 else 0;
+                offset += 1;
+                if (child.pack) |pack_| {
+                    @memcpy(bytes[offset..][0..32], &pack_.digest);
+                    writeU32(bytes, offset + 32, pack_.bytes);
+                    writeU32(bytes, offset + 36, pack_.offset);
+                    offset += 40;
+                }
+            }
+            @memcpy(bytes[offset..][0..child_aggregate.len], child_aggregate);
+            offset += child_aggregate.len;
         } else {
             @memcpy(bytes[offset..][0..entry.value.len], entry.value);
             offset += entry.value.len;
@@ -958,6 +1012,7 @@ pub const SortedBuilder = struct {
     closed: bool = false,
     pending: [max_write_batch]Write = undefined,
     pending_count: usize = 0,
+    pending_parents: [max_write_batch]struct { height: usize, index: usize } = undefined,
     // The extra slot holds the final root ref, never another persisted page.
     levels: [max_height + 2]Level = @splat(.{}),
 
@@ -1053,9 +1108,27 @@ pub const SortedBuilder = struct {
 
     fn flush(self: *SortedBuilder, height: usize) anyerror!void {
         if (height > max_height) return error.GraphPageTreeTooDeep;
+        // A parent may be encoded only after every child's final locator is
+        // durably bound. Earlier levels can still share one bounded pack.
+        if (self.store.pack_many != null and height > 0) try self.persist();
         const level = &self.levels[height];
         var aggregate: []u8 = &.{};
         defer self.alloc.free(aggregate);
+        if (self.store.pack_many != null) {
+            const page = try encode(self.alloc, self.store, level.entries.items, @intCast(height), &aggregate);
+            var owned = true;
+            defer if (owned) self.alloc.free(page.bytes);
+            // append may recursively flush a full parent. Queue this new page
+            // only after that recursion, so every pending ref has a live slot.
+            try self.append(height + 1, .{ .key = level.entries.items[0].key, .child = page.ref, .aggregate = aggregate });
+            self.pending[self.pending_count] = page;
+            self.pending_parents[self.pending_count] = .{ .height = height + 1, .index = self.levels[height + 1].entries.items.len - 1 };
+            self.pending_count += 1;
+            owned = false;
+            if (self.pending_count == self.pending.len) try self.persist();
+            level.clear(self.alloc);
+            return;
+        }
         const ref = if (self.store.put_many != null) queued: {
             const page = try encode(self.alloc, self.store, level.entries.items, @intCast(height), &aggregate);
             self.pending[self.pending_count] = page;
@@ -1070,7 +1143,16 @@ pub const SortedBuilder = struct {
     fn persist(self: *SortedBuilder) !void {
         if (self.pending_count == 0) return;
         try self.store.check(self.store.ptr);
-        try self.store.put_many.?(self.store.ptr, self.pending[0..self.pending_count]);
+        if (self.store.pack_many) |pack_many| {
+            try pack_many(self.store.ptr, self.pending[0..self.pending_count]);
+            for (self.pending[0..self.pending_count], self.pending_parents[0..self.pending_count]) |page, parent| {
+                const level = &self.levels[parent.height];
+                const entry = &level.entries.items[parent.index];
+                level.bytes -= entry.size();
+                entry.child = page.ref;
+                level.bytes += entry.size();
+            }
+        } else try self.store.put_many.?(self.store.ptr, self.pending[0..self.pending_count]);
         for (self.pending[0..self.pending_count]) |page| self.alloc.free(page.bytes);
         self.pending_count = 0;
     }

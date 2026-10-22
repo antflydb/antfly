@@ -13855,7 +13855,7 @@ fn searchDenseInternal(
             .epsilon = resolved_epsilon,
             .rerank_factor = resolveRerankFactor(effort),
             .filter_prefix = req.filter_prefix,
-            .key_predicate = if (dense_residual) if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows } else null else null,
+            .key_predicate = if (dense_residual) if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows, .allows_many = predicate.allows_many } else null else null,
             .distance_over = req.distance_over,
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
@@ -34834,4 +34834,68 @@ test "logical value bootstrap reads only two originals before pinning projection
     try std.testing.expectEqual(@as(usize, docs.len - 2), loader.projected);
     try std.testing.expectEqual(@as(usize, 1), loader.opens);
     try std.testing.expectEqual(@as(u64, docs.len * body.len), execution.local_work.bytes.load(.monotonic));
+}
+
+test "native dense residual batches cross named callbacks and preserve HBC filters" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/native-batch-filter", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var dense = try hbc_mod.HBCIndex.open(a, path.ptr, .{ .dims = 2, .leaf_size = 256, .branching_factor = 8 });
+    defer dense.close();
+    const count = 6001;
+    const vectors = try a.alloc([2]f32, count);
+    defer a.free(vectors);
+    const metadata = try a.alloc([32]u8, count);
+    defer a.free(metadata);
+    const items = try a.alloc(hbc_mod.BatchInsertItem, count);
+    defer a.free(items);
+    for (vectors, metadata, items, 0..) |*vector, *key, *item, i| {
+        vector.* = .{ @floatFromInt(i), 0 };
+        item.* = .{ .vector_id = i + 1, .vector = vector, .metadata = try std.fmt.bufPrint(key, "doc:{d}", .{i}) };
+    }
+    try dense.bulkBuildWithMetadata(items);
+    const Predicate = struct {
+        calls: usize = 0,
+        candidates: usize = 0,
+        scalar_calls: usize = 0,
+        cancel: bool = false,
+        canceled: std.atomic.Value(bool) = .init(false),
+        fn keep(key: []const u8) !bool {
+            const ordinal = try std.fmt.parseUnsigned(usize, key[4..], 10);
+            return ordinal % 3 == 0 and ordinal != 6;
+        }
+        fn one(raw: *anyopaque, key: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.scalar_calls += 1;
+            return keep(key);
+        }
+        fn many(raw: *anyopaque, keys: []const []const u8, allowed: []bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(keys.len <= 128);
+            self.calls += 1;
+            self.candidates += keys.len;
+            for (keys, allowed) |key, *result| result.* = try keep(key);
+            if (self.cancel) self.canceled.store(true, .release);
+        }
+    };
+    var state: Predicate = .{};
+    const predicate: types.NativeKeyPredicate = .{ .ptr = &state, .allows = Predicate.one, .allows_many = Predicate.many };
+    const received = predicate.receiver();
+    var request: hbc_mod.SearchRequest = .{ .query = &.{ 0, 0 }, .k = 16, .search_effort = 1, .key_predicate = .{ .ptr = received.ptr, .allows = received.allows, .allows_many = received.allows_many } };
+    var found = try dense.searchWithRequest(request);
+    defer found.deinit();
+    try std.testing.expect(state.calls > 1 and state.candidates >= count);
+    try std.testing.expectEqual(@as(usize, 16), found.getHits().len);
+    for (found.getHits(), 0..) |hit, i| try std.testing.expectEqual(@as(u64, (if (i < 2) i else i + 1) * 3 + 1), hit.vector_id);
+    // Legacy owners still use exact scalar evaluation.
+    request.key_predicate.?.allows_many = null;
+    var scalar = try dense.searchWithRequest(request);
+    defer scalar.deinit();
+    for (found.getHits(), scalar.getHits()) |batch_hit, scalar_hit| try std.testing.expectEqual(batch_hit.vector_id, scalar_hit.vector_id);
+    request.key_predicate.?.allows_many = received.allows_many;
+    request.cancellation = hbc_mod.CancellationToken.fromAtomic(&state.canceled);
+    state.cancel = true;
+    try std.testing.expectError(error.Cancelled, dense.searchWithRequest(request));
 }

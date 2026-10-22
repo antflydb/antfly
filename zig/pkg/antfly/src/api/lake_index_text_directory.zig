@@ -121,12 +121,11 @@ const Reader = struct {
         try self.token.check();
         if (self.cached) |cached| try cached.context.ensureActive();
     }
-    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: Id, token: Cancellation, budget: *u64) ![]u8 {
+    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: Id, token: Cancellation, budget: *u64) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         try self.check();
-        if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
         try stores.chargeReadBudget(budget, length);
-        return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.cached);
     }
 };
 fn key(id: Id, offset: usize) [36]u8 {

@@ -838,12 +838,11 @@ const inventory_pages = @import("../serverless/graph_segment/page_store.zig");
 fn readServingInventory(a: A, scratch_backing: A, directory: Root, store_value: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Root {
     const Read = struct {
         cached: artifacts.CachedRead,
-        fn page(raw: *anyopaque, alloc: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, _: [32]u8, token: Cancellation, budget: *u64) ![]u8 {
+        fn page(raw: *anyopaque, alloc: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, digest: [32]u8, token: Cancellation, budget: *u64) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.cached.context.ensureActive();
-            if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
             try stores.chargeReadBudget(budget, length);
-            return artifacts.readArtifact(alloc, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+            return artifacts.readPageRange(alloc, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.cached);
         }
     };
     var reader: Read = .{ .cached = cached };

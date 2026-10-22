@@ -58,11 +58,10 @@ pub const Access = struct {
         try stores.chargeReadBudget(&self.reads, ref.bytes);
         return self.navigation.?.acquirePage(a, self, ref);
     }
-    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, len: usize, _: [32]u8, token: Token, remaining: *u64) ![]u8 {
+    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, len: usize, digest: [32]u8, token: Token, remaining: *u64) ![]u8 {
         const self: *Access = @ptrCast(@alignCast(raw));
-        if (offset != 0 or len != ref.byte_len) return error.InvalidNativeLakeFiles;
-        try stores.chargeReadBudget(remaining, ref.byte_len);
-        return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+        try stores.chargeReadBudget(remaining, len);
+        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, len, digest, token, self.cached);
     }
 };
 pub fn key(ordinal: usize) [8]u8 {
@@ -131,6 +130,13 @@ pub const Navigation = struct {
         hash.update(&access.domain);
         hash.update(&ref.digest);
         hash.update(&ref.attempt);
+        if (ref.pack) |pack_| {
+            hash.update(&pack_.digest);
+            var locator: [8]u8 = undefined;
+            std.mem.writeInt(u32, locator[0..4], pack_.bytes, .big);
+            std.mem.writeInt(u32, locator[4..8], pack_.offset, .big);
+            hash.update(&locator);
+        }
         var shape: [13]u8 = undefined;
         std.mem.writeInt(u32, shape[0..4], ref.bytes, .little);
         shape[4] = ref.height;

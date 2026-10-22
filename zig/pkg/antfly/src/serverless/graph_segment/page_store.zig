@@ -30,6 +30,9 @@ pub const ReadCache = struct {
 pub const PageStore = struct {
     domain: [32]u8 = @splat(0),
     prefix_keys: bool = false,
+    /// Native lake publication forests opt in; graph topology/facts retain
+    /// their standalone object reclamation path.
+    pack_pages: bool = false,
     attempt: [16]u8 = @splat(0),
     artifacts: *artifacts.ArtifactStore,
     cancellation: CancellationToken = .none,
@@ -45,6 +48,7 @@ pub const PageStore = struct {
     /// Async readers keep their independent scheduling and never inherit this.
     read_phase: ?*const artifacts.IoPhase = null,
     pub fn admitPublication(self: *PageStore) void {
+        self.pack_pages = true;
         if (self.artifacts.io_phase) |phase| {
             self.io = phase.io;
             self.read_phase = phase;
@@ -52,7 +56,7 @@ pub const PageStore = struct {
     }
 
     pub fn store(self: *PageStore) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .ptr = self, .get = get, .read_many = if (self.io != null and self.read_phase == null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null) putMany else null, .check = check };
+        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .ptr = self, .get = get, .read_many = if (self.io != null and self.read_phase == null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
     }
 
     pub fn namespaceDomain(namespace: []const u8) [32]u8 {
@@ -120,7 +124,7 @@ pub const PageStore = struct {
     }
 
     pub fn identity(domain: [32]u8, ref: tree.Ref) ![175]u8 {
-        return (artifacts.UploadScope{ .domain = domain, .attempt = ref.attempt }).artifactId(&std.fmt.bytesToHex(&ref.digest, .lower));
+        return (artifacts.UploadScope{ .domain = domain, .attempt = ref.attempt }).artifactId(&std.fmt.bytesToHex(&ref.artifactDigest(), .lower));
     }
 
     fn get(ptr: *anyopaque, alloc: std.mem.Allocator, ref: tree.Ref) ![]u8 {
@@ -141,10 +145,10 @@ pub const PageStore = struct {
             .kind = .graph_segment,
             .artifact_id = id,
             .checksum = id[7..71],
-            .byte_len = ref.bytes,
-        }, 0, ref.bytes, ref.digest, self.cancellation, self.remaining_read_bytes);
+            .byte_len = ref.artifactBytes(),
+        }, ref.offset(), ref.bytes, ref.digest, self.cancellation, self.remaining_read_bytes);
         try artifacts.chargeReadBudget(self.remaining_read_bytes, ref.bytes);
-        return self.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, id, 0, ref.bytes, self.cancellation);
+        return self.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, id, ref.offset(), ref.bytes, self.cancellation);
     }
 
     fn readMany(raw: *anyopaque, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.Page) !void {
@@ -187,6 +191,45 @@ pub const PageStore = struct {
         const id = try identity(self.domain, ref);
         if (metadata.byte_len != ref.bytes or !std.mem.eql(u8, metadata.artifact_id, &id) or
             !std.mem.eql(u8, metadata.checksum, id[7..71])) return error.ArtifactIntegrityMismatch;
+    }
+
+    fn packMany(ptr: *anyopaque, writes: []tree.Write) !void {
+        const self: *PageStore = @ptrCast(@alignCast(ptr));
+        if (writes.len == 0 or writes.len > tree.max_write_batch) return error.GraphPageWriteBudgetExceeded;
+        if (writes.len == 1) return put(ptr, writes[0].ref, writes[0].bytes);
+        var total: usize = 0;
+        for (writes) |write| {
+            try write.ref.validate();
+            if (write.ref.pack != null or write.ref.bytes != write.bytes.len) return error.InvalidGraphPage;
+            if (!std.mem.eql(u8, &write.ref.attempt, &self.attempt)) return error.GraphPageAttemptMismatch;
+            total = try std.math.add(usize, total, write.bytes.len);
+        }
+        if (total > tree.max_pack_bytes) return error.GraphPageWriteBudgetExceeded;
+        if (self.streaming) self.remaining_write_bytes.* = total;
+        if (total > self.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
+        self.remaining_write_bytes.* -= total;
+        const a = self.artifacts.allocator;
+        const bytes = try a.alloc(u8, total);
+        defer a.free(bytes);
+        var offset: usize = 0;
+        for (writes) |write| {
+            try self.cancellation.check();
+            @memcpy(bytes[offset..][0..write.bytes.len], write.bytes);
+            offset += write.bytes.len;
+        }
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        var metadata = try self.artifacts.putScoped(.{ .domain = self.domain, .attempt = self.attempt }, bytes, self.cancellation);
+        defer metadata.deinit(a);
+        const id = try (artifacts.UploadScope{ .domain = self.domain, .attempt = self.attempt }).artifactId(&std.fmt.bytesToHex(&digest, .lower));
+        if (metadata.byte_len != total or !std.mem.eql(u8, metadata.artifact_id, &id) or !std.mem.eql(u8, metadata.checksum, id[7..71])) return error.ArtifactIntegrityMismatch;
+        offset = 0;
+        // Mutation is atomic from the private builder's perspective: no locator
+        // changes until the complete upload and its identity have succeeded.
+        for (writes) |*write| {
+            write.ref.pack = .{ .digest = digest, .bytes = @intCast(total), .offset = @intCast(offset) };
+            offset += write.bytes.len;
+        }
     }
 
     fn putMany(ptr: *anyopaque, writes: []const tree.Write) !void {
@@ -1260,4 +1303,141 @@ test "serverless graph query page waves overlap reads and drain failures cancell
     measured.cancel_on_read = true;
     try std.testing.expectError(error.Canceled, readBatch(std.testing.io, a, sources[0..count], refs_[0..count], output[0..count]));
     try std.testing.expectEqual(@as(usize, 0), measured.active.load(.acquire));
+}
+
+test "serverless navigation packs reduce objects preserve seeks and authenticate individual ranges" {
+    const a = std.testing.allocator;
+    var fixture: TestArtifacts = .{ .memory = .{ .alloc = a } };
+    defer fixture.memory.deinit();
+    var backend = fixture.capability();
+    const scope = try artifacts.UploadScope.forPublication(@splat(61), 1, std.testing.io);
+    var reads: u64 = 64 * 1024 * 1024;
+    var writes: u64 = 64 * 1024 * 1024;
+    var pages: PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &backend, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .pack_pages = true };
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = pages.store(), .target_bytes = 1024 };
+    defer builder.deinit();
+    var value: [128]u8 = @splat(29);
+    for (0..1000) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        @memcpy(value[0..8], &key);
+        try builder.add(&key, &value);
+    }
+    const root = (try builder.finish()).?;
+    try std.testing.expect(root.pack == null);
+    const Walk = struct {
+        count: usize = 0,
+        packed_count: usize = 0,
+        leaf: ?tree.Ref = null,
+        pub fn skip(_: *@This(), _: tree.Ref) !bool {
+            return false;
+        }
+        pub fn visit(self: *@This(), ref: tree.Ref) !void {
+            self.count += 1;
+            if (ref.pack != null) self.packed_count += 1;
+            if (ref.height == 0 and ref.pack != null) self.leaf = ref;
+        }
+    };
+    var walk: Walk = .{};
+    try tree.walkPostOrder(a, pages.store(), root, &walk, false);
+    try std.testing.expect(walk.packed_count > 100);
+    try std.testing.expect(fixture.memory.pages.count() * 2 < walk.count);
+    for ([_]bool{ false, true }) |reverse| {
+        var cursor = if (reverse) try tree.Cursor.initReverse(a, pages.store(), root, "", null) else try tree.Cursor.init(a, pages.store(), root, "", null);
+        defer cursor.deinit();
+        var count: u64 = 0;
+        while (try cursor.next()) |entry| {
+            try std.testing.expectEqual(if (reverse) 999 - count else count, std.mem.readInt(u64, entry.key[0..8], .big));
+            try std.testing.expectEqualSlices(u8, entry.key, entry.value[0..8]);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(u64, 1000), count);
+    }
+    var key: [8]u8 = undefined;
+    std.mem.writeInt(u64, &key, 333, .big);
+    try std.testing.expectEqual(@as(u64, 333), try tree.rankOf(a, pages.store(), root, &key));
+    const found = try tree.lookupMany(a, pages.store(), root, &.{ &key, &key });
+    defer a.free(found);
+    defer for (found) |entry| if (entry) |row| row.deinit(a);
+    try std.testing.expectEqualSlices(u8, &key, found[0].?.value[0..8]);
+    const changed = (try tree.apply(a, pages.store(), root, &.{.{ .key = &key, .value = "updated" }})).?;
+    const after = try tree.lookupMany(a, pages.store(), changed, &.{&key});
+    defer a.free(after);
+    defer for (after) |entry| if (entry) |row| row.deinit(a);
+    try std.testing.expectEqualStrings("updated", after[0].?.value);
+    try std.testing.expectEqualSlices(u8, &key, found[1].?.value[0..8]);
+    const leaf = walk.leaf.?;
+    var bad = leaf;
+    bad.pack.?.offset = bad.pack.?.bytes;
+    try std.testing.expectError(error.InvalidGraphPage, tree.readPage(a, pages.store(), bad));
+    const pack_id = try PageStore.identity(scope.domain, leaf);
+    const pack = fixture.memory.pages.get(TestArtifacts.address(&pack_id)).?;
+    pack[leaf.offset()] ^= 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, tree.readPage(a, pages.store(), leaf));
+}
+
+test "serverless navigation pack upload failures expose no partial locators" {
+    const a = std.testing.allocator;
+    var fixture: TestArtifacts = .{ .memory = .{ .alloc = a }, .fail_upload = true };
+    defer fixture.memory.deinit();
+    var backend = fixture.capability();
+    const scope = try artifacts.UploadScope.forPublication(@splat(62), 1, std.testing.io);
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    var pages: PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &backend, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .pack_pages = true };
+    var bytes: [2][64]u8 = @splat(@splat(41));
+    var batch: [2]tree.Write = undefined;
+    for (&bytes, &batch) |*wire, *write| {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(wire, &digest, .{});
+        write.* = .{ .ref = .{ .digest = digest, .attempt = scope.attempt, .bytes = wire.len, .height = 0, .records = 1 }, .bytes = wire };
+    }
+    try std.testing.expectError(error.InjectedUploadFailure, PageStore.packMany(&pages, &batch));
+    for (batch) |write| try std.testing.expect(write.ref.pack == null);
+    try std.testing.expectEqual(@as(u32, 0), fixture.memory.pages.count());
+    fixture.fail_upload = false;
+    try PageStore.packMany(&pages, &batch);
+    try std.testing.expect(batch[0].ref.pack != null and batch[1].ref.pack != null);
+    try std.testing.expectEqual(batch[0].ref.pack.?.digest, batch[1].ref.pack.?.digest);
+    try std.testing.expectEqual(@as(u32, 64), batch[1].ref.offset());
+    // Historical references retain their exact JSON commitment.
+    var legacy = batch[0].ref;
+    legacy.pack = null;
+    const json = try std.json.Stringify.valueAlloc(a, legacy, .{});
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "pack") == null);
+    const parsed = try std.json.parseFromSlice(tree.Ref, a, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(legacy.eql(parsed.value));
+}
+
+test "serverless navigation packed builders release every failed allocation" {
+    const Run = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var fixture: TestArtifacts = .{ .memory = .{ .alloc = a } };
+            defer fixture.memory.deinit();
+            var backend = fixture.capability();
+            const scope: artifacts.UploadScope = .{ .domain = @splat(63), .attempt = @splat(1) };
+            var reads: u64 = 16 * 1024 * 1024;
+            var writes: u64 = 16 * 1024 * 1024;
+            var pages: PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &backend, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .pack_pages = true };
+            var builder: tree.SortedBuilder = .{ .alloc = a, .store = pages.store(), .target_bytes = 256 };
+            defer builder.deinit();
+            for (0..80) |i| {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, i, .big);
+                try builder.add(&key, &key);
+            }
+            const root = (try builder.finish()).?;
+            var cursor = try tree.Cursor.init(a, pages.store(), root, "", null);
+            defer cursor.deinit();
+            var count: u64 = 0;
+            while (try cursor.next()) |row| {
+                try std.testing.expectEqual(count, std.mem.readInt(u64, row.key[0..8], .big));
+                count += 1;
+            }
+            try std.testing.expectEqual(@as(u64, 80), count);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

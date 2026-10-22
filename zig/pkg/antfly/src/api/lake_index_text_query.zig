@@ -447,8 +447,11 @@ const Execution = struct {
         return ref;
     }
     fn fileFor(self: *Execution, hex: []const u8, public: bool) !?[]const u8 {
-        if (!public) if (self.index_resolver) |resolver| return resolver.file(resolver.ptr, self.arena, hex);
-        if (self.navigation) |resolver| return resolver.file(self.arena, hex, public);
+        return self.fileForAlloc(self.arena, hex, public);
+    }
+    fn fileForAlloc(self: *Execution, a: A, hex: []const u8, public: bool) !?[]const u8 {
+        if (!public) if (self.index_resolver) |resolver| return resolver.file(resolver.ptr, a, hex);
+        if (self.navigation) |resolver| return resolver.file(a, hex, public);
         return if (public) self.files.get(hex) else self.private_files.get(hex);
     }
     fn privateDigest(self: *Execution, file: []const u8) ![]const u8 {
@@ -459,7 +462,7 @@ const Execution = struct {
     fn vectorRequest(self: *Execution, req: types.SearchRequest) types.SearchRequest {
         var result = req;
         if (self.overlay != null or self.vector_include != null or self.vector_exclude != null or self.vector_include_provider != null or self.vector_exclude_provider != null) {
-            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_dense = selectDenseConstraints, .select_constraints = selectSparseConstraints, .constraint_revision = sparseConstraintRevision, .select_range = selectSparseRange };
+            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .allows_many = allowsVectorKeys, .select_dense = selectDenseConstraints, .select_constraints = selectSparseConstraints, .constraint_revision = sparseConstraintRevision, .select_range = selectSparseRange };
             result.filter_query_json = "";
             result.exclusion_query_json = "";
         }
@@ -729,6 +732,61 @@ const Execution = struct {
         }
         return result;
     }
+    /// Broad exact filters remain compressed; only the current candidate tile
+    /// is translated. This avoids allocating an archive-sized dense ID array.
+    fn allowsVectorKeys(raw: *anyopaque, member_keys: []const []const u8, output: []bool) !void {
+        const self: *Execution = @ptrCast(@alignCast(raw));
+        const RowRef = local.storage_rowsource_types.RowRef;
+        if (member_keys.len != output.len) return error.InvalidSqlBackendResponse;
+        var begin: usize = 0;
+        while (begin < member_keys.len) {
+            try self.context.ensureActive();
+            const end = @min(member_keys.len, begin + 128);
+            var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(self.result_allocator));
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            var files: std.StringHashMapUnmanaged([]const u8) = .empty;
+            var refs: [128]RowRef = undefined;
+            var positions: [128]usize = undefined;
+            var count: usize = 0;
+            for (member_keys[begin..end], begin..) |member_key, position| {
+                const key = try @import("lake_enrichment_units.zig").parent(member_key);
+                if (self.overlay) |overlay| if (overlay.row(key) != null) {
+                    output[position] = try allowsVectorKey(raw, member_key);
+                    continue;
+                };
+                const coordinate = try @import("lake_index_native_state.zig").coordinates(key);
+                const digest = key[6..70];
+                const entry = try files.getOrPut(a, digest);
+                if (!entry.found_existing) entry.value_ptr.* = (try self.fileForAlloc(a, digest, false)) orelse return error.ExternalLakeSnapshotMismatch;
+                refs[count] = .{ .external = .{ .source_id = if (self.index_resolver) |resolver| resolver.source else self.source.inventory.source_id, .snapshot_id = if (self.index_resolver) |resolver| resolver.snapshot else self.source.inventory.snapshot_id, .identity_version = self.source.inventory.row_identity_version, .file_id = entry.value_ptr.*, .row_group_ordinal = coordinate.group, .row_ordinal = coordinate.row } };
+                positions[count] = position;
+                count += 1;
+            }
+            const translated = if (self.index_resolver) |resolver| mapped: {
+                if (resolver.translate_many) |many| break :mapped try many(resolver.ptr, a, refs[0..count], true);
+                if (resolver.translate_many_bounded) |many| {
+                    var allowance: local.serverless_query_lake_serving.ServingSource.TranslationAllowance = .{};
+                    break :mapped try many(resolver.ptr, a, refs[0..count], true, &allowance);
+                }
+                const result = try a.alloc(RowRef, count);
+                for (refs[0..count], result) |ref, *out| out.* = try self.fromIndex(a, ref);
+                break :mapped result;
+            } else refs[0..count];
+            if (translated.len != count) return error.InvalidLogicalRowIdentity;
+            for (translated, positions[0..count]) |ref, position| output[position] = try self.allowsCurrentVectorRef(ref);
+            begin = end;
+        }
+    }
+    fn allowsCurrentVectorRef(self: *Execution, ref: local.storage_rowsource_types.RowRef) !bool {
+        const current = ref.external;
+        if (self.overlay) |overlay| if (overlay.physical) |*mask| if (mask.contains(current.file_id, current.row_group_ordinal, current.row_ordinal)) return false;
+        if (self.vector_include_provider) |*provider| if (!try provider.allows(ref)) return false;
+        if (self.vector_exclude_provider) |*provider| if (try provider.allows(ref)) return false;
+        if (self.vector_include) |*include| if (!include.contains(current.file_id, current.row_group_ordinal, current.row_ordinal)) return false;
+        if (self.vector_exclude) |*exclude| if (exclude.contains(current.file_id, current.row_group_ordinal, current.row_ordinal)) return false;
+        return true;
+    }
     fn allowsVectorKey(raw: *anyopaque, member_key: []const u8) !bool {
         const key = try @import("lake_enrichment_units.zig").parent(member_key);
         const self: *Execution = @ptrCast(@alignCast(raw));
@@ -748,14 +806,9 @@ const Execution = struct {
         var scratch = std.heap.ArenaAllocator.init(self.result_allocator);
         defer scratch.deinit();
         const ref = try self.fromIndex(scratch.allocator(), index_ref);
-        const current = ref.external;
-        if (self.overlay) |pending_overlay| if (pending_overlay.physical) |*mask| if (mask.contains(current.file_id, current.row_group_ordinal, current.row_ordinal)) return false;
-        if (self.vector_include_provider) |*provider| if (!try provider.allows(ref)) return false;
-        if (self.vector_exclude_provider) |*provider| if (try provider.allows(ref)) return false;
-        if (self.vector_include) |*include| if (!include.contains(current.file_id, current.row_group_ordinal, current.row_ordinal)) return false;
-        if (self.vector_exclude) |*exclude| if (exclude.contains(current.file_id, current.row_group_ordinal, current.row_ordinal)) return false;
-        return true;
+        return self.allowsCurrentVectorRef(ref);
     }
+
     fn deinit(self: *Execution) void {
         self.ordinal_live_rows.deinit(self.result_allocator);
         if (self.vector_include_provider) |*provider| provider.deinit();
@@ -781,7 +834,9 @@ const Execution = struct {
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
         if (identities.spans.len == 0) return null;
         self.ordinal_live_rows.backing = self.result_allocator;
-        var row = try identities.physicalRow(a, &self.ordinal_live_rows, self.store.artifactStore(), .{ .cache = &self.server.lake_read_cache, .scope = self.domain, .context = self.context }, doc, self.source.inventory.source_id, self.source.inventory.snapshot_id);
+        var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+        defer scratch.deinit();
+        var row = try identities.physicalRow(scratch.allocator(), &self.ordinal_live_rows, self.store.artifactStore(), .{ .cache = &self.server.lake_read_cache, .scope = self.domain, .context = self.context }, doc, self.source.inventory.source_id, self.source.inventory.snapshot_id);
         row.external.identity_version = self.source.inventory.row_identity_version;
         return try local.storage_rowsource_identity.allocId(a, row);
     }
@@ -806,7 +861,9 @@ const Execution = struct {
         }
         const file = (try self.fileFor(key[6..70], false)) orelse return error.ExternalLakeSnapshotMismatch;
         const index_ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = if (self.index_resolver) |resolver| resolver.source else self.source.inventory.source_id, .snapshot_id = if (self.index_resolver) |resolver| resolver.snapshot else self.source.inventory.snapshot_id, .identity_version = self.source.inventory.row_identity_version, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } };
-        const parent_key = try local.storage_rowsource_identity.allocId(a, try self.fromIndex(a, index_ref));
+        var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const parent_key = try local.storage_rowsource_identity.allocId(a, try self.fromIndex(scratch.allocator(), index_ref));
         defer a.free(parent_key);
         return units.rebind(a, member_key, parent_key);
     }
@@ -825,7 +882,9 @@ const Execution = struct {
         const position = try @import("lake_index_native_state.zig").coordinates(key);
         const file = (try self.fileFor(try local.storage_rowsource_identity.publicFile(key), true)) orelse return a.dupe(u8, key);
         const current_ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .identity_version = self.source.inventory.row_identity_version, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } };
-        const index_ref = try self.toIndex(a, current_ref);
+        var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const index_ref = try self.toIndex(scratch.allocator(), current_ref);
         const digest = try self.privateDigest(index_ref.external.file_id);
         const parent_key = try std.fmt.allocPrint(a, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, index_ref.external.row_group_ordinal, index_ref.external.row_ordinal });
         defer a.free(parent_key);
@@ -4523,6 +4582,7 @@ test "external lake relocated sparse predicates translate selective masks and de
     const Bitmap = local.encoding_roaring.RoaringBitmap;
     const Mock = struct {
         translated: usize = 0,
+        batch_calls: usize = 0,
         points: usize = 0,
         fn from(_: *anyopaque, _: A, ref: RowRef) !RowRef {
             var result = ref;
@@ -4543,6 +4603,7 @@ test "external lake relocated sparse predicates translate selective masks and de
             if (refs.len > allowance.remaining_rows) return error.QueryCandidateBudgetExceeded;
             allowance.remaining_rows -= refs.len;
             self.translated += refs.len;
+            self.batch_calls += 1;
             const result = try alloc.alloc(RowRef, refs.len);
             for (refs, result) |ref, *out| out.* = if (forward) try from(raw, alloc, ref) else try to(raw, alloc, ref);
             return result;
@@ -4619,4 +4680,83 @@ test "external lake relocated sparse predicates translate selective masks and de
     try window.prepareRead();
     try std.testing.expectEqual(@as(usize, 11), window.include.?.cardinality());
     try std.testing.expect(window.include.?.contains(7) and !window.include.?.contains(9));
+    // The broad dense path declines eager ID materialization, but translates
+    // every exact residual candidate through bounded native callback tiles.
+    try std.testing.expect((try Execution.selectDenseConstraints(&execution, a)) == null);
+    var key_storage: [6001][96]u8 = undefined;
+    var keys: [6001][]const u8 = undefined;
+    var allowed: [6001]bool = undefined;
+    for (&key_storage, &keys, 0..) |*buffer, *key, ordinal| key.* = try std.fmt.bufPrint(buffer, "lake2:{s}:00000000:{x:0>16}", .{ try Mock.digest(undefined, undefined, ""), @as(u64, ordinal) + 100 });
+    mock.translated = 0;
+    mock.batch_calls = 0;
+    const predicate: types.NativeKeyPredicate = .{ .ptr = &execution, .allows = Execution.allowsVectorKey, .allows_many = Execution.allowsVectorKeys };
+    const received = predicate.receiver();
+    try received.allows_many.?(received.ptr, &keys, &allowed);
+    try std.testing.expectEqual(keys.len, mock.translated);
+    try std.testing.expectEqual(@as(usize, 47), mock.batch_calls);
+    for (allowed, 0..) |keep, ordinal| try std.testing.expectEqual(ordinal != 9, keep);
+}
+
+test "external lake relocation key projection releases intermediate references" {
+    const a = std.testing.allocator;
+    const Source = local.serverless_query_lake_serving.ServingSource;
+    const RowRef = local.storage_rowsource_types.RowRef;
+    const Callbacks = struct {
+        fn translate(_: *anyopaque, alloc: A, ref: RowRef) !RowRef {
+            var result = ref;
+            result.external.source_id = try alloc.dupe(u8, ref.external.source_id);
+            errdefer alloc.free(result.external.source_id);
+            result.external.snapshot_id = try alloc.dupe(u8, ref.external.snapshot_id);
+            errdefer alloc.free(result.external.snapshot_id);
+            result.external.file_id = try alloc.dupe(u8, "part.parquet");
+            return result;
+        }
+        fn file(_: *anyopaque, _: A, _: []const u8) !?[]const u8 {
+            return "part.parquet";
+        }
+        fn digest(_: *anyopaque, _: A, _: []const u8) ![]const u8 {
+            return "0000000000000000000000000000000000000000000000000000000000000000";
+        }
+        fn rank(_: *anyopaque, _: A, _: RowRef) !u64 {
+            return 0;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var source: Source = undefined;
+    source.inventory.source_id = @constCast("source");
+    source.inventory.snapshot_id = @constCast("snapshot");
+    source.inventory.row_identity_version = 2;
+    var marker: u8 = 0;
+    var execution: Execution = .{
+        .server = undefined,
+        .source = &source,
+        .store = undefined,
+        .domain = @splat(0),
+        .declarations = &.{},
+        .context = .{},
+        .request = .{},
+        .schema_json = "",
+        .arena = a,
+        .table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{} },
+        .index_resolver = .{
+            .ptr = &marker,
+            .source = "source",
+            .snapshot = "snapshot",
+            .current_source = "source",
+            .current_snapshot = "snapshot",
+            .rows = 1,
+            .from_index = Callbacks.translate,
+            .to_index = Callbacks.translate,
+            .file = Callbacks.file,
+            .digest = Callbacks.digest,
+            .tie_rank = Callbacks.rank,
+            .close = Callbacks.close,
+        },
+    };
+    const public = try Execution.publicKey(&execution, a, "lake2:0000000000000000000000000000000000000000000000000000000000000000:00000000:0000000000000000");
+    defer a.free(public);
+    try execution.files.put(a, try local.storage_rowsource_identity.publicFile(public), "part.parquet");
+    defer execution.files.deinit(a);
+    const native = try Execution.nativeKey(&execution, a, public);
+    defer a.free(native);
 }

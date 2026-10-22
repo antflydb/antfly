@@ -256,6 +256,13 @@ const Binding = struct {
         for ([_]?@import("../serverless/graph_segment/page_tree.zig").Ref{ self.space.by_location, self.space.files }) |root| if (root) |ref| {
             hash.update(&ref.digest);
             hash.update(&ref.attempt);
+            if (ref.pack) |pack_| {
+                hash.update(&pack_.digest);
+                var locator: [8]u8 = undefined;
+                std.mem.writeInt(u32, locator[0..4], pack_.bytes, .big);
+                std.mem.writeInt(u32, locator[4..8], pack_.offset, .big);
+                hash.update(&locator);
+            }
         };
         var space: [32]u8 = undefined;
         hash.final(&space);
@@ -407,12 +414,11 @@ const Owner = struct {
         defer lane.deinit();
         return ReadLane.decodedPage(&lane, a, ref);
     }
-    fn readPage(raw: *anyopaque, a: A, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: [32]u8, token: @import("antfly_cancellation").CancellationToken, _: *u64) ![]u8 {
+    fn readPage(raw: *anyopaque, a: A, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, page_digest: [32]u8, token: @import("antfly_cancellation").CancellationToken, _: *u64) ![]u8 {
         const self: *Owner = @ptrCast(@alignCast(raw));
         try self.cached.context.ensureActive();
-        if (offset != 0 or length != ref.byte_len) return error.InvalidLogicalRowIdentity;
         try self.charge(length, null);
-        return @import("lake_index_aggregate_artifact.zig").readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached) catch |err| return self.failed(err);
+        return @import("lake_index_aggregate_artifact.zig").readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, page_digest, token, self.cached) catch |err| return self.failed(err);
     }
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
@@ -468,12 +474,11 @@ const ReadLane = struct {
     fn deinit(self: *ReadLane) void {
         self.cache.deinit();
     }
-    fn readPage(raw: *anyopaque, a: A, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: [32]u8, token: @import("antfly_cancellation").CancellationToken, _: *u64) ![]u8 {
+    fn readPage(raw: *anyopaque, a: A, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, page_digest: [32]u8, token: @import("antfly_cancellation").CancellationToken, _: *u64) ![]u8 {
         const self: *ReadLane = @ptrCast(@alignCast(raw));
         try self.owner.cached.context.ensureActive();
-        if (offset != 0 or length != ref.byte_len) return error.InvalidLogicalRowIdentity;
         try self.owner.charge(length, self.allowance);
-        return @import("lake_index_aggregate_artifact.zig").readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.owner.cached) catch |err| return self.owner.failed(err);
+        return @import("lake_index_aggregate_artifact.zig").readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, page_digest, token, self.owner.cached) catch |err| return self.owner.failed(err);
     }
     const DecodedPage = struct { page: @import("../serverless/graph_segment/page_tree.zig").Page };
     fn decodedPage(raw: *anyopaque, a: A, ref: @import("../serverless/graph_segment/page_tree.zig").Ref) !@import("../serverless/graph_segment/page_tree.zig").Page {
@@ -488,6 +493,13 @@ const ReadLane = struct {
         hash.update(&self.reader.root.domain);
         hash.update(&ref.digest);
         hash.update(&ref.attempt);
+        if (ref.pack) |pack_| {
+            hash.update(&pack_.digest);
+            var locator: [8]u8 = undefined;
+            std.mem.writeInt(u32, locator[0..4], pack_.bytes, .big);
+            std.mem.writeInt(u32, locator[4..8], pack_.offset, .big);
+            hash.update(&locator);
+        }
         var shape: [13]u8 = undefined;
         std.mem.writeInt(u32, shape[0..4], ref.bytes, .big);
         shape[4] = ref.height;

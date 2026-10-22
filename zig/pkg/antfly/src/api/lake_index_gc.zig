@@ -100,7 +100,10 @@ pub const Collector = struct {
         for (state.stores) |binding| {
             if (std.mem.eql(u8, &binding.identity, &self.identity)) if (binding.vacuum) |cut| try self.markPages(a, cut.domain, cut.marks, false);
         }
-        self.result.marked = self.marked.count();
+        var marked = self.marked.valueIterator();
+        while (marked.next()) |entry| if (entry.checksum.len != 0) {
+            self.result.marked += 1;
+        };
         // No destructive work until the complete bounded mark phase succeeds.
         try self.check();
         try self.store.visitScopedUploads(@import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace), .{ .ptr = self, .visit = visit }, self.cancellation());
@@ -240,6 +243,23 @@ pub const Collector = struct {
     }
     /// Collection must understand the preceding immutable root format after an
     /// upgrade, while serving and rebuild selection continue to require current metadata.
+    /// Object retention and logical page expansion are separate for packs:
+    /// marking one sibling must never hide another sibling's dependencies.
+    fn expandPage(self: *Collector, domain: [32]u8, page: @import("../serverless/graph_segment/page_tree.zig").Ref, mode: Expansion, reason: []const u8) !bool {
+        const PageStore = @import("../serverless/graph_segment/page_store.zig").PageStore;
+        const id = try PageStore.identity(domain, page);
+        const ref: artifacts.ChunkRef = .{ .artifact_id = &id, .checksum = id[7..71], .byte_len = page.artifactBytes() };
+        if (page.pack == null) return self.expand(ref, mode, reason);
+        _ = try self.mark(ref);
+        const key = try std.fmt.allocPrint(self.a, "expanded-page:{s}:{s}:{x}:{s}", .{ reason, id, page.offset(), std.fmt.bytesToHex(&page.digest, .lower) });
+        var owned = true;
+        defer if (owned) self.a.free(key);
+        if (self.marked.contains(key)) return false;
+        if (self.marked.count() >= self.options.max_marked) return error.LakeIndexGcBudgetExceeded;
+        try self.marked.put(self.a, key, .{ .artifact_id = key, .checksum = "", .byte_len = 0 });
+        owned = false;
+        return true;
+    }
     fn retainedNativeRoot(self: *Collector, a: A, comptime native: type, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !native.Root {
         const current = if (@hasDecl(native, "supportsBuildMetadata")) native.supportsBuildMetadata(ref.metadata_version) else if (@hasDecl(native, "supportsMetadata")) native.supportsMetadata(ref.metadata_version) else ref.metadata_version == native.metadata_version;
         if (current) {
@@ -273,8 +293,7 @@ pub const Collector = struct {
     fn markContributionIndex(self: *Collector, a: A, root: @import("../serverless/graph_segment/page_tree.zig").Ref) anyerror!void {
         const page_store = @import("../serverless/graph_segment/page_store.zig");
         const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
-        const id = try page_store.PageStore.identity(domain, root);
-        if (!try self.mark(.{ .artifact_id = &id, .checksum = &std.fmt.bytesToHex(&root.digest, .lower), .byte_len = root.bytes })) return;
+        if (!try self.expandPage(domain, root, .native_page, "contribution-index")) return;
         var writes: u64 = 0;
         var pages: page_store.PageStore = .{ .domain = domain, .artifacts = &self.store, .cancellation = self.cancellation(), .remaining_read_bytes = &self.remaining_reads, .remaining_write_bytes = &writes };
         const Visitor = struct {
@@ -518,8 +537,7 @@ pub const Collector = struct {
                 }
             }
             pub fn skip(w: *@This(), page: directory.tree.Ref) !bool {
-                const ref: artifacts.ChunkRef = .{ .artifact_id = &try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(w.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes };
-                return !try w.collector.expand(ref, .native_page, if (w.chunks) "native-generation-chunks" else "native-generation-files");
+                return !try w.collector.expandPage(w.domain, page, .native_page, if (w.chunks) "native-generation-chunks" else "native-generation-files");
             }
             pub fn visit(_: *@This(), _: directory.tree.Ref) !void {}
         };
@@ -562,10 +580,9 @@ pub const Collector = struct {
                 }
             }
             pub fn skip(w: *@This(), child: tree.Ref) !bool {
-                const ref: artifacts.ChunkRef = .{ .artifact_id = &try page_store.PageStore.identity(w.domain, child), .checksum = &std.fmt.bytesToHex(&child.digest, .lower), .byte_len = child.bytes };
-                if (w.native_files) return !try w.collector.expand(ref, .native_page, "native-file-state-page");
-                if (w.ordered_rows) return !try w.collector.expand(ref, .ordered_page, "ordered-page");
-                return !try w.collector.mark(ref);
+                if (w.native_files) return !try w.collector.expandPage(w.domain, child, .native_page, "native-file-state-page");
+                if (w.ordered_rows) return !try w.collector.expandPage(w.domain, child, .ordered_page, "ordered-page");
+                return !try w.collector.expandPage(w.domain, child, .native_page, "page");
             }
             pub fn visit(_: *@This(), _: tree.Ref) !void {}
         };

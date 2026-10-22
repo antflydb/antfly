@@ -86,11 +86,11 @@ const PageWarm = struct {
         self.count += 1;
     }
     pub fn record(_: *PageWarm, _: []const u8, _: []const u8) !void {}
-    fn read(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, _: u64, length: usize, _: [32]u8, token: Token, budget: *u64) ![]u8 {
+    fn read(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: [32]u8, token: Token, budget: *u64) ![]u8 {
         const self: *PageWarm = @ptrCast(@alignCast(raw));
         try self.cached.context.ensureActive();
         try stores.chargeReadBudget(budget, length);
-        return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.cached);
     }
     fn run(self: *PageWarm) anyerror!void {
         try self.cached.context.ensureActive();

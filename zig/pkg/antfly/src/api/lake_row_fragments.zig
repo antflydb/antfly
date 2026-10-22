@@ -480,6 +480,7 @@ const Spool = struct {
     initialized: bool = false,
     source_passes: u64 = 0,
     adoption_rows: u64 = 0,
+    payload_decodes: u64 = 0,
     captured: ?*@import("lake_row_payloads.zig").Capture = null,
     fn deinit(self: *Spool) void {
         if (self.initialized) {
@@ -554,6 +555,8 @@ const Spool = struct {
         root.indexes = self.owner.space;
         root.reused = &.{};
         var resolver: identity.Reader = .{ .root = root, .pages = &pages, .cache = &cache };
+        var cluster = @import("lake_row_payloads.zig").Cluster.init(a, &self.manager, columns.len);
+        defer cluster.deinit();
         var bound = false;
         while (true) {
             var reading = try store.beginIo(1);
@@ -590,35 +593,25 @@ const Spool = struct {
                     coordinates[count] = row.coordinate;
                     count += 1;
                 }
-                var captured: usize = 0;
-                while (captured < count) {
-                    var take = @min(spill.JoinPayloads.page_rows, count - captured);
-                    while (take > 1 and try sizing.selected(selected[captured..][0..take]) > 8 * 1024 * 1024) take = @max(1, take / 2);
-                    var adapter: @import("lake_index_build_replay.zig").Replay.CaptureBatch = .{ .vectors = vectors };
-                    const Reader = @import("lake_index_build_replay.zig").Replay.CaptureBatch;
-                    const borrowed: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &adapter, .read = Reader.cell, .read_physical = Reader.physical, .read_identity = Reader.identity, .count = batch.rowCount(), .width = columns.len } };
-                    var writing = try store.beginIo(1);
-                    defer writing.abort();
-                    const offset = self.payloads.appendBatch(try borrowed.select(ta, selected[captured..][0..take])) catch |err| return writing.failed(err);
-                    try writing.finish();
-                    for (selected[captured..][0..take], coordinates[captured..][0..take], 0..) |physical, coordinate, row| {
-                        var value: [24]u8 = @splat(0);
-                        std.mem.writeInt(u64, value[0..8], offset, .big);
-                        std.mem.writeInt(u64, value[8..16], row, .big);
-                        std.mem.writeInt(u64, value[16..24], try sizing.selected(&.{physical}), .big);
-                        const key = coordinate.encode();
-                        try edits.addRecord(&key, &value);
-                    }
-                    captured += take;
+                const keys = try ta.alloc([]const u8, count);
+                const encoded = try ta.alloc([16]u8, count);
+                for (coordinates[0..count], encoded, keys) |coordinate, *bytes, *key| {
+                    bytes.* = coordinate.encode();
+                    key.* = bytes;
                 }
+                var writing = try store.beginIo(1);
+                defer writing.abort();
+                cluster.add(ta, vectors, keys, selected[0..count], sizing) catch |err| return writing.failed(err);
+                try writing.finish();
                 begin = end;
             }
         }
+        try cluster.finish(&self.payloads, &edits);
         self.route_root = try edits.finish(null);
         self.routes.phase = null;
     }
     /// Merge the verified ID stream with captured offsets; sort only final routes.
-    /// Typed Parquet payloads stay in the original private capture pages.
+    /// Typed payload pages were clustered by verified ID before adoption.
     fn adopt(self: *Spool, capture: *@import("lake_row_payloads.zig").Capture, store: *stores.ArtifactStore) !void {
         if (!capture.complete or capture.rows != self.owner.root.current.rows) return error.InvalidLogicalRowIdentity;
         const a = self.budget.allocator();
@@ -765,6 +758,7 @@ const Spool = struct {
                 while (end < count and items[end].offset == items[begin].offset) end += 1;
                 try self.owner.mutex.lock(self.owner.manager.io);
                 const payloads = if (self.owner.captured) |capture| &capture.payloads else &self.owner.payloads;
+                self.owner.payload_decodes += 1;
                 const block = payloads.read(items[begin].offset) catch |err| {
                     self.owner.mutex.unlock(self.owner.manager.io);
                     return phase.failed(err);
@@ -1284,16 +1278,17 @@ test "external lake logical fragments shrink wide Parquet gathers before copying
 }
 
 test "external lake logical fragments route broad Parquet rebuilds through one projected typed spill pass" {
-    try broadSpoolScenario(false, false);
+    try broadSpoolScenario(false, false, false);
 }
 test "external lake logical fragments reuse verification payloads without another Parquet scan" {
-    try broadSpoolScenario(true, false);
+    try broadSpoolScenario(true, false, false);
 }
 test "external lake logical fragments reuse captured payloads for selective changed fragments" {
-    try broadSpoolScenario(true, true);
+    try broadSpoolScenario(true, true, false);
 }
-fn broadSpoolScenario(fused: bool, selective: bool) !void {
+fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime hashed: bool) !void {
     const a = std.testing.allocator;
+    const row_count = if (hashed) 8193 else 257;
     var directory = try local.common_test_directory.TestDirectory.init("logical-fragment-spool");
     defer directory.cleanup();
     var storage = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
@@ -1303,9 +1298,9 @@ fn broadSpoolScenario(fused: bool, selective: bool) !void {
     const payload = try a.alloc(u8, 1024);
     defer a.free(payload);
     @memset(payload, 'x');
-    var ids: [257]i64 = undefined;
-    var prices: [257]i64 = undefined;
-    var bodies: [257][]const u8 = undefined;
+    var ids: [row_count]i64 = undefined;
+    var prices: [row_count]i64 = undefined;
+    var bodies: [row_count][]const u8 = undefined;
     for (&ids, &bodies, 0..) |*id, *body, i| {
         id.* = @intCast(i);
         body.* = payload;
@@ -1340,11 +1335,13 @@ fn broadSpoolScenario(fused: bool, selective: bool) !void {
     var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
     const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{physical.inventory.files[0].file_id}, null, null, &.{.{ .name = "text", .digest = @splat(8), .columns = &.{ "id", "body", "price" } }}, physical.inventory.source_id, physical.inventory.snapshot_id);
     defer builder.deinit();
-    for (0..257) |row| {
+    for (0..row_count) |row| {
         var id: [32]u8 = @splat(3);
-        id[0] = if (selective) @intCast((row % 16) << 4) else 0;
-        std.mem.writeInt(u64, id[24..32], row, .big);
-        try builder.addWithInputs(.{ .id = id, .values = @splat(4) }, .{ .file = 0, .group = 0, .row = 256 - row }, &.{@splat(5)});
+        if (hashed) std.crypto.hash.Blake3.hash(std.mem.asBytes(&row), &id, .{}) else {
+            id[0] = if (selective) @intCast((row % 16) << 4) else 0;
+            std.mem.writeInt(u64, id[24..32], row, .big);
+        }
+        try builder.addWithInputs(.{ .id = id, .values = @splat(4) }, .{ .file = 0, .group = 0, .row = row_count - 1 - row }, &.{@splat(5)});
     }
     const root = try builder.finish(@splat(1), @splat(2), @splat(3));
     const native = (try prepare(a, &store, table, &physical, &provider, root, null)).?;
@@ -1377,10 +1374,12 @@ fn broadSpoolScenario(fused: bool, selective: bool) !void {
             const keys = try a.alloc([32]u8, batch.rowCount());
             defer a.free(keys);
             for (keys, 0..) |*id, row| {
-                const ordinal: usize = @intCast(256 - batch.rowRef(row).external.row_ordinal);
+                const ordinal: usize = @intCast(row_count - 1 - batch.rowRef(row).external.row_ordinal);
                 id.* = @splat(3);
-                id[0] = if (selective) @intCast((ordinal % 16) << 4) else 0;
-                std.mem.writeInt(u64, id[24..32], ordinal, .big);
+                if (hashed) std.crypto.hash.Blake3.hash(std.mem.asBytes(&ordinal), id, .{}) else {
+                    id[0] = if (selective) @intCast((ordinal % 16) << 4) else 0;
+                    std.mem.writeInt(u64, id[24..32], ordinal, .big);
+                }
             }
             try captured.?.add(batch, keys, &store);
         }
@@ -1388,26 +1387,35 @@ fn broadSpoolScenario(fused: bool, selective: bool) !void {
     }
     try prepareCapturedSpool(native, &provider, &store, captured);
     try std.testing.expect(native.spool != null);
-    if (fused) try std.testing.expectEqual(@as(u64, if (selective) 17 else 257), native.spool.?.adoption_rows);
+    if (fused) try std.testing.expectEqual(@as(u64, if (selective) 17 else row_count), native.spool.?.adoption_rows);
     try std.testing.expectEqual(@as(u64, if (fused) 0 else 1), native.spool.?.source_passes);
     for (0..2) |_| {
-        const input = try Build.open(native, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .column_bindings = &.{ "id", "body", "price" }, .index_config_hash = "test" }, 0, .none, null);
+        native.spool.?.payload_decodes = 0;
+        const input = try Build.open(native, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .column_bindings = &.{ "id", "body", "price" }, .index_config_hash = "test" }, if (hashed) null else 0, .none, null);
         defer input.deinit(a);
         var count: usize = 0;
         while (try input.next(a)) |batch| {
             try std.testing.expect(batch.rowCount() <= 256);
             for (0..batch.rowCount()) |row| {
-                try std.testing.expectEqual(@as(i64, @intCast(256 - count * @as(usize, if (selective) 16 else 1))), try batch.findColumn("id").?.integerAt(row));
+                const physical_id = try batch.findColumn("id").?.integerAt(row);
+                if (!hashed) try std.testing.expectEqual(@as(i64, @intCast(row_count - 1 - count * @as(usize, if (selective) 16 else 1))), physical_id);
                 try std.testing.expectEqual(payload.len, (try batch.findColumn("body").?.bytesAt(row)).len);
                 const price = batch.findColumn("price").?.values.decimal128;
                 try std.testing.expectEqual(@as(i32, 18), price.precision);
                 try std.testing.expectEqual(@as(i32, 2), price.scale);
-                try std.testing.expectEqual(@as(i128, prices[256 - count * @as(usize, if (selective) 16 else 1)]), price.values[row]);
-                try std.testing.expectEqual(@as(u64, @intCast(count)), batch.rowRef(row).external.row_ordinal);
+                try std.testing.expectEqual(@as(i128, prices[@intCast(physical_id)]), price.values[row]);
+                if (!hashed) try std.testing.expectEqual(@as(u64, @intCast(count)), batch.rowRef(row).external.row_ordinal);
                 count += 1;
             }
         }
-        try std.testing.expectEqual(@as(usize, if (selective) 17 else 257), count);
+        try std.testing.expectEqual(@as(usize, if (selective) 17 else row_count), count);
+        if (hashed) {
+            const encoded = if (captured) |capture| capture.payloads.encoded_pages else native.spool.?.payloads.encoded_pages;
+            // Random stable IDs defeated physical-order captures by >27x.
+            // Allow page/window and fragment boundary overlap, independent of N.
+            try std.testing.expect(native.spool.?.payload_decodes <= encoded * 4);
+            try std.testing.expect(encoded <= row_count / 32 + 32);
+        }
     }
     try std.testing.expectEqual(@as(u64, if (fused) 0 else 1), native.spool.?.source_passes);
 }
@@ -1490,4 +1498,11 @@ test "external lake logical fragments skip unchanged input cohorts and hash only
         last = next;
         previous = root;
     }
+}
+
+test "external lake hashed payload capture clusters spilled pages for repeated consumers" {
+    try broadSpoolScenario(true, false, true);
+}
+test "external lake broad typed spool clusters random coordinates without verification capture" {
+    try broadSpoolScenario(false, false, true);
 }

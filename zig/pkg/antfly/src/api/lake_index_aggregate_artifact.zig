@@ -45,6 +45,42 @@ pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellati
     if (cached) |cache| return cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
     return @TypeOf(loader).load(&loader, a);
 }
+/// Authenticate a page range independently of its containing immutable object.
+/// Range cache identities bind the pack, offset, length and page digest. A cold
+/// seek reads only that page; it never downloads the whole navigation pack.
+pub fn readPageRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead) ![]u8 {
+    try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
+    if (offset > ref.byte_len or length > ref.byte_len - offset or length > @import("../serverless/graph_segment/page_tree.zig").max_page_bytes) return error.InvalidGraphPage;
+    if (offset == 0 and length == ref.byte_len) {
+        const object_digest = try stores.sha256DigestFromChecksum(ref.checksum);
+        if (!std.mem.eql(u8, &object_digest, &digest)) return error.ArtifactIntegrityMismatch;
+        return readArtifact(a, store, ref, cancellation, cached);
+    }
+    const Loader = struct {
+        store: stores.ArtifactStore,
+        ref: ChunkRef,
+        offset: u64,
+        length: usize,
+        digest: [32]u8,
+        token: Cancellation,
+        fn load(raw: *anyopaque, alloc: A) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.offset, self.length, self.token);
+            errdefer alloc.free(bytes);
+            if (bytes.len != self.length) return error.ArtifactIntegrityMismatch;
+            try stores.validatePayloadSha256WithCancellation(bytes, &std.fmt.bytesToHex(&self.digest, .lower), self.token);
+            return bytes;
+        }
+    };
+    var loader: Loader = .{ .store = store, .ref = ref, .offset = offset, .length = length, .digest = digest, .token = cancellation };
+    try cancellation.check();
+    if (cached) |cache| {
+        var identity: [256]u8 = undefined;
+        const key = try std.fmt.bufPrint(&identity, "{s}:page:{x}:{x}", .{ ref.artifact_id, offset, length });
+        return cache.cache.readImmutableAlloc(a, cache.scope, key, length, digest, cache.context, .{ .ptr = &loader, .load = Loader.load });
+    }
+    return Loader.load(&loader, a);
+}
 /// Explicit synchronous publication read. Verified transport completes and CPU
 /// admission resumes before callers parse metadata or advance reducers.
 /// Serving and asynchronous readers never borrow this serial capability.

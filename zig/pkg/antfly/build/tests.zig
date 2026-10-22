@@ -6411,7 +6411,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const dense_selection_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{"one percent native filter routes through integrated dense search exactly"},
+        .filters = &.{ "one percent native filter routes through integrated dense search exactly", "native dense residual batches cross named callbacks" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("native-dense-selection-test", "Verify exact lake dense-ID callback intersection and empty selections")

@@ -762,12 +762,11 @@ pub const Reader = struct {
         try self.read.context.ensureActive();
         try self.read.cancellation.check();
     }
-    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: [32]u8, cancellation: Cancellation, budget: *u64) ![]u8 {
+    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, budget: *u64) ![]u8 {
         const self: *Reader = @ptrCast(@alignCast(raw));
         try self.check();
-        if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextStatistics;
         try stores.chargeReadBudget(budget, length);
-        return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, self.read.cache);
+        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, cancellation, self.read.cache);
     }
     fn lookup(self: *Reader, a: A, cache: tree.Store, root: ?Ref, key: []const u8) !?[]u8 {
         try self.check();
@@ -993,16 +992,15 @@ pub const Reader = struct {
     const SeekRead = struct {
         reader: *Reader,
         budget: *SeekBudget,
-        fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: [32]u8, token: Cancellation, _: *u64) ![]u8 {
+        fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: [32]u8, token: Cancellation, _: *u64) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.reader.check();
-            if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextStatistics;
             {
                 @import("antfly_platform").sync.lockYielding(&self.budget.mutex);
                 defer self.budget.mutex.unlock();
                 try stores.chargeReadBudget(&self.budget.remaining, length);
             }
-            return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.reader.read.cache);
+            return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.reader.read.cache);
         }
     };
     /// Each lane owns its routing cache and bounded decode arena. Shared
