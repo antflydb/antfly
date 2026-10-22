@@ -75,7 +75,7 @@ pub const EntityProjection = struct {
     text: []const u8,
     embedding: []const f32,
 };
-pub const semantic_index_version: u32 = 1;
+pub const semantic_index_version: u32 = 2;
 pub const SemanticIndex = struct { version: u32 = 0, generation: u64 = 0, cursor: ?[]const u8 = null, work_cursor: ?[]const u8 = null, backfill_complete: bool = false, complete: bool = false };
 pub const Config = struct {
     version: u32 = schema_version,

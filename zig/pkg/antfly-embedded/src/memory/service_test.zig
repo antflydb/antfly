@@ -5063,3 +5063,223 @@ test "memory semantic scheduler upgrade installs deadlines without reembedding u
     try std.testing.expectEqual(.indexed, page.semantic_discovery);
     try std.testing.expect(std.mem.indexOf(u8, page.seed_view.description, "Future graph") != null);
 }
+
+test "memory semantic ready projections refresh on source access transitions" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var service = SemanticFixture.service(&store, 1);
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"entity\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"},{\"id\":\"support\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"entity\"}]}],\"assertions\":[{\"id\":\"d\",\"subject\":\"graph\",\"predicate\":\"p\",\"value\":\"graph\",\"statement\":\"Secret graph description\",\"evidence\":[{\"id\":\"support\"}]}]}", "observe");
+    try drainSemantic(service, a, "initial");
+    store.resource_state = .denied;
+    for ([_]i64{ 40000, 80000 }) |now| {
+        service.context.now_ms = now;
+        for (0..16) |i| _ = try service.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "denied-{d}-{d}", .{ now, i }));
+    }
+    const page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+    const work = try service.backend.scan(service.backend.ptr, a, "entity-semantic-work/", null, 8);
+    const timers = try service.backend.scan(service.backend.ptr, a, "entity-semantic-due/", null, 8);
+    try std.testing.expectEqual(@as(usize, 0), work.rows.len);
+    try std.testing.expectEqual(@as(usize, 1), timers.rows.len);
+    try std.testing.expectEqual(.indexed, page.semantic_discovery);
+    try std.testing.expectEqualStrings("knowledge graph", page.seed_view.description);
+    store.resource_state = .current;
+    service.context.now_ms = 120000;
+    try drainSemantic(service, a, "restored");
+    const restored = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, restored.semantic_discovery);
+    try std.testing.expect(std.mem.indexOf(u8, restored.seed_view.description, "Secret graph") != null);
+}
+
+test "memory semantic audience eligibility cannot pin healthy backfill" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const service = SemanticFixture.service(&store, 1);
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    var bob = service;
+    bob.context.principal = "bob";
+    bob.context.admin = false;
+    _ = try bob.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"bob-e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Bob private evidence\"}]}", "evidence");
+    _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"alice-e\",\"source_id\":\"a\",\"source_version\":\"1\",\"text\":\"Alice observation\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"graph\",\"evidence\":[{\"id\":\"bob-e\"}]},{\"id\":\"healthy\",\"name\":\"healthy\",\"evidence\":[{\"id\":\"alice-e\"}]}]}", "entity");
+    try drainSemantic(service, a, "backfill");
+    const page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "healthy", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, page.semantic_discovery);
+    const rows = try service.backend.scan(service.backend.ptr, a, "entity-semantic/", null, 8);
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+    for (rows.rows) |row| try std.testing.expectEqualStrings("healthy", (try std.json.parseFromSliceLeaky(m.types.EntityProjection, a, row.json, .{})).entity_id);
+    var owner = service;
+    owner.context.admin = false;
+    try std.testing.expectError(error.MemoryNotFound, owner.execute(a, .entity_view, "graph", "{}", ""));
+}
+
+test "memory semantic curation retires serving projections before bounded neighbors" {
+    const Ranked = struct {
+        fn neighbors(ptr: *anyopaque, a: A, request: m.NeighborRequest) ![]const m.Neighbor {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            const prefix = try std.fmt.allocPrint(a, "entity-semantic/{s}/", .{request.index});
+            var healthy: ?m.Neighbor = null;
+            var rows = store.values.iterator();
+            while (rows.next()) |row| {
+                if (!std.mem.startsWith(u8, row.key_ptr.*, prefix)) continue;
+                const value = try std.json.parseFromSliceLeaky(m.types.EntityProjection, a, row.value_ptr.*, .{});
+                if (std.mem.eql(u8, value.entity_id, "retired")) return a.dupe(m.Neighbor, &.{.{ .key = row.key_ptr.*, .similarity = 1 }});
+                if (std.mem.eql(u8, value.entity_id, "healthy")) healthy = .{ .key = row.key_ptr.*, .similarity = 0.95 };
+            }
+            return if (healthy) |hit| a.dupe(m.Neighbor, &.{hit}) else a.alloc(m.Neighbor, 0);
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var service = SemanticFixture.service(&store, 1);
+    service.backend.neighbors = Ranked.neighbors;
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true, .neighbors = 1 } };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"}],\"entities\":[{\"id\":\"seed\",\"name\":\"radiance\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"retired\",\"name\":\"opaque\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"healthy\",\"name\":\"mystery\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    try drainSemantic(service, a, "initial");
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    _ = try service.execute(a, .curate_entity, "", try std.fmt.allocPrint(a, "{{\"expected_revision\":{d},\"action\":\"suppress\",\"from\":\"retired\"}}", .{state.revision}), "suppress");
+    for (0..16) |i| _ = try service.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "maintain-{d}", .{i}));
+    const page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "seed", "{}", ""), .{});
+    const rows = try service.backend.scan(service.backend.ptr, a, "entity-semantic/", null, 64);
+    try std.testing.expectEqual(.indexed, page.semantic_discovery);
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectEqualStrings("healthy", page.items[0].entity.entity.id);
+    try std.testing.expectEqual(@as(usize, 4), rows.rows.len);
+    for (rows.rows) |row| try std.testing.expect(!std.mem.eql(u8, "retired", (try std.json.parseFromSliceLeaky(m.types.EntityProjection, a, row.json, .{})).entity_id));
+}
+
+test "memory semantic ANN identities survive the full lexical continuation" {
+    const Ranked = struct {
+        fn neighbors(ptr: *anyopaque, a: A, request: m.NeighborRequest) ![]const m.Neighbor {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            const prefix = try std.fmt.allocPrint(a, "entity-semantic/{s}/", .{request.index});
+            var rows = store.values.iterator();
+            while (rows.next()) |row| {
+                if (!std.mem.startsWith(u8, row.key_ptr.*, prefix)) continue;
+                const value = try std.json.parseFromSliceLeaky(m.types.EntityProjection, a, row.value_ptr.*, .{});
+                if (std.mem.eql(u8, value.entity_id, store.resource_json)) return a.dupe(m.Neighbor, &.{.{ .key = row.key_ptr.*, .similarity = 1 }});
+            }
+            return a.alloc(m.Neighbor, 0);
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var service = SemanticFixture.service(&store, 1);
+    service.backend.neighbors = Ranked.neighbors;
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true, .neighbors = 1 }, .max_output_items = 256 };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    var entities: [101]m.types.Entity = undefined;
+    var last: []const u8 = "";
+    for (&entities, 0..) |*entity, i| {
+        entity.* = .{ .id = try std.fmt.allocPrint(a, "entity-{d}", .{i}), .name = "radiance", .evidence = &.{.{ .id = "e" }} };
+        const position = try fixtureKey(a, "entity", entity.id);
+        if (i != 0 and std.mem.lessThan(u8, last, position)) {
+            last = position;
+            store.resource_json = entity.id;
+        }
+    }
+    _ = try service.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &[_]m.types.Evidence{.{ .id = "e", .source_id = "s", .source_version = "1", .text = "evidence" }}, .entities = entities }, .{}), "observe");
+    try drainSemantic(service, a, "initial");
+    var cursor: ?[]const u8 = null;
+    var count: usize = 0;
+    for (0..64) |_| {
+        const page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "entity-0", try std.json.Stringify.valueAlloc(a, .{ .limit = @as(u16, 64), .cursor = cursor }, .{}), ""), .{});
+        for (page.items) |hit| if (std.mem.eql(u8, hit.entity.entity.id, store.resource_json)) {
+            count += 1;
+            try std.testing.expect(hit.semantic_discovered);
+        };
+        cursor = page.next_cursor;
+        if (cursor == null) break;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "memory semantic resource transitions fan out in bounded pages without entity scans" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var service = SemanticFixture.service(&store, 1);
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true }, .max_output_items = 256 };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    var entities: [70]m.types.Entity = undefined;
+    var claims: [70]m.types.Assertion = undefined;
+    for (&entities, &claims, 0..) |*entity, *claim, i| {
+        const id = try std.fmt.allocPrint(a, "entity-{d}", .{i});
+        entity.* = .{ .id = id, .name = "graph", .evidence = &.{.{ .id = "local" }} };
+        claim.* = .{ .id = id, .subject = id, .predicate = "description", .value = "graph", .statement = "Source-backed description", .evidence = &.{.{ .id = "source" }} };
+    }
+    const evidence = [_]m.types.Evidence{ .{ .id = "local", .source_id = "s", .source_version = "1", .text = "Graph" }, .{ .id = "source", .resource_selector = .{ .table = "business", .id = "approval" } } };
+    _ = try service.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = evidence, .entities = entities, .assertions = claims }, .{}), "observe");
+    try drainSemantic(service, a, "initial");
+    const scans = store.entity_scans;
+    store.resource_state = .denied;
+    service.context.now_ms = 40000;
+    _ = try service.execute(a, .advance, "", "{}", "poll");
+    try std.testing.expectEqual(@as(usize, 1), (try service.backend.scan(service.backend.ptr, a, "dependency/work/", null, 8)).rows.len);
+    try drainSemantic(service, a, "redact");
+    const rows = try service.backend.scan(service.backend.ptr, a, "entity-semantic/", null, 256);
+    try std.testing.expectEqual(@as(usize, 140), rows.rows.len);
+    for (rows.rows) |row| try std.testing.expectEqualStrings("graph", (try std.json.parseFromSliceLeaky(m.types.EntityProjection, a, row.json, .{})).text);
+    try std.testing.expectEqual(scans, store.entity_scans);
+}
+
+test "memory semantic manifests retire prior generations and all bindings on disable" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const service = SemanticFixture.service(&store, 1);
+    var config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"entities\":[{\"id\":\"graph\",\"name\":\"graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    try drainSemantic(service, a, "initial");
+    const old = try service.backend.scan(service.backend.ptr, a, "entity-semantic/", null, 8);
+    config.models.embedder.?.revision = "v2";
+    var state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    _ = try service.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = state.revision, .config = config }, .{}), "configure");
+    try drainSemantic(service, a, "replacement");
+    for (old.rows) |row| try std.testing.expect(store.values.get(row.key) == null);
+    try std.testing.expectEqual(@as(usize, 2), (try service.backend.scan(service.backend.ptr, a, "entity-semantic/", null, 8)).rows.len);
+    config.models = .{};
+    config.semantic_discovery.enabled = false;
+    state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    _ = try service.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = state.revision, .config = config }, .{}), "disable");
+    for (0..64) |i| {
+        state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        if (!try @import("scheduling.zig").retentionDue(service.backend, a, service.context.now_ms, state)) break;
+        _ = try service.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "disable-{d}", .{i}));
+    } else return error.TestUnexpectedResult;
+    for ([_][]const u8{ "entity-semantic/", "entity-semantic-binding/", "dependency/semantic-resource/", "entity-semantic-due/", "entity-semantic-timer/", "entity-semantic-work/", "entity-semantic-blocked/" }) |prefix| try std.testing.expectEqual(@as(usize, 0), (try service.backend.scan(service.backend.ptr, a, prefix, null, 8)).rows.len);
+}
+
+test "memory semantic version one upgrade installs resource bindings without reembedding" {
+    const Fail = struct {
+        fn embed(_: *anyopaque, _: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            return error.TransientInferenceFailure;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var service = SemanticFixture.service(&store, 1);
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"entities\":[{\"id\":\"graph\",\"name\":\"graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    try drainSemantic(service, a, "initial");
+    for ([_][]const u8{ "entity-semantic-binding/", "dependency/semantic-resource/" }) |prefix| {
+        const rows = try service.backend.scan(service.backend.ptr, a, prefix, null, 8);
+        for (rows.rows) |row| _ = store.values.remove(row.key);
+    }
+    var index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, store.values.get("entity-semantic-index").?, .{});
+    index.version = 1;
+    try store.values.put(a, "entity-semantic-index", try std.json.Stringify.valueAlloc(a, index, .{}));
+    service.backend.embed_document = Fail.embed;
+    try drainSemantic(service, a, "upgrade");
+    try std.testing.expectEqual(@as(usize, 1), (try service.backend.scan(service.backend.ptr, a, "entity-semantic-binding/", null, 8)).rows.len);
+    try std.testing.expectEqual(@as(usize, 1), (try service.backend.scan(service.backend.ptr, a, "dependency/semantic-resource/", null, 8)).rows.len);
+}

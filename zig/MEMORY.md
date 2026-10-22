@@ -363,9 +363,14 @@ entity neighborhoods; curation dirties the affected identity components rather
 than restarting a whole-space backfill. A configuration generation restarts the
 resumable backfill. Candidate reads do not generate stored projections.
 
-A retained entity whose source is temporarily unavailable keeps a durable blocked
-obligation and a retry deadline. Deferred jobs leave the runnable queue so they
-cannot pin healthy work or cause the worker to spin and append receipts between
+Projection eligibility and rendering both use the entity owner's audience,
+including private support checks. An administrator's wider read access cannot
+admit an owner-invisible entity into a projection batch or cause rendering to
+abort healthy work. Immutable support owned privately by another principal is
+outside that entity's current audience; it does not block eligible projections.
+A retained entity whose external source is temporarily unavailable keeps a durable
+blocked obligation and a retry deadline. Deferred jobs leave the runnable queue so
+they cannot pin healthy work or cause the worker to spin and append receipts between
 poll deadlines. A rotating cursor bounds each runnable quantum. Backfill readiness
 remains false until blocked obligations are materialized or authoritatively retired.
 Changed historical source pins do not block eligible current projections; a retry
@@ -383,6 +388,22 @@ needed to discover a time transition. An internal scheduler version makes older
 projection generations resume a bounded backfill to install deadline coverage;
 unchanged text reuses its existing embedding.
 
+A durable per-entity manifest records the current serving projection keys and the
+external resource identities in the evaluated support closure. Reverse dependency
+postings include redacted branches and transitive parents. Every observed source
+state transition, including access denial and restoration, enters the existing
+durable dependency frontier; each quantum fans out to at most 64 affected entities
+before admitting projection work. This also refreshes previously ready views that
+have no timer. Source changes never require a primary entity scan. The scheduler
+version backfill installs these manifests and postings on existing generations.
+
+Dirty maintenance retires serving projections for merged, suppressed and
+currently ineligible entities. Native index deletion uses the same full-index
+publication barrier as projection insertion, before readiness is acknowledged.
+The manifest also retires obsolete generation paths by point operations; config
+changes arm bounded legacy cleanup, and disabling discovery removes projections,
+source bindings and timers. Unsuppress and unmerge create fresh projection work.
+
 Candidate pages report `semantic_discovery: indexed`, `not_ready`, or
 `not_indexed` alongside `retrieval`. Pending backfill/dirty work and a stale seed
 fail readiness; lexical results remain available. Each bounded neighbor is also
@@ -396,9 +417,12 @@ Even two disjoint 64-neighbor windows remain fully pageable at a 64-item limit;
 page-size truncation never discards candidates. Continuations carry identities,
 not trusted scores: subsequent pages recompute similarity and all policy and
 provenance checks using current stored projections. The remainder is bounded to
-192 identities, cursor size and identity lengths are checked, and duplicates are
-rejected. Each continuation retains the existing principal and space-revision
-binding. One pass over N seeds performs at most 2N bounded neighbor calls,
+192 pending identities, plus at most 128 ANN union identities carried through the
+entire lexical continuation. Later lexical windows skip these ANN identities;
+draining the pending union never loses their discovery provenance or emits them
+again. Cursor size and identity lengths are checked, and duplicate identities
+within each cursor set are rejected. Each continuation retains the existing
+principal and space-revision binding. One pass over N seeds performs at most 2N bounded neighbor calls,
 independent of the requested page size; additional bounded point reads validate
 policy and provenance without repeating ANN.
 

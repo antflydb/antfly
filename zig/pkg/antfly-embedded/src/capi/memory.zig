@@ -298,6 +298,85 @@ test "capi native memory semantic deadlines survive reopen and refresh both vali
     }
 }
 
+test "capi native memory projection manifests survive reopen and retire curation entries" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("memory-semantic-manifests");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    const Fixture = struct {
+        fn embed(_: *anyopaque, allocator: std.mem.Allocator, _: memory.types.Model, _: []const u8) ![]const f32 {
+            return allocator.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    for (0..3) |phase| {
+        var id: ?*anyopaque = null;
+        const status = if (phase == 0) api.antfly_lite_create(path, &id) else api.antfly_lite_open(path, &id);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, status);
+        defer api.antfly_db_close(id);
+        var guard = api.enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const root = guard.handle.parent_handle orelse guard.handle;
+        if (phase == 0) {
+            try @import("tables.zig").create(root, "business", "{}", true);
+            const business = try @import("tables.zig").get(root, "business");
+            try business.batch(.{ .writes = &.{.{ .key = "approval", .value = "{\"message\":\"Approved deployment\"}" }}, .sync_level = .write });
+            try @import("tables.zig").create(root, "memory_manifests", "{}", true);
+        }
+        const db = try @import("tables.zig").get(root, "memory_manifests");
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const context: memory.Context = .{ .principal = "owner", .admin = true, .now_ms = if (phase == 0) 1 else @intCast(40000 * phase), .table_id = db.core.identity_namespace.table_id, .space = "manifests" };
+        var reader: ResourceReader = .{ .guard = &guard };
+        var native: engine.Native(h.db_mod.DB) = .{ .db = db, .context = context, .resource_ptr = &reader, .resource_fn = ResourceReader.read };
+        var backend = native.backend();
+        backend.embed = Fixture.embed;
+        backend.embed_document = Fixture.embed;
+        const service: memory.Service = .{ .backend = backend, .context = context };
+        if (phase == 0) {
+            const config: memory.types.Config = .{ .models = .{ .embedder = .{ .provider = "fixture", .model = "manifest", .revision = "v1", .dimensions = 2 } }, .semantic_discovery = .{ .enabled = true } };
+            _ = try service.execute(alloc, .create, "", try std.json.Stringify.valueAlloc(alloc, config, .{}), "create");
+            _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"},{\"id\":\"source\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"kg\",\"name\":\"KG\",\"evidence\":[{\"id\":\"e\"}]}],\"assertions\":[{\"id\":\"d\",\"subject\":\"graph\",\"predicate\":\"description\",\"value\":\"graph\",\"statement\":\"Source-backed description\",\"evidence\":[{\"id\":\"source\"}]}]}", "observe");
+        } else {
+            const bindings = try backend.scan(backend.ptr, alloc, "entity-semantic-binding/", null, 8);
+            try std.testing.expectEqual(@as(usize, if (phase == 1) 2 else 1), bindings.rows.len);
+            try std.testing.expectEqual(@as(usize, 1), (try backend.scan(backend.ptr, alloc, "dependency/semantic-resource/", null, 8)).rows.len);
+            if (phase == 1) {
+                const state = try std.json.parseFromSliceLeaky(memory.types.State, alloc, (try backend.get(backend.ptr, alloc, "control")).?.json, .{});
+                _ = try service.execute(alloc, .curate_entity, "", try std.json.Stringify.valueAlloc(alloc, .{ .expected_revision = state.revision, .action = "suppress", .from = "kg" }, .{}), "suppress");
+            } else {
+                const business = try @import("tables.zig").get(root, "business");
+                try business.batch(.{ .writes = &.{.{ .key = "approval", .value = "{\"message\":\"Changed source\"}" }}, .sync_level = .write });
+                const stale = try std.json.parseFromSliceLeaky(memory.types.EntityCandidatePage, alloc, try service.execute(alloc, .entity_candidates, "graph", "{}", ""), .{});
+                try std.testing.expectEqual(.not_ready, stale.semantic_discovery);
+            }
+        }
+        for (0..32) |i| {
+            _ = try service.execute(alloc, .advance, "", "{}", try std.fmt.allocPrint(alloc, "phase-{d}-{d}", .{ phase, i }));
+            const page = try std.json.parseFromSliceLeaky(memory.types.EntityCandidatePage, alloc, try service.execute(alloc, .entity_candidates, "graph", "{}", ""), .{});
+            if (page.semantic_discovery == .indexed) {
+                try std.testing.expectEqual(phase != 2, std.mem.indexOf(u8, page.seed_view.description, "Source-backed") != null);
+                break;
+            }
+        } else return error.TestUnexpectedResult;
+        const projections = try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 8);
+        try std.testing.expectEqual(@as(usize, if (phase == 0) 4 else 2), projections.rows.len);
+        for (projections.rows) |row| {
+            const rest = row.key["entity-semantic/".len..];
+            const slash = std.mem.indexOfScalar(u8, rest, '/').?;
+            const neighbors = try backend.neighbors.?(backend.ptr, alloc, .{ .index = rest[0..slash], .vector = &.{ 1, 0 }, .limit = 4 });
+            try std.testing.expectEqual(@as(usize, if (phase == 0) 2 else 1), neighbors.len);
+            if (phase != 0) for (neighbors) |neighbor| {
+                const projection = try std.json.parseFromSliceLeaky(memory.types.EntityProjection, alloc, (try backend.get(backend.ptr, alloc, neighbor.key)).?.json, .{});
+                try std.testing.expectEqualStrings("graph", projection.entity_id);
+            };
+        }
+    }
+}
+
 // This qualification isolates retrieval cost from model latency and import.
 // Projection fixtures use the exact native view contract and real vector indexes.
 fn qualifyAnnScale(allocator: std.mem.Allocator, native: *engine.Native(h.db_mod.DB), service: memory.Service, prototypes: []const memory.Row) !void {

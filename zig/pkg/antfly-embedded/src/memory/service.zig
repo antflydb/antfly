@@ -224,6 +224,7 @@ pub const Service = struct {
             .configure => {
                 try run.requireAdmin();
                 try run.put("entity-semantic-index", t.SemanticIndex{});
+                try run.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
                 const request = try parse(operations.Configure, a, body);
                 if (request.expected_revision != run.state.revision - 1) return error.MemoryRevisionConflict;
                 var config = request.config;
@@ -2038,6 +2039,20 @@ const Run = struct {
         // without a corpus-sized postfilter or an ordinal membership scan.
         return std.fmt.allocPrint(self.a, "memory_{s}_{s}", .{ @tagName(kind), try hash(self.a, .{ self.state.config.embedding_generation, self.state.config.models.embedder, record.entity.visibility, if (record.entity.visibility == .private) record.owner else "" }) });
     }
+    const SemanticSnapshot = struct { view: ?t.EntityView = null, canonical: bool = true };
+    fn semanticSnapshot(self: *Run, record: t.EntityRecord) !SemanticSnapshot {
+        const prior = self.service.context;
+        self.service.context.admin = false;
+        self.service.context.principal = record.owner;
+        defer self.service.context = prior;
+        // Eligibility and rendering share the entity's audience. Immutable
+        // private support owned by another principal is not a current input
+        // for this audience, even if the maintenance administrator can read it.
+        if (!try self.entityVisible(record)) return .{};
+        const selected = try self.canonical(record.entity.id);
+        if (selected == null or !eql(u8, selected.?, record.entity.id)) return .{ .canonical = false };
+        return .{ .view = try self.entityView(record.entity.id, .{}) };
+    }
     fn semanticView(self: *Run, record: t.EntityRecord) !t.EntityView {
         // A projection can never acquire the maintenance principal's wider
         // administrative visibility. Its read audience belongs to the entity.
@@ -2061,6 +2076,45 @@ const Run = struct {
         if (!eql(u8, projection.fingerprint, view.fingerprint) or !eql(u8, try self.encode(projection.dependencies), try self.encode(view.dependencies))) return false;
         const text = if (projection.kind == .names) try self.semanticNames(record.entity) else view.description;
         return eql(u8, projection.text, text);
+    }
+    // A per-entity manifest makes serving retirement and source fanout point
+    // operations. Resource identities include every evaluated support branch,
+    // including currently redacted branches and transitive parents.
+    const SemanticBinding = struct { id: []const u8, projections: []const []const u8 = &.{}, resources: []const []const u8 = &.{} };
+    fn semanticResourceId(self: *Run, reference: prov.Resource) ![]const u8 {
+        return hash(self.a, reference.identity());
+    }
+    fn semanticBindings(self: *Run, id: []const u8, resources: ResourceSet, projections: []const []const u8) !void {
+        const path = try key(self.a, "entity-semantic-binding", id);
+        const prior = (try self.read(SemanticBinding, path)) orelse SemanticBinding{ .id = id };
+        var current: std.StringHashMapUnmanaged(void) = .empty;
+        var inputs = resources.keyIterator();
+        while (inputs.next()) |input| try current.put(self.a, try self.semanticResourceId(self.resource_states.get(input.*).?.reference), {});
+        for (prior.projections) |projection| {
+            var keep = false;
+            for (projections) |desired| if (eql(u8, projection, desired)) {
+                keep = true;
+                break;
+            };
+            if (!keep) try self.remove(projection);
+        }
+        for (prior.resources) |resource| if (!current.contains(resource)) try self.remove(try dependencyKey(self.a, "semantic-resource", resource, id));
+        const ids = try self.a.alloc([]const u8, current.count());
+        var iterator = current.keyIterator();
+        var i: usize = 0;
+        while (iterator.next()) |resource| : (i += 1) {
+            ids[i] = resource.*;
+            try self.put(try dependencyKey(self.a, "semantic-resource", resource.*, id), .{ .child = id });
+        }
+        std.mem.sort([]const u8, ids, {}, stringLess);
+        if (ids.len == 0 and projections.len == 0) try self.remove(path) else try self.put(path, SemanticBinding{ .id = id, .resources = ids, .projections = projections });
+    }
+    fn retireSemantic(self: *Run, record: t.EntityRecord) !void {
+        // Also cover projections predating the manifest's bounded backfill.
+        inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
+            const path = try self.semanticProjectionKey(record, kind);
+            if (try self.read(t.EntityProjection, path) != null) try self.remove(path);
+        }
     }
     const SemanticTimer = struct { id: []const u8, at: i64 };
     fn semanticTimerKey(self: *Run, timer: SemanticTimer) ![]const u8 {
@@ -2101,6 +2155,9 @@ const Run = struct {
             const record = if (initial) try parse(t.EntityRecord, self.a, row.json) else blk: {
                 const work = try parse(struct { id: []const u8 }, self.a, row.json);
                 break :blk (try self.read(t.EntityRecord, try key(self.a, "entity", work.id))) orelse {
+                    try self.semanticBindings(work.id, .empty, &.{});
+                    try self.scheduleSemanticTimer(work.id, null);
+                    try self.remove(try key(self.a, "entity-semantic-blocked", work.id));
                     try self.remove(row.key);
                     continue;
                 };
@@ -2109,49 +2166,57 @@ const Run = struct {
             self.temporal_boundary = null;
             self.temporal_denied = false;
             defer self.temporal_tracking = false;
-            if (try self.entityVisible(record)) {
-                const canonical_id = try self.canonical(record.entity.id);
-                if (canonical_id != null and eql(u8, canonical_id.?, record.entity.id)) {
-                    const captured = try self.captureResources(semanticView, .{record});
-                    const view = captured.result;
-                    // Rebinding unchanged text is still a derived publication
-                    // and must fence live source dependencies at final commit.
-                    self.inferred = true;
-                    inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
-                        const path = try self.semanticProjectionKey(record, kind);
-                        const existing = try self.read(t.EntityProjection, path);
-                        if (existing == null or !try self.semanticCurrent(existing.?, record, view)) {
-                            const text = if (kind == .names) try self.semanticNames(record.entity) else view.description;
-                            const model = self.state.config.models.embedder.?;
-                            const index_name = try self.semanticIndexName(record, kind);
-                            try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, index_name, model.dimensions.?);
-                            const reusable = if (existing) |prior| prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and eql(u8, prior.text, text) and eql(u8, try self.encode(prior.model), try self.encode(model)) else false;
-                            const embedding = if (reusable) existing.?.embedding else blk: {
-                                const computed = try self.service.backend.embed_document.?(self.service.backend.ptr, self.a, model, text);
-                                try self.inferenceCompleted(captured.resources);
-                                break :blk computed;
-                            };
-                            if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
-                            for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
-                            try self.put(path, t.EntityProjection{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = embedding });
-                        }
+            const captured = try self.captureResources(semanticSnapshot, .{record});
+            // Eligibility, dependency bindings and serving retirement are also
+            // derived publications, including a currently unavailable branch.
+            self.inferred = true;
+            if (captured.result.view) |view| {
+                const paths = try self.a.alloc([]const u8, 2);
+                inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }, 0..) |kind, i| paths[i] = try self.semanticProjectionKey(record, kind);
+                try self.semanticBindings(record.entity.id, captured.resources, paths);
+                // Rebinding unchanged text is still a derived publication
+                // and must fence live source dependencies at final commit.
+                self.inferred = true;
+                inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
+                    const path = try self.semanticProjectionKey(record, kind);
+                    const existing = try self.read(t.EntityProjection, path);
+                    if (existing == null or !try self.semanticCurrent(existing.?, record, view)) {
+                        const text = if (kind == .names) try self.semanticNames(record.entity) else view.description;
+                        const model = self.state.config.models.embedder.?;
+                        const index_name = try self.semanticIndexName(record, kind);
+                        try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, index_name, model.dimensions.?);
+                        const reusable = if (existing) |prior| prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and eql(u8, prior.text, text) and eql(u8, try self.encode(prior.model), try self.encode(model)) else false;
+                        const embedding = if (reusable) existing.?.embedding else blk: {
+                            const computed = try self.service.backend.embed_document.?(self.service.backend.ptr, self.a, model, text);
+                            try self.inferenceCompleted(captured.resources);
+                            break :blk computed;
+                        };
+                        if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
+                        for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
+                        try self.put(path, t.EntityProjection{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = embedding });
                     }
                 }
                 try self.scheduleSemanticTimer(record.entity.id, self.temporal_boundary);
-            } else if (try self.entityRetained(record)) {
-                if (self.temporal_denied) {
-                    // Preserve readiness debt separately from runnable work.
-                    // The durable deadline retries denial at the poll cadence,
-                    // allowing both healthy jobs and retention work to advance.
-                    try self.put(try key(self.a, "entity-semantic-blocked", record.entity.id), .{ .id = record.entity.id });
-                    try self.scheduleSemanticTimer(record.entity.id, self.temporal_boundary orelse (self.service.context.now_ms +| resource_check_interval_ms));
-                    try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
-                    continue;
-                }
-                // A changed pinned source remains historical, rather than an
-                // eligible current projection. Revisit it if the pin is restored.
-                try self.scheduleSemanticTimer(record.entity.id, self.temporal_boundary);
-            } else try self.scheduleSemanticTimer(record.entity.id, null);
+            } else {
+                try self.retireSemantic(record);
+                const retained_entity = try self.entityRetained(record);
+                const revisit = retained_entity and captured.result.canonical;
+                try self.semanticBindings(record.entity.id, if (revisit) captured.resources else .empty, &.{});
+                if (revisit) {
+                    if (self.temporal_denied) {
+                        // Preserve readiness debt separately from runnable work.
+                        // The durable deadline retries denial at the poll cadence,
+                        // allowing both healthy jobs and retention work to advance.
+                        try self.put(try key(self.a, "entity-semantic-blocked", record.entity.id), .{ .id = record.entity.id });
+                        try self.scheduleSemanticTimer(record.entity.id, self.temporal_boundary orelse (self.service.context.now_ms +| resource_check_interval_ms));
+                        try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
+                        continue;
+                    }
+                    // A changed pinned source remains historical, rather than an
+                    // eligible current projection. Revisit it if the pin is restored.
+                    try self.scheduleSemanticTimer(record.entity.id, self.temporal_boundary);
+                } else try self.scheduleSemanticTimer(record.entity.id, null);
+            }
             try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
             try self.remove(try key(self.a, "entity-semantic-blocked", record.entity.id));
         }
@@ -2183,7 +2248,7 @@ const Run = struct {
         try backend.commit(backend.ptr, self.a, control, &.{ .{ .key = "entity-semantic-index", .json = try self.encode(index) }, .{ .key = "control", .json = control.json } });
     }
     const CandidateRef = struct { id: []const u8, semantic: bool = false };
-    const CandidateContinuation = struct { pending: []const CandidateRef = &.{}, lexical: ?[]const u8 = null };
+    const CandidateContinuation = struct { pending: []const CandidateRef = &.{}, lexical: ?[]const u8 = null, semantic: []const []const u8 = &.{} };
     fn semanticCandidates(self: *Run, input_seed: t.EntityRecord, request: t.EntityCandidateRequest, pending: []const CandidateRef) !SemanticMatches {
         if (!self.state.config.semantic_discovery.enabled) return .{};
         var result: SemanticMatches = .{ .state = .not_ready };
@@ -2268,7 +2333,13 @@ const Run = struct {
                 error.OutOfMemory => return err,
                 else => return error.InvalidMemoryCursor,
             };
-            if (continuation.pending.len > 192) return error.InvalidMemoryCursor;
+            if (continuation.pending.len > 192 or continuation.semantic.len > 128) return error.InvalidMemoryCursor;
+            var semantic_seen: std.StringHashMapUnmanaged(void) = .empty;
+            for (continuation.semantic) |semantic_id| {
+                t.validateId(semantic_id) catch return error.InvalidMemoryCursor;
+                if (semantic_seen.contains(semantic_id)) return error.InvalidMemoryCursor;
+                try semantic_seen.put(self.a, semantic_id, {});
+            }
             var seen: std.StringHashMapUnmanaged(void) = .empty;
             for (continuation.pending) |ref| {
                 t.validateId(ref.id) catch return error.InvalidMemoryCursor;
@@ -2310,6 +2381,14 @@ const Run = struct {
         for (candidate_rows.items) |row| {
             try self.service.context.check();
             const candidate = try parse(t.EntityRecord, self.a, row.json);
+            if (request.cursor != null and continuation.pending.len == 0) {
+                var emitted = false;
+                for (continuation.semantic) |semantic_id| if (eql(u8, semantic_id, candidate.entity.id)) {
+                    emitted = true;
+                    break;
+                };
+                if (emitted) continue;
+            }
             self.authorize(candidate.owner, candidate.entity.visibility) catch continue;
             if (!try self.entityVisible(candidate)) continue;
             const canonical_id = (try self.canonical(candidate.entity.id)) orelse continue;
@@ -2362,11 +2441,15 @@ const Run = struct {
             }
         }.less);
         const count = @min(matches.items.len, request.limit);
+        var semantic_ids: std.ArrayList([]const u8) = .empty;
+        if (request.cursor != null) try semantic_ids.appendSlice(self.a, continuation.semantic) else {
+            for (matches.items) |item| if (item.semantic_discovered) try semantic_ids.append(self.a, item.entity.entity.id);
+        }
         const pending = try self.a.alloc(CandidateRef, matches.items.len - count);
         for (matches.items[count..], pending) |item, *ref| ref.* = .{ .id = item.entity.entity.id, .semantic = item.semantic_discovered };
         var next: ?[]const u8 = null;
         if (pending.len != 0 or page.next != null) {
-            const json = try self.encode(CandidateContinuation{ .pending = pending, .lexical = page.next });
+            const json = try self.encode(CandidateContinuation{ .pending = pending, .lexical = page.next, .semantic = semantic_ids.items });
             const encoded = try self.a.alloc(u8, json.len * 2);
             const hex = "0123456789abcdef";
             for (json, 0..) |byte, i| {
@@ -3148,6 +3231,7 @@ const Run = struct {
             if (state != watch.last_state) {
                 watch.last_state = state;
                 try self.put(row.key, watch);
+                if (self.state.config.semantic_discovery.enabled) try self.invalidate("semantic-resource", try self.semanticResourceId(reference));
                 if (state == .changed) try self.invalidate("resource", watch.evidence_id);
                 if (state == .missing) try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
             }
@@ -3233,6 +3317,10 @@ const Run = struct {
     }
     fn maintainChild(self: *Run, row: Row, item: DependencyWork) anyerror!void {
         const child = try parse(struct { child: []const u8 }, self.a, row.json);
+        if (eql(u8, item.kind, "semantic-resource")) {
+            if (self.state.config.semantic_discovery.enabled and try self.read(t.EntityRecord, try key(self.a, "entity", child.child)) != null) try self.semanticDirty(child.child) else try self.remove(row.key);
+            return;
+        }
         if (try self.assertion(child.child)) |value| {
             if (self.state.config.semantic_discovery.enabled) {
                 try self.semanticDirty(value.assertion.subject);
@@ -3330,7 +3418,7 @@ const Run = struct {
         } else if (std.mem.startsWith(u8, row.key, "entity-semantic/")) {
             const projection = try parse(t.EntityProjection, self.a, row.json);
             const record = try self.read(t.EntityRecord, try key(self.a, "entity", projection.entity_id));
-            if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?)) {
+            if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?) or !eql(u8, row.key, try self.semanticProjectionKey(record.?, projection.kind))) {
                 try self.remove(row.key);
             } else {
                 const selected = try self.canonical(record.?.entity.id);
@@ -3347,6 +3435,10 @@ const Run = struct {
                     }
                 }
             }
+        } else if (std.mem.startsWith(u8, row.key, "entity-semantic-binding/")) {
+            const binding = try parse(SemanticBinding, self.a, row.json);
+            const record = try self.read(t.EntityRecord, try key(self.a, "entity", binding.id));
+            if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?)) try self.semanticBindings(binding.id, .empty, &.{});
         } else if (std.mem.startsWith(u8, row.key, "entity-semantic-timer/")) {
             const timer = try parse(SemanticTimer, self.a, row.json);
             const record = try self.read(t.EntityRecord, try key(self.a, "entity", timer.id));
