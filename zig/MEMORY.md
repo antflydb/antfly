@@ -819,9 +819,17 @@ selection/cleanup and finalization budgets. A shared maintenance classification
 selects retention before semantic work; semantic backfills and refreshes receive
 the model budget even though they have no pending operation receipt. Retention
 keeps its short budget and never invokes a provider in that quantum. Provider
-deadlines leave a grace period for publication. A timed-out semantic quantum
-retains its durable frontier for a later retry. For receipt-backed processing,
-if the entire attempt overruns, the worker
+deadlines leave a grace period for publication. A semantic quantum checkpoints
+completed projections when a later provider/storage timeout or work-budget limit
+interrupts its batch. The durable cursor remains before the unfinished entity,
+including when only its names projection is ready; retries reuse completed
+embeddings. Partial entities retain dependency bindings and timers, and generation
+readiness remains false until every obligation is complete. Background owners
+may open one fresh five-second publication window, without further inference;
+publication still rechecks leadership, live grants, the memory revision and every
+captured source. Foreground deadlines cannot be extended. With no completed work,
+the original failure propagates. For receipt-backed processing, if the entire
+attempt overruns, the worker
 re-enters the native service with a fresh, bounded finalization context and the
 original revision/receipt fence, recording the failure without invoking a model.
 Receipt replay handles an ambiguously committed result; a changed control revision

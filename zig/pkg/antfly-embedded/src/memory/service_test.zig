@@ -5456,3 +5456,190 @@ test "memory semantic version two upgrades install internal closure without reem
     try std.testing.expectEqual(.indexed, page.semantic_discovery);
     try std.testing.expectEqualStrings("graph", page.seed_view.description);
 }
+
+test "memory semantic timeout checkpoints projections and resumes the unfinished entity" {
+    const Slow = struct {
+        var elapsed: u64 = 0;
+        var deadline: u64 = 125;
+        var seconds: u64 = 10;
+        var calls: usize = 0;
+        var checkpoints: usize = 0;
+        fn check(_: *anyopaque) !void {
+            if (elapsed >= deadline) return error.DeadlineExceeded;
+        }
+        fn checkpoint(_: *anyopaque) !void {
+            checkpoints += 1;
+            deadline = elapsed + 5;
+        }
+        fn embed(_: *anyopaque, a: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            calls += 1;
+            elapsed += seconds;
+            if (elapsed >= 120) return error.Timeout;
+            return a.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    for ([_]u64{ 10, 70 }) |seconds| {
+        Slow.seconds = seconds;
+        Slow.elapsed = 0;
+        Slow.deadline = 125;
+        Slow.calls = 0;
+        Slow.checkpoints = 0;
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var service = SemanticFixture.service(&store, 1);
+        service.context.check_ptr = &store;
+        service.context.check_fn = Slow.check;
+        service.context.checkpoint_ptr = &store;
+        service.context.checkpoint_fn = Slow.checkpoint;
+        service.backend.embed_document = Slow.embed;
+        const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+        _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+        const count: usize = if (seconds == 10) 8 else 1;
+        const entities = try a.alloc(m.types.Entity, count);
+        for (entities, 0..) |*entity, i| entity.* = .{ .id = try std.fmt.allocPrint(a, "entity-{d}", .{i}), .name = "graph", .evidence = &.{.{ .id = "e" }} };
+        _ = try service.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &[_]m.types.Evidence{.{ .id = "e", .source_id = "s", .source_version = "1", .text = "Graph" }}, .entities = entities }, .{}), "observe");
+        const revision = store.revision;
+        _ = try service.execute(a, .advance, "", "{}", "first");
+        const first = (try service.backend.get(service.backend.ptr, a, "entity-semantic-index")).?;
+        const partial = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, first.json, .{});
+        try std.testing.expect(!partial.complete and !partial.backfill_complete);
+        try std.testing.expectEqual(seconds == 10, partial.cursor != null);
+        try std.testing.expect(store.revision > revision);
+        const rows = try service.backend.scan(service.backend.ptr, a, "entity-semantic/", null, 32);
+        try std.testing.expectEqual(@as(usize, if (seconds == 10) 11 else 1), rows.rows.len);
+        const calls_after_checkpoint = Slow.calls;
+        _ = try service.execute(a, .advance, "", "{}", "first");
+        try std.testing.expectEqual(calls_after_checkpoint, Slow.calls);
+        // Reopen policy from persisted rows. The first entity not fully built
+        // is revisited; its successful name projection is reused on retry.
+        Slow.elapsed = 0;
+        Slow.deadline = 125;
+        var reopened = service;
+        _ = try reopened.execute(a, .advance, "", "{}", "resume");
+        const final = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, (try service.backend.get(service.backend.ptr, a, "entity-semantic-index")).?.json, .{});
+        try std.testing.expect(final.complete and final.backfill_complete);
+        try std.testing.expectEqual(2 * count + 1, Slow.calls);
+        try std.testing.expectEqual(@as(usize, 1), Slow.checkpoints);
+        try std.testing.expectEqual(2 * count, (try service.backend.scan(service.backend.ptr, a, "entity-semantic/", null, 32)).rows.len);
+        // Repeat under the dirty-work lane rather than the initial backfill.
+        var entries = store.values.iterator();
+        var paths: std.ArrayList([]const u8) = .empty;
+        while (entries.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, "entity-semantic/")) try paths.append(a, entry.key_ptr.*);
+        for (paths.items) |path| _ = store.values.remove(path);
+        for (entities) |entity| try store.values.put(a, try fixtureKey(a, "entity-semantic-work", entity.id), try std.json.Stringify.valueAlloc(a, .{ .id = entity.id }, .{}));
+        Slow.elapsed = 0;
+        Slow.deadline = 125;
+        _ = try service.execute(a, .advance, "", "{}", "dirty-first");
+        const dirty = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, (try service.backend.get(service.backend.ptr, a, "entity-semantic-index")).?.json, .{});
+        try std.testing.expect(dirty.backfill_complete and !dirty.complete);
+        try std.testing.expectEqual(seconds == 10, dirty.work_cursor != null);
+        try std.testing.expectEqual(@as(usize, if (seconds == 10) 11 else 1), (try service.backend.scan(service.backend.ptr, a, "entity-semantic/", null, 32)).rows.len);
+        Slow.elapsed = 0;
+        Slow.deadline = 125;
+        _ = try service.execute(a, .advance, "", "{}", "dirty-resume");
+        const done = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, (try service.backend.get(service.backend.ptr, a, "entity-semantic-index")).?.json, .{});
+        try std.testing.expect(done.complete);
+        try std.testing.expectEqual(2 * (2 * count + 1), Slow.calls);
+    }
+}
+
+test "memory semantic timeout checkpoints retain source grant and foreground deadline fences" {
+    const Failure = enum { grant, source, foreground, revision };
+    const Provider = struct {
+        var calls: usize = 0;
+        var expired: bool = false;
+        var failure: Failure = .grant;
+        fn check(_: *anyopaque) !void {
+            if (expired) return error.DeadlineExceeded;
+        }
+        fn checkpoint(ptr: *anyopaque) !void {
+            if (failure == .grant) return error.Forbidden;
+            if (failure == .revision) {
+                const store: *Store = @ptrCast(@alignCast(ptr));
+                store.revision += 1;
+            }
+            expired = false;
+        }
+        fn embed(ptr: *anyopaque, a: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            calls += 1;
+            if (calls == 2) {
+                if (failure == .source) {
+                    const store: *Store = @ptrCast(@alignCast(ptr));
+                    store.resource_state = .changed;
+                }
+                expired = true;
+                return error.Timeout;
+            }
+            return a.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    for ([_]Failure{ .grant, .source, .foreground, .revision }) |failure| {
+        Provider.calls = 0;
+        Provider.expired = false;
+        Provider.failure = failure;
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var service = SemanticFixture.service(&store, 1);
+        service.context.check_ptr = &store;
+        service.context.check_fn = Provider.check;
+        if (failure != .foreground) {
+            service.context.checkpoint_ptr = &store;
+            service.context.checkpoint_fn = Provider.checkpoint;
+        }
+        service.backend.embed_document = Provider.embed;
+        const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+        _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+        _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"resource\":{\"database\":\"default\",\"namespace\":\"public\",\"table\":\"business\",\"table_id\":7,\"kind\":\"record\",\"id\":\"r\",\"revision\":7}}],\"entities\":[{\"id\":\"graph\",\"name\":\"graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+        const revision = store.revision;
+        const expected = switch (failure) {
+            .grant => error.Forbidden,
+            .source => error.MemoryResourceChanged,
+            .foreground => error.DeadlineExceeded,
+            .revision => error.MemoryRevisionConflict,
+        };
+        try std.testing.expectError(expected, service.execute(a, .advance, "", "{}", "checkpoint"));
+        try std.testing.expectEqual(revision + @intFromBool(failure == .revision), store.revision);
+        Provider.expired = false;
+        try std.testing.expectEqual(@as(usize, 0), (try service.backend.scan(service.backend.ptr, a, "entity-semantic/", null, 8)).rows.len);
+    }
+}
+
+test "memory semantic checkpoints preserve progress across storage and work-budget boundaries" {
+    const Boundary = struct {
+        var calls: usize = 0;
+        var interrupted: bool = false;
+        var failure: anyerror = error.Timeout;
+        fn ensure(_: *anyopaque, _: A, _: []const u8, _: u32) !void {
+            if (calls == 1 and !interrupted) {
+                interrupted = true;
+                return failure;
+            }
+        }
+        fn embed(_: *anyopaque, a: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            calls += 1;
+            return a.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    for ([_]anyerror{ error.Timeout, error.DeadlineExceeded, error.MemoryWorkLimit }) |failure| {
+        Boundary.calls = 0;
+        Boundary.interrupted = false;
+        Boundary.failure = failure;
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var service = SemanticFixture.service(&store, 1);
+        service.backend.embed_document = Boundary.embed;
+        service.backend.ensure_vector_index = Boundary.ensure;
+        const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+        _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+        _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+        _ = try service.execute(a, .advance, "", "{}", "partial");
+        try std.testing.expectEqual(@as(usize, 1), (try service.backend.scan(service.backend.ptr, a, "entity-semantic/", null, 8)).rows.len);
+        _ = try service.execute(a, .advance, "", "{}", "resume");
+        try std.testing.expectEqual(@as(usize, 2), Boundary.calls);
+        const index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, (try service.backend.get(service.backend.ptr, a, "entity-semantic-index")).?.json, .{});
+        try std.testing.expect(index.complete and index.backfill_complete);
+    }
+}

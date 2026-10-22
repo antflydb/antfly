@@ -5537,6 +5537,9 @@ pub const ApiHttpServer = struct {
             context.namespace = state.namespace;
             context.space = state.space;
             var resources: MemoryResourceReader = .{ .server = server, .executor = executor, .database = state.database, .request = .{ .deadline_ns = work.deadline.end } };
+            var checkpoint: MemoryWorkCheckpoint = .{ .deadline = work.deadline, .adapter = &adapter, .resources = &resources };
+            context.checkpoint_ptr = &checkpoint;
+            context.checkpoint_fn = MemoryWorkCheckpoint.begin;
             adapter.resource_ptr = &resources;
             adapter.resource_fn = MemoryResourceReader.read;
             adapter.context = context;
@@ -5565,6 +5568,20 @@ pub const ApiHttpServer = struct {
                 };
                 return;
             };
+        }
+    };
+
+    const MemoryWorkCheckpoint = struct {
+        deadline: *MemoryWorkDeadline,
+        adapter: *@import("memory.zig").engine.Routed,
+        resources: *MemoryResourceReader,
+        fn begin(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.deadline.beginFinalization(platform_time.monotonicNs());
+            self.adapter.request.deadline_ns = self.deadline.end;
+            self.resources.request.deadline_ns = self.deadline.end;
+            // Policy rechecks live leadership/grants and every captured source
+            // before publishing the retained projections and resumable cursor.
         }
     };
 
@@ -59598,6 +59615,15 @@ test "native memory worker separates model and finalization budgets while fencin
     try std.testing.expectError(error.DeadlineExceeded, ApiHttpServer.MemoryWorkDeadline.check(&budget));
     budget.beginFinalization(platform_time.monotonicNs());
     try ApiHttpServer.MemoryWorkDeadline.check(&budget);
+    // Recovery must update copied storage/source deadlines as well as the
+    // live context clock, or checkpoint reads would still use the expired one.
+    var adapter: @import("memory.zig").engine.Routed = .{ .table = "memory_team", .reads = undefined, .writes = undefined, .context = .{ .principal = "owner", .now_ms = 1 }, .request = .{ .deadline_ns = 0 } };
+    var resources: ApiHttpServer.MemoryResourceReader = .{ .server = &server, .executor = "owner", .database = "default", .request = .{ .deadline_ns = 0 } };
+    var checkpoint: ApiHttpServer.MemoryWorkCheckpoint = .{ .deadline = &budget, .adapter = &adapter, .resources = &resources };
+    try ApiHttpServer.MemoryWorkCheckpoint.begin(&checkpoint);
+    try std.testing.expectEqual(budget.end, adapter.request.deadline_ns.?);
+    try std.testing.expectEqual(budget.end, resources.request.deadline_ns.?);
+    try ApiHttpServer.MemoryWorkDeadline.check(&budget);
     fixture.leader = false;
     try std.testing.expectError(error.NotLeader, ApiHttpServer.MemoryWorkDeadline.check(&budget));
 }
@@ -59623,13 +59649,18 @@ test "native memory worker budgets slow semantic publication independently from 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.budget.checkAt(self.now);
         }
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.budget.beginFinalization(self.now);
+        }
         fn validate(_: *anyopaque, _: memory.memory.types.Config) !void {}
         fn embed(ptr: *anyopaque, a: std.mem.Allocator, _: memory.memory.types.Model, _: []const u8) ![]const f32 {
             const native: *Native = @ptrCast(@alignCast(ptr));
             const self: *@This() = @ptrCast(@alignCast(native.context.check_ptr.?));
-            self.now += 3 * std.time.ns_per_s;
+            self.now += 10 * std.time.ns_per_s;
             self.embeddings += 1;
             if (self.lose_leadership) self.leader = false;
+            if (self.now >= self.budget.end - 5 * std.time.ns_per_s) return error.Timeout;
             return a.dupe(f32, &.{ 1, 0 });
         }
         fn state(backend: memory.memory.Backend, a: std.mem.Allocator) !memory.memory.types.State {
@@ -59649,7 +59680,7 @@ test "native memory worker budgets slow semantic publication independently from 
     var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone, .relational_maintenance_leadership = .{ .ptr = &fixture, .vtable = &.{ .is_local_leader = Fixture.isLeader } } }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
     defer server.deinit();
     budget.server = &server;
-    const context: memory.memory.Context = .{ .principal = "owner", .admin = true, .now_ms = 1, .check_ptr = &fixture, .check_fn = Fixture.check };
+    const context: memory.memory.Context = .{ .principal = "owner", .admin = true, .now_ms = 1, .check_ptr = &fixture, .check_fn = Fixture.check, .checkpoint_ptr = &fixture, .checkpoint_fn = Fixture.checkpoint };
     var native: Native = .{ .db = &db, .context = context };
     var backend = native.backend();
     backend.validate_models = Fixture.validate;
@@ -59659,16 +59690,27 @@ test "native memory worker budgets slow semantic publication independently from 
     const config: memory.memory.types.Config = .{ .semantic_discovery = .{ .enabled = true }, .models = .{ .embedder = .{ .provider = "fixture", .model = "fixture", .revision = "v1", .dimensions = 2 } } };
     _ = try service.execute(alloc, .create, "", try std.json.Stringify.valueAlloc(alloc, config, .{}), "create");
     _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"},{\"id\":\"obsolete\",\"source_id\":\"old\",\"source_version\":\"1\",\"text\":\"Old\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    var more: [7]memory.memory.types.Entity = undefined;
+    for (&more, 0..) |*entity, i| entity.* = .{ .id = try std.fmt.allocPrint(alloc, "graph-{d}", .{i}), .name = "graph", .evidence = &.{.{ .id = "e" }} };
+    _ = try service.execute(alloc, .observe, "", try std.json.Stringify.valueAlloc(alloc, .{ .evidence = &[_]memory.memory.types.Evidence{.{ .id = "e", .source_id = "s", .source_version = "1", .text = "Graph" }}, .entities = more }, .{}), "more");
     var state = try Fixture.state(backend, alloc);
     const inference_end = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
     try std.testing.expectEqual(@as(u64, 120 * std.time.ns_per_s), inference_end);
     _ = try service.advanceAtRevision(alloc, "", "backfill", state.revision);
     try std.testing.expect(fixture.now > 5 * std.time.ns_per_s);
-    try std.testing.expectEqual(@as(usize, 2), fixture.embeddings);
+    try std.testing.expectEqual(@as(usize, 12), fixture.embeddings);
+    const partial = try std.json.parseFromSliceLeaky(memory.memory.types.SemanticIndex, alloc, (try backend.get(backend.ptr, alloc, "entity-semantic-index")).?.json, .{});
+    try std.testing.expect(!partial.complete and !partial.backfill_complete and partial.cursor != null);
+    try std.testing.expectEqual(@as(usize, 11), (try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 32)).rows.len);
+    state = try Fixture.state(backend, alloc);
+    _ = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
+    _ = try service.advanceAtRevision(alloc, "", "resume", state.revision);
+    try std.testing.expectEqual(@as(usize, 17), fixture.embeddings);
     const index_row = (try backend.get(backend.ptr, alloc, "entity-semantic-index")).?;
     const index = try std.json.parseFromSliceLeaky(memory.memory.types.SemanticIndex, alloc, index_row.json, .{});
     try std.testing.expect(index.complete and index.backfill_complete);
-    try std.testing.expectEqual(@as(usize, 2), (try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 8)).rows.len);
+    try std.testing.expectEqual(@as(usize, 16), (try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 32)).rows.len);
+    const completed_embeddings = fixture.embeddings;
 
     // A new view and retention debt compete. Cleanup keeps the short budget
     // and cannot invoke the slow provider or roll back its own progress.
@@ -59681,7 +59723,7 @@ test "native memory worker budgets slow semantic publication independently from 
         const cleanup_end = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
         try std.testing.expectEqual(fixture.now + 5 * std.time.ns_per_s, cleanup_end);
         _ = try service.advanceAtRevision(alloc, "", try std.fmt.allocPrint(alloc, "cleanup-{d}", .{i}), state.revision);
-        try std.testing.expectEqual(@as(usize, 2), fixture.embeddings);
+        try std.testing.expectEqual(completed_embeddings, fixture.embeddings);
     }
     state = try Fixture.state(backend, alloc);
     try std.testing.expectEqual(.semantic, try scheduling.maintenanceKind(backend, alloc, 1, state));
@@ -59698,9 +59740,9 @@ test "native memory worker budgets slow semantic publication independently from 
     _ = try service.advanceAtRevision(alloc, "", "refresh", state.revision);
     state = try Fixture.state(backend, alloc);
     try std.testing.expectEqual(.idle, try scheduling.maintenanceKind(backend, alloc, 1, state));
-    const rows = try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 8);
+    const rows = try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 32);
     for (rows.rows) |row| {
         const projection = try std.json.parseFromSliceLeaky(memory.memory.types.EntityProjection, alloc, row.json, .{});
-        if (projection.kind == .view) try std.testing.expect(std.mem.indexOf(u8, projection.text, "Derived graph description") != null);
+        if (projection.kind == .view and std.mem.eql(u8, projection.entity_id, "graph")) try std.testing.expect(std.mem.indexOf(u8, projection.text, "Derived graph description") != null);
     }
 }
