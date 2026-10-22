@@ -1,0 +1,29 @@
+1/111 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...LIGHTONOCR3 admission_items=1 host_scratch=40861568 backend_scratch=242810112 kv=51904512 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 memory device_allocated=1960951808 bf16_weights=1503789056 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4251444 tracked=1522233396 scratch_pool=0 tensor_live=24194304
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=898 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+LIGHTONOCR3 admission_items=1 host_scratch=40861568 backend_scratch=242810112 kv=51904512 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 memory device_allocated=1961082880 bf16_weights=1503789056 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4251444 tracked=1522233396 scratch_pool=0 tensor_live=24194304
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+OCR_REFERENCE {"image_index":0,"text":"Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"}
+LIGHTONOCR3 admission_items=1 host_scratch=46736896 backend_scratch=356557056 kv=60555264 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 memory device_allocated=2085765120 bf16_weights=1503789056 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4284212 tracked=1525624884 scratch_pool=0 tensor_live=24194304
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+OCR_REFERENCE {"image_index":1,"text":"# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"}
+LIGHTONOCR3 admission_items=1 host_scratch=51948544 backend_scratch=476328192 kv=68419584 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 memory device_allocated=2195783680 bf16_weights=1503789056 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4349748 tracked=1528541236 scratch_pool=0 tensor_live=24194304
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+OCR_REFERENCE {"image_index":2,"text":"# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY"}
+LIGHTONOCR3 admission_items=16 host_scratch=738596608 backend_scratch=1416056832 kv=956301312 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 memory device_allocated=10318282752 bf16_weights=1503789056 f32_weights=0 packed_qkv=0 embeddings=0 scratch=4361440 tracked=1689574880 scratch_pool=0 tensor_live=387108864
+LIGHTONOCR3 cohort_items=16 decode_steps=259 batched_steps=255 singleton_steps=4 decode_items=1439
+OCR_CONCURRENCY concurrency=16 requests=16 pages_per_request=1 completed=16 elapsed_ms=14093 pages_per_second=1.1353 p50_ms=14090 p95_ms=14091 native_items=16 parity=true
+OK
+1 selected; 1 passed; 0 skipped.

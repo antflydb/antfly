@@ -1,0 +1,6 @@
+1/111 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...[default] (warn): inference live-memory admission denied requested_bytes=11348275670 pending_bytes=0 available_bytes=17781164605 reserve_bytes=6442450944 capacity_bytes=11338713661 basis=macos_memory_pressure policy=dynamic_pressure process_rss_bytes=77135872 process_anonymous_bytes=0 process_private_dirty_bytes=0
+[default] (warn): loadModel(/private/tmp/antfly-lightonocr3-4b-model) backend metal admission failed: ResourceTemporarilyUnavailable; peak_host=2269655134 peak_backend=9078620536 host_limit=30064771072 backend_limit=17179869184 combined_limit=30064771072
+[default] (err): loadModel(/private/tmp/antfly-lightonocr3-4b-model) failed: no backend accepted model
+[default] (err): manifest paths onnx=null visual=null audio=null text_projection=null visual_projection=null audio_projection=null
+FAIL (ResourceTemporarilyUnavailable)
+1 selected; 0 passed; 0 skipped; 2 failed; 0 leaked.

@@ -1,0 +1,19 @@
+1/92 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...LIGHTONOCR3 admission_items=1 host_scratch=80543616 backend_scratch=381284352 kv=138412032 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=2517 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+LIGHTONOCR3 admission_items=1 host_scratch=80543616 backend_scratch=381284352 kv=138412032 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 admission_items=1 host_scratch=88417792 backend_scratch=541442048 kv=161480704 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 admission_items=1 host_scratch=95398912 backend_scratch=708657152 kv=182452224 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 admission_items=8 host_scratch=697682048 backend_scratch=1709854720 kv=1264582656 scratch_limit=4294967296 kv_limit=4294967296
+LIGHTONOCR3 cohort_items=8 decode_steps=203 batched_steps=202 singleton_steps=1 decode_items=784
+LIGHTONOCR3 admission_items=8 host_scratch=704663168 backend_scratch=1726885888 kv=1285554176 scratch_limit=4294967296 kv_limit=4294967296

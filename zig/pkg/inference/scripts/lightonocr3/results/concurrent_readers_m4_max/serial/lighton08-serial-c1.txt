@@ -1,0 +1,11 @@
+1/92 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=2004 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+OCR_CONCURRENCY concurrency=1 requests=16 pages_per_request=1 completed=16 elapsed_ms=41199 pages_per_second=0.3884 p50_ms=1991 p95_ms=5298 native_items=0 parity=true
+OK
+1 selected; 1 passed; 0 skipped.

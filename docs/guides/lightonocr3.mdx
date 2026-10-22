@@ -476,8 +476,10 @@ precision comparison. The current measurements do **not** establish parity for
 all three readers. Earlier complete tuned runs reached about 0.96/0.28/3.20
 pages/s for LightOn 0.8B, LightOn 4B and Florence, against reference runs at
 2.80/0.81/4.90 pages/s. Later adjacent runs under heavier shared-machine load
-measured 0.37 native versus 0.85 vLLM for 0.8B, and 1.16 native versus 1.54 MLX
-for Florence. These are exploratory runs with differing runtime precision,
+measured 0.37 native versus 0.85 vLLM for 0.8B, 0.065 versus 0.27 vLLM for
+4B, and 1.16 versus 1.54 MLX for Florence. The final 4B run completed all
+16 pages with matching content, but later cohorts slowed substantially inside
+GPU execution. This remains unresolved. These are exploratory runs with differing runtime precision,
 not a controlled performance guarantee. Continuous cohort refill and batched
 vision/prefill remain unimplemented. Complete settings, gaps and rejected experiments are retained
 in `zig/pkg/inference/scripts/lightonocr3/results/concurrent_readers_m4_max/README.md`.
