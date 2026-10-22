@@ -34727,6 +34727,7 @@ pub const DB = struct {
     pub const applyDenseArtifactCounterDelta = local_mutation.applyDenseArtifactCounterDelta;
 
     pub const appendDenseArtifactCounterMutations = local_mutation.appendDenseArtifactCounterMutations;
+    pub const prepareDenseArtifactCounterMutations = local_mutation.prepareDenseArtifactCounterMutations;
 
     pub const FinalDenseArtifactMutation = local_mutation.FinalDenseArtifactMutation;
 
@@ -147925,5 +147926,84 @@ test "db prepared transaction effects required assembly funds complete grouped g
         const actual = try db.core.store.get(a, plan.bytes.writes[0].key);
         defer a.free(actual);
         try std.testing.expectEqualSlices(u8, plan.bytes.writes[0].value, actual);
+    }
+}
+
+test "db prepared transaction effects required assembly dense artifact counter deltas permit metadata progress and apply exactly once" {
+    const a = std.testing.allocator;
+    const id: types.TxnId = @splat(201);
+    const deltas = @import("dense_artifact_counter_deltas.zig");
+    for (0..3) |mode| {
+        var directory = try TestDirectory.init("prepared-dense-deltas");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), PreparedAssemblyFixture.options);
+        defer db.close();
+        try db.enablePreparedTransactionProtocol();
+        try db.addIndex(.{ .name = "vector", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":3,\"external\":true}", .coverage_generation = 42 });
+        const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "row", "vector");
+        defer a.free(artifact);
+        const value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, null, &.{ 1, 2, 3 });
+        defer a.free(value);
+        const counter = try DB.denseArtifactTargetCounterKeyAlloc(a, "vector");
+        defer a.free(counter);
+        const bootstrap = try DB.denseArtifactCounterBootstrapKeyAlloc(a, "vector");
+        defer a.free(bootstrap);
+        if (mode == 0) {
+            var encoded: [8]u8 = undefined;
+            std.mem.writeInt(u64, &encoded, 41, .little);
+            try db.core.store.put(counter, &encoded);
+        } else {
+            db.core.store.delete(counter) catch |cause| if (cause != error.NotFound) return cause;
+            try db.core.store.put(bootstrap, &(deltas.Bootstrap{ .repair_id = 17, .attempt_id = 23, .delta = 5 }).encode());
+        }
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            _ = try db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+        }
+        try db.writeTransaction(id, .{ .writes = &.{.{ .key = "row", .value = "{\"body\":\"prepared\"}" }} });
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            var captured = try db.core.capturePreparedTransactionInputs(a, id, .deferred, null);
+            defer captured.deinit();
+            var artifact_writes = [_]types.BatchWrite{.{ .key = artifact, .value = value }};
+            const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = captured.contract, .effects = .{ .artifact_writes = &artifact_writes } }, null);
+            defer a.free(frame);
+            try db.core.sealPreparedTransactionEffects(id, frame, .deferred, null);
+        }
+        var plan = try db.prepareTransactionAssembly(a, id, 19, null);
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(usize, 1), plan.counter_deltas.?.entries.items.len);
+        for (plan.bytes.writes) |write| try std.testing.expect(!std.mem.eql(u8, write.key, counter) and !std.mem.eql(u8, write.key, bootstrap));
+        // This is unrelated repair/control progress, not a primary mutation.
+        if (mode == 1) {
+            try db.core.store.put(bootstrap, &(deltas.Bootstrap{ .repair_id = 17, .attempt_id = 29, .delta = 20 }).encode());
+        } else {
+            var encoded: [8]u8 = undefined;
+            std.mem.writeInt(u64, &encoded, 100, .little);
+            try db.core.store.put(counter, &encoded);
+        }
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            try plan.validateDependencies(db.core, null);
+        }
+        try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 19, .propose);
+        if (mode == 1) {
+            const result = try db.core.store.get(a, bootstrap);
+            defer a.free(result);
+            try std.testing.expectEqualDeep(deltas.Bootstrap{ .repair_id = 17, .attempt_id = 29, .delta = 21 }, try deltas.Bootstrap.decode(result));
+        } else {
+            const result = try db.core.store.get(a, counter);
+            defer a.free(result);
+            try std.testing.expectEqual(@as(u64, 101), std.mem.readInt(u64, result[0..8], .little));
+        }
+        const before = try PreparedAssemblyFixture.snapshot(&db);
+        defer PreparedAssemblyFixture.free(before);
+        try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 19, .propose);
+        const after = try PreparedAssemblyFixture.snapshot(&db);
+        defer PreparedAssemblyFixture.free(after);
+        try std.testing.expectEqualDeep(before, after);
     }
 }

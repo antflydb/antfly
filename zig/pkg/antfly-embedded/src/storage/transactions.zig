@@ -338,6 +338,9 @@ pub const TxnSummaryPage = struct {
 };
 
 pub const ResolutionExtraBatch = struct {
+    /// Prepared ordered adjustments; folded once in the final native writer.
+    /// Terminal retries and aborts never reapply them.
+    dense_counter_deltas: ?*const @import("db/dense_artifact_counter_deltas.zig").Program = null,
     /// Borrowed through this resolution attempt. Terminal-decision retries do
     /// not attach it: they must never re-certify already applied row effects.
     commit_participant: ?@import("commit_participant.zig").Participant = null,
@@ -1169,7 +1172,7 @@ pub const TxnManager = struct {
 
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
-        try self.applyResolutionResourceBatch(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() }, null, control, null, .{ .txn_id = txn_id, .phase = .admission });
+        try self.applyResolutionResourceBatch(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() }, null, control, null, .{ .txn_id = txn_id, .phase = .admission }, null);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
     }
@@ -1310,7 +1313,7 @@ pub const TxnManager = struct {
             }
             if (status == .aborted and try self.hasPreparationRequirement(txn_id)) try completion_deletes.append(self.alloc, &requirement_key);
             if (completion_writes.items.len != 0 or completion_deletes.items.len != 0) {
-                try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, null, null, control, if (status == .aborted) .{ .id = txn_id, .status = status } else null, null);
+                try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, null, null, control, if (status == .aborted) .{ .id = txn_id, .status = status } else null, null, null);
             }
             return .{
                 .applied = false,
@@ -1375,7 +1378,7 @@ pub const TxnManager = struct {
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             try completion_deletes.appendSlice(self.alloc, indexed_deletes.items);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, control, if (status == .aborted) .{ .id = txn_id, .status = status } else null, null);
+            try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, control, if (status == .aborted) .{ .id = txn_id, .status = status } else null, null, null);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -1516,7 +1519,7 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, indexed_deletes.items);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyResolutionResourceBatch(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control, .{ .id = txn_id, .status = status, .prepared = consumed != null }, null);
+        try self.applyResolutionResourceBatch(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control, .{ .id = txn_id, .status = status, .prepared = consumed != null }, null, if (status == .committed) extra_batch.dense_counter_deltas else null);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -3614,10 +3617,10 @@ pub const TxnManager = struct {
     }
 
     fn applyBatchWithParticipantAndAdmission(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port) !void {
-        return self.applyResolutionResourceBatch(writes, deletes, replay, reservation, participant, control, null, null);
+        return self.applyResolutionResourceBatch(writes, deletes, replay, reservation, participant, control, null, null, null);
     }
 
-    fn applyResolutionResourceBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port, transition: ?struct { id: TxnId, status: TxnStatus, prepared: bool = false }, guard_scope: ?writer_read_guards.Scope) !void {
+    fn applyResolutionResourceBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port, transition: ?struct { id: TxnId, status: TxnStatus, prepared: bool = false }, guard_scope: ?writer_read_guards.Scope, counters: ?*const @import("db/dense_artifact_counter_deltas.zig").Program) !void {
         if (control) |owner| try owner.checkpoint();
         const mutation_batch = @import("transaction_batch_admission.zig");
         // Prepared data is detached before acquiring the writer. Its byte owner
@@ -3677,7 +3680,9 @@ pub const TxnManager = struct {
         }
         if (participant) |observer| try batch.setCommitParticipant(observer);
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
-        try mutation_batch.apply(&batch, physical_writes, physical_deletes, physical_replay, control);
+        try mutation_batch.stage(&batch, physical_writes, physical_deletes, physical_replay, control);
+        if (counters) |program| try program.apply(&batch, control);
+        try batch.commit();
     }
 
     fn traceResolveDecisionConflict(self: *TxnManager, txn_id: TxnId, previous: TxnStatus, requested: TxnStatus, timestamp: u64) void {

@@ -270,6 +270,7 @@ pub const storage_db_group_source_mutations = @import("storage/db/group_source_m
 pub const storage_db_prepared_read_set = @import("storage/db/prepared_read_set.zig");
 pub const storage_db_prepared_mutation_dependencies = @import("storage/db/prepared_mutation_dependencies.zig");
 pub const storage_db_artifact_authored_acceptance = @import("storage/db/artifact_authored_acceptance.zig");
+pub const storage_db_dense_artifact_counter_deltas = @import("storage/db/dense_artifact_counter_deltas.zig");
 pub const storage_db_artifact_catalog_view = @import("storage/db/artifact_catalog_view.zig");
 pub const storage_db_artifact_chunk_cursor = @import("storage/db/artifact_chunk_cursor.zig");
 pub const storage_db_artifact_chunk_generation = @import("storage/db/artifact_chunk_generation.zig");

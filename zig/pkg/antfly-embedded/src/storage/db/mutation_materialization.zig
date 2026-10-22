@@ -199,11 +199,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const shouldDeferBacklogPressureForExternalDenseBulk = S.shouldDeferBacklogPressureForExternalDenseBulk;
         const syncLevelParticipatesInDerivedBacklogPressure = S.syncLevelParticipatesInDerivedBacklogPressure;
         const truncateReplayJournalIfSafeContext = S.truncateReplayJournalIfSafeContext;
-        pub const DenseArtifactCounterBootstrap = struct {
-            repair_id: u128,
-            attempt_id: u128,
-            delta: i64 = 0,
-        };
+        pub const DenseArtifactCounterBootstrap = @import("dense_artifact_counter_deltas.zig").Bootstrap;
 
         pub const DenseArtifactCounterCatalog = struct {
             targets: std.ArrayListUnmanaged(DenseArtifactCounterTarget) = .empty,
@@ -441,6 +437,35 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             owned_keys: *std.ArrayListUnmanaged([]u8),
             owned_values: *std.ArrayListUnmanaged([]u8),
         ) !void {
+            return appendDenseArtifactCounterMutationsInner(alloc, store, index_manager, store_writes, delete_keys, promotions, owned_keys, owned_values, null, null);
+        }
+
+        pub fn prepareDenseArtifactCounterMutations(
+            alloc: Allocator,
+            store: anytype,
+            index_manager: *const index_manager_mod.IndexManager,
+            store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+            delete_keys: []const []const u8,
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            deltas: *@import("dense_artifact_counter_deltas.zig").Program,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) !void {
+            return appendDenseArtifactCounterMutationsInner(alloc, store, index_manager, store_writes, delete_keys, &.{}, owned_keys, owned_values, deltas, control);
+        }
+
+        fn appendDenseArtifactCounterMutationsInner(
+            alloc: Allocator,
+            store: anytype,
+            index_manager: *const index_manager_mod.IndexManager,
+            store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+            delete_keys: []const []const u8,
+            promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion,
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            deltas: ?*@import("dense_artifact_counter_deltas.zig").Program,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) !void {
             var may_mutate_embedding_artifact = false;
             for (delete_keys) |key| {
                 if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
@@ -519,13 +544,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (artifact_keys, old_values) |artifact_key, old_value| {
                 const final_mutation = final_artifact_mutations.get(artifact_key).?;
                 if (old_value) |value| {
-                    try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, artifact_key, value, -1);
+                    if (deltas) |output| try prepareDenseArtifactCounterDelta(alloc, &catalog, output, artifact_key, value, -1, control) else try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, artifact_key, value, -1);
                 }
                 switch (final_mutation) {
                     .deleted => {},
                     .write => |write_idx| {
                         const write = store_writes.items[write_idx];
-                        try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, write.value, 1);
+                        if (deltas) |output| try prepareDenseArtifactCounterDelta(alloc, &catalog, output, write.key, write.value, 1, control) else try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, write.value, 1);
                     },
                     .promotion => |promotion_idx| {
                         const promotion = promotions[promotion_idx];
@@ -534,11 +559,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             else => return err,
                         };
                         defer alloc.free(staged_value);
-                        try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, promotion.final_key, staged_value, 1);
+                        if (deltas) |output| try prepareDenseArtifactCounterDelta(alloc, &catalog, output, promotion.final_key, staged_value, 1, control) else try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, promotion.final_key, staged_value, 1);
                     },
                 }
             }
 
+            if (deltas != null) return;
             var it = mutations.iterator();
             while (it.next()) |entry| {
                 const target = &catalog.targets.items[entry.key_ptr.*];
@@ -715,6 +741,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             });
         }
 
+        fn prepareDenseArtifactCounterDelta(
+            alloc: Allocator,
+            catalog: *const DenseArtifactCounterCatalog,
+            output: *@import("dense_artifact_counter_deltas.zig").Program,
+            artifact_key: []const u8,
+            artifact_value: ?[]const u8,
+            delta: i64,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) !void {
+            if (control) |owner| try owner.checkpoint();
+            var identity = (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |cause| switch (cause) {
+                error.InvalidInternalUserKey => return,
+                else => return cause,
+            }) orelse return;
+            defer identity.deinit(alloc);
+            const value = artifact_value orelse return;
+            const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch return;
+            if (dims == 0) return;
+            for (catalog.targetsFor(identity.embedding_name, dims)) |target| try output.append(catalog.targets.items[target].index_name, delta, control);
+        }
+
         pub fn applyDenseArtifactCounterDelta(
             alloc: Allocator,
             store: anytype,
@@ -788,21 +835,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn decodeDenseArtifactCounterBootstrap(raw: []const u8) !DenseArtifactCounterBootstrap {
-            if (raw.len != dense_artifact_counter_bootstrap_encoded_len or
-                !std.mem.eql(u8, raw[0..dense_artifact_counter_bootstrap_magic.len], dense_artifact_counter_bootstrap_magic))
-            {
-                return error.InvalidDenseArtifactCounterBootstrap;
-            }
-            var offset = dense_artifact_counter_bootstrap_magic.len;
-            const repair_id = std.mem.readInt(u128, raw[offset..][0..@sizeOf(u128)], .little);
-            offset += @sizeOf(u128);
-            const attempt_id = std.mem.readInt(u128, raw[offset..][0..@sizeOf(u128)], .little);
-            offset += @sizeOf(u128);
-            return .{
-                .repair_id = repair_id,
-                .attempt_id = attempt_id,
-                .delta = std.mem.readInt(i64, raw[offset..][0..@sizeOf(i64)], .little),
-            };
+            return DenseArtifactCounterBootstrap.decode(raw);
         }
 
         pub fn deinitOwnedGraphEdgeDelete(alloc: Allocator, delete: *types.GraphEdgeDelete) void {
@@ -932,13 +965,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn encodeDenseArtifactCounterBootstrap(value: DenseArtifactCounterBootstrap, out: *[dense_artifact_counter_bootstrap_encoded_len]u8) void {
-            @memcpy(out[0..dense_artifact_counter_bootstrap_magic.len], dense_artifact_counter_bootstrap_magic);
-            var offset = dense_artifact_counter_bootstrap_magic.len;
-            std.mem.writeInt(u128, out[offset..][0..@sizeOf(u128)], value.repair_id, .little);
-            offset += @sizeOf(u128);
-            std.mem.writeInt(u128, out[offset..][0..@sizeOf(u128)], value.attempt_id, .little);
-            offset += @sizeOf(u128);
-            std.mem.writeInt(i64, out[offset..][0..@sizeOf(i64)], value.delta, .little);
+            out.* = value.encode();
         }
 
         pub fn graphMutationIdentityEql(left: anytype, right: anytype) bool {

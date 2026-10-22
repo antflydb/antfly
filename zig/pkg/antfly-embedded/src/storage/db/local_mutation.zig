@@ -210,6 +210,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const acquireTransactionSchemaView = materialization.acquireTransactionSchemaView;
         pub const appendDenseArtifactCounterBootstrapWrite = materialization.appendDenseArtifactCounterBootstrapWrite;
         pub const appendDenseArtifactCounterMutations = materialization.appendDenseArtifactCounterMutations;
+        pub const prepareDenseArtifactCounterMutations = materialization.prepareDenseArtifactCounterMutations;
         pub const appendDenseArtifactCounterMutationsWithPromotions = materialization.appendDenseArtifactCounterMutationsWithPromotions;
         pub const appendDenseArtifactTargetCounterWrite = materialization.appendDenseArtifactTargetCounterWrite;
         pub const appendGraphTransformDelete = materialization.appendGraphTransformDelete;

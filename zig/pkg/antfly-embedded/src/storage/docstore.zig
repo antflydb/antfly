@@ -3055,6 +3055,19 @@ pub const DocStore = struct {
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
     ) !void {
+        return self.putBatchWithReplayOnceAndParticipantAndCounters(writes, deletes, replay, options, participant, null, null);
+    }
+
+    fn putBatchWithReplayOnceAndParticipantAndCounters(
+        self: *DocStore,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        counters: ?*const @import("db/dense_artifact_counter_deltas.zig").Program,
+        control: ?@import("../common/read_admission.zig").Port,
+    ) !void {
         const has_owner_job = blk: {
             for (writes) |write| if (internal_keys.isGraphOwnerReplayJobKey(write.key)) break :blk true;
             break :blk false;
@@ -3098,6 +3111,7 @@ pub const DocStore = struct {
         if (replay) |entry| {
             try batch.setReplayOpaque(entry.sequence, entry.payload);
         }
+        if (counters) |program| try program.apply(&txn, control);
         try batch.commit();
     }
 
@@ -3125,15 +3139,36 @@ pub const DocStore = struct {
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
     ) !void {
+        return self.putBatchWithReplayAndParticipantAndCounters(io, writes, deletes, replay, options, participant, null, null);
+    }
+
+    pub fn putBatchWithReplayAndParticipantAndCounters(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        counters: ?*const @import("db/dense_artifact_counter_deltas.zig").Program,
+        control: ?@import("../common/read_admission.zig").Port,
+    ) !void {
+        var trace: @import("../common/read_admission.zig").RejectionTrace = .{};
+        const original = trace.bind(control);
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, participant) catch |err| switch (err) {
-                error.WriterLocked => {
-                    if (attempt >= writer_locked_retry_count) return err;
-                    backoffWriterLockRetry(io);
-                    continue;
-                },
-                else => return err,
+            self.putBatchWithReplayOnceAndParticipantAndCounters(writes, deletes, replay, options, participant, counters, original) catch |err| {
+                // A foreign admission denial may share a backend retry name.
+                // Retrying it can swallow the original failure and commit.
+                if (trace.failure) |cause| return cause;
+                switch (err) {
+                    error.WriterLocked => {
+                        if (attempt >= writer_locked_retry_count) return err;
+                        backoffWriterLockRetry(io);
+                        continue;
+                    },
+                    else => return err,
+                }
             };
             if (replay) |entry| {
                 self.markReplayIndexAvailable();
@@ -8934,4 +8969,46 @@ test "docstore prepared replay credit assembly unwinds output allocations and pr
     };
     try std.testing.expectEqualDeep(before, try fixture.debt());
     try std.testing.expectError(error.NotFound, fixture.store.get(a, &F.credit.grantKey(F.input_id)));
+}
+
+test "docstore dense artifact counter deltas commit atomically with primary writes and retry aborted attempts" {
+    const a = std.testing.allocator;
+    var fixture: PreparedReplayCreditFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const deltas = @import("db/dense_artifact_counter_deltas.zig");
+    var program = deltas.Program.init(a);
+    defer program.deinit();
+    try program.append("vector", 1, null);
+    const counter = program.entries.items[0].counter;
+    const physical = try internal_keys.documentKeyAlloc(a, "row");
+    defer a.free(physical);
+    const writes = [_]KVPair{.{ .key = physical, .value = "committed" }};
+    try fixture.store.put(counter, "malformed");
+    try std.testing.expectError(error.InvalidDenseArtifactTargetCounter, fixture.store.putBatchWithReplayAndParticipantAndCounters(null, &writes, &.{}, null, .{}, null, &program, null));
+    try std.testing.expectError(error.NotFound, fixture.store.get(a, physical));
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, 41, .little);
+    try fixture.store.put(counter, &encoded);
+    const Denial = struct {
+        calls: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1) return error.WriterLocked;
+        }
+    };
+    var denial: Denial = .{};
+    const controls = @import("../common/read_admission.zig");
+    var source: controls.Payload = .{ .ptr = &denial, .vtable = &.{ .checkpoint = Denial.check } };
+    try std.testing.expectError(error.WriterLocked, fixture.store.putBatchWithReplayAndParticipantAndCounters(null, &writes, &.{}, null, .{}, null, &program, .init(&source)));
+    try std.testing.expectEqual(@as(usize, 1), denial.calls);
+    try std.testing.expectError(error.NotFound, fixture.store.get(a, physical));
+    try fixture.store.putBatchWithReplayAndParticipantAndCounters(null, &writes, &.{}, null, .{}, null, &program, null);
+    const result = try fixture.store.get(a, counter);
+    defer a.free(result);
+    try std.testing.expectEqual(@as(u64, 42), std.mem.readInt(u64, result[0..8], .little));
+    const row = try fixture.store.get(a, physical);
+    defer a.free(row);
+    try std.testing.expectEqualStrings("committed", row);
 }

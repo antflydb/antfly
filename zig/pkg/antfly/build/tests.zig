@@ -6127,6 +6127,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("docstore-read-observation-catalog-test", "Verify reader floors and prepared catalog observation leases")
         .dependOn(&addCuratedTestRunArtifact(b, observation_catalog_tests, &observation_catalog_filters).step);
     const counter_materialization_filters = [_][]const u8{
+        "dense artifact counter deltas",
         "db inline dense coverage counters rebase with range ownership",
         "db dense artifact counter bootstrap combines snapshot with concurrent write delta",
         "db dense artifact counter bootstrap fences stale concurrent attempt",

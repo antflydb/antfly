@@ -94,7 +94,8 @@ const builtin = @import("builtin");
 // Semantic predicate enforcement adds typed native batch retirement.
 // Replay reservation writers retain input contracts through final commit validation.
 // Batch preparation can return owned uncommitted bytes and their witnesses.
-pub const abi_version: u32 = 62;
+// Owned assemblies and resolution options carry final-writer counter programs.
+pub const abi_version: u32 = 63;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

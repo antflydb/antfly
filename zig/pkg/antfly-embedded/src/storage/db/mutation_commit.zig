@@ -120,7 +120,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const GeneratedWriteReadSnapshot = S.GeneratedWriteReadSnapshot;
         const appendArtifactSourceRevisionWritesFromReplay = S.appendArtifactSourceRevisionWritesFromReplay;
         const appendAssetArtifactSourceIndexMutations = S.appendAssetArtifactSourceIndexMutations;
-        const appendDenseArtifactCounterMutations = S.appendDenseArtifactCounterMutations;
+        const prepareDenseArtifactCounterMutations = S.prepareDenseArtifactCounterMutations;
         const appendDirectGraphTtlDueWrite = S.appendDirectGraphTtlDueWrite;
         const appendEmbeddingArtifactWrite = S.appendEmbeddingArtifactWrite;
         const appendGraphEdgeArtifactWrite = S.appendGraphEdgeArtifactWrite;
@@ -3043,7 +3043,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             if (persisted_range) |range| try S.ownerField(self, "core").*.index_manager.validateRangeTransition(range);
-            try appendDenseArtifactCounterMutations(
+            const counter_program = @import("dense_artifact_counter_deltas.zig");
+            var counter_deltas = counter_program.Program.init(if (opts.assembly) |output| output.allocator else preparation_alloc);
+            defer counter_deltas.deinit();
+            try prepareDenseArtifactCounterMutations(
                 S.ownerField(self, "alloc").*,
                 observed_store,
                 S.ownerField(self, "core").*.index_manager,
@@ -3051,6 +3054,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 delete_keys.items,
                 &owned_store_keys,
                 &owned_store_values,
+                &counter_deltas,
+                publication_control,
             );
             // Synchronous enrichment is the producer for every request it consumes.
             // Commit its terminal coverage decisions in the same backend batch as
@@ -3215,6 +3220,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 publication_control,
             ) else null;
             defer if (prepared_physical) |*plan| plan.deinit();
+            if (prepared_physical) |*plan| {
+                plan.counter_deltas = counter_deltas;
+                counter_deltas = counter_program.Program.init(counter_deltas.allocator);
+            }
             if (prepared_physical) |*plan| try plan.retainDependencies(physical_allocator, S.ownerField(self, "core").*, .{
                 .schema_namespace = schema_namespace,
                 .catalog_revision = prepared_catalog_revision orelse return error.PreparedGenerationChanged,
@@ -3256,6 +3265,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 replay_append;
             const commit_participant = if (prepared_physical) |*plan| plan.participant() else null;
+            const commit_counters: *const counter_program.Program = if (prepared_physical) |*plan| &plan.counter_deltas.? else &counter_deltas;
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             // Known mandatory publication envelopes are funded before the
             // local primary decision. Native allocation failure is final here;
@@ -3286,6 +3296,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     resolution.commit_version,
                     .{
                         .commit_participant = commit_participant,
+                        .dense_counter_deltas = commit_counters,
                         .writes = commit_writes,
                         .deletes = commit_deletes,
                         .replay = if (commit_replay) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
@@ -3306,17 +3317,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             } else blk: {
                 if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
-                try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipant(
+                try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipantAndCounters(
                     S.ownerField(self, "backend_runtime").*.io(),
                     commit_writes,
                     commit_deletes,
                     commit_replay,
                     store_batch_options,
                     commit_participant,
+                    commit_counters,
+                    publication_control,
                 );
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
+            // Counter scratch belongs to preparation, including the path with
+            // no authored physical owner. Retire it before any visibility wait.
+            counter_deltas.deinit();
+            counter_deltas = counter_program.Program.init(preparation_alloc);
             // Backend commit has joined every participant callback. Detached
             // postimages must not retain preparation capacity across remote
             // durability or derived-visibility waits below.

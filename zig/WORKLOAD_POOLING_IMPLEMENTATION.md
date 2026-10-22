@@ -22467,3 +22467,63 @@ or failed runs preserve harness, compiler and fixture corrections and supply no
 final qualification. Pinned formatting, generated-error, control-catalog,
 whitespace and embedded source-boundary checks pass (964 production sources,
 no server coordination imports).
+
+### Final-writer dense-artifact coverage adjustments (2026-10-21)
+
+The shared primary-batch assembler now retains dense-artifact coverage changes
+as an owned program instead of materializing absolute counter/bootstrap values.
+Routing still observes the old artifact bytes and the pinned index catalog. Each
+index owns its counter/bootstrap keys and a constant-size composition of ordered
+signed adjustments; it retains no borrowed request buffers or controls. An
+interval and signed bias preserve saturating count arithmetic, while signed
+prefix extrema preserve intermediate bootstrap overflows. Preparation storage
+and final-writer arithmetic scale with target indexes, not artifact count. Preparation does not read the mutable
+counter or bootstrap state. This permits unrelated repair/counter metadata to
+advance while an assembly candidate is retained.
+
+Ordinary DocStore writes and transaction resolution fold the program into their
+actual final writer before commit. The count currently present wins; otherwise
+an active repair bootstrap receives the signed adjustments while retaining its
+current repair/attempt identity. Missing count and bootstrap remain unavailable.
+Ordered saturating count arithmetic and checked signed-bootstrap arithmetic
+preserve existing behavior. The bootstrap codec is shared with legacy repair and
+materialization helpers and keeps its original bytes. A failed fold aborts the
+primary batch; writer retries use the original immutable program. Original
+admission denials retain their identity even when named WriterLocked and cannot
+be retried into an accepted commit. Aborts and terminal transaction retries never
+apply it. Counter scratch retires before
+remote or visibility waits, including batches without an authored physical owner.
+
+Native ABI 63 and storage-owner ABI 121 fence the expanded owned plan and
+resolution options. Stored formats, reader floors and activation defaults are
+unchanged. This moves dense-artifact coverage counters to commit; coverage
+outcome/producer and other cached counters still need the same treatment.
+Provisional replay sequencing, other backend commit metadata, durable read
+predicate installation, live route/DB lifetime ownership, executable recovery
+resources/derived-log quota and normal required PREPARE integration remain open.
+Strong required providers stay disabled and the full goal remains active.
+Full Linux qualification remains waived; Linux builds require pinned Nix/glibc
+Zig. Cross-engine performance remains unproven.
+
+Qualification: the broader baseline passes 68 required-PREPARE DB, 109 prepared-
+effects, nine counter and 51 runtime ABI/identity cases (237 executions). The
+admission-error correction changes only DocStore and passes nine counter plus
+51 ABI/identity cases. The final compaction changes only the new counter module
+and passes ten counter plus 51 ABI/identity cases; five native ABI cases also
+pass on final source. These are 363 executions across the three source revisions,
+including repeated companions; 66 executions qualify the exact final revision.
+No cases failed, skipped or leaked. The compact arithmetic test compares all 256
+eight-step orderings against reference saturation and checked arithmetic at both
+integer boundaries, including a net-zero intermediate overflow. Other new cases
+cover unavailable counters, repair progress/completion, current attempt identity,
+atomic abort/retry, terminal idempotence, original denial identity, every program
+allocation failure and every original checkpoint for NotFound/OOM/deadline.
+
+The 5,495 native/schema inputs are reverified against final source; receipts
+record the exact changed files between revisions. See dense-counter-commit-
+verified.json, dense-counter-commit-deltas-v1.json/log, dense-counter-commit-
+deltas-final.json/log and dense-counter-compact-final.json/log in the cumulative
+receipts. Pinned formatting, control-catalog, generated-error and whitespace
+checks pass. The embedded production boundary audit passes 965 sources without
+server coordination imports. Existing bootstrap/range behavior is exercised;
+this does not qualify all engines or a full linked storage-owner image.
