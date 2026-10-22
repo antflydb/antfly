@@ -1985,8 +1985,18 @@ excessive depths retain ordinary reads. Type proofs compose list concatenation,
 records and nested sequences, with memoized DAG traversal. Original producers
 still execute, so constructor, parameter and expression failures retain their
 position. Entity reads may invoke backend visibility projection. Varying keys,
-uncertified reads and potentially
-failing expressions keep their original evaluation.
+uncertified reads and potentially failing expressions keep their original
+evaluation.
+
+Structural proofs for imported containers inspect existing metadata only. An
+uncached parameter is not traversed merely to plan an unused read, including
+when an upstream producer is empty. Real evaluation registers immutable parameter
+metadata with the statement owner and shares it across row and child epochs.
+A reached read-only CALL may resolve its initial mandatory variable-read prefix,
+stopping before fallible expressions or entity authority reads, then normalize
+its dead captures. Memo keys use that certified body's actual dependencies;
+uncertified later bindings retain their original captures and cannot reuse an
+entry whose dependency was removed. Producer and grouping errors stay observable.
 
 Primitive certificates follow parameter lists through forwarding projections and
 nested CALL imports. Element validation is lazy: only a proposed dead variable
@@ -2044,9 +2054,12 @@ concatenations, can advance a group's mean without visiting its values. The
 proof bounds the complete prefix so integer values, half-integer means,
 subtractions and denominators are exactly representable in binary64. Existing
 state must match the certified prefix, including its weight representation.
-Unsupported prefixes, nonconsecutive domains, DISTINCT averages and expanding
-children retain ordinary contribution order and rounding. This certificate
-never replaces a rounded online mean with a generic SUM/COUNT quotient.
+Independent zero-or-one-row CALLs preserve this arithmetic axis, including
+nested children, filtering, local windows and global empty-input reducers.
+Binding conflicts and failed children still run at their original boundary.
+Unsupported prefixes, nonconsecutive domains and expanding children retain
+ordinary non-DISTINCT contribution order and rounding. This certificate never
+replaces a rounded online mean with a generic SUM/COUNT quotient.
 
 DISTINCT integer observers retain exact arithmetic set support per group. Native
 range descriptors carry membership through reducer snapshots without allocating
@@ -2060,10 +2073,21 @@ may decline to charged encounter-order replay without expanding prior support.
 Immutable producer support uses a shared DAG with one charged visit per node;
 repeated producer branches cannot expand the certificate exponentially.
 
+AVG DISTINCT shares the compressed integer domain and first-encounter DAG. A
+nonmutating union proof measures novel support before publishing membership.
+Exact moments propose an ordered remainder on the incoming lattice; subset,
+disjointness and equal cardinality prove that it is the complete remainder.
+Only an exact binary64 recurrence can consume that remainder as a summary.
+Fragmented remainders and rounded prefixes replay incoming values without
+expanding old compressed support. Bulk scalar replay clears the caller's single
+value token so DISTINCT cohorts cannot reuse an ordinal for different values.
+Independent expanding children may duplicate these idempotent set contributions.
+
 Pure integer DISTINCT packets can merge into existing groups using their ordered
-range encounters. Floating SUM and unsupported mixed packet forms preserve
-ordinary replay. Restored membership does not recompute aggregate values or
-change floating representations. All packet data is cloned before reducer
+range encounters, including exact arithmetic AVG state. Floating SUM and
+unsupported mixed packet forms preserve ordinary replay. Restored membership
+does not recompute aggregate values or change floating representations. All
+packet data is cloned before reducer
 arenas close; group eviction releases its range support and encounter history.
 
 Bounded COUNT group windows accept pure expanding children using dynamic emitted
@@ -2129,7 +2153,10 @@ or downstream folds retain their ordinary execution paths.
 Monotone arithmetic group keys have an exact rank interval for key-ranked
 windows. A read-only single-seed domain with one preserved integer key and a
 complete independent suffix can allocate reducers only for its best SKIP+LIMIT
-keys. The suffix packet first certifies successful argument evaluation, all
+keys. Checked nonzero integer affine keys share this rank certificate, with
+negative slopes reversing rank direction. Every intermediate key expression must
+be total over the full source interval; zero slopes and unknown forms decline.
+The suffix packet first certifies successful argument evaluation, all
 consumer bounds and all producer stages. Selected keys retain source encounter
 order; omitted logical rows still contribute to stage counters. Correlated
 expressions, joins, DISTINCT stages, filters, key rebinding and uncertified

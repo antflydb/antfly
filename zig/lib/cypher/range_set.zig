@@ -35,6 +35,22 @@ pub const Set = struct {
         }
         return false;
     }
+    /// Measure an incoming range without publishing membership. Reducers whose
+    /// order-sensitive summary can decline must certify it before insertion.
+    pub fn novelMeasure(self: *const @This(), scratch: std.mem.Allocator, range: Range, ptr: *anyopaque, charge: *const fn (*anyopaque, usize) anyerror!void) !?arithmetic.Measure {
+        if (range.length == 0) return .{};
+        try charge(ptr, 1);
+        if (self.ranges.items.len == 0) return arithmetic.Measure.of(range);
+        if (self.ranges.items.len == 1) if (arithmetic.mergeCompatible(self.ranges.items[0], range)) |merged| {
+            return arithmetic.Measure.of(merged).difference(self.measure orelse arithmetic.Measure.of(self.ranges.items[0]));
+        };
+        const before = self.measure orelse (try arithmetic.unionMeasureWork(scratch, self.ranges.items, ptr, charge)) orelse return null;
+        const combined = try scratch.alloc(Range, self.ranges.items.len + 1);
+        @memcpy(combined[0..self.ranges.items.len], self.ranges.items);
+        combined[self.ranges.items.len] = range;
+        const after = (try arithmetic.unionMeasureWork(scratch, combined, ptr, charge)) orelse return null;
+        return after.difference(before);
+    }
     pub fn insert(self: *@This(), a: std.mem.Allocator, scratch: std.mem.Allocator, range: Range, ptr: *anyopaque, charge: *const fn (*anyopaque, usize) anyerror!void) !?arithmetic.Measure {
         if (range.length == 0) return .{};
         try charge(ptr, 1);

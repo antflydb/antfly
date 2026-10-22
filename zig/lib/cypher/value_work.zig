@@ -47,6 +47,14 @@ pub const Work = struct {
             else => null,
         };
     }
+    /// Observe an existing certificate without traversing an unevaluated value.
+    /// Parent epochs only contain immutable values whose lifetime encloses us.
+    pub fn cachedInfo(self: *const Work, value: v.Value) ?Info {
+        const identity_key = key(value) orelse return null;
+        var owner: ?*const Work = self;
+        while (owner) |current| : (owner = current.parent) if (current.cache.get(identity_key)) |known| return known;
+        return null;
+    }
     pub fn hasMetadata(self: *const Work, value: v.Value) bool {
         return if (key(value)) |k| self.cache.contains(k) else false;
     }

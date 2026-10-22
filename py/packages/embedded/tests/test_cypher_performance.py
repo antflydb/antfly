@@ -6828,3 +6828,104 @@ def test_monotone_window_packet_bounds_retry_large_symbolic_domains(graph_db, ag
     assert result["rows"][0][1]["value"] == expected
     assert result["plan"][0]["output_rows"] == 4
     assert result["plan"][1]["output_rows"] == 4000000000000000
+
+
+@pytest.mark.parametrize("source", ["UNWIND [] AS i", "UNWIND range(1,0) AS i", "WITH 1 AS i WHERE false"])
+def test_unreachable_container_proofs_do_not_scan_parameters(graph_db, source):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": source
+            + " WITH i,$payload AS j UNWIND [1,2] AS x CALL {WITH j,avg(x) AS y RETURN y} RETURN count(*)",
+            "parameters": {"payload": [0] * 50000},
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert result["rows"][0][0]["value"] == "0"
+    assert result["stats"]["intermediate_states"] < 100
+
+
+def test_reached_container_proof_shares_immutable_parameter_metadata(graph_db):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND [1] AS i WITH i,$payload AS j UNWIND [1,2] AS x "
+            "CALL {WITH j,avg(x) AS y RETURN y} RETURN count(*)",
+            "parameters": {"payload": [0] * 1000},
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert result["rows"][0][0]["value"] == "2"
+
+
+@pytest.mark.parametrize("expression,scale,offset", [("i+1", 1, 1), ("-i", -1, 0), ("3-2*i", -2, 3), ("(i+7)-7", 1, 0)])
+@pytest.mark.parametrize("direction", ["ASC", "DESC"])
+def test_injective_affine_group_keys_keep_monotone_windows_bounded(graph_db, expression, scale, offset, direction):
+    suffix = f"UNWIND [0,1,0] AS x RETURN {expression} AS g,avg(x),sum(x) ORDER BY g {direction} SKIP 2 LIMIT 5"
+    actual = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(40000,1,-1) AS i " + suffix,
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    ascending_source = (scale > 0) == (direction == "ASC")
+    groups = list(range(1, 8)) if ascending_source else list(range(40000, 39993, -1))
+    expected = graph_db.cypher_json("g", {"query": "UNWIND $groups AS i " + suffix, "parameters": {"groups": groups}})
+    assert actual["rows"] == expected["rows"]
+    assert actual["plan"][0]["output_rows"] == 40000
+    assert actual["plan"][1]["output_rows"] == 120000
+    assert actual["stats"]["memory_bytes"] < 200000
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "range(1,1000000)",
+        "reverse(range(1,1000000))",
+        "range(1,500000)+range(250000,1000000)",
+        "reverse(range(1,500000)+range(250000,1000000))",
+    ],
+)
+@pytest.mark.parametrize("groups", ["[1,2]", "[1,2,1]"])
+@pytest.mark.parametrize("child", ["", "CALL {UNWIND [7,8] AS y RETURN y} "])
+def test_distinct_average_ranges_share_ordered_integer_support(graph_db, source, groups, child):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND {groups} AS g UNWIND {source} AS x {child}"
+            "RETURN g,count(DISTINCT x),sum(DISTINCT x),avg(DISTINCT x) ORDER BY g",
+            "limits": {"intermediate_states": 5000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert len(result["rows"]) == 2
+    for row, group in zip(result["rows"], [1, 2], strict=True):
+        assert [int(cell["value"]) for cell in row[:3]] == [group, 1000000, 500000500000]
+        assert row[3]["value"] == 500000.5
+    assert result["stats"]["memory_bytes"] < 200000
+
+
+@pytest.mark.parametrize(
+    "body,nonempty",
+    [
+        ("RETURN 7 AS y", True),
+        ("CALL {RETURN 7 AS z} RETURN z AS y", True),
+        ("WITH 7 AS z WHERE false RETURN count(*) AS y", True),
+        ("RETURN 7 AS y LIMIT 0", False),
+        ("WITH 7 AS z WHERE false RETURN z AS y", False),
+    ],
+)
+def test_singleton_children_preserve_arithmetic_average_certificates(graph_db, body, nonempty):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND range(1,1000000) AS x CALL {{{body}}} RETURN count(x),avg(x)",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    row = result["rows"][0]
+    assert row[0]["value"] == ("1000000" if nonempty else "0")
+    if nonempty:
+        assert row[1]["value"] == 500000.5
+    else:
+        assert row[1]["type"] == "null"

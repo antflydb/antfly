@@ -1986,6 +1986,15 @@ const Engine = struct {
             }
         }
         fn addIntegerRanges(self: *@This(), engine: *Engine, parts: []const @import("range_set.zig").Part) anyerror!void {
+            // A bulk domain visits many values inside one caller emission.
+            // Cohort ordinal reuse is valid only for one concrete scalar.
+            const token = engine.distinct_input_token;
+            engine.distinct_input_token = null;
+            defer engine.distinct_input_token = token;
+            if (std.ascii.eqlIgnoreCase(self.function.name, "avg")) {
+                for (parts) |part| try self.addDistinctAveragePart(engine, part);
+                return;
+            }
             const sum = std.ascii.eqlIgnoreCase(self.function.name, "sum");
             var compressed = (!sum or self.sum == .integer) and try self.seedIntegerDomain(engine);
             for (parts) |part| {
@@ -2010,6 +2019,47 @@ const Engine = struct {
                     try engine.state();
                     try self.addValue(engine, part.sequence.at(if (part.reversed) part.sequence.length - index - 1 else index), Count.one);
                 }
+            }
+        }
+        fn addDistinctAveragePart(self: *@This(), engine: *Engine, part: @import("range_set.zig").Part) anyerror!void {
+            if (part.sequence.length == 0) return;
+            compressed: {
+                if (self.mean_scaled != null or self.mean_weight != @as(f64, @floatFromInt(self.count)) or !try self.seedIntegerDomain(engine)) break :compressed;
+                var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                defer scratch.deinit();
+                const domain = self.integer_domain.?;
+                const novel = (try domain.novelMeasure(scratch.allocator(), part.sequence, engine, Engine.chargeWork)) orelse break :compressed;
+                if (novel.count == 0) return;
+                const step = if (novel.count == 1) @as(i64, 1) else if (part.reversed) std.math.negate(part.sequence.step) catch break :compressed else part.sequence.step;
+                const length: i128 = @intCast(novel.count);
+                const twice_total = std.math.mul(i128, novel.total(), 2) catch break :compressed;
+                if (@rem(twice_total, length) != 0) break :compressed;
+                const distance = std.math.mul(i128, length - 1, step) catch break :compressed;
+                const twice_first = std.math.sub(i128, @divTrunc(twice_total, length), distance) catch break :compressed;
+                if (@rem(twice_first, 2) != 0) break :compressed;
+                const first = std.math.cast(i64, @divTrunc(twice_first, 2)) orelse break :compressed;
+                const last = std.math.cast(i64, std.math.add(i128, first, distance) catch break :compressed) orelse break :compressed;
+                if (!part.sequence.contains(.{ .integer = first }).boolean or !part.sequence.contains(.{ .integer = last }).boolean) break :compressed;
+                const candidate: @import("range.zig").Range = .{ .start = first, .step = step, .length = novel.count };
+                // Equal cardinality alone does not prove an ordered remainder.
+                // This candidate is a subset of the source lattice; proving it
+                // disjoint from prior support certifies the complete remainder.
+                if (((try domain.novelMeasure(scratch.allocator(), candidate, engine, Engine.chargeWork)) orelse break :compressed).count != novel.count) break :compressed;
+                const sequence: @import("arithmetic_average.zig").Sequence = .{ .start = first, .step = step, .length = novel.count };
+                const mean = sequence.meanAfter(self.count, self.mean) orelse break :compressed;
+                _ = (try domain.insert(self.distinct_arena.allocator(), scratch.allocator(), part.sequence, engine, Engine.chargeWork)) orelse break :compressed;
+                try domain.encounters.append(self.distinct_arena.allocator(), .{ .sequence = candidate });
+                self.count += @intCast(novel.count);
+                self.mean_weight = @floatFromInt(self.count);
+                self.mean = mean;
+                return;
+            }
+            // A fragmented remainder or rounded prefix keeps ordinary encounter
+            // order, consulting compressed support without expanding old keys.
+            var index: u128 = 0;
+            while (index < part.sequence.length) : (index += 1) {
+                try engine.state();
+                try self.addValue(engine, part.sequence.at(if (part.reversed) part.sequence.length - index - 1 else index), Count.one);
             }
         }
         fn addAverageSequence(self: *@This(), engine: *Engine, sequence: @import("arithmetic_average.zig").Sequence) anyerror!void {
@@ -3077,16 +3127,10 @@ const Engine = struct {
             },
             .items, .element => items: {
                 const values = if (kind == .items) kind.items.items else kind.element.items;
-                var maximum: usize = 0;
-                for (values) |value| {
-                    const info = work.info(value) catch |err| {
-                        if (err == error.CypherValueDepthExceeded) break :items null;
-                        return err;
-                    };
-                    if (info.entities) break :items null;
-                    maximum = @max(maximum, info.depth + @as(usize, if (kind == .items) 1 else 0));
-                }
-                break :items maximum;
+                const value: v.Value = .{ .list = values };
+                const info = (if (self.immutableOwner(value)) |owner| owner.work.cachedInfo(value) else self.values.cachedInfo(value)) orelse break :items null;
+                if (info.entities) break :items null;
+                break :items if (kind == .items) info.depth else info.depth -| 1;
             },
             .collection => null,
         };
@@ -3325,6 +3369,29 @@ const Engine = struct {
             }
         }
         return plain;
+    }
+    /// At an actual CALL arrival, resolve only an initial prefix of reads which
+    /// the child must perform before any fallible expression or authority read.
+    /// Symbolic normalization never uses this path, including empty upstreams.
+    fn reachedCall(self: *Engine, initial: Row, clauses: []const ast.Clause) anyerror![]const ast.Clause {
+        if (!self.read_only or !axisReturningCall(clauses) or clauses[0].operation != .project) return clauses;
+        const projection = clauses[0].operation.project.value;
+        const grouped = for (projection.items) |item| {
+            if (aggregates(item.expression)) break true;
+        } else false;
+        var candidate = false;
+        for (projection.items) |item| {
+            if (grouped and aggregates(item.expression)) continue;
+            if (item.expression.value == .literal) continue;
+            if (item.expression.value != .variable) break;
+            const value = lookup(initial, item.expression.value.variable) orelse break;
+            if (value == .list) {
+                _ = try self.listType(value.list);
+                if ((try self.readMetadata(value)).entities) break;
+                candidate = true;
+            } else if (!primitive(value)) break;
+        }
+        return if (candidate) self.normalizeScalarPipeline(initial, clauses) else clauses;
     }
     fn normalizeScalarPipeline(self: *Engine, initial: Row, clauses: []const ast.Clause) anyerror![]const ast.Clause {
         return self.normalizeScalarPipelineTyped(initial, clauses, try self.rowScalarTypes(initial));
@@ -3816,13 +3883,13 @@ const Engine = struct {
         }
     }
     fn mergeIntegerSnapshot(self: *Engine, state_value: *StreamingAggregate, snapshot: Row) !void {
-        const sum = std.ascii.eqlIgnoreCase(state_value.function.name, "sum");
-        const encoded = lookup(snapshot, if (sum) "integer_order" else "integer_ranges").?.list;
+        const ordered = !std.ascii.eqlIgnoreCase(state_value.function.name, "count");
+        const encoded = lookup(snapshot, if (ordered) "integer_order" else "integer_ranges").?.list;
         for (encoded) |item| {
             const sequence = (try @import("range.zig").Range.init(item.list[0], item.list[1], item.list[2])) orelse return error.CypherInvalidBackendPage;
-            try state_value.addIntegerRanges(self, &.{.{ .sequence = sequence, .reversed = sum and item.list[3].boolean }});
+            try state_value.addIntegerRanges(self, &.{.{ .sequence = sequence, .reversed = ordered and item.list[3].boolean }});
         }
-        if (!sum and snapshot[5].value == .list) for (snapshot[5].value.list) |value| try state_value.addValue(self, value, Count.one);
+        if (!ordered and snapshot[5].value == .list) for (snapshot[5].value.list) |value| try state_value.addValue(self, value, Count.one);
     }
     fn computeAxis(self: *Engine, parent: *StreamFold, plan: *AxisPlan, key: Row) anyerror!WeightedRows {
         const columns = self.columns;
@@ -4042,7 +4109,7 @@ const Engine = struct {
             } else (if (sequence) |range| try self.observeRange(range, arg, proof.alias) else try self.observeArithmetic(source, row, arg, proof.alias, &cache)) orelse return null;
             if (reversed) observation = try self.reverseObserver(observation);
             if (observation.extrema == null or (std.ascii.eqlIgnoreCase(expression.value.call.name, "sum") and !expression.value.call.distinct and observation.summary == null)) return null;
-            if (std.ascii.eqlIgnoreCase(expression.value.call.name, "avg") and observation.average == null) return null;
+            if (std.ascii.eqlIgnoreCase(expression.value.call.name, "avg") and !expression.value.call.distinct and observation.average == null) return null;
             observer.* = observation;
         };
         return result;
@@ -4063,7 +4130,7 @@ const Engine = struct {
                 if (fold.active_calls) |active| if (!active[index]) continue;
                 const call_value = expression.value.call;
                 sum = sum or (std.ascii.eqlIgnoreCase(call_value.name, "sum") and !call_value.distinct);
-                range_distinct = range_distinct or (range and call_value.distinct and (std.ascii.eqlIgnoreCase(call_value.name, "count") or std.ascii.eqlIgnoreCase(call_value.name, "sum")));
+                range_distinct = range_distinct or (range and call_value.distinct and (std.ascii.eqlIgnoreCase(call_value.name, "count") or std.ascii.eqlIgnoreCase(call_value.name, "sum") or std.ascii.eqlIgnoreCase(call_value.name, "avg")));
             };
             return .{ .slots = slots, .summary = if (sum) summary.? else null, .facts = facts, .weight = weight, .non_null = non_null, .distinct_range = range_distinct };
         }
@@ -4227,7 +4294,7 @@ const Engine = struct {
             defer scope.leave(engine);
             var key: std.ArrayList(v.Entry) = .empty;
             for (row) |entry| if (plan.captures.contains(entry.name)) {
-                if ((try engine.values.info(entry.value)).entities) return false;
+                if ((try engine.readMetadata(entry.value)).entities) return false;
                 try key.append(engine.a, entry);
             };
             var packet = try plan.memo.find(engine, key.items, null);
@@ -4329,12 +4396,15 @@ const Engine = struct {
             const sequence = source.values.range;
             const keep = @min(sequence.length, window.capacity);
             if (sequence.length <= keep) return false;
-            var keys: usize = 0;
+            var key_form: ?Affine = null;
             for (fold.projection.items) |item| if (!aggregates(item.expression)) {
-                if (item.expression.value != .variable or !std.mem.eql(u8, item.expression.value.variable, unwind.alias)) return false;
-                keys += 1;
+                if (key_form != null or !rangeArgumentShape(item.expression, unwind.alias)) return false;
+                const last = sequence.at(sequence.length - 1).integer;
+                const form = (try engine.rangeArgument(item.expression, unwind.alias, .{ .low = @min(sequence.start, last), .high = @max(sequence.start, last) })) orelse return false;
+                if (form.scale == 0) return false;
+                key_form = form;
             };
-            if (keys != 1) return false;
+            if (key_form == null) return false;
             // Preserve the key's identity, and never hide correlated scalar
             // evaluation, joins, filters, or DISTINCT partition membership.
             for (fold.middle[index + 1 ..]) |clause| switch (clause.operation) {
@@ -4385,7 +4455,7 @@ const Engine = struct {
             };
             if (try plan.memo.find(engine, key.items, null) == null) return false;
             accepted = true;
-            const ascending = (sequence.step > 0) != source.reversed;
+            const ascending = ((sequence.step > 0) != source.reversed) != (key_form.?.scale < 0);
             const best_first = ascending != fold.projection.order[0].descending;
             const first = if (best_first) 0 else sequence.length - keep;
             var ordinal = first;
@@ -4405,7 +4475,7 @@ const Engine = struct {
         }
         fn expand(fold: *@This(), engine: *Engine, row: Row, index: usize) anyerror!void {
             if (fold.axis_trace) |trace| {
-                for (row) |entry| if ((try engine.values.info(entry.value)).entities) return error.CypherAxisMemoDeclined;
+                for (row) |entry| if ((try engine.readMetadata(entry.value)).entities) return error.CypherAxisMemoDeclined;
                 if (index < fold.middle.len) trace.reached[index] = true else trace.count = try trace.count.add(engine.a, fold.weight);
                 if (index != 0) if (trace.plan.calls[index - 1]) |scalar| if (!trace.sampled[scalar.sample]) {
                     var sample: std.ArrayList(v.Entry) = .empty;
@@ -4582,25 +4652,32 @@ const Engine = struct {
                         const apply = &fold.applies[index];
                         var key_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
                         defer key_arena.deinit();
-                        const key = try apply.key(engine, row, inner, fold.retained, key_arena.allocator());
+                        const live_inner = try engine.reachedCall(row, inner);
+                        const key: Row = if (apply.memo.disabled) &.{} else if (live_inner.ptr == inner.ptr) try apply.key(engine, row, inner, fold.retained, key_arena.allocator()) else live: {
+                            var names: Names = .empty;
+                            try engine.retainQueryReferences(&names, row, live_inner);
+                            var captured: std.ArrayList(v.Entry) = .empty;
+                            for (row) |entry| if (names.contains(entry.name)) try captured.append(key_arena.allocator(), entry);
+                            break :live captured.items;
+                        };
                         const cached = try apply.memo.find(engine, key, null);
-                        if (cached == null and streamableCall(inner)) {
+                        if (cached == null and streamableCall(live_inner)) {
                             var child_returned = false;
                             var capture: StreamCapture = .{ .budget = .{ .backing = engine.scratch_allocator, .limit = @min(4 << 20, engine.limits.memory_bytes / 32) }, .disabled = apply.memo.disabled };
                             defer capture.deinit();
                             var input = row;
                             var start: usize = 0;
-                            while (start + 1 < inner.len and inner[start].operation == .project) : (start += 1) {
-                                const projected = try engine.projectUnordered(&.{input}, inner[start].operation.project.value, false);
+                            while (start + 1 < live_inner.len and live_inner[start].operation == .project) : (start += 1) {
+                                const projected = try engine.projectUnordered(&.{input}, live_inner[start].operation.project.value, false);
                                 if (projected.len == 0) {
                                     try apply.memo.put(engine, key, null, .{ .rows = &.{}, .weights = &.{} });
                                     return;
                                 }
                                 input = projected[0];
                             }
-                            if (start + 1 < inner.len and inner[start].operation == .match) {
-                                const last = inner[inner.len - 1].operation.project.value;
-                                if (try engine.streamMatchProjectionInto(&.{input}, &.{Count.one}, inner[start].operation.match, last, inner[start + 1 .. inner.len - 1], inner[start].span, inner[inner.len - 1].span, .{ .parent = fold, .index = index + 1, .apply = row, .returned = &child_returned, .capture = &capture }, null)) |_| {
+                            if (start + 1 < live_inner.len and live_inner[start].operation == .match) {
+                                const last = live_inner[live_inner.len - 1].operation.project.value;
+                                if (try engine.streamMatchProjectionInto(&.{input}, &.{Count.one}, live_inner[start].operation.match, last, live_inner[start + 1 .. live_inner.len - 1], live_inner[start].span, live_inner[live_inner.len - 1].span, .{ .parent = fold, .index = index + 1, .apply = row, .returned = &child_returned, .capture = &capture }, null)) |_| {
                                     if (!child_returned) {
                                         try apply.memo.put(engine, key, null, .{ .rows = &.{}, .weights = &.{} });
                                     } else if (!capture.disabled) {
@@ -4615,7 +4692,7 @@ const Engine = struct {
                         const children = cached orelse blk: {
                             const scope = PatternScope.enter(engine);
                             defer scope.leave(engine);
-                            break :blk try engine.runWeightedRows(inner, .{ .rows = &.{row}, .weights = &.{Count.one} }, true, true);
+                            break :blk try engine.runWeightedRows(live_inner, .{ .rows = &.{row}, .weights = &.{Count.one} }, true, true);
                         };
                         if (cached == null) try apply.memo.put(engine, key, null, children);
                         const prior = fold.weight;
@@ -4764,8 +4841,10 @@ const Engine = struct {
                         const ranges = lookup(snapshot, "integer_ranges") orelse return error.CypherAxisMemoDeclined;
                         if (state_value.failure != null or snapshot[6].value.integer != 0 or ranges != .list or !state_value.function.distinct or state_value.distinct_support != null) return error.CypherAxisMemoDeclined;
                         const sum = std.ascii.eqlIgnoreCase(state_value.function.name, "sum");
-                        if (!sum and !std.ascii.eqlIgnoreCase(state_value.function.name, "count")) return error.CypherAxisMemoDeclined;
-                        if (sum and (state_value.sum != .integer or snapshot[1].value != .integer or snapshot[5].value.list.len != 0 or (lookup(snapshot, "integer_order") orelse v.Value.null) != .list)) return error.CypherAxisMemoDeclined;
+                        const average = std.ascii.eqlIgnoreCase(state_value.function.name, "avg");
+                        if (!sum and !average and !std.ascii.eqlIgnoreCase(state_value.function.name, "count")) return error.CypherAxisMemoDeclined;
+                        if (sum and (state_value.sum != .integer or snapshot[1].value != .integer)) return error.CypherAxisMemoDeclined;
+                        if ((sum or average) and (snapshot[5].value.list.len != 0 or (lookup(snapshot, "integer_order") orelse v.Value.null) != .list)) return error.CypherAxisMemoDeclined;
                     }
                     for (states, packet) |*state_value, snapshot| {
                         engine.mergeIntegerSnapshot(state_value, snapshot) catch |err| {
@@ -4821,14 +4900,14 @@ const Engine = struct {
                     continue;
                 };
                 if (fold.range_counts) |slots| if (slots[i]) {
-                    if (std.ascii.eqlIgnoreCase(accumulator.function.name, "avg")) {
+                    if (std.ascii.eqlIgnoreCase(accumulator.function.name, "avg") and !accumulator.function.distinct) {
                         accumulator.addAverageSequence(engine, fold.range_observers.?[i].?.average.?) catch |err| {
                             if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
                             accumulator.failure = err;
                         };
                         continue;
                     }
-                    if (accumulator.function.distinct and (std.ascii.eqlIgnoreCase(accumulator.function.name, "count") or std.ascii.eqlIgnoreCase(accumulator.function.name, "sum"))) {
+                    if (accumulator.function.distinct and (std.ascii.eqlIgnoreCase(accumulator.function.name, "count") or std.ascii.eqlIgnoreCase(accumulator.function.name, "sum") or std.ascii.eqlIgnoreCase(accumulator.function.name, "avg"))) {
                         if (!first_domain) continue;
                         accumulator.addIntegerTree(engine, fold.range_observers.?[i].?.support) catch |err| {
                             if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
@@ -4931,18 +5010,22 @@ const Engine = struct {
                 observed_alias = forwardedAxis(clause.operation.project.value, observed_alias) orelse return null;
             }
             const has_average = for (fold.calls) |expression| {
-                if (std.ascii.eqlIgnoreCase(expression.value.call.name, "avg")) break true;
+                if (std.ascii.eqlIgnoreCase(expression.value.call.name, "avg") and !expression.value.call.distinct) break true;
             } else false;
             if (has_average) {
                 if (!fold.weight.isOne()) return null;
-                for (fold.middle[index..]) |clause| if (clause.operation != .project) return null;
+                for (fold.middle[index..]) |clause| switch (clause.operation) {
+                    .project => {},
+                    .subquery => |inner| if (!try engine.independentUnitCall(inner, observed_alias)) return null,
+                    else => return null,
+                };
             }
             const counts = try engine.a.alloc(bool, fold.calls.len);
             var observed = false;
             for (fold.calls, counts) |expression, *qualified| {
                 const c = expression.value.call;
                 const average = std.ascii.eqlIgnoreCase(c.name, "avg");
-                if (average and (c.distinct or c.star or c.args.len != 1 or !rangeArgumentShape(c.args[0], observed_alias))) return null;
+                if (average and (c.star or c.args.len != 1 or !rangeArgumentShape(c.args[0], observed_alias))) return null;
                 const sum = std.ascii.eqlIgnoreCase(c.name, "sum");
                 if (sum and (c.star or c.args.len != 1 or !rangeArgumentShape(c.args[0], observed_alias))) return null;
                 const is_count = std.ascii.eqlIgnoreCase(c.name, "count");
@@ -7548,7 +7631,7 @@ const Engine = struct {
                     const columns = self.columns;
                     defer self.columns = columns;
                     for (rows) |row| {
-                        const children = try self.run(inner, &.{row}, false, false);
+                        const children = try self.run(try self.reachedCall(row, inner), &.{row}, false, false);
                         const last = inner[inner.len - 1].operation;
                         const unit = last != .project or !last.project.final;
                         if (unit) {
@@ -11132,11 +11215,22 @@ const Engine = struct {
             if (try get_relationship(self.backend.ptr, self.a, .{ .identity = value.relationship.identity, .index = value.relationship.index }) == null) return error.CypherDeletedEntity;
         };
     }
+    /// Metadata work happens only at an existing evaluation boundary. Parameter
+    /// arrays are immutable for the statement, so their first real validation
+    /// can be shared by planning and subsequent row/child epochs.
+    fn readMetadata(self: *Engine, value: v.Value) anyerror!value_work.Info {
+        if (self.read_only) {
+            if (self.immutableOwner(value)) |owner| return owner.work.info(value);
+            if (value == .list and self.invariants != null) {
+                const identity: Invariants.Identity = .{ .address = @intFromPtr(value.list.ptr), .length = value.list.len };
+                if (self.invariants.?.parameter_items.contains(identity)) return self.invariants.?.work.info(value);
+            }
+            if (self.statement_ownership != null and self.statement_ownership.?.owns(value)) return (try self.rootInvariantState()).work.info(value);
+        }
+        return self.values.info(value);
+    }
     fn readValue(self: *Engine, value: v.Value) anyerror!v.Value {
-        const metadata = if (self.read_only and self.statement_ownership != null and self.statement_ownership.?.owns(value))
-            try (try self.rootInvariantState()).work.info(value)
-        else
-            try self.values.info(value);
+        const metadata = try self.readMetadata(value);
         if (!metadata.entities) return value;
         if (self.backend.vtable.project_node != null or self.backend.vtable.get_relationship != null or self.has_deletions or self.postimages.count() != 0) try self.values.entityTraversal(value);
         return self.readValueInner(value);
