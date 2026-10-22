@@ -7104,3 +7104,57 @@ def test_certified_unit_prefix_keeps_ranked_windows_bounded(graph_db, prefix):
     assert result["rows"] == expected["rows"]
     assert result["stats"]["intermediate_states"] < 1500
     assert result["stats"]["memory_bytes"] < 250000
+
+
+@pytest.mark.parametrize(
+    ("query", "control"),
+    [
+        ("UNWIND range(1,1000000) AS x RETURN avg(7)", "RETURN 7.0"),
+        ("UNWIND range(1,1000000) AS x RETURN avg(7) AS a ORDER BY a LIMIT 1", "RETURN 7.0 AS a"),
+        (
+            "UNWIND range(1,1000000) AS x RETURN x%10 AS g,count(*) AS n ORDER BY n,g LIMIT 5",
+            "UNWIND [0,1,2,3,4] AS g RETURN g,100000 AS n",
+        ),
+        (
+            "UNWIND range(1,1000000) AS x WITH x SKIP 999995 LIMIT 5 RETURN avg(x)",
+            "UNWIND range(999996,1000000) AS x RETURN avg(x)",
+        ),
+        (
+            "UNWIND range(1,1000000) AS x WITH x ORDER BY x DESC LIMIT 5 RETURN avg(x)",
+            "UNWIND range(1000000,999996,-1) AS x RETURN avg(x)",
+        ),
+        (
+            "UNWIND range(1,1000000)+range(1,1000000) AS x WITH DISTINCT x+1 AS y RETURN avg(y)",
+            "UNWIND range(1,1000000) AS x RETURN avg(x+1)",
+        ),
+        (
+            "UNWIND range(1,1000000) AS x WITH DISTINCT x%10 AS g RETURN g,count(*) ORDER BY g",
+            "UNWIND range(0,9) AS g RETURN g,count(*) ORDER BY g",
+        ),
+        (
+            "UNWIND range(1,1000000) AS x RETURN x%10 AS g,count(*) ORDER BY g",
+            "UNWIND range(0,9) AS g UNWIND range(1,100000) AS x RETURN g,count(*) ORDER BY g",
+        ),
+        (
+            "UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i AS g,avg(x) AS a ORDER BY a,g LIMIT 5",
+            "UNWIND range(1,5) AS i UNWIND [0,1,0] AS x RETURN i AS g,avg(x) AS a ORDER BY g",
+        ),
+        (
+            "UNWIND range(1,1000000) AS x WITH x WHERE x>999992 RETURN x%10 AS g,count(*)",
+            "UNWIND [999993,999994,999995,999996,999997,999998,999999,1000000] AS x RETURN x%10 AS g,count(*)",
+        ),
+        (
+            "UNWIND [7,8] AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5",
+            "UNWIND range(1,5) AS i UNWIND [0,1,0,0,1,0] AS x RETURN i,avg(x) ORDER BY i",
+        ),
+    ],
+)
+def test_bounded_observer_domains_remove_million_row_materialization(graph_db, query, control):
+    result = graph_db.cypher_json(
+        "g", {"query": query, "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20}}
+    )
+    expected = graph_db.cypher_json("g", {"query": control})
+    assert result["rows"] == expected["rows"]
+    assert result["plan"][0]["output_rows"] in (2, 1000000, 2000000)
+    assert result["stats"]["intermediate_states"] < 2000
+    assert result["stats"]["memory_bytes"] < 1 << 20

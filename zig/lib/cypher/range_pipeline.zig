@@ -27,6 +27,7 @@ pub const Context = struct {
     a: std.mem.Allocator,
     sequence: Range,
     parts: ?[]const Range = null,
+    periodic: bool = false,
     bindings: []const Binding,
     positions: std.StringHashMapUnmanaged(usize) = .empty,
     parameters: []const v.Entry,
@@ -141,6 +142,94 @@ pub const Context = struct {
         }
         return selected.items;
     }
+    pub fn paginate(self: *Context, skip: u128, limit: ?u128) !void {
+        var output: std.ArrayList(Range) = .empty;
+        var left = skip;
+        var remaining = limit orelse std.math.maxInt(u128);
+        for (self.ranges()) |part| {
+            const start = @min(left, part.length);
+            left -= start;
+            const size = @min(remaining, part.length - start);
+            if (size != 0) try output.append(self.a, subrange(part, start, size));
+            remaining -= size;
+            if (remaining == 0) break;
+        }
+        self.parts = output.items;
+    }
+    /// Sort disjoint monotone runs without enumerating their values. General
+    /// interleaving lattices retain ordinary replay rather than losing order.
+    fn orderRanges(self: *Context, ascending: bool) !bool {
+        const runs = try self.a.dupe(Range, self.ranges());
+        for (runs) |*part| if (part.length > 1 and (part.step > 0) != ascending) {
+            const step = std.math.negate(part.step) catch return false;
+            part.start = part.at(part.length - 1).integer;
+            part.step = step;
+        };
+        const Order = struct {
+            fn less(up: bool, x: Range, y: Range) bool {
+                return if (up) x.start < y.start else x.start > y.start;
+            }
+        };
+        try self.charge(self.ptr, runs.len *| 8);
+        std.mem.sort(Range, runs, ascending, Order.less);
+        for (runs[0..runs.len -| 1], runs[@min(1, runs.len)..]) |prior, next| {
+            if (prior.length == 0 or next.length == 0) continue;
+            const last = prior.at(prior.length - 1).integer;
+            if (if (ascending) last >= next.start else last <= next.start) return false;
+        }
+        self.parts = runs;
+        return true;
+    }
+    fn appendPiece(self: *Context, output: *std.ArrayList(Range), part: Range, start: u128, size: u128) !bool {
+        if (size == 0) return true;
+        if (output.items.len == 128) return false;
+        try self.charge(self.ptr, 1);
+        try output.append(self.a, subrange(part, start, size));
+        return true;
+    }
+    /// Stable novel support. Subtract prior runs in encounter order. Periodic
+    /// differences may split, but planning work and retained segments are capped.
+    pub fn deduplicate(self: *Context) !bool {
+        var output: std.ArrayList(Range) = .empty;
+        for (self.ranges()) |part| {
+            if (part.length == 0) continue;
+            var pending: std.ArrayList(Range) = .empty;
+            try pending.append(self.a, part);
+            for (output.items) |seen| {
+                var next: std.ArrayList(Range) = .empty;
+                for (pending.items) |candidate| {
+                    try self.charge(self.ptr, 1);
+                    const hit = @import("range.zig").Run.intersect(@import("range.zig").Run.from(candidate), @import("range.zig").Run.from(seen)) orelse {
+                        if (!try self.appendPiece(&next, candidate, 0, candidate.length)) return false;
+                        continue;
+                    };
+                    const first_hit: u128 = @intCast(@divExact((if (candidate.step > 0) hit.low else hit.high) - candidate.start, candidate.step));
+                    const last_hit: u128 = @intCast(@divExact((if (candidate.step > 0) hit.high else hit.low) - candidate.start, candidate.step));
+                    const stride: u128 = if (hit.low == hit.high) 1 else @intCast(@divExact(hit.step, @as(i128, @intCast(@abs(@as(i128, candidate.step))))));
+                    if (!try self.appendPiece(&next, candidate, 0, first_hit)) return false;
+                    if (stride == 2 and last_hit > first_hit) {
+                        const size = (last_hit - first_hit) / 2;
+                        const step = if (size == 1) @as(i64, 1) else std.math.cast(i64, @as(i128, candidate.step) * 2) orelse return false;
+                        if (next.items.len == 128) return false;
+                        try next.append(self.a, .{ .start = candidate.at(first_hit + 1).integer, .step = step, .length = size });
+                    } else if (stride > 1 and last_hit > first_hit) {
+                        if ((last_hit - first_hit) / stride > 128) return false;
+                        var ordinal = first_hit;
+                        while (ordinal < last_hit) : (ordinal += stride) {
+                            if (!try self.appendPiece(&next, candidate, ordinal + 1, stride - 1)) return false;
+                        }
+                    }
+                    if (!try self.appendPiece(&next, candidate, last_hit + 1, candidate.length - last_hit - 1)) return false;
+                }
+                pending = next;
+                if (pending.items.len == 0) break;
+            }
+            if (output.items.len + pending.items.len > 128) return false;
+            try output.appendSlice(self.a, pending.items);
+        }
+        self.parts = output.items;
+        return true;
+    }
     fn known(value: v.Value) Known {
         return if (value == .integer) .{ .integer = Form.literal(value.integer) } else .{ .scalar = value };
     }
@@ -191,6 +280,23 @@ pub const Context = struct {
                 break :blk .{ .integer = if (u.op == .positive) form else if (u.op == .negative) form.negative() orelse return null else return null };
             },
             .binary => |b| blk: {
+                if (b.op == .modulo) {
+                    const left = (try self.integer(b.left)) orelse return null;
+                    const right = (try self.integer(b.right)) orelse return null;
+                    if (right.scale != 0 or right.offset == 0) return null;
+                    const modulus: i128 = @intCast(@abs(@as(i128, right.offset)));
+                    var remainder: ?i64 = null;
+                    for (self.ranges()) |part| {
+                        if (part.length == 0) continue;
+                        const first = std.math.cast(i64, @as(i128, left.scale) * part.start + left.offset) orelse return null;
+                        const last = std.math.cast(i64, @as(i128, left.scale) * part.at(part.length - 1).integer + left.offset) orelse return null;
+                        const r: i64 = @intCast(@rem(@as(i128, first), modulus));
+                        if (part.length > 1 and @rem(@as(i128, left.scale) * part.step, modulus) != 0) return null;
+                        if (@rem(@as(i128, last), modulus) != r or (remainder != null and remainder.? != r)) return null;
+                        remainder = r;
+                    }
+                    break :blk .{ .integer = Form.literal(remainder orelse return null) };
+                }
                 if (b.op != .add and b.op != .subtract and b.op != .multiply) return null;
                 const left = (try self.integer(b.left)) orelse return null;
                 const right = (try self.integer(b.right)) orelse return null;
@@ -215,11 +321,11 @@ pub const Context = struct {
     /// WITH expressions share the old scope. WHERE overlays projected names on
     /// that old scope; its output drops unprojected input names afterwards.
     pub fn project(self: *Context, projection: ast.Projection, names: []const []const u8) !bool {
-        if (projection.order.len != 0 or projection.skip != null or projection.limit != null) return false;
+        if (projection.skip != null or projection.limit != null) return false;
         var output: std.ArrayList(Binding) = .empty;
         if (projection.wildcard) try output.appendSlice(self.a, self.bindings);
         for (projection.items, names) |item, name| try output.append(self.a, .{ .name = name, .value = (try self.expression(item.expression)) orelse return false });
-        if (projection.predicate) |predicate_value| {
+        if (projection.predicate != null or projection.order.len != 0) {
             var scope: std.ArrayList(Binding) = .empty;
             try scope.appendSlice(self.a, self.bindings);
             var positions = self.positions;
@@ -230,10 +336,13 @@ pub const Context = struct {
                     try scope.append(self.a, entry);
                 }
             }
-            self.bindings = scope.items;
-            self.positions = positions;
-            if (!try self.restrict(predicate_value)) return false;
+            if (projection.distinct) try self.setBindings(output.items) else {
+                self.bindings = scope.items;
+                self.positions = positions;
+            }
+            if (projection.predicate) |predicate_value| if (!try self.restrict(predicate_value)) return false;
         }
+        var order_scope = self.*;
         try self.setBindings(output.items);
         if (projection.distinct and self.domainLength() != 0) {
             var varying = false;
@@ -247,12 +356,24 @@ pub const Context = struct {
                 }
             }
             if (varying) {
-                if (!try self.injective()) return false;
+                if (self.periodic) return false;
+                if (!try self.deduplicate()) return false;
             } else {
                 const selected = try self.a.alloc(Range, 1);
                 selected[0] = .{ .start = self.firstValue().?.integer, .step = 1, .length = 1 };
                 self.parts = selected;
             }
+        }
+        if (projection.order.len != 0 and self.domainLength() != 0) {
+            if (projection.distinct) order_scope = self.* else order_scope.setRanges(self.ranges());
+            var direction: ?bool = null;
+            for (projection.order) |order| {
+                const key = (try order_scope.expression(order.expression)) orelse return false;
+                if (key == .integer) {
+                    if (direction == null and key.integer.scale != 0) direction = (key.integer.scale > 0) != order.descending;
+                } else if (key.scalar == .number and !std.math.isFinite(key.scalar.number)) return false;
+            }
+            if (direction) |ascending| if (!try self.orderRanges(ascending)) return false;
         }
         return true;
     }
@@ -302,6 +423,22 @@ pub const Context = struct {
             },
             else => return false,
         }
+        return true;
+    }
+    pub fn residue(self: *Context, alias: []const u8, period: i64, desired: i64) !bool {
+        const variable: ast.Expr = .{ .span = .{}, .value = .{ .variable = alias } };
+        const divisor: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = period } } };
+        const remainder: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = desired } } };
+        const expression_value: ast.Expr = .{ .span = .{}, .value = .{ .binary = .{ .op = .modulo, .left = &variable, .right = &divisor } } };
+        var parts: std.ArrayList(Range) = .empty;
+        for (self.ranges()) |part| {
+            var child = self.*;
+            child.parts = null;
+            child.sequence = part;
+            if (!try child.modulo(&expression_value, &remainder)) return false;
+            if (child.sequence.length != 0) try parts.append(self.a, child.sequence);
+        }
+        self.setRanges(parts.items);
         return true;
     }
     fn modulo(self: *Context, expression_value: *const ast.Expr, remainder_value: *const ast.Expr) !bool {

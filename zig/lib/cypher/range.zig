@@ -78,18 +78,18 @@ test "range descriptor preserves signs inclusive bounds and full signed-domain i
 
 /// A finite integer lattice interval. Direction and duplicate occurrences do
 /// not affect set membership. Wider steps occur when intersecting lattices.
-const Run = struct {
+pub const Run = struct {
     low: i128,
     high: i128,
     step: i128,
-    fn from(range: Range) Run {
+    pub fn from(range: Range) Run {
         const last = range.at(range.length - 1).integer;
         return .{ .low = @min(range.start, last), .high = @max(range.start, last), .step = if (range.length == 1) 1 else @intCast(@abs(@as(i128, range.step))) };
     }
     fn length(self: Run) u128 {
         return @intCast(@divTrunc(self.high - self.low, self.step) + 1);
     }
-    fn intersect(a: Run, b: Run) ?Run {
+    pub fn intersect(a: Run, b: Run) ?Run {
         const low = @max(a.low, b.low);
         const high = @min(a.high, b.high);
         if (low > high) return null;

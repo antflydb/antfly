@@ -2057,7 +2057,8 @@ encounter order. Eager AND and OR operands are independently certified over thei
 full incoming domain before intersection or union. Compatible OR branches and
 interior inequalities retain multiple ordered segments; incompatible overlapping
 lattices decline. WHERE overlays projected aliases on the
-input scope; later stages receive only the projected scope. Binding indexes
+input scope for ordinary projections; DISTINCT predicates and later stages
+receive only the projected scope. Binding indexes
 preserve first-name lookup and avoid quadratic proof lookup on wide projections.
 The resulting ordered domain feeds the existing aggregate certificates, including
 checked SUM prefixes and exact-recurrence AVG; unsupported or rounded cases
@@ -2068,14 +2069,39 @@ The same checked program feeds reductions and ranked windows. Its ordered bag
 segments remain separate from unordered DISTINCT support: concatenation retains
 copies and reversal changes both segment order and leaf direction. Source proof
 work and segment count are bounded, with ordinary replay on a decline. Arithmetic
-WITH DISTINCT keeps an injective tuple without materializing members only after
-proving that its entire reached raw domain has no duplicates; constant tuples
-retain the first encounter. This requires a certified unit producer invocation,
+WITH DISTINCT keeps affine tuples as stable novel support, subtracting prior
+ordered runs without materializing members. Overlapping progressions use checked
+lattice intersections and bounded segment subtraction; constant tuples retain
+the first encounter. This requires a certified unit producer invocation,
 so repeated outer rows cannot bypass shared DISTINCT membership. Independent
 zero-or-one-row CALLs and singleton UNWINDs extend the program after their values,
 binding compatibility and child-local cardinality are checked. Failed probes
 decline before publishing results. CALL reducers and windows retain unit-input
 semantics, and structural or varying captures keep their ordinary paths.
+
+A certified complete scalar domain also carries WITH ordering and SKIP/LIMIT.
+Ordinal slicing and sorting disjoint monotone runs happen before downstream
+observers, without enumerating the omitted values. Pagination bounds and every
+reached pre-window expression must be checked before publication; unsupported
+scopes, interleaving lattices and fallible expressions retain ordinary execution.
+Invariant integer AVG arguments use the same zero-stride observer certificate.
+
+Small constant modulo periods (bounded at 64) partition an arithmetic producer
+into signed remainder cohorts. Each cohort retains its source encounter order;
+constant cohort keys feed existing exact aggregate observers. All cohort programs
+and packets are proved before publishing any groups. Cross-cohort key collisions
+and varying DISTINCT tuples decline, preserving shared DISTINCT membership and
+sequential floating recurrence. Cohorts are ordered by their first surviving source ordinal
+and record original logical stage counts. Planning is bounded independently of
+the source cardinality.
+
+Ranked group windows may ignore an aggregate rank only when the independent
+suffix packet proves identical contributions for every candidate key. A finite
+independent outer list can move inside an injective key axis while preserving
+each group's exact contribution sequence. The same suffix proof validates all
+outer values before pruning keys; no generic SUM/COUNT replacement changes AVG
+rounding. Key dependencies, unsupported shared stages and failed proofs keep
+ordinary execution.
 
 Total, invariant affine grouping keys can also collapse an unobserved producer
 axis through independent fanout. The grouping key is retained and evaluated on a
