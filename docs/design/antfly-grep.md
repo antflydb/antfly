@@ -336,7 +336,8 @@ preserves each parent's authorization, revision, result ownership and budgets.
 ### Bounded cross-parent pipeline (2026-10-22)
 
 Indexed visual search uses at most eight persistent worker lanes, further bounded
-by provider concurrency. Lanes borrow manifest page data; every lane is joined
+by provider concurrency. Allocate lanes lazily for the actual window and omit
+the local-file pipeline for indexed-only invocations. Lanes borrow manifest page data; every lane is joined
 before either its materialized asset page or manifest arena can be released.
 Each lane owns mutable matcher and decision state and shares the invocation's
 atomic budgets, cancellation, HTTP pools, score store and synchronized ranking or
@@ -346,7 +347,9 @@ Compatible model work coalesces across parents with unique wire IDs. A
 single-parent window retains intra-document provider parallelism.
 
 An asset window contains at most eight parents and 8 MiB conservative evidence.
-Only equal image-field projection shapes are grouped. Unioning unrelated fields
+Plan complete first waves, shrinking the parent prefix when its shape or
+conservative byte estimate changes; never preload unused partial waves. Only
+equal image-field projection shapes are grouped. Unioning unrelated fields
 would overfetch those fields on every row. A group is one current ID-filtered
 query, with no ordering or retained pagination state. Each returned parent
 independently checks access and revision before its payloads are validated.
@@ -377,7 +380,9 @@ peak RSS without charging the Python harness to the CLI. Reports retain exact
 binary hashes, alternating trial order, output equivalence and fixture delays.
 First stdout in the ranked fixture follows ranking completion; it is not a
 claim of streaming an early unranked hit. Live providers and real Cloud ACLs
-remain separate qualification.
+remain separate qualification. The [cross-parent qualification](../../zig/pkg/antfly-grep/bench/results/grep-cross-parent-summary.json)
+records wall time, CPU, memory and first-output tradeoffs on macOS and the
+constrained Linux VM; it does not establish zero-cost execution.
 
 Warm scores still require fresh authorized asset validation. Avoiding those image
 bytes requires a generic server-owned source/asset identity contract: an identity

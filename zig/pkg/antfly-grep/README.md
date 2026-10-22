@@ -4523,3 +4523,26 @@ adds valid PNG payloads to exercise larger transfers. Five alternating paired
 trials record exact output equivalence, HTTP counts, child CPU/wall time, first
 stdout and peak RSS. Use pinned baseline/current binaries and write raw reports
 to ignored `output/`. Live model tokens, prices and relevance remain unmeasured.
+
+The [cross-parent qualification](bench/results/grep-cross-parent-summary.json)
+records the final binaries and all four workload shapes. For eight separate
+documents, total requests fall from 17 to 3 cold and 9 to 2 warm:
+
+| Host | Cold median, baseline → current | Warm median, baseline → current |
+|---|---:|---:|
+| macOS ARM64 | 454 → 110 ms | 234 → 68 ms |
+| Linux ARM64 VM, 2 CPUs / 1 GiB | 418 → 78 ms | 224 → 53 ms |
+
+These are loopback fixtures with 20 ms artificial delay per HTTP request. With
+256 KiB images, peak RSS rises from 7.8 to 16.9 MiB on macOS and 8.5 to 18.8 MiB
+in the Linux VM. Cold tiny-input CPU time also rises from 11 to 29 ms in that VM.
+Unranked first-output latency is similar or slightly worse despite lower total
+time; results still arrive before later provider work finishes. The report
+includes CPU, RSS and first-output figures rather than implying universal cost
+or latency improvements. Live provider cost and relevance remain unmeasured.
+
+The scalar source-proof cache now admits one cold entry with CLOCK eviction
+instead of clearing all 4,096 entries, retaining 4,095 existing facts. Proof
+lookup and registration take one lock per bounded window of up to 64 rows.
+Epoch, owner and publication checks still fence reuse; a cached fact never
+authorizes an asset or substitutes for a complete predicate certificate.
