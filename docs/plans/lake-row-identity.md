@@ -201,7 +201,13 @@ failures and cancellation propagate.
 
 Reader leases, GC traversal, cloud publication certificates, startup navigation
 warming and recovery include all current and original navigation/map roots and
-compact translations. Protocol 69 additionally fences readers that cannot interpret
+compact translations. Protocol 70 introduces a v2 identity root with shared
+coordinate-space/translation descriptors and compact declaration bindings.
+Descriptors coalesce by content even when independently loaded. The complete
+prospective binding set is admitted before native payload construction; a final
+mixed-space overflow retries ordinary physical construction with identity disabled.
+Historical v1 certificates retain their exact serialization. Protocol 69
+additionally fences readers that cannot interpret
 logical native fragment spaces; protocol 68 introduced rank-free coordinate maps.
 Historical rank-bearing map certificates retain their original serialization and
 remain readable. Reconciliation probes bounded unique navigation roots. A deeper
@@ -211,9 +217,10 @@ invalidate a later publication. Hints are process-local and are rediscovered by 
 failed reader after restart.
 
 Existing physical public IDs remain unchanged; the logical ID codec is internal
-and does not introduce a public stable-ID promise. Worst-case identity verification,
-fragment census hashing and proof comparisons still scale with row count; unchanged
-authenticated subtrees skip verification reads. Cross-file rewrite savings must be
+and does not introduce a public stable-ID promise. Worst-case identity verification
+and proof comparisons still scale with row count for a complete external rewrite; unchanged
+authenticated subtrees skip verification reads. Ordinary append/update census planning
+uses COW differences and rehashes only affected radix leaves. Cross-file rewrite savings must be
 measured against this verification/publication cost.
 
 ## Native delta reuse across membership changes
@@ -228,7 +235,13 @@ fragments, updating postings, collection statistics, dense/sparse membership,
 covering tuples and algebraic retractions in the same atomic publication.
 Fresh sparse fragment keys append native immutable posting segments, including
 incremental generations. Scalar insertion would repeatedly requantize retained
-chunks and accumulate score error. The v9 sparse writer binding migrates older
+chunks and accumulate score error. Publication compacts pressured size tiers of
+32 posting/docmap segments, both during ingestion and before checkpointing, rather
+than rebuilding the historical base after every small update. Compaction reads
+the exact retained forward vectors once into a bounded external (term, ordinal)
+sort; it never requantizes previously decoded weights. The ordinary live-incarnation
+proofs and atomic native compaction publication continue to govern visibility.
+The v9 sparse writer binding migrates older
 checkpoints on their next rebuild; it does not change the reader's wire codec.
 
 Coordinates within a fragment are collision-free ordered ordinals, never truncated
@@ -237,16 +250,33 @@ reused. Per-index equivalence proofs still retain exact artifact roots for index
 whose captured inputs are unchanged. Retained indexes can therefore refer to older
 fragment spaces; each index binds its own authenticated resolver and coordinate map.
 
-Construction gathers changed fragments through bounded 256-row physical selections
-and the existing projected replay shared by native builders. Each consumer owns a
-parallel physical reader. A typed scatter restores logical order across physical
-file/page boundaries before exposing each tile; wide integers, decimals and NULLs
-retain their native representations. Expanded payloads above an 8 MiB target
-retry with fewer selected rows before copying, down to one row subject to the
-existing decoder and native construction limits. It does not scan the archive for every fragment. The exact
-verified census supplies COUNT metadata without interpreting internal fragment
-identifiers as source object paths. Invalid/missing identity evidence or exhausted
-optional construction admission selects ordinary complete physical rebuilding.
+Census planning walks COW differences of verified logical IDs and input-version
+trees. It ignores coordinate-only changes and equal records in changed pages.
+Per-input cohorts share fingerprints only when their captured column sets match;
+separate authenticated navigation roots give each native builder exactly its own
+fragment versions and private identities. Ordered and aggregate builders fuse
+only consumers sharing that census. A body-only update therefore does not
+replace neighboring vector fragments. Splits and missing/legacy input censuses
+rehash the affected ranges conservatively.
+
+Construction chooses between two bounded source paths. Selective changes use
+256-row physical gathers and the existing projected replay. When at least one
+eighth of a source with 128 or more rows needs rebuilding, one delete-aware
+projected physical pass writes typed payload pages once and partitions compact
+logical-coordinate references into private spill trees. Independent builders then
+read those partitions without rescanning or decoding Parquet. The spool shares
+a 64 MiB retained-memory reservation and the configured identity spill quota;
+quota denial selects ordinary gathers. It is attempt-private and is never a
+serving artifact or a durable recovery checkpoint.
+
+A typed scatter restores logical order across physical file/page boundaries.
+Wide integers, exact decimal coefficients, NULLs, and shared string dictionaries
+retain their representations. Expanded payloads above an 8 MiB target split
+before copying, down to one row subject to existing decoder/native limits. Spool
+payload pages hold at most 64 rows; reference/scatter tiles hold at most 256.
+The exact verified census supplies COUNT metadata without interpreting internal
+fragment identifiers as source object paths. Invalid/missing identity evidence
+or exhausted optional construction admission selects complete physical rebuilding.
 
 Only retained aggregate declarations keep prior contribution roots live; replaced
 roots retire through counted ownership. Aggregate deltas require the seed's
@@ -265,7 +295,9 @@ map/tree paths without holding a mutex across remote I/O.
 Selective dense constraints also cross the native owner boundary as complete
 include/exclude vector-ID sets (at most 4,096 IDs in a 4 MiB planning workspace).
 The planner verifies native metadata against each physical key before accepting a
-hashed vector ID. Partial plans retain the exact residual predicate; declined
+hashed vector ID. Verification uses one pinned native read transaction and a sorted
+batch metadata lookup, with exact key comparison before accepting each ID.
+Partial plans retain the exact residual predicate; declined
 translations never reinterpret current coordinates as historical native addresses.
 Broad selections keep bounded candidate membership evaluation.
 

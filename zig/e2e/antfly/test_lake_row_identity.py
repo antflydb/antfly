@@ -293,6 +293,21 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     and "values_recipe" in value
                     and "current" in value
                 ):
+                    if value.get("version") == 2:
+                        spaces = {
+                            view["id"]: view for view in value["coordinate_spaces"]
+                        }
+                        value["reused"] = [
+                            {
+                                "name": binding["name"],
+                                **{
+                                    k: v
+                                    for k, v in spaces[binding["space"]].items()
+                                    if k != "id"
+                                },
+                            }
+                            for binding in value["index_bindings"]
+                        ]
                     result.append((path.stat().st_mtime_ns, value))
             return [value for _, value in sorted(result, key=lambda item: item[0])]
 

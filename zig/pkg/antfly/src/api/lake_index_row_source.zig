@@ -36,6 +36,8 @@ pub const Provider = struct {
         open: *const fn (*anyopaque, A, bindings.Binding, ?usize, Cancellation, ?*const stores.IoPhase) anyerror!rows.Source,
     } = null,
 
+    fragment_views: []const FragmentView = &.{},
+
     /// Total work belongs to a configuration, across private file checkpoints.
     resume_work: ?*ResumeWork = null,
     source: *serving.ServingSource,
@@ -58,6 +60,23 @@ pub const Provider = struct {
     replay_consumer: ?usize = null,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
     statistics: ?Statistics = null,
+    pub const FragmentView = struct { name: []const u8, files: []const local.serverless_external_source_types.FileEntry, delta: @import("lake_source_navigation.zig").Delta, navigation: local.serverless_manifest_artifact_ref.ArtifactRef };
+    /// Borrow a per-input census while preserving this worker's private scanner
+    /// and any file-major append frontier. Payload replay shares coordinates.
+    pub fn forIndex(self: *Provider, source: *serving.ServingSource, name: []const u8) Provider {
+        var selected = self.*;
+        selected.source = source;
+        for (self.fragment_views) |view| if (std.mem.eql(u8, view.name, name)) {
+            source.inventory.files = @constCast(view.files[0..source.inventory.files.len]);
+            // File-major construction deliberately hides the full census;
+            // its reached prefix and append plan are the only scan authority.
+            selected.native_delta = if (self.resume_work != null) null else view.delta;
+            selected.previous_inventory = null;
+            break;
+        };
+        return selected;
+    }
+
     pub fn wantsIndex(self: *const Provider, name: []const u8) bool {
         for (self.skip_indexes) |skip| if (std.mem.eql(u8, skip, name)) return false;
         return true;

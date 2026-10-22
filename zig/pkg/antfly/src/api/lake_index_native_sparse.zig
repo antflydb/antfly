@@ -61,11 +61,22 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: local.serverless_manifes
 fn appendFresh(index: *local.sparse_sparse.SparseIndex, writes: []const local.sparse_sparse.SparseWrite, initial: bool) !void {
     try index.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true, .backend_batch_options = .{ .mode = if (initial) .bulk_ingest else .default } });
 }
+fn compactNative(index: *local.sparse_sparse.SparseIndex, a: A, budget: *local.sql_memory_budget, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, path: []const u8, maximum: usize) !void {
+    for (0..maximum) |_| {
+        try cancellation.check();
+        try provider.context.ensureActive();
+        const compacted = index.compactSegmentsWithOptions(a, .{ .min_segments = 32, .max_segments = 32, .size_tiered = true, .exact_forward_weights = true, .scratch = .{ .io = provider.context.io.?, .directory = path, .cancellation = cancellation, .max_input_bytes = @intCast(@min(provider.identity_spill_bytes, std.math.maxInt(usize))) } }) catch |err| {
+            if (err == error.ResourceBudgetExceeded or (err == error.OutOfMemory and budget.isLocallyExhausted())) return;
+            return err;
+        };
+        if (!compacted) return;
+    }
+}
 pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared) ![]const Declared {
     return buildIncremental(a, out, table, source, base, store, provider, cancellation, reusable, &.{});
 }
-pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared, candidates: []const Declared) ![]const Declared {
-    var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(a, base, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
+pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.TableRecord, parent_source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, parent_provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared, candidates: []const Declared) ![]const Declared {
+    var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(a, base, parent_source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
     defer desired.deinit(a);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -74,6 +85,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     var result: std.ArrayList(Declared) = .empty;
     errdefer result.deinit(out);
     for (desired.artifacts) |wanted| {
+        var source_view = parent_source.*;
+        var selected_provider = parent_provider.forIndex(&source_view, wanted.name);
+        const provider = &selected_provider;
         if (!provider.wantsIndex(wanted.name)) continue;
         if (wanted.kind != .sparse_segment) continue;
         try provider.context.ensureActive();
@@ -179,6 +193,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer rows.deinit(a);
         var input_remaining: u64 = 512 * 1024 * 1024;
         const input = if (provider.resume_work) |work| &work.native_input_left else &input_remaining;
+        var batches: usize = 0;
         while (try rows.next(a)) |batch| {
             var page_arena = std.heap.ArenaAllocator.init(a);
             defer page_arena.deinit();
@@ -212,9 +227,12 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 try transaction.commit();
             }
             try appendFresh(&index, writes.items, seed == null);
+            batches += 1;
+            if (batches % 32 == 0) try compactNative(&index, budget.allocator(), &budget, provider, cancellation, path, 4);
         }
         if (seed == null) try index.finishBulkIngestSessionWithOptions(.{});
         try tracker.finish();
+        try compactNative(&index, budget.allocator(), &budget, provider, cancellation, path, 16);
         finished = true;
         var checkpoint = try index.pinNativeCheckpoint();
         defer checkpoint.deinit();
@@ -252,28 +270,32 @@ test "external lake fresh sparse fragment mutations keep quantization error boun
     defer arena.deinit();
     const scratch = arena.allocator();
     var ids: [257][]const u8 = undefined;
-    var weights: [257][1]f32 = undefined;
+    var weights: [257][2]f32 = undefined;
     var initial: [257]local.sparse_sparse.SparseWrite = undefined;
     for (&ids, &weights, &initial, 0..) |*id, *weight, *write, row| {
         id.* = try std.fmt.allocPrint(scratch, "row-{d:0>4}-0", .{row});
         weight[0] = @floatFromInt(row + 1);
-        write.* = .{ .doc_id = id.*, .vec = .{ .indices = &.{1}, .values = weight } };
+        weight[1] = @as(f32, @floatFromInt(258 - row)) * 0.5;
+        write.* = .{ .doc_id = id.*, .vec = .{ .indices = &.{ 1, 7 }, .values = weight } };
     }
     try appendFresh(&index, &initial, true);
-    for (0..10) |cycle| {
+    var compactions: usize = 0;
+    for (0..40) |cycle| {
         var removed: [16][]const u8 = undefined;
         var next: [16]local.sparse_sparse.SparseWrite = undefined;
-        var values: [16][1]f32 = undefined;
+        var values: [16][2]f32 = undefined;
         for (&removed, &next, &values, 0..) |*old, *write, *weight, lane| {
             const row = (cycle * 17 + lane * 13) % ids.len;
             old.* = ids[row];
             ids[row] = try std.fmt.allocPrint(scratch, "row-{d:0>4}-{d}", .{ row, cycle + 1 });
             weight[0] = @floatFromInt(row + 1);
-            write.* = .{ .doc_id = ids[row], .vec = .{ .indices = &.{1}, .values = weight } };
+            weight[1] = @as(f32, @floatFromInt(258 - row)) * 0.5;
+            write.* = .{ .doc_id = ids[row], .vec = .{ .indices = &.{ 1, 7 }, .values = weight } };
         }
         try index.batchWithOptions(&.{}, &removed, .{});
         try appendFresh(&index, &next, false);
-        const hits = try index.search(a, &.{ .indices = &.{1}, .values = &.{2} }, 257);
+        if (try index.compactSegmentsWithOptions(a, .{ .min_segments = 4, .max_segments = 4, .size_tiered = true, .exact_forward_weights = true, .scratch = .{ .io = std.testing.io, .directory = directory.path() } })) compactions += 1;
+        const hits = try index.search(a, &.{ .indices = &.{ 1, 7 }, .values = &.{ 2, 0.25 } }, 257);
         defer {
             for (hits) |hit| a.free(hit.doc_id);
             a.free(hits);
@@ -285,8 +307,9 @@ test "external lake fresh sparse fragment mutations keep quantization error boun
             try std.testing.expect(!seen[row]);
             seen[row] = true;
             try std.testing.expectEqualStrings(ids[row], hit.doc_id);
-            const expected: f32 = @floatFromInt(2 * (row + 1));
-            try std.testing.expectApproxEqAbs(expected, hit.score, 2 * 258.0 / 255.0 + 0.001);
+            const expected: f32 = @as(f32, @floatFromInt(2 * (row + 1))) + 0.125 * @as(f32, @floatFromInt(258 - row));
+            try std.testing.expectApproxEqAbs(expected, hit.score, (2 * 258.0 + 0.25 * 129.0) / 255.0 + 0.001);
         }
     }
+    try std.testing.expect(compactions >= 10);
 }

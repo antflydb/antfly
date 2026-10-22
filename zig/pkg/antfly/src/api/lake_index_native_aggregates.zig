@@ -98,7 +98,7 @@ pub const BuildResult = struct { declarations: []const Declared, contributions: 
 pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: @import("antfly_cancellation").CancellationToken, reusable: []const Declared, old_contributions: []const local.metadata_lake_index_catalog.FileContribution) !BuildResult {
     return buildIndexed(a, out, table, source, store, provider, cancellation, reusable, old_contributions, null);
 }
-pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: @import("antfly_cancellation").CancellationToken, reusable: []const Declared, old_contributions: []const local.metadata_lake_index_catalog.FileContribution, contribution_lookup: ?*@import("lake_index_contributions.zig").Index) !BuildResult {
+pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableRecord, parent_source: *local.serverless_query_lake_serving.ServingSource, store: *stores.ArtifactStore, parent_provider: *@import("lake_index_row_source.zig").Provider, cancellation: @import("antfly_cancellation").CancellationToken, reusable: []const Declared, old_contributions: []const local.metadata_lake_index_catalog.FileContribution, contribution_lookup: ?*@import("lake_index_contributions.zig").Index) !BuildResult {
     var contributions: std.ArrayList(local.metadata_lake_index_catalog.FileContribution) = .empty;
     var config_arena = std.heap.ArenaAllocator.init(a);
     defer config_arena.deinit();
@@ -111,17 +111,17 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
         };
     } else false;
     if (!has_algebraic) return .{ .declarations = &.{}, .contributions = &.{} };
-    const io = provider.context.io orelse return error.UnsupportedSqlExecution;
-    try source.ensureInventory(provider.context);
-    try source.ensureCanonicalPlan(provider.context);
+    const io = parent_provider.context.io orelse return error.UnsupportedSqlExecution;
+    try parent_source.ensureInventory(parent_provider.context);
+    try parent_source.ensureCanonicalPlan(parent_provider.context);
     var schemas = @import("sql_schema_cache.zig").Cache.init(a);
     defer schemas.deinit();
     const sql_table = try schemas.resolve(io, ca, table.schema_json, table.table_id, table.name);
     const contract = try ca.alloc(local.serverless_query_lake_schema.Column, sql_table.columns.len);
     for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = if (definition.element_type == .numeric) "numeric" else @tagName(definition.type), .required = !definition.nullable };
-    var native_provider = provider.*;
-    native_provider.schema_contract = if (source.iceberg_schema) |selected| selected.columns else contract;
-    if (source.iceberg_schema) |selected| for (contract) |expected| {
+    var native_provider = parent_provider.*;
+    native_provider.schema_contract = if (parent_source.iceberg_schema) |selected| selected.columns else contract;
+    if (parent_source.iceberg_schema) |selected| for (contract) |expected| {
         const actual = for (selected.columns) |column| {
             if (std.mem.eql(u8, column.name, expected.name)) break column;
         } else return error.ExternalLakeSchemaMismatch;
@@ -130,7 +130,6 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
     var old: ContributionIndex = .{};
     defer old.deinit(a);
     for (old_contributions, 0..) |contribution, index| try old.put(a, contributionKey(contribution.file, contribution.recipe, contribution.name), index);
-    var file_keys: ?[][32]u8 = null;
     var declarations: std.ArrayList(Declared) = .empty;
     errdefer {
         // Nested bytes are allocated in the publication arena by the caller.
@@ -153,8 +152,8 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
             if (name != .string or name.string.len == 0) return error.InvalidAlgebraicConfig;
             const identity = try recipeIdentity(ca, recipe);
             const logical_name = try @import("lake_index_names.zig").materialization(out, entry.key_ptr.*, name.string);
-            if (!provider.wantsIndex(logical_name)) continue;
-            const contributes = incrementalRecipe(recipe) and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
+            if (!parent_provider.wantsIndex(logical_name)) continue;
+            const contributes = incrementalRecipe(recipe) and parent_source.inventory.deleted_row_groups.len == 0 and (if (parent_source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
             // Whole-root reuse remains valid for recipes with no file tree
             // (floating reductions, DISTINCT, or delete-bearing snapshots).
             const previous = for (if (contribution_lookup == null or !contributes) reusable else &.{}) |decl| {
@@ -182,6 +181,15 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
         for (requests.items[first..], first..) |candidate, index| {
             if (consumed[index]) continue;
             if (!compatibleInputGroup(request.recipe, candidate.recipe)) continue;
+            // Fused reducers must agree on the authenticated input census.
+            // Different projected inputs can change independently.
+            if (native_provider.fragment_views.len != 0) {
+                var left_source = parent_source.*;
+                var right_source = parent_source.*;
+                _ = native_provider.forIndex(&left_source, request.name);
+                _ = native_provider.forIndex(&right_source, candidate.name);
+                if (left_source.inventory.files.ptr != right_source.inventory.files.ptr) continue;
+            }
             consumed[index] = true;
             try cohort.append(ca, index);
             if (cohort.items.len == 64) break;
@@ -195,6 +203,11 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
             name.* = requests.items[index].name;
         }
         const recipe: recipes.Recipe = .{ .keys = request.recipe.keys, .inputs = inputs };
+        var source_view = parent_source.*;
+        var selected_provider = native_provider.forIndex(&source_view, names[0]);
+        const provider = &selected_provider;
+        const source = provider.source;
+        var file_keys: ?[][32]u8 = null;
         {
             var projected: std.ArrayList([]const u8) = .empty;
             for (recipe.keys) |key| {
@@ -239,7 +252,7 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
             const budget = if (provider.resume_work) |work| &work.aggregate else &local_budget;
             const incremental = incrementalRecipe(recipe) and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
             if (incremental and source.inventory.files.len != 0) {
-                var resolver: LeafResolver = .{ .a = a, .out = out, .provider = &native_provider, .source = source, .binding = binding, .recipe = recipe, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .metadata_count = metadata_count, .store = store, .spill = &spill, .budget = budget, .cancellation = cancellation, .contributions = &contributions };
+                var resolver: LeafResolver = .{ .a = a, .out = out, .provider = &selected_provider, .source = source, .binding = binding, .recipe = recipe, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .metadata_count = metadata_count, .store = store, .spill = &spill, .budget = budget, .cancellation = cancellation, .contributions = &contributions };
                 var metadata_cache = local.serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(a, 2 * 1024 * 1024);
                 defer metadata_cache.deinit();
                 metadata_cache.decoded.max_bytes = 4 * 1024 * 1024;
@@ -247,15 +260,15 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                 var reduction: Reduction = .{ .cached = cached, .a = a, .out = out, .store = store, .recipe = recipe, .specs = specs, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .contributions = &contributions, .spill = &spill, .cancellation = cancellation, .resolver = &resolver };
                 defer reduction.shape_keys.deinit(a);
                 defer reduction.proof_memo.deinit(a);
-                native_provider.only_file = null;
-                const root = (try reduction.reduceAppend(&native_provider)) orelse (try reduction.reduceDelta(&native_provider)) orelse full: {
+                selected_provider.only_file = null;
+                const root = (try reduction.reduceAppend(&selected_provider)) orelse (try reduction.reduceDelta(&selected_provider)) orelse full: {
                     if (file_keys == null) {
                         file_keys = try ca.alloc([32]u8, source.inventory.files.len);
                         for (source.inventory.files, file_keys.?) |file, *key| key.* = fileIdentity(source, file);
                     }
                     const leaves = try ca.alloc(Reduction.Leaf, file_keys.?.len);
                     for (file_keys.?, leaves, 0..) |key, *leaf, index| leaf.* = .{ .key = key, .index = index };
-                    var scan_order = @import("lake_index_native_state.zig").ScanOrder.init(&native_provider);
+                    var scan_order = @import("lake_index_native_state.zig").ScanOrder.init(&selected_provider);
                     var pending: [8]Reduction.Leaf = undefined;
                     var count: usize = 0;
                     while (try scan_order.next()) |ordinal| {
@@ -287,7 +300,7 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                     try declarations.append(out, .{ .name = name, .binding = slot_binding, .artifact = artifact });
                 }
                 continue;
-            } else if (metadata_count and native_provider.fragment_rows != null) {
+            } else if (metadata_count and selected_provider.fragment_rows != null) {
                 // The authenticated logical census already applied source
                 // deletes and verified every key; no physical footer is owed.
                 var count: u64 = 0;
@@ -296,17 +309,17 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
             } else if (metadata_count) {
                 var stream = try local.serverless_query_lake_stream.Stream.init(a, source, columns, &.{}, provider.context, provider.limits);
                 defer stream.deinit();
-                stream.schema_contract = native_provider.schema_contract;
+                stream.schema_contract = selected_provider.schema_contract;
                 stream.identity_only = true;
                 try group.addGlobalCount((try stream.countAll()) orelse return error.UnsupportedExternalLakeIndex);
             } else {
-                if (native_provider.replay_consumer != null) {
-                    var scan = try @import("lake_index_native_state.zig").Plan.init(a, ca, &native_provider, &.{});
+                if (selected_provider.replay_consumer != null) {
+                    var scan = try @import("lake_index_native_state.zig").Plan.init(a, ca, &selected_provider, &.{});
                     defer scan.deinit();
-                    native_provider.only_plan = &scan;
-                    defer native_provider.only_plan = null;
-                    try consumeCohort(a, &native_provider, binding, recipe, group, budget, cancellation);
-                } else try consumeCohort(a, &native_provider, binding, recipe, group, budget, cancellation);
+                    selected_provider.only_plan = &scan;
+                    defer selected_provider.only_plan = null;
+                    try consumeCohort(a, &selected_provider, binding, recipe, group, budget, cancellation);
+                } else try consumeCohort(a, &selected_provider, binding, recipe, group, budget, cancellation);
             }
             const published = try artifacts.publishCohort(a, out, store, names, group, recipe, cancellation);
             for (published, names, cohort.items) |artifact, name, index| {

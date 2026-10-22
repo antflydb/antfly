@@ -3692,9 +3692,14 @@ tie ranks, budgeted predicate translation, native dense-ID constraints, parallel
 map readers and covering delivery. Logical radix fragments now reuse native
 per-file mutations across append/removal after relocation; their census,
 coordinate maps and native roots share the publication, certificate and GC
-closure. Changed fragments use bounded physical gathers and shared projected
-replay. Identity verification and fragment census hashing can still scale with
-row count. Trusted-producer mapping adapters remain staged in the linked design.
+closure. Changed fragments select bounded physical gathers or a single typed
+projected scan with private partition spill. COW input censuses avoid rehashing unaffected
+leaves and isolate native mutation to each input cohort. Shared v2 coordinate
+descriptors bound declaration metadata; quota denial keeps complete physical
+construction available. Sparse posting/docmap compaction uses geometric size
+tiers and exact forward weights to bound fan-out without cumulative score drift.
+A complete external rewrite still requires row-value verification.
+Trusted-producer mapping adapters remain staged in the linked design.
 
 [Lance fragment reuse](https://lance.org/format/index/system/frag_reuse/) defers
 physical index remapping using verified compaction transitions.

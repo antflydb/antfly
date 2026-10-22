@@ -131,7 +131,7 @@ fn deltaMatches(provider: *Provider, source: []const u8, schema: []const u8, sna
 pub fn changedFiles(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation) !?Needed {
     return changedFilesIndexed(a, out, provider, store, declarations, contributions, cancellation, null);
 }
-pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation, index: ?*@import("lake_index_contributions.zig").Index) !?Needed {
+pub fn changedFilesIndexed(a: A, out: A, parent_provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation, index: ?*@import("lake_index_contributions.zig").Index) !?Needed {
     const state = @import("lake_index_native_state.zig");
     var needed: Needed = .{ .files = .init(out) };
     var returned = false;
@@ -141,6 +141,10 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
     defer old.deinit(a);
     for (contributions) |contribution| try old.put(a, aggregate.contributionKey(contribution.file, contribution.recipe, contribution.name), {});
     for (declarations) |declaration| {
+        if (!parent_provider.wantsIndex(declaration.name)) continue;
+        var source = parent_provider.source.*;
+        var selected = parent_provider.forIndex(&source, declaration.name);
+        const provider = &selected;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const ca = arena.allocator();
@@ -440,9 +444,9 @@ pub const Replay = struct {
         self.ready = true;
         self.captures += 1;
     }
-    const CaptureBatch = struct {
+    pub const CaptureBatch = struct {
         vectors: []const rows.ColumnVector,
-        fn physical(raw: *anyopaque, _: A, ordinal: usize) !?local.sql_execution_batch.PhysicalColumn {
+        pub fn physical(raw: *anyopaque, _: A, ordinal: usize) !?local.sql_execution_batch.PhysicalColumn {
             const self: *CaptureBatch = @ptrCast(@alignCast(raw));
             const column = self.vectors[ordinal];
             const kind: local.sql_ast.ColumnType = switch (column.values) {
@@ -457,7 +461,7 @@ pub const Replay = struct {
             if (vector.values == .json) vector.values = .{ .bytes = vector.values.json };
             return .{ .vector = vector, .range = .{ .count = column.rowCount() }, .kind = kind, .element = if (kind == .number) .float64 else null };
         }
-        fn identity(raw: *anyopaque, row: usize, ordinal: usize) !?u64 {
+        pub fn identity(raw: *anyopaque, row: usize, ordinal: usize) !?u64 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const column = self.vectors[ordinal];
             const ids = switch (column.values) {
@@ -468,7 +472,7 @@ pub const Replay = struct {
             };
             return if (column.nulls.isNull(row)) 0 else @as(u64, ids[row]) + 2;
         }
-        fn cell(raw: *anyopaque, a: A, row: usize, ordinal: usize) !local.sql_scalar.Datum {
+        pub fn cell(raw: *anyopaque, a: A, row: usize, ordinal: usize) !local.sql_scalar.Datum {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const column = self.vectors[ordinal];
             if (column.nulls.isNull(row)) return .{};

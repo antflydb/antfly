@@ -494,8 +494,9 @@ const Execution = struct {
         defer if (converted) |*set| set.deinit();
         const selection = if (self.relocated()) (if (converted) |*set| set else return null) else selected orelse return null;
         const count = selection.boundedCardinality(4096) orelse return null;
-        var ids: std.ArrayList(u64) = .empty;
-        try ids.ensureTotalCapacity(a, count);
+        const Candidate = struct { id: u64, key: []const u8 };
+        var candidates: std.ArrayList(Candidate) = .empty;
+        try candidates.ensureTotalCapacity(a, count);
         var files = selection.files.iterator();
         while (files.next()) |file| {
             try self.context.ensureActive();
@@ -508,15 +509,32 @@ const Execution = struct {
                     var buffer: [96]u8 = undefined;
                     const key = try std.fmt.bufPrint(&buffer, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, block.key_ptr.group, row });
                     const id = @import("lake_index_native_dense.zig").vectorId(key);
-                    const metadata = (try entry.index.getMetadata(id)) orelse continue;
-                    defer entry.index.alloc.free(metadata);
-                    if (!std.mem.eql(u8, metadata, key)) return error.NativeLakeVectorIdentityCollision;
-                    ids.appendAssumeCapacity(id);
+                    candidates.appendAssumeCapacity(.{ .id = id, .key = try a.dupe(u8, key) });
                 }
             }
         }
-        std.mem.sort(u64, ids.items, {}, std.sort.asc(u64));
-        return ids.items;
+        std.mem.sort(Candidate, candidates.items, {}, struct {
+            fn less(_: void, left: Candidate, right: Candidate) bool {
+                return left.id < right.id;
+            }
+        }.less);
+        const ids = try a.alloc(u64, candidates.items.len);
+        const metadata = try a.alloc(?[]const u8, ids.len);
+        for (candidates.items, ids) |candidate, *id| id.* = candidate.id;
+        // One pinned, sorted lookup shares native navigation and returns
+        // borrowed values. Exact identity verification still detects collisions.
+        var read = try entry.index.beginRuntimeSearchTxn();
+        defer read.abort();
+        try entry.index.getMetadataManySortedInTxnUncached(&read, ids, metadata);
+        var written: usize = 0;
+        for (candidates.items, metadata) |candidate, value| if (value) |key| {
+            if (!std.mem.eql(u8, key, candidate.key)) return error.NativeLakeVectorIdentityCollision;
+            if (written == 0 or ids[written - 1] != candidate.id) {
+                ids[written] = candidate.id;
+                written += 1;
+            }
+        };
+        return ids[0..written];
     }
     fn includeSet(self: *Execution) ?*const @import("lake_index_physical_set.zig").Set {
         if (self.vector_include) |*set| return set;

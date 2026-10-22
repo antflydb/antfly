@@ -167,7 +167,7 @@ pub const BuildPolicy = struct { allow_reuse: bool = true, identity_spill_bytes:
 pub fn buildWithReuse(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, policy: BuildPolicy) ![]u8 {
     return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, policy.allow_reuse, policy.identity_spill_bytes) catch |err| {
         switch (err) {
-            error.LakeIndexArtifactUnavailable, error.CloudGenerationMapUnavailable, error.ArtifactIntegrityMismatch, error.InvalidLogicalRowIdentity => {},
+            error.LakeIndexArtifactUnavailable, error.CloudGenerationMapUnavailable, error.ArtifactIntegrityMismatch, error.InvalidLogicalRowIdentity, error.LogicalRowIdentityAdmissionDeclined => {},
             else => return err,
         }
         try context.ensureActive();
@@ -186,9 +186,9 @@ pub fn buildWithReuse(a: A, artifact_store: *stores.ArtifactStore, table: record
             }
             const fresh = try owner.snapshot(owner.ptr, a);
             defer a.free(fresh.lake_index_catalog_json);
-            return buildAttempt(a, artifact_store, fresh, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false, policy.identity_spill_bytes);
+            return buildAttempt(a, artifact_store, fresh, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false, if (err == error.LogicalRowIdentityAdmissionDeclined) 0 else policy.identity_spill_bytes);
         }
-        return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false, policy.identity_spill_bytes);
+        return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false, if (err == error.LogicalRowIdentityAdmissionDeclined) 0 else policy.identity_spill_bytes);
     };
 }
 /// Prior inventory is an optional planning proof. Missing/corrupt derived
@@ -572,6 +572,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     const legacy_json = try std.json.Stringify.valueAlloc(na, legacy_indexes, .{});
     var manifest = if (relocated) rebuild.ReconciledManifest{ .artifacts = try a.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, 0) } else try rebuild.reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(a, &scoped, provider.provider(), base_source, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = legacy_json }, reusable, cancellation, .{ .published_generation = attempt.generation, .edge_generation = attempt.generation, .computed_at_ms = started }, .{}, scope);
     defer manifest.deinit(a);
+    if (!relocated) if (fragments) |value| try @import("lake_row_fragments.zig").prepareSpool(value, &provider, &scoped);
     const builders = @import("lake_index_publication_builders.zig");
     native_provider.skip_indexes = provider.skip_indexes;
     const built = if (relocated) builders.Result{} else (try builders.build(.{ .a = a, .out = na, .table = table, .store = &scoped, .provider = native_provider, .base = base_source, .reusable = reusable, .candidates = native_candidates, .contributions = previous_contributions, .index = &contribution_index, .token = cancellation })) orelse serial: {
@@ -631,7 +632,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
             const retained = for (identity.reused) |entry| {
                 if (std.mem.eql(u8, entry.name, declaration.name)) break entry;
             } else null;
-            binding_.* = retained orelse .{ .name = declaration.name, .space = value.space, .translation = translation };
+            binding_.* = retained orelse .{ .name = declaration.name, .space = @import("lake_row_fragments.zig").indexSpace(value, declaration.name), .translation = translation };
         }
         identity.reused = bindings;
     };
@@ -652,6 +653,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     defer a.free(directory.checksum);
     try context.ensureActive();
     const row_identity_ref = if (row_identity) |*identity| published: {
+        identity.version = row_identity_api.metadata_version;
         identity.artifacts = try row_identity_api.declarationDigest(a, declarations);
         try identity.reseal(a);
         break :published try row_identity_api.publish(na, &scoped, identity.*, cancellation);

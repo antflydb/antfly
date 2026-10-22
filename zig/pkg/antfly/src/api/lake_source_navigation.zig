@@ -245,7 +245,7 @@ fn proofLower(proofs: []const Proof, id: [32]u8, inclusive: bool) usize {
     }
     return lo;
 }
-const Record = struct { file: local.serverless_external_source_types.FileEntry, digest: [32]u8, deletes: [32]u8 };
+pub const Record = struct { file: local.serverless_external_source_types.FileEntry, digest: [32]u8, deletes: [32]u8 };
 /// Logical census commitment stays stable across attempt-scoped page rewrites.
 /// Include the predecessor separately when authorizing a partial checkpoint.
 fn cutIdentity(a: A, root: Root) ![32]u8 {

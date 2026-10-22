@@ -567,7 +567,7 @@ pub fn install(table_id: u64, source: *Source, store: *Store, publication: local
     owner.cached.context = context;
     const oa = owner.arena.allocator();
     const encoded = try std.json.Stringify.valueAlloc(oa, root, .{});
-    const owned = try std.json.parseFromSliceLeaky(identity.Root, oa, encoded, .{ .allocate = .alloc_always });
+    const owned = try identity.decode(oa, encoded);
     const index = owned.indexSpace();
     const nav = try navigation.load(oa, owner.artifacts, index.navigation orelse return error.InvalidLogicalRowIdentity, token, owner.cached);
     if (!std.mem.eql(u8, &nav.domain, &root.domain) or !std.mem.eql(u8, nav.source, index.source) or !std.mem.eql(u8, nav.snapshot, index.snapshot) or nav.count != index.liveFiles()) return error.InvalidLogicalRowIdentity;

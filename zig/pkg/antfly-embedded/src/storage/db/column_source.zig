@@ -89,16 +89,35 @@ pub const Page = struct {
                     break :blk .{ .f64 = values };
                 },
                 .bytes, .dictionary_bytes => blk: {
-                    const values = try pa.alloc([]const u8, positions.len);
-                    for (positions, values, nulls) |position, *value, flag| value.* = if (flag != 0) "" else try pa.dupe(u8, try position.page.columns[ci].bytesAt(position.row));
-                    break :blk .{ .bytes = values };
+                    var dictionary: std.StringHashMapUnmanaged(u32) = .empty;
+                    defer dictionary.deinit(pa);
+                    var values: std.ArrayList([]const u8) = .empty;
+                    try values.append(pa, "");
+                    try dictionary.put(pa, "", 0);
+                    const indices = try pa.alloc(u32, positions.len);
+                    for (positions, indices, nulls) |position, *index, flag| {
+                        if (flag != 0) {
+                            index.* = 0;
+                            continue;
+                        }
+                        const raw = try position.page.columns[ci].bytesAt(position.row);
+                        const entry = try dictionary.getOrPut(pa, raw);
+                        if (!entry.found_existing) {
+                            const owned = try pa.dupe(u8, raw);
+                            entry.key_ptr.* = owned;
+                            entry.value_ptr.* = @intCast(values.items.len);
+                            try values.append(pa, owned);
+                        }
+                        index.* = entry.value_ptr.*;
+                    }
+                    break :blk .{ .dictionary_bytes = .{ .values = values.items, .indices = indices } };
                 },
                 .decimal128 => |decimal| blk: {
                     var result = decimal;
                     const values = try pa.alloc(i128, positions.len);
                     for (positions, values, nulls) |position, *value, flag| {
                         const source = position.page.columns[ci].values;
-                        if (source != .decimal128 or source.decimal128.scale != decimal.scale) return error.RowSourceColumnKindMismatch;
+                        if (source != .decimal128 or (source.decimal128.scale != decimal.scale or source.decimal128.precision != decimal.precision)) return error.RowSourceColumnKindMismatch;
                         value.* = if (flag != 0) 0 else source.decimal128.values[position.row];
                     }
                     result.values = values;

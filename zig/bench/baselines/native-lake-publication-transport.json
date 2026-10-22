@@ -185,7 +185,7 @@
     "automatic_dirty_page_pager": false
   },
   "logical_native_fragments": {
-    "reader_protocol": 69,
+    "reader_protocol": 70,
     "initial_radix_bits": 4,
     "target_maximum_rows": 8192,
     "maximum_fragments": 16384,
@@ -196,7 +196,7 @@
     "tie_rank_batch_rows": 64,
     "dense_selection_maximum_ids": 4096,
     "dense_selection_workspace_bytes": 4194304,
-    "remaining_cost": "full identity verification and fragment census hashing can scale with row count",
+    "remaining_cost": "full external rewrites require identity verification; ordinary census work follows changed COW input ranges",
     "performance_claim": "structural bounds and correctness tests; archive throughput not measured",
     "physical_gather_target_payload_bytes": 8388608,
     "physical_gather_wide_test_rows": 65,
@@ -204,6 +204,35 @@
     "physical_gather_wide_test_maximum_rows_per_tile": 32,
     "oversized_gather": "shrink before copying; single rows retain decoder/native construction limits",
     "sparse_writer_binding": 9,
-    "sparse_fragment_mutations": "native immutable bulk posting segments; avoid cumulative quantization error"
+    "sparse_fragment_mutations": "native immutable bulk posting segments; avoid cumulative quantization error",
+    "identity_root_version": 2,
+    "identity_root_shared_descriptor_test_declarations": 1024,
+    "identity_root_shared_descriptor_test_maximum_bytes": 131072,
+    "identity_root_admission": "prospective before native builds; final overflow retries with identity disabled",
+    "census": "reuse unaffected leaf versions; hash changed leaves independently per captured-input cohort",
+    "broad_rebuild": {
+      "minimum_rows": 128,
+      "minimum_fraction": "1/8",
+      "physical_projected_passes": 1,
+      "retained_memory_bytes": 67108864,
+      "payload_page_rows": 64,
+      "reference_tile_rows": 256,
+      "payload_target_bytes": 8388608,
+      "quota_fallback": "physical gather",
+      "durability": "attempt-private spill only"
+    },
+    "sparse_compaction": {
+      "minimum_segments_per_tier": 32,
+      "maximum_segments_per_task": 32,
+      "maintenance_batch_interval": 32,
+      "maximum_tasks_per_interval": 4,
+      "maximum_final_tasks": 16,
+      "weights": "exact forward vectors sorted by (term, native ordinal); no cumulative requantization",
+      "test_replacement_rounds": 40,
+      "test_terms": 2,
+      "test_minimum_compactions": 10
+    },
+    "dense_metadata_verification": "one pinned sorted batch with exact key verification",
+    "scatter_dictionary": "shared string dictionary across gathered source pages"
   }
 }

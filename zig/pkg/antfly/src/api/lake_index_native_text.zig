@@ -1033,8 +1033,8 @@ pub fn loadWriter(a: A, store: stores.ArtifactStore, root: Root, cancellation: C
 pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared) ![]const Declared {
     return buildIncremental(a, out, table, source, base, store, provider, cancellation, reusable, &.{});
 }
-pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared, candidates: []const Declared) ![]const Declared {
-    var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(a, base, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
+pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.TableRecord, parent_source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, parent_provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared, candidates: []const Declared) ![]const Declared {
+    var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(a, base, parent_source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
     defer desired.deinit(a);
     var schema = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
     defer schema.deinit(a);
@@ -1043,6 +1043,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     var declarations: std.ArrayList(Declared) = .empty;
     errdefer declarations.deinit(out);
     for (desired.artifacts) |want| {
+        var source_view = parent_source.*;
+        var selected_provider = parent_provider.forIndex(&source_view, want.name);
+        const provider = &selected_provider;
+        const source = provider.source;
         if (!provider.wantsIndex(want.name)) continue;
         if (want.kind != .text_segment) continue;
         const spec = want.build_spec.?.text;

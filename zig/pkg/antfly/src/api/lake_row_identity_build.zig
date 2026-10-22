@@ -201,7 +201,7 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     if (encoded.len > identity.max_root_bytes) return error.LogicalRowIdentityAdmissionDeclined;
     // Only the small admitted root escapes the optional workspace. Temporary
     // file dictionaries and recipe planning cannot consume publication memory.
-    return try std.json.parseFromSliceLeaky(identity.Root, out, encoded, .{ .allocate = .alloc_always });
+    return try identity.decode(out, encoded);
 }
 fn checkpoint(raw: *anyopaque) !void {
     const provider: *@import("lake_index_row_source.zig").Provider = @ptrCast(@alignCast(raw));

@@ -26,7 +26,7 @@ const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const A = std.mem.Allocator;
 const Token = @import("antfly_cancellation").CancellationToken;
 const Coordinate = logical.Coordinate;
-pub const metadata_version: u16 = 1;
+pub const metadata_version: u16 = 2;
 pub const max_root_bytes = 1024 * 1024;
 
 /// Only derived map navigation uses this normalization. Source reads retain
@@ -109,6 +109,83 @@ pub const ReusedIndex = struct {
         if (self.translation) |translation| try writer.write(.{ .name = self.name, .space = self.space, .translation = translation }) else try writer.write(.{ .name = self.name, .space = self.space });
     }
 };
+const CoordinateSpace = struct { id: u32, space: Space, translation: ?Translation = null };
+const IndexBinding = struct { name: []const u8, space: u32 };
+fn descriptorEqual(left: anytype, right: @TypeOf(left)) bool {
+    switch (@typeInfo(@TypeOf(left))) {
+        .@"struct" => |info| {
+            inline for (info.field_names) |name| if (!descriptorEqual(@field(left, name), @field(right, name))) return false;
+            return true;
+        },
+        .optional => {
+            const value = left orelse return right == null;
+            return descriptorEqual(value, right orelse return false);
+        },
+        .pointer => |info| if (info.size == .slice) {
+            if (left.len != right.len) return false;
+            if (left.ptr == right.ptr) return true;
+            for (left, right) |l, r| if (!descriptorEqual(l, r)) return false;
+            return true;
+        },
+        else => {},
+    }
+    return std.meta.eql(left, right);
+}
+fn sameView(left: ReusedIndex, right: ReusedIndex) bool {
+    return descriptorEqual(left.space, right.space) and descriptorEqual(left.translation, right.translation);
+}
+const CompactSpaces = struct {
+    entries: []const ReusedIndex,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginArray();
+        for (self.entries, 0..) |entry, i| {
+            const duplicate = for (self.entries[0..i]) |prior| {
+                if (sameView(prior, entry)) break true;
+            } else false;
+            if (!duplicate) try writer.write(CoordinateSpace{ .id = @intCast(i), .space = entry.space, .translation = entry.translation });
+        }
+        try writer.endArray();
+    }
+};
+const CompactBindings = struct {
+    entries: []const ReusedIndex,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginArray();
+        for (self.entries, 0..) |entry, i| {
+            var first = i;
+            for (self.entries[0..i], 0..) |prior, j| if (sameView(prior, entry)) {
+                first = j;
+                break;
+            };
+            try writer.write(IndexBinding{ .name = entry.name, .space = @intCast(first) });
+        }
+        try writer.endArray();
+    }
+};
+/// Expand the bounded v2 wire directory once; every binding borrows the same
+/// immutable space/map descriptors. V1 certificate bytes remain unchanged.
+pub fn decode(a: A, encoded: []const u8) !Root {
+    var root = try std.json.parseFromSliceLeaky(Root, a, encoded, .{ .allocate = .alloc_always });
+    if (root.version == 1) {
+        if (root.coordinate_spaces.len != 0 or root.index_bindings.len != 0) return error.InvalidLogicalRowIdentity;
+        return root;
+    }
+    if (root.version != metadata_version or root.reused.len != 0 or root.index_bindings.len > local.metadata_lake_index_catalog.max_directory_artifacts or root.coordinate_spaces.len > root.index_bindings.len) return error.InvalidLogicalRowIdentity;
+    const bindings = try a.alloc(ReusedIndex, root.index_bindings.len);
+    var positions: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+    defer positions.deinit(a);
+    for (root.coordinate_spaces, 0..) |view, i| {
+        const position = try positions.getOrPut(a, view.id);
+        if (position.found_existing) return error.InvalidLogicalRowIdentity;
+        position.value_ptr.* = i;
+    }
+    for (bindings, root.index_bindings) |*binding, wire| {
+        const view = root.coordinate_spaces[positions.get(wire.space) orelse return error.InvalidLogicalRowIdentity];
+        binding.* = .{ .name = wire.name, .space = view.space, .translation = view.translation };
+    }
+    root.reused = bindings;
+    return root;
+}
 pub const Root = struct {
     version: u16 = metadata_version,
     domain: logical.Digest,
@@ -125,7 +202,13 @@ pub const Root = struct {
     certificate: ?logical.Digest = null,
     reused: []const ReusedIndex = &.{},
     native_space: ?Space = null,
+    coordinate_spaces: []const CoordinateSpace = &.{},
+    index_bindings: []const IndexBinding = &.{},
     pub fn jsonStringify(self: Root, writer: anytype) !void {
+        if (self.version == 2) {
+            try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate, .coordinate_spaces = CompactSpaces{ .entries = self.reused }, .index_bindings = CompactBindings{ .entries = self.reused }, .native_space = self.native_space });
+            return;
+        }
         if (self.native_space) |space| {
             try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate, .reused = self.reused, .native_space = space });
             return;
@@ -140,7 +223,7 @@ pub const Root = struct {
         }
     }
     pub fn validate(self: Root, a: A) !void {
-        if ((self.values_format != 1 and self.values_format != 2) or self.version != metadata_version or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.namespace, 0) or std.mem.allEqual(u8, &self.values_recipe, 0) or std.mem.allEqual(u8, &self.cut, 0)) return error.InvalidLogicalRowIdentity;
+        if ((self.values_format != 1 and self.values_format != 2) or (self.version != 1 and self.version != metadata_version) or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.namespace, 0) or std.mem.allEqual(u8, &self.values_recipe, 0) or std.mem.allEqual(u8, &self.cut, 0)) return error.InvalidLogicalRowIdentity;
         try self.current.validate();
         if ((self.reused.len != 0 and self.values_format != 2) or self.reused.len > local.metadata_lake_index_catalog.max_directory_artifacts) return error.InvalidLogicalRowIdentity;
         if (self.indexes) |index| try self.validateIndexSpace(index);
@@ -227,16 +310,30 @@ pub const Spaces = struct {
             self.translation = null;
             if (position == 0) return self.root.current;
             if (position == 1) {
-                if (self.root.indexes) |space| return space;
+                if (self.root.indexes) |space| if (!descriptorEqual(space, self.root.current)) return space;
                 continue;
             }
             if (position == 2) {
-                if (self.root.native_space) |space| return space;
+                if (self.root.native_space) |space| {
+                    if (descriptorEqual(space, self.root.current)) continue;
+                    if (self.root.indexes) |indexes| if (descriptorEqual(space, indexes)) continue;
+                    return space;
+                }
                 continue;
             }
             if (position - 3 < self.root.reused.len) {
-                self.translation = self.root.reused[position - 3].translation;
-                return self.root.reused[position - 3].space;
+                const entry = self.root.reused[position - 3];
+                const duplicate = for (self.root.reused[0 .. position - 3]) |prior| {
+                    if (sameView(prior, entry)) break true;
+                } else false;
+                if (duplicate) continue;
+                if (entry.translation == null) {
+                    if (descriptorEqual(entry.space, self.root.current)) continue;
+                    if (self.root.indexes) |space| if (descriptorEqual(entry.space, space)) continue;
+                    if (self.root.native_space) |space| if (descriptorEqual(entry.space, space)) continue;
+                }
+                self.translation = entry.translation;
+                return entry.space;
             }
             return null;
         }
@@ -513,19 +610,20 @@ pub fn publish(a: A, store: *stores.ArtifactStore, root: Root, token: Token) !Re
     if (store.upload_scope == null or !std.mem.eql(u8, &store.upload_scope.?.domain, &root.domain)) return error.InvalidLogicalRowIdentity;
     const encoded = try std.json.Stringify.valueAlloc(a, root, .{});
     defer a.free(encoded);
-    if (encoded.len > max_root_bytes) return error.InvalidLogicalRowIdentity;
+    if (encoded.len > max_root_bytes) return error.LogicalRowIdentityAdmissionDeclined;
     var upload = try store.putWithCancellation(encoded, token);
     defer upload.deinit(store.allocator);
     const id = try a.dupe(u8, upload.artifact_id);
     errdefer a.free(id);
     const checksum = try a.dupe(u8, upload.checksum);
-    return .{ .kind = .doc_values, .metadata_version = metadata_version, .artifact_id = id, .checksum = checksum, .byte_len = upload.byte_len };
+    return .{ .kind = .doc_values, .metadata_version = root.version, .artifact_id = id, .checksum = checksum, .byte_len = upload.byte_len };
 }
 pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, token: Token, cached: ?artifacts.CachedRead) !Root {
-    if (ref.kind != .doc_values or ref.metadata_version != metadata_version or ref.byte_len > max_root_bytes) return error.InvalidLogicalRowIdentity;
+    if (ref.kind != .doc_values or (ref.metadata_version != 1 and ref.metadata_version != metadata_version) or ref.byte_len > max_root_bytes) return error.InvalidLogicalRowIdentity;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
     defer a.free(bytes);
-    const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
+    const root = try decode(a, bytes);
+    if (root.version != ref.metadata_version) return error.InvalidLogicalRowIdentity;
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidLogicalRowIdentity;
     if (!std.mem.eql(u8, &scope.domain, &root.domain)) return error.InvalidLogicalRowIdentity;
     try root.validate(a);
@@ -882,4 +980,42 @@ test "external lake batched relocation preserves shuffled duplicates and reverse
     const mapped = try reader.translateMany(a, &refs, true);
     defer a.free(mapped);
     for (mapped, positions) |row, i| try std.testing.expectEqual(TestRows.coordinate(i, true, 257), row.coordinate);
+}
+
+test "external lake shared identity spaces keep thousands of declarations inside root admission" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const ref: tree.Ref = .{ .digest = @splat(128), .attempt = @splat(128), .bytes = 256, .height = 0, .records = 1 };
+    const space: Space = .{ .source = "source", .snapshot = "snapshot", .rows = 1, .file_count = 1, .files = ref, .by_id = ref, .by_location = ref, .file_slots = ref, .by_file = ref, .by_order = ref };
+    const bindings = try out.alloc(ReusedIndex, 1024);
+    for (bindings, 0..) |*binding, i| binding.* = .{ .name = try std.fmt.allocPrint(out, "aggregate:stats{d}:rows{d}", .{ i / 64, i % 64 }), .space = space, .translation = .{ .forward = ref, .reverse = ref, .ranked = false } };
+    // Independently decoded descriptors must coalesce by content as well.
+    for (bindings) |*binding| {
+        binding.space.source = try out.dupe(u8, space.source);
+        binding.space.snapshot = try out.dupe(u8, space.snapshot);
+    }
+    var root: Root = .{ .domain = @splat(1), .namespace = @splat(2), .values_recipe = @splat(3), .cut = @splat(4), .artifacts = @splat(5), .values_format = 2, .current = space, .native_space = space, .reused = bindings };
+    try root.reseal(a);
+    try root.validate(a);
+    const encoded = try std.json.Stringify.valueAlloc(out, root, .{});
+    try std.testing.expect(encoded.len < 128 * 1024);
+    const reopened = try decode(out, encoded);
+    try reopened.validate(a);
+    try std.testing.expectEqual(@as(usize, 1), reopened.coordinate_spaces.len);
+    try std.testing.expectEqual(@as(usize, 1024), reopened.reused.len);
+    var closure = dependencies(reopened);
+    var roots: usize = 0;
+    while (closure.next() != null) roots += 1;
+    try std.testing.expectEqual(@as(usize, 14), roots);
+    try std.testing.expect(reopened.reused[0].space.source.ptr == reopened.reused[1023].space.source.ptr);
+    try std.testing.expectEqualStrings(encoded, try std.json.Stringify.valueAlloc(out, reopened, .{}));
+    root.version = 1;
+    try root.reseal(a);
+    try root.validate(a);
+    const historical = try std.json.Stringify.valueAlloc(out, root, .{});
+    try std.testing.expect(historical.len > max_root_bytes);
+    const old = try decode(out, historical);
+    try old.validate(a);
 }
