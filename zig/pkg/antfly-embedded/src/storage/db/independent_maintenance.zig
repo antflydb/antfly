@@ -45,6 +45,8 @@ pub const Owner = struct {
     stop_started: bool = false,
     joined: std.Io.Event = .unset,
     stop_progress: std.Io.Event = .unset,
+    stop_generation: std.atomic.Value(u64) = .init(0),
+    stop_waiters: std.atomic.Value(u32) = .init(0),
     repair_retry_after_ns: u64 = 0,
     pub const idle_poll_ns: u64 = 5 * std.time.ns_per_s;
     pub const active_poll_ns: u64 = 100 * std.time.ns_per_ms;
@@ -67,7 +69,7 @@ pub const Owner = struct {
         };
     }
     fn shutdown(self: *Owner) @import("maintenance_stop.zig").Borrowed {
-        return .{ .mutex = &self.lifecycle_mutex, .registration = &self.future, .stopping = &self.stopping, .finisher = &self.stop_started, .joined = &self.joined, .changed = &self.stop_progress };
+        return .{ .mutex = &self.lifecycle_mutex, .registration = &self.future, .stopping = &self.stopping, .finisher = &self.stop_started, .joined = &self.joined, .changed = &self.stop_progress, .generation = &self.stop_generation, .waiters = &self.stop_waiters };
     }
     pub fn stop(self: *Owner, runtime: *runtime_mod.BackendRuntime) void {
         self.shutdown().stop(runtime.io(), false);
@@ -397,12 +399,12 @@ test "independent maintenance concurrent shutdown callers both join physical cal
     const second_thread = try std.Thread.spawn(.{}, Stopper.stop, .{&second});
     defer second_thread.join();
     defer fixture.release.set(io);
-    while (@atomicLoad(std.Io.Event, &owner.stop_progress, .acquire) != .waiting and
+    while (owner.stop_waiters.load(.acquire) == 0 and
         !second.returned.load(.acquire) and @import("antfly_platform").time.monotonicNs() < deadline)
         io.sleep(.fromMilliseconds(1), .awake) catch {};
     // The second caller really reached the retirement wait; this is not an
     // inference from an arbitrary sleep while a thread might be unscheduled.
-    try std.testing.expectEqual(std.Io.Event.waiting, @atomicLoad(std.Io.Event, &owner.stop_progress, .acquire));
+    try std.testing.expect(owner.stop_waiters.load(.acquire) > 0);
     try std.testing.expect(!first.returned.load(.acquire));
     try std.testing.expect(!second.returned.load(.acquire));
     try std.testing.expect(!fixture.retired.load(.acquire));

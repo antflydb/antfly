@@ -7021,6 +7021,9 @@ test "controlled owner close preflight C entry drains a real DB with the origina
     try std.testing.expect(handle.db.quarantine_recovery.joined.isSet());
     try std.testing.expect(handle.db.graph_cleanup_owner.joined.isSet());
     try std.testing.expect(handle.db.publication_recovery.stopping.load(.acquire));
+    try std.testing.expect(handle.db.group_source_owner.joined.isSet());
+    try std.testing.expect(handle.db.local_execution.source_publication.stopped);
+    try std.testing.expect(handle.db.local_execution.online_merge_reader.closing.load(.acquire));
     try std.testing.expect(handle.db.portable_activation_recovery.stopping.load(.acquire));
     try std.testing.expect(handle.db.local_execution.schema_reconcile.stopping.load(.acquire));
     try std.testing.expect(handle.db.portable_activation_owner_id != handle.db.backend_owner_id and handle.db.schema_reconcile_owner_id != handle.db.backend_owner_id and handle.db.portable_activation_owner_id != handle.db.schema_reconcile_owner_id);

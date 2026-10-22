@@ -13,8 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Supervised, close-safe warming. Durable progress belongs to the repository;
-//! this owner only schedules bounded turns and supplies cancellation.
+//! Recurring callback retirement preserves original execution and ownership.
 const std = @import("std");
 const Handle = @import("../../common/maintenance_scheduler.zig").Scheduler.Handle;
 const admission = @import("../../common/read_admission.zig");
@@ -29,6 +28,8 @@ pub const Borrowed = struct {
     finisher: *bool,
     joined: *std.Io.Event,
     changed: *std.Io.Event,
+    generation: *std.atomic.Value(u64),
+    waiters: *std.atomic.Value(u32),
 
     fn lock(self: Borrowed) void {
         while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
@@ -42,6 +43,7 @@ pub const Borrowed = struct {
         self.registration.* = null;
         self.finisher.* = false;
         signal(self.joined, io);
+        _ = self.generation.fetchAdd(1, .release);
         signal(self.changed, io);
     }
     fn abandon(self: Borrowed, io: ?std.Io) void {
@@ -50,12 +52,8 @@ pub const Borrowed = struct {
         self.finisher.* = false;
         // Wake a competing quiesced joiner even though retirement failed.
         // joined must remain unset until physical completion.
+        _ = self.generation.fetchAdd(1, .release);
         signal(self.changed, io);
-    }
-    fn available(self: Borrowed) bool {
-        self.lock();
-        defer self.mutex.unlock();
-        return self.joined.isSet() or !self.finisher.*;
     }
     /// Compatibility path requires quiesced cleanup ownership. Detaching the
     /// handle transfers its physical join to this exclusive finisher.
@@ -68,12 +66,16 @@ pub const Borrowed = struct {
                 return;
             }
             if (self.finisher.*) {
+                const observed = self.generation.load(.acquire);
+                _ = self.waiters.fetchAdd(1, .acquire);
                 self.mutex.unlock();
-                if (io) |lane| self.changed.waitUncancelable(lane) else @import("antfly_platform").time.yieldNow();
+                while (self.generation.load(.acquire) == observed) {
+                    if (io) |lane| lane.sleep(.fromMilliseconds(1), .awake) catch {} else @import("antfly_platform").time.yieldNow();
+                }
+                _ = self.waiters.fetchSub(1, .release);
                 continue;
             }
             self.finisher.* = true;
-            self.changed.reset();
             var registration = self.registration.*;
             self.registration.* = null;
             self.mutex.unlock();
@@ -91,7 +93,7 @@ pub const Borrowed = struct {
         self.stopping.store(true, .release);
         var trace: admission.RejectionTrace = .{};
         const control = trace.bind(original).?;
-        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
         _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
         while (true) {
             try control.checkpoint();
@@ -102,7 +104,6 @@ pub const Borrowed = struct {
             }
             if (!self.finisher.*) {
                 self.finisher.* = true;
-                self.changed.reset();
                 var registration = self.registration.*;
                 self.mutex.unlock();
                 errdefer self.abandon(io);
@@ -113,21 +114,20 @@ pub const Borrowed = struct {
                 self.complete(io);
                 return;
             }
+            const observed = self.generation.load(.acquire);
+            _ = self.waiters.fetchAdd(1, .acquire);
             self.mutex.unlock();
-            try boundary.beginWait();
-            var failure: ?anyerror = null;
-            while (!self.available()) {
-                control.checkLifetime() catch |cause| {
-                    failure = trace.failure orelse cause;
-                    break;
-                };
-                @import("antfly_platform").time.yieldNow();
-            }
-            boundary.endWait() catch |cause| {
-                if (failure) |first| return first;
-                return trace.failure orelse cause;
+            defer _ = self.waiters.fetchSub(1, .release);
+            const Progress = struct {
+                generation: *std.atomic.Value(u64),
+                previous: u64,
+                fn ready(raw: *anyopaque) anyerror!bool {
+                    const value: *@This() = @ptrCast(@alignCast(raw));
+                    return value.generation.load(.acquire) != value.previous;
+                }
             };
-            if (failure) |cause| return cause;
+            var progress: Progress = .{ .generation = self.generation, .previous = observed };
+            try @import("../../common/cleanup_wait.zig").until(io, control, &progress, Progress.ready, null);
         }
     }
 };
@@ -246,7 +246,7 @@ test "maintenance runtime abandoned controlled finisher wakes a competing quiesc
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.thread = try std.Thread.spawn(.{}, stop, .{self});
             const until = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
-            while (@atomicLoad(std.Io.Event, &self.owner.stop_progress, .acquire) != .waiting) {
+            while (self.owner.stop_waiters.load(.acquire) == 0) {
                 if (@import("antfly_platform").time.monotonicNs() >= until) return error.TestUnexpectedResult;
                 @import("antfly_platform").time.yieldNow();
             }

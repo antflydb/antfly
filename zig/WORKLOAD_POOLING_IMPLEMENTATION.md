@@ -23332,3 +23332,57 @@ snapshots and hashes are in controlled-close-producers-verified.json in the
 cumulative receipts. Error/identity companions, five native ABI cases, embedded
 boundary, control catalog, generated errors, formatting and whitespace checks
 pass. The full scheduler design remains incomplete.
+
+### Publication, group cursors and retained reader close
+
+Serving close preflight now joins group-source callbacks before retiring their
+cursors, stops immutable source publication, and fences the retained merge reader
+cache. Group slices recheck stop after taking the slice mutex, preventing a stale
+admission from recreating cursor state during retirement. Slice/cache guards are
+acquired after successful CPU reentry; a failed wait cannot consume retained
+readers or buffers. All snapshot, receiver, tail and rewrite cache consumers
+check the permanent close flag under the cache mutex. Ordinary scope retirement
+continues to serve committed release operations.
+
+Publication tracks direct polling borrows, including durable-certificate reads,
+and keeps its future attached until callback completion and valid reentry. The
+exporter publishes completion after export locks and cleanup release. Competing
+closers wait for physical completion or take over an interrupted finisher.
+Direct borrows retire before the stop is marked complete. Request polling
+deadlines still govern polling rather than replacing an admitted export's
+lifetime; owner close supplies its separate cancellation signal.
+
+Recurring finisher attempts use a monotonic generation instead of resetting an
+event that may still have old waiters. Enrollment is tracked explicitly, and
+competing cleanup callers recheck the generation. Callback cancellation and
+cleanup guards share finite waits: event notifications where available and
+1 ms relative sleeps otherwise, with original lifetime checks between waits.
+These waits preserve the first failure, always rejoin after successful park, and
+perform no user callback work or retained-state destruction while CPU is lent.
+
+Native ABI 78 and storage-owner ABI 136 fence the expanded lifecycle layouts.
+Durable formats, reader floors and defaults are unchanged. Individual cursor,
+cache and allocator callback costs still require funding/cost contracts; derived
+runtime/executor, transaction owner, backend and physical IO teardown remain
+open, alongside routes, executable recovery funding, metadata parent charges and
+complete mandatory completion. Strong required providers remain disabled. Full
+Linux qualification is waived; Linux requires the pinned Nix/glibc Zig toolchain.
+
+Pinned Debug qualification passes 107/107 build steps and 80/80 reported tests.
+Direct current-binary runs pass all 54 maintenance and 18 shared-service tests,
+plus both C-entry/source-root runs. The source-local suite passes 18 cases,
+including exporter and direct-poll interruption matrices, reader-buffer
+retention on failed waits, and durable publication receipts across reopen. The
+competing-closer test observes a real condition waiter before rejecting the
+original begin, retains the live future, then joins it through the next finisher.
+Group tests retain allocated cursors after interrupted joins. The cleanup mutex
+test confirms a failed reentry leaves no acquired guard. Existing one-slot
+producer progress, health capacity, finisher handoff and eight activation DB
+regressions continue to pass with the sleeping cancellation loop.
+
+All 5,505 native/schema inputs match controlled-close-readers-v4. Source snapshots
+and hashes are in controlled-close-readers-verified.json in the cumulative
+receipts. Native ABI cases, error/identity companions, boundary (1,036 sources),
+control catalog, generated errors, formatting, license and whitespace checks
+pass. These focused results leave the remaining shutdown, callback funding and
+full linked-owner/cross-engine behavior unqualified.

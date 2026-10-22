@@ -28,6 +28,7 @@ const topology = @import("relational_integrity_topology.zig");
 /// is acquired by an apply-locked operation; release retires it after commit.
 pub const Cache = struct {
     mutex: std.Io.Mutex = .init,
+    closing: std.atomic.Value(bool) = .init(false),
     scope: ?source.Scope = null,
     session: ?tail.Session = null,
     fragment: ?tail.Fragment = null,
@@ -43,7 +44,14 @@ pub const Cache = struct {
         self.session = null;
         self.scope = null;
     }
+    pub fn closeWithAdmission(self: *Cache, io: std.Io, original: @import("../../common/read_admission.zig").Port) !void {
+        self.closing.store(true, .release);
+        try @import("../../common/cleanup_wait.zig").lockIo(&self.mutex, io, original);
+        defer self.mutex.unlock(io);
+        self.clear();
+    }
     pub fn retire(self: *Cache, io: std.Io, scope: ?source.Scope) void {
+        if (scope == null) self.closing.store(true, .release);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (scope == null or self.scope == null or std.meta.eql(scope.?, self.scope.?)) self.clear();
@@ -104,6 +112,7 @@ fn rewriteTailJson(db: *DB, alloc: Allocator, scope: source.Scope, after: u64, o
     const cache = &db.local_execution.online_merge_reader;
     try cache.mutex.lock(io);
     defer cache.mutex.unlock(io);
+    if (cache.closing.load(.acquire)) return error.Canceled;
     try cancellation.check();
     const progress = try db.onlineSourceStatus(scope);
     if (progress.phase == .released or progress.snapshot_phase != .published) return error.OnlineSourceScopeChanged;
@@ -963,6 +972,7 @@ fn prepareTailJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     const cache = &db.local_execution.online_merge_reader;
     try cache.mutex.lock(io);
     defer cache.mutex.unlock(io);
+    if (cache.closing.load(.acquire)) return error.Canceled;
     // No apply fence is held while taking the cache lock. Revalidate after
     // acquiring it so a source release cannot resurrect a retired reader.
     const progress = try db.onlineSourceStatus(scope);
@@ -1075,4 +1085,75 @@ test "relational index system rewrite admission owns complete immutable historic
     const parsed = try std.json.parseFromSlice(wire.AdmissionFacts, alloc, ordinary, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed.value.source_schemas.len);
+}
+
+test "controlled owner reader cache close retains buffers after original wait rejection" {
+    const admission = @import("../../common/read_admission.zig");
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    for (std.enums.values(Case)) |case| {
+        const io = std.testing.io;
+        var cache: Cache = .{};
+        cache.snapshot.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        _ = try cache.snapshot.arena.?.allocator().alloc(u8, 128);
+        cache.receiver.alloc = std.testing.allocator;
+        cache.receiver.after = try std.testing.allocator.dupe(u8, "retained");
+        try std.testing.expect(cache.mutex.tryLock());
+        const F = struct {
+            cache: *Cache,
+            case: Case,
+            released: bool = false,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case != .lifetime_in_wait) {
+                    self.cache.mutex.unlock(std.testing.io);
+                    self.released = true;
+                }
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                if (!self.released) {
+                    self.cache.mutex.unlock(std.testing.io);
+                    self.released = true;
+                }
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        var f: F = .{ .cache = &cache, .case = case };
+        defer {
+            if (!f.released) cache.mutex.unlock(io);
+            cache.retire(io, null);
+        }
+        var payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.begin, .end = F.end } };
+        const result = cache.closeWithAdmission(io, .init(&payload));
+        if (case == .success) try result else {
+            try std.testing.expectError(switch (case) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .lifetime_in_wait => error.DeadlineExceeded,
+                .success => unreachable,
+            }, result);
+            try std.testing.expect(cache.snapshot.arena != null and cache.receiver.after != null);
+            if (!f.released) {
+                cache.mutex.unlock(io);
+                f.released = true;
+            }
+            cache.retire(io, null);
+        }
+        try std.testing.expect(cache.closing.load(.acquire));
+        try std.testing.expect(cache.snapshot.arena == null and cache.receiver.after == null);
+        try std.testing.expectEqual(@as(usize, 1), f.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .begin_failure) 0 else 1), f.ends);
+    }
 }

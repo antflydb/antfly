@@ -53,6 +53,8 @@ pub const Owner = struct {
     stop_started: bool = false,
     joined: std.Io.Event = .unset,
     stop_progress: std.Io.Event = .unset,
+    stop_generation: std.atomic.Value(u64) = .init(0),
+    stop_waiters: std.atomic.Value(u32) = .init(0),
     fn lock(self: *Owner) void {
         while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
@@ -71,7 +73,7 @@ pub const Owner = struct {
         };
     }
     fn shutdown(self: *Owner) @import("maintenance_stop.zig").Borrowed {
-        return .{ .mutex = &self.mutex, .registration = &self.registration, .stopping = &self.stopping, .finisher = &self.stop_started, .joined = &self.joined, .changed = &self.stop_progress };
+        return .{ .mutex = &self.mutex, .registration = &self.registration, .stopping = &self.stopping, .finisher = &self.stop_started, .joined = &self.joined, .changed = &self.stop_progress, .generation = &self.stop_generation, .waiters = &self.stop_waiters };
     }
     pub fn stop(self: *Owner, io: ?std.Io) void {
         self.shutdown().stop(io, false);

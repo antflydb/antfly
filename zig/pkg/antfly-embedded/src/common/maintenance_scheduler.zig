@@ -185,36 +185,14 @@ pub const Scheduler = struct {
         /// lends CPU; ready Future/registration metadata retires after reentry.
         pub fn cancelWithAdmission(self: *Handle, io: Io, original: @import("read_admission.zig").Port) !void {
             self.requestStop();
-            var trace: @import("read_admission.zig").RejectionTrace = .{};
-            const control = trace.bind(original).?;
-            const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
-            _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
-            while (true) {
-                try control.checkpoint();
-                if (try self.readyToFinish()) {
-                    self.cancel(io);
-                    return;
+            const Ready = struct {
+                fn get(raw: *anyopaque) anyerror!bool {
+                    const handle: *Handle = @ptrCast(@alignCast(raw));
+                    return handle.readyToFinish();
                 }
-                try boundary.beginWait();
-                var failure: ?anyerror = null;
-                while (true) {
-                    control.checkLifetime() catch |cause| {
-                        failure = trace.failure orelse cause;
-                        break;
-                    };
-                    const ready = self.readyToFinish() catch |cause| {
-                        failure = cause;
-                        break;
-                    };
-                    if (ready) break;
-                    @import("antfly_platform").time.yieldNow();
-                }
-                boundary.endWait() catch |cause| {
-                    if (failure) |first| return first;
-                    return trace.failure orelse cause;
-                };
-                if (failure) |cause| return cause;
-            }
+            };
+            try @import("cleanup_wait.zig").until(io, original, self, Ready.get, null);
+            self.cancel(io);
         }
 
         pub fn await(self: *Handle, _: Io) void {

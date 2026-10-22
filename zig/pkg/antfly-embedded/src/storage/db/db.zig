@@ -6223,6 +6223,9 @@ pub const DB = struct {
         try self.publication_recovery.stopWithAdmission(original);
         try self.portable_activation_recovery.stopWithAdmission(self.portableActivationRecoveryPort(), original);
         try self.local_execution.schema_reconcile.stopWithAdmission(self.backend_runtime, self.schema_reconcile_owner_id, original);
+        try self.group_source_owner.stopWithAdmission(self.backend_runtime.io(), original);
+        try self.local_execution.source_publication.stopWithAdmission(self.backend_runtime, original);
+        try self.local_execution.online_merge_reader.closeWithAdmission(self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io, original);
     }
 
     fn stopRetainedPreparations(self: *DB) void {
@@ -7370,6 +7373,7 @@ pub const DB = struct {
         if (self.open_mode != .writer or self.core.index_manager.minimum_reader_version.load(.acquire) < 8 or self.group_source_owner.stopping.load(.acquire)) return false;
         if (!self.group_source_owner.slice_mutex.tryLock()) return false;
         defer self.group_source_owner.slice_mutex.unlock();
+        if (self.group_source_owner.stopping.load(.acquire)) return false;
         if (try self.maintenanceRequiresOrderedApply()) return false;
         try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
         var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, self.runtime_alloc, 1) else null;

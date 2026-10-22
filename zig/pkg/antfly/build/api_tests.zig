@@ -3456,6 +3456,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-owner-close-preflight-test", "Exercise controlled close preflight with a real DB and original cleanup capsule")
         .dependOn(&b.addRunArtifact(owner_close_preflight_tests).step);
 
+    const source_close_admission_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/source_close_admission_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, source_close_admission_root, true, true);
+    source_close_admission_root.addImport("antfly_source_root", source_close_admission_root);
+    const source_close_capi_options = b.addOptions();
+    source_close_capi_options.addOption(bool, "linked_storage", false);
+    source_close_capi_options.addOption(bool, "inference_enabled", true);
+    const source_close_sources = source_close_admission_root.import_table.get("antfly_local_sources").?;
+    source_close_sources.addOptions("capi_build_options", source_close_capi_options);
+    source_close_sources.addImport("antfly_storage_root", source_close_admission_root);
+    const source_close_admission_tests = b.addTest(.{
+        .name = "source-close-admission-tests",
+        .root_module = source_close_admission_root,
+        .filters = &.{ "controlled owner source publication stop", "controlled owner reader cache close", "relational index system source publication job survives" },
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("source-close-admission-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024),
+    });
+    b.step("antfly-source-close-admission-test", "Verify exporter, polling and reader state across bounded cleanup waits")
+        .dependOn(&b.addRunArtifact(source_close_admission_tests).step);
+
     const owner_control_funding_check = b.addTest(.{
         .name = "owner-control-funding-check",
         .root_module = owner_preflight_context_root,
