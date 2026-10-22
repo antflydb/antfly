@@ -9233,3 +9233,58 @@ test "docstore coverage outcome program legacy primary counts exclude metadata a
     try fixture.store.put(next, "{}");
     try std.testing.expectError(error.PreparedReadSetChanged, reads.validate(&fixture.store, null));
 }
+
+test "docstore prepared replay binding patches only registered native fields including child keys and canonical ID sentinels" {
+    const a = std.testing.allocator;
+    const binding = @import("db/prepared_replay_bindings.zig");
+    const mutations = @import("transaction_batch_admission.zig");
+    var fixture: PreparedReplayCreditFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var sources = binding.Sources.init(a);
+    defer sources.deinit();
+    const registered = try @import("db/artifact_producer_readiness.zig").localPrimaryRevisionKeyAlloc(a, "registered");
+    defer a.free(registered);
+    const unregistered = try @import("db/artifact_producer_readiness.zig").localPrimaryRevisionKeyAlloc(a, "opaque");
+    defer a.free(unregistered);
+    var number: [8]u8 = undefined;
+    std.mem.writeInt(u64, &number, binding.symbolic, .little);
+    var state: [25]u8 = @splat(0);
+    std.mem.writeInt(u64, state[0..8], binding.symbolic, .big);
+    std.mem.writeInt(u64, state[8..16], binding.symbolic, .big);
+    const ordinal = internal_keys.identityOrdinalStateKey(7);
+    const child = try internal_keys.documentChildRangeOutboxKeyAlloc(a, binding.symbolic, 3);
+    defer a.free(child);
+    const writes = [_]KVPair{
+        .{ .key = registered, .value = &number },
+        .{ .key = unregistered, .value = &number },
+        .{ .key = &ordinal, .value = &state },
+        .{ .key = child, .value = "{\"opaque\":18446744073709551615}" },
+    };
+    try sources.remember(.primary_revision, registered, &number);
+    try sources.remember(.identity, &ordinal, &state);
+    try sources.remember(.child, child, writes[3].value);
+    const replay = try @import("db/derived/change_journal.zig").encodeRecord(a, .{ .sequence = binding.symbolic });
+    defer a.free(replay);
+    var batch = try mutations.OwnedBatch.capture(a, &writes, &.{}, .{ .sequence = binding.symbolic, .payload = replay }, null);
+    defer batch.deinit();
+    var recipe = try binding.Bindings.capture(a, &fixture.store, &writes, &.{}, &batch, &sources, 9, null);
+    defer recipe.deinit();
+    for ([_]u64{ 9, 10001 }) |sequence| {
+        try recipe.validate(&batch, sequence, null);
+        recipe.bindValidated(&batch, sequence);
+        try std.testing.expectEqual(sequence, std.mem.readInt(u64, batch.writes[0].value[0..8], .little));
+        try std.testing.expectEqual(binding.symbolic, std.mem.readInt(u64, batch.writes[1].value[0..8], .little));
+        try std.testing.expectEqual(binding.symbolic, std.mem.readInt(u64, batch.writes[2].value[0..8], .big));
+        try std.testing.expectEqual(sequence, std.mem.readInt(u64, batch.writes[2].value[8..16], .big));
+        const expected = try internal_keys.documentChildRangeOutboxKeyAlloc(a, sequence, 3);
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, batch.writes[3].key);
+        try std.testing.expectEqualStrings(writes[3].value, batch.writes[3].value);
+        try std.testing.expectEqual(sequence, batch.replay.?.sequence);
+    }
+    const offset = @intFromPtr(batch.writes[0].value.ptr) - @intFromPtr(batch.backing.ptr);
+    batch.backing[offset] ^= 1;
+    try std.testing.expectError(error.PreparedEffectsMismatch, recipe.validate(&batch, 20001, null));
+    try std.testing.expectEqual(@as(u64, 10001), batch.replay.?.sequence);
+}

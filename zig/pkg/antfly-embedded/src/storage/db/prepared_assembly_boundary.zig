@@ -26,7 +26,13 @@ pub fn invoke(self: *db.DB, alloc: std.mem.Allocator, txn_id: types.TxnId, commi
     return .{ .value = self.prepareTransactionAssemblyWithPolicyLease(alloc, txn_id, commit_version, lease, original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
 }
 
+pub fn refresh(self: *db.DB, plan: *physical.OwnedPhysicalPlan, original: ?control.Port) engine.Outcome(void) {
+    return .{ .value = self.refreshTransactionAssembly(plan, original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
+}
+
 comptime {
     const signature: @FieldType(engine.VTable, "prepareTransactionAssemblyWithPolicyLease") = &invoke;
     _ = signature;
+    const refresh_signature: @FieldType(engine.VTable, "refreshTransactionAssembly") = &refresh;
+    _ = refresh_signature;
 }

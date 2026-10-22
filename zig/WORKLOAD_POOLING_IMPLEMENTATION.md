@@ -22591,3 +22591,57 @@ source-boundary checks pass (967 sources without server coordination imports).
 This verifies the native directory path and the stated Lite primitive/reopen
 case; full linked owner-image, object-engine, crash and cross-engine performance
 qualification remain open.
+
+### Refreshable owned replay sequence bindings
+
+Uncommitted transaction assembly now retains a recipe for replay sequence fields
+emitted by native metadata builders. Preparation builds those fields with a
+symbolic maximum-width value, captures owned backing, and binds them to the
+current next sequence before returning the candidate. Provenance is registered
+at the emission sites; arbitrary primary values, canonical document IDs and
+unregistered metadata never become sequence references.
+
+The recipe covers CJ2 headers and transaction replay copies, identity creation
+and deletion generations and visibility summaries, grouped invalidation sequence
+intervals, sequence-keyed grouped debt and child-range outbox keys, artifact and
+local primary revisions, and desired coverage outcome sequences. Binding updates
+key-bound checksums and permits grouped JSON numbers to grow within the original
+owned backing. Existing stored identity/group generations are checked before
+symbolic references are accepted. Group source revision counters remain observed
+dependencies rather than relocatable replay fields.
+
+`DB.refreshTransactionAssembly` runs inside the compiled storage owner under the
+owning apply lock. It revalidates the original data, catalog, namespace, policy,
+transaction and accepted-effects dependencies, permitting only clock progress.
+It verifies binding ownership, byte digests and coverage sequence consistency
+before changing any candidate bytes. Original admission failures leave both the
+candidate and persistent store unchanged. The final byte-binding operation
+allocates nothing; dependency validation can still allocate and read storage.
+Ordinary dependency validation continues to reject a stale candidate clock.
+
+Refreshing neither reserves a sequence nor publishes a decision. The candidate
+still cannot authorize a vote or a direct commit. Commit-owned reservation,
+executable recovery resources and normal required-PREPARE orchestration remain
+open, along with the other full-design work listed above. Strong required
+providers remain disabled. Native ABI 65 and storage-owner ABI 123 cover the new
+entry and owned recipe; durable formats and default activation are unchanged.
+Full Linux qualification remains waived; Linux uses pinned Nix/glibc Zig.
+
+Pinned Debug qualification passes all four focused replay-binding cases, 72
+required-PREPARE DB cases, 23 replay-plan cases, 51 runtime error/identity
+companions and five native ABI cases: 155 executions with no failures, skips or
+leaks. Grouped document and relational batches match ordinary commit bytes after
+two sequence refreshes, including JSON width growth, fresh and coalesced debt,
+unchanged backing ownership and unchanged persistent state. Tests cover readonly
+and changed-data rejection, all original refresh checkpoint failures, opaque
+values and canonical-ID sentinels, child-range keys, digest tampering, and coverage
+program sequence refresh. Existing preparation allocation-failure sweeps pass.
+
+All 5,498 native/schema inputs are independently reverified against final source.
+Formatting, generated errors, the generated control catalog, whitespace and
+production source-boundary checks pass. Evidence is retained in
+replay-binding-verified.json and replay-binding-v3.json/log in the cumulative
+receipts. Earlier failed runs retain the Zig API corrections and the corrected
+raw-store ABA test assumption; they provide no final qualification. Full linked
+owner-image, crash, object-engine and cross-engine performance qualification
+remain open.

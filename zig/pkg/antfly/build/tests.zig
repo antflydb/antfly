@@ -5999,6 +5999,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-prepared-replay-plan-test", "Verify canonical prepared request and accepted-effect replay bounds")
         .dependOn(&addCuratedTestRunArtifact(b, replay_plan_tests, &.{"prepared replay plan"}).step);
+    const replay_binding_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"replay binding"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-prepared-replay-binding-test", "Verify complete native replay sequence rebinding and retained admission")
+        .dependOn(&addCuratedTestRunArtifact(b, replay_binding_tests, &.{"replay binding"}).step);
     const assembly_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"db prepared transaction effects required assembly"},

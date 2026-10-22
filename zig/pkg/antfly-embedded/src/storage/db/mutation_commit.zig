@@ -378,6 +378,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const preparation_timestamp_ns = if (req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
             const preparation_alloc = prepared_row_allocator.allocator();
+            const replay_bindings = @import("prepared_replay_bindings.zig");
+            var sequence_sources = replay_bindings.Sources.init(preparation_alloc);
+            defer sequence_sources.deinit();
             // Relational graph TTL effects read primary artifacts before apply.
             // Retain those observations under the original lifetime, then seal
             // this stage before under-apply capture installs its own controls.
@@ -2557,10 +2560,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     changed_graph_artifact_keys.items,
                     derived_changed_flags,
                 ));
+            const assembly_replay_next = if (opts.assembly != null) S.ownerField(self, "core").*.nextDerivedAppendSequence() else 0;
+            if (opts.assembly != null and (assembly_replay_next == 0 or assembly_replay_next >= replay_bindings.symbolic)) return error.ResourceLimitExceeded;
             const sequence = if (elide_semantic_noop_replay)
                 S.ownerField(self, "core").*.nextDerivedSequence()
             else if (opts.assembly != null)
-                S.ownerField(self, "core").*.nextDerivedAppendSequence()
+                replay_bindings.symbolic
             else
                 S.ownerField(self, "core").*.reserveDerivedAppendSequence();
             if (group_plan) |plan| {
@@ -2583,7 +2588,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 delete_keys.shrinkRetainingCapacity(retained_deletes);
                 var effects = overlay.effects.iterator();
                 while (effects.next()) |effect| {
-                    if (effect.value_ptr.*) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key_ptr.*, .value = value }) else try delete_keys.append(S.ownerField(self, "alloc").*, effect.key_ptr.*);
+                    if (effect.value_ptr.*) |value| {
+                        try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key_ptr.*, .value = value });
+                        if (opts.assembly != null) try sequence_sources.remember(.group, effect.key_ptr.*, value);
+                    } else {
+                        try delete_keys.append(S.ownerField(self, "alloc").*, effect.key_ptr.*);
+                        if (opts.assembly != null) try sequence_sources.rememberDelete(.group, effect.key_ptr.*);
+                    }
                 }
             }
             if (review_plan) |review| {
@@ -2704,6 +2715,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             try store_writes.appendSlice(S.ownerField(self, "alloc").*, identity_writes.items);
+            if (opts.assembly != null) for (identity_writes.items) |write| try sequence_sources.remember(.identity, write.key, write.value);
             if (next_table_catalog != null) try store_writes.append(S.ownerField(self, "alloc").*, .{
                 .key = table_catalog_mod.key,
                 .value = &table_catalog_value,
@@ -2717,6 +2729,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &owned_child_range_outbox_keys,
                 &owned_child_range_outbox_values,
             );
+            if (opts.assembly != null) for (owned_child_range_outbox_keys.items, owned_child_range_outbox_values.items) |key, value| try sequence_sources.remember(.child, key, value);
             const build_derived_start_ns = monotonicTimeNs();
             var replay_payload = if (opts.group_source_command != null)
                 try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, .{ .sequence = sequence, .changed_doc_keys = try group_staged.replayDocuments(group_alloc), .deleted_doc_keys = group_staged.deleted, .changed_artifact_keys = changed_graph_artifact_keys.items, .target_hints = &.{ .enrichment, .graph, .dense_vector, .sparse_vector } })
@@ -2793,6 +2806,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const append_derived_replay = !opts.suppress_derived_replay_append and
                 !elide_semantic_noop_replay;
             if (append_derived_replay) {
+                const revision_keys_start = owned_store_keys.items.len;
+                const revision_values_start = owned_store_values.items.len;
                 try appendArtifactSourceRevisionWritesFromReplay(
                     S.ownerField(self, "alloc").*,
                     replay_payload,
@@ -2801,6 +2816,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     &owned_store_keys,
                     &owned_store_values,
                 );
+                if (opts.assembly != null) for (owned_store_keys.items[revision_keys_start..], owned_store_values.items[revision_values_start..]) |key, value| try sequence_sources.remember(.artifact_revision, key, value);
             }
             var durable_replication_batch_payload: ?[]u8 = null;
             var durable_replication_replay_payload: ?[]u8 = null;
@@ -3081,6 +3097,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     };
                     std.mem.writeInt(u64, value[0..8], sequence, .little);
                     try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = value });
+                    if (opts.assembly != null) try sequence_sources.remember(.primary_revision, key, value);
                 }
                 for (effective_req.deletes) |document| {
                     const key = try readiness.localPrimaryRevisionKeyAlloc(S.ownerField(self, "alloc").*, document);
@@ -3176,6 +3193,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try owned_store_keys.append(S.ownerField(self, "alloc").*, key);
                     try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = payload });
                     transaction_replication_replay_payload = payload;
+                    if (opts.assembly != null) try sequence_sources.remember(.journal, key, payload);
                 };
             };
             const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (append_derived_replay)
@@ -3253,8 +3271,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 prepared_physical.?.preparation = .{
                     .contract = accepted.decoded.plan.contract,
                     .fingerprint = accepted.fingerprint,
-                    .replay_next = sequence,
+                    .replay_next = assembly_replay_next,
                 };
+                const bindings = try replay_bindings.Bindings.capture(output.allocator, S.ownerField(self, "core").*.store, store_writes.items, delete_keys.items, &prepared_physical.?.bytes, &sequence_sources, assembly_replay_next, publication_control);
+                prepared_physical.?.replay_bindings = bindings;
+                try prepared_physical.?.validateCoverageSequence(replay_bindings.symbolic, publication_control);
+                prepared_physical.?.replay_bindings.?.bindValidated(&prepared_physical.?.bytes, assembly_replay_next);
+                prepared_physical.?.bindCoverageSequence(assembly_replay_next);
                 try prepared_physical.?.validateDependencies(S.ownerField(self, "core").*, publication_control);
                 output.plan = prepared_physical;
                 prepared_physical = null;

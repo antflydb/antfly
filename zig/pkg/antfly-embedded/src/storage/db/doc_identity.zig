@@ -3104,6 +3104,39 @@ fn appendNamespaceWrite(
     try writes.append(alloc, .{ .key = key, .value = value });
 }
 
+/// Visit only codec-owned replay generation fields. Canonical IDs, counts,
+/// ordinal offsets and unrelated metadata never become sequence references.
+pub fn visitReplayGenerations(key: []const u8, raw: []const u8, visitor: anytype) !bool {
+    comptime {
+        if (visibility_chunk_header_len != 8 or visibility_chunk_entry_len != 20) @compileError("review identity generation binding after codec layout changes");
+        if (@typeInfo(OrdinalState).@"struct".field_names.len != 3 or @typeInfo(VisibilitySummary).@"struct".field_names.len != 5) @compileError("review identity generation fields");
+    }
+    if (std.mem.eql(u8, key, &internal_keys.identity_visibility_summary_key)) {
+        _ = try decodeVisibilitySummary(raw);
+        try visitor.big(16);
+        try visitor.big(24);
+        try visitor.big(32);
+        return true;
+    }
+    if (key.len == 6 and key[0] == internal_keys.identity_namespace and key[1] == internal_keys.identity_ordinal_state_kind) {
+        const state = try decodeOrdinalState(raw);
+        try visitor.big(8);
+        if (state.deleted_generation != null) try visitor.big(17);
+        return true;
+    }
+    if (internal_keys.parseIdentityVisibilityChunkKey(key) != null) {
+        _ = try VisibilityChunk.encodedStats(raw);
+        const count = std.mem.readInt(u32, raw[4..8], .big);
+        for (0..count) |index| {
+            const offset = visibility_chunk_header_len + index * visibility_chunk_entry_len;
+            try visitor.big(offset + 4);
+            if (raw[offset + 2] == 1) try visitor.big(offset + 12);
+        }
+        return true;
+    }
+    return false;
+}
+
 fn encodeOrdinalState(state: OrdinalState) [25]u8 {
     var out: [25]u8 = undefined;
     std.mem.writeInt(u64, out[0..8], state.canonical_doc_id, .big);

@@ -217,8 +217,9 @@ pub const OwnedPhysicalPlan = struct {
     dependencies: ?@import("prepared_mutation_dependencies.zig").Owned = null,
     counter_deltas: ?@import("dense_artifact_counter_deltas.zig").Program = null,
     coverage_outcomes: ?@import("prepared_coverage_outcomes.zig").Program = null,
-    /// This candidate cannot authorize a vote or a direct commit. Until replay
-    /// relocation/deltas have an owner, sequence advancement invalidates it.
+    replay_bindings: ?@import("prepared_replay_bindings.zig").Bindings = null,
+    /// This candidate cannot authorize a vote or a direct commit. Its current
+    /// sequence is optimistic until refreshed under the owning apply fence.
     preparation: ?struct {
         contract: @import("prepared_transaction_effects.zig").Contract,
         fingerprint: [32]u8,
@@ -243,14 +244,14 @@ pub const OwnedPhysicalPlan = struct {
 
     pub fn validateDependencies(self: *const OwnedPhysicalPlan, core: anytype, control: ?admission.Port) !void {
         var trace: admission.RejectionTrace = .{};
-        self.validateDependenciesInner(core, trace.bind(control)) catch |cause| return trace.failure orelse cause;
+        self.validateDependenciesInner(core, trace.bind(control), false) catch |cause| return trace.failure orelse cause;
         if (trace.failure) |cause| return cause;
     }
-    fn validateDependenciesInner(self: *const OwnedPhysicalPlan, core: anytype, control: ?admission.Port) !void {
+    fn validateDependenciesInner(self: *const OwnedPhysicalPlan, core: anytype, control: ?admission.Port, refreshing: bool) !void {
         const owned = if (self.dependencies) |*value| value else return error.PreparedEffectsRequired;
         try owned.validate(core, control);
         if (self.preparation) |expected| {
-            if (core.nextDerivedAppendSequence() != expected.replay_next) return error.PreparedGenerationChanged;
+            if (!refreshing and core.nextDerivedAppendSequence() != expected.replay_next) return error.PreparedGenerationChanged;
             if (!std.meta.eql(try core.preparedEffectsCatalogDigest(control), expected.contract.catalog_digest)) return error.PreparedEffectsMismatch;
             var manager = try core.initTxnManager();
             defer manager.deinit();
@@ -264,7 +265,39 @@ pub const OwnedPhysicalPlan = struct {
         }
     }
 
+    pub fn validateCoverageSequence(self: *const OwnedPhysicalPlan, expected: u64, control: ?admission.Port) !void {
+        if (self.coverage_outcomes) |*program| for (program.groups.items) |group| for (group.desired.items) |entry| {
+            if (control) |owner| try owner.checkpoint();
+            if (entry.sequence != expected) return error.InvalidDerivedSequence;
+        };
+    }
+    pub fn bindCoverageSequence(self: *OwnedPhysicalPlan, next: u64) void {
+        if (self.coverage_outcomes) |*program| for (program.groups.items) |*group| for (group.desired.items) |*entry| {
+            entry.sequence = next;
+        };
+    }
+    /// Caller holds the owning apply fence. Revalidate every non-clock witness
+    /// before the allocation-free rebind. This reserves and publishes nothing.
+    pub fn refreshReplaySequence(self: *OwnedPhysicalPlan, core: anytype, original: ?admission.Port) !void {
+        var trace: admission.RejectionTrace = .{};
+        self.refreshReplaySequenceInner(core, trace.bind(original)) catch |cause| return trace.failure orelse cause;
+        if (trace.failure) |cause| return cause;
+    }
+    fn refreshReplaySequenceInner(self: *OwnedPhysicalPlan, core: anytype, control: ?admission.Port) !void {
+        const bindings = if (self.replay_bindings) |*value| value else return error.PreparedEffectsRequired;
+        const expected = self.preparation orelse return error.PreparedEffectsRequired;
+        try self.validateDependenciesInner(core, control, true);
+        const next = core.nextDerivedAppendSequence();
+        try bindings.validate(&self.bytes, next, control);
+        try self.validateCoverageSequence(expected.replay_next, control);
+        if (control) |owner| try owner.checkpoint();
+        bindings.bindValidated(&self.bytes, next);
+        self.bindCoverageSequence(next);
+        self.preparation.?.replay_next = next;
+    }
+
     pub fn deinit(self: *OwnedPhysicalPlan) void {
+        if (self.replay_bindings) |*value| value.deinit();
         if (self.counter_deltas) |*program| program.deinit();
         if (self.coverage_outcomes) |*program| program.deinit();
         if (self.dependencies) |*owned| owned.deinit();

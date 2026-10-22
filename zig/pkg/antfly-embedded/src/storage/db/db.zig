@@ -24471,6 +24471,40 @@ pub const DB = struct {
         return result;
     }
 
+    /// Refresh only native sequence references. The whole operation remains
+    /// inside the compiled storage owner and revalidates the original lease.
+    /// It neither reserves a sequence nor authorizes or publishes a decision.
+    pub fn refreshTransactionAssembly(self: *DB, plan: *@import("artifact_authored_acceptance.zig").OwnedPhysicalPlan, original: ?@import("../../common/read_admission.zig").Port) !void {
+        var trace: @import("../../common/read_admission.zig").RejectionTrace = .{};
+        const control = trace.bind(original);
+        (if (comptime storage_engine.enabled)
+            storage_engine.call("refreshTransactionAssembly", .{ self, plan, control })
+        else
+            self.refreshTransactionAssemblyInner(plan, control)) catch |cause| return trace.failure orelse cause;
+        if (trace.failure) |cause| return cause;
+    }
+    fn refreshTransactionAssemblyInner(self: *DB, plan: *@import("artifact_authored_acceptance.zig").OwnedPhysicalPlan, original: ?@import("../../common/read_admission.zig").Port) !void {
+        if (original) |owner| try owner.checkLifetime();
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        const Check = struct {
+            fn lifetime(raw: *const anyopaque) !void {
+                const value: *const ?@import("../../common/read_admission.zig").Port = @ptrCast(@alignCast(raw));
+                if (value.*) |owner| try owner.checkLifetime();
+            }
+        };
+        const controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition = if (original) |owner| .{
+            .lifetime = .{ .context = &original, .check_fn = Check.lifetime },
+            .execution_wait = try owner.executionWaitAfterLifetime(),
+        } else null;
+        const admission = @import("mutation_admission.zig");
+        var collection: admission.IntentCollection = .{};
+        const control = collection.bind(admission.retainedLeaseControls(controls), self.core.apply_mutex.io);
+        try admission.lockApplyPreDecision(self, admission.retainedLeaseControls(controls));
+        defer self.core.unlockApply();
+        try plan.refreshReplaySequence(self.core, control);
+    }
+
     fn prepareTransactionAssemblyInner(self: *DB, alloc: Allocator, txn_id: types.TxnId, commit_version: u64, supplied_lease: ?*const row_policy_gate_mod.Gate.Lease, original: ?@import("../../common/read_admission.zig").Port) !@import("artifact_authored_acceptance.zig").OwnedPhysicalPlan {
         const admission = @import("mutation_admission.zig");
         if (original) |port| {
@@ -148049,6 +148083,10 @@ test "db prepared transaction effects required assembly coverage outcome program
             try std.testing.expect(!std.mem.eql(u8, write.key, marker));
             for (group.counters) |key| try std.testing.expect(!std.mem.eql(u8, write.key, key));
         }
+        while (db.core.nextDerivedAppendSequence() < 100) _ = db.core.reserveDerivedAppendSequence();
+        try db.refreshTransactionAssembly(&plan, null);
+        try std.testing.expectEqual(@as(u64, 100), plan.preparation.?.replay_next);
+        for (group.desired.items) |desired| try std.testing.expectEqual(@as(u64, 100), desired.sequence);
         // Old producer completion can advance while this candidate is held.
         // Existing sidecars must agree with the current marker transition;
         // missing legacy sidecars are reconstructed only in the final writer.
@@ -148083,4 +148121,157 @@ test "db prepared transaction effects required assembly coverage outcome program
         defer PreparedAssemblyFixture.free(after);
         try std.testing.expectEqualDeep(before, after);
     }
+}
+
+test "db prepared transaction effects required assembly replay binding refresh preserves complete grouped batches across sequence growth" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    for ([_]bool{ false, true }) |relational| for ([_]bool{ false, true }) |acknowledged| {
+        var directory = try TestDirectory.init("prepared-sequence-refresh");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), F.options);
+        defer db.close();
+        try F.seed(&db, relational, true);
+        if (acknowledged) {
+            const scanned = try F.snapshot(&db);
+            defer F.free(scanned);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            var batch = try db.core.store.beginWriteBatch();
+            errdefer batch.abort();
+            for (scanned) |entry| if (@import("group_source_transfer.zig").isKey(entry.key)) {
+                const info = try @import("group_source_transfer.zig").info(scratch.allocator(), entry.key);
+                if (info.kind == @import("group_source_index.zig").outbox_kind) try std.testing.expect(try @import("group_source_index.zig").acknowledge(scratch.allocator(), &batch, entry.key, entry.value));
+            };
+            try batch.commit();
+        }
+        var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+        defer plan.deinit();
+        const backing = plan.bytes.backing.ptr;
+        const before = try F.snapshot(&db);
+        defer F.free(before);
+        for ([_]u64{ 99, 10001 }) |next| {
+            while (db.core.nextDerivedAppendSequence() < next) _ = db.core.reserveDerivedAppendSequence();
+            {
+                db.core.lockApply();
+                defer db.core.unlockApply();
+                try std.testing.expectError(error.PreparedGenerationChanged, plan.validateDependencies(db.core, null));
+            }
+            const result = @import("prepared_assembly_boundary.zig").refresh(&db, &plan, null);
+            try std.testing.expect(result.failure.ptr == null);
+            try std.testing.expectEqual(next, plan.bytes.replay.?.sequence);
+            try std.testing.expectEqual(next, db.core.nextDerivedAppendSequence());
+            try std.testing.expectEqual(backing, plan.bytes.backing.ptr);
+            {
+                db.core.lockApply();
+                defer db.core.unlockApply();
+                try plan.validateDependencies(db.core, null);
+            }
+        }
+        const after = try F.snapshot(&db);
+        defer F.free(after);
+        try std.testing.expectEqualDeep(before, after);
+        const sequence = plan.bytes.replay.?.sequence;
+        try db.resolveTransactionIntentsWithSyncLevel(F.id, .committed, 19, .propose);
+        for (plan.bytes.writes, 0..) |write, index| {
+            var superseded = false;
+            for (plan.bytes.writes[index + 1 ..]) |later| if (std.mem.eql(u8, later.key, write.key)) {
+                superseded = true;
+                break;
+            };
+            if (superseded) continue;
+            const actual = try db.core.store.get(a, write.key);
+            defer a.free(actual);
+            try std.testing.expectEqualStrings(write.value, actual);
+        }
+        for (plan.bytes.deletes) |key| try std.testing.expectError(error.NotFound, db.core.store.get(a, key));
+        const replay = try db.core.store.get(a, &internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence));
+        defer a.free(replay);
+        try std.testing.expectEqualStrings(plan.bytes.replay.?.payload, replay);
+    };
+}
+
+test "db prepared transaction effects required assembly replay binding refresh preserves original errors without mutation or reservation" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    var directory = try TestDirectory.init("prepared-sequence-refresh-cancel");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    defer db.close();
+    try F.seed(&db, false, true);
+    var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+    defer plan.deinit();
+    _ = db.core.reserveDerivedAppendSequence();
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.DeadlineExceeded,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(owner: *DB, candidate: *@import("artifact_authored_acceptance.zig").OwnedPhysicalPlan, checks: *@This()) !void {
+            const controls = @import("../../common/read_admission.zig");
+            var source: controls.Payload = .{ .ptr = checks, .vtable = &.{ .checkpoint = check } };
+            try owner.refreshTransactionAssembly(candidate, .init(&source));
+        }
+    };
+    var baseline: Checks = .{};
+    try Checks.run(&db, &plan, &baseline);
+    const bound = plan.preparation.?.replay_next;
+    const image = try a.dupe(u8, plan.bytes.backing);
+    defer a.free(image);
+    const before = try F.snapshot(&db);
+    defer F.free(before);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        _ = db.core.reserveDerivedAppendSequence();
+        const current = db.core.nextDerivedAppendSequence();
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(&db, &plan, &checks));
+        try std.testing.expectEqual(current, db.core.nextDerivedAppendSequence());
+        try std.testing.expectEqual(bound, plan.preparation.?.replay_next);
+        try std.testing.expectEqualSlices(u8, image, plan.bytes.backing);
+    };
+    const after = try F.snapshot(&db);
+    defer F.free(after);
+    try std.testing.expectEqualDeep(before, after);
+    try db.refreshTransactionAssembly(&plan, null);
+    try std.testing.expectEqual(db.core.nextDerivedAppendSequence(), plan.bytes.replay.?.sequence);
+}
+
+test "db prepared transaction effects required assembly replay binding refresh retains readonly and changed-data fences" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    var directory = try TestDirectory.init("prepared-sequence-refresh-fences");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    defer db.close();
+    try F.seed(&db, false, false);
+    var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+    defer plan.deinit();
+    const before = try a.dupe(u8, plan.bytes.backing);
+    defer a.free(before);
+    _ = db.core.reserveDerivedAppendSequence();
+    {
+        const mode = db.open_mode;
+        db.open_mode = .query_readonly;
+        defer db.open_mode = mode;
+        const result = @import("prepared_assembly_boundary.zig").refresh(&db, &plan, null);
+        try std.testing.expectEqualStrings("ReadOnly", result.failure.ptr.?[0..result.failure.len]);
+    }
+    const row = try internal_keys.documentKeyAlloc(a, "row");
+    defer a.free(row);
+    const old = try db.core.store.get(a, row);
+    defer a.free(old);
+    try db.core.store.put(row, "{\"changed\":true}");
+    try std.testing.expectError(error.PreparedReadSetChanged, db.refreshTransactionAssembly(&plan, null));
+    try std.testing.expectEqualSlices(u8, before, plan.bytes.backing);
+    try db.core.store.put(row, old);
+    // Raw store writes restore this point observation without advancing the
+    // native mutation revision. Normal mutation ABA is covered separately.
+    try db.refreshTransactionAssembly(&plan, null);
+    try std.testing.expectEqual(db.core.nextDerivedAppendSequence(), plan.bytes.replay.?.sequence);
 }

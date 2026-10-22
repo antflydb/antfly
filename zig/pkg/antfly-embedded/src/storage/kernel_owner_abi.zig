@@ -36,7 +36,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Batch preparation can return owned uncommitted bytes and their witnesses.
 // Owned assemblies and resolution options carry final-writer counter programs.
 // Coverage outcome transitions join final-writer metadata programs.
-pub const abi_version: u32 = 122;
+// Owned replay binding recipes and whole-operation refresh expand native state.
+pub const abi_version: u32 = 123;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
