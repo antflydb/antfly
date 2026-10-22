@@ -504,11 +504,13 @@ const FontDecoder = struct {
     differences: [256]?[]u8 = @as([256]?[]u8, @splat(null)),
     difference_codepoints: [256]?u21 = @as([256]?u21, @splat(null)),
     difference_defined: [256]bool = @as([256]bool, @splat(false)),
+    type1_builtin_fallbacks: [256]?[]u8 = @as([256]?[]u8, @splat(null)),
     to_unicode: []ToUnicodeEntry = &.{},
     codespace_ranges: []CodeSpaceRange = &.{},
 
     pub fn deinit(self: *FontDecoder, alloc: Allocator) void {
         for (self.differences) |mapping| if (mapping) |bytes| alloc.free(bytes);
+        for (self.type1_builtin_fallbacks) |mapping| if (mapping) |bytes| alloc.free(bytes);
         for (self.to_unicode) |entry| alloc.free(entry.dst);
         if (self.to_unicode.len > 0) alloc.free(self.to_unicode);
         if (self.codespace_ranges.len > 0) alloc.free(self.codespace_ranges);
@@ -533,6 +535,10 @@ const FontDecoder = struct {
         }
         if (self.difference_defined[b]) {
             try out.appendSlice(alloc, "�");
+            return;
+        }
+        if (self.type1_builtin_fallbacks[b]) |mapping| {
+            try out.appendSlice(alloc, mapping);
             return;
         }
         const decoded = try text_encoding.decodeNamedAlloc(alloc, self.base_encoding, &.{b});
@@ -589,11 +595,27 @@ const FontDecoder = struct {
         return @min(self.code_bytes, remaining.len);
     }
 
+    fn applyType1BuiltinFallbacks(self: *FontDecoder, alloc: Allocator, font: *const Type1Font) !void {
+        for (font.glyphs) |glyph| {
+            if (!glyph.encoded or
+                self.lookupToUnicode(glyph.code, 1) != null or
+                self.difference_defined[glyph.code] or
+                self.type1_builtin_fallbacks[glyph.code] != null) continue;
+            self.type1_builtin_fallbacks[glyph.code] = try type1GlyphNameToUtf8Alloc(alloc, glyph.name) orelse continue;
+        }
+    }
+
     /// Resolve a simple-font character code for painting. ToUnicode is
     /// intentionally excluded: it describes extraction text and may expand
     /// one PDF code into several Unicode scalars.
     fn paintCodepoint(self: *const FontDecoder, code: u8) ?u21 {
         if (self.difference_defined[code]) return self.difference_codepoints[code];
+        if (self.type1_builtin_fallbacks[code]) |mapping| {
+            var view = std.unicode.Utf8View.init(mapping) catch return null;
+            var iterator = view.iterator();
+            const codepoint = iterator.nextCodepoint() orelse return null;
+            return if (iterator.nextCodepoint() == null) codepoint else null;
+        }
         const cp = switch (self.base_encoding) {
             .pdf_doc => text_encoding.pdf_doc_encoding[code],
             .win_ansi => text_encoding.win_ansi_encoding[code],
@@ -735,6 +757,7 @@ const Type1Glyph = struct {
 const Type1Font = struct {
     local_subrs: [][]u8 = &.{},
     glyphs: []Type1Glyph = &.{},
+    uses_builtin_encoding: bool = false,
     missing_width: f64 = 0,
 
     pub fn deinit(self: *Type1Font, alloc: Allocator) void {
@@ -11183,6 +11206,10 @@ pub const Reader = struct {
                 break :blk null;
             },
         };
+        if (font.type1) |*type1| {
+            if (type1.uses_builtin_encoding)
+                try font.decoder.applyType1BuiltinFallbacks(self.alloc, type1);
+        }
         try self.checkCancellation();
         const built_sfnt = self.buildSfntFont(font_obj, &font.decoder) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -12147,6 +12174,21 @@ pub const Reader = struct {
                 }
             }
         }
+        var builtin_encoding = Type1BuiltinEncoding{};
+        defer builtin_encoding.deinit(self.alloc);
+        var uses_builtin_encoding = false;
+        if (font_obj.get("Encoding") == null and
+            (try self.simpleFontSymbolicAlloc(font_obj)) == true)
+        {
+            builtin_encoding = try parseType1BuiltinEncodingAlloc(self.alloc, bytes);
+            uses_builtin_encoding = builtin_encoding.has_entries;
+            if (uses_builtin_encoding) {
+                for (builtin_encoding.names, 0..) |glyph_name, code| {
+                    if (glyph_name) |value| code_to_name[code] = value;
+                }
+            }
+        }
+
 
         const first_char: usize = if (font_obj.get("FirstChar")) |obj| blk: {
             const value = (try self.resolvedIntegerObjectValue(obj)) orelse return error.InvalidPdf;
@@ -12175,6 +12217,7 @@ pub const Reader = struct {
         return .{
             .local_subrs = local_subrs,
             .glyphs = glyphs,
+            .uses_builtin_encoding = uses_builtin_encoding,
             .missing_width = missing_width,
         };
     }
@@ -14106,6 +14149,74 @@ fn decodeAsciiHexLooseAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
 fn decryptType1BytesAlloc(alloc: Allocator, len_iv: i64, bytes: []const u8) ![]u8 {
     if (len_iv < 0) return try alloc.dupe(u8, bytes);
     return try font_lib.type1.decryptCharStringAlloc(alloc, bytes, @intCast(len_iv));
+}
+
+const Type1BuiltinEncoding = struct {
+    names: [256]?[]u8 = @as([256]?[]u8, @splat(null)),
+    has_entries: bool = false,
+
+    fn deinit(self: *Type1BuiltinEncoding, alloc: Allocator) void {
+        for (self.names) |name| if (name) |owned| alloc.free(owned);
+        self.* = undefined;
+    }
+};
+
+fn parseType1BuiltinEncodingAlloc(alloc: Allocator, bytes: []const u8) !Type1BuiltinEncoding {
+    const cleartext_end = std.mem.indexOf(u8, bytes, "currentfile eexec") orelse bytes.len;
+    var scanner = syntax.Scanner.init(alloc, bytes[0..cleartext_end]);
+    defer scanner.deinit();
+    var result = Type1BuiltinEncoding{};
+    errdefer result.deinit(alloc);
+    var in_encoding = false;
+
+    while (true) {
+        var tok = try scanner.readLexeme();
+        defer syntax.Scanner.freeLexeme(alloc, &tok);
+        switch (tok) {
+            .eof => return result,
+            .name => |name| {
+                if (!in_encoding and std.mem.eql(u8, name, "Encoding"))
+                    in_encoding = true;
+            },
+            .keyword => |keyword| {
+                if (!in_encoding) continue;
+                if (std.mem.eql(u8, keyword, "def")) return result;
+                if (!std.mem.eql(u8, keyword, "dup")) continue;
+
+                var code_tok = try scanner.readLexeme();
+                defer syntax.Scanner.freeLexeme(alloc, &code_tok);
+                var name_tok = try scanner.readLexeme();
+                defer syntax.Scanner.freeLexeme(alloc, &name_tok);
+                var put_tok = try scanner.readLexeme();
+                defer syntax.Scanner.freeLexeme(alloc, &put_tok);
+                if (code_tok != .integer or
+                    code_tok.integer < 0 or
+                    code_tok.integer > 255 or
+                    name_tok != .name or
+                    put_tok != .keyword or
+                    !std.mem.eql(u8, put_tok.keyword, "put")) continue;
+
+                const code: usize = @intCast(code_tok.integer);
+                if (result.names[code]) |old| alloc.free(old);
+                result.names[code] = name_tok.name;
+                name_tok = .eof;
+                result.has_entries = true;
+            },
+            else => {},
+        }
+    }
+}
+
+fn type1GlyphNameToUtf8Alloc(alloc: Allocator, name: []const u8) !?[]u8 {
+    if (try text_encoding.glyphNameToUtf8Alloc(alloc, name)) |mapping| return mapping;
+    // TeX Type 1 extension fonts suffix delimiter names with their visual
+    // size. The semantic character is still the unsuffixed delimiter.
+    for ([_][]const u8{ "bigg", "Bigg", "big", "Big" }) |suffix| {
+        if (name.len <= suffix.len or !std.mem.endsWith(u8, name, suffix)) continue;
+        if (try text_encoding.glyphNameToUtf8Alloc(alloc, name[0 .. name.len - suffix.len])) |mapping|
+            return mapping;
+    }
+    return null;
 }
 
 fn ensureType1SubrCapacity(alloc: Allocator, subrs: *std.ArrayList([]u8), index: usize) !void {
@@ -21453,6 +21564,57 @@ test "reader uses ToUnicode cmap for text extraction" {
     const text = try reader.extractPlainTextAlloc();
     defer alloc.free(text);
     try std.testing.expectEqualStrings("A\n", text);
+}
+
+test "reader uses symbolic Type1 built-in encoding for partial ToUnicode gaps" {
+    const alloc = std.testing.allocator;
+    const content = "BT\n/F1 12 Tf\n<084109> Tj\nET\n";
+    const cmap =
+        "begincmap\n" ++
+        "1 begincodespacerange\n" ++
+        "<00> <FF>\n" ++
+        "endcodespacerange\n" ++
+        "1 beginbfchar\n" ++
+        "<41> <03B2>\n" ++
+        "endbfchar\n" ++
+        "endcmap\n";
+    const type1 =
+        "%!PS-AdobeFont-1.0: Delimiters 1.0\n" ++
+        "/FontType 1 def\n" ++
+        "/FontMatrix [0.001 0 0 0.001 0 0] readonly def\n" ++
+        "/Encoding 256 array\n" ++
+        "0 1 255 {1 index exch /.notdef put} for\n" ++
+        "dup 8 /braceleftbig put\n" ++
+        "dup 9 /bracerightbig put\n" ++
+        "readonly def\n" ++
+        "/Private 1 dict dup begin\n" ++
+        "/lenIV -1 def\n" ++
+        "end\n" ++
+        "/CharStrings 2 dict dup begin\n" ++
+        "/braceleftbig <0e> def\n" ++
+        "/bracerightbig <0e> def\n" ++
+        "end\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Delimiters /ToUnicode 6 0 R /FontDescriptor 7 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "6 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap }),
+        "7 0 obj\n<< /Type /FontDescriptor /FontName /Delimiters /Flags 4 /FontFile 8 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "8 0 obj\n<< /Length {d} /Length1 {d} >>\nstream\n{s}endstream\nendobj\n", .{ type1.len, type1.len, type1 }),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[5]);
+    defer alloc.free(objects[7]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const text = try reader.extractPlainTextAlloc();
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("{β}\n", text);
 }
 
 test "reader uses ToUnicode codespacerange for multibyte text extraction" {
