@@ -70,6 +70,7 @@ QUERY_REQUEST_PROPERTIES = (
     "indexes",
     "embeddings",
     "fields",
+    "source_projection",
     "hierarchy",
     "limit",
     "offset",

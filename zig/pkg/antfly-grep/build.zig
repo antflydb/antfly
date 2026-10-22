@@ -86,6 +86,7 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     image_hash.update(@import("builtin").zig_version_string);
     b.dependOnDirectoryContents(b.path("lib/image/src"));
     image_hash.update(@embedFile("../../lib/source_evidence/root.zig"));
+    image_hash.update(@embedFile("../../lib/decisions/evidence.zig"));
     image_hash.update(@embedFile("src/image_descriptor.zig"));
     var image_dir = b.root.openDir(cache_io, "lib/image/src", .{ .iterate = true }) catch @panic("open image sources");
     defer image_dir.close(cache_io);
