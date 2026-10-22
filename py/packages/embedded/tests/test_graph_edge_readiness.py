@@ -1400,7 +1400,9 @@ def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
 
 @pytest.mark.parametrize("promote", [False, True])
 @pytest.mark.parametrize("write_count", [1, 10])
-def test_inline_resolver_background_work_settles_after_writes(aflite_path, promote, write_count) -> None:
+def test_inline_resolver_background_work_settles_after_writes(
+    aflite_path, promote, write_count, background_progress_deadline
+) -> None:
     options = antfly_embedded.OpenOptions(
         profile=antfly_embedded.Profile.NATIVE, generated_enrichment_replay=True, busy_timeout=5.0
     )
@@ -1450,7 +1452,7 @@ def test_inline_resolver_background_work_settles_after_writes(aflite_path, promo
                     docs.add_index({**request, "name": graph_name, "replaces": "kg"})
                 if write_count > 1:
                     time.sleep(0.1)
-            deadline = time.monotonic() + 30
+            deadline = background_progress_deadline()
             while True:
                 stats = docs.pending_work_stats()
                 if (
@@ -1460,7 +1462,7 @@ def test_inline_resolver_background_work_settles_after_writes(aflite_path, promo
                     and graph_name in {index["name"] for index in docs.list_indexes()}
                 ):
                     break
-                if time.monotonic() >= deadline:
+                if deadline.expired(stats):
                     pytest.fail(f"background resolver work did not settle: {json.dumps(stats, sort_keys=True)}")
                 time.sleep(0.1)
             assert docs.edges(graph_name, "d0", "about", antfly_embedded.GraphDirection.OUT)
