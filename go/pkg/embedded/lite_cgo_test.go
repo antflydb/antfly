@@ -32,7 +32,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 func TestBundledCABIHeaderMatchesSourceTree(t *testing.T) {

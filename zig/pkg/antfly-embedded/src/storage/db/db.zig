@@ -25625,6 +25625,9 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
+        // Reject before staging the durable intent. The catalog materializer
+        // cannot change configuration while source ownership is migrating.
+        try self.enforceVectorMigrationConfigurationGate();
         var txn = try self.core.store.beginWriteTxn();
         var preflight_open = true;
         defer if (preflight_open) txn.abort();
@@ -132217,6 +132220,11 @@ test "source vector migration waits for an admitted artifact catalog transition"
     try std.testing.expect(!db.local_execution.vector_migration_active.load(.acquire));
     try db.core.store.delete(intent.key);
     try db.startVectorMigration(request);
+    try std.testing.expectError(error.VectorMigrationActive, db.reconcileReplicatedArtifactAdmission(
+        .{ .artifact_catalog = command },
+        .{ .term = 1, .index = 1 },
+    ));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, intent.key));
     try completeVectorMigrationForTest(&db, request.job_id);
 }
 

@@ -31,7 +31,9 @@ import antfly_embedded as af
 @pytest.mark.parametrize("storage", [af.Storage.LITE, af.Storage.DIRECTORY])
 @pytest.mark.parametrize("child", [False, True], ids=["root", "table"])
 @pytest.mark.parametrize("completion", ["background", "idle", "visibility", "overlap"])
-def test_grouped_sources_drive_downstream_graph(require_native, tmp_path, storage, child, completion):
+def test_grouped_sources_drive_downstream_graph(
+    require_native, tmp_path, storage, child, completion, background_progress_deadline
+):
     inputs = []
     errors = []
     provider_started = threading.Event()
@@ -240,13 +242,13 @@ def test_grouped_sources_drive_downstream_graph(require_native, tmp_path, storag
                     assert time.monotonic() - started < 10
                 if completion == "idle":
                     table.run_until_idle()
-                deadline = time.monotonic() + (0 if completion == "idle" else 30)
+                deadline = background_progress_deadline()
                 edges = table.edges("turn_graph", "thread/t1", "about", 0)
-                while time.monotonic() < deadline:
-                    edges = table.edges("turn_graph", "thread/t1", "about", 0)
-                    if len(edges) == 2:
+                while completion != "idle" and len(edges) != 2:
+                    if deadline.expired(table.pending_work_stats(), completed=len(edges)):
                         break
-                    time.sleep(0.02)
+                    time.sleep(0.1)
+                    edges = table.edges("turn_graph", "thread/t1", "about", 0)
                 assert not errors, errors
                 assert len(edges) == 2, (edges, inputs, table.pending_work_stats())
                 assert {base64.b64decode(edge["target_b64"]).decode() for edge in edges} == {

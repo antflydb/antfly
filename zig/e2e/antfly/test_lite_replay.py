@@ -260,15 +260,6 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                 return ready_index_status(value, until="complete")
 
             assert wait_until(
-                lambda: call("GET", "/tables/docs/indexes/knowledge"),
-                timeout_s=300,
-                ready_when=graph_complete,
-            ), (
-                json.dumps(call("GET", "/tables/docs/indexes/knowledge"), indent=2)
-                + "\n"
-                + server.debug_logs()
-            )
-            assert wait_until(
                 lambda: call("GET", "/tables/docs/resolvers/concepts"),
                 timeout_s=60,
                 ready_when=lambda value: (
@@ -280,6 +271,17 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                     )
                 ),
             ), server.debug_logs()
+            # Resolver/promotion commits can publish new graph inputs. Observe
+            # their completion before fencing the downstream graph generation.
+            assert wait_until(
+                lambda: call("GET", "/tables/docs/indexes/knowledge"),
+                timeout_s=300,
+                ready_when=graph_complete,
+            ), (
+                json.dumps(call("GET", "/tables/docs/indexes/knowledge"), indent=2)
+                + "\n"
+                + server.debug_logs()
+            )
             result = call(
                 "POST",
                 "/tables/docs/query",
