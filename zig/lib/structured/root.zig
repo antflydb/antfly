@@ -38,12 +38,61 @@ pub const Batch = struct {
             return error.InvalidConstrainedGenerationConfig;
     }
 };
+/// A constrained batch becomes one scalar generation request. Native item
+/// media ceilings therefore bound the sum of evidence across its batch items.
+pub const Limits = struct {
+    max_media_parts_per_call: ?usize = null,
+    max_encoded_media_bytes_per_call: ?usize = null,
+
+    pub fn fromNativeBatch(batch: anytype) Limits {
+        return .{ .max_media_parts_per_call = batch.max_media_parts_per_item, .max_encoded_media_bytes_per_call = batch.max_encoded_media_bytes };
+    }
+    fn accepts(self: Limits, cost: EvidenceCost) bool {
+        return (self.max_media_parts_per_call == null or cost.media_parts <= self.max_media_parts_per_call.?) and
+            (self.max_encoded_media_bytes_per_call == null or cost.encoded_media_bytes <= self.max_encoded_media_bytes_per_call.?);
+    }
+};
+const EvidenceCost = struct {
+    media_parts: usize = 0,
+    encoded_media_bytes: usize = 0,
+    fn add(self: EvidenceCost, other: EvidenceCost) EvidenceCost {
+        return .{ .media_parts = self.media_parts +| other.media_parts, .encoded_media_bytes = self.encoded_media_bytes +| other.encoded_media_bytes };
+    }
+};
+fn evidenceCost(input: Json) !EvidenceCost {
+    var cost = EvidenceCost{};
+    if (input == .string) return cost;
+    if (input != .array) return error.UnsupportedInferenceFeature;
+    for (input.array.items) |message| {
+        if (message != .object) return error.UnsupportedInferenceFeature;
+        const content = message.object.get("content") orelse return error.UnsupportedInferenceFeature;
+        if (content == .string) continue;
+        if (content != .array) return error.UnsupportedInferenceFeature;
+        for (content.array.items) |part| {
+            if (part != .object) return error.UnsupportedInferenceFeature;
+            const kind = part.object.get("type") orelse return error.UnsupportedInferenceFeature;
+            if (kind != .string) return error.UnsupportedInferenceFeature;
+            if (std.mem.eql(u8, kind.string, "input_text")) continue;
+            if (!std.mem.eql(u8, kind.string, "input_image")) return error.UnsupportedInferenceFeature;
+            const url = part.object.get("image_url") orelse return error.UnsupportedInferenceFeature;
+            if (url != .string) return error.UnsupportedInferenceFeature;
+            cost.media_parts += 1;
+            if (std.mem.startsWith(u8, url.string, "data:")) {
+                const offset = std.mem.indexOf(u8, url.string, ";base64,") orelse return error.UnsupportedInferenceFeature;
+                cost.encoded_media_bytes +|= std.base64.standard.Decoder.calcSizeForSlice(url.string[offset + 8 ..]) catch return error.UnsupportedInferenceFeature;
+            }
+        }
+    }
+    return cost;
+}
+
 /// These are resolved executor/model facts, never caller-supplied claims.
 pub const Capabilities = struct {
     tool_call: bool = false,
     json_schema: bool = false,
     grammar: bool = false,
     images: bool = false,
+    limits: Limits = .{},
     token_logprobs: bool = false,
     tool_call_token_logprobs: bool = false,
     model_revision: ?[]const u8 = null,
@@ -72,6 +121,7 @@ pub const Invocation = struct {
     instructions: []const u8,
     items: []const Item,
     validation_error: ?[]const u8 = null,
+    usage: ?*Usage = null,
 };
 
 /// Render typed user evidence as real provider content, keeping item identity
@@ -131,6 +181,28 @@ pub const TokenEvidence = struct {
         return self.get_distribution(self.ptr, a, item, path, values);
     }
 };
+/// Attempt usage is independent of output parsing and validation. An adapter
+/// records each provider attempt once, including failed HTTP responses/retries.
+pub const Usage = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    observed: bool = false,
+    /// Native scalar endpoints report prompt/completion usage in the envelope,
+    /// even when the returned status or generated content is invalid.
+    pub fn recordResponse(self: *Usage, value: Json) void {
+        if (value != .object) return;
+        const usage = value.object.get("usage") orelse return;
+        const GenerationUsage = @import("antfly_generating").GenerationUsage;
+        const reported = GenerationUsage.fromValue(usage, "prompt_tokens", "completion_tokens", "total_tokens") orelse
+            GenerationUsage.fromValue(usage, "input_tokens", "output_tokens", "total_tokens") orelse return;
+        self.record(reported.input_tokens, reported.output_tokens);
+    }
+    pub fn record(self: *Usage, input: u64, output: u64) void {
+        self.input_tokens +|= input;
+        self.output_tokens +|= output;
+        self.observed = true;
+    }
+};
 pub const Reply = struct {
     /// {"items":[{"item":<original position>,"value":<answer>}, ...]}
     value: Json,
@@ -140,6 +212,7 @@ pub const Reply = struct {
     token_evidence: ?TokenEvidence = null,
 };
 pub const Executor = struct {
+    limits: Limits = .{},
     ptr: *anyopaque,
     invoke: *const fn (*anyopaque, Allocator, Invocation) anyerror!Reply,
     checkpoint: ?*const fn (*anyopaque) anyerror!void = null,
@@ -264,6 +337,9 @@ pub fn execute(a: Allocator, executor: Executor, mode: Output, value_schema: Jso
 pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_schema: Json, instructions: []const u8, batch: Batch, inputs: []const Json) !Result {
     try batch.validate();
     try validateSchema(value_schema);
+    const costs = try a.alloc(EvidenceCost, inputs.len);
+    defer a.free(costs);
+    for (inputs, costs) |input, *cost| cost.* = try evidenceCost(input);
     const sizes = try a.alloc(usize, inputs.len);
     defer a.free(sizes);
     for (inputs, sizes) |input, *size| {
@@ -289,7 +365,7 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
     @memset(result.token_evidence, null);
     var begin: usize = 0;
     while (begin < inputs.len) {
-        if (sizes[begin] > batch.max_input_bytes) {
+        if (sizes[begin] > batch.max_input_bytes or !executor.limits.accepts(costs[begin])) {
             result.failures[begin] = error.ConstrainedInputTooLarge;
             result.execution.rejected_items += 1;
             begin += 1;
@@ -297,10 +373,14 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
         }
         var pending: std.ArrayList(Item) = .empty;
         var bytes: usize = 0;
+        var media = EvidenceCost{};
         while (begin + pending.items.len < inputs.len and pending.items.len < batch.max_items_per_call) {
             const id = begin + pending.items.len;
             if (sizes[id] > batch.max_input_bytes) break;
             if (sizes[id] > batch.max_input_bytes - bytes) break;
+            const next_media = media.add(costs[id]);
+            if (!executor.limits.accepts(next_media)) break;
+            media = next_media;
             bytes += sizes[id];
             try pending.append(a, .{ .id = id, .input = inputs[id] });
         }
@@ -324,13 +404,17 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
                 } else result.execution.serial_items += pending.items.len;
             }
             result.calls += 1;
+            var usage = Usage{};
             const reply = executor.invoke(executor.ptr, a, .{
+                .usage = &usage,
                 .mode = mode,
                 .schema = try batchSchema(a, value_schema, pending.items),
                 .instructions = instructions,
                 .items = pending.items,
                 .validation_error = if (attempt == 0) null else validation_error orelse "Return exactly one schema-valid result for each requested item, preserving the IDs.",
             }) catch |err| {
+                result.input_tokens +|= usage.input_tokens;
+                result.output_tokens +|= usage.output_tokens;
                 if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled) return err;
                 for (pending.items) |item| result.failures[item.id] = err;
                 if (err == error.Timeout) {
@@ -340,8 +424,9 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
                 }
                 break :attempts;
             };
-            result.input_tokens +|= reply.input_tokens;
-            result.output_tokens +|= reply.output_tokens;
+            if (!usage.observed) usage.record(reply.input_tokens, reply.output_tokens);
+            result.input_tokens +|= usage.input_tokens;
+            result.output_tokens +|= usage.output_tokens;
             const rows = if (reply.value == .object) reply.value.object.get("items") else null;
             if (rows) |entries| if (entries == .array) {
                 const duplicates = try a.alloc(bool, end - begin);
@@ -796,4 +881,83 @@ test "constrained evidence renderer preserves provider images without duplicatin
     const native = try evidenceMessages(a, invocation, "System", false);
     try std.testing.expectEqualStrings("image/png", native[3].content.?.parts[1].media.mime_type);
     try std.testing.expectEqualStrings("iVBORw0KGgo=", native[3].content.?.parts[1].media.data);
+}
+
+test "constrained batches respect encoded media ceilings and preserve oversized siblings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fake = struct {
+        calls: usize = 0,
+        fn invoke(ptr: *anyopaque, alloc: Allocator, request: Invocation) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), request.items.len);
+            var row = object();
+            try put(alloc, &row, "item", .{ .integer = @intCast(request.items[0].id) });
+            try put(alloc, &row, "value", .{ .bool = true });
+            var root = object();
+            try put(alloc, &root, "items", try array(alloc, &.{row}));
+            return .{ .value = root };
+        }
+    };
+    var fake = Fake{};
+    const image = try std.json.parseFromSliceLeaky(Json, a,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]
+    , .{});
+    const schema = try parseReply(a, "{\"type\":\"boolean\"}");
+    const executor = Executor{ .ptr = &fake, .invoke = Fake.invoke, .limits = .{ .max_encoded_media_bytes_per_call = 8 } };
+    const result = try executeEvidence(a, executor, .grammar, schema, "", .{}, &.{ image, image });
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expect(result.values[0].?.bool and result.values[1].?.bool);
+    var narrow = executor;
+    narrow.limits.max_encoded_media_bytes_per_call = 7;
+    const partial = try executeEvidence(a, narrow, .grammar, schema, "", .{}, &.{ image, .{ .string = "Valid text" } });
+    try std.testing.expectEqual(error.ConstrainedInputTooLarge, partial.failures[0].?);
+    try std.testing.expect(partial.values[1].?.bool);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "constrained attempts account failure repair and success exactly once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fake = struct {
+        calls: usize = 0,
+        fn invoke(ptr: *anyopaque, alloc: Allocator, request: Invocation) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            request.usage.?.record(12, 3);
+            if (request.items[0].id == 0) return error.DecisionUpstreamFailure;
+            if (self.calls == 2) return .{ .value = try parseReply(alloc, "{\"items\":[]}"), .input_tokens = 12, .output_tokens = 3 };
+            return .{ .value = try parseReply(alloc, "{\"items\":[{\"item\":1,\"value\":true}]}"), .input_tokens = 12, .output_tokens = 3 };
+        }
+    };
+    var fake = Fake{};
+    const result = try execute(a, .{ .ptr = &fake, .invoke = Fake.invoke }, .grammar, try parseReply(a, "{\"type\":\"boolean\"}"), "", .{ .max_items_per_call = 1 }, &.{ "Failed", "Repaired" });
+    try std.testing.expectEqual(error.DecisionUpstreamFailure, result.failures[0].?);
+    try std.testing.expect(result.values[1].?.bool);
+    try std.testing.expectEqual(@as(u64, 36), result.input_tokens);
+    try std.testing.expectEqual(@as(u64, 9), result.output_tokens);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "constrained timeout retains reported attempt usage and successful siblings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fake = struct {
+        fn invoke(_: *anyopaque, alloc: Allocator, request: Invocation) !Reply {
+            request.usage.?.record(12, 3);
+            if (request.items[0].id > 0) return error.Timeout;
+            return .{ .value = try parseReply(alloc, "{\"items\":[{\"item\":0,\"value\":true}]}"), .input_tokens = 12, .output_tokens = 3 };
+        }
+    };
+    var marker: u8 = 0;
+    const result = try execute(a, .{ .ptr = &marker, .invoke = Fake.invoke }, .grammar, try parseReply(a, "{\"type\":\"boolean\"}"), "", .{ .max_items_per_call = 1 }, &.{ "Successful", "Timed out", "Not dispatched" });
+    try std.testing.expect(result.values[0].?.bool);
+    try std.testing.expectEqual(error.Timeout, result.failures[1].?);
+    try std.testing.expectEqual(error.Timeout, result.failures[2].?);
+    try std.testing.expectEqual(@as(u64, 24), result.input_tokens);
+    try std.testing.expectEqual(@as(u64, 6), result.output_tokens);
 }

@@ -49,6 +49,7 @@ pub const Runtime = struct {
     http: *httpx.Client,
     options: generating.BackendFactory.Options = .{},
     cache: *remote.Cache,
+    limits: constrained.Limits = .{},
     semantic_validation: ?struct {
         ptr: *anyopaque,
         validate: *const fn (*anyopaque, Allocator, usize, Json, ?constrained.TokenEvidence) anyerror!void,
@@ -88,7 +89,7 @@ pub const Runtime = struct {
             if (lease.descriptor_revision) |revision| cfg.capability_revision = try a.dupe(u8, revision.slice());
         }
         const caps = native orelse return error.UnsupportedConstrainedOutput;
-        return .{ .images = caps.input_modalities.image, .grammar = caps.generation_grammar_v1, .token_logprobs = caps.generation_token_logprobs_v1, .model_revision = if (caps.model_revision) |revision| try std.fmt.allocPrint(a, "{x}", .{&revision}) else null };
+        return .{ .limits = constrained.Limits.fromNativeBatch(caps.batch), .images = caps.input_modalities.image, .grammar = caps.generation_grammar_v1, .token_logprobs = caps.generation_token_logprobs_v1, .model_revision = if (caps.model_revision) |revision| try std.fmt.allocPrint(a, "{x}", .{&revision}) else null };
     }
 
     pub fn execute(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig, mode: constrained.Output, schema: Json, instructions: []const u8, batch: constrained.Batch, inputs: []const []const u8) !constrained.Result {
@@ -98,7 +99,7 @@ pub const Runtime = struct {
 
     pub fn executeEvidence(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig, mode: constrained.Output, schema: Json, instructions: []const u8, batch: constrained.Batch, inputs: []const Json) !constrained.Result {
         var backend = Backend{ .runtime = self, .cfg = cfg };
-        return constrained.executeEvidence(a, .{ .ptr = &backend, .invoke = Backend.invoke, .checkpoint = Backend.checkpoint, .validate_item = Backend.validateItem }, mode, schema, instructions, batch, inputs);
+        return constrained.executeEvidence(a, .{ .limits = self.limits, .ptr = &backend, .invoke = Backend.invoke, .checkpoint = Backend.checkpoint, .validate_item = Backend.validateItem }, mode, schema, instructions, batch, inputs);
     }
 
     const Backend = struct {
@@ -111,6 +112,10 @@ pub const Runtime = struct {
         fn validateItem(ptr: *anyopaque, a: Allocator, id: usize, value: Json, proof: ?constrained.TokenEvidence) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.runtime.semantic_validation) |validation| try validation.validate(validation.ptr, a, id, value, proof);
+        }
+        fn recordUsage(ptr: *anyopaque, input: u64, output: u64) void {
+            const usage: *constrained.Usage = @ptrCast(@alignCast(ptr));
+            usage.record(input, output);
         }
         fn invoke(ptr: *anyopaque, a: Allocator, request: constrained.Invocation) !constrained.Reply {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -148,6 +153,7 @@ pub const Runtime = struct {
                 .execution = self.runtime.options.execution,
                 .request_context = self.runtime.options.request_context,
                 .limits = self.runtime.options.limits,
+                .usage_observer = if (request.usage) |usage| .{ .ptr = usage, .record_fn = recordUsage } else null,
             }, messages) catch |err| switch (err) {
                 error.InvalidStructuredOutput, error.InvalidGeneratedToolArguments => return .{ .value = try std.json.parseFromSliceLeaky(Json, a, "{\"items\":[]}", .{}) },
                 else => return err,

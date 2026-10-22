@@ -133,6 +133,7 @@ pub const Executor = struct {
             .antfly_url = self.inference_api_url,
             .antfly_api_key = self.inference_api_key,
         };
+        defer runtime.deinit();
         const results = try runtime.provider().evaluateBatch(a, &.{.{ .decider = name, .input = input, .questions = if (questions == .array) try decisions.publicQuestions(a, questions) else questions }});
         return results[0];
     }
@@ -154,6 +155,7 @@ pub const Executor = struct {
             .antfly_url = self.inference_api_url,
             .antfly_api_key = self.inference_api_key,
         };
+        defer runtime.deinit();
         const result = try runtime.evaluatePartial(a, requests);
         var data: Json = .{ .array = std.array_list.Managed(Json).init(a) };
         for (batch.items, result.values, result.failures, 0..) |item, value, failure, index| {

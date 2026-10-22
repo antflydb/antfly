@@ -199,6 +199,7 @@ pub const Adapter = struct {
         const previous_provider = self.decision_provider;
         defer self.decision_provider = previous_provider;
         decision_runtime = try self.decisionRuntime();
+        defer if (decision_runtime) |*active| active.deinit();
         if (decision_runtime) |*active| self.decision_provider = active.provider();
         if (self.policy_proofs != null) return zig017_failure: {
             zig017_return_error = error.InvalidSqlBackendResponse;
