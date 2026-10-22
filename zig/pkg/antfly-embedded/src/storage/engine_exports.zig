@@ -262,6 +262,7 @@ fn activateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
 }
 
 const prepareTransactionAssemblyWithPolicyLease = @import("db/prepared_assembly_boundary.zig").invoke;
+const drainPreparedAssembliesWithAdmission = @import("db/prepared_assembly_boundary.zig").drain;
 const refreshTransactionAssembly = @import("db/prepared_assembly_boundary.zig").refresh;
 
 fn batchPrepared(self: *DB.PreparedBatchOwner, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions, memo: *@import("db/execution_resources.zig").GeneratedEmbeddingMemo, allocator: *@import("db/execution_resources.zig").PreparedRowAllocator) engine.Outcome(void) {

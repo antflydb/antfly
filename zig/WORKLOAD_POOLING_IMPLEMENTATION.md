@@ -23000,3 +23000,56 @@ receipts; prepared-drain-verified.json retains the final source snapshots. The
 970-source production boundary, generated errors, control catalog, formatting
 and whitespace checks pass. The first diagnostic run is not final qualification.
 Full physical shutdown ownership and the broader design remain open.
+
+### Checked storage-owner candidate drain entry
+
+The scheduled drain now has a checked storage-engine method-table entry and
+export, backed by `prepared_assembly_boundary.drain`. The prior DB method could
+name the operation but a compiled consumer could not instantiate that dispatch:
+the method-table field and export were missing. The adapter borrows the original
+port synchronously and returns the physical owner's named outcome. Signature
+assertions tie the adapter to the method table. A caller-owned synchronous relay
+preserves arbitrary original lifetime/checkpoint/deadline and begin/end errors;
+only catalogued cancellation crosses the callback ABI. It preserves the first
+rejection and always attempts the original end after a successful begin, even
+when the parked lifetime has already failed. Native ABI 71 and storage-owner
+ABI 129 fence the expanded native method contract; durable formats, reader floors
+and default activation are unchanged.
+
+Checked C dispatch coverage uses the real prepared candidate and admission port.
+An invalid method contract rejects before DB fencing or callbacks. Missing wait
+metadata, original lifetime rejection, failed wait entry and failed reentry retain
+candidate dependency/quota pins until the original cleanup owner retries. The
+success case retires them. Distinct local trampolines exercise the contract and
+status path; they do not prove a separately compiled linked image. The existing
+storage-owner linkage probe now calls the actual consumer DB entry, checks named
+lifetime/reentry failures, retries the fenced owner and verifies that successful
+drain leaves physical DB teardown with its owner. Running that full linked-image
+probe remains open.
+
+The Apache production boundary checker also resolves the standalone
+`inference_execution_control` module to its actual source rather than treating
+its name as configuration. Regression coverage traverses it, rejects a missing
+source and rejects a transitive server import. This adds no runtime authority.
+Full physical shutdown ownership, route ownership, executable recovery funding,
+mandatory completion and the remaining scheduler design remain open. Strong
+required providers remain disabled. Full Linux qualification remains waived;
+Linux uses the pinned Nix/glibc Zig toolchain.
+
+Pinned Debug qualification passes 11 focused lifetime/drain cases, 86 required DB
+cases, 15 backlog cases, 51 error/identity companions and five native ABI cases:
+168 native executions with no failures, skips or leaks. The final frozen-source
+receipt is prepared-drain-boundary-v3; all 5,502 native/schema inputs match.
+The initial diagnostic run exposed an untransportable original callback error;
+it is not final qualification. The caller relay now preserves that error across
+checked admission and wait trampolines, including a parked rejection followed by
+a secondary reentry failure. Source snapshots and checks are retained in
+prepared-drain-boundary-verified.json in the cumulative receipts.
+
+The 36 Apache boundary checker tests pass. The production boundary follows 2,503
+sources, and the embedded boundary follows 1,034 sources with no server
+coordination imports. Generated errors, control catalog, formatting and whitespace
+checks pass. A declaration audit finds entries for all 376 literal DB dispatches
+and exports for all 481 storage method-table fields. This audit supplements the
+runtime cases; full linked-owner, physical shutdown and cross-engine qualification
+remain open.

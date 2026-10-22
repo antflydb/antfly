@@ -30,7 +30,52 @@ pub fn refresh(self: *db.DB, plan: *physical.OwnedPhysicalPlan, original: ?contr
     return .{ .value = self.refreshTransactionAssembly(plan, original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
 }
 
+/// The original port is a synchronous borrow. Retirement callbacks remain in
+/// the physical owner; only the named outcome crosses back to the caller.
+pub fn drain(self: *db.DB, original: control.Port) engine.Outcome(void) {
+    return .{ .value = self.drainPreparedAssembliesWithAdmission(original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
+}
+
+/// Runs in the caller's compilation so arbitrary original control failures
+/// never need a status-catalog entry. The borrowed relay cannot escape invoke.
+/// Reentry is mandatory after successful begin, even after lifetime rejection.
+pub fn callDrain(self: *db.DB, original: control.Port, comptime invoke_owner: fn (*db.DB, control.Port) anyerror!void) !void {
+    var relay: DrainRelay = .{};
+    const borrowed = try relay.bind(original);
+    invoke_owner(self, borrowed) catch |cause| return relay.errors.rejection orelse cause;
+    if (relay.errors.rejection) |cause| return cause;
+}
+
+const DrainRelay = struct {
+    errors: control.ErrorRelay = .{},
+    original_wait: ?@import("../../common/execution_wait.zig").Boundary = null,
+    fn bind(self: *DrainRelay, original: control.Port) !control.Port {
+        const borrowed = try self.errors.bind(original);
+        self.original_wait = self.errors.payload.execution_wait;
+        if (self.original_wait != null) self.errors.payload.execution_wait = .{ .ptr = self, .begin = begin, .end = end };
+        return borrowed;
+    }
+    fn reject(self: *DrainRelay, cause: anyerror) anyerror {
+        self.errors.rejection = self.errors.rejection orelse cause;
+        return error.Canceled;
+    }
+    fn begin(raw: *anyopaque) !void {
+        const self: *DrainRelay = @ptrCast(@alignCast(raw));
+        if (self.errors.rejection != null) return error.Canceled;
+        self.original_wait.?.beginWait() catch |cause| return self.reject(cause);
+    }
+    fn end(raw: *anyopaque) !void {
+        const self: *DrainRelay = @ptrCast(@alignCast(raw));
+        // Do not gate reentry on a prior rejection: the original caller still
+        // owns this balanced wait pair and must get its grant back or its own
+        // reentry failure before any retirement callback can run.
+        self.original_wait.?.endWait() catch |cause| return self.reject(cause);
+    }
+};
+
 comptime {
+    const drain_signature: @FieldType(engine.VTable, "drainPreparedAssembliesWithAdmission") = &drain;
+    _ = drain_signature;
     const signature: @FieldType(engine.VTable, "prepareTransactionAssemblyWithPolicyLease") = &invoke;
     _ = signature;
     const refresh_signature: @FieldType(engine.VTable, "refreshTransactionAssembly") = &refresh;

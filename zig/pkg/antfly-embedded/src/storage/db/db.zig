@@ -6180,7 +6180,11 @@ pub const DB = struct {
     /// not the physical DB or its other worker owners.
     /// Failure keeps the fenced owner for the original cleanup path to retry.
     pub fn drainPreparedAssembliesWithAdmission(self: *DB, original: @import("../../common/read_admission.zig").Port) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("drainPreparedAssembliesWithAdmission", .{ self, original });
+        if (comptime storage_engine.enabled) return @import("prepared_assembly_boundary.zig").callDrain(self, original, struct {
+            fn invoke(database: *DB, borrowed: @import("../../common/read_admission.zig").Port) anyerror!void {
+                return storage_engine.call("drainPreparedAssembliesWithAdmission", .{ database, borrowed });
+            }
+        }.invoke);
         if (self.closed) return;
         self.async_context.background_closing.store(true, .release);
         if (self.local_execution.retained_preparation_owner) |owner| try owner.closeWithAdmission(original);
@@ -149096,4 +149100,123 @@ test "db prepared transaction effects required assembly prepared lifetime drain 
     health.finish();
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
     db.close();
+}
+
+test "db prepared transaction effects required assembly prepared lifetime checked owner drain preserves outcomes and resumable pins" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    const control = @import("../../common/read_admission.zig");
+    const entry = @import("prepared_assembly_boundary.zig");
+    const abi = @import("antfly_runtime_abi");
+    const Case = enum { success, bad_contract, no_boundary, lifetime_failure, begin_failure, end_failure, end_callback_failure, parked_lifetime_and_end_failure };
+    const Hook = struct {
+        case: Case,
+        access: *@import("prepared_lifetime.zig").Access,
+        parked: bool = false,
+        checkpoints: usize = 0,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoints += 1;
+        }
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.case == .lifetime_failure or (self.case == .parked_lifetime_and_end_failure and self.parked)) return error.TestWindowFailed;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            if (self.case == .begin_failure) return error.TestWindowFailed;
+            self.parked = true;
+            if (self.case != .parked_lifetime_and_end_failure) self.access.deinit();
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            if (self.case == .end_failure or self.case == .parked_lifetime_and_end_failure) return error.DeadlineExceeded;
+            if (self.case == .end_callback_failure) return error.TestWindowFailed;
+            self.parked = false;
+        }
+        fn admissionDispatch(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            return control.Boundary.local_dispatch(contract, callback, args, output);
+        }
+        fn waitDispatch(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            return abi.execution_wait.Boundary.local_dispatch(contract, callback, args, output);
+        }
+        fn call(database: *DB, borrowed: control.Port) anyerror!void {
+            return callChecked(database, borrowed, false);
+        }
+        fn invalidCall(database: *DB, borrowed: control.Port) anyerror!void {
+            return callChecked(database, borrowed, true);
+        }
+        fn callChecked(database: *DB, borrowed: control.Port, invalid: bool) !void {
+            // The relay is caller-owned, so force its callbacks through the
+            // checked path just as a separately compiled owner would do.
+            var received = @as(*const control.Payload, @ptrCast(@alignCast(borrowed.payload))).*;
+            received.dispatch = admissionDispatch;
+            if (received.execution_wait) |*boundary| boundary.boundary_dispatch = waitDispatch;
+            const outcome = try storage_engine.Boundary.call("drainPreparedAssembliesWithAdmission", if (invalid) invalidDispatch else dispatch, &entry.drain, .{ database, control.Port.init(&received) });
+            if (outcome.failure.ptr) |ptr| return @import("storage_engine_errors").fromName(ptr[0..outcome.failure.len]);
+        }
+        // Distinct trampoline addresses exercise checked C dispatch. The
+        // separately compiled archive still needs its linked-image probe.
+        fn dispatch(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            return storage_engine.Boundary.local_dispatch(contract, callback, args, output);
+        }
+        fn invalidDispatch(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            var invalid = contract.*;
+            invalid.version += 1;
+            return storage_engine.Boundary.local_dispatch(&invalid, callback, args, output);
+        }
+    };
+    for (std.enums.values(Case)) |case| {
+        var directory = try TestDirectory.init("prepared-owner-drain");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), F.options);
+        defer db.close();
+        try F.seed(&db, false, false);
+        var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+        defer plan.deinit();
+        var access = try plan.enterLifetime();
+        defer access.deinit();
+        const owner = access.guard.?.owner;
+        var hook: Hook = .{ .case = case, .access = &access };
+        var payload: control.Payload = .{ .ptr = &hook, .vtable = &.{ .checkpoint = Hook.checkpoint, .check_lifetime = Hook.lifetime, .deadline_ns = Hook.deadline }, .execution_wait = if (case == .no_boundary) null else .{ .ptr = &hook, .begin = Hook.begin, .end = Hook.end } };
+        const outcome = if (case == .bad_contract) entry.callDrain(&db, .init(&payload), Hook.invalidCall) else entry.callDrain(&db, .init(&payload), Hook.call);
+        if (case == .bad_contract) {
+            try std.testing.expectError(error.UnsupportedVersion, outcome);
+            try std.testing.expect(!owner.closing.load(.acquire));
+            try std.testing.expect(!db.async_context.background_closing.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), hook.checkpoints);
+        } else {
+            if (case == .success) {
+                try outcome;
+                try std.testing.expect(owner.closed.load(.acquire));
+                try std.testing.expect(plan.backlog_admission.?.reservation == null);
+            } else {
+                const expected: anyerror = switch (case) {
+                    .no_boundary => error.ExecutionWaitUnsupported,
+                    .lifetime_failure, .begin_failure, .end_callback_failure, .parked_lifetime_and_end_failure => error.TestWindowFailed,
+                    .end_failure => error.DeadlineExceeded,
+                    else => unreachable,
+                };
+                try std.testing.expectError(expected, outcome);
+                try std.testing.expect(owner.closing.load(.acquire));
+                try std.testing.expect(!owner.closed.load(.acquire));
+                try std.testing.expect(plan.backlog_admission.?.reservation != null);
+                try std.testing.expectError(error.Canceled, plan.enterLifetime());
+            }
+        }
+        try std.testing.expectEqual(@as(usize, if (case == .success or case == .begin_failure or case == .end_failure or case == .end_callback_failure or case == .parked_lifetime_and_end_failure) 1 else 0), hook.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .success or case == .end_failure or case == .end_callback_failure or case == .parked_lifetime_and_end_failure) 1 else 0), hook.ends);
+        access.deinit();
+        // The original quiesced cleanup owner keeps the DB alive on failure.
+        // It completes once without obtaining a new deadline or reservation.
+        db.close();
+        try std.testing.expect(plan.backlog_admission.?.reservation == null);
+    }
 }

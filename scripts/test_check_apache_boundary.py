@@ -258,6 +258,22 @@ class ApacheBoundaryTests(unittest.TestCase):
             )
         )
 
+    def test_inference_execution_control_is_traversed_as_source(self):
+        target = "zig/pkg/inference/src/execution_control.zig"
+        source = 'const control = @import("inference_execution_control");'
+        seen, errors = self.check_fixture(source, {target: ""})
+        self.assertIn(target, seen)
+        self.assertEqual([], errors)
+        _, errors = self.check_fixture(source)
+        self.assertTrue(any(f"missing source: {target}" in error for error in errors))
+        _, errors = self.check_fixture(
+            source,
+            {
+                target: 'const server = @import("../../antfly/src/main.zig");',
+            },
+        )
+        self.assertTrue(any("non-Apache dependency" in error for error in errors))
+
     def test_rejects_missing_named_source_module(self):
         _, errors = self.check_fixture('const httpx = @import("httpx");')
         self.assertTrue(
