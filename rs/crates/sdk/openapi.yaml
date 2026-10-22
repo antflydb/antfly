@@ -14598,6 +14598,122 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+  /ai/v1/models/instances:
+    get:
+      summary: List model instances
+      description: Inspect this inference server's shared model cache without loading models or extending
+        idle eviction deadlines. Each incarnation appears once, even when it supports multiple tasks.
+      operationId: listModelInstances
+      tags:
+        - Models
+      responses:
+        '200':
+          description: Loaded and loading model instances
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceModelInstanceList'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+    post:
+      summary: Load a model instance
+      description: Prepare the instance used by the requested task. Reuses an existing compatible instance.
+        Normal idle eviction still applies; loading does not pin weights or guarantee device residency.
+      operationId: loadModelInstance
+      tags:
+        - Models
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceModelInstanceLoadRequest'
+      responses:
+        '200':
+          description: Prepared model instance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceModelInstance'
+        '400':
+          description: Invalid model or unsupported task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '404':
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/models/instances/{instance_id}:
+    delete:
+      summary: Unload a model instance
+      description: Evict one exact incarnation from the shared server cache. A stale ID is an idempotent
+        miss and never evicts a replacement. Loading, busy, and startup-managed instances cannot be unloaded.
+      operationId: unloadModelInstance
+      tags:
+        - Models
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Instance unloaded or already absent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceModelInstanceUnloadResponse'
+        '400':
+          description: Malformed instance ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '409':
+          description: Instance is loading, has active owners, or is managed by startup configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/models:
     get:
       summary: List available models
@@ -17874,6 +17990,16 @@ components:
           type: boolean
           description: True when this model is referenced by a configured embedder, generator, reranker,
             or chunker.
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: Inference capabilities advertised by the provider for this model and task.
+        inputs:
+          type: array
+          items:
+            type: string
+          description: Input modalities accepted by the provider's resolved executor.
     InferenceConnection:
       type: object
       required:
@@ -42544,6 +42670,100 @@ components:
           maxLength: 4096
         wait:
           $ref: '#/components/schemas/ResolverWait'
+    InferenceModelInstance:
+      type: object
+      description: One loading or loaded incarnation of a model in this inference server. Backend session
+        and composite-cache implementation details are private.
+      required:
+        - id
+        - model
+        - tasks
+        - state
+        - active_handles
+        - startup_managed
+        - unloadable
+        - residency_mode
+        - idle_ms
+      properties:
+        id:
+          type: string
+          description: Opaque incarnation identifier; changes after eviction and reload.
+        model:
+          type: string
+        tasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceModelKind'
+        state:
+          type: string
+          enum:
+            - loading
+            - loaded
+        active_handles:
+          type: integer
+          format: int64
+          description: Internal owners or loading waiters preventing eviction. This is not a count of
+            HTTP requests.
+        startup_managed:
+          type: boolean
+        unloadable:
+          type: boolean
+          description: Whether an unload would be permitted at snapshot time; concurrent use can change
+            this.
+        unload_blocked_reason:
+          type: string
+          enum:
+            - loading
+            - in_use
+            - startup_managed
+        backend:
+          type: string
+          description: Selected execution backend, when known.
+        residency_mode:
+          type: string
+          enum:
+            - backend_managed
+            - streamed
+            - resident
+          description: Weight residency policy; loaded does not imply full device residency.
+        idle_ms:
+          type: integer
+          format: int64
+          description: Elapsed milliseconds since last use, not a wall-clock timestamp.
+    InferenceModelInstanceList:
+      type: object
+      required:
+        - object
+        - data
+      properties:
+        object:
+          type: string
+          enum:
+            - list
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceModelInstance'
+    InferenceModelInstanceLoadRequest:
+      type: object
+      required:
+        - model
+        - task
+      properties:
+        model:
+          type: string
+        task:
+          $ref: '#/components/schemas/InferenceModelKind'
+    InferenceModelInstanceUnloadResponse:
+      type: object
+      required:
+        - outcome
+      properties:
+        outcome:
+          type: string
+          enum:
+            - unloaded
+            - already_unloaded
     InferenceError:
       type: object
       required:

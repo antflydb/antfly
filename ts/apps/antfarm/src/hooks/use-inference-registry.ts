@@ -7,38 +7,7 @@ import type {
   QuantizationOption,
 } from "@/data/inference-models";
 import { useConnectedModels } from "@/hooks/use-connections";
-
-type InferenceTaskKey =
-  | "embedders"
-  | "rerankers"
-  | "chunkers"
-  | "generators"
-  | "extractors"
-  | "rewriters"
-  | "readers"
-  | "transcribers"
-  | "deciders"
-  | "synthesizers"
-  | "predictors"
-  | "chains"
-  | "other";
-
-const TASK_TO_TYPE: Record<InferenceTaskKey, ModelType> = {
-  deciders: "decider",
-  synthesizers: "synthesizer",
-  predictors: "predictor",
-  chains: "generator",
-  embedders: "embedder",
-  rerankers: "reranker",
-  chunkers: "chunker",
-  generators: "generator",
-  extractors: "extractor",
-  rewriters: "rewriter",
-  readers: "reader",
-  transcribers: "transcriber",
-  // OpenAI-compatible listing APIs generally do not report task metadata.
-  other: "generator",
-};
+import { INFERENCE_MODEL_GROUPS, INFERENCE_MODEL_GROUP_TYPES } from "@/lib/inference-model-tasks";
 
 const MODEL_TYPE_NAMES: Record<ModelType, string> = {
   decider: "decision",
@@ -54,7 +23,7 @@ const MODEL_TYPE_NAMES: Record<ModelType, string> = {
   transcriber: "transcription",
 };
 
-const TASK_KEYS = Object.keys(TASK_TO_TYPE) as InferenceTaskKey[];
+const TASK_KEYS = INFERENCE_MODEL_GROUPS.filter((task) => task !== "rewriters");
 
 function modelId(type: ModelType, name: string): string {
   return `${type}-${name}`
@@ -106,13 +75,6 @@ const MODEL_TYPES: ModelTypeInfo[] = [
     name: "Extractor",
     description: "Entity extraction, relation extraction, and question answering",
     icon: "Tag",
-  },
-  {
-    type: "rewriter",
-    name: "Rewriter",
-    description:
-      "Sequence-to-sequence text transformation like paraphrasing and question generation",
-    icon: "RefreshCw",
   },
   {
     type: "generator",
@@ -189,7 +151,9 @@ export function transformConnectionModels(connections: Connection[]): InferenceM
     const connectionName = connection.display_name ?? connection.name;
 
     for (const task of TASK_KEYS) {
-      const type = TASK_TO_TYPE[task];
+      const kind = INFERENCE_MODEL_GROUP_TYPES[task];
+      const type: ModelType =
+        kind === "other" ? "generator" : kind === "classifier" ? "decider" : kind;
       for (const listed of inference.models[task] ?? []) {
         const id = modelId(type, `${connection.id}-${listed.name}`);
         if (seen.has(id)) continue;
@@ -208,6 +172,9 @@ export function transformConnectionModels(connections: Connection[]): InferenceM
           sourceUrl,
           type,
           description: `${MODEL_TYPE_NAMES[type][0]?.toUpperCase()}${MODEL_TYPE_NAMES[type].slice(1)} model available through ${connectionName}.`,
+          capabilities: listed.capabilities,
+          inputs: listed.inputs,
+          allowDownloads: inference.provider === "antfly",
           variants: [],
           inRegistry: connection.status === "connected" || connection.id === "named-inference",
           availability: connection.id === "named-inference" ? "unknown" : connection.status,

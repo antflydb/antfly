@@ -9590,7 +9590,7 @@ test "standalone inference middleware reuses public API authentication" {
     var table_read = try antfly.usermgr.Permission.initOwned(alloc, .table, "documents", .read);
     defer table_read.deinit(alloc);
     try manager.addPermissionToUser("admin", table_read);
-    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics", "/ai//v1/models/", "//ml/v1/metrics" }) |path| {
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics", "/ai//v1/models/", "//ml/v1/metrics", "/ai/v1/models/instances" }) |path| {
         try Harness.expect(middleware, path, null, 401);
         try Harness.expect(middleware, path, "Basic YWRtaW46d3Jvbmc=", 401);
         try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 403);
@@ -9599,15 +9599,29 @@ test "standalone inference middleware reuses public API authentication" {
     var inference_read = try antfly.usermgr.Permission.initOwned(alloc, .inference, "*", .read);
     defer inference_read.deinit(alloc);
     try manager.addPermissionToUser("admin", inference_read);
-    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics", "/ai//v1/models/", "//ml/v1/metrics" }) |path| {
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics", "/ai//v1/models/", "//ml/v1/metrics", "/ai/v1/models/instances" }) |path| {
         try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 204);
     }
     try Harness.expectMethod(middleware, .POST, "/ai/v1/generate", "Basic YWRtaW46YWRtaW4=", 403);
+    for ([_]struct { httpx.Method, []const u8 }{
+        .{ .POST, "/ai/v1/models/instances" },
+        .{ .DELETE, "/ai/v1/models/instances/example" },
+    }) |route| {
+        try Harness.expectMethod(middleware, route[0], route[1], null, 401);
+        try Harness.expectMethod(middleware, route[0], route[1], "Basic YWRtaW46YWRtaW4=", 403);
+    }
 
     var inference_write = try antfly.usermgr.Permission.initOwned(alloc, .inference, "*", .write);
     defer inference_write.deinit(alloc);
     try manager.addPermissionToUser("admin", inference_write);
     try Harness.expectMethod(middleware, .POST, "/ai/v1/generate", "Basic YWRtaW46YWRtaW4=", 204);
+    for ([_]struct { httpx.Method, []const u8 }{
+        .{ .POST, "/ai/v1/models/instances" },
+        .{ .DELETE, "/ai/v1/models/instances/example" },
+    }) |route| {
+        try Harness.expectMethod(middleware, route[0], route[1], null, 401);
+        try Harness.expectMethod(middleware, route[0], route[1], "Basic YWRtaW46YWRtaW4=", 204);
+    }
 
     var global_read = try antfly.usermgr.Permission.initOwned(alloc, .@"*", "*", .read);
     defer global_read.deinit(alloc);

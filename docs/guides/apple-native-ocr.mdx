@@ -116,6 +116,24 @@ bounded recording download. These are scheduling allowances, not hard limits on
 Apple's model memory. Cancellation and deadlines are cooperative and retain all
 borrowed buffers until the native task actually finishes.
 
+## Try OCR in Antfarm
+
+With a server built using `-Dapple-providers=true`, open **Inference → Reader
+Playground**, select the **Local inference** connection, and choose **Apple Vision OCR**.
+Configured remote connections do not offer native OCR. Upload PNG/JPEG images or choose
+**Load Sample**, then **Read Images**. Select accurate or fast recognition and
+enter comma-separated language codes, such as `en-US, fr-FR`. Accurate mode is
+the default. Results include text, confidence, and pixel-coordinate regions.
+Apple OCR extracts visible text; it does not describe scenes or answer questions
+about images. Select a vision model such as Qwen3-VL for those tasks. Photos
+without readable text may produce empty results or false text detections.
+The first request can take substantially longer while macOS initializes Vision.
+
+Availability follows the connected server, not the browser's operating system.
+Older servers and builds without Apple providers continue to show their normal
+reader models. Native OCR has no downloadable model, prompt, or token limit;
+Antfarm uses private capability and OCR handlers under `/ai/v1/_antfarm/`.
+
 ## Configure an image reader
 
 Use this producer on an asset enrichment whose field contains a PNG or JPEG URL:
