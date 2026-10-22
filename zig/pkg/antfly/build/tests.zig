@@ -5999,6 +5999,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-prepared-replay-plan-test", "Verify canonical prepared request and accepted-effect replay bounds")
         .dependOn(&addCuratedTestRunArtifact(b, replay_plan_tests, &.{"prepared replay plan"}).step);
+    const prepared_lifetime_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"prepared lifetime"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-prepared-lifetime-test", "Verify DB-close revocation and live dependency retirement for retained candidates")
+        .dependOn(&addCuratedTestRunArtifact(b, prepared_lifetime_tests, &.{"prepared lifetime"}).step);
     const retained_backlog_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "derived backlog", "retained backlog" },

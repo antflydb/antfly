@@ -272,6 +272,7 @@ pub const storage_db_prepared_mutation_dependencies = @import("storage/db/prepar
 pub const storage_db_artifact_authored_acceptance = @import("storage/db/artifact_authored_acceptance.zig");
 pub const storage_db_prepared_replay_bindings = @import("storage/db/prepared_replay_bindings.zig");
 pub const storage_db_managed_sync_targets = @import("storage/db/managed_sync_targets.zig");
+pub const storage_db_prepared_lifetime = @import("storage/db/prepared_lifetime.zig");
 pub const storage_db_prepared_completion = @import("storage/db/prepared_completion.zig");
 pub const storage_db_prepared_commit_state = @import("storage/db/prepared_commit_state.zig");
 pub const storage_db_prepared_coverage_outcomes = @import("storage/db/prepared_coverage_outcomes.zig");

@@ -4134,8 +4134,16 @@ pub const DB = struct {
             else
                 null;
             errdefer if (policy_authority_owned) if (policy_issuer) |value| alloc.free(value);
+            // Scope metadata may outlive the DB allocator/runtime after close.
+            const retained_preparation_owner = try @import("prepared_lifetime.zig").Owner.create(backgroundRuntimeAllocator(std.heap.page_allocator));
+            var retained_preparation_owner_transferred = false;
+            errdefer if (!retained_preparation_owner_transferred) {
+                retained_preparation_owner.close();
+                retained_preparation_owner.release();
+            };
             const local_execution = try runtime_alloc.create(LocalExecutionState);
             local_execution.* = .{
+                .retained_preparation_owner = retained_preparation_owner,
                 .artifact_publication_dispatcher = opts.artifact_publication_dispatcher,
                 .row_policy_gate = row_policy_gate_mod.Gate.init(core_owner.table_catalog),
                 .row_policy_authority_secret = if (policy_secret != null and policy_issuer != null) policy_secret else null,
@@ -4213,6 +4221,7 @@ pub const DB = struct {
             generation_read_lease = null;
             policy_authority_owned = false;
             errdefer db.deinitWrapperState(executor_ready);
+            retained_preparation_owner_transferred = true;
             if (db.core.table_catalog.row_policy_phase == .active) {
                 const schema = db.core.schema orelse return error.RowPolicyCatalogChanged;
                 db.local_execution.row_policy_bundle = (try row_policy_bundle_mod.load(alloc, db.core.store, db.core.identity_namespace.table_id, schema)) orelse
@@ -5273,6 +5282,7 @@ pub const DB = struct {
     /// Its cached indexes must never flush over the newer durable generation.
     pub fn closeImmutableSnapshot(self: *DB) void {
         if (self.closed) return;
+        self.stopRetainedPreparations();
         self.open_mode = .query_readonly;
         self.core.discard_storage_writes = true;
         self.close();
@@ -5281,6 +5291,7 @@ pub const DB = struct {
     pub fn close(self: *DB) void {
         if (comptime storage_engine.enabled) return storage_engine.call("close", .{self}) catch unreachable;
         if (self.closed) return;
+        self.stopRetainedPreparations();
         self.closed = true;
         self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
         self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
@@ -6163,7 +6174,17 @@ pub const DB = struct {
         self.embedding_activity.clear(self.alloc);
     }
 
+    fn stopRetainedPreparations(self: *DB) void {
+        self.async_context.background_closing.store(true, .release);
+        if (self.local_execution.retained_preparation_owner) |owner| {
+            owner.close();
+            self.local_execution.retained_preparation_owner = null;
+            owner.release();
+        }
+    }
+
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
+        self.stopRetainedPreparations();
         if (self.last_run_until_idle_no_progress) |*diagnostic| diagnostic.deinit(self.alloc);
         self.last_run_until_idle_no_progress = null;
         // Stop background workers before tearing down stores, runtimes, and
@@ -24449,8 +24470,10 @@ pub const DB = struct {
     /// Physical PREPARE validates the same table contract as local API writes.
     /// Validation scratch and principal parsing use the native preparation budget.
     /// Assemble an existing accepted transaction without changing its decision,
-    /// primary store or replay clock. The caller owns output memory and keeps
-    /// this DB alive until deinit. This candidate does not authorize a vote.
+    /// primary store or replay clock. The caller owns output memory. DB close
+    /// revokes live dependencies before teardown; a candidate may be freed
+    /// afterward. Initial calls still require a valid borrowed DB handle.
+    /// This candidate does not authorize a vote.
     pub fn prepareTransactionAssembly(self: *DB, alloc: Allocator, txn_id: types.TxnId, commit_version: u64, original: ?@import("../../common/read_admission.zig").Port) !@import("artifact_authored_acceptance.zig").OwnedPhysicalPlan {
         return self.prepareTransactionAssemblyWithPolicyLease(alloc, txn_id, commit_version, null, original);
     }
@@ -24458,16 +24481,22 @@ pub const DB = struct {
     /// A supplied lease must be the original write admission for this DB.
     /// Retaining it preserves expiry and policy identity; it grants no new role.
     pub fn prepareTransactionAssemblyWithPolicyLease(self: *DB, alloc: Allocator, txn_id: types.TxnId, commit_version: u64, lease: ?*const row_policy_gate_mod.Gate.Lease, original: ?@import("../../common/read_admission.zig").Port) !@import("artifact_authored_acceptance.zig").OwnedPhysicalPlan {
-        var trace: @import("../../common/read_admission.zig").RejectionTrace = .{};
-        const control = trace.bind(original);
+        if (self.closed) return error.Canceled;
+        var access: @import("prepared_lifetime.zig").Access = .{ .guard = try (self.local_execution.retained_preparation_owner orelse return error.Canceled).enter() };
+        defer access.deinit();
+        const control = access.bind(original);
         var result = (if (comptime storage_engine.enabled)
             storage_engine.call("prepareTransactionAssemblyWithPolicyLease", .{ self, alloc, txn_id, commit_version, lease, control })
         else
-            self.prepareTransactionAssemblyInner(alloc, txn_id, commit_version, lease, control)) catch |cause| return trace.failure orelse cause;
-        if (trace.failure) |cause| {
+            self.prepareTransactionAssemblyInner(alloc, txn_id, commit_version, lease, control)) catch |cause| return access.trace.failure orelse cause;
+        if (access.trace.failure) |cause| {
             result.deinit();
             return cause;
         }
+        access.checkLifetime() catch |cause| {
+            result.deinit();
+            return access.trace.failure orelse cause;
+        };
         return result;
     }
 
@@ -24475,13 +24504,16 @@ pub const DB = struct {
     /// inside the compiled storage owner and revalidates the original lease.
     /// It neither reserves a sequence nor authorizes or publishes a decision.
     pub fn refreshTransactionAssembly(self: *DB, plan: *@import("artifact_authored_acceptance.zig").OwnedPhysicalPlan, original: ?@import("../../common/read_admission.zig").Port) !void {
-        var trace: @import("../../common/read_admission.zig").RejectionTrace = .{};
-        const control = trace.bind(original);
+        if (self.closed) return error.Canceled;
+        var access = try plan.enterLifetime();
+        defer access.deinit();
+        if (access.guard) |guard| if (self.local_execution.retained_preparation_owner != guard.owner) return error.PreparedGenerationChanged;
+        const control = access.bind(original);
         (if (comptime storage_engine.enabled)
             storage_engine.call("refreshTransactionAssembly", .{ self, plan, control })
         else
-            self.refreshTransactionAssemblyInner(plan, control)) catch |cause| return trace.failure orelse cause;
-        if (trace.failure) |cause| return cause;
+            self.refreshTransactionAssemblyInner(plan, control)) catch |cause| return access.trace.failure orelse cause;
+        if (access.trace.failure) |cause| return cause;
     }
     fn refreshTransactionAssemblyInner(self: *DB, plan: *@import("artifact_authored_acceptance.zig").OwnedPhysicalPlan, original: ?@import("../../common/read_admission.zig").Port) !void {
         if (original) |owner| try owner.checkLifetime();
@@ -148826,7 +148858,7 @@ test "db prepared transaction effects required assembly retained backlog credits
             defer std.testing.expectEqual(initial, manager_ptr.sliceStats(.derived_backlog).used_bytes) catch @panic("assembly quota leaked on failure");
             var plan = try owner.prepareTransactionAssembly(output, F.id, 19, null);
             defer plan.deinit();
-            try std.testing.expect(plan.backlog_admission.reservation != null);
+            try std.testing.expect(plan.backlog_admission.?.reservation != null);
         }
     };
     var workspace = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
@@ -148857,8 +148889,8 @@ test "db prepared transaction effects required assembly retained backlog credits
         };
         var transferred = false;
         defer if (!transferred) plan.deinit();
-        try std.testing.expect(plan.backlog_admission.reservation != null);
-        retained += plan.backlog_admission.retained_bytes;
+        try std.testing.expect(plan.backlog_admission.?.reservation != null);
+        retained += plan.backlog_admission.?.retained_bytes;
         try plans.append(a, plan);
         transferred = true;
         try std.testing.expectEqual(baseline + retained, manager.sliceStats(.derived_backlog).used_bytes);
@@ -148867,14 +148899,14 @@ test "db prepared transaction effects required assembly retained backlog credits
     try std.testing.expect(rejected and plans.items.len > 1);
     try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
     const last = plans.items.len - 1;
-    const released = plans.items[last].backlog_admission.retained_bytes;
+    const released = plans.items[last].backlog_admission.?.retained_bytes;
     plans.items[last].deinit();
     plans.items.len = last;
     retained -= released;
     try std.testing.expectEqual(baseline + retained, manager.sliceStats(.derived_backlog).used_bytes);
     var replacement = try db.prepareTransactionAssembly(a, F.id, 19, null);
     defer replacement.deinit();
-    try std.testing.expectEqual(released, replacement.backlog_admission.retained_bytes);
+    try std.testing.expectEqual(released, replacement.backlog_admission.?.retained_bytes);
     _ = db.core.reserveDerivedAppendSequence();
     try db.refreshTransactionAssembly(&replacement, null);
     try std.testing.expectEqual(baseline + retained + released, manager.sliceStats(.derived_backlog).used_bytes);
@@ -148882,4 +148914,75 @@ test "db prepared transaction effects required assembly retained backlog credits
     defer F.free(after);
     try std.testing.expectEqualDeep(before, after);
     try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(F.id));
+}
+
+test "db prepared transaction effects required assembly prepared lifetime retires live dependencies before DB and runtime destruction" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    var directory = try TestDirectory.init("prepared-lifetime-close");
+    defer directory.cleanup();
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    var options = F.options;
+    options.resource_manager = &manager;
+    options.backend_runtime = runtime.ptr();
+    options.executor = .{ .backend = .manual };
+    var db = try DB.open(a, directory.path(), options);
+    var closed = false;
+    defer if (!closed) {
+        db.close();
+        runtime.deinit();
+        manager.deinit(a);
+    };
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try F.seed(&db, false, false);
+    var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+    defer plan.deinit();
+    const old_core = db.core;
+    try std.testing.expect(!db.local_execution.row_policy_gate.quiesced());
+    try std.testing.expect(plan.backlog_admission.?.reservation != null);
+    db.close();
+    try std.testing.expect(plan.backlog_admission.?.reservation == null);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_backlog).used_bytes);
+    runtime.deinit();
+    manager.deinit(a);
+    closed = true;
+    try std.testing.expectError(error.Canceled, plan.validateDependencies(old_core, null));
+    try std.testing.expectError(error.Canceled, plan.refreshReplaySequence(old_core, null));
+    try std.testing.expectError(error.Canceled, db.refreshTransactionAssembly(&plan, null));
+    try std.testing.expectError(error.Canceled, db.prepareTransactionAssembly(a, F.id, 19, null));
+    try std.testing.expect(plan.bytes.replay.?.payload.len > 0);
+    try std.testing.expect(plan.completion.?.batch.?.documents.len > 0);
+    var reopened = try DB.open(a, directory.path(), F.options);
+    defer reopened.close();
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try reopened.getTransactionStatus(F.id));
+    try std.testing.expectError(error.Canceled, plan.validateDependencies(reopened.core, null));
+}
+
+test "db prepared transaction effects required assembly prepared lifetime close drains active candidate access before retiring quota" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    var directory = try TestDirectory.init("prepared-lifetime-drain");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    defer db.close();
+    try F.seed(&db, false, false);
+    var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+    defer plan.deinit();
+    var access = try plan.enterLifetime();
+    defer access.deinit();
+    const owner = access.guard.?.owner;
+    const Close = struct {
+        fn run(database: *DB) void {
+            database.close();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Close.run, .{&db});
+    defer thread.join();
+    defer access.deinit();
+    while (!owner.closing.load(.acquire)) @import("antfly_platform").time.yieldNow();
+    try std.testing.expectError(error.Canceled, access.checkLifetime());
+    try std.testing.expect(!owner.closed.load(.acquire));
+    try std.testing.expect(plan.backlog_admission.?.reservation != null);
+    access.deinit();
 }

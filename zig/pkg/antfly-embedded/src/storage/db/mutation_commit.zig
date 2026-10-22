@@ -3304,8 +3304,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 prepared_physical.?.replay_bindings.?.bindValidated(&prepared_physical.?.bytes, assembly_replay_next);
                 prepared_physical.?.bindReplayPrograms(replay_bindings.symbolic, assembly_replay_next);
                 try prepared_physical.?.validateDependencies(S.ownerField(self, "core").*, publication_control);
-                prepared_physical.?.backlog_admission = backlog_admission;
+                prepared_physical.?.backlog_admission.?.* = backlog_admission;
                 backlog_admission = .{};
+                try prepared_physical.?.attachLifetime(S.ownerField(self, "local_execution").*.retained_preparation_owner orelse return error.Canceled);
                 output.plan = prepared_physical;
                 prepared_physical = null;
                 unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);

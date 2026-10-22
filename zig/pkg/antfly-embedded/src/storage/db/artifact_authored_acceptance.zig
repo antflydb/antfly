@@ -214,15 +214,15 @@ pub const Prepared = struct {
 pub const OwnedPhysicalPlan = struct {
     bytes: mutation_bytes.OwnedBatch,
     acceptance: Prepared,
-    dependencies: ?@import("prepared_mutation_dependencies.zig").Owned = null,
+    dependencies: ?*@import("prepared_mutation_dependencies.zig").Owned = null,
+    live: ?*Live = null,
     counter_deltas: ?@import("dense_artifact_counter_deltas.zig").Program = null,
     coverage_outcomes: ?@import("prepared_coverage_outcomes.zig").Program = null,
     replay_bindings: ?@import("prepared_replay_bindings.zig").Bindings = null,
     commit_state: @import("prepared_commit_state.zig").State = .{},
     completion: ?@import("prepared_completion.zig").Owned = null,
-    /// Owns quota and one allocation-free tracker slot until cancellation or
-    /// primary-commit transfer. The DB/runtime must outlive this candidate.
-    backlog_admission: @import("derived/backlog_tracker.zig").Tracker.Admission = .{},
+    /// Stable live storage is retired by DB close or candidate destruction.
+    backlog_admission: ?*@import("derived/backlog_tracker.zig").Tracker.Admission = null,
     /// This candidate cannot authorize a vote or a direct commit. Its current
     /// sequence is optimistic until refreshed under the owning apply fence.
     preparation: ?struct {
@@ -230,6 +230,31 @@ pub const OwnedPhysicalPlan = struct {
         fingerprint: [32]u8,
         replay_next: u64,
     } = null,
+
+    const lifetime = @import("prepared_lifetime.zig");
+    const Live = struct {
+        alloc: std.mem.Allocator,
+        dependencies: @import("prepared_mutation_dependencies.zig").Owned,
+        backlog: @import("derived/backlog_tracker.zig").Tracker.Admission = .{},
+        node: ?*lifetime.Node = null,
+        fn retire(ptr: *anyopaque) void {
+            const self: *Live = @ptrCast(@alignCast(ptr));
+            self.backlog.cancel();
+            self.dependencies.deinit();
+        }
+        fn deinit(self: *Live) void {
+            if (self.node) |node| node.release() else retire(self);
+            self.alloc.destroy(self);
+        }
+    };
+    pub fn attachLifetime(self: *OwnedPhysicalPlan, owner: *lifetime.Owner) !void {
+        const live = self.live orelse return error.PreparedEffectsRequired;
+        if (live.node != null) return error.InvalidArgument;
+        live.node = try owner.register(live.alloc, live, Live.retire);
+    }
+    pub fn enterLifetime(self: *const OwnedPhysicalPlan) !lifetime.Access {
+        return .{ .guard = if (self.live) |live| if (live.node) |node| try node.enter() else null else null };
+    }
 
     pub fn init(alloc: std.mem.Allocator, root: u128, authored: anytype, writes: []const @import("../docstore.zig").KVPair, deletes: []const []const u8, replay: ?mutation_bytes.Replay, control: ?admission.Port) !OwnedPhysicalPlan {
         var bytes = try mutation_bytes.OwnedBatch.capture(alloc, writes, deletes, replay, control);
@@ -244,18 +269,25 @@ pub const OwnedPhysicalPlan = struct {
 
     pub fn retainDependencies(self: *OwnedPhysicalPlan, alloc: std.mem.Allocator, core: anytype, source: @import("prepared_mutation_dependencies.zig").Sources, control: ?admission.Port) !void {
         if (self.dependencies != null) return error.InvalidArgument;
-        self.dependencies = try @import("prepared_mutation_dependencies.zig").Owned.capture(alloc, core, source, control);
+        const live = try alloc.create(Live);
+        errdefer alloc.destroy(live);
+        live.* = .{ .alloc = alloc, .dependencies = try @import("prepared_mutation_dependencies.zig").Owned.capture(alloc, core, source, control) };
+        self.live = live;
+        self.dependencies = &live.dependencies;
+        self.backlog_admission = &live.backlog;
     }
 
     pub fn validateDependencies(self: *const OwnedPhysicalPlan, core: anytype, control: ?admission.Port) !void {
-        var trace: admission.RejectionTrace = .{};
-        self.validateDependenciesInner(core, trace.bind(control), false) catch |cause| return trace.failure orelse cause;
-        if (trace.failure) |cause| return cause;
+        var access = try self.enterLifetime();
+        defer access.deinit();
+        self.validateDependenciesInner(core, access.bind(control), false) catch |cause| return access.trace.failure orelse cause;
+        access.checkLifetime() catch |cause| return access.trace.failure orelse cause;
+        if (access.trace.failure) |cause| return cause;
     }
     fn validateDependenciesInner(self: *const OwnedPhysicalPlan, core: anytype, control: ?admission.Port, refreshing: bool) !void {
         try self.commit_state.validate(self.bytes.writes, control);
         if (self.completion) |*owned| try owned.validateSequence(if (self.bytes.replay) |entry| entry.sequence else owned.sequence);
-        const owned = if (self.dependencies) |*value| value else return error.PreparedEffectsRequired;
+        const owned = self.dependencies orelse return error.PreparedEffectsRequired;
         try owned.validate(core, control);
         if (self.preparation) |expected| {
             if (!refreshing and core.nextDerivedAppendSequence() != expected.replay_next) return error.PreparedGenerationChanged;
@@ -289,11 +321,12 @@ pub const OwnedPhysicalPlan = struct {
     /// Caller holds the owning apply fence. Revalidate every non-clock witness
     /// before the allocation-free rebind. This reserves and publishes nothing.
     pub fn refreshReplaySequence(self: *OwnedPhysicalPlan, core: anytype, original: ?admission.Port) !void {
-        var trace: admission.RejectionTrace = .{};
-        self.refreshReplaySequenceInner(core, trace.bind(original)) catch |cause| return trace.failure orelse cause;
-        if (trace.failure) |cause| return cause;
+        var access = try self.enterLifetime();
+        defer access.deinit();
+        self.refreshReplaySequenceInner(core, access.bind(original), if (access.guard) |*guard| guard else null) catch |cause| return access.trace.failure orelse cause;
+        if (access.trace.failure) |cause| return cause;
     }
-    fn refreshReplaySequenceInner(self: *OwnedPhysicalPlan, core: anytype, control: ?admission.Port) !void {
+    fn refreshReplaySequenceInner(self: *OwnedPhysicalPlan, core: anytype, control: ?admission.Port, guard: ?*const lifetime.Guard) !void {
         const bindings = if (self.replay_bindings) |*value| value else return error.PreparedEffectsRequired;
         const expected = self.preparation orelse return error.PreparedEffectsRequired;
         try self.validateDependenciesInner(core, control, true);
@@ -301,26 +334,27 @@ pub const OwnedPhysicalPlan = struct {
         try bindings.validate(&self.bytes, next, control);
         try self.validateCoverageSequence(expected.replay_next, control);
         if (control) |owner| try owner.checkpoint();
+        if (guard) |live| try live.check();
         bindings.bindValidated(&self.bytes, next);
         self.bindReplayPrograms(expected.replay_next, next);
         self.preparation.?.replay_next = next;
     }
 
     pub fn deinit(self: *OwnedPhysicalPlan) void {
-        self.backlog_admission.cancel();
+        if (self.live) |live| live.deinit();
         if (self.completion) |*owned| owned.deinit();
         if (self.replay_bindings) |*value| value.deinit();
         if (self.counter_deltas) |*program| program.deinit();
         if (self.coverage_outcomes) |*program| program.deinit();
-        if (self.dependencies) |*owned| owned.deinit();
         self.acceptance.deinit();
         self.bytes.deinit();
         self.* = undefined;
     }
 };
 
-/// Synchronous output slot. The allocator and database must outlive the plan;
-/// request scratch, decoded frames and controls retire when capture returns.
+/// Synchronous output slot. The output allocator must outlive the plan.
+/// DB close revokes live dependencies; independent bytes remain caller owned.
+/// Request scratch, decoded frames and controls retire when capture returns.
 pub const Assembly = struct {
     allocator: std.mem.Allocator,
     plan: ?OwnedPhysicalPlan = null,

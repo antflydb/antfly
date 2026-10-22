@@ -22897,3 +22897,57 @@ the cumulative receipts. Earlier interrupted and failed fixture runs are diagnos
 only. The 969-source production boundary, generated errors, control catalog,
 formatting and whitespace checks pass. Full linked owner-image, object-engine,
 crash and cross-engine performance qualification remain open.
+
+### Revocable retained-candidate lifetime
+
+Each DB now owns a revocable local scope. Preparation borrows that scope for
+its synchronous call; returned assemblies register stable live dependency and
+replay-credit storage. Validation and refresh borrow the registration before
+using a core, and refresh checks lifetime before its final allocation-free rebind.
+The original control port, deadlines, execution-wait reentry and retirement
+capability remain synchronous borrows. No port is added for an uncontrolled
+legacy caller, preserving manual backend eligibility without a new I/O demand.
+
+Close fences new operations, drains active guards, and retires every idle
+candidate's policy/schema/index/read dependencies and unused replay credit before
+tearing down the executor, core or runtime. It does not wait for idle callers to
+discard their independent plan data. As with runtime shutdown, the close caller
+must permit draining operations to execute; integration with an owned/lending
+shutdown runnable and qualification under a single shared CPU slot remain open. Concurrent candidate destruction detaches
+under the registry lock and keeps retirement in the drain count; callback cleanup
+runs outside that lock and exactly once. After close, validation/rebind rejects
+before touching the old core, including when a new DB reuses an address.
+
+The small registry metadata uses a process allocator and reference counts so it
+can survive the DB allocator/runtime until the last caller destroys a revoked
+candidate. Independent bytes, counters, completion projections and target names
+remain caller owned. Their output allocator must still outlive the plan, and
+initial API calls require a valid borrowed DB handle. Ordinary DB ownership and
+supplied-lease contracts remain in force. Close leaves pending transaction
+choices pending; revocation is not a commit or abort decision.
+
+Native ABI 69 and storage-owner ABI 127 fence the changed plan/context layout.
+Durable formats, reader floors and default activation are unchanged. This owns
+local DB dependency lifetime; it neither retains remote routes nor supplies an
+executable recovery RAM/CPU/I/O/dependency bundle or mandatory completion owner.
+Those, required-PREPARE orchestration, remaining counters/backend metadata/read
+guards and broader scheduler/engine qualification remain open. Strong required
+providers remain disabled. Full Linux qualification remains waived; Linux uses
+the pinned Nix/glibc Zig toolchain.
+
+Pinned Debug qualification passes six focused lifetime cases, 84 required DB
+cases, 15 backlog cases, 51 error/identity companions and five native ABI cases:
+161 executions with no failures, skips or leaks. Tests cover idle revocation,
+active-access draining, concurrent close/caller retirement, exactly-once callbacks
+outside the registry lock, allocator failures, original control errors, execution-
+wait reentry after revocation, and candidate destruction after both DB and runtime
+teardown. Reopen retains the pending transaction while the old candidate rejects.
+The existing every-checkpoint refresh sweep confirms original rejections still
+precede sequence/byte mutation; the diagnostic first run caught a post-rebind
+check and is not final qualification.
+
+All 5,502 native/schema source inputs match prepared-lifetime-v2 in the cumulative
+receipts; prepared-lifetime-verified.json retains the final source snapshots.
+The 970-source production boundary, generated errors, control catalog, formatting
+and whitespace checks pass. Full linked owner-image, object-engine, crash,
+scheduler shutdown and cross-engine performance qualification remain open.

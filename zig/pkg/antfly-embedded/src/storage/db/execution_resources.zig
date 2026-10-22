@@ -1143,6 +1143,7 @@ pub const ShadowState = struct {
 };
 
 pub const LocalExecutionState = struct {
+    retained_preparation_owner: ?*@import("prepared_lifetime.zig").Owner = null,
     /// Optional generation hint, accessed only under the physical query-pin guard.
     native_query_reuse: ?@import("native_query_reuse.zig").State = null,
     native_query_reuse_epoch: [16]u8 = @splat(0),
