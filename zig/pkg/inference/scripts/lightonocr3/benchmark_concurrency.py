@@ -45,6 +45,7 @@ def run(args, model, label, mode, concurrency, output):
             ("TERMITE_METAL_DISABLE_LIGHTONOCR3", "TERMITE_METAL_DISABLE_QWEN35")
         ) or key in (
             "TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY",
             "TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS",
             "ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE",
             "ANTFLY_FLORENCE2_BATCH_WAIT_US",
@@ -64,6 +65,7 @@ def run(args, model, label, mode, concurrency, output):
             "TERMITE_METAL_LIGHTONOCR3_SMALL_MPP",
             "TERMITE_METAL_FLORENCE2_ENCODER_MIRRORS",
             "TERMITE_METAL_DISABLE_FLORENCE2_CHANNEL_REDUCTION",
+            "TERMITE_METAL_DISABLE_F16_ENCODER_MPP",
             "TERMITE_METAL_DISABLE_FLORENCE2_WINDOW_SOFTMAX",
             "TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP",
             "TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE",
@@ -88,6 +90,16 @@ def run(args, model, label, mode, concurrency, output):
         env["TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP"] = "1"
     if args.disable_ocr_attention:
         env["TERMITE_METAL_DISABLE_LIGHTONOCR3_GQA_SPLIT"] = "1"
+    if args.disable_prefill_conv_vec4:
+        env["TERMITE_METAL_DISABLE_QWEN35_PREFILL_CONV_VEC4"] = "1"
+    if args.weight_residency:
+        env["TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY"] = "1"
+    if args.disable_f16_encoder_mpp:
+        env["TERMITE_METAL_DISABLE_F16_ENCODER_MPP"] = "1"
+    if args.disable_four_row_tile:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE"] = "1"
+    if args.disable_down_split:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT"] = "1"
     if args.disable_qkv_small_tile:
         env["TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE"] = "1"
     if args.disable_ffn_small_tile:
@@ -281,6 +293,11 @@ def main():
     parser.add_argument("--disable-recurrent-fusion", action="store_true")
     parser.add_argument("--disable-ffn-small-tile", action="store_true")
     parser.add_argument("--disable-qkv-small-tile", action="store_true")
+    parser.add_argument("--disable-down-split", action="store_true")
+    parser.add_argument("--disable-four-row-tile", action="store_true")
+    parser.add_argument("--disable-f16-encoder-mpp", action="store_true")
+    parser.add_argument("--weight-residency", action="store_true")
+    parser.add_argument("--disable-prefill-conv-vec4", action="store_true")
     parser.add_argument("--disable-ocr-attention", action="store_true")
     parser.add_argument("--disable-florence-window-softmax", action="store_true")
     parser.add_argument("--disable-ocr-ffn-fusion", action="store_true")
@@ -320,6 +337,11 @@ def main():
         help="Compare markup-stripped content with saved serial references; use one model per run",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--build-manifest",
+        type=Path,
+        help="Saved binary/source fingerprints for the tested build",
+    )
     args = parser.parse_args()
     if args.prefill_direct_kv and not args.prefill_sg_attention:
         parser.error("direct KV prefill requires --prefill-sg-attention")
@@ -368,6 +390,19 @@ def main():
             digest(image) for image in (args.images or [])
         ]:
             parser.error("reference report must use the same images in the same order")
+    build = None
+    if args.build_manifest:
+        build = json.loads(args.build_manifest.read_text())
+        if build.get("binary_sha256") != digest(args.native_test):
+            parser.error("build manifest does not match the native test binary")
+        if not re.fullmatch(
+            r"[0-9a-f]{40}", build.get("runtime_commit", "")
+        ) or not re.fullmatch(
+            r"[0-9a-f]{64}", build.get("runtime_source_diff_sha256", "")
+        ):
+            parser.error(
+                "build manifest requires valid commit and runtime diff fingerprints"
+            )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017 (stock macOS Python 3.9)
@@ -395,6 +430,14 @@ def main():
         "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
         "results": [],
     }
+    if build is not None:
+        report["worktree_runtime_commit"] = report["runtime_commit"]
+        report["worktree_runtime_source_diff_sha256"] = report[
+            "runtime_source_diff_sha256"
+        ]
+        report["runtime_commit"] = build["runtime_commit"]
+        report["runtime_source_diff_sha256"] = build["runtime_source_diff_sha256"]
+        report["build_manifest_sha256"] = digest(args.build_manifest)
     report_path = args.output_dir / "report.json"
     for label, model in models.items():
         for concurrency in args.concurrency:

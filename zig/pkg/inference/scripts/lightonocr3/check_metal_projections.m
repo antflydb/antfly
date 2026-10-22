@@ -337,10 +337,14 @@ static int benchmark_small_rows(termite_metal_decode_runtime *r) {
                 unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_SMALL_MPP");
                 unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE");
                 unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE");
+                unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT");
+                unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE");
                 if(mode>0) {
                     setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_SMALL_MPP","1",1);
                     setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE","1",1);
                     setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE","1",1);
+                    setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT","1",1);
+                    setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE","1",1);
                 }
                 if(mode==2)setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS","1",1);
                 if(mode==3)setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS","1",1);
@@ -750,7 +754,7 @@ static int florence_window_check(termite_metal_decode_runtime *r, size_t batch, 
 // Alternate the production dispatcher and its rollback on the same nonuniform
 // weights. Include partial rows that deliberately retain their prior kernel.
 static int small_projection_timing(termite_metal_decode_runtime *r, size_t in, size_t out, size_t rows) {
-    const char *rollback = (out == 6144 || out == 8192) ? "TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE" : "TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE";
+    const char *rollback = rows == 4 && ((in == 1024 && out == 3584) || (in == 2560 && (out == 8192 || out == 9216))) ? "TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE" : (in == 3584 || in == 9216) ? "TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT" : (out == 6144 || out == 8192) ? "TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE" : "TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE";
     uint16_t *weights = malloc(in * out * 2);
     float *bias = calloc(out, 4);
     id<MTLBuffer> input = [r->device newBufferWithLength:rows * in * 4 options:MTLResourceStorageModeShared];
@@ -783,8 +787,8 @@ static int small_projection_timing(termite_metal_decode_runtime *r, size_t in, s
                 unsetenv(rollback);
             uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             if (termite_metal_decode_runtime_begin_frame(r) ||
-                termite_metal_decode_runtime_apply_linear_multi_row_device(
-                    r, 0, (__bridge void *)input, 0, rows, in, out, (__bridge void *)output, 0) ||
+                (rows == 1 ? termite_metal_decode_runtime_apply_linear_device(r, 0, (__bridge void *)input, 0, in, out, (__bridge void *)output, 0)
+                           : termite_metal_decode_runtime_apply_linear_multi_row_device(r, 0, (__bridge void *)input, 0, rows, in, out, (__bridge void *)output, 0)) ||
                 termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r))
                 return 3;
             if (fabs(((float *)output.contents)[0] - expected) > 2e-4)
@@ -952,6 +956,244 @@ static int ocr_gqa_check(termite_metal_decode_runtime *r, size_t n, size_t heads
     return worst > 2e-4f || cpu_error > 2e-4 ? 8 : 0;
 }
 
+// Verify the frame-owned temporary survives interleaved projection/attention,
+// and that frame N+1 never borrows frame N's submitted scratch slot.
+static int down_split_frame_check(termite_metal_decode_runtime *r, size_t in, size_t out) {
+    const size_t rows = 8, count = rows * out;
+    uint16_t *weights = malloc(in * out * 2);
+    float *bias = calloc(out, 4), *gold = malloc(count * 4);
+    id<MTLBuffer> x = [r->device newBufferWithLength:(rows * in + 4) * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> y[3];
+    for (size_t j = 0; j < 3; j++) {
+        y[j] = [r->device newBufferWithLength:(count + 12) * 4 options:MTLResourceStorageModeShared];
+        uint32_t *raw = y[j].contents;
+        for (size_t i = 0; i < count + 12; i++) raw[i] = 0xdeadbeefu;
+    }
+    if (!weights || !bias || !gold || !x || !y[0] || !y[1] || !y[2]) return 1;
+    uint32_t rng = 123;
+    for (size_t i = 0; i < in * out; i++) {
+        rng = rng * 1664525u + 1013904223u;
+        weights[i] = round_bf16(((int)(rng >> 16) - 32768) * .000001f);
+    }
+    for (size_t i = 0; i < rows * in; i++) ((float *)x.contents)[i + 4] = sinf(i * .01f);
+    if (termite_metal_decode_runtime_prepare_linear_bf16(r, 0, (uint8_t *)weights, in * out * 2, bias, in, out)) return 2;
+    free(weights); free(bias);
+    setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT", "1", 1);
+    if (termite_metal_decode_runtime_apply_linear_multi_row_device(r, 0, (__bridge void *)x, 16, rows, in, out, (__bridge void *)y[0], 16)) return 3;
+    memcpy(gold, (float *)y[0].contents + 4, count * 4);
+    unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT");
+    // Constant attention has an independent exact result, while using the
+    // same physical split scratch between two down-projection dispatches.
+    id<MTLBuffer> q = [r->device newBufferWithLength:8 * 256 * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> k = [r->device newBufferWithLength:256 * 2 * 256 * 2 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> v = [r->device newBufferWithLength:k.length options:MTLResourceStorageModeShared];
+    id<MTLBuffer> blocks = [r->device newBufferWithLength:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> attn = [r->device newBufferWithLength:q.length options:MTLResourceStorageModeShared];
+    memset(q.contents, 0, q.length); memset(k.contents, 0, k.length); *(uint32_t *)blocks.contents = 0;
+    for (size_t i = 0; i < v.length / 2; i++) ((uint16_t *)v.contents)[i] = 0x3d00;
+    termite_metal_paged_attention_params p = {.q_len=1,.kv_tokens=192,.num_heads=8,.num_kv_heads=2,.head_dim=256,
+        .key_row_bytes=1024,.base_key_row_bytes=1024,.query_position_offset=191,.v_row_stride=512,
+        .page_size=256,.block_count=1,.format=3,.v_element_bytes=2};
+    if (termite_metal_decode_runtime_begin_frame(r)) return 4;
+    if (termite_metal_try_lightonocr3_down_split(r, 0, x, 16, rows, in, out, y[0], 16) != 1) return 5;
+    termite_metal_decode_gqa_split_launch launch;
+    id<MTLBuffer> scratch = nil; bool strict = false;
+    if (!termite_metal_decode_gqa_split_eligible(r,r,3,1,192,0,8,2,256,1024,512,256,0,0,NULL,&scratch,&launch,&strict) || strict) return 6;
+    id<MTLComputeCommandEncoder> enc = termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
+    [enc setBuffer:q offset:0 atIndex:0]; [enc setBuffer:k offset:0 atIndex:1]; [enc setBuffer:v offset:0 atIndex:2];
+    [enc setBuffer:blocks offset:0 atIndex:3]; [enc setBuffer:q offset:0 atIndex:4];
+    if (termite_metal_encode_decode_gqa_split_dispatch(r,r,enc,&p,scratch,&launch,attn,0,attn.length,-1)) return 7;
+    [enc endEncoding];
+    if (termite_metal_try_lightonocr3_down_split(r,0,x,16,rows,in,out,y[1],16) != 1) return 8;
+    if (termite_metal_decode_runtime_submit_frame(r)) return 9;
+    id<MTLBuffer> submitted_scratch = r->submitted_frame_decode_gqa_split_scratch_slot == 0
+        ? r->attention_decode_gqa_split_scratch_buffer : r->attention_decode_gqa_split_scratch_buffer_alt;
+    if (termite_metal_decode_runtime_begin_frame(r)) return 10;
+    if (termite_metal_decode_gqa_split_scratch_for_encoding(r) == submitted_scratch) return 11;
+    if (termite_metal_try_lightonocr3_down_split(r,0,x,16,rows,in,out,y[2],16) != 1) return 12;
+    if (termite_metal_decode_runtime_wait_frame(r) || termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r)) return 13;
+    float worst = 0;
+    for (size_t j = 0; j < 3; j++) {
+        uint32_t *raw = y[j].contents;
+        for (size_t i = 0; i < count; i++) {
+            const float got = ((float *)y[j].contents)[i + 4];
+            if (!isfinite(got)) return 19;
+            worst = fmaxf(worst,fabsf(gold[i] - got));
+        }
+        for (size_t i = 0; i < 4; i++) if (raw[i] != 0xdeadbeefu) return 14;
+        for (size_t i = count + 4; i < count + 12; i++) if (raw[i] != 0xdeadbeefu) return 15;
+    }
+    for (size_t i = 0; i < attn.length / 4; i++) if (!isfinite(((float *)attn.contents)[i]) || fabsf(((float *)attn.contents)[i] - 1.25f) > 1e-5f) return 16;
+    // Every optional dependency must decline before encoding any GPU work.
+    id<MTLComputePipelineState> saved_stage = r->lightonocr3_down_split32_pipeline;
+    id<MTLComputePipelineState> saved_stage64 = r->lightonocr3_down_split64_pipeline;
+    id<MTLComputePipelineState> saved_reduce = r->lightonocr3_down_split_reduce_pipeline;
+    id<MTLBuffer> saved_scratch = r->attention_decode_gqa_split_scratch_buffer;
+    for (size_t mode = 0; mode < 4; mode++) {
+        if (mode == 0) {r->lightonocr3_down_split32_pipeline = nil; r->lightonocr3_down_split64_pipeline = nil;}
+        if (mode == 1) r->lightonocr3_down_split_reduce_pipeline = nil;
+        if (mode == 2) r->attention_decode_gqa_split_scratch_buffer = nil;
+        if (mode == 3) setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT","1",1);
+        if (termite_metal_try_lightonocr3_down_split(r,0,x,16,rows,in,out,y[0],16) != 0) return 17;
+        r->lightonocr3_down_split32_pipeline = saved_stage; r->lightonocr3_down_split64_pipeline = saved_stage64;
+        r->lightonocr3_down_split_reduce_pipeline = saved_reduce; r->attention_decode_gqa_split_scratch_buffer = saved_scratch;
+    }
+    unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT");
+    fprintf(stderr,"down_split_frame_check in=%zu out=%zu partial_scratch_interleaving=pass overlapping_frames=pass max_abs=%g\n",in,out,worst);
+    free(gold);
+    return worst > 2e-4f ? 18 : 0;
+}
+
+static int prefill_conv_check(termite_metal_decode_runtime *r, size_t seq, size_t value_heads, bool initialized, bool benchmark) {
+    const size_t channels = (32 + value_heads) * 128, count = seq * channels;
+    id<MTLBuffer> x = [r->device newBufferWithLength:(count + 4) * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> w = [r->device newBufferWithLength:(channels * 4 + 4) * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> h = [r->device newBufferWithLength:w.length options:MTLResourceStorageModeShared];
+    id<MTLBuffer> y = [r->device newBufferWithLength:(count + 12) * 4 options:MTLResourceStorageModeShared];
+    float *gold = malloc(count * 4);
+    if (!x || !w || !h || !y || !gold) return 1;
+    float *xs = (float *)x.contents + 4, *ws = (float *)w.contents + 4, *hs = (float *)h.contents + 4;
+    for (size_t i = 0; i < count; i++) xs[i] = sinf(i * .01f);
+    for (size_t i = 0; i < channels * 4; i++) {ws[i] = cosf(i * .01f) * .1f; hs[i] = sinf(i * .03f);}
+    size_t offsets[15] = {0}; offsets[0] = offsets[1] = offsets[6] = offsets[9] = 16;
+    uint32_t p[6] = {(uint32_t)seq,16,(uint32_t)value_heads,128,4,initialized};
+    double gpu[2] = {0};
+    for (size_t trial = 0; trial < (benchmark ? 30 : 1); trial++)
+        for (size_t mode = 0; mode < 2; mode++) {
+            if (mode == 0) setenv("TERMITE_METAL_DISABLE_QWEN35_PREFILL_CONV_VEC4","1",1);
+            else unsetenv("TERMITE_METAL_DISABLE_QWEN35_PREFILL_CONV_VEC4");
+            const bool vector = termite_metal_qwen35_prefill_conv_vec4_available(r,seq,128,4,offsets);
+            if (vector != (mode == 1)) return 2;
+            uint32_t *raw = y.contents;
+            for (size_t i = 0; i < 4; i++) raw[i] = 0xdeadbeefu;
+            for (size_t i = count + 4; i < count + 12; i++) raw[i] = 0xcafebabeu;
+            if (termite_metal_decode_runtime_begin_frame(r)) return 3;
+            id<MTLComputePipelineState> kernel = vector ? r->qwen35_prefill_conv_vec4_pipeline : r->qwen35_conv_pipeline;
+            id<MTLComputeCommandEncoder> enc = termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb,TERMITE_METAL_COMPUTE_SOURCE_OTHER);
+            [enc setComputePipelineState:kernel]; [enc setBuffer:x offset:16 atIndex:0]; [enc setBuffer:w offset:16 atIndex:1];
+            [enc setBuffer:h offset:16 atIndex:6]; [enc setBuffer:y offset:16 atIndex:9]; [enc setBytes:p length:sizeof(p) atIndex:15];
+            [enc dispatchThreads:MTLSizeMake(count / (vector ? 4 : 1),1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; [enc endEncoding];
+            if (termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r)) return 4;
+            if (benchmark && trial >= 10) gpu[mode] += r->last_frame_gpu_nanos;
+            float *got = (float *)y.contents + 4;
+            if (mode == 0) memcpy(gold,got,count * 4);
+            else if (memcmp(gold,got,count * 4) != 0) return 5;
+            for (size_t i = 0; i < 4; i++) if (raw[i] != 0xdeadbeefu) return 6;
+            for (size_t i = count + 4; i < count + 12; i++) if (raw[i] != 0xcafebabeu) return 7;
+            for (size_t t = 0; t < seq; t += seq - 1)
+                for (size_t c = 0; c < channels; c += channels - 1) {
+                    double sum = 0;
+                    for (size_t k = 0; k < 4; k++) {
+                        const int src = (int)t + (int)k - 3;
+                        const float value = src >= 0 ? xs[(size_t)src * channels + c] : initialized ? hs[c * 4 + (size_t)(4 + src)] : 0;
+                        sum += (double)value * ws[c * 4 + k];
+                    }
+                    if (fabs(got[t * channels + c] - sum / (1 + exp(-sum))) > 2e-6) return 8;
+                }
+        }
+    id<MTLComputePipelineState> saved = r->qwen35_prefill_conv_vec4_pipeline;
+    r->qwen35_prefill_conv_vec4_pipeline = nil;
+    if (termite_metal_qwen35_prefill_conv_vec4_available(r,seq,128,4,offsets)) return 9;
+    r->qwen35_prefill_conv_vec4_pipeline = saved;
+    offsets[0] = 4;
+    if (termite_metal_qwen35_prefill_conv_vec4_available(r,seq,128,4,offsets)) return 10;
+    offsets[0] = 16;
+    if (termite_metal_qwen35_prefill_conv_vec4_available(r,1,128,4,offsets) || termite_metal_qwen35_prefill_conv_vec4_available(r,seq,64,4,offsets)) return 11;
+    fprintf(stderr,"prefill_conv_check seq=%zu value_heads=%zu initialized=%d offset=16 bit_exact=pass cpu_samples=pass\n",seq,value_heads,initialized);
+    if (benchmark) fprintf(stderr,"prefill_conv_benchmark seq=%zu value_heads=%zu rollback_gpu_us=%.2f vector_gpu_us=%.2f\n",seq,value_heads,gpu[0]/20000,gpu[1]/20000);
+    free(gold);
+    return 0;
+}
+
+static float expand_f16(uint16_t bits) { __fp16 value; memcpy(&value,&bits,2); return (float)value; }
+static int f16_encoder_check(termite_metal_decode_runtime *r,size_t rows,size_t in,size_t out,size_t offset,bool benchmark) {
+    uint16_t *weights=malloc(in*out*2); float *bias=malloc(out*4),*gold=malloc(rows*out*4);
+    id<MTLBuffer>x=[r->device newBufferWithLength:rows*in*4+offset options:MTLResourceStorageModeShared];
+    id<MTLBuffer>y=[r->device newBufferWithLength:(rows*out+12)*4 options:MTLResourceStorageModeShared];
+    if(!weights||!bias||!gold||!x||!y)return 1;
+    uint32_t rng=123;for(size_t i=0;i<in*out;i++){rng=rng*1664525u+1013904223u;__fp16 value=(__fp16)(((int)(rng>>16)-32768)*.000001f);memcpy(weights+i,&value,2);}
+    float*xs=(float*)((uint8_t*)x.contents+offset);
+    for(size_t i=0;i<rows*in;i++)xs[i]=sinf(i*.01f);
+    for(size_t i=0;i<out;i++)bias[i]=cosf(i*.01f)*.1f;
+    double expected[4];for(size_t a=0;a<2;a++)for(size_t b=0;b<2;b++){size_t row=a?rows-1:0,col=b?out-1:0;double sum=bias[col];for(size_t k=0;k<in;k++)sum+=(double)xs[row*in+k]*expand_f16(weights[col*in+k]);expected[a*2+b]=sum;}
+    if(termite_metal_decode_runtime_prepare_linear_f16(r,0,(uint8_t*)weights,in*out*2,bias,in,out))return 2;
+    free(weights);free(bias);
+    id<MTLComputePipelineState>saved=r->f16_encoder_mpp_pipeline;double gpu[2]={0};float worst=0;double cpu_error=0;
+    for(size_t trial=0;trial<(benchmark?30:1);trial++)for(size_t mode=0;mode<(benchmark?2:3);mode++){
+        if(mode==0)setenv("TERMITE_METAL_DISABLE_F16_ENCODER_MPP","1",1);else unsetenv("TERMITE_METAL_DISABLE_F16_ENCODER_MPP");
+        if(mode==2)r->f16_encoder_mpp_pipeline=nil;
+        uint32_t*raw=y.contents;for(size_t i=0;i<4;i++)raw[i]=0xdeadbeefu;for(size_t i=rows*out+4;i<rows*out+12;i++)raw[i]=0xcafebabeu;
+        if(termite_metal_decode_runtime_begin_frame(r))return 3;
+        const uint64_t mps_before=r->mps_dense_linear_active_frame_calls;
+        if(termite_metal_decode_runtime_apply_linear_multi_row_device(r,0,(__bridge void*)x,offset,rows,in,out,(__bridge void*)y,16))return 4;
+        bool optimized=mode==1&&offset%16==0&&termite_metal_f16_encoder_mpp_shape(rows,in,out);
+        if((r->mps_dense_linear_active_frame_calls==mps_before)!=optimized)return 5;
+        if(termite_metal_decode_runtime_submit_frame(r)||termite_metal_decode_runtime_wait_frame(r))return 6;
+        r->f16_encoder_mpp_pipeline=saved;
+        float*got=(float*)y.contents+4;
+        if(mode==0)memcpy(gold,got,rows*out*4);
+        for(size_t i=0;i<rows*out;i++){if(!isfinite(got[i]))return 7;worst=fmaxf(worst,fabsf(got[i]-gold[i]));}
+        for(size_t a=0;a<2;a++)for(size_t b=0;b<2;b++)cpu_error=fmax(cpu_error,fabs(got[(a?rows-1:0)*out+(b?out-1:0)]-expected[a*2+b]));
+        for(size_t i=0;i<4;i++)if(raw[i]!=0xdeadbeefu)return 8;
+        for(size_t i=rows*out+4;i<rows*out+12;i++)if(raw[i]!=0xcafebabeu)return 9;
+        if(benchmark&&trial>=10)gpu[mode]+=r->last_frame_gpu_nanos;
+    }
+    unsetenv("TERMITE_METAL_DISABLE_F16_ENCODER_MPP");
+    fprintf(stderr,"f16_encoder_check rows=%zu in=%zu out=%zu offset=%zu max_abs=%g cpu_max_abs=%g\n",rows,in,out,offset,worst,cpu_error);
+    if(benchmark)fprintf(stderr,"f16_encoder_benchmark rows=%zu in=%zu out=%zu mps_gpu_us=%.2f tensor_gpu_us=%.2f\n",rows,in,out,gpu[0]/20000,gpu[1]/20000);
+    free(gold);return worst>2e-4f||cpu_error>2e-4?10:0;
+}
+
+static int ocr_residency_check(termite_metal_decode_runtime *r) {
+    const char *previous=getenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY");
+    char *saved=previous?strdup(previous):NULL;
+    setenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY","1",1);
+    uint16_t weights[128*64]={0};float bias[64]={0};
+    if(termite_metal_decode_runtime_prepare_linear_bf16(r,0,(uint8_t*)weights,sizeof(weights),bias,128,64))return 1;
+    id<MTLBuffer> original=r->linear_weight_buffers[0];
+    if(r->ocr_residency_placements.count!=1||r->ocr_residency_total_bytes!=original.length)return 2;
+    const size_t bytes=r->ocr_residency_total_bytes;
+    r->linear_weight_buffers[1]=original;
+    termite_metal_ocr_residency_track(r,1,original);
+    NSDictionary *record=[r->ocr_residency_placements objectForKey:original];
+    if([record[@"refs"] unsignedLongLongValue]!=2||r->ocr_residency_total_bytes!=bytes)return 3;
+    if(termite_metal_decode_runtime_clear_linear_slot(r,0))return 4;
+    record=[r->ocr_residency_placements objectForKey:original];
+    if([record[@"refs"] unsignedLongLongValue]!=1||r->ocr_residency_total_bytes!=bytes)return 5;
+    if(termite_metal_decode_runtime_clear_linear_slot(r,1)||r->ocr_residency_total_bytes!=0||r->ocr_residency_placements.count!=0)return 6;
+    if (@available(macOS 15.0,*))for(id<MTLResidencySet>set in r->ocr_residency_sets)if(set.allAllocations.count!=0)return 7;
+    // Safetensors use no-copy shared allocations; test that exact resource
+    // type as well as owned buffers, with lifetime tied to the Metal object.
+    void *mapped=NULL;
+    if(posix_memalign(&mapped,16384,16384)!=0)return 15;
+    memset(mapped,0,16384);
+    id<MTLBuffer>alias=[r->device newBufferWithBytesNoCopy:mapped length:16384 options:MTLResourceStorageModeShared deallocator:^(void *pointer,NSUInteger length){(void)length;free(pointer);}];
+    if(alias==nil){free(mapped);return 16;}
+    termite_metal_ocr_residency_track(r,3,alias);
+    if(r->ocr_residency_slots[3]!=alias||r->ocr_residency_total_bytes!=alias.length)return 17;
+    termite_metal_ocr_residency_track(r,3,nil);
+    if(r->ocr_residency_total_bytes!=0||r->ocr_residency_placements.count!=0)return 18;
+    // Refuse an additional allocation when the model-owned soft cap is full.
+    id<MTLBuffer> small=[r->device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+    r->ocr_residency_total_bytes=(size_t)12*1024*1024*1024;
+    termite_metal_ocr_residency_track(r,2,small);
+    if(r->ocr_residency_slots[2]!=nil||r->ocr_residency_placements.count!=0)return 8;
+    r->ocr_residency_total_bytes=0;
+    if(termite_metal_decode_runtime_prepare_linear_bf16(r,0,(uint8_t*)weights,sizeof(weights),bias,128,64))return 9;
+    id<MTLBuffer> first=r->linear_weight_buffers[0];
+    if(termite_metal_decode_runtime_prepare_linear_bf16(r,0,(uint8_t*)weights,sizeof(weights),bias,128,64))return 10;
+    if(r->ocr_residency_slots[0]!=r->linear_weight_buffers[0]||r->ocr_residency_placements.count!=1)return 11;
+    if(first!=r->linear_weight_buffers[0]&&[r->ocr_residency_placements objectForKey:first]!=nil)return 12;
+    unsetenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY");
+    termite_metal_ocr_residency_track(r,0,r->linear_weight_buffers[0]);
+    if(r->ocr_residency_total_bytes!=0||r->ocr_residency_slots[0]!=nil)return 13;
+    termite_metal_ocr_residency_shutdown(r);
+    if(r->ocr_residency_sets!=nil||r->ocr_residency_placements!=nil||r->ocr_residency_total_bytes!=0)return 14;
+    if(saved){setenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY",saved,1);free(saved);}
+    fprintf(stderr,"ocr_weight_residency_check tied_buffers=pass mapped_alias=pass clear_replace=pass cap=pass disable=pass release=pass\n");
+    return 0;
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         termite_metal_decode_runtime *r = termite_metal_decode_runtime_create();
@@ -978,12 +1220,56 @@ int main(int argc, const char **argv) {
         r->lightonocr3_batch8_pipeline = nil;
         if (termite_metal_decode_runtime_lightonocr3_batch_projection_available(r, 8, 2560)) return 62;
         r->lightonocr3_batch8_pipeline = saved_batch8;
+        if(ocr_residency_check(r))return 121;
+        if (!r->f16_encoder_mpp_pipeline) return 116;
+        if (termite_metal_f16_encoder_mpp_shape(127,128,512) || termite_metal_f16_encoder_mpp_shape(524289,128,512) || termite_metal_f16_encoder_mpp_shape(128,129,512)) return 117;
+        const bool f16_benchmark = argc == 2 && strcmp(argv[1],"--benchmark-f16-encoder") == 0;
+        for (size_t width=128;width<=1024;width*=2) {
+            if(f16_encoder_check(r,129,width,width,16,false) || f16_encoder_check(r,129,width,width*3,16,false) || f16_encoder_check(r,129,width,width*4,16,false) || f16_encoder_check(r,129,width*4,width,16,false)) return 118;
+        }
+        if(f16_encoder_check(r,578,768,768,16,false) || f16_encoder_check(r,578,3072,768,16,false) || f16_encoder_check(r,129,1024,768,16,false) || f16_encoder_check(r,127,128,512,16,false) || f16_encoder_check(r,129,128,512,4,false)) return 119;
+        if(f16_encoder_check(r,25088,128,512,16,f16_benchmark) || f16_encoder_check(r,578,768,3072,16,f16_benchmark) || f16_encoder_check(r,2304,512,2048,16,f16_benchmark)) return 120;
+        if(f16_benchmark)return 0;
+        if (!r->lightonocr3_four_row_segment_pipeline || !r->lightonocr3_mpp_four_row_pipeline) return 114;
+        id<MTLComputePipelineState> saved_four_segment = r->lightonocr3_four_row_segment_pipeline;
+        id<MTLComputePipelineState> saved_four_mpp = r->lightonocr3_mpp_four_row_pipeline;
+        for (size_t mode = 0; mode < 3; mode++) {
+            if (mode == 1) {r->lightonocr3_four_row_segment_pipeline = nil; r->lightonocr3_mpp_four_row_pipeline = nil;}
+            if (mode == 2) setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE","1",1);
+            if (projection(r,4,1024,3584,4) || projection(r,4,2560,8192,4) || projection(r,4,2560,9216,4)) return 115;
+            r->lightonocr3_four_row_segment_pipeline = saved_four_segment;
+            r->lightonocr3_mpp_four_row_pipeline = saved_four_mpp;
+        }
+        unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE");
+        if (!r->qwen35_prefill_conv_vec4_pipeline) return 111;
+        const bool conv_benchmark = argc == 2 && strcmp(argv[1],"--benchmark-prefill-conv") == 0;
+        const size_t conv_seqs[] = {2,3,4,17,432,554};
+        for (size_t i = 0; i < 6; i++) for (size_t vh = 16; vh <= 32; vh += 16) for (size_t init = 0; init < 2; init++)
+            if (prefill_conv_check(r,conv_seqs[i],vh,init != 0,conv_benchmark && conv_seqs[i] == 554)) return 112;
+        if (conv_benchmark) return 0;
+        if (!r->lightonocr3_down_split32_pipeline || !r->lightonocr3_down_split64_pipeline || !r->lightonocr3_down_split_reduce_pipeline) return 107;
+        if (down_split_frame_check(r,3584,1024) || down_split_frame_check(r,9216,2560)) return 108;
+        for (size_t rows = 2; rows <= 8; rows++) {
+            if (projection(r,rows,3584,1024,4) || projection(r,rows,9216,2560,4)) return 109;
+        }
         if (!r->lightonocr3_gqa_split_stage_pipeline || !r->lightonocr3_gqa_split_reduce_pipeline) return 102;
         const bool ocr_gqa_benchmark=argc==2 && strcmp(argv[1],"--benchmark-ocr-gqa")==0;
         const size_t ocr_contexts[]={128,192,432,554,662,1024,2048,2056};
         for(size_t i=0;i<8;i++)for(size_t shape=0;shape<2;shape++)
             if(ocr_gqa_check(r,ocr_contexts[i],shape?16:8,shape?4:2,i%2?8:1,ocr_gqa_benchmark && (ocr_contexts[i]==432 || ocr_contexts[i]==662)))return 103;
         if (ocr_gqa_benchmark) return 0;
+        if (argc == 2 && strcmp(argv[1], "--benchmark-down-split") == 0) {
+            for (size_t rows = 2; rows <= 8; rows++)
+                if (small_projection_timing(r,3584,1024,rows) || small_projection_timing(r,9216,2560,rows)) return 110;
+            return 0;
+        }
+        if (argc == 2 && strcmp(argv[1], "--benchmark-projection-parity") == 0) {
+            const size_t shapes[][2] = {{1024,6144},{1024,3584},{3584,1024},{2560,8192},{2560,9216},{9216,2560}};
+            const size_t batch_rows[] = {1,4,8,128,512};
+            for (size_t shape = 0; shape < 6; shape++) for (size_t row = 0; row < 5; row++)
+                if (small_projection_timing(r,shapes[shape][0],shapes[shape][1],batch_rows[row])) return 113;
+            return 0;
+        }
         if (!r->lightonocr3_mpp_small_tile_pipeline) return 97;
         if (argc==2 && strcmp(argv[1],"--benchmark-ffn-tile")==0) {
             for (size_t rows=2;rows<=8;rows++)

@@ -1,0 +1,27 @@
+f16_encoder_check rows=129 in=128 out=128 offset=16 max_abs=0 cpu_max_abs=2.27857e-08
+f16_encoder_check rows=129 in=128 out=384 offset=16 max_abs=0 cpu_max_abs=2.27857e-08
+f16_encoder_check rows=129 in=128 out=512 offset=16 max_abs=0 cpu_max_abs=2.27857e-08
+f16_encoder_check rows=129 in=512 out=128 offset=16 max_abs=0 cpu_max_abs=9.77508e-08
+f16_encoder_check rows=129 in=256 out=256 offset=16 max_abs=0 cpu_max_abs=8.91954e-08
+f16_encoder_check rows=129 in=256 out=768 offset=16 max_abs=0 cpu_max_abs=3.89911e-08
+f16_encoder_check rows=129 in=256 out=1024 offset=16 max_abs=0 cpu_max_abs=1.44326e-07
+f16_encoder_check rows=129 in=1024 out=256 offset=16 max_abs=0 cpu_max_abs=5.28276e-07
+f16_encoder_check rows=129 in=512 out=512 offset=16 max_abs=0 cpu_max_abs=3.33199e-07
+f16_encoder_check rows=129 in=512 out=1536 offset=16 max_abs=0 cpu_max_abs=2.04946e-07
+f16_encoder_check rows=129 in=512 out=2048 offset=16 max_abs=0 cpu_max_abs=1.0311e-07
+f16_encoder_check rows=129 in=2048 out=512 offset=16 max_abs=0 cpu_max_abs=6.85407e-07
+f16_encoder_check rows=129 in=1024 out=1024 offset=16 max_abs=0 cpu_max_abs=3.5134e-07
+f16_encoder_check rows=129 in=1024 out=3072 offset=16 max_abs=0 cpu_max_abs=3.5134e-07
+f16_encoder_check rows=129 in=1024 out=4096 offset=16 max_abs=0 cpu_max_abs=3.5134e-07
+f16_encoder_check rows=129 in=4096 out=1024 offset=16 max_abs=0 cpu_max_abs=6.61418e-07
+f16_encoder_check rows=578 in=768 out=768 offset=16 max_abs=0 cpu_max_abs=1.22786e-07
+f16_encoder_check rows=578 in=3072 out=768 offset=16 max_abs=0 cpu_max_abs=8.53213e-07
+f16_encoder_check rows=129 in=1024 out=768 offset=16 max_abs=0 cpu_max_abs=7.2532e-07
+f16_encoder_check rows=127 in=128 out=512 offset=16 max_abs=0 cpu_max_abs=3.33187e-08
+f16_encoder_check rows=129 in=128 out=512 offset=4 max_abs=0 cpu_max_abs=2.27857e-08
+f16_encoder_check rows=25088 in=128 out=512 offset=16 max_abs=0 cpu_max_abs=3.85163e-08
+f16_encoder_benchmark rows=25088 in=128 out=512 mps_gpu_us=2347.71 tensor_gpu_us=1633.21
+f16_encoder_check rows=578 in=768 out=3072 offset=16 max_abs=0 cpu_max_abs=2.15431e-07
+f16_encoder_benchmark rows=578 in=768 out=3072 mps_gpu_us=1588.89 tensor_gpu_us=1272.25
+f16_encoder_check rows=2304 in=512 out=2048 offset=16 max_abs=0 cpu_max_abs=1.0311e-07
+f16_encoder_benchmark rows=2304 in=512 out=2048 mps_gpu_us=2548.90 tensor_gpu_us=2103.27

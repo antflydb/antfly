@@ -536,3 +536,37 @@ This adds a small bounded wait to sparse requests and reduces underfilled
 cohorts under concurrent load. `benchmark_concurrency.py --florence-batch-wait-us`
 controls this independently of the LightOn window. `--profile-reader` enables
 reader phase logs in the opt-in checkpoint test.
+
+### Projection and encoder follow-up
+
+The next M4 Max kernel pass adds split-K down projections using existing
+frame-owned scratch, narrower four-row gate/up and QKV tiles, and vectorized
+prefill convolution. F32 projection activations, accumulation and outputs are
+preserved. Large qualified F16 encoder projections, including Florence's
+vision/BART shapes, use TensorOps with fused bias and retain MPS fallbacks.
+
+On the shared M4 Max, 29 of 30 representative projection cases measured within
+20% of MLX or faster. This excludes the vocabulary head and does not establish
+whole-reader parity. The final Florence repeat reached 4.63 pages/s against
+4.68 for MLX-VLM; native uses Q4_K weights with F16 encoder mirrors while the
+reference uses original FP16 weights and a different generation policy.
+LightOn remains behind: opt-in residency runs reached 1.31/0.44 pages/s for
+0.8B/4B against 2.72/0.76 for vLLM Metal. Successive runs under uncontrolled
+machine load are exploratory comparisons. The earlier projection-only
+ablations did not establish page-throughput gains.
+
+`TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY=1`, set before preparing the
+model, wires already-admitted dense weights without copying them. It is off
+by default, bounded to 12 GiB and 32 residency sets, and releases cleared slots
+and runtime allocations. The benchmark exposes `--weight-residency`. Existing
+memory admission still applies; qualify this option under your workload's
+memory pressure before selecting it.
+
+Additional rollback switches are
+`TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT=1`,
+`TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE=1`,
+`TERMITE_METAL_DISABLE_QWEN35_PREFILL_CONV_VEC4=1`, and
+`TERMITE_METAL_DISABLE_F16_ENCODER_MPP=1`.
+Full measurements, negative ablations, precision differences, source/binary
+hashes and 73 passing focused GPU tests are retained in
+`zig/pkg/inference/scripts/lightonocr3/results/projection_parity_m4_max/README.md`.
