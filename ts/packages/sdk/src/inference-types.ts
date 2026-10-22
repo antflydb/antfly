@@ -12,6 +12,19 @@ export type EmbedResponse = components["schemas"]["InferenceEmbedResponse"];
 export type ChunkRequest = components["schemas"]["InferenceChunkRequest"];
 export type ChunkConfig = components["schemas"]["InferenceChunkConfig"];
 export type ChunkResponse = components["schemas"]["InferenceChunkResponse"];
+export type ChunkEmbeddingResponse = components["schemas"]["ChunkEmbeddingResponse"];
+export type ChunkEmbeddingObject = components["schemas"]["ChunkEmbeddingObject"];
+export type ChunkEmbeddingRequest = ChunkRequest & {
+  embedding: NonNullable<ChunkRequest["embedding"]>;
+};
+export type ChunkSourceReference = components["schemas"]["ChunkSourceReference"];
+export type MediaChunkPolicy = components["schemas"]["MediaChunkPolicy"];
+export type ChunkEmbeddingTarget = components["schemas"]["ChunkEmbeddingTarget"];
+export type ChunkEmbeddingContext = components["schemas"]["ChunkEmbeddingContext"];
+export type ChunkEmbeddingStreamEvent =
+  | { object: "chunk.embedding.start"; context: ChunkEmbeddingContext }
+  | { object: "chunk.embedding"; data: ChunkEmbeddingObject }
+  | { object: "chunk.embedding.complete"; response: ChunkEmbeddingResponse };
 export type Chunk = components["schemas"]["InferenceChunk"];
 
 export type RerankRequest = components["schemas"]["InferenceRerankRequest"];
@@ -21,7 +34,11 @@ export type ExtractRequest = components["schemas"]["ExtractionRequest"];
 /** A strict mixed-task request; extractV2 supplies schema_version:2. */
 export type ExtractV2Request = Omit<ExtractRequest, "schema_version">;
 export type ExtractResponse = components["schemas"]["ExtractionResponse"];
-export type DecideRequest = components["schemas"]["InferenceDecideRequest"];
+export type GeneratedDecideRequest = components["schemas"]["GeneratedDecideRequest"];
+export type GeneratedExtractRequest = components["schemas"]["GeneratedExtractionRequest"];
+export type DecideRequest =
+  | components["schemas"]["InferenceDecideRequest"]
+  | GeneratedDecideRequest;
 export type DecideResponse = components["schemas"]["InferenceDecideResponse"];
 export type ExtractEntity = components["schemas"]["ExtractionEntity"];
 export type ExtractRelation = components["schemas"]["ExtractionRelation"];

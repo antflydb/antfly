@@ -143,7 +143,8 @@ export default function ChatMessages({
   useEffect(() => {
     // Reference turns to trigger scroll on new messages and streaming updates
     void turns;
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    messagesEndRef.current?.scrollIntoView({ behavior: reducedMotion ? "instant" : "smooth" });
   }, [turns]);
 
   return (

@@ -5,6 +5,8 @@
 @import "@xyflow/react/dist/style.css";
 @import "@antfly/graph/styles.css";
 
+/* Keep app utilities discoverable in ignored .worktrees checkouts. */
+@source "./";
 @source "../node_modules/@antfly/design-system/dist/**/*.js";
 @source "../../../packages/graph/src/**/*.{ts,tsx,js,jsx}";
 @source "../node_modules/streamdown/dist/*.js";
@@ -146,6 +148,104 @@ select::placeholder {
 
 /* Antfarm-local visual utilities */
 @layer components {
+  .af-dashboard [data-slot="sidebar-inner"] [data-slot="sidebar-header"],
+  .af-dashboard [data-slot="sidebar-inner"] [data-slot="sidebar-content"],
+  .af-dashboard [data-slot="sidebar-inner"] [data-slot="sidebar-footer"] {
+    border-color: var(--sidebar-border);
+  }
+
+  .af-ai-workflow {
+    @apply mx-auto w-full max-w-[1480px] gap-6;
+  }
+
+  .af-ai-workflow-header {
+    @apply border-b border-border/70 pb-5;
+  }
+
+  .af-ai-context-bar {
+    @apply flex flex-col gap-3 border border-border bg-background-secondary/45 p-3 sm:flex-row sm:flex-wrap sm:items-end;
+  }
+
+  .af-ai-context-bar > * {
+    @apply min-w-0;
+  }
+
+  .af-ai-backend-info {
+    @apply m-0 w-full min-w-0 border-0 bg-transparent p-0;
+  }
+
+  .af-ai-panel {
+    @apply min-w-0 border border-border bg-card;
+  }
+
+  .af-ai-panel-header {
+    @apply flex flex-col gap-3 border-b border-border/80 px-4 py-3 sm:flex-row sm:items-start sm:justify-between;
+  }
+
+  .af-ai-panel-content {
+    @apply min-w-0 p-4;
+  }
+
+  .af-ai-workflow [data-slot="card"] {
+    @apply min-w-0 gap-0 overflow-hidden py-0;
+  }
+
+  .af-ai-workflow [data-slot="card-header"] {
+    @apply border-b border-border/80 px-4 py-3;
+  }
+
+  .af-ai-workflow [data-slot="card-content"] {
+    @apply min-w-0 px-4 py-4;
+  }
+
+  .af-ai-workflow [data-slot="card-footer"] {
+    @apply border-t border-border/80 px-4 py-3;
+  }
+
+  .af-ai-workbench {
+    @apply grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-2;
+  }
+
+  .af-ai-settings {
+    @apply border border-border bg-background-secondary/25;
+  }
+
+  .af-ai-settings-trigger {
+    @apply flex w-full items-center justify-between gap-4 px-4 py-3 text-foreground outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset;
+  }
+
+  .af-ai-settings-content {
+    @apply border-t border-border px-4 py-4;
+  }
+
+  .af-ai-metrics {
+    @apply grid grid-cols-2 border-y border-border bg-background-secondary/30 sm:grid-cols-3 lg:grid-cols-4;
+  }
+
+  .af-ai-metric {
+    @apply min-w-0 border-r border-border px-3 py-2 last:border-r-0;
+  }
+
+  .af-ai-metric dt {
+    @apply font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground;
+  }
+
+  .af-ai-metric dd {
+    @apply mt-0.5 truncate font-mono text-sm font-medium text-foreground;
+  }
+
+  .af-ai-empty {
+    @apply flex min-h-52 flex-col items-center justify-center gap-3 border border-dashed border-border bg-background-secondary/20 p-8 text-center;
+  }
+
+  .af-ai-empty-icon {
+    @apply flex size-9 items-center justify-center border border-border bg-background text-muted-foreground;
+  }
+
+  .af-ai-file-upload [role="button"] {
+    @apply bg-background-secondary/20 hover:border-foreground/35 hover:bg-background-secondary/35;
+  }
+
   .af-chart-badge {
     background: color-mix(in oklch, var(--af-chart-badge-color) 12%, transparent);
     border-color: color-mix(in oklch, var(--af-chart-badge-color) 28%, transparent);
@@ -361,6 +461,18 @@ select::placeholder {
   .af-status-selected {
     border-color: color-mix(in oklch, var(--chart-6) 72%, var(--border));
     box-shadow: 0 0 0 2px color-mix(in oklch, var(--chart-6) 30%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .af-dashboard [data-slot="sidebar-inner"],
+  .af-ai-workflow *,
+  .af-ai-workflow *::before,
+  .af-ai-workflow *::after {
+    scroll-behavior: auto;
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transition-duration: 0.01ms;
   }
 }
 

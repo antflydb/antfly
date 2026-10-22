@@ -51,10 +51,11 @@ func TestDocumentEngineGuideExamplesRoundTrip(t *testing.T) {
 	}
 
 	blocks := extractJSONFenceBlocks(t, content)
-	if got, want := len(blocks), 3; got != want {
+	if got, want := len(blocks), 4; got != want {
 		t.Fatalf("json example block count = %d, want %d", got, want)
 	}
 
+	var sawLogicalQuery bool
 	var sawSchema bool
 	var sawSortedQuery bool
 	var sawCursorQuery bool
@@ -74,6 +75,22 @@ func TestDocumentEngineGuideExamplesRoundTrip(t *testing.T) {
 			}
 			sawSchema = true
 			assertDocumentEngineSchemaExample(t, block)
+		case root["execution"] != nil:
+			sawLogicalQuery = true
+			var req oapi.QueryRequest
+			if err := json.Unmarshal(block, &req); err != nil {
+				t.Fatal(err)
+			}
+			if !req.Execution.ValueVerification.AllowScan || !req.Profile {
+				t.Fatal("logical example must explicitly permit scans and enable profiling")
+			}
+			var logical oapi.ContainsQuery
+			if err := json.Unmarshal(req.Query, &logical); err != nil {
+				t.Fatal(err)
+			}
+			if logical.Field != "content" || logical.Contains != "connection-refused" {
+				t.Fatal("logical query lost original-value semantics")
+			}
 		case root["order_by"] != nil:
 			hasCursor := root["search_after"] != nil || root["search_before"] != nil
 			if hasCursor {
@@ -92,7 +109,7 @@ func TestDocumentEngineGuideExamplesRoundTrip(t *testing.T) {
 			t.Fatalf("json block %d is not a recognized document-engine example: %s", i, block)
 		}
 	}
-	if !sawSchema || !sawSortedQuery || !sawCursorQuery {
+	if !sawLogicalQuery || !sawSchema || !sawSortedQuery || !sawCursorQuery {
 		t.Fatalf("expected schema, sorted query, and cursor query examples; saw schema=%t sorted=%t cursor=%t", sawSchema, sawSortedQuery, sawCursorQuery)
 	}
 }

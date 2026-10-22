@@ -42,6 +42,8 @@ pub const Limits = struct {
     /// Native execution batches are independent of response/decision pages.
     execution_batch_rows: u32 = 4096,
     page_bytes: usize = 256 * 1024,
+    /// Native scans charge execution-sized logical row batches plus empty
+    /// nonterminal pulls. Worker and row-group fragmentation do not add credit.
     scan_pages: usize = 65_536,
     spill_bytes: u64 = 1024 * 1024 * 1024,
     spill_root: []const u8 = "/tmp",
@@ -235,7 +237,43 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
 pub const RowSink = struct {
     ptr: *anyopaque,
     append: *const fn (*anyopaque, []const Datum) anyerror!void,
+    append_batch: ?*const fn (*anyopaque, @import("execution_batch.zig").Batch) anyerror!void = null,
     take_sorted: ?*const fn (*anyopaque, *@import("operators.zig").TopK, usize, usize, bool) anyerror!void = null,
+};
+// A synchronous view over a scan-page lease. Expressions and sort keys use
+// scalar semantics; pass-through JSON retains the native producer capability.
+const ProjectedBatch = struct {
+    rows: []const catalog.Row,
+    selection: []const usize,
+    positions: []const ?usize,
+    fields: []const []const u8,
+    columns: []const describe.Column,
+    expressions: []const ?[]const Datum,
+    coerced: []const ?[]const Datum = &.{},
+    fn cell(raw: *anyopaque, a: std.mem.Allocator, lane: usize, column: usize) anyerror!Datum {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (column < self.coerced.len) if (self.coerced[column]) |values| return values[lane];
+        const row = self.selection[lane];
+        const input = if (column < self.expressions.len and self.expressions[column] != null)
+            self.expressions[column].?[self.positions[row].?]
+        else
+            try self.rows[row].cell(self.fields[column]);
+        return describe.coerceDatum(a, input, self.columns[column].type, self.columns[column].element_type);
+    }
+    fn native(self: *@This(), column: usize) bool {
+        return self.columns[column].type == .json and (column >= self.expressions.len or self.expressions[column] == null);
+    }
+    fn frozen(raw: *anyopaque, lane: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (self.native(column)) self.rows[self.selection[lane]].frozenJson(self.fields[column]) else null;
+    }
+    fn json(raw: *anyopaque, lane: usize, column: usize) anyerror!?[]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (self.native(column)) self.rows[self.selection[lane]].encodedJson(self.fields[column]) else null;
+    }
+    fn batch(self: *@This()) @import("execution_batch.zig").Batch {
+        return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .count = self.selection.len, .width = self.columns.len } };
+    }
 };
 pub const Context = struct {
     sink: ?RowSink = null,
@@ -366,7 +404,7 @@ pub const Context = struct {
         const Cursor = @import("result_cursor.zig").Cursor;
         const cursor = if (self.spill) |manager| try Cursor.create(self.alloc, manager, self.binding.columns.len) else try Cursor.createMemory(self.alloc, self.binding.columns.len, self.limits.retained_bytes / 2);
         errdefer cursor.close();
-        try self.selectInto(statement, .{ .ptr = cursor, .append = Cursor.append, .take_sorted = Cursor.takeSorted });
+        try self.selectInto(statement, .{ .ptr = cursor, .append = Cursor.append, .append_batch = Cursor.appendBatch, .take_sorted = Cursor.takeSorted });
         return cursor;
     }
 
@@ -499,7 +537,12 @@ pub const Context = struct {
     fn parameterDatum(self: Context, index: usize) !Datum {
         if (index >= self.parameters.len) return error.InvalidSqlParameters;
         if (self.binding.parameter_invocation) |invocation| if (invocation.frame) |frame| return frame.values[index];
-        return Datum.fromJson(self.parameters[index]);
+        const raw = Datum.fromJson(self.parameters[index]);
+        if (index < self.binding.parameter_descriptors.len) {
+            const actual = self.binding.parameter_descriptors[index];
+            if (actual.kind) |kind| return describe.coerceDatum(self.arena, raw, kind, actual.element_type);
+        }
+        return raw;
     }
 
     pub fn count(self: Context, input: ?ast.Value, default: usize) !usize {
@@ -618,16 +661,20 @@ pub const Context = struct {
                 // scalar program's floating domain (including REAL/NUMERIC
                 // comparisons in double precision), without narrowing the
                 // operand to the physical column width.
+                var comparison_operand: ?Json = null;
                 if (column.type == .number and comparison.value == .parameter) {
                     const datum = try self.parameterDatum(comparison.value.parameter - 1);
-                    if (datum.numeric != null) {
+                    if (datum.numeric != null or (datum.value == .float and !std.math.isFinite(datum.value.float))) {
                         output.complete = false;
                         return;
                     }
+                    // Frame values already carry their declared width. A REAL
+                    // stored cell must not narrow a declared float8 operand.
+                    comparison_operand = if (datum.sql_null) .null else try describe.coerceAlloc(self.arena, datum.value, column.type);
                 }
                 // Row identity has a separate native key boundary; never
                 // pretend it is a document property in a storage predicate.
-                const bound_value = try self.value(comparison.value, column);
+                const bound_value = comparison_operand orelse try self.value(comparison.value, column);
                 if (column.type == .json) {
                     output.complete = false;
                     return;
@@ -873,6 +920,77 @@ pub const Context = struct {
                     try @import("decision_eval.zig").evaluateBatchWithLimits(scratch, self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
                 else
                     null;
+                if (!defer_projection and !statement.count_all and (top_k != null or (self.sink != null and self.sink.?.append_batch != null))) {
+                    const selection = try scratch.alloc(usize, selected_cells.items.len);
+                    const ordinals = try scratch.alloc(u64, selected_cells.items.len);
+                    var selected_count: usize = 0;
+                    var complete = false;
+                    for (chunk_rows, 0..) |_, row_index| {
+                        try self.checkpoint();
+                        visited += 1;
+                        if (predicate_values) |values| {
+                            if (values[row_index].sql_null or !values[row_index].value.bool) continue;
+                        }
+                        scanned += 1;
+                        if (top_k == null and scanned <= offset) continue;
+                        if (top_k == null and delivered + selected_count == limit) {
+                            if (statement.limit == null) return error.SqlResultTooLarge;
+                            complete = true;
+                            break;
+                        }
+                        selection[selected_count] = row_index;
+                        ordinals[selected_count] = visited;
+                        selected_count += 1;
+                        if (top_k == null and delivered + selected_count == limit and statement.limit != null) {
+                            complete = true;
+                            break;
+                        }
+                    }
+                    if (selected_count != 0) {
+                        var view: ProjectedBatch = .{ .rows = chunk_rows, .selection = selection[0..selected_count], .positions = selected_positions, .fields = fields.items, .columns = columns, .expressions = projection_values };
+                        // Keep declared coercion errors eager even for heap
+                        // losers. Cache scalar columns once; validated native
+                        // JSON needs no DOM to cross its declared JSON boundary.
+                        if (top_k != null) {
+                            const coerced = try scratch.alloc(?[]const Datum, columns.len);
+                            @memset(coerced, null);
+                            for (columns, 0..) |column, ordinal| {
+                                if (column.type == .json) {
+                                    for (0..selected_count) |lane| {
+                                        if (try ProjectedBatch.frozen(&view, lane, ordinal) != null or try ProjectedBatch.json(&view, lane, ordinal) != null) continue;
+                                        _ = try ProjectedBatch.cell(&view, scratch, lane, ordinal);
+                                    }
+                                    continue;
+                                }
+                                const values = try scratch.alloc(Datum, selected_count);
+                                for (values, 0..) |*cell_, lane| cell_.* = try ProjectedBatch.cell(&view, scratch, lane, ordinal);
+                                coerced[ordinal] = values;
+                            }
+                            view.coerced = coerced;
+                        }
+                        const batch = view.batch();
+                        if (top_k) |*operator| {
+                            const keys = try scratch.alloc([]const Datum, selected_count);
+                            for (selection[0..selected_count], keys, 0..) |physical, *out, lane| {
+                                const row_keys = try scratch.alloc(Datum, self.binding.order_keys.len);
+                                for (self.binding.order_keys, row_keys) |key, *sort_key| sort_key.* = switch (key.source) {
+                                    .output => |column| try batch.cell(scratch, lane, column),
+                                    .expression => |column| order_values[column].?[selected_positions[physical].?],
+                                    .column => |column| try describe.coerceDatum(scratch, try chunk_rows[physical].cell(column.path), column.type, column.element_type),
+                                };
+                                out.* = row_keys;
+                            }
+                            try operator.addBatch(scratch, batch, keys, ordinals[0..selected_count]);
+                        } else {
+                            const sink = self.sink.?;
+                            try sink.append_batch.?(sink.ptr, batch);
+                            delivered += selected_count;
+                        }
+                    }
+                    if (complete) return .{ .columns = columns, .command_tag = "SELECT" };
+                    first += chunk_rows.len;
+                    continue;
+                }
                 for (chunk_rows, 0..) |row, row_index| {
                     try self.checkpoint();
                     visited += 1;
@@ -1039,9 +1157,12 @@ pub const Context = struct {
     /// The caller selects predicate/OFFSET/LIMIT survivors before calling this,
     /// so discarded rows never invoke projection providers.
     pub fn projectValuesBatch(self: Context, alloc: std.mem.Allocator, rows: []const catalog.Row, fields: []const []const u8, cells: []const []const Datum) ![]const []const Datum {
+        return self.projectValuesBatchDemand(alloc, rows, fields, cells, null);
+    }
+    pub fn projectValuesBatchDemand(self: Context, alloc: std.mem.Allocator, rows: []const catalog.Row, fields: []const []const u8, cells: []const []const Datum, needed: ?[]const bool) ![]const []const Datum {
         if (rows.len != cells.len) return error.InvalidSqlBackendResponse;
         const columns = try alloc.alloc(?[]const Datum, self.binding.scalars.projections.len);
-        for (self.binding.scalars.projections, columns) |optional, *values| values.* = if (optional) |*program|
+        for (self.binding.scalars.projections, columns, 0..) |optional, *values, index| values.* = if (needed != null and !needed.?[index]) null else if (optional) |*program|
             try @import("decision_eval.zig").evaluateBatchWithLimits(alloc, self.backend.decision_provider, program, cells, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
         else
             null;
@@ -1049,6 +1170,10 @@ pub const Context = struct {
         for (rows, output, 0..) |row, *values, row_index| {
             const projected = try alloc.alloc(Datum, fields.len);
             for (fields, self.binding.columns, projected, 0..) |field, column, *out, index| {
+                if (needed != null and !needed.?[index]) {
+                    out.* = .{};
+                    continue;
+                }
                 const input = if (index < columns.len and columns[index] != null) columns[index].?[row_index] else blk: {
                     const cell = try row.cell(field);
                     break :blk cell;
@@ -5029,6 +5154,129 @@ test "external lake SQL native aggregate materialization retains projection and 
     try std.testing.expectEqual(@as(usize, 2), driver.base.pages);
 }
 
+test "SQL finalized aggregate runtime stops unordered limits after filtering and HAVING" {
+    const a = std.testing.allocator;
+    const Driver = struct {
+        base: TestBackend = .{},
+        position: usize = 0,
+        emitted: usize = 0,
+        closes: usize = 0,
+        transferred: bool = false,
+        request: catalog.FinalGroupRequest = undefined,
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+            return TestBackend.resolve(&from(raw).base, alloc, name, action);
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.TestUnexpectedResult;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.TestUnexpectedResult;
+        }
+        fn load(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
+            if (recipe.keys.len != 1 or recipe.inputs.len != 1 or recipe.inputs[0].spec.kind != .count) return error.TestUnexpectedResult;
+            return .{ .ptr = raw, .next = nextPartial, .close = closeCursor, .adopt_final_groups = adopt };
+        }
+        fn nextPartial(_: *anyopaque, _: std.mem.Allocator, _: u32) !?[]const operators.GroupResult {
+            return error.TestUnexpectedResult;
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            try TestBackend.checkpoint(&from(raw).base);
+        }
+        fn closeCursor(raw: *anyopaque) void {
+            if (!from(raw).transferred) close(raw);
+        }
+        fn close(raw: *anyopaque) void {
+            from(raw).closes += 1;
+        }
+        fn adopt(raw: *anyopaque, grouped: *operators.Grouped, request: catalog.FinalGroupRequest) !bool {
+            const self = from(raw);
+            self.request = request;
+            try grouped.adoptFinalized(.{ .ptr = raw, .count = 10000, .exact_count = request.predicate == null, .next = next, .close = close }, request.page_limit);
+            self.transferred = true;
+            return true;
+        }
+        fn next(raw: *anyopaque, out: std.mem.Allocator, maximum: usize, _: bool) !?operators.GroupBatch {
+            const self = from(raw);
+            var scratch = std.heap.ArenaAllocator.init(out);
+            defer scratch.deinit();
+            const keys = try out.alloc([]const Datum, maximum);
+            const values = try out.alloc([]const Datum, maximum);
+            const ordinals = try out.alloc(u64, maximum);
+            var count: usize = 0;
+            while (count < maximum and self.position < 10000) {
+                const row = self.position;
+                self.position += 1;
+                const key = [_]Datum{Datum.json(.{ .integer = @intCast(row) })};
+                _ = scratch.reset(.free_all);
+                if (self.request.predicate) |predicate| if (!try predicate.matches(predicate.ptr, scratch.allocator(), &key)) continue;
+                keys[count] = try out.dupe(Datum, &key);
+                values[count] = try out.dupe(Datum, &.{Datum.json(.{ .integer = 1 })});
+                ordinals[count] = row;
+                count += 1;
+            }
+            if (count == 0) return null;
+            self.emitted += count;
+            return .{ .keys = .{ .rows = keys[0..count] }, .aggregates = .{ .rows = values[0..count] }, .ordinals = ordinals[0..count] };
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .aggregate_partials = load } };
+        }
+    };
+    for ([_]struct { sql: []const u8, first: i64, rows: usize, emitted: usize }{
+        .{ .sql = "SELECT id, COUNT(*) FROM docs GROUP BY id LIMIT 3 OFFSET 2", .first = 2, .rows = 3, .emitted = 5 },
+        .{ .sql = "SELECT id, COUNT(*) FROM docs WHERE id >= 9950 GROUP BY id LIMIT 1", .first = 9950, .rows = 1, .emitted = 1 },
+        .{ .sql = "SELECT id, COUNT(*) FROM docs GROUP BY id HAVING id >= 50 LIMIT 2 OFFSET 1", .first = 51, .rows = 2, .emitted = 56 },
+        .{ .sql = "SELECT id, COUNT(*) FROM docs GROUP BY id ORDER BY id + 0 DESC LIMIT 1", .first = 9999, .rows = 1, .emitted = 10000 },
+        .{ .sql = "SELECT id, COUNT(*) FROM docs WHERE id < 0 GROUP BY id LIMIT 1", .first = 0, .rows = 0, .emitted = 0 },
+    }) |case| {
+        var driver: Driver = .{};
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, driver.backend(), &compiled, &.{}, .{ .execution_batch_rows = 7 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.rows, result.output.rows.len);
+        for (result.output.rows, 0..) |row, index| try std.testing.expectEqual(case.first + @as(i64, @intCast(index)), try std.fmt.parseInt(i64, row[0].string, 10));
+        try std.testing.expectEqual(case.emitted, driver.emitted);
+        try std.testing.expectEqual(@as(usize, 1), driver.closes);
+    }
+
+    const Sink = struct {
+        rows: usize = 0,
+        batches: usize = 0,
+        fn row(_: *anyopaque, _: []const Datum) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn batch(raw: *anyopaque, cells: @import("execution_batch.zig").Batch) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (cells != .vectors) return error.TestUnexpectedResult;
+            for (0..cells.len()) |i| {
+                try std.testing.expectEqual(@as(i64, @intCast(51 + self.rows)), (try cells.cell(std.testing.allocator, i, 0)).value.integer);
+                self.rows += 1;
+            }
+            self.batches += 1;
+        }
+    };
+    var driver: Driver = .{};
+    var sink: Sink = .{};
+    var compiled = try compiler.compile(a, "SELECT id, COUNT(*) FROM docs GROUP BY id HAVING id >= 50 LIMIT 9 OFFSET 1", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    _ = try runBound(a, arena.allocator(), driver.backend(), &compiled, &.{}, .{ .execution_batch_rows = 7 }, .{ .ptr = &sink, .append = Sink.row, .append_batch = Sink.batch });
+    try std.testing.expectEqual(@as(usize, 9), sink.rows);
+    try std.testing.expectEqual(@as(usize, 2), sink.batches);
+    try std.testing.expectEqual(@as(usize, 1), driver.closes);
+    var overflow: Driver = .{};
+    var unbounded = try compiler.compile(a, "SELECT id, COUNT(*) FROM docs GROUP BY id", .{});
+    defer unbounded.deinit();
+    try std.testing.expectError(error.SqlResultTooLarge, execute(a, overflow.backend(), &unbounded, &.{}, .{ .result_rows = 3 }));
+    try std.testing.expectEqual(@as(usize, 4), overflow.emitted);
+    try std.testing.expectEqual(@as(usize, 1), overflow.closes);
+}
+
 test "SQL filtered LIMIT hints require a complete bound predicate and remain advisory" {
     const cases = [_]struct { sql: []const u8, goal: ?u64 }{
         .{ .sql = "SELECT id FROM things WHERE id >= 9007199254740993 LIMIT 2 OFFSET 1", .goal = 3 },
@@ -5812,4 +6060,137 @@ test "SQL native transport parameters retain arrays numeric JSON null and source
         }
     };
     for ([_]bool{ false, true }) |leased| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{leased});
+}
+
+test "SQL REAL pushed comparisons preserve declared float8 parameter operands" {
+    const Fixture = struct {
+        expected: f64,
+        sample: f64 = @as(f32, 0.1),
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .float32 }} };
+        }
+        fn scan(raw: *anyopaque, a: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), request.conditions.len);
+            try std.testing.expectEqual(self.expected, request.conditions[0].value.float);
+            const order = try @import("scalar.zig").compare(.{ .float = self.sample }, request.conditions[0].value);
+            if (order != (if (request.conditions[0].op == .gt) std.math.Order.gt else .eq)) return .{ .rows = &.{} };
+            const rows = try a.alloc(catalog.Row, 1);
+            var object: std.json.ObjectMap = .empty;
+            try object.put(a, "n", .{ .float = self.sample });
+            rows[0] = .{ .id = "one", .version = 0, .value = .{ .object = object } };
+            return .{ .rows = rows };
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnsupportedSqlExecution;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{ .expected = 0.10000000148 };
+    const backend: catalog.Backend = .{ .ptr = &fixture, .parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .float64 }}, .vtable = &.{ .resolve = Fixture.resolve, .scan = Fixture.scan, .mutate = Fixture.mutate, .checkpoint = Fixture.checkpoint } };
+    var compiled = try compiler.compile(a, "SELECT n FROM docs WHERE n > $1", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{.{ .float = 0.10000000148 }}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    // Declared REAL operands normalize to their own descriptor as well.
+    fixture.expected = @as(f32, 0.1);
+    var real_backend = backend;
+    real_backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .float32 }};
+    var equality = try compiler.compile(a, "SELECT n FROM docs WHERE n = $1", .{});
+    defer equality.deinit();
+    var real = try execute(a, real_backend, &equality, &.{.{ .float = 0.1 }}, .{});
+    defer real.deinit();
+    try std.testing.expectEqual(@as(usize, 1), real.output.rows.len);
+}
+
+test "SQL finalized materialization page quota stays independent of decision output fragmentation" {
+    const a = std.testing.allocator;
+    const Driver = struct {
+        base: TestBackend = .{},
+        position: usize = 0,
+        emitted: usize = 0,
+        closes: usize = 0,
+        transferred: bool = false,
+        request: catalog.FinalGroupRequest = undefined,
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+            return TestBackend.resolve(&from(raw).base, alloc, name, action);
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.TestUnexpectedResult;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.TestUnexpectedResult;
+        }
+        fn load(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
+            if (recipe.keys.len != 1 or recipe.inputs.len != 1 or recipe.inputs[0].spec.kind != .count) return error.TestUnexpectedResult;
+            return .{ .ptr = raw, .next = nextPartial, .close = closeCursor, .adopt_final_groups = adopt };
+        }
+        fn nextPartial(_: *anyopaque, _: std.mem.Allocator, _: u32) !?[]const operators.GroupResult {
+            return error.TestUnexpectedResult;
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            try TestBackend.checkpoint(&from(raw).base);
+        }
+        fn closeCursor(raw: *anyopaque) void {
+            if (!from(raw).transferred) close(raw);
+        }
+        fn close(raw: *anyopaque) void {
+            from(raw).closes += 1;
+        }
+        fn adopt(raw: *anyopaque, grouped: *operators.Grouped, request: catalog.FinalGroupRequest) !bool {
+            const self = from(raw);
+            self.request = request;
+            try grouped.adoptFinalized(.{ .ptr = raw, .count = 10, .exact_count = request.predicate == null, .ordered = request.selection.order.len != 0, .batch_rows = request.batch_rows, .next = next, .close = close }, request.page_limit);
+            self.transferred = true;
+            return true;
+        }
+        fn next(raw: *anyopaque, out: std.mem.Allocator, maximum: usize, _: bool) !?operators.GroupBatch {
+            const self = from(raw);
+            var scratch = std.heap.ArenaAllocator.init(out);
+            defer scratch.deinit();
+            const keys = try out.alloc([]const Datum, maximum);
+            const values = try out.alloc([]const Datum, maximum);
+            const ordinals = try out.alloc(u64, maximum);
+            var count: usize = 0;
+            while (count < maximum and self.position < 10) {
+                const row = self.position;
+                self.position += 1;
+                const key = [_]Datum{Datum.json(.{ .integer = @intCast(row) })};
+                _ = scratch.reset(.free_all);
+                if (self.request.predicate) |predicate| if (!try predicate.matches(predicate.ptr, scratch.allocator(), &key)) continue;
+                keys[count] = try out.dupe(Datum, &key);
+                values[count] = try out.dupe(Datum, &.{Datum.json(.{ .integer = 1 })});
+                ordinals[count] = row;
+                count += 1;
+            }
+            if (count == 0) return null;
+            self.emitted += count;
+            return .{ .keys = .{ .rows = keys[0..count] }, .aggregates = .{ .rows = values[0..count] }, .ordinals = ordinals[0..count] };
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .aggregate_partials = load } };
+        }
+    };
+    for ([_][]const u8{
+        "SELECT id, COUNT(*) FROM docs GROUP BY id LIMIT 3",
+        "SELECT id, COUNT(*), ai_probability(CAST(id AS TEXT),'Refund?','local') FROM docs GROUP BY id LIMIT 3",
+        "SELECT id, COUNT(*), ai_probability(CAST(id AS TEXT),'Refund?','local') FROM docs GROUP BY id",
+        "SELECT id, COUNT(*), ai_probability(CAST(id AS TEXT),'Refund?','local') FROM docs GROUP BY id ORDER BY id LIMIT 9",
+    }) |query| {
+        var driver: Driver = .{};
+        var provider: @import("decision_eval.zig").testing.Provider = .{};
+        var backend = driver.backend();
+        backend.decision_provider = provider.provider();
+        var compiled = try compiler.compile(a, query, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .execution_batch_rows = 8, .scan_pages = 2 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, if (std.mem.indexOf(u8, query, "LIMIT") == null) 10 else if (std.mem.indexOf(u8, query, "LIMIT 9") != null) 9 else 3), result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), driver.closes);
+    }
 }

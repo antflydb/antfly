@@ -607,3 +607,14 @@ func TestGatewayInjectsJoinedTableRowFilters(t *testing.T) {
 		t.Fatalf("expected right conjunction, got %s", rightFilters["filter_query"])
 	}
 }
+
+func TestResolverCurationOperationClassification(t *testing.T) {
+	for _, path := range []string{"/resolvers/concepts:render", "/resolvers/concepts:resolve"} {
+		if got := inferOperationFromBackendPath(http.MethodPost, path); got != OperationRead {
+			t.Fatalf("%s: got %s", path, got)
+		}
+	}
+	if got := inferOperationFromBackendPath(http.MethodPost, "/resolvers/concepts:namespace"); got != OperationAdmin {
+		t.Fatalf("namespace operation: got %s", got)
+	}
+}

@@ -1710,7 +1710,7 @@ pub const Session = struct {
         if (bytes.written().len > payload_limit or remaining_headers > payload_limit - bytes.written().len) return error.ProgramLimitExceeded;
         const cell_limit = payload_limit - bytes.written().len - remaining_headers;
         if (value.sql_null) {
-            if (value.value != .null or value.array != null or value.numeric != null) return error.InvalidResult;
+            if (value.value != .null or value.array != null or value.numeric != null or value.json_bytes != null or value.frozen_json != null) return error.InvalidResult;
             try bytes.writer.writeInt(i32, -1, .big);
             return;
         }

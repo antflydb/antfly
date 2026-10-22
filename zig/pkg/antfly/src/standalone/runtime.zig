@@ -786,6 +786,9 @@ const LocalStandaloneMetadata = struct {
 
     system_catalog_state: ?system_catalog.MutableState = null,
     routing_generation: ?*antfly.public_api.table_catalog.RoutingGeneration = null,
+    // Replicated catalog replacement can reuse a locally initialized revision.
+    // Fence out-of-lock cache builders independently of that durable revision.
+    projection_incarnation: u64 = 0,
     join_planning_generation: ?*antfly.public_api.join_planning.Generation = null,
     join_planning_epoch: u64 = 0,
     const CatalogCreate = struct {
@@ -826,6 +829,9 @@ const LocalStandaloneMetadata = struct {
         committed: bool = false,
 
         fn upsertTable(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, table: antfly.metadata.TableRecord) !void {
+            if (metadata.lifecycle_store) |store| {
+                if (!try store.resolverProjectionValid(metadata.alloc, group_ids.main_metadata_group_id, table)) return error.ResolverCurationConflict;
+            }
             try self.captureTable(metadata, table.table_id);
             try metadata.manager.upsertTable(table);
         }
@@ -1077,6 +1083,7 @@ const LocalStandaloneMetadata = struct {
                 .status = status,
                 .system_catalog = systemCatalog,
                 .supports_query_definitions = true,
+                .supports_resolver_catalog_read = true,
                 .supports_object_tables = true,
                 .acquire_join_planning = acquireJoinPlanning,
                 .admin_snapshot = catalogAdminSnapshot,
@@ -1846,6 +1853,12 @@ const LocalStandaloneMetadata = struct {
             self.mutex.unlock();
             return error.MetadataMutationOutcomeUnknown;
         }
+        // A failed durable publication/reload must not leave a reusable
+        // projection. Healthy reads keep the in-memory fast path.
+        if (self.lifecycle_store != null and self.durable_revision == 0) self.reloadLifecycleProjectionLocked() catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
         // The metadata mutex is the standalone linearizable-read barrier.
         if (self.routing_generation) |generation| {
             if (generation.indexed.snapshot.value.catalog_revision == self.epoch) {
@@ -1854,6 +1867,7 @@ const LocalStandaloneMetadata = struct {
                 return generation;
             }
         }
+        const projection_incarnation = self.projection_incarnation;
         var snapshot = self.routingSnapshotLocked(deadline_ns) catch |err| {
             self.mutex.unlock();
             return err;
@@ -1871,7 +1885,7 @@ const LocalStandaloneMetadata = struct {
             return error.MetadataMutationOutcomeUnknown;
         }
         var previous: ?*antfly.public_api.table_catalog.RoutingGeneration = null;
-        if (self.epoch == snapshot.catalog_revision) {
+        if (self.epoch == snapshot.catalog_revision and self.projection_incarnation == projection_incarnation) {
             previous = self.routing_generation;
             self.routing_generation = next;
             next.retain();
@@ -1890,6 +1904,12 @@ const LocalStandaloneMetadata = struct {
             self.mutex.unlock();
             return error.MetadataMutationOutcomeUnknown;
         }
+        // A failed durable publication/reload must not leave a reusable
+        // projection. Healthy reads keep the in-memory fast path.
+        if (self.lifecycle_store != null and self.durable_revision == 0) self.reloadLifecycleProjectionLocked() catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
         if (self.join_planning_generation) |generation| {
             if (self.join_planning_epoch == self.epoch) {
                 const retained = generation.retain();
@@ -1913,7 +1933,7 @@ const LocalStandaloneMetadata = struct {
         errdefer next.release();
         if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
         var previous: ?*antfly.public_api.join_planning.Generation = null;
-        if (!self.catalog_durability_failed and self.epoch == snapshot.catalog_revision) {
+        if (!self.catalog_durability_failed and self.epoch == snapshot.catalog_revision and self.routing_generation == routing) {
             previous = self.join_planning_generation;
             self.join_planning_generation = next.retain();
             self.join_planning_epoch = snapshot.catalog_revision;
@@ -1946,7 +1966,7 @@ const LocalStandaloneMetadata = struct {
             if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
             defer self.mutex.unlock();
             if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
-            if (generation.indexed.snapshot.value.catalog_revision != self.epoch) continue;
+            if (generation.indexed.snapshot.value.catalog_revision != self.epoch or self.routing_generation != generation) continue;
             const table = self.manager.findTableByName(table_name);
             const tables = try self.alloc.alloc(antfly.metadata.TableRecord, if (table != null) 1 else 0);
             var copied_table = false;
@@ -2167,6 +2187,31 @@ const LocalStandaloneMetadata = struct {
         try binding.validate();
         if (self.native_owner_binding) |admitted| if (!admitted.eql(binding)) return error.StoreRootEnrollmentChanged;
         return binding;
+    }
+
+    fn nativeOwnerBindingRequiredOnOpen(self: *LocalStandaloneMetadata) !bool {
+        if (self.storage_engine != .lite) return true;
+        // Plain Lite files must remain self-contained. Bind directory-owned
+        // FK authority only when a publication actually requests it. Existing
+        // bindings still require the original physical root on every reopen.
+        const store = self.catalog_store orelse return error.MissingCatalogStore;
+        var txn = try store.beginRead();
+        defer txn.abort();
+        var key_buf: [160]u8 = undefined;
+        _ = txn.get(try @import("../metadata/standalone_native_owner.zig").key(&key_buf, group_ids.main_metadata_group_id)) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    /// Schema cleanup may use FK publication authority already acquired by
+    /// admission, but must never acquire it. In particular, a plain Lite
+    /// migration must not introduce a dependency on a directory-owned root.
+    /// Revalidate existing authority against the physical root on every use.
+    fn currentNativeOwnerProofLocked(self: *LocalStandaloneMetadata) !?@import("../metadata/standalone_native_owner.zig").Binding {
+        if (self.native_owner_binding == null) return null;
+        return try self.physicalNativeOwnerBinding();
     }
 
     /// First registration is a standalone catalog CAS before any FK plan is
@@ -2582,6 +2627,12 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
+            .resolver_catalog_read => |input| {
+                _ = try self.ensureNativeOwnerBindingLocked();
+                var read = input;
+                read.standalone = true;
+                return self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, read);
+            },
             .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
@@ -3173,6 +3224,12 @@ const LocalStandaloneMetadata = struct {
         const namespace = try std.fmt.allocPrint(self.alloc, "group-{d}/table-db", .{ranges[0].group_id});
         defer self.alloc.free(namespace);
 
+        // Validate the catalog before acquiring standalone ownership. A refused
+        // translation must leave the file editable by its embedded owner.
+        var definition = try @import("antfly_local_sources").storage_lite_restore_staging.embeddedTableDefinition(self.alloc, backend.native_runtime_store.?);
+        defer definition.deinit(self.alloc);
+        const adopted_table = try deriveStandaloneTableRecord(.lite, "default", definition);
+
         // The durable alias is published first. If catalog publication fails,
         // startup fails and the next attempt safely retries the idempotent
         // catalog adoption; it can never publish a table that points at an
@@ -3195,7 +3252,7 @@ const LocalStandaloneMetadata = struct {
         if (self.findTableByNameLocked("default") != null) return;
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
-        try mutation.upsertTable(self, table);
+        try mutation.upsertTable(self, adopted_table);
         for (ranges) |range| try mutation.upsertRange(self, range);
         self.epoch +|= 1;
         try mutation.commit(self);
@@ -3228,13 +3285,19 @@ const LocalStandaloneMetadata = struct {
             .identity_range_id = ranges[0].range_id,
         });
 
+        var store = try context.systemStore(self.alloc, namespace);
+        defer store.deinit();
+        var definition = try @import("antfly_local_sources").storage_lite_restore_staging.embeddedTableDefinition(self.alloc, &store);
+        defer definition.deinit(self.alloc);
+        const adopted_table = try deriveStandaloneTableRecord(.lite, "default", definition);
+
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (self.findTableByNameLocked("default") != null) return;
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
-        try self.manager.upsertTable(table);
-        for (ranges) |range| try self.manager.upsertRange(range);
+        try mutation.upsertTable(self, adopted_table);
+        for (ranges) |range| try mutation.upsertRange(self, range);
         self.epoch +|= 1;
         try mutation.commit(self);
     }
@@ -3514,6 +3577,7 @@ const LocalStandaloneMetadata = struct {
     fn runRound(ptr: *anyopaque) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try self.reconcileRelations();
+        try self.reconcileResolverNamespaces();
         try self.provisionRestoreOwners();
         self.finalizeReadySchemaMigrations() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.LmdbUnexpected, error.Corrupted => {},
@@ -3549,6 +3613,32 @@ const LocalStandaloneMetadata = struct {
         }
     }
 
+    fn reconcileResolverNamespaces(self: *LocalStandaloneMetadata) !void {
+        const store = self.lifecycle_store orelse return;
+        if (!self.mutex.tryLock()) return;
+        defer self.mutex.unlock();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const group = group_ids.main_metadata_group_id;
+        const job = (try store.pendingResolverNamespaceTable(a, group)) orelse {
+            const id = (try store.pendingResolverNamespaceDrop(a, group)) orelse return;
+            const fence = try store.getTableTransitionFence(group, id);
+            try self.applyJobCommandLocked(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
+            return;
+        };
+        const sources = try store.pendingResolverNamespaceSources(a, group);
+        try store.updateStandaloneCatalog(group, self.durable_revision, .{ .table_replacements = &.{.{ .expected = job, .replacement = job }} });
+        // Certify the new projection only after each touched table is refreshed.
+        self.durable_revision = 0;
+        for (sources) |source| {
+            const actual = (try store.getTable(a, group, source.table_id)) orelse continue;
+            try self.manager.upsertTable(actual);
+        }
+        self.durable_revision = try store.standaloneRevision();
+        self.epoch = self.durable_revision;
+    }
+
     fn reconcileRelations(self: *LocalStandaloneMetadata) !void {
         // HA has a separate writer/replica authority contract. A standalone
         // coordinator cannot activate a single-owner capability for it.
@@ -3568,7 +3658,10 @@ const LocalStandaloneMetadata = struct {
         // the next catalog reader. No full projection scan on control rounds.
         if (self.durable_revision != 0 and self.durable_revision == before and
             applied and before != std.math.maxInt(u64) and after == before + 1)
+        {
             self.durable_revision = after;
+            self.epoch = after;
+        }
     }
 
     fn provisionRestoreOwners(self: *LocalStandaloneMetadata) !void {
@@ -3985,11 +4078,6 @@ const LocalStandaloneMetadata = struct {
 
         var locked = try self.lockMutation();
         defer locked.deinit();
-        const native_owner_proof = if (self.localFkPublicationSupported())
-            try self.ensureNativeOwnerBindingLocked()
-        else
-            null;
-
         // The native catalog uses the same durable owner-progress predicate as
         // the replicated table writer. Publish only observations for the exact
         // table cut collected above before asking that writer to retire the
@@ -4010,6 +4098,11 @@ const LocalStandaloneMetadata = struct {
             }
             try ready_progress.append(self.alloc, record);
         }
+        if (ready_progress.items.len == 0) return;
+        const native_owner_proof = if (self.localFkPublicationSupported())
+            try self.currentNativeOwnerProofLocked()
+        else
+            null;
         if (self.lifecycle_store != null) {
             const batch_size = antfly.metadata.table_manager.max_schema_progress_batch;
             for (0..std.math.divCeil(usize, ready_progress.items.len, batch_size) catch unreachable) |batch| {
@@ -4180,6 +4273,14 @@ const LocalStandaloneMetadata = struct {
         });
         defer parsed.deinit();
 
+        // Drop derived catalog caches before replacing the projection, including
+        // partial replacement failures. Existing readers retain their immutable
+        // cut; an in-flight builder must not republish it under a reused epoch.
+        self.projection_incarnation += 1;
+        if (self.routing_generation) |generation| generation.release();
+        self.routing_generation = null;
+        if (self.join_planning_generation) |generation| generation.release();
+        self.join_planning_generation = null;
         _ = try self.manager.replaceProjectedTopology(parsed.value.tables, parsed.value.ranges);
         try self.extension_catalog.loadProjectedRows(
             parsed.value.extension_packages,
@@ -4468,6 +4569,15 @@ const LocalStandaloneMetadata = struct {
         mutation.committed = true;
         self.durable_revision += 1;
         self.epoch = self.durable_revision;
+        var projected_tables = mutation.previous_tables.keyIterator();
+        while (projected_tables.next()) |id| {
+            if (!self.manager.tables.contains(id.*)) continue;
+            const actual = (try self.lifecycle_store.?.getTable(a, group_ids.main_metadata_group_id, id.*)) orelse return error.TableLifecycleConflict;
+            self.manager.upsertTable(actual) catch {
+                self.durable_revision = 0;
+                return error.MetadataMutationOutcomeUnknown;
+            };
+        }
     }
 
     fn persistMutationLocked(self: *LocalStandaloneMetadata, mutation: *CatalogMutation) !void {
@@ -4769,9 +4879,7 @@ pub fn runFromIterator(
             },
             .memory_limit_bytes = process_memory_limit_bytes,
         });
-        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
-        defer alloc.free(security_json);
-        try storage_kernel_context.configureRemoteContentSecurity(security_json);
+        try storage_kernel_context.configureRemoteContent(remote_content);
         try storage_kernel_context.configureSecrets(&secret_store);
         const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, if (loaded_config) |*cfg| cfg else null, .standalone, data_dir);
         defer alloc.free(retained_setup);
@@ -5062,31 +5170,32 @@ pub fn runFromIterator(
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
+    defer if (comptime !control_only_storage_sources) if (auth_backend) |*backend| backend.close();
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (auth_runtime) |*runtime| runtime.deinit();
     var kernel_auth_users_store: ?antfly.storage_backend_erased.Store = null;
+    defer if (kernel_auth_users_store) |*store| store.deinit();
     var kernel_auth_casbin_store: ?antfly.storage_backend_erased.Store = null;
+    defer if (kernel_auth_casbin_store) |*store| store.deinit();
     var kernel_auth_users_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
     var kernel_auth_casbin_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
     var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
+    defer if (user_manager) |*manager| manager.deinit();
     if (auth_enabled) {
         if (comptime control_only_storage_sources) {
             kernel_auth_users_store = try storage_kernel_context.systemStore(alloc, "system/auth-users");
-            errdefer kernel_auth_users_store.?.deinit();
             kernel_auth_casbin_store = try storage_kernel_context.systemStore(alloc, "system/auth-casbin");
-            errdefer kernel_auth_casbin_store.?.deinit();
             kernel_auth_users_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_users_store.?, "usermgr_users");
-            errdefer kernel_auth_users_runtime.?.deinit();
             kernel_auth_casbin_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_casbin_store.?, "usermgr_casbin");
-            errdefer kernel_auth_casbin_runtime.?.deinit();
             auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, kernel_auth_users_runtime.?);
             auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, kernel_auth_casbin_runtime.?);
         } else {
             auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
-            errdefer if (auth_backend) |*backend| backend.close();
             auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
-            errdefer if (auth_runtime) |*runtime| runtime.deinit();
             auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
             auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
         }
@@ -5096,7 +5205,6 @@ pub fn runFromIterator(
             auth_user_store.?.iface(),
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
-        errdefer if (user_manager) |*manager| manager.deinit();
         if (hot_standby_role_requested) {
             // Auth is carried by the portable seed, not the continuous HA WAL.
             // Creating a local default admin on either HA role after seeding
@@ -5118,13 +5226,6 @@ pub fn runFromIterator(
             };
         }
     }
-    defer if (user_manager) |*manager| manager.deinit();
-    defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (comptime !control_only_storage_sources) if (auth_backend) |*backend| backend.close();
-    defer if (kernel_auth_users_store) |*store| store.deinit();
-    defer if (kernel_auth_casbin_store) |*store| store.deinit();
-    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
-    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
 
     const public_listener = resolvePublicListener(cli);
     antfly.common.listener_security.warnIfUnauthenticated("public", public_listener.bind_host, public_listener.bind_port, auth_enabled);
@@ -5599,7 +5700,7 @@ pub fn runFromIterator(
     }
     try data_server.initApiServer();
     local_metadata.data_server = &data_server;
-    if (local_metadata.localFkPublicationSupported()) {
+    if (local_metadata.localFkPublicationSupported() and try local_metadata.nativeOwnerBindingRequiredOnOpen()) {
         var binding_lock = try local_metadata.lockMutation();
         defer binding_lock.deinit();
         _ = try local_metadata.ensureNativeOwnerBindingLocked();
@@ -5934,7 +6035,7 @@ fn serveUnifiedInner(
     }
     if (register_inference_routes) {
         if (comptime inline_inference) {
-            try inference_host.linkedInferenceRegisterRoutesOn(antfly_node, &server);
+            try inference_host.linkedInferenceRegisterRoutesOnExcept(antfly_node, &server, @import("../api/inference_gateway.zig").public_paths);
         } else {
             const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
             try registerLinkedInferenceManifest(
@@ -6032,6 +6133,7 @@ fn registerLinkedInferenceManifest(
     if (!status.isOk()) return inference_bridge.errorFromStatus(status);
     const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
     for (entries) |entry| {
+        if (@import("../api/inference_gateway.zig").ownsPath(entry.path.slice())) continue;
         const route = try alloc.create(LinkedInferenceRoute);
         errdefer alloc.destroy(route);
         route.* = .{
@@ -6492,8 +6594,7 @@ fn isHttpToken(value: []const u8) bool {
 }
 
 fn isInferenceApiPath(path: []const u8) bool {
-    return hasPathComponentPrefix(path, inference_bridge.ai_api_prefix) or
-        hasPathComponentPrefix(path, inference_bridge.public_api_prefix);
+    return @import("../api/inference_route_policy.zig").isInferenceApiPath(path);
 }
 
 const isInteractiveGeneratePath = inference_provider.isInteractiveGeneratePath;
@@ -9475,7 +9576,10 @@ test "standalone inference middleware reuses public API authentication" {
     var user = try manager.createUser("admin", "admin", &.{});
     defer user.deinit(alloc);
 
+    var public_config = try antfly.common.config.Config.parseFromSlice(alloc, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     var api_server = antfly.public_api.http_server.ApiHttpServer.init(alloc, .{
+        .node_config = &public_config,
         .auth_enabled = true,
         .user_manager = &manager,
     }, .{ .ptr = undefined, .vtable = undefined }, null, null);
@@ -9486,7 +9590,7 @@ test "standalone inference middleware reuses public API authentication" {
     var table_read = try antfly.usermgr.Permission.initOwned(alloc, .table, "documents", .read);
     defer table_read.deinit(alloc);
     try manager.addPermissionToUser("admin", table_read);
-    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics" }) |path| {
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics", "/ai//v1/models/", "//ml/v1/metrics", "/ai/v1/models/instances" }) |path| {
         try Harness.expect(middleware, path, null, 401);
         try Harness.expect(middleware, path, "Basic YWRtaW46d3Jvbmc=", 401);
         try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 403);
@@ -9495,15 +9599,29 @@ test "standalone inference middleware reuses public API authentication" {
     var inference_read = try antfly.usermgr.Permission.initOwned(alloc, .inference, "*", .read);
     defer inference_read.deinit(alloc);
     try manager.addPermissionToUser("admin", inference_read);
-    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics" }) |path| {
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics", "/ai//v1/models/", "//ml/v1/metrics", "/ai/v1/models/instances" }) |path| {
         try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 204);
     }
     try Harness.expectMethod(middleware, .POST, "/ai/v1/generate", "Basic YWRtaW46YWRtaW4=", 403);
+    for ([_]struct { httpx.Method, []const u8 }{
+        .{ .POST, "/ai/v1/models/instances" },
+        .{ .DELETE, "/ai/v1/models/instances/example" },
+    }) |route| {
+        try Harness.expectMethod(middleware, route[0], route[1], null, 401);
+        try Harness.expectMethod(middleware, route[0], route[1], "Basic YWRtaW46YWRtaW4=", 403);
+    }
 
     var inference_write = try antfly.usermgr.Permission.initOwned(alloc, .inference, "*", .write);
     defer inference_write.deinit(alloc);
     try manager.addPermissionToUser("admin", inference_write);
     try Harness.expectMethod(middleware, .POST, "/ai/v1/generate", "Basic YWRtaW46YWRtaW4=", 204);
+    for ([_]struct { httpx.Method, []const u8 }{
+        .{ .POST, "/ai/v1/models/instances" },
+        .{ .DELETE, "/ai/v1/models/instances/example" },
+    }) |route| {
+        try Harness.expectMethod(middleware, route[0], route[1], null, 401);
+        try Harness.expectMethod(middleware, route[0], route[1], "Basic YWRtaW46YWRtaW4=", 204);
+    }
 
     var global_read = try antfly.usermgr.Permission.initOwned(alloc, .@"*", "*", .read);
     defer global_read.deinit(alloc);
@@ -13536,6 +13654,69 @@ test "standalone metadata rejects corrupt catalog without double-freeing owned p
     } else |_| {}
 }
 
+test "standalone ordinary schema migration never acquires native FK ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/catalog.json", .{root});
+    defer alloc.free(path);
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+    defer metadata.deinit();
+    var server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = root,
+        .replica_catalog_path = path,
+        .backend_runtime = runtime.ptr(),
+        .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://localhost", .role = "data" },
+        .api_server_cfg = .{ .deployment_mode = .standalone },
+    }, metadata.catalogSource(), metadata.statusSource());
+    defer server.deinit();
+    metadata.data_server = &server;
+    try std.testing.expect(metadata.localFkPublicationSupported());
+    {
+        var setup = try metadata.beginCatalogMutationLocked();
+        defer setup.deinit(&metadata);
+        try setup.upsertTable(&metadata, .{
+            .table_id = 7,
+            .name = "docs",
+            .desired_replica_count = 1,
+            .schema_json = "{\"version\":1}",
+            .read_schema_json = "{\"version\":0}",
+            .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+        });
+        try setup.upsertRange(&metadata, .{ .group_id = 70, .range_id = 70, .table_id = 7, .start_key = "", .doc_identity_shard_id = 70, .doc_identity_range_id = 70 });
+        try setup.commit(&metadata);
+    }
+    const Provider = struct {
+        fn collect(_: *anyopaque, a: std.mem.Allocator, _: []const antfly.metadata.TableRecord, _: []const antfly.metadata.RangeRecord) !antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot {
+            const records = try a.alloc(antfly.metadata.SchemaProgressRecord, 1);
+            records[0] = .{ .table_id = 7, .node_id = 1, .schema_version = 1 };
+            return .{ .records = records, .runtime_coverage_complete = true };
+        }
+    };
+    metadata.local_schema_progress_provider = .{ .ptr = undefined, .collect = Provider.collect };
+    try metadata.finalizeReadySchemaMigrations();
+    try std.testing.expectEqualStrings("", metadata.findTableByNameLocked("docs").?.read_schema_json);
+    try std.testing.expect(metadata.native_owner_binding == null);
+    try std.testing.expect(try metadata.currentNativeOwnerProofLocked() == null);
+    // Publication admission still acquires durable authority, and cleanup
+    // must validate it instead of trusting a cached proof after a root change.
+    const binding = try metadata.ensureNativeOwnerBindingLocked();
+    try std.testing.expect(binding.eql((try metadata.currentNativeOwnerProofLocked()).?));
+    const replacement = try std.fmt.allocPrint(alloc, "{s}/replacement", .{root});
+    defer alloc.free(replacement);
+    const io = runtime.ptr().filesystemIo().?;
+    try std.Io.Dir.cwd().createDirPath(io, replacement);
+    _ = try @import("antfly_local_sources").storage_db_root_identity.loadOrCreate(alloc, io, replacement);
+    const previous_root = metadata.replica_root_dir;
+    metadata.replica_root_dir = replacement;
+    defer metadata.replica_root_dir = previous_root;
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, metadata.currentNativeOwnerProofLocked());
+}
+
 test "standalone metadata finalizes schema migration from resident runtime evidence" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -14676,6 +14857,43 @@ test "system catalog standalone routing generation retains old identity through 
     defer alloc.free(page);
     clock_now = context.deadline_ns.?;
     try std.testing.expectError(error.DeadlineExceeded, metadata.statusSource().systemCatalog(alloc, context, .{ .list_tables = .{} }));
+}
+
+test "system catalog standalone replacement invalidates same-revision routing and planning cuts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    const epoch = metadata.epoch;
+    const old = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    defer old.release();
+    const old_plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
+    defer old_plan.release();
+    const replacement = try std.json.Stringify.valueAlloc(alloc, LocalStandaloneMetadata.PersistedCatalog{
+        .epoch = epoch,
+        .tables = &.{.{ .table_id = 77, .name = "replicated" }},
+        .ranges = &.{.{ .table_id = 77, .group_id = 7001, .start_key = "" }},
+    }, .{});
+    defer alloc.free(replacement);
+    try metadata.loadCatalogBytes(replacement);
+    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    defer current.release();
+    const plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
+    defer plan.release();
+    try std.testing.expectEqual(epoch, current.indexed.snapshot.value.catalog_revision);
+    try std.testing.expect(old != current);
+    try std.testing.expect(!old.indexed.table_indexes.contains("replicated"));
+    try std.testing.expect(current.indexed.table_indexes.contains("replicated"));
+    try std.testing.expect(!old_plan.tables.contains("replicated"));
+    try std.testing.expect(plan.tables.contains("replicated"));
+    var table_cut = try LocalStandaloneMetadata.catalogTableRoutingSnapshot(&metadata, "replicated", null);
+    defer LocalStandaloneMetadata.catalogFreeRoutingSnapshot(&metadata, &table_cut);
+    try std.testing.expectEqual(@as(usize, 1), table_cut.ranges.len);
 }
 
 test "system catalog standalone imports main checkpoints and current logical seeds atomically" {

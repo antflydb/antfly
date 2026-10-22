@@ -17,13 +17,26 @@
 //! to the supplied allocator (normally a bounded request arena).
 const std = @import("std");
 const contract = @import("antfly_decisions");
+const generating = @import("antfly_generating");
+const constrained = @import("antfly_structured");
 pub const Json = std.json.Value;
+pub const Input = @import("decision_input.zig").Input;
+/// Request-arena-owned wire payload; adapters supply transport metadata along
+/// with their body so the shared executor is independent of vendor formats.
+pub const WirePayload = struct {
+    body: []const u8,
+    /// Encoded/binary image bytes in the body; visual tokens are reserved
+    /// separately instead of charging compressed images as UTF-8 text.
+    image_bytes: usize = 0,
+    content_type: []const u8 = "application/json",
+    headers: []const [2][]const u8 = &.{},
+};
 pub const Provider = enum { antfly, jev, openai };
 pub const Kind = enum { choice, multi_choice, score, noul };
 pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability };
-pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, full_distribution: bool = true, embedding_similarity: bool = false };
+pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, images: bool = false, messages: bool = false, full_distribution: bool = true, embedding_similarity: bool = false, generated: bool = false };
 pub fn capabilities(provider: Provider) Capabilities {
-    return .{ .max_levels = if (provider == .antfly) 64 else 10 };
+    return .{ .max_levels = if (provider == .antfly) 64 else 10, .images = provider != .antfly, .messages = provider != .antfly };
 }
 pub const RateLimit = struct {
     pacing: ?enum { token_bucket, completion } = null,
@@ -52,8 +65,13 @@ pub const EmbeddingOptions = struct {
     }
 };
 pub const DeciderConfig = struct {
-    provider: Provider,
-    decision_method: enum { typed, embedding_similarity } = .typed,
+    provider: Provider = .antfly,
+    decision_method: enum { typed, embedding_similarity, generated } = .typed,
+    generator: ?generating.GeneratorConfig = null,
+    output: constrained.Output = .auto,
+    probabilities: constrained.Probabilities = .token_logprobs,
+    instructions: []const u8 = "",
+    batch: constrained.Batch = .{},
     model: []const u8 = "",
     model_identity: ?[]const u8 = null,
     embedding_options: ?EmbeddingOptions = null,
@@ -61,9 +79,19 @@ pub const DeciderConfig = struct {
     api_key: ?[]const u8 = null,
     max_rows: u32 = 10000,
     max_input_tokens: u64 = 1000000,
+    /// Operator-supplied upper bound for one image's token contribution for
+    /// this provider/model. Required for image calls, including remote URLs.
+    max_image_input_tokens: ?u64 = null,
     batch_size: u16 = 32,
     rate_limit: ?RateLimit = null,
     pub fn validate(self: @This()) !void {
+        if (self.decision_method == .generated) {
+            const generator = self.generator orelse return error.InvalidDeciderConfig;
+            try generator.validate();
+            if (generator.provider != .antfly) _ = try constrained.hostedCapabilities(generator).select(self.output, self.probabilities);
+            try self.batch.validate();
+            if (self.model.len != 0 or self.url.len != 0 or self.api_key != null or self.rate_limit != null or self.instructions.len > 65536) return error.InvalidDeciderConfig;
+        } else if (self.generator != null or self.instructions.len != 0 or self.output != .auto or self.probabilities != .token_logprobs or !std.meta.eql(self.batch, constrained.Batch{})) return error.InvalidDeciderConfig;
         if (self.decision_method == .embedding_similarity and self.provider != .antfly) return error.InvalidDeciderConfig;
         if (self.model_identity != null or self.embedding_options != null) {
             if (self.decision_method != .embedding_similarity) return error.InvalidDeciderConfig;
@@ -73,8 +101,11 @@ pub const DeciderConfig = struct {
                 for (identity) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidDeciderConfig;
             }
         }
+        if (self.max_image_input_tokens) |bound| {
+            if (bound == 0 or self.provider == .antfly or self.decision_method != .typed) return error.InvalidDeciderConfig;
+        }
         if (self.max_rows == 0 or self.max_input_tokens == 0 or self.batch_size == 0 or self.batch_size > 256) return error.InvalidDeciderConfig;
-        if (self.provider != .jev and std.mem.trim(u8, self.model, " \r\n\t").len == 0) return error.InvalidDeciderConfig;
+        if (self.decision_method != .generated and self.provider != .jev and std.mem.trim(u8, self.model, " \r\n\t").len == 0) return error.InvalidDeciderConfig;
         if (std.mem.indexOfAny(u8, self.url, "\r\n") != null) return error.InvalidDeciderConfig;
         if (self.rate_limit) |policy| {
             inline for (.{ policy.requests_per_minute, policy.burst, policy.tokens_per_minute, policy.max_concurrency }) |value| if (value) |v| if (v == 0) return error.InvalidDeciderConfig;
@@ -83,6 +114,12 @@ pub const DeciderConfig = struct {
     }
     pub fn resolvedCapabilities(self: @This()) Capabilities {
         var caps = capabilities(self.provider);
+        caps.generated = self.decision_method == .generated;
+        if (caps.generated) {
+            caps.max_levels = 64;
+            caps.images = false;
+            caps.messages = false;
+        }
         if (self.decision_method == .embedding_similarity) {
             caps.embedding_similarity = true;
             caps.full_distribution = false;
@@ -91,7 +128,7 @@ pub const DeciderConfig = struct {
         return caps;
     }
     pub fn modelName(self: @This()) []const u8 {
-        return if (self.model.len != 0) self.model else "jev-latest";
+        return if (self.generator) |generator| generator.model else if (self.model.len != 0) self.model else "jev-latest";
     }
     pub fn baseUrl(self: @This()) []const u8 {
         return if (self.url.len != 0) self.url else switch (self.provider) {
@@ -113,9 +150,15 @@ pub const DeciderConfig = struct {
         if (result.embedding_options) |*options| if (options.calibration_id) |id| {
             options.calibration_id = try a.dupe(u8, id);
         };
+        errdefer if (result.embedding_options) |options| if (options.calibration_id) |id| a.free(id);
+        result.generator = if (self.generator) |generator| try generator.clone(a) else null;
+        errdefer if (result.generator) |*generator| generator.deinit(a);
+        result.instructions = try a.dupe(u8, self.instructions);
         return result;
     }
     pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        if (self.generator) |*generator| generator.deinit(a);
+        a.free(self.instructions);
         a.free(self.model);
         a.free(self.url);
         if (self.api_key) |key| a.free(key);
@@ -193,7 +236,7 @@ pub fn validateQuestions(questions: Json, caps: Capabilities) !void {
         var keys = q.iterator();
         while (keys.next()) |key| if (!std.mem.eql(u8, key.key_ptr.*, "type") and !std.mem.eql(u8, key.key_ptr.*, "instructions") and !std.mem.eql(u8, key.key_ptr.*, "criteria") and !std.mem.eql(u8, key.key_ptr.*, "level_labels") and !(caps.embedding_similarity and (std.mem.eql(u8, key.key_ptr.*, "embedding_options") or std.mem.eql(u8, key.key_ptr.*, "similarity_thresholds")))) return error.InvalidDecisionSpecification;
         const kind = std.meta.stringToEnum(Kind, try text(q.get("type") orelse return error.InvalidDecisionSpecification)) orelse return error.InvalidDecisionSpecification;
-        if ((caps.embedding_similarity and kind != .choice and kind != .multi_choice) or (!caps.embedding_similarity and kind == .multi_choice)) return error.UnsupportedDecisionKind;
+        if ((caps.embedding_similarity and kind != .choice and kind != .multi_choice) or (!caps.embedding_similarity and !caps.generated and kind == .multi_choice)) return error.UnsupportedDecisionKind;
         schema_bytes +|= (try text(q.get("instructions") orelse return error.InvalidDecisionSpecification)).len;
         const criteria = q.get("criteria");
         switch (kind) {
@@ -219,10 +262,14 @@ pub fn validateQuestions(questions: Json, caps: Capabilities) !void {
                 }
             },
             .score => {
-                const levels = criteria orelse return error.InvalidDecisionSpecification;
-                if (levels != .array) return error.InvalidDecisionSpecification;
-                if (levels.array.items.len < 2 or levels.array.items.len > caps.max_levels) return error.DecisionLimitExceeded;
-                for (levels.array.items) |level| schema_bytes +|= (try text(level)).len;
+                if (caps.generated) {
+                    if (criteria != null) return error.InvalidDecisionSpecification;
+                } else {
+                    const levels = criteria orelse return error.InvalidDecisionSpecification;
+                    if (levels != .array) return error.InvalidDecisionSpecification;
+                    if (levels.array.items.len < 2 or levels.array.items.len > caps.max_levels) return error.DecisionLimitExceeded;
+                    for (levels.array.items) |level| schema_bytes +|= (try text(level)).len;
+                }
             },
         }
         if (schema_bytes > caps.max_input_bytes) return error.DecisionLimitExceeded;
@@ -234,7 +281,21 @@ fn parseSpecificationJson(a: std.mem.Allocator, bytes: []const u8) !Json {
         else => return error.InvalidDecisionSpecification,
     };
 }
+pub fn generatedQuestions(a: std.mem.Allocator, questions: Json, instructions: []const u8) !Json {
+    var envelope = jsonObject();
+    var generator = jsonObject();
+    try put(a, &generator, "model", .{ .string = "contract-validation" });
+    try put(a, &envelope, "generator", generator);
+    try put(a, &envelope, "probabilities", .{ .string = "verdict_only" });
+    try put(a, &envelope, "input", .{ .string = "validation" });
+    try put(a, &envelope, "questions", questions);
+    if (instructions.len > 0) try put(a, &envelope, "instructions", .{ .string = instructions });
+    return (try contract.generated.parseRequest(a, envelope)).questions;
+}
 pub fn publicQuestions(a: std.mem.Allocator, questions: Json) !Json {
+    if (questions == .array) for (questions.array.items) |question| {
+        if (question == .object) if (question.object.get("type")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "score") and !question.object.contains("levels")) return generatedQuestions(a, questions, "");
+    };
     return contract.internalQuestions(a, questions) catch |err| return if (err == error.OutOfMemory) err else error.InvalidDecisionSpecification;
 }
 pub fn questionsFor(a: std.mem.Allocator, function: Function, args: []const Json) !Json {
@@ -337,6 +398,11 @@ fn normalizeLegacy(a: std.mem.Allocator, questions: Json, source: Json, caps: Ca
         if (answer != .object) return error.InvalidDecisionOutput;
         const actual_kind = answer.object.get("type") orelse return error.InvalidDecisionOutput;
         if (actual_kind != .string or !std.mem.eql(u8, actual_kind.string, @tagName(kind))) return error.InvalidDecisionOutput;
+        if (caps.generated) {
+            try validateGeneratedAnswer(a, spec, kind, answer);
+            try put(a, &normalized, q.key_ptr.*, answer);
+            continue;
+        }
         if (answer.object.get("decision_method")) |method| {
             if (method != .string or !std.mem.eql(u8, method.string, "embedding_similarity") or !caps.embedding_similarity or (kind != .choice and kind != .multi_choice)) return error.InvalidDecisionOutput;
             inline for (.{ "confidence", "confidence_method", "act_probability", "probabilities", "noul", "probability" }) |field|
@@ -480,6 +546,53 @@ fn normalizeLegacy(a: std.mem.Allocator, questions: Json, source: Json, caps: Ca
     return result;
 }
 
+fn validateGeneratedAnswer(a: std.mem.Allocator, spec: std.json.ObjectMap, kind: Kind, answer: Json) !void {
+    const method = try text(answer.object.get("decision_method") orelse return error.InvalidDecisionOutput);
+    if (!std.mem.eql(u8, method, "generated")) return error.InvalidDecisionOutput;
+    const source = try text(answer.object.get("probability_source") orelse return error.InvalidDecisionOutput);
+    const verdict = std.mem.eql(u8, source, "verdict");
+    if (!verdict and !std.mem.eql(u8, source, "token_logprobs")) return error.InvalidDecisionOutput;
+    const raw = answer.object.get("raw_structured_answer") orelse return error.InvalidDecisionOutput;
+    if (kind == .score) {
+        const score = try probability(answer.object.get("score") orelse return error.InvalidDecisionOutput);
+        if (!verdict or @abs(score - try probability(raw)) > 1e-9) return error.InvalidDecisionOutput;
+        return;
+    }
+    if (kind == .noul) {
+        if (raw != .bool) return error.InvalidDecisionOutput;
+        const p = try probability(answer.object.get("noul") orelse return error.InvalidDecisionOutput);
+        if (verdict and p != @as(f64, if (raw.bool) 1 else 0)) return error.InvalidDecisionOutput;
+        return;
+    }
+    const criteria = spec.get("criteria").?.object;
+    const dist = try object(answer.object.get("probabilities") orelse return error.InvalidDecisionOutput);
+    if (dist.count() != criteria.count()) return error.InvalidDecisionOutput;
+    var total: f64 = 0;
+    if (kind == .choice) {
+        if (raw != .string or !criteria.contains(raw.string)) return error.InvalidDecisionOutput;
+        if (!std.mem.eql(u8, try text(answer.object.get("choice") orelse return error.InvalidDecisionOutput), raw.string)) return error.InvalidDecisionOutput;
+    } else {
+        if (!verdict or raw != .array) return error.InvalidDecisionOutput;
+        const choices = answer.object.get("choices") orelse return error.InvalidDecisionOutput;
+        if (choices != .array or choices.array.items.len != raw.array.items.len) return error.InvalidDecisionOutput;
+        for (raw.array.items, 0..) |choice, i| {
+            if (choice != .string or !criteria.contains(choice.string) or !std.mem.eql(u8, choice.string, try text(choices.array.items[i]))) return error.InvalidDecisionOutput;
+            for (raw.array.items[0..i]) |previous| if (std.mem.eql(u8, previous.string, choice.string)) return error.InvalidDecisionOutput;
+        }
+    }
+    for (criteria.keys()) |label| {
+        const p = try probability(dist.get(label) orelse return error.InvalidDecisionOutput);
+        var selected = kind == .choice and std.mem.eql(u8, raw.string, label);
+        if (kind == .multi_choice) for (raw.array.items) |choice| {
+            if (std.mem.eql(u8, choice.string, label)) selected = true;
+        };
+        if (verdict and p != @as(f64, if (selected) 1 else 0)) return error.InvalidDecisionOutput;
+        total += p;
+    }
+    if (kind == .choice and (@abs(total - 1) > 1e-6)) return error.InvalidDecisionOutput;
+    _ = a;
+}
+
 test "decision provider embeddinggemma2 scored decisions require configured capability and preserve SQL null" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -545,10 +658,10 @@ test "decision provider embeddinggemma2 provider wrapper retains the trusted sim
     const questions = try std.json.parseFromSliceLeaky(Json, a, "{\"answer\":{\"type\":\"choice\",\"instructions\":\"Route\",\"criteria\":{\"a\":\"Account\",\"b\":\"Billing\"}}}", .{});
     var mock = Mock{ .response = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"embeddinggemma2\",\"answers\":{\"answer\":{\"type\":\"choice\",\"decision_method\":\"embedding_similarity\",\"similarity_metric\":\"cosine\",\"prototype_set_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"choice\":null,\"status\":\"abstained\",\"abstention_reason\":\"tie\",\"similarities\":{\"a\":0.3,\"b\":0.3},\"margin\":0}},\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}", .{}) };
     const provider = DecisionProvider{ .ptr = &mock, .validate_fn = Mock.validate, .evaluate_batch_fn = Mock.evaluate, .capabilities_fn = Mock.caps };
-    const rows = try provider.evaluateBatch(a, &.{.{ .decider = "routing", .questions = questions, .input = "Reset password" }});
+    const rows = try provider.evaluateBatch(a, &.{.{ .decider = "routing", .questions = questions, .input = .{ .text = "Reset password" } }});
     try std.testing.expect((try selectResult(.ai_choice, rows[0])) == .null);
 }
-pub const Request = struct { decider: []const u8, questions: Json, input: []const u8, source_table: []const u8 = "" };
+pub const Request = struct { decider: []const u8, questions: Json, input: Input, source_table: []const u8 = "" };
 pub const DecisionProvider = struct {
     /// Trusted routing scope borrowed from the bound statement, never public JSON.
     source_table: []const u8 = "",
@@ -572,7 +685,11 @@ pub const DecisionProvider = struct {
         try self.checkpoint();
         for (requests) |request| {
             try self.validate(request.decider, request.questions);
-            _ = try text(.{ .string = request.input });
+            try request.input.validate();
+            const caps = if (self.capabilities_fn) |f| try f(self.ptr, request.decider) else Capabilities{ .max_levels = 64 };
+            if (!caps.messages) _ = try request.input.requireText();
+            if (!caps.images and request.input.imageCount() != 0) return error.UnsupportedInferenceFeature;
+            try request.input.checkLimit(a, caps.max_input_bytes);
         }
         const scoped = if (self.source_table.len > 0) try a.dupe(Request, requests) else null;
         defer if (scoped) |owned| a.free(owned);

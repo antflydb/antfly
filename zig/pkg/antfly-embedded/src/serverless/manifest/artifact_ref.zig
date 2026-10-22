@@ -96,8 +96,15 @@ pub const ArtifactRef = struct {
 /// physical/integrity field must agree; only names and per-reference provenance
 /// may differ. Comparing the normalized whole struct also checks future fields.
 pub fn areGraphArtifactAliases(a: ArtifactRef, b: ArtifactRef) bool {
+    if (a.kind != .graph_segment and a.kind != .graph_metric_segment) return false;
+    return areArtifactAliases(a, b);
+}
+
+/// Packed aggregate logical slots share one complete authenticated object.
+/// The selected name/recipe is independently verified by the pack reader.
+pub fn areArtifactAliases(a: ArtifactRef, b: ArtifactRef) bool {
     const std = @import("std");
-    if (a.kind != b.kind or (a.kind != .graph_segment and a.kind != .graph_metric_segment) or
+    if (a.kind != b.kind or (a.kind != .graph_segment and a.kind != .graph_metric_segment and !(a.kind == .algebraic_segment and (a.metadata_version == 6 or a.metadata_version == 7 or a.metadata_version == 8))) or
         (a.kind == .graph_metric_segment and a.metadata_version != graph_metric_segment_wire_version) or
         a.name.len == 0 or b.name.len == 0 or std.mem.eql(u8, a.name, b.name) or
         !std.mem.eql(u8, a.artifact_id, b.artifact_id) or !std.mem.eql(u8, a.checksum, b.checksum)) return false;
@@ -141,4 +148,82 @@ test "manifest artifact kinds include lake-native artifacts" {
     try @import("std").testing.expectEqual(@as(u8, 9), @backingInt(ArtifactKind.row_fragment));
     try @import("std").testing.expectEqual(@as(u8, 11), @backingInt(ArtifactKind.algebraic_segment));
     try @import("std").testing.expectEqual(@as(u8, 13), @backingInt(ArtifactKind.graph_metric_segment));
+}
+
+/// Provider-qualified map edges are separate from legacy content identities.
+/// Parents authenticate the generation as well as the payload digest.
+pub const ProviderGenerationRef = struct {
+    artifact_id: []const u8,
+    checksum: []const u8,
+    byte_len: u64,
+    generation: []const u8,
+    retention_until_ms: u64 = 0,
+    pub fn validate(self: @This()) !void {
+        if (self.artifact_id.len != 175 or self.checksum.len != 64 or self.byte_len == 0 or self.byte_len > 1024 * 1024 or self.generation.len == 0 or self.generation.len > max_provider_generation_bytes) return error.InvalidCloudGenerationMap;
+        const std = @import("std");
+        if (!std.mem.eql(u8, self.artifact_id[0..7], "sha256:") or !std.mem.eql(u8, self.artifact_id[7..71], self.checksum) or std.mem.eql(u8, self.generation, "null")) return error.InvalidCloudGenerationMap;
+    }
+};
+
+/// Shared producer/admission bound for retained capabilities with exact versions.
+pub const max_provider_generation_bytes = 4096;
+pub const max_retained_generation_token_bytes = 8 + 175 + 3 + @import("std").base64.url_safe_no_pad.Encoder.calcSize(max_provider_generation_bytes) + 1 + 20;
+pub fn retainedGenerationToken(token: []const u8) bool {
+    const prefix: usize = if (@import("std").mem.startsWith(u8, token, "lake2:")) 6 else if (@import("std").mem.startsWith(u8, token, "native2:")) 8 else return false;
+    if (token.len > max_retained_generation_token_bytes or token.len <= prefix + 178) return false;
+    if (!@import("std").mem.eql(u8, token[prefix + 175 ..][0..3], ":g:")) return false;
+    const end = @import("std").mem.lastIndexOfScalar(u8, token, ':') orelse return false;
+    if (end <= prefix + 178 or token.len - end - 1 > 20) return false;
+    const size = @import("std").fmt.parseUnsigned(u64, token[end + 1 ..], 10) catch return false;
+    if (size == 0) return false;
+    const encoded = token[prefix + 178 .. end];
+    const decoder = @import("std").base64.url_safe_no_pad.Decoder;
+    const length = decoder.calcSizeForSlice(encoded) catch return false;
+    if (length == 0 or length > max_provider_generation_bytes) return false;
+    var buffer: [max_provider_generation_bytes]u8 = undefined;
+    decoder.decode(buffer[0..length], encoded) catch return false;
+    return !@import("std").mem.eql(u8, buffer[0..length], "null");
+}
+
+test "serverless aggregate pack aliases fence interpretation and physical metadata" {
+    const std = @import("std");
+    const original: ArtifactRef = .{ .kind = .algebraic_segment, .metadata_version = 6, .name = "stats.count", .artifact_id = "pack", .checksum = "checksum", .byte_len = 128 };
+    var alias = original;
+    alias.name = "stats.sum";
+    try std.testing.expect(areArtifactAliases(original, alias));
+    try std.testing.expect(!areGraphArtifactAliases(original, alias));
+    try std.testing.expect(!areArtifactAliases(original, original));
+    alias.byte_len += 1;
+    try std.testing.expect(!areArtifactAliases(original, alias));
+    alias = original;
+    alias.name = "stats.sum";
+    alias.metadata_version = 2;
+    try std.testing.expect(!areArtifactAliases(original, alias));
+    var legacy = original;
+    legacy.metadata_version = 2;
+    try std.testing.expect(!areArtifactAliases(legacy, alias));
+}
+
+test "serverless ordered aggregate state aliases preserve complete physical identity" {
+    const std = @import("std");
+    const original: ArtifactRef = .{ .kind = .algebraic_segment, .metadata_version = 7, .name = "stats.count", .artifact_id = "state", .checksum = "checksum", .byte_len = 128 };
+    var alias = original;
+    alias.name = "stats.sum";
+    try std.testing.expect(areArtifactAliases(original, alias));
+    alias.metadata_version = 6;
+    try std.testing.expect(!areArtifactAliases(original, alias));
+    alias = original;
+    alias.name = "stats.sum";
+    alias.byte_len += 1;
+    try std.testing.expect(!areArtifactAliases(original, alias));
+}
+
+test "serverless compact aggregate state aliases bind version eight physical identity" {
+    const std = @import("std");
+    const original: ArtifactRef = .{ .kind = .algebraic_segment, .metadata_version = 8, .name = "stats.count", .artifact_id = "state", .checksum = "checksum", .byte_len = 128 };
+    var alias = original;
+    alias.name = "stats.sum";
+    try std.testing.expect(areArtifactAliases(original, alias));
+    alias.metadata_version = 7;
+    try std.testing.expect(!areArtifactAliases(original, alias));
 }

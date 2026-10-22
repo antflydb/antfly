@@ -356,6 +356,8 @@ pub fn mapErrorContext(err: anyerror, context: []const u8) ErrorCode {
 }
 
 pub fn mapError(err: anyerror) ErrorCode {
+    if (err == error.StandaloneLiteCatalogRequiresApi)
+        return mapErrorContext(err, "this Lite catalog is owned by standalone; use antfly standalone and the /db/v1 API for catalog changes");
     const code = classifyError(err);
     if (comptime storage_engine.enabled) return recordError(code, @errorName(err));
     last_error_detail = @errorName(err);
@@ -371,7 +373,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.IndexReplacementConfigurationMismatch => .replacement_configuration_mismatch,
         error.Canceled, error.Cancelled => .cancelled,
         error.VersionConflict => .version_conflict,
-        error.SqlFeatureNotSupported, error.UnsupportedOperation, error.UnsupportedResolverCatalogVersion, error.UnsupportedDatabaseReaderVersion => .unsupported,
+        error.StandaloneLiteCatalogRequiresApi, error.SqlFeatureNotSupported, error.UnsupportedOperation, error.UnsupportedResolverCatalogVersion, error.UnsupportedDatabaseReaderVersion => .unsupported,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
         error.NotFound, error.IndexNotFound, error.TableNotFound => .not_found,
@@ -400,6 +402,17 @@ fn classifyError(err: anyerror) ErrorCode {
         error.ResolverSourceArtifactImmutable,
         error.ResolverArtifactImmutable,
         error.InvalidResolverConfig,
+        error.InvalidAdjudicationConfig,
+        error.InvalidAdjudicationDescriptions,
+        error.InvalidResolverSuppression,
+        error.InvalidResolverDistinctPair,
+        error.InvalidResolverCurationKey,
+        error.InvalidResolverCurationVersion,
+        error.InvalidResolverCurationRequest,
+        error.ResolverCurationLimitExceeded,
+        error.ResolverRedirectExists,
+        error.SuppressedResolverRedirectTarget,
+        error.ResolverDistinctPair,
         error.ResolverIdentityActive,
         error.EmptyEntityKey,
         error.InvalidArgument,
@@ -499,6 +512,7 @@ fn classifyError(err: anyerror) ErrorCode {
         => .invalid_argument,
         error.FileNotFound => .not_found,
         error.Busy,
+        error.ResolverCurationConflict,
         error.IndexArtifactCleanupPending,
         error.WouldBlock,
         error.WriterLocked,

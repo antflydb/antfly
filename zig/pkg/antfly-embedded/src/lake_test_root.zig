@@ -19,6 +19,8 @@ test {
     _ = @import("serverless/query/lake_serving.zig");
     _ = @import("serverless/query/lake_stream.zig");
     _ = @import("serverless/query/lake_parquet_rowgroup.zig");
+    _ = @import("serverless/query/lake_parquet_encoded.zig");
+    _ = @import("serverless/query/lake_parquet_page.zig");
     _ = @import("serverless/external_source/mod.zig");
     _ = @import("serverless/lake_host.zig");
     _ = @import("storage/rowsource/identity.zig");

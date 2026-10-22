@@ -44,6 +44,8 @@ pub const default_mcp_max_tool_result_bytes: u32 = 96 * 1024;
 pub const minimum_mcp_max_tool_result_bytes: u32 = 512;
 pub const default_backup_operation_timeout_ms: u64 = 60 * 60 * 1_000;
 pub const max_backup_operation_timeout_ms: u64 = 24 * 60 * 60 * 1_000;
+pub const default_inference_connection_id = "default-inference";
+pub const named_inference_connection_id = "named-inference";
 pub const local_inference_connection_id = "local-inference";
 
 pub const DeploymentMode = enum {
@@ -66,6 +68,7 @@ pub const Config = struct {
     transcribers: transcribing.Registry,
     readers: readers.Registry,
     text_to_speech: synthesizing.Registry,
+    public_inference: PublicInferenceConfig = .{},
     auth_enabled: bool = false,
     deployment_mode: DeploymentMode = .distributed,
     health_enabled: bool = true,
@@ -89,6 +92,10 @@ pub const Config = struct {
     connections: ConnectionsConfig = .{},
     connectors: ConnectorsConfig = .{},
     shard_allocation: ShardAllocationConfig = .{},
+
+    pub const PublicInferenceConfig = struct {
+        enabled: bool = false,
+    };
 
     pub const RequestAdmissionConfig = struct {
         /// Zero disables this foreground admission class. Transport safeguards
@@ -180,6 +187,10 @@ pub const Config = struct {
         protected_bytes: usize = 256 * 1024 * 1024,
     };
     pub const LakeIndexConfig = struct {
+        /// Enable retention certificates only after qualifying the configured
+        /// provider's exact-version retention enforcement. Generation pinning
+        /// and ordinary complete auditing do not require this option.
+        cloud_generations: struct { qualified_retention: bool = false } = .{},
         /// Optional planning prefetch; required reads and publication proofs remain authoritative.
         navigation_warming: struct { enabled: bool = true } = .{},
         query_cursors: struct {
@@ -188,6 +199,9 @@ pub const Config = struct {
             max_native_retained_bytes: u64 = 64 * 1024 * 1024 * 1024,
         } = .{},
         text_cache: struct {
+            /// Maximum corpus admitted by one streaming ranking window.
+            admission_window_segments: u8 = 64,
+            admission_window_bytes: u64 = 32 * 1024 * 1024,
             max_seekable_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024,
             max_heap_bytes: usize = 256 * 1024 * 1024,
         } = .{},
@@ -563,6 +577,7 @@ pub const Config = struct {
         project_id: ?[]u8 = null,
         location: ?[]u8 = null,
         credentials_path: ?[]u8 = null,
+        max_image_input_tokens: ?u64 = null,
         names: []const []u8 = &.{},
         configured_model_types: []const []u8 = &.{},
 
@@ -783,6 +798,11 @@ pub const Config = struct {
             .object => |object| object,
             else => return error.InvalidConfig,
         };
+        if (root.contains("public_inference")) try validateObjectMemberFields(root, "public_inference", &.{"enabled"});
+        const public_inference_enabled = if (root.get("public_inference")) |policy|
+            try optionalBoolField(policy.object, "enabled") orelse false
+        else
+            false;
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
             try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference" });
@@ -880,6 +900,25 @@ pub const Config = struct {
 
         var registry = try provider_registry.Registry.parseFromValue(alloc, raw_tree.value);
         errdefer registry.deinit();
+        inline for (.{ .{ "extractor_configs", "models.extract" }, .{ "rewriter_configs", "models.rewrite" }, .{ "predictor_configs", "models.predict" } }) |binding_kind| {
+            for (@field(registry, binding_kind[0]).values()) |binding| {
+                if (std.mem.eql(u8, binding.connection, local_inference_connection_id)) continue;
+                if (std.mem.eql(u8, binding.connection, default_inference_connection_id)) {
+                    const inference = root.get("inference") orelse return error.InvalidConfig;
+                    if (inference != .object or inference.object.get("api_url") == null) return error.InvalidConfig;
+                    continue;
+                }
+                const connection = connections.get(binding.connection) orelse return error.InvalidConfig;
+                if (connection.kind != .inference) return error.InvalidConfig;
+                const configured = connection.inference orelse return error.InvalidConfig;
+                if (!std.mem.eql(u8, configured.provider, "antfly")) return error.InvalidConfig;
+                var qualified = false;
+                for (connection.capabilities) |capability| {
+                    if (std.mem.eql(u8, capability, binding_kind[1])) qualified = true;
+                }
+                if (!qualified) return error.InvalidConfig;
+            }
+        }
         var transcribers = if (root.get("transcribers")) |transcribers_value|
             try transcribing.Registry.parseFromValue(alloc, transcribers_value)
         else
@@ -936,6 +975,7 @@ pub const Config = struct {
             .transcribers = transcribers,
             .readers = reader_registry,
             .text_to_speech = text_to_speech,
+            .public_inference = .{ .enabled = public_inference_enabled },
             .auth_enabled = try optionalBoolField(root, "enable_auth") orelse false,
             .deployment_mode = deployment_mode,
             .health_enabled = try optionalBoolField(root, "health_enabled") orelse true,
@@ -1789,7 +1829,7 @@ pub fn remoteContentSecurityJsonAlloc(
     remote_content: ?*const scraping.RemoteContentConfig,
 ) ![]u8 {
     const configured = remote_content orelse return try alloc.dupe(u8, "");
-    var snapshot = configured.acquire();
+    var snapshot = try configured.acquire();
     defer snapshot.deinit();
     const security = snapshot.config.security orelse scraping.ContentSecurityConfig{};
     return try std.json.Stringify.valueAlloc(alloc, security, .{});
@@ -1895,7 +1935,7 @@ fn parseConnectionsConfig(alloc: std.mem.Allocator, maybe_value: ?std.json.Value
 
     var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, local_inference_connection_id)) return error.InvalidConfig;
+        if (std.mem.eql(u8, entry.key_ptr.*, local_inference_connection_id) or std.mem.eql(u8, entry.key_ptr.*, default_inference_connection_id) or std.mem.eql(u8, entry.key_ptr.*, named_inference_connection_id)) return error.InvalidConfig;
         const id = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(id);
         var connection = try parseConnectionConfig(alloc, entry.value_ptr.*);
@@ -2049,8 +2089,11 @@ fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Confi
 
 fn parseInferenceConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.InferenceConnectionConfig {
     if (value != .object) return error.InvalidConfig;
-    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "names", "configured_model_types" })) return error.InvalidConfig;
+    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "names", "configured_model_types", "max_image_input_tokens" })) return error.InvalidConfig;
+    const image_tokens = try optionalU64Field(value.object, "max_image_input_tokens");
+    if (image_tokens == 0) return error.InvalidConfig;
     return .{
+        .max_image_input_tokens = image_tokens,
         .provider = try requiredStringFieldDup(alloc, value.object, "provider"),
         .url = try optionalStringFieldDup(alloc, value.object, "url"),
         .api_key = try optionalStringFieldDup(alloc, value.object, "api_key"),
@@ -3921,6 +3964,7 @@ fn parseLakeIndexConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.La
     defer parsed.deinit();
     const text = parsed.value.text_cache;
     if (text.max_seekable_artifact_bytes == 0 or text.max_seekable_artifact_bytes > 1024 * 1024 * 1024 * 1024 or text.max_heap_bytes == 0 or @as(u64, text.max_heap_bytes) > 64 * 1024 * 1024 * 1024) return error.InvalidConfig;
+    if (text.admission_window_segments == 0 or text.admission_window_segments > 64 or text.admission_window_bytes == 0 or text.admission_window_bytes > 32 * 1024 * 1024) return error.InvalidConfig;
     const cursors = parsed.value.query_cursors;
     if (cursors.retention_ms < 1000 or cursors.retention_ms > std.time.ms_per_hour or cursors.max_native_cuts == 0 or cursors.max_native_cuts > 4096 or cursors.max_native_retained_bytes == 0 or cursors.max_native_retained_bytes > 1024 * 1024 * 1024 * 1024) return error.InvalidConfig;
     const gc = parsed.value.artifact_gc;
@@ -3939,6 +3983,9 @@ test "external lake native artifact collection config validates bounded operator
         "{\"lake_indexes\":{\"artifact_gc\":{\"interval_ms\":0}}}",
         "{\"lake_indexes\":{\"artifact_gc\":{\"max_deleted\":0}}}",
         "{\"lake_indexes\":{\"artifact_gc\":{\"unknown\":1}}}",
+        "{\"lake_indexes\":{\"text_cache\":{\"admission_window_segments\":0}}}",
+        "{\"lake_indexes\":{\"text_cache\":{\"admission_window_segments\":65}}}",
+        "{\"lake_indexes\":{\"text_cache\":{\"admission_window_bytes\":0}}}",
         "{\"lake_indexes\":{\"unknown\":1}}",
     }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, invalid));
 }
@@ -3986,4 +4033,38 @@ test "external lake cursor retention and capacity policy reject unbounded admiss
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_cuts\":0}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_retained_bytes\":0}}}",
     }) |bytes| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, bytes));
+}
+
+test "provider registry gateway public inference policy defaults off and requires explicit opt-in" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{}", "{\"public_inference\":{}}", "{\"public_inference\":{\"enabled\":false}}" }) |body| {
+        var config = try Config.parseFromSlice(a, body);
+        defer config.deinit();
+        try std.testing.expect(!config.public_inference.enabled);
+    }
+    var config = try Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    try std.testing.expect(config.public_inference.enabled);
+    for ([_][]const u8{
+        "{\"public_inference\":false}",
+        "{\"public_inference\":{\"enabled\":\"false\"}}",
+        "{\"public_inference\":{\"enable\":false}}",
+    }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, invalid));
+}
+
+test "provider registry gateway connection image token bounds are positive and optional" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ ",\"max_image_input_tokens\":8192", "" }) |bound| {
+        const input = try std.fmt.allocPrint(a, "{{\"connections\":{{\"vendor\":{{\"kind\":\"inference\",\"capabilities\":[\"models.decide\"],\"inference\":{{\"provider\":\"openai\"{s}}}}}}}}}", .{bound});
+        defer a.free(input);
+        var config = try Config.parseFromSlice(a, input);
+        defer config.deinit();
+        const actual = config.connections.get("vendor").?.inference.?.max_image_input_tokens;
+        try std.testing.expectEqual(if (bound.len == 0) @as(?u64, null) else @as(?u64, 8192), actual);
+    }
+    for ([_][]const u8{ "0", "-1", "\"8192\"" }) |bound| {
+        const input = try std.fmt.allocPrint(a, "{{\"connections\":{{\"vendor\":{{\"kind\":\"inference\",\"capabilities\":[\"models.decide\"],\"inference\":{{\"provider\":\"openai\",\"max_image_input_tokens\":{s}}}}}}}}}", .{bound});
+        defer a.free(input);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, input));
+    }
 }

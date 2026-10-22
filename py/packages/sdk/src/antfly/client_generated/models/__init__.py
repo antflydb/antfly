@@ -58,6 +58,7 @@ from .artifact_sources_capability_state import ArtifactSourcesCapabilityState
 from .audio_chunk_options import AudioChunkOptions
 from .auth_subject import AuthSubject
 from .auth_subject_kind import AuthSubjectKind
+from .autocomplete_query import AutocompleteQuery
 from .backup_already_exists_conflict import BackupAlreadyExistsConflict
 from .backup_already_exists_conflict_code import BackupAlreadyExistsConflictCode
 from .backup_info import BackupInfo
@@ -79,6 +80,8 @@ from .bedrock_embedder_config import BedrockEmbedderConfig
 from .bedrock_embedder_config_provider import BedrockEmbedderConfigProvider
 from .bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
 from .bool_field_query import BoolFieldQuery
+from .bool_query import BoolQuery
+from .bool_query_body import BoolQueryBody
 from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
@@ -109,7 +112,29 @@ from .chat_tool_name import ChatToolName
 from .chat_tools_config import ChatToolsConfig
 from .choice_decision_question import ChoiceDecisionQuestion
 from .choice_decision_question_type import ChoiceDecisionQuestionType
+from .chunk_coordinates import ChunkCoordinates
+from .chunk_coordinates_kind import ChunkCoordinatesKind
+from .chunk_coordinates_picture_basis import ChunkCoordinatesPictureBasis
+from .chunk_descriptor import ChunkDescriptor
+from .chunk_embedding_context import ChunkEmbeddingContext
+from .chunk_embedding_error import ChunkEmbeddingError
+from .chunk_embedding_event import ChunkEmbeddingEvent
+from .chunk_embedding_event_object import ChunkEmbeddingEventObject
+from .chunk_embedding_initialization_error_event import ChunkEmbeddingInitializationErrorEvent
+from .chunk_embedding_initialization_error_event_object import ChunkEmbeddingInitializationErrorEventObject
+from .chunk_embedding_object import ChunkEmbeddingObject
+from .chunk_embedding_response import ChunkEmbeddingResponse
+from .chunk_embedding_response_object import ChunkEmbeddingResponseObject
+from .chunk_embedding_response_status import ChunkEmbeddingResponseStatus
+from .chunk_embedding_start_event import ChunkEmbeddingStartEvent
+from .chunk_embedding_start_event_object import ChunkEmbeddingStartEventObject
+from .chunk_embedding_target import ChunkEmbeddingTarget
+from .chunk_embedding_terminal_event import ChunkEmbeddingTerminalEvent
+from .chunk_embedding_terminal_event_object import ChunkEmbeddingTerminalEventObject
 from .chunk_options import ChunkOptions
+from .chunk_source_reference import ChunkSourceReference
+from .chunk_source_reference_type import ChunkSourceReferenceType
+from .chunk_source_reference_version_kind import ChunkSourceReferenceVersionKind
 from .chunker_config import ChunkerConfig
 from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
 from .chunker_provider import ChunkerProvider
@@ -158,6 +183,12 @@ from .connections_response import ConnectionsResponse
 from .connector_capabilities import ConnectorCapabilities
 from .connector_capabilities_chatgpt import ConnectorCapabilitiesChatgpt
 from .connector_capabilities_chatgpt_reason import ConnectorCapabilitiesChatgptReason
+from .constrained_generation_batch import ConstrainedGenerationBatch
+from .constrained_generator_producer_config import ConstrainedGeneratorProducerConfig
+from .constrained_generator_producer_config_output_schema import ConstrainedGeneratorProducerConfigOutputSchema
+from .constrained_output import ConstrainedOutput
+from .constrained_probabilities import ConstrainedProbabilities
+from .contains_query import ContainsQuery
 from .create_algebraic_index_request import CreateAlgebraicIndexRequest
 from .create_algebraic_index_request_type import CreateAlgebraicIndexRequestType
 from .create_api_key_request import CreateApiKeyRequest
@@ -203,13 +234,44 @@ from .created_provider_config import CreatedProviderConfig
 from .created_relational_index import CreatedRelationalIndex
 from .created_relational_index_type import CreatedRelationalIndexType
 from .credentials import Credentials
+from .curation_origin import CurationOrigin
+from .curation_origin_origin import CurationOriginOrigin
+from .curation_proposal import CurationProposal
+from .curation_proposal_action import CurationProposalAction
+from .curation_proposal_decision_request import CurationProposalDecisionRequest
+from .curation_proposal_decision_result import CurationProposalDecisionResult
+from .curation_proposal_decision_result_atomicity import CurationProposalDecisionResultAtomicity
+from .curation_proposal_decision_result_results_item import CurationProposalDecisionResultResultsItem
+from .curation_proposal_evidence_type_0 import CurationProposalEvidenceType0
+from .curation_proposal_options import CurationProposalOptions
+from .curation_proposal_options_absorbed import CurationProposalOptionsAbsorbed
+from .curation_proposal_page import CurationProposalPage
+from .curation_proposal_request import CurationProposalRequest
+from .curation_proposal_request_action import CurationProposalRequestAction
+from .curation_proposal_request_evidence_type_0 import CurationProposalRequestEvidenceType0
+from .curation_proposal_state import CurationProposalState
+from .curation_suppression_entry import CurationSuppressionEntry
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .database_catalog_record import DatabaseCatalogRecord
 from .date_range_string_query import DateRangeStringQuery
+from .decider_config import DeciderConfig
+from .decider_config_decision_method import DeciderConfigDecisionMethod
+from .decider_config_embedding_options import DeciderConfigEmbeddingOptions
+from .decider_config_embedding_options_dimensions import DeciderConfigEmbeddingOptionsDimensions
+from .decider_config_embedding_options_task_type import DeciderConfigEmbeddingOptionsTaskType
+from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
 from .decision_choice import DecisionChoice
 from .decision_choice_probability import DecisionChoiceProbability
+from .decision_evidence_image import DecisionEvidenceImage
+from .decision_evidence_image_detail import DecisionEvidenceImageDetail
+from .decision_evidence_image_type import DecisionEvidenceImageType
+from .decision_evidence_message import DecisionEvidenceMessage
+from .decision_evidence_message_role import DecisionEvidenceMessageRole
+from .decision_evidence_message_type import DecisionEvidenceMessageType
+from .decision_evidence_text import DecisionEvidenceText
+from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
@@ -302,13 +364,28 @@ from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
-from .enrichment_config_producer import EnrichmentConfigProducer
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
+from .enrichment_producer_config import EnrichmentProducerConfig
+from .enrichment_producer_config_config_type_2 import EnrichmentProducerConfigConfigType2
+from .enrichment_producer_config_type import EnrichmentProducerConfigType
 from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
 from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
+from .entity_curation_result import EntityCurationResult
+from .entity_curation_result_atomicity import EntityCurationResultAtomicity
+from .entity_curation_result_results_item import EntityCurationResultResultsItem
+from .entity_curation_result_results_item_absorbed_item import EntityCurationResultResultsItemAbsorbedItem
+from .entity_curation_result_results_item_absorbed_item_disposition import (
+    EntityCurationResultResultsItemAbsorbedItemDisposition,
+)
+from .entity_curation_result_results_item_curation import EntityCurationResultResultsItemCuration
+from .entity_distinct_request import EntityDistinctRequest
+from .entity_merge_request import EntityMergeRequest
+from .entity_suppress_request import EntitySuppressRequest
+from .entity_suppress_request_absorbed import EntitySuppressRequestAbsorbed
+from .equals_query import EqualsQuery
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -346,6 +423,7 @@ from .external_lake_table_source import ExternalLakeTableSource
 from .external_lake_table_source_format import ExternalLakeTableSourceFormat
 from .external_lake_table_source_kind import ExternalLakeTableSourceKind
 from .external_lake_table_source_object_mutability import ExternalLakeTableSourceObjectMutability
+from .external_lake_table_source_row_identity_version import ExternalLakeTableSourceRowIdentityVersion
 from .external_lake_table_source_write_policy import ExternalLakeTableSourceWritePolicy
 from .extraction_attribute_group import ExtractionAttributeGroup
 from .extraction_attribute_label import ExtractionAttributeLabel
@@ -441,6 +519,7 @@ from .extraction_long_document_options import ExtractionLongDocumentOptions
 from .extraction_long_document_options_mode import ExtractionLongDocumentOptionsMode
 from .extraction_long_document_options_record_identity import ExtractionLongDocumentOptionsRecordIdentity
 from .extraction_object import ExtractionObject
+from .extraction_object_probability_source import ExtractionObjectProbabilitySource
 from .extraction_object_structure_metadata import ExtractionObjectStructureMetadata
 from .extraction_object_structures import ExtractionObjectStructures
 from .extraction_offset_unit import ExtractionOffsetUnit
@@ -482,10 +561,14 @@ from .failed_operation import FailedOperation
 from .failed_operation_operation import FailedOperationOperation
 from .fetch_config import FetchConfig
 from .field_capability import FieldCapability
-from .field_capability_index_sort_order import FieldCapabilityIndexSortOrder
-from .field_capability_query_modes_item import FieldCapabilityQueryModesItem
+from .field_capability_kind import FieldCapabilityKind
 from .field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
+from .field_capability_value_operations_item import FieldCapabilityValueOperationsItem
 from .field_mapping_type import FieldMappingType
+from .field_representation import FieldRepresentation
+from .field_representation_index_sort_order import FieldRepresentationIndexSortOrder
+from .field_representation_query_modes_item import FieldRepresentationQueryModesItem
+from .field_representation_sort_lifecycle_state import FieldRepresentationSortLifecycleState
 from .field_statistics import FieldStatistics
 from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
@@ -506,6 +589,39 @@ from .full_text_index_stats_resolution import FullTextIndexStatsResolution
 from .full_text_index_stats_text_merge import FullTextIndexStatsTextMerge
 from .fuzziness_type_1 import FuzzinessType1
 from .fuzzy_query import FuzzyQuery
+from .generated_choice_answer import GeneratedChoiceAnswer
+from .generated_choice_answer_decision_method import GeneratedChoiceAnswerDecisionMethod
+from .generated_choice_answer_probability_source import GeneratedChoiceAnswerProbabilitySource
+from .generated_choice_answer_type import GeneratedChoiceAnswerType
+from .generated_choice_decision_question import GeneratedChoiceDecisionQuestion
+from .generated_choice_decision_question_type import GeneratedChoiceDecisionQuestionType
+from .generated_decide_request import GeneratedDecideRequest
+from .generated_decide_request_decision_method import GeneratedDecideRequestDecisionMethod
+from .generated_extraction_input import GeneratedExtractionInput
+from .generated_extraction_request import GeneratedExtractionRequest
+from .generated_extraction_request_entity_definitions import GeneratedExtractionRequestEntityDefinitions
+from .generated_extraction_request_method import GeneratedExtractionRequestMethod
+from .generated_extractor_config import GeneratedExtractorConfig
+from .generated_extractor_config_entity_definitions import GeneratedExtractorConfigEntityDefinitions
+from .generated_extractor_config_method import GeneratedExtractorConfigMethod
+from .generated_multi_choice_answer import GeneratedMultiChoiceAnswer
+from .generated_multi_choice_answer_decision_method import GeneratedMultiChoiceAnswerDecisionMethod
+from .generated_multi_choice_answer_probability_source import GeneratedMultiChoiceAnswerProbabilitySource
+from .generated_multi_choice_answer_type import GeneratedMultiChoiceAnswerType
+from .generated_multi_choice_decision_question import GeneratedMultiChoiceDecisionQuestion
+from .generated_multi_choice_decision_question_type import GeneratedMultiChoiceDecisionQuestionType
+from .generated_predicate_answer import GeneratedPredicateAnswer
+from .generated_predicate_answer_decision_method import GeneratedPredicateAnswerDecisionMethod
+from .generated_predicate_answer_probability_source import GeneratedPredicateAnswerProbabilitySource
+from .generated_predicate_answer_type import GeneratedPredicateAnswerType
+from .generated_predicate_decision_question import GeneratedPredicateDecisionQuestion
+from .generated_predicate_decision_question_type import GeneratedPredicateDecisionQuestionType
+from .generated_score_answer import GeneratedScoreAnswer
+from .generated_score_answer_decision_method import GeneratedScoreAnswerDecisionMethod
+from .generated_score_answer_probability_source import GeneratedScoreAnswerProbabilitySource
+from .generated_score_answer_type import GeneratedScoreAnswerType
+from .generated_score_decision_question import GeneratedScoreDecisionQuestion
+from .generated_score_decision_question_type import GeneratedScoreDecisionQuestionType
 from .generation_step_config import GenerationStepConfig
 from .generator_config import GeneratorConfig
 from .generator_provider import GeneratorProvider
@@ -546,7 +662,6 @@ from .graph_artifact_node_mapping_config import GraphArtifactNodeMappingConfig
 from .graph_artifact_node_mapping_config_model import GraphArtifactNodeMappingConfigModel
 from .graph_artifact_producer_config import GraphArtifactProducerConfig
 from .graph_artifact_producer_config_kind import GraphArtifactProducerConfigKind
-from .graph_artifact_producer_config_producer import GraphArtifactProducerConfigProducer
 from .graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
 from .graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
 from .graph_artifact_producer_source_config_type import GraphArtifactProducerSourceConfigType
@@ -675,6 +790,10 @@ from .graph_relationship_filter import GraphRelationshipFilter
 from .graph_relationship_property_predicate import GraphRelationshipPropertyPredicate
 from .graph_relationship_property_predicate_op import GraphRelationshipPropertyPredicateOp
 from .graph_relationship_property_predicate_value_type import GraphRelationshipPropertyPredicateValueType
+from .graph_resolver_adjudication_acceptance import GraphResolverAdjudicationAcceptance
+from .graph_resolver_adjudication_config import GraphResolverAdjudicationConfig
+from .graph_resolver_adjudication_config_description_inputs import GraphResolverAdjudicationConfigDescriptionInputs
+from .graph_resolver_adjudication_config_on_failure import GraphResolverAdjudicationConfigOnFailure
 from .graph_resolver_config import GraphResolverConfig
 from .graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
@@ -685,6 +804,7 @@ from .graph_resolver_scorer_config import GraphResolverScorerConfig
 from .graph_resolver_scorer_config_combine import GraphResolverScorerConfigCombine
 from .graph_resolver_scorer_config_decision import GraphResolverScorerConfigDecision
 from .graph_resolver_scorer_level import GraphResolverScorerLevel
+from .graph_resolver_suppression_config import GraphResolverSuppressionConfig
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
@@ -708,6 +828,8 @@ from .graph_work_budget_exceeded_error_dimension import GraphWorkBudgetExceededE
 from .graph_work_budget_exceeded_error_error import GraphWorkBudgetExceededErrorError
 from .graph_work_budget_exceeded_error_status import GraphWorkBudgetExceededErrorStatus
 from .ground_truth import GroundTruth
+from .grouped_artifact_source import GroupedArtifactSource
+from .grouped_artifact_source_filter import GroupedArtifactSourceFilter
 from .hierarchy_ancestor import HierarchyAncestor
 from .hierarchy_ancestor_document import HierarchyAncestorDocument
 from .hierarchy_ancestors import HierarchyAncestors
@@ -778,6 +900,9 @@ from .inference_capacity_error_reason import InferenceCapacityErrorReason
 from .inference_chat_message import InferenceChatMessage
 from .inference_chunk import InferenceChunk
 from .inference_chunk_config import InferenceChunkConfig
+from .inference_chunk_embedding_response import InferenceChunkEmbeddingResponse
+from .inference_chunk_embedding_response_object import InferenceChunkEmbeddingResponseObject
+from .inference_chunk_embedding_response_status import InferenceChunkEmbeddingResponseStatus
 from .inference_chunk_object import InferenceChunkObject
 from .inference_chunk_object_object import InferenceChunkObjectObject
 from .inference_chunk_request import InferenceChunkRequest
@@ -791,6 +916,7 @@ from .inference_credentials import InferenceCredentials
 from .inference_decide_long_document import InferenceDecideLongDocument
 from .inference_decide_long_document_mode import InferenceDecideLongDocumentMode
 from .inference_decide_request import InferenceDecideRequest
+from .inference_decide_request_context_version import InferenceDecideRequestContextVersion
 from .inference_decide_response import InferenceDecideResponse
 from .inference_dictate_request import InferenceDictateRequest
 from .inference_dictate_response import InferenceDictateResponse
@@ -809,6 +935,7 @@ from .inference_embed_request_task_type import InferenceEmbedRequestTaskType
 from .inference_embed_response import InferenceEmbedResponse
 from .inference_embed_response_object import InferenceEmbedResponseObject
 from .inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
+from .inference_embedding_content_input import InferenceEmbeddingContentInput
 from .inference_embedding_group import InferenceEmbeddingGroup
 from .inference_embedding_item_error import InferenceEmbeddingItemError
 from .inference_embedding_item_error_stage import InferenceEmbeddingItemErrorStage
@@ -860,7 +987,18 @@ from .inference_media_content_part_type import InferenceMediaContentPartType
 from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
+from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
+from .inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
+from .inference_model_instance import InferenceModelInstance
+from .inference_model_instance_list import InferenceModelInstanceList
+from .inference_model_instance_list_object import InferenceModelInstanceListObject
+from .inference_model_instance_load_request import InferenceModelInstanceLoadRequest
+from .inference_model_instance_residency_mode import InferenceModelInstanceResidencyMode
+from .inference_model_instance_state import InferenceModelInstanceState
+from .inference_model_instance_unload_blocked_reason import InferenceModelInstanceUnloadBlockedReason
+from .inference_model_instance_unload_response import InferenceModelInstanceUnloadResponse
+from .inference_model_instance_unload_response_outcome import InferenceModelInstanceUnloadResponseOutcome
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
@@ -913,6 +1051,8 @@ from .inference_runtime_config_model_strategies_additional_property import (
 )
 from .inference_sparse_vector import InferenceSparseVector
 from .inference_style import InferenceStyle
+from .inference_synthesis_request import InferenceSynthesisRequest
+from .inference_synthesis_request_format import InferenceSynthesisRequestFormat
 from .inference_text_content import InferenceTextContent
 from .inference_text_content_part import InferenceTextContentPart
 from .inference_text_content_part_type import InferenceTextContentPartType
@@ -982,9 +1122,6 @@ from .lake_catalog_create_request_write_order import LakeCatalogCreateRequestWri
 from .lake_catalog_response import LakeCatalogResponse
 from .lake_catalog_response_metadata import LakeCatalogResponseMetadata
 from .lake_catalog_response_state import LakeCatalogResponseState
-from .lake_read_receipt import LakeReadReceipt
-from .lake_read_requirement import LakeReadRequirement
-from .lake_read_requirement_visibility import LakeReadRequirementVisibility
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
@@ -1023,6 +1160,8 @@ from .match_none_query import MatchNoneQuery
 from .match_none_query_match_none import MatchNoneQueryMatchNone
 from .match_phrase_query import MatchPhraseQuery
 from .match_query import MatchQuery
+from .matches_query import MatchesQuery
+from .media_chunk_policy import MediaChunkPolicy
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
 from .merge_config import MergeConfig
@@ -1092,6 +1231,7 @@ from .phrase_query import PhraseQuery
 from .predicate_decision_question import PredicateDecisionQuestion
 from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
+from .prior_artifact_context import PriorArtifactContext
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
@@ -1114,6 +1254,7 @@ from .query_evaluation_compute import QueryEvaluationCompute
 from .query_evaluation_order_by_item import QueryEvaluationOrderByItem
 from .query_evaluation_scope import QueryEvaluationScope
 from .query_evaluation_where import QueryEvaluationWhere
+from .query_execution import QueryExecution
 from .query_expression import QueryExpression
 from .query_expression_call import QueryExpressionCall
 from .query_expression_criteria_type_0 import QueryExpressionCriteriaType0
@@ -1136,6 +1277,10 @@ from .query_hits import QueryHits
 from .query_hits_total import QueryHitsTotal
 from .query_hits_total_relation import QueryHitsTotalRelation
 from .query_profile import QueryProfile
+from .query_profile_value_verification import QueryProfileValueVerification
+from .query_profile_value_verification_plans_item import QueryProfileValueVerificationPlansItem
+from .query_profile_value_verification_plans_item_operation import QueryProfileValueVerificationPlansItemOperation
+from .query_profile_value_verification_plans_item_verification import QueryProfileValueVerificationPlansItemVerification
 from .query_request import QueryRequest
 from .query_request_aggregations import QueryRequestAggregations
 from .query_request_embeddings import QueryRequestEmbeddings
@@ -1250,6 +1395,45 @@ from .research_unsupported_claim import ResearchUnsupportedClaim
 from .research_usage import ResearchUsage
 from .research_verification import ResearchVerification
 from .research_write_step_config import ResearchWriteStepConfig
+from .resolver_adjudication_evidence import ResolverAdjudicationEvidence
+from .resolver_adjudication_evidence_response_type_0 import ResolverAdjudicationEvidenceResponseType0
+from .resolver_adjudication_evidence_status import ResolverAdjudicationEvidenceStatus
+from .resolver_curation_state import ResolverCurationState
+from .resolver_curation_state_version import ResolverCurationStateVersion
+from .resolver_distinct_pair import ResolverDistinctPair
+from .resolver_group_progress import ResolverGroupProgress
+from .resolver_list import ResolverList
+from .resolver_merge_request import ResolverMergeRequest
+from .resolver_mutation_result import ResolverMutationResult
+from .resolver_mutation_result_metadata_commit_type_0 import ResolverMutationResultMetadataCommitType0
+from .resolver_mutation_result_replay_sequence_kind import ResolverMutationResultReplaySequenceKind
+from .resolver_namespace_request import ResolverNamespaceRequest
+from .resolver_redirect import ResolverRedirect
+from .resolver_redirect_list import ResolverRedirectList
+from .resolver_render_request import ResolverRenderRequest
+from .resolver_render_response import ResolverRenderResponse
+from .resolver_replay_progress import ResolverReplayProgress
+from .resolver_replay_stage import ResolverReplayStage
+from .resolver_resolve_request import ResolverResolveRequest
+from .resolver_resolve_request_extraction import ResolverResolveRequestExtraction
+from .resolver_resolve_response import ResolverResolveResponse
+from .resolver_resolve_response_extraction import ResolverResolveResponseExtraction
+from .resolver_resolve_response_resolution import ResolverResolveResponseResolution
+from .resolver_resolve_response_resolution_resolution_work import ResolverResolveResponseResolutionResolutionWork
+from .resolver_resolved_entity import ResolverResolvedEntity
+from .resolver_resolved_entity_decision import ResolverResolvedEntityDecision
+from .resolver_resolved_entity_doc_ref import ResolverResolvedEntityDocRef
+from .resolver_resolved_entity_suppression_reason import ResolverResolvedEntitySuppressionReason
+from .resolver_review import ResolverReview
+from .resolver_review_decision import ResolverReviewDecision
+from .resolver_review_decision_decision import ResolverReviewDecisionDecision
+from .resolver_review_page import ResolverReviewPage
+from .resolver_summary import ResolverSummary
+from .resolver_suppression_list import ResolverSuppressionList
+from .resolver_suppression_request import ResolverSuppressionRequest
+from .resolver_suppression_selection import ResolverSuppressionSelection
+from .resolver_unmerge_request import ResolverUnmergeRequest
+from .resolver_wait import ResolverWait
 from .resource_type import ResourceType
 from .restore_job import RestoreJob
 from .restore_job_list import RestoreJobList
@@ -1278,6 +1462,7 @@ from .row_filter_entry_filter import RowFilterEntryFilter
 from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
+from .runtime_resolver_suppression import RuntimeResolverSuppression
 from .saved_query_source import SavedQuerySource
 from .scan_keys_request import ScanKeysRequest
 from .scoped_row_filter import ScopedRowFilter
@@ -1321,7 +1506,6 @@ from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
 from .sql_request import SQLRequest
-from .sql_request_lake_visibility import SQLRequestLakeVisibility
 from .sql_response import SQLResponse
 from .sql_setting_database_default import SqlSettingDatabaseDefault
 from .sql_setting_mutation_drop import SqlSettingMutationDrop
@@ -1495,6 +1679,7 @@ from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
+from .value_verification import ValueVerification
 from .vector_source_storage_status import VectorSourceStorageStatus
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_embedder_config_provider import VertexEmbedderConfigProvider
@@ -1505,6 +1690,9 @@ from .vertex_reranker_config_provider import VertexRerankerConfigProvider
 from .vertex_search_config import VertexSearchConfig
 from .vertex_search_config_provider import VertexSearchConfigProvider
 from .vertex_search_config_service import VertexSearchConfigService
+from .video_sampling_policy import VideoSamplingPolicy
+from .video_sampling_policy_overflow import VideoSamplingPolicyOverflow
+from .video_sampling_policy_policy import VideoSamplingPolicyPolicy
 from .web_search_config import WebSearchConfig
 from .web_search_connection import WebSearchConnection
 from .web_search_provider import WebSearchProvider
@@ -1571,6 +1759,7 @@ __all__ = (
     "AudioChunkOptions",
     "AuthSubject",
     "AuthSubjectKind",
+    "AutocompleteQuery",
     "BackupAlreadyExistsConflict",
     "BackupAlreadyExistsConflictCode",
     "BackupInfo",
@@ -1593,6 +1782,8 @@ __all__ = (
     "BedrockEmbedderConfigRequestFormat",
     "BooleanQuery",
     "BoolFieldQuery",
+    "BoolQuery",
+    "BoolQueryBody",
     "BraveSearchConfig",
     "BraveSearchConfigFreshness",
     "BraveSearchConfigProvider",
@@ -1622,10 +1813,32 @@ __all__ = (
     "ChatToolsConfig",
     "ChoiceDecisionQuestion",
     "ChoiceDecisionQuestionType",
+    "ChunkCoordinates",
+    "ChunkCoordinatesKind",
+    "ChunkCoordinatesPictureBasis",
+    "ChunkDescriptor",
+    "ChunkEmbeddingContext",
+    "ChunkEmbeddingError",
+    "ChunkEmbeddingEvent",
+    "ChunkEmbeddingEventObject",
+    "ChunkEmbeddingInitializationErrorEvent",
+    "ChunkEmbeddingInitializationErrorEventObject",
+    "ChunkEmbeddingObject",
+    "ChunkEmbeddingResponse",
+    "ChunkEmbeddingResponseObject",
+    "ChunkEmbeddingResponseStatus",
+    "ChunkEmbeddingStartEvent",
+    "ChunkEmbeddingStartEventObject",
+    "ChunkEmbeddingTarget",
+    "ChunkEmbeddingTerminalEvent",
+    "ChunkEmbeddingTerminalEventObject",
     "ChunkerConfig",
     "ChunkerConfigFullTextIndex",
     "ChunkerProvider",
     "ChunkOptions",
+    "ChunkSourceReference",
+    "ChunkSourceReferenceType",
+    "ChunkSourceReferenceVersionKind",
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",
@@ -1671,6 +1884,12 @@ __all__ = (
     "ConnectorCapabilities",
     "ConnectorCapabilitiesChatgpt",
     "ConnectorCapabilitiesChatgptReason",
+    "ConstrainedGenerationBatch",
+    "ConstrainedGeneratorProducerConfig",
+    "ConstrainedGeneratorProducerConfigOutputSchema",
+    "ConstrainedOutput",
+    "ConstrainedProbabilities",
+    "ContainsQuery",
     "CreateAlgebraicIndexRequest",
     "CreateAlgebraicIndexRequestType",
     "CreateApiKeyRequest",
@@ -1716,13 +1935,44 @@ __all__ = (
     "CreateUserRequest",
     "CreateUserRequestMetadataType0",
     "Credentials",
+    "CurationOrigin",
+    "CurationOriginOrigin",
+    "CurationProposal",
+    "CurationProposalAction",
+    "CurationProposalDecisionRequest",
+    "CurationProposalDecisionResult",
+    "CurationProposalDecisionResultAtomicity",
+    "CurationProposalDecisionResultResultsItem",
+    "CurationProposalEvidenceType0",
+    "CurationProposalOptions",
+    "CurationProposalOptionsAbsorbed",
+    "CurationProposalPage",
+    "CurationProposalRequest",
+    "CurationProposalRequestAction",
+    "CurationProposalRequestEvidenceType0",
+    "CurationProposalState",
+    "CurationSuppressionEntry",
     "DatabaseCatalogRecord",
     "DataShapeDecl",
     "DataShapeKind",
     "DateRangeStringQuery",
+    "DeciderConfig",
+    "DeciderConfigDecisionMethod",
+    "DeciderConfigEmbeddingOptions",
+    "DeciderConfigEmbeddingOptionsDimensions",
+    "DeciderConfigEmbeddingOptionsTaskType",
+    "DeciderConfigProvider",
     "DecisionBatchItem",
     "DecisionChoice",
     "DecisionChoiceProbability",
+    "DecisionEvidenceImage",
+    "DecisionEvidenceImageDetail",
+    "DecisionEvidenceImageType",
+    "DecisionEvidenceMessage",
+    "DecisionEvidenceMessageRole",
+    "DecisionEvidenceMessageType",
+    "DecisionEvidenceText",
+    "DecisionEvidenceTextType",
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
@@ -1813,13 +2063,26 @@ __all__ = (
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
-    "EnrichmentConfigProducer",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",
+    "EnrichmentProducerConfig",
+    "EnrichmentProducerConfigConfigType2",
+    "EnrichmentProducerConfigType",
     "EnrichmentRuntimeStatus",
     "EnrichmentRuntimeStatusActivePhase",
     "EnrichmentRuntimeStatusStallReason",
+    "EntityCurationResult",
+    "EntityCurationResultAtomicity",
+    "EntityCurationResultResultsItem",
+    "EntityCurationResultResultsItemAbsorbedItem",
+    "EntityCurationResultResultsItemAbsorbedItemDisposition",
+    "EntityCurationResultResultsItemCuration",
+    "EntityDistinctRequest",
+    "EntityMergeRequest",
+    "EntitySuppressRequest",
+    "EntitySuppressRequestAbsorbed",
+    "EqualsQuery",
     "Error",
     "EvalConfig",
     "EvalOptions",
@@ -1857,6 +2120,7 @@ __all__ = (
     "ExternalLakeTableSourceFormat",
     "ExternalLakeTableSourceKind",
     "ExternalLakeTableSourceObjectMutability",
+    "ExternalLakeTableSourceRowIdentityVersion",
     "ExternalLakeTableSourceWritePolicy",
     "ExtractionAttributeGroup",
     "ExtractionAttributeLabel",
@@ -1946,6 +2210,7 @@ __all__ = (
     "ExtractionLongDocumentOptionsMode",
     "ExtractionLongDocumentOptionsRecordIdentity",
     "ExtractionObject",
+    "ExtractionObjectProbabilitySource",
     "ExtractionObjectStructureMetadata",
     "ExtractionObjectStructures",
     "ExtractionOffsetUnit",
@@ -1987,10 +2252,14 @@ __all__ = (
     "FailedOperationOperation",
     "FetchConfig",
     "FieldCapability",
-    "FieldCapabilityIndexSortOrder",
-    "FieldCapabilityQueryModesItem",
+    "FieldCapabilityKind",
     "FieldCapabilitySortLifecycleState",
+    "FieldCapabilityValueOperationsItem",
     "FieldMappingType",
+    "FieldRepresentation",
+    "FieldRepresentationIndexSortOrder",
+    "FieldRepresentationQueryModesItem",
+    "FieldRepresentationSortLifecycleState",
     "FieldStatistics",
     "FilterSpec",
     "FilterSpecOperator",
@@ -2011,6 +2280,39 @@ __all__ = (
     "FullTextIndexStatsTextMerge",
     "FuzzinessType1",
     "FuzzyQuery",
+    "GeneratedChoiceAnswer",
+    "GeneratedChoiceAnswerDecisionMethod",
+    "GeneratedChoiceAnswerProbabilitySource",
+    "GeneratedChoiceAnswerType",
+    "GeneratedChoiceDecisionQuestion",
+    "GeneratedChoiceDecisionQuestionType",
+    "GeneratedDecideRequest",
+    "GeneratedDecideRequestDecisionMethod",
+    "GeneratedExtractionInput",
+    "GeneratedExtractionRequest",
+    "GeneratedExtractionRequestEntityDefinitions",
+    "GeneratedExtractionRequestMethod",
+    "GeneratedExtractorConfig",
+    "GeneratedExtractorConfigEntityDefinitions",
+    "GeneratedExtractorConfigMethod",
+    "GeneratedMultiChoiceAnswer",
+    "GeneratedMultiChoiceAnswerDecisionMethod",
+    "GeneratedMultiChoiceAnswerProbabilitySource",
+    "GeneratedMultiChoiceAnswerType",
+    "GeneratedMultiChoiceDecisionQuestion",
+    "GeneratedMultiChoiceDecisionQuestionType",
+    "GeneratedPredicateAnswer",
+    "GeneratedPredicateAnswerDecisionMethod",
+    "GeneratedPredicateAnswerProbabilitySource",
+    "GeneratedPredicateAnswerType",
+    "GeneratedPredicateDecisionQuestion",
+    "GeneratedPredicateDecisionQuestionType",
+    "GeneratedScoreAnswer",
+    "GeneratedScoreAnswerDecisionMethod",
+    "GeneratedScoreAnswerProbabilitySource",
+    "GeneratedScoreAnswerType",
+    "GeneratedScoreDecisionQuestion",
+    "GeneratedScoreDecisionQuestionType",
     "GenerationStepConfig",
     "GeneratorConfig",
     "GeneratorProvider",
@@ -2051,7 +2353,6 @@ __all__ = (
     "GraphArtifactNodeMappingConfigModel",
     "GraphArtifactProducerConfig",
     "GraphArtifactProducerConfigKind",
-    "GraphArtifactProducerConfigProducer",
     "GraphArtifactProducerConfigProducerJson",
     "GraphArtifactProducerSourceConfig",
     "GraphArtifactProducerSourceConfigType",
@@ -2180,6 +2481,10 @@ __all__ = (
     "GraphRelationshipPropertyPredicate",
     "GraphRelationshipPropertyPredicateOp",
     "GraphRelationshipPropertyPredicateValueType",
+    "GraphResolverAdjudicationAcceptance",
+    "GraphResolverAdjudicationConfig",
+    "GraphResolverAdjudicationConfigDescriptionInputs",
+    "GraphResolverAdjudicationConfigOnFailure",
     "GraphResolverConfig",
     "GraphResolverConfigAliasesItem",
     "GraphResolverConfigCandidateSearch",
@@ -2190,6 +2495,7 @@ __all__ = (
     "GraphResolverScorerConfigCombine",
     "GraphResolverScorerConfigDecision",
     "GraphResolverScorerLevel",
+    "GraphResolverSuppressionConfig",
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
@@ -2213,6 +2519,8 @@ __all__ = (
     "GraphWorkBudgetExceededErrorError",
     "GraphWorkBudgetExceededErrorStatus",
     "GroundTruth",
+    "GroupedArtifactSource",
+    "GroupedArtifactSourceFilter",
     "HierarchyAncestor",
     "HierarchyAncestorDocument",
     "HierarchyAncestors",
@@ -2283,6 +2591,9 @@ __all__ = (
     "InferenceChatMessage",
     "InferenceChunk",
     "InferenceChunkConfig",
+    "InferenceChunkEmbeddingResponse",
+    "InferenceChunkEmbeddingResponseObject",
+    "InferenceChunkEmbeddingResponseStatus",
     "InferenceChunkObject",
     "InferenceChunkObjectObject",
     "InferenceChunkRequest",
@@ -2296,6 +2607,7 @@ __all__ = (
     "InferenceDecideLongDocument",
     "InferenceDecideLongDocumentMode",
     "InferenceDecideRequest",
+    "InferenceDecideRequestContextVersion",
     "InferenceDecideResponse",
     "InferenceDictateRequest",
     "InferenceDictateResponse",
@@ -2307,6 +2619,7 @@ __all__ = (
     "InferenceDictationTranscript",
     "InferenceDictationWord",
     "InferenceEmbeddingBatchSummary",
+    "InferenceEmbeddingContentInput",
     "InferenceEmbeddingGroup",
     "InferenceEmbeddingItemError",
     "InferenceEmbeddingItemErrorStage",
@@ -2365,7 +2678,18 @@ __all__ = (
     "InferenceModelBackend",
     "InferenceModelFormat",
     "InferenceModelInfo",
+    "InferenceModelInfoChunkingLimits",
+    "InferenceModelInfoInferenceCapabilities",
     "InferenceModelInfoQualifiedLimits",
+    "InferenceModelInstance",
+    "InferenceModelInstanceList",
+    "InferenceModelInstanceListObject",
+    "InferenceModelInstanceLoadRequest",
+    "InferenceModelInstanceResidencyMode",
+    "InferenceModelInstanceState",
+    "InferenceModelInstanceUnloadBlockedReason",
+    "InferenceModelInstanceUnloadResponse",
+    "InferenceModelInstanceUnloadResponseOutcome",
     "InferenceModelKind",
     "InferenceModelQuantization",
     "InferenceModelRef",
@@ -2417,6 +2741,8 @@ __all__ = (
     "InferenceschemasConfig",
     "InferenceSparseVector",
     "InferenceStyle",
+    "InferenceSynthesisRequest",
+    "InferenceSynthesisRequestFormat",
     "InferenceTextContent",
     "InferenceTextContentPart",
     "InferenceTextContentPartType",
@@ -2485,9 +2811,6 @@ __all__ = (
     "LakeCatalogResponse",
     "LakeCatalogResponseMetadata",
     "LakeCatalogResponseState",
-    "LakeReadReceipt",
-    "LakeReadRequirement",
-    "LakeReadRequirementVisibility",
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
@@ -2522,10 +2845,12 @@ __all__ = (
     "MaintainLakeTableResponse200",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
+    "MatchesQuery",
     "MatchNoneQuery",
     "MatchNoneQueryMatchNone",
     "MatchPhraseQuery",
     "MatchQuery",
+    "MediaChunkPolicy",
     "MediaContentPart",
     "MediaContentPartType",
     "MergeConfig",
@@ -2591,6 +2916,7 @@ __all__ = (
     "PredicateDecisionQuestion",
     "PredicateDecisionQuestionType",
     "PrefixQuery",
+    "PriorArtifactContext",
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
@@ -2613,6 +2939,7 @@ __all__ = (
     "QueryEvaluationOrderByItem",
     "QueryEvaluationScope",
     "QueryEvaluationWhere",
+    "QueryExecution",
     "QueryExpression",
     "QueryExpressionCall",
     "QueryExpressionCriteriaType0",
@@ -2635,6 +2962,10 @@ __all__ = (
     "QueryHitsTotal",
     "QueryHitsTotalRelation",
     "QueryProfile",
+    "QueryProfileValueVerification",
+    "QueryProfileValueVerificationPlansItem",
+    "QueryProfileValueVerificationPlansItemOperation",
+    "QueryProfileValueVerificationPlansItemVerification",
     "QueryRequest",
     "QueryRequestAggregations",
     "QueryRequestEmbeddings",
@@ -2749,6 +3080,45 @@ __all__ = (
     "ResearchUsage",
     "ResearchVerification",
     "ResearchWriteStepConfig",
+    "ResolverAdjudicationEvidence",
+    "ResolverAdjudicationEvidenceResponseType0",
+    "ResolverAdjudicationEvidenceStatus",
+    "ResolverCurationState",
+    "ResolverCurationStateVersion",
+    "ResolverDistinctPair",
+    "ResolverGroupProgress",
+    "ResolverList",
+    "ResolverMergeRequest",
+    "ResolverMutationResult",
+    "ResolverMutationResultMetadataCommitType0",
+    "ResolverMutationResultReplaySequenceKind",
+    "ResolverNamespaceRequest",
+    "ResolverRedirect",
+    "ResolverRedirectList",
+    "ResolverRenderRequest",
+    "ResolverRenderResponse",
+    "ResolverReplayProgress",
+    "ResolverReplayStage",
+    "ResolverResolvedEntity",
+    "ResolverResolvedEntityDecision",
+    "ResolverResolvedEntityDocRef",
+    "ResolverResolvedEntitySuppressionReason",
+    "ResolverResolveRequest",
+    "ResolverResolveRequestExtraction",
+    "ResolverResolveResponse",
+    "ResolverResolveResponseExtraction",
+    "ResolverResolveResponseResolution",
+    "ResolverResolveResponseResolutionResolutionWork",
+    "ResolverReview",
+    "ResolverReviewDecision",
+    "ResolverReviewDecisionDecision",
+    "ResolverReviewPage",
+    "ResolverSummary",
+    "ResolverSuppressionList",
+    "ResolverSuppressionRequest",
+    "ResolverSuppressionSelection",
+    "ResolverUnmergeRequest",
+    "ResolverWait",
     "ResourceType",
     "RestoreJob",
     "RestoreJobList",
@@ -2777,6 +3147,7 @@ __all__ = (
     "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
+    "RuntimeResolverSuppression",
     "SavedQuerySource",
     "ScanKeysRequest",
     "ScopedRowFilter",
@@ -2822,7 +3193,6 @@ __all__ = (
     "SQLPreparedResponse",
     "SQLPrepareRequest",
     "SQLRequest",
-    "SQLRequestLakeVisibility",
     "SQLResponse",
     "SqlSettingDatabaseDefault",
     "SqlSettingMutationDrop",
@@ -2994,6 +3364,7 @@ __all__ = (
     "User",
     "UserMetadataType0",
     "VADOptions",
+    "ValueVerification",
     "VectorSourceStorageStatus",
     "VertexEmbedderConfig",
     "VertexEmbedderConfigProvider",
@@ -3004,6 +3375,9 @@ __all__ = (
     "VertexSearchConfig",
     "VertexSearchConfigProvider",
     "VertexSearchConfigService",
+    "VideoSamplingPolicy",
+    "VideoSamplingPolicyOverflow",
+    "VideoSamplingPolicyPolicy",
     "WebSearchConfig",
     "WebSearchConnection",
     "WebSearchProvider",

@@ -204,6 +204,8 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     defer lease.deinit();
     context = lease.readContext();
     try server.prepareLakeCache();
+    store.implementation.cloud_io = context.io;
+    try store.bindPublication(publication, token);
     const cached: artifacts.CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context };
     // Published metadata can hold only the directory reference. Read the small
     // authenticated declaration document; never expand maintenance contributions.
@@ -221,17 +223,18 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
         defer arena.deinit();
         const sa = arena.allocator();
         var domain: [32]u8 = undefined;
-        var selected: [8]?tree.Ref = @splat(null);
+        var selected: [10]?tree.Ref = @splat(null);
         if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == @import("lake_index_native_text.zig").metadata_version) {
             const metadata = try @import("lake_index_decoded_metadata.zig").acquire(@import("lake_index_native_text.zig").Directory, cached, store.artifactStore(), declaration.artifact, token, @import("lake_index_native_text.zig").loadDirectory);
             defer metadata.release();
             const root = metadata.value.root;
             domain = root.domain;
-            selected = .{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.segments, root.directories.files, root.serving_routes, root.segment_files };
+            selected = .{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.segments, root.directories.files, root.serving_routes, root.segment_files, root.source_routes, root.tie_bounds };
         } else if (declaration.artifact.kind == .ordered_row_index) {
-            const root = try @import("lake_index_ordered_rows.zig").loadRoot(sa, store.artifactStore(), declaration.artifact, token, cached);
+            const root = try @import("lake_index_ordered_rows.zig").loadRootLazy(sa, store.artifactStore(), declaration.artifact, token, cached);
             domain = root.domain;
             selected[0..4].* = .{ root.page, root.reverse, root.ties, root.predicates };
+            if (root.file_dictionary) |dictionary| selected[4..7].* = .{ dictionary.slots, dictionary.names, dictionary.public };
         } else continue;
         for (selected) |ref| if (ref) |page| {
             if (count == roots.len) break;

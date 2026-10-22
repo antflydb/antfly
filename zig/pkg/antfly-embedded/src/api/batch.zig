@@ -446,6 +446,8 @@ pub const OwnedBatchRequest = struct {
     row_policy_install_bundle: ?[]u8 = null,
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
+    group_source: ?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command) = null,
+    resolver_review: ?std.json.Parsed(@import("../storage/db/resolver_review.zig").Command) = null,
     artifact_catalog: ?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command) = null,
     artifact_publication: ?std.json.Parsed(@import("../storage/db/artifact_publication.zig").Command) = null,
     artifact_publication_transport: ?std.json.Parsed(@import("../storage/db/artifact_publication_transport.zig").Request) = null,
@@ -478,6 +480,8 @@ pub const OwnedBatchRequest = struct {
         if (self.row_policy_install_bundle) |bundle| alloc.free(bundle);
         if (self.restore_staging) |*control| control.deinit();
         if (self.online_source) |*control| control.deinit();
+        if (self.group_source) |*control| control.deinit();
+        if (self.resolver_review) |*control| control.deinit();
         if (self.artifact_catalog) |*control| control.deinit();
         if (self.artifact_publication) |*control| control.deinit();
         if (self.artifact_publication_transport) |*control| control.deinit();
@@ -549,10 +553,20 @@ pub fn parseBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatch
         .parse_numbers = false,
         .allocate = .alloc_always,
         .max_value_len = public_limits.max_json_value_len,
-    }, false);
+    }, false, false);
 }
 
 pub fn parseInternalBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatchRequest {
+    return parsePrivateBatchRequest(alloc, body, false);
+}
+
+/// Only the local owner entry point may evaluate predicates without a
+/// transaction. Replicated ingress must keep requiring prepared predicates.
+pub fn parseOwnerBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatchRequest {
+    return parsePrivateBatchRequest(alloc, body, true);
+}
+
+fn parsePrivateBatchRequest(alloc: std.mem.Allocator, body: []const u8, local_owner: bool) !OwnedBatchRequest {
     return try parseBatchRequestWithOptions(alloc, body, .{
         // Row/transform numbers belong to the schema, not the transport.
         // Parsing decimal integer spellings as f64 here irreversibly rounds
@@ -560,7 +574,7 @@ pub fn parseInternalBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Ow
         .parse_numbers = false,
         .allocate = .alloc_always,
         .max_value_len = public_limits.max_json_value_len,
-    }, true);
+    }, true, local_owner);
 }
 
 test "distributed txn batch transport preserves exact row and transform number tokens" {
@@ -604,6 +618,7 @@ fn parseBatchRequestWithOptions(
     body: []const u8,
     options: std.json.ParseOptions,
     allow_internal: bool,
+    local_owner: bool,
 ) !OwnedBatchRequest {
     if (body.len == 0) return .{};
 
@@ -801,6 +816,30 @@ fn parseBatchRequestWithOptions(
         break :control @as(?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command), try std.json.parseFromValue(@import("../storage/db/artifact_inventory.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (artifact_catalog) |*control| control.deinit();
+    var group_source = if (root.get("_group_source")) |value| control: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "group_source_v1")) return error.InvalidBatchRequest;
+        const parsed_control = try std.json.parseFromValue(@import("../storage/db/group_source_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always });
+        errdefer parsed_control.deinit();
+        try parsed_control.value.validate();
+        break :control @as(?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command), parsed_control);
+    } else null;
+    errdefer if (group_source) |*control| control.deinit();
+    var resolver_review = if (root.get("_resolver_review")) |value| control: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "resolver_review_v1")) return error.InvalidBatchRequest;
+        const parsed_control = try std.json.parseFromValue(@import("../storage/db/resolver_review.zig").Command, alloc, value, .{ .allocate = .alloc_always });
+        errdefer parsed_control.deinit();
+        try parsed_control.value.validate();
+        break :control @as(?std.json.Parsed(@import("../storage/db/resolver_review.zig").Command), parsed_control);
+    } else null;
+    errdefer if (resolver_review) |*control| control.deinit();
     var artifact_publication = if (root.get("_artifact_publication")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
@@ -1192,6 +1231,14 @@ fn parseBatchRequestWithOptions(
             if (artifact_catalog == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
         }
+        if (std.mem.eql(u8, kind_value.string, "group_source_v1")) {
+            if (group_source == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
+        if (std.mem.eql(u8, kind_value.string, "resolver_review_v1")) {
+            if (resolver_review == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
         if (std.mem.eql(u8, kind_value.string, "artifact_publication_v1")) {
             if (artifact_publication == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
@@ -1393,7 +1440,7 @@ fn parseBatchRequestWithOptions(
     {
         return error.InvalidBatchRequest;
     }
-    if (predicates.len != 0 and transaction == null) return error.InvalidBatchRequest;
+    if (predicates.len != 0 and transaction == null and !local_owner) return error.InvalidBatchRequest;
     if (range_guards != null and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (integrity.len != 0 and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (integrity_commands != null and (transaction == null or transaction.? != .prepare or integrity.len != 0)) return error.InvalidBatchRequest;
@@ -1461,6 +1508,8 @@ fn parseBatchRequestWithOptions(
         .row_policy_install_bundle = row_policy_install_bundle,
         .restore_staging = restore_staging,
         .online_source = online_source,
+        .group_source = group_source,
+        .resolver_review = resolver_review,
         .artifact_catalog = artifact_catalog,
         .artifact_publication = artifact_publication,
         .artifact_publication_transport = artifact_publication_transport,
@@ -1493,6 +1542,8 @@ fn parseBatchRequestWithOptions(
             .row_policy_install_bundle = row_policy_install_bundle orelse "",
             .restore_staging = if (restore_staging) |control| control.value else null,
             .online_source = if (online_source) |control| control.value else null,
+            .group_source = if (group_source) |control| control.value else null,
+            .resolver_review = if (resolver_review) |control| control.value else null,
             .artifact_catalog = if (artifact_catalog) |control| control.value else null,
             .artifact_publication = if (artifact_publication) |control| control.value else null,
             .artifact_publication_transport = if (artifact_publication_transport) |control| control.value else null,
@@ -1534,6 +1585,7 @@ fn parseBatchRequestWithOptions(
         for (result_value.req.deletes) |key| if (keys.isGraphEndpointCleanupControlKey(key)) return error.InvalidBatchRequest;
         for (result_value.req.transforms) |transform| if (keys.isGraphEndpointCleanupControlKey(transform.key)) return error.InvalidBatchRequest;
     }
+    try @import("../storage/db/resolver_review.zig").validateRequest(result_value.req);
     try validateGraphBatchCommand(result_value.req);
     try db_mod.types.validateMergeArtifacts(result_value.req);
     try merge_pages.validateRequest(result_value.req);
@@ -1578,14 +1630,26 @@ fn validateGraphBatchCommand(req: db_mod.types.BatchRequest) !void {
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    return encodeBatchRequestOwned(alloc, req) catch |err| switch (err) {
+    return encodeBatchRequestOwned(alloc, req, false) catch |err| switch (err) {
         // This memory writer can fail only when allocation fails.
         error.WriteFailed => error.OutOfMemory,
         else => err,
     };
 }
 
-fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+/// A local compiled owner evaluates optimistic predicates under its apply
+/// fence. Remote replicated batches still require the prepare protocol and
+/// continue to use encodeBatchRequest, which rejects unscoped predicates.
+pub fn encodeOwnerBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+    return encodeBatchRequestOwned(alloc, req, true) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest, local_owner: bool) ![]u8 {
+    try @import("../storage/db/resolver_review.zig").validateRequest(req);
+    try @import("../storage/db/group_source_contract.zig").validateRequest(req);
     try @import("../storage/db/artifact_publication.zig").validateRequest(alloc, req);
     try @import("../storage/db/artifact_publication_transport.zig").validateBatchRequest(req);
     if (req.row_policy_publication) |publication| {
@@ -1622,7 +1686,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         if (req.transaction == null or req.transaction.? != .prepare or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_repair or req.restore_staging_scope != null) return error.InvalidBatchRequest;
     }
     try db_mod.types.validateMergeArtifacts(req);
-    if (req.predicates.len > 0 and req.transaction == null) {
+    if (req.predicates.len > 0 and req.transaction == null and !local_owner) {
         return error.UnsupportedBatchRequestEncoding;
     }
     if ((req.split_transition != null or req.merge_source_transition != null) and
@@ -1820,6 +1884,18 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     if (req.artifact_catalog) |control| {
         if (req.online_source == null and req.merge_checkpoint == null) try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"artifact_catalog_v1\"}");
         try writer.writeAll(",\"_artifact_catalog\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
+    }
+    if (req.group_source) |control| {
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"group_source_v1\"},\"_group_source\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
+    }
+    if (req.resolver_review) |control| {
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"resolver_review_v1\"},\"_resolver_review\":");
         const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
@@ -3238,4 +3314,23 @@ test "graph cleanup owner replay afterimages survive internal batch round trip" 
     try std.testing.expectEqualSlices(u8, &contract.checkpointDigest(old), &parsed.req.graph_endpoint_cleanup_guards[0].checkpoint_digest);
     try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, bytes));
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_merge_artifacts\":[{\"key\":\"arbitrary\",\"value\":\"payload\"}]}"));
+}
+
+test "local owner conditional batch wire retains predicates without exposing remote authority" {
+    const a = std.testing.allocator;
+    const req: db_mod.types.BatchRequest = .{
+        .writes = &.{.{ .key = "entity/ada", .value = "{}" }},
+        .predicates = &.{.{ .key = "entity/ada", .expected_version = 7, .expected_content_digest = @splat(11) }},
+        .sync_level = .write,
+    };
+    try std.testing.expectError(error.UnsupportedBatchRequestEncoding, encodeBatchRequest(a, req));
+    const encoded = try encodeOwnerBatchRequest(a, req);
+    defer a.free(encoded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, encoded));
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, encoded));
+    var decoded = try parseOwnerBatchRequest(a, encoded);
+    defer decoded.deinit(a);
+    try std.testing.expect(decoded.req.transaction == null);
+    try std.testing.expectEqual(@as(u64, 7), decoded.req.predicates[0].expected_version);
+    try std.testing.expectEqual(@as([32]u8, @splat(11)), decoded.req.predicates[0].expected_content_digest.?);
 }

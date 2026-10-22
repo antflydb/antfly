@@ -279,14 +279,17 @@ pub fn resolveExtraction(
         gpa,
         cfg.table,
         cfg.key_template,
-        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence },
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence orelse 0 },
         cfg.type_must_match,
         cfg.scorer_json,
     );
     defer resolver.deinit();
     const effective_aliases = try cfg.effectiveAliasesAlloc(gpa);
     defer gpa.free(effective_aliases);
-    resolver.aliases = effective_aliases;
+    try resolver.installAliases(effective_aliases);
+    resolver.curation_enabled = cfg.suppress_json.len > 0 or cfg.curation_json.len > 0;
+    resolver.curation_index = try resolver_lib.curation.Index.init(resolver.arena.allocator(), cfg.suppress_json, cfg.curation_json);
+    try resolver.curation_index.bindRedirects(resolver.arena.allocator(), resolver.alias_index.?);
 
     var parsed = try resolver_lib.parseExtractionEntities(gpa, extraction_bytes);
     defer parsed.deinit();
@@ -371,7 +374,7 @@ fn siblingResolutionsJsonAlloc(
         var resolution = resolver_lib.parseResolution(gpa, raw orelse continue) catch continue;
         defer resolution.deinit();
         for (resolution.entities) |entity| {
-            if (entity.decision == .review) continue;
+            if (entity.decision == .review or entity.decision == .suppressed) continue;
             if (entity.doc_ref.key.len == 0) continue;
             var ref: std.json.ObjectMap = .empty;
             try ref.put(a, "key", .{ .string = try a.dupe(u8, entity.doc_ref.key) });
@@ -481,14 +484,17 @@ fn processChangedExtractionWithConfigOptions(
         gpa,
         cfg.table,
         cfg.key_template,
-        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence },
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence orelse 0 },
         cfg.type_must_match,
         cfg.scorer_json,
     );
     defer resolver.deinit();
     const effective_aliases = try cfg.effectiveAliasesAlloc(gpa);
     defer gpa.free(effective_aliases);
-    resolver.aliases = effective_aliases;
+    try resolver.installAliases(effective_aliases);
+    resolver.curation_enabled = cfg.suppress_json.len > 0 or cfg.curation_json.len > 0;
+    resolver.curation_index = try resolver_lib.curation.Index.init(resolver.arena.allocator(), cfg.suppress_json, cfg.curation_json);
+    try resolver.curation_index.bindRedirects(resolver.arena.allocator(), resolver.alias_index.?);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.resolution_scope_key, cfg.resolution_artifact);
     errdefer gpa.free(resolution_key);
@@ -575,9 +581,27 @@ fn processChangedExtractionWithConfigOptions(
     } else .{};
     const vector_fields = try resolver.candidateVectorFields(gpa);
     defer gpa.free(vector_fields);
+    const policy = if (cfg.adjudicate_json.len > 0) try resolver_lib.adjudication.Config.parse(gpa, cfg.adjudicate_json) else null;
+    defer if (policy) |parsed_policy| parsed_policy.deinit();
+    const execution_dependency = if (policy != null) try std.json.Stringify.valueAlloc(gpa, cfg.*, .{}) else null;
+    defer if (execution_dependency) |raw| gpa.free(raw);
+    var validation = if (batch_source) |source| AdjudicationCandidateValidator{ .source = source } else undefined;
+    const mention_descriptions = if (policy) |parsed_policy| if (parsed_policy.value.description_inputs.mention_artifact) |artifact| blk: {
+        const dependency_key = try internal_keys.artifactNamedPrefixAlloc(gpa, parsed.doc_key, "asset", artifact);
+        defer gpa.free(dependency_key);
+        break :blk try store.get(gpa, dependency_key);
+    } else null else null;
+    defer if (mention_descriptions) |raw| gpa.free(raw);
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
+        .adjudicate = if (policy) |parsed_policy| parsed_policy.value else null,
+        .adjudicator = if (batch_source) |source| if (source.vtable.adjudicate) |execute| .{ .ptr = source.ptr, .execute = execute, .execute_batch = source.vtable.adjudicate_batch, .model_revision = source.vtable.adjudicator_model_revision, .get_description = source.vtable.get_description } else null else null,
+        .execution_dependency = execution_dependency orelse "",
+        .candidate_validator = if (policy != null and batch_source != null) .{ .ptr = &validation, .validate = AdjudicationCandidateValidator.validate } else null,
+        .mention_descriptions_json = mention_descriptions,
+        .now_ns = replayNowNs,
         .config_generation = cfg.effectiveGeneration(),
+        .namespace_curation_generation = cfg.namespace_curation_generation,
         .promotion_enabled = cfg.promote and cfg.replacement_index.len == 0,
         .retain_work = retain_work,
         .work_retention = cfg.retain_work,
@@ -815,6 +839,7 @@ fn decisionFromName(name: []const u8) ?resolver_lib.Decision {
     if (std.mem.eql(u8, name, "match")) return .match;
     if (std.mem.eql(u8, name, "review")) return .review;
     if (std.mem.eql(u8, name, "new")) return .new;
+    if (std.mem.eql(u8, name, "suppressed") or std.mem.eql(u8, name, "reject")) return .suppressed;
     return null;
 }
 
@@ -847,6 +872,7 @@ pub const ReviewDecision = struct {
     decision: resolver_lib.Decision,
     table: []const u8,
     key: []const u8,
+    origin: ?resolver_lib.curation.Origin = null,
 };
 
 pub fn buildReviewDecisionBytesAlloc(
@@ -881,6 +907,10 @@ pub fn buildReviewDecisionsBytesAlloc(gpa: std.mem.Allocator, existing_raw: ?[]c
         try value.put(scratch, "decision", .{ .string = @tagName(update.decision) });
         try value.put(scratch, "table", .{ .string = update.table });
         try value.put(scratch, "key", .{ .string = update.key });
+        if (update.origin) |origin| {
+            try origin.validate();
+            try value.put(scratch, "origin", try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.json.Stringify.valueAlloc(scratch, origin, .{}), .{}));
+        }
         try object.put(scratch, update.local_id, .{ .object = value });
     }
     return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = object }, .{});
@@ -927,6 +957,34 @@ const AliasFirstCandidateProvider = struct {
                 list.* = combined;
             }
         }
+    }
+};
+
+const AdjudicationCandidateValidator = struct {
+    source: CandidateSource,
+    fn validate(ptr: *anyopaque, a: Allocator, candidate: resolver_lib.Candidate) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try self.validateRecord(a, candidate.doc_ref, candidate.record);
+        if (candidate.resolved_doc_ref) |target| try self.validateRecord(a, target, candidate.resolved_record orelse return error.Busy);
+    }
+    fn validateRecord(self: *@This(), a: Allocator, ref: resolver_lib.DocRef, expected: matcher.Record) !void {
+        const raw = (try self.source.get(a, ref.table, ref.key)) orelse return error.Busy;
+        defer a.free(raw);
+        var current: std.ArrayListUnmanaged(resolver_lib.Candidate) = .empty;
+        try appendEntityCandidate(a, ref.table, ref.key, raw, &current);
+        if (current.items.len != 1) return error.Busy;
+        // Embedding hydration may add vector fields absent in the primary JSON.
+        // Validate every identity/context string and explicit absence instead.
+        for ([_][]const u8{ "canonical_name", "label", "entity_type", "description", "merged_into", "merged_into_table" }) |field| {
+            const before = textField(expected, field);
+            const after = textField(current.items[0].record, field);
+            if ((before == null) != (after == null)) return error.Busy;
+            if (before != null and !std.mem.eql(u8, before.?, after.?)) return error.Busy;
+        }
+    }
+    fn textField(record: matcher.Record, name: []const u8) ?[]const u8 {
+        for (record.fields) |field| if (std.mem.eql(u8, field.name, name)) return if (field.value == .text) field.value.text else null;
+        return null;
     }
 };
 
@@ -1452,6 +1510,50 @@ fn entityRawFromStore(allocator: std.mem.Allocator, store: resolver_lib.Artifact
     return try store.get(allocator, doc_store_key);
 }
 
+/// Shared dependency expansion for local and ordered publication. The caller's
+/// arena owns appended extraction keys. Descriptor updates never become sources
+/// of their own or wait for another producer during resolution.
+pub fn appendDescriptionSources(a: Allocator, resolvers: []const ResolverConfig, key: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var dependency = (try parseSourceArtifactKeyAlloc(a, key)) orelse return;
+    defer dependency.deinit(a);
+    if (dependency.source_artifact_kind != .asset) return;
+    for (resolvers) |cfg| {
+        if (cfg.adjudicate_json.len == 0) continue;
+        const policy = try resolver_lib.adjudication.Config.parse(a, cfg.adjudicate_json);
+        defer policy.deinit();
+        const artifact = policy.value.description_inputs.mention_artifact orelse continue;
+        if (!std.mem.eql(u8, artifact, dependency.artifact_name)) continue;
+        const source_key = try internal_keys.artifactNamedPrefixAlloc(a, dependency.doc_key, "asset", cfg.source_artifact);
+        try appendUniqueSource(a, out, source_key);
+    }
+}
+fn appendUniqueSource(a: Allocator, out: *std.ArrayList([]const u8), key: []const u8) !void {
+    for (out.items) |existing| if (std.mem.eql(u8, existing, key)) return;
+    try out.append(a, key);
+}
+
+test "resolver adjudication description dependencies redrive owning extraction once" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const policy =
+        \\{"decider":{"provider":"antfly","model":"fixture"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"description_inputs":{"mention_artifact":"descriptions"}}
+    ;
+    const config: ResolverConfig = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .scorer_json = "{\"comparisons\":[]}", .adjudicate_json = policy };
+    try config.validate();
+    var sources: std.ArrayList([]const u8) = .empty;
+    const dependency = try internal_keys.artifactNamedPrefixAlloc(scratch, "source", "asset", "descriptions");
+    const expected = try internal_keys.artifactNamedPrefixAlloc(scratch, "source", "asset", "kg");
+    try appendDescriptionSources(scratch, &.{config}, dependency, &sources);
+    try appendDescriptionSources(scratch, &.{config}, dependency, &sources);
+    try testing.expectEqual(@as(usize, 1), sources.items.len);
+    try testing.expectEqualStrings(expected, sources.items[0]);
+    var invalid = config;
+    invalid.source_artifact_kind = .chunk;
+    try testing.expectError(error.InvalidResolverConfig, invalid.validate());
+}
+
 /// Process every changed extraction artifact in a replay record. Changed
 /// resolution artifacts are committed atomically with full graph+promotion
 /// replay; unchanged identity decisions emit a graph-only reconciliation for
@@ -1473,7 +1575,15 @@ pub fn processRecordKeys(
     var pending: PendingRecordCommit = .{};
     defer pending.deinit(gpa);
 
+    var dependency_arena = std.heap.ArenaAllocator.init(gpa);
+    defer dependency_arena.deinit();
+    const scratch = dependency_arena.allocator();
+    var source_keys: std.ArrayList([]const u8) = .empty;
     for (changed_artifact_keys) |key| {
+        try appendDescriptionSources(scratch, resolvers, key, &source_keys);
+        try appendUniqueSource(scratch, &source_keys, key);
+    }
+    for (source_keys.items) |key| {
         _ = try processChangedExtractionForAllResolvers(gpa, resolvers, store, provider, key, candidate_source, embedder, &pending);
     }
 
@@ -2440,14 +2550,30 @@ fn clearReresolveCursor(store: *backend_erased.Store, key: []const u8) !void {
     try txn.commit();
 }
 
-fn hasReresolveCursor(store: *backend_erased.Store, key: []const u8) !bool {
-    var txn = try store.beginRead();
-    defer txn.abort();
-    _ = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return false,
-        else => return err,
-    };
-    return true;
+/// Check both durable backfill namespaces in one committed view. Cold startup
+/// must observe cursor-only debt without constructing workers or scanning the
+/// document corpus, even when the replay watermarks already match.
+pub fn hasDurableReresolveBacklog(store: anytype) !bool {
+    // getManySorted requires lexical order (repair precedes resume).
+    const keys = [_][]const u8{ resolver_catalog.reresolve_repair_resume_key, resolver_catalog.reresolve_resume_key };
+    var values: [keys.len]?[]const u8 = @splat(null);
+    if (comptime @hasDecl(@typeInfo(@TypeOf(store)).pointer.child, "readManyConsistent")) {
+        var txn = try store.readManyConsistent(&keys, &values);
+        defer txn.abort();
+        return values[0] != null or values[1] != null;
+    } else {
+        var probe = try store.beginProbe();
+        if (probe.vtable.get_many_sorted_is_atomic) {
+            defer probe.abort();
+            try probe.getManySorted(&keys, &values);
+        } else {
+            probe.abort();
+            var txn = try store.beginRead();
+            defer txn.abort();
+            try txn.getManySorted(&keys, &values);
+        }
+        return values[0] != null or values[1] != null;
+    }
 }
 
 pub fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
@@ -2544,8 +2670,7 @@ pub const ResolutionRuntime = struct {
             .replay_progress = try loadReplayProgress(alloc, &store_handle.store, applied),
             .target_sequence = .init(target),
             .shutdown_flag = .init(false),
-            .backfill_pending = .init((try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_resume_key)) or
-                (try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_repair_resume_key))),
+            .backfill_pending = .init(try hasDurableReresolveBacklog(&store_handle.store)),
             .worker_started = .init(false),
             .future = null,
         };
@@ -2855,8 +2980,7 @@ pub const ResolutionRuntime = struct {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionHasReresolveBacklog", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
-        return (try hasReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key)) or
-            (try hasReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_repair_resume_key));
+        return try hasDurableReresolveBacklog(&self.store_handle.store);
     }
 
     /// Enqueue one bounded window of existing extraction artifacts for

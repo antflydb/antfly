@@ -40,7 +40,7 @@ pub const Cache = struct {
         self.managed = local.storage_resource_manager.BudgetedAllocator.init(manager, .dense_search_working_set, @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), 1);
         self.heap.backing = self.managed.?.allocator();
     }
-    pub fn acquire(self: *Cache, server: *server_api.ApiHttpServer, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact, domain: [32]u8, scope: [32]u8, context: Context) !*Entry {
+    pub fn acquire(self: *Cache, server: *server_api.ApiHttpServer, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact, domain: [32]u8, scope: [32]u8, context: Context, cloud: ?local.metadata_lake_index_catalog.CloudGenerations) !*Entry {
         try context.ensureActive();
         @import("antfly_platform").sync.lockYielding(&self.heap.mutex);
         const pressure = self.heap.live > self.heap.limit / 2;
@@ -51,6 +51,10 @@ pub const Cache = struct {
         hash.update(&domain);
         hash.update(declaration.artifact.artifact_id);
         hash.update(declaration.name);
+        if (cloud) |binding| {
+            hash.update(binding.root.artifact_id);
+            hash.update(binding.root.generation);
+        }
         var key: [32]u8 = undefined;
         hash.final(&key);
         @import("antfly_platform").sync.lockYielding(&self.mutex);
@@ -97,7 +101,7 @@ pub const Cache = struct {
             self.mutex.unlock();
             entry.destroy();
         }
-        try entry.open(server, declaration, domain, scope, context);
+        try entry.open(server, declaration, domain, scope, context, cloud);
         return entry;
     }
     fn evictIdle(self: *Cache) void {
@@ -145,7 +149,9 @@ pub const Entry = struct {
     vectors: ?*local.storage_lsm_backend.Backend = null,
     loader: ?*dense.VectorLoader = null,
     fn bind(self: *Entry, context: Context) void {
+        if (self.store.cloud_binding) |*binding| binding.reader.resetBudget();
         const reader = self.reader.?;
+        reader.navigation.detach();
         reader.context = context;
         if (reader.cache) |*cached| cached.context = context;
         if (self.loader) |loader| loader.context = context;
@@ -165,15 +171,18 @@ pub const Entry = struct {
         if (self.reader) |reader| reader.deinit();
         if (self.dense_metadata) |owned| owned.release();
         if (self.sparse_metadata) |owned| owned.release();
-        std.debug.assert(self.budget.live == 0);
         if (self.store_open) self.store.deinit();
+        std.debug.assert(self.budget.live == 0);
         self.arena.deinit();
         std.heap.page_allocator.destroy(self);
     }
-    fn open(self: *Entry, server: *server_api.ApiHttpServer, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact, domain: [32]u8, scope: [32]u8, context: Context) !void {
+    fn open(self: *Entry, server: *server_api.ApiHttpServer, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact, domain: [32]u8, scope: [32]u8, context: Context, cloud: ?local.metadata_lake_index_catalog.CloudGenerations) !void {
         const a = self.arena.allocator();
         self.store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
         self.store_open = true;
+        self.store.implementation.cloud_io = context.io;
+        try self.store.bindGenerationMap(cloud, if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none);
+        if (self.store.cloud_binding) |*binding| binding.reader.cache_allocator = self.budget.allocator();
         if (!std.mem.eql(u8, &self.store.identity, &scope)) return error.ExternalLakeIndexStoreChanged;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = scope, .context = context };
         const name = try a.dupe(u8, declaration.name);
@@ -185,7 +194,7 @@ pub const Entry = struct {
             self.dense_metadata = try @import("lake_index_decoded_metadata.zig").acquire(dense.Root, cached, self.store.artifactStore(), declaration.artifact, .none, dense.loadRoot);
             const root = self.dense_metadata.?.value.*;
             if (!std.mem.eql(u8, &root.generation.domain, &domain) or !@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, declaration.binding)) return error.InvalidNativeLakeDenseRoot;
-            reader.* = .{ .root = root.generation, .prefix = path, .store = self.store.artifactStore(), .context = context, .cache = cached, .scratch = self.budget.allocator(), .max_block_bytes = 8 * 1024 * 1024 };
+            reader.* = .{ .root = root.generation, .prefix = path, .store = self.store.artifactStore(), .context = context, .cache = cached, .scratch = self.budget.allocator(), .navigation = .{ .allocator = self.budget.allocator() }, .max_block_bytes = 8 * 1024 * 1024 };
             self.reader = reader;
             const vectors = try a.create(local.storage_lsm_backend.Backend);
             vectors.* = try local.storage_lsm_backend.Backend.open(self.budget.allocator(), try std.fmt.allocPrint(a, "{s}/vectors", .{path}), .{ .storage = reader.storage(), .backend = .{ .read_only = true, .create_if_missing = false } });
@@ -210,7 +219,7 @@ pub const Entry = struct {
             self.sparse_metadata = try @import("lake_index_decoded_metadata.zig").acquire(sparse.Root, cached, self.store.artifactStore(), declaration.artifact, .none, sparse.loadRoot);
             const root = self.sparse_metadata.?.value.*;
             if (!std.mem.eql(u8, &root.generation.domain, &domain) or !@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, declaration.binding)) return error.InvalidNativeLakeSparseRoot;
-            reader.* = .{ .root = root.generation, .prefix = path, .store = self.store.artifactStore(), .context = context, .cache = cached, .scratch = self.budget.allocator(), .max_block_bytes = 8 * 1024 * 1024 };
+            reader.* = .{ .root = root.generation, .prefix = path, .store = self.store.artifactStore(), .context = context, .cache = cached, .scratch = self.budget.allocator(), .navigation = .{ .allocator = self.budget.allocator() }, .max_block_bytes = 8 * 1024 * 1024 };
             self.reader = reader;
             const entry = try a.create(Manager.SparseIndex);
             entry.* = .{ .apply_mutex = mutex, .config = .{ .name = name, .kind = .sparse_vector, .config_json = root.config_json }, .field_name = try a.dupe(u8, root.binding.column_bindings[0]), .external = true, .chunk_name = try @import("lake_enrichment_units.zig").chunkName(a, name, root.config_json), .embedding_name = null, .supports_unit_grouping = true, .rebuild_root_path = path, .index = try local.sparse_sparse.SparseIndex.open(self.budget.allocator(), path, .{ .lsm_storage = reader.storage(), .lsm_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } }) };

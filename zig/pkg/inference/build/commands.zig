@@ -20,6 +20,7 @@ const runtime_build = @import("runtime.zig");
 pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile {
     const b = ctx.b;
     const exe = runtime_build.addStandaloneExecutable(b, ctx.graph, ctx.target, ctx.optimize, ctx.paths.inference_root, ctx.backend.link_libc);
+    exe.root_module.strip = ctx.strip;
     const install_exe = b.addInstallArtifact(exe, .{
         .dest_sub_path = "antfly-inference",
     });
@@ -40,9 +41,9 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
 
     const bench_server = b.addExecutable(.{
         .name = "antfly-inference-bench-server",
-        // Match the macOS Metal inference-test allowance; other accelerators
-        // reserve 8 GiB for the production Decide prepared-pipeline benchmark.
-        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else if (ctx.hasAccelerator()) 8 else 6) * 1024 * 1024 * 1024,
+        // Retain video codec compiler headroom and main's larger Darwin Metal
+        // allowance for the production prepared-pipeline benchmark.
+        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 12) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/benchmark_server.zig"),
             .target = ctx.target,
@@ -50,6 +51,7 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
         }),
     });
     ctx.graph.linkBuildInfo(bench_server.root_module);
+    bench_server.root_module.strip = ctx.strip;
     bench_server.root_module.addImport("inference", ctx.graph.inference_mod);
     bench_server.root_module.addImport("build_options", ctx.graph.build_options_mod);
     bench_server.root_module.addImport("structlog", ctx.graph.structlog_mod);
@@ -58,6 +60,30 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const install_bench_server = b.addInstallArtifact(bench_server, .{});
     const bench_server_step = ctx.step("bench-server", "Build the production HTTP server without the other CLI commands");
     bench_server_step.dependOn(&install_bench_server.step);
+
+    const http_server = b.addExecutable(.{
+        .name = "antfly-inference-http-server",
+        // HTTP-only ReleaseSmall with Metal measured a 4.46 GiB build-tree
+        // peak on an M4, under a 10 GiB watchdog with no additional swap.
+        // Other optimization modes retain the broader Metal allowance.
+        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal)
+            (if (ctx.optimize == .small) 10 else 14)
+        else if (ctx.hasAccelerator()) 8 else 6) * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/http_server.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    ctx.graph.linkBuildInfo(http_server.root_module);
+    http_server.root_module.addImport("inference", ctx.graph.inference_mod);
+    http_server.root_module.addImport("build_options", ctx.graph.build_options_mod);
+    http_server.root_module.addImport("structlog", ctx.graph.structlog_mod);
+    http_server.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
+    http_server.root_module.link_libc = ctx.backend.link_libc;
+    const install_http_server = b.addInstallArtifact(http_server, .{});
+    const http_server_step = ctx.step("http-server", "Build the constrained production HTTP-only server");
+    http_server_step.dependOn(&install_http_server.step);
 
     return exe;
 }

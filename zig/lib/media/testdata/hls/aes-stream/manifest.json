@@ -1,0 +1,19 @@
+{
+  "tool": "LibreSSL 3.3.6",
+  "command": [
+    "openssl",
+    "enc",
+    "-aes-128-cbc",
+    "-K",
+    "000102030405060708090a0b0c0d0e0f",
+    "-iv",
+    "0000000000000000000000000000000a"
+  ],
+  "key": "Public fixture bytes 00..0f; not a credential",
+  "source": "../../fragmented.mp4, bytes [797:]",
+  "source_sha256": "8b0d6caa76acfa98258536bce04d1ae058ba2ff2c4dcfb4e109cd289bea8d8be",
+  "plaintext_sha256": "24f5f17b792e13be4192c0128f6b678a74650d406c74a34f287fa94af2afe9ca",
+  "ciphertext_sha256": "35845f9906213907f2743a13869ee44b87c3b7f907a6fb5b7bfd41fefda640df",
+  "plaintext_bytes": 62381,
+  "ciphertext_bytes": 62384
+}

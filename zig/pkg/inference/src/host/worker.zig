@@ -32,6 +32,7 @@ const ForwardControl = struct {
     progress: bridge.ProgressView = .{},
     stream: http.StreamSink = .{},
     stream_started: bool = false,
+    body_source: http.RequestBodySource = .{},
 
     fn check(raw: ?*anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -62,8 +63,16 @@ const ForwardControl = struct {
         }
     }
 
+    fn readBody(raw: ?*anyopaque, dest: []u8) !usize {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try check(raw);
+        var count: usize = 0;
+        try callbackResult((self.body_source.read orelse return error.BodySourceUnavailable)(self.body_source.context, dest.ptr, dest.len, &count));
+        if (count > dest.len) return error.BodyReadFailed;
+        return count;
+    }
     fn view(self: *@This()) rpc.Control {
-        return .{ .ptr = self, .check = check, .event = event };
+        return .{ .ptr = self, .check = check, .event = event, .read_body = if (self.body_source.read != null) readBody else null };
     }
 };
 
@@ -115,10 +124,13 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
     const alloc = arena.allocator();
     // Events can be numerous on a long stream: use a freeing allocator rather
     // than retaining every decoded frame in the request arena.
-    var control = ForwardControl{ .alloc = client.alloc, .cancellation = context.cancellation, .stream = context.stream };
+    var control = ForwardControl{ .alloc = client.alloc, .cancellation = context.cancellation, .stream = context.stream, .body_source = context.body_source };
     try ForwardControl.check(&control);
     var body = context.request.body;
-    if (body.slice() == null) if (context.body_source.read_all) |read| {
+    const streaming_body = context.body_source.streaming != 0 and context.body_source.read != null and
+        std.mem.endsWith(u8, context.request.path.slice(), "/stream") and
+        std.mem.indexOf(u8, context.request.path.slice(), "/transcription/sessions/") != null;
+    if (!streaming_body and body.slice() == null) if (context.body_source.read_all) |read| {
         try callbackResult(read(context.body_source.context, &body));
     };
     const headers = try alloc.alloc(wire.Header, context.request.headers_len);
@@ -135,6 +147,7 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
         .headers = headers,
         .params = params,
         .has_body = body.slice() != null,
+        .streaming_body = streaming_body,
     }, .{});
     const result = client.invoke(.http, data, body.slice() orelse "", control.view()) catch |err| {
         if (control.stream_started) return err;
@@ -717,6 +730,7 @@ const Child = struct {
                     .route_handle = route_handle,
                     .request = &view,
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
+                    .body_source = if (incoming.streaming_body) .{ .context = request, .streaming = 1, .read = readBody, .read_all = readAllBody } else .{},
                     .stream = .{ .context = request, .start = streamStart, .write = streamWrite, .close = streamClose },
                     .out_response_handle = &response_handle,
                     .out_response = &response,
@@ -732,6 +746,18 @@ const Child = struct {
             },
             else => return error.UnsupportedOperation,
         }
+    }
+
+    fn readBody(raw: ?*anyopaque, dest: [*]u8, capacity: usize, out: *usize) callconv(.c) http.CallbackStatus {
+        const request: *rpc.Request = @ptrCast(@alignCast(raw orelse return .failed));
+        out.* = request.readBody(dest[0..capacity]) catch |err| return switch (err) {
+            error.Canceled, error.Cancelled => .canceled,
+            else => .failed,
+        };
+        return .ok;
+    }
+    fn readAllBody(_: ?*anyopaque, _: *http.OptionalBytes) callconv(.c) http.CallbackStatus {
+        return .failed;
     }
 
     fn cancelled(raw: ?*const anyopaque) callconv(.c) u8 {

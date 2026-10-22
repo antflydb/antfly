@@ -29,6 +29,8 @@ pub const Provider = struct {
     attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
+    response_format_json: ?[]const u8 = null,
+    logprobs: bool = false,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -185,6 +187,8 @@ pub const Provider = struct {
     /// the shared wire encoder and their non-OpenAI sampling extensions.
     fn chatRequestJsonAlloc(self: *const Provider, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) ![]u8 {
         const options = inference.ChatRequestOptions{
+            .response_format_json = self.response_format_json,
+            .logprobs = self.logprobs,
             .tools_json = self.tools_json,
             .tool_choice_json = self.tool_choice_json,
             .max_tokens = self.max_tokens,
@@ -199,11 +203,13 @@ pub const Provider = struct {
         // Reuse multimodal/tool message adaptation, then let the generated
         // upstream type own provider parameter names and optional-field encoding.
         const envelope = try inference.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .openai_compatible, .{
+            .response_format_json = self.response_format_json,
+            .logprobs = self.logprobs,
             .tools_json = self.tools_json,
             .tool_choice_json = self.tool_choice_json,
         });
         defer alloc.free(envelope);
-        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, envelope, .{});
+        const parsed = try @import("antfly-json").parseValueLossless(alloc, envelope);
         defer parsed.deinit();
         const wire_messages = try alloc.alloc(openai_api.types.ChatCompletionRequestMessage, messages.len);
         defer alloc.free(wire_messages);
@@ -232,6 +238,9 @@ pub const Provider = struct {
             .messages = wire_messages,
             .tools = if (parsed.value.object.get("tools")) |tools| tools.array.items else null,
             .tool_choice = parsed.value.object.get("tool_choice"),
+            .response_format = parsed.value.object.get("response_format"),
+            .logprobs = if (self.logprobs) .{ .value = true } else .absent,
+            .top_logprobs = if (self.logprobs) .{ .integer = 20 } else null,
         };
         if (self.max_completion_tokens) |limit| {
             request.max_completion_tokens = .{ .value = limit };
@@ -255,7 +264,9 @@ pub const Provider = struct {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
         const Response = struct {
+            usage: std.json.Value = .null,
             choices: []const struct {
+                logprobs: ?std.json.Value = null,
                 message: struct {
                     content: ?[]const u8 = null,
                     tool_calls: ?[]const struct {
@@ -282,22 +293,29 @@ pub const Provider = struct {
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
+        if (!resp.ok()) return inference.remoteGenerationStatusError(resp.status.code);
         const body = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
 
         const choices = parsed.value.choices;
+        var synthesized = false;
         if (choices.len > 0) {
+            const proof = if (choices[0].logprobs) |evidence| try std.json.Stringify.valueAlloc(alloc, evidence, .{}) else null;
+            errdefer if (proof) |value| alloc.free(value);
             var tool_calls = try cloneOpenAIToolCalls(alloc, choices[0].message.tool_calls);
             errdefer freeToolCalls(alloc, tool_calls);
             if (choices[0].message.content) |content| {
                 if (tool_calls.len == 0) {
                     tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, self.tools_json, self.tool_choice_json);
+                    synthesized = tool_calls.len > 0;
                 }
                 return .{
                     .content = try alloc.dupe(u8, content),
                     .tool_calls = tool_calls,
+                    .tool_calls_synthesized = synthesized,
+                    .token_logprobs_json = proof,
+                    .usage = inference.GenerationUsage.fromValue(parsed.value.usage, "prompt_tokens", "completion_tokens", "total_tokens"),
                     .allocator = alloc,
                 };
             }
@@ -305,6 +323,9 @@ pub const Provider = struct {
                 return .{
                     .content = try alloc.dupe(u8, ""),
                     .tool_calls = tool_calls,
+                    .tool_calls_synthesized = synthesized,
+                    .token_logprobs_json = proof,
+                    .usage = inference.GenerationUsage.fromValue(parsed.value.usage, "prompt_tokens", "completion_tokens", "total_tokens"),
                     .allocator = alloc,
                 };
             }
@@ -528,4 +549,20 @@ test "openai generate round trip and empty choices failure" {
     group.await(io) catch {};
 
     try std.testing.expectEqual(error.GenerateRequestFailed, state.err);
+}
+
+test "generating backend OpenAI preserves numeric literals in tools and response schemas" {
+    const a = std.testing.allocator;
+    const provider = Provider{
+        .allocator = a,
+        .http = undefined,
+        .base_url = "https://api.openai.com/v1",
+        .use_openai_schema = true,
+        .tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"antfly_output\",\"parameters\":{\"type\":\"number\",\"const\":1.0000000000000001}}}]",
+        .response_format_json = "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"test\",\"schema\":{\"type\":\"number\",\"minimum\":1e-400}}}",
+    };
+    const body = try provider.chatRequestJsonAlloc(a, "model", &.{});
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "1.0000000000000001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "1e-400") != null);
 }

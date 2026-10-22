@@ -4857,6 +4857,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
+        try distributed_graph.validateIncomingStartIdentities(alloc, self.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
             try table_catalog.RoutingSession.init(alloc, self.catalog, queryRoutingDeadline(self.catalog, req))
         else
@@ -6384,7 +6385,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}")) and
             !opts.include_primary_digest and !opts.relational_integrity_catalog and !opts.relational_integrity_action and
             !opts.generation_handoff_install_read_index_certified and
-            opts.relational_integrity_jobs_json.len == 0 and opts.relational_index_status_json.len == 0 and
+            opts.relational_integrity_jobs_json.len == 0 and opts.group_source_query_json.len == 0 and opts.relational_index_status_json.len == 0 and
             opts.relational_activation_json.len == 0 and opts.fields.len == 0 and
             opts.restore_staging_scope != null and opts.restore_staging_plan_id != null;
     }
@@ -7341,6 +7342,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         var req = requested;
         try checkQueryDeadline(req);
+        try distributed_graph.validateIncomingStartIdentities(alloc, hosted.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
             try table_catalog.RoutingSession.init(alloc, hosted.catalog, queryRoutingDeadline(hosted.catalog, req))
         else
@@ -15610,6 +15612,7 @@ fn lookupRemote(
         opts.relational_activation_json,
         opts.relational_index_status_json,
         opts.relational_topology_json,
+        opts.group_source_query_json,
         opts.restore_staging_scope,
         opts.restore_staging_plan_id,
         opts.include_primary_digest,

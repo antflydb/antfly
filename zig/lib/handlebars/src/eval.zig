@@ -27,6 +27,8 @@ pub const Value = union(enum) {
     string: []const u8,
     integer: i64,
     float: f64,
+    /// Valid JSON number token retained without floating-point rounding.
+    number_string: []const u8,
     boolean: bool,
     null,
     undefined,
@@ -40,6 +42,11 @@ pub const Value = union(enum) {
             .boolean => |b| b,
             .integer => |i| i != 0,
             .float => |f| f != 0.0,
+            .number_string => |raw| blk: {
+                const end = std.mem.indexOfAny(u8, raw, "eE") orelse raw.len;
+                for (raw[0..end]) |byte| if (byte >= '1' and byte <= '9') break :blk true;
+                break :blk false;
+            },
             .string => |s| s.len > 0,
             .safe_string => |s| s.len > 0,
             .array => |a| a.len > 0,
@@ -50,7 +57,7 @@ pub const Value = union(enum) {
     pub fn toString(self: Value, arena: Allocator) ![]const u8 {
         return switch (self) {
             .string => |s| s,
-            .safe_string => |s| s,
+            .safe_string, .number_string => |s| s,
             .integer => |i| std.fmt.allocPrint(arena, "{d}", .{i}),
             .float => |f| std.fmt.allocPrint(arena, "{d}", .{f}),
             .boolean => |b| if (b) "true" else "false",
@@ -770,17 +777,30 @@ pub const Eval = struct {
             .path => |p| self.resolvePath(&p),
             .string_literal => |s| Value.str(s.value),
             .boolean_literal => |b| Value.bln(b.value),
-            // Parse integers from the source text: the f64 value loses
-            // precision near the i64 limits and may not convert at all.
-            .number_literal => |n| if (!n.is_int)
-                Value.flt(n.value)
-            else if (std.fmt.parseInt(i64, n.original, 10)) |int|
-                Value.int(int)
-            else |_|
-                Value.flt(n.value),
+            .number_literal => |n| try self.evalNumberLiteral(n.original),
             .sub_expression => |s| self.evalExpressionValue(&s.expression.expression),
             else => .undefined,
         };
+    }
+
+    fn evalNumberLiteral(self: *Eval, raw: []const u8) EvalError!Value {
+        if (std.mem.indexOfScalar(u8, raw, '.') == null) {
+            if (std.fmt.parseInt(i64, raw, 10)) |integer| return Value.int(integer) else |_| {}
+        }
+        // Keep decimals and large integers exact, just like document numbers.
+        // Handlebars also accepts leading zeroes and a trailing decimal point;
+        // normalize those spellings so number_string remains valid JSON.
+        const negative = raw[0] == '-';
+        const unsigned = raw[@intFromBool(negative)..];
+        var start: usize = 0;
+        while (start + 1 < unsigned.len and unsigned[start] == '0' and std.ascii.isDigit(unsigned[start + 1])) : (start += 1) {}
+        const trailing_dot = unsigned[unsigned.len - 1] == '.';
+        if (start == 0 and !trailing_dot) return .{ .number_string = raw };
+        return .{ .number_string = try std.fmt.allocPrint(self.arena, "{s}{s}{s}", .{
+            if (negative) "-" else "",
+            unsigned[start..],
+            if (trailing_dot) "0" else "",
+        }) };
     }
 
     fn callHelper(self: *Eval, helper: Helper, expr: *const ast.Expression) EvalError!Value {
@@ -861,7 +881,8 @@ pub const Eval = struct {
     // Path resolution
     // ---------------------------------------------------------------
 
-    fn resolvePath(self: *Eval, path: *const ast.Path) Value {
+    /// Borrow a path value without evaluating an expression or calling helpers.
+    pub fn resolvePath(self: *Eval, path: *const ast.Path) Value {
         // Data references (@index, @key, @root, etc.)
         if (path.data) {
             return self.resolveDataPath(path);
@@ -1005,13 +1026,13 @@ fn nodeStripAfter(node: *const ast.Node) bool {
     };
 }
 
-fn trimLeadingWhitespace(s: []const u8) []const u8 {
+pub fn trimLeadingWhitespace(s: []const u8) []const u8 {
     var start: usize = 0;
     while (start < s.len and std.ascii.isWhitespace(s[start])) start += 1;
     return s[start..];
 }
 
-fn trimTrailingWhitespace(buf: *std.ArrayListUnmanaged(u8)) void {
+pub fn trimTrailingWhitespace(buf: *std.ArrayListUnmanaged(u8)) void {
     while (buf.items.len > 0 and std.ascii.isWhitespace(buf.items[buf.items.len - 1])) {
         _ = buf.pop();
     }
@@ -2344,4 +2365,13 @@ test "eval @root in each" {
 
     const result = try testRender(arena, "{{#each items}}{{@root.sep}}{{this}}{{/each}}", .{ .map = m });
     try std.testing.expectEqualStrings("|x", result);
+}
+
+test "lossless numeric values render verbatim with numeric truthiness" {
+    const a = std.testing.allocator;
+    const tiny = Value{ .number_string = "1e-400" };
+    try std.testing.expect(tiny.isTruthy());
+    try std.testing.expectEqualStrings("1e-400", try tiny.toString(a));
+    try std.testing.expect(!(Value{ .number_string = "-0.000e999" }).isTruthy());
+    try std.testing.expect((Value{ .number_string = "-0.001e-999" }).isTruthy());
 }

@@ -1276,3 +1276,83 @@ func TestClient_Generate_PreservesUnifiedAuthAndRemoteContentErrors(t *testing.T
 		})
 	}
 }
+
+func TestGenerateResponsePreservesUnknownAndMeasuredUsage(t *testing.T) {
+	for _, usage := range []string{"null", `{"prompt_tokens":2,"completion_tokens":1,"total_tokens":5}`} {
+		t.Run(usage, func(t *testing.T) {
+			body := `{"id":"generation","object":"chat.completion","created":1,"model":"google","choices":[],"usage":` + usage + `}`
+			var response oapi.InferenceGenerateResponse
+			require.NoError(t, json.Unmarshal([]byte(body), &response))
+			if usage == "null" {
+				require.Nil(t, response.Usage)
+			} else {
+				require.NotNil(t, response.Usage)
+				require.Equal(t, 5, response.Usage.TotalTokens)
+			}
+		})
+	}
+}
+
+func TestGeneratedInferenceRequestsPreserveNestedConfiguration(t *testing.T) {
+	for _, extraction := range []bool{false, true} {
+		t.Run(fmt.Sprint(extraction), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+				assert.NotContains(t, body, "model")
+				assert.Equal(t, "registered", body["generator"].(map[string]any)["model"])
+				assert.Equal(t, "verdict_only", body["probabilities"])
+				w.Header().Set("Content-Type", "application/json")
+				if extraction {
+					assert.Equal(t, "/ai/v1/extract", r.URL.Path)
+					assert.Equal(t, "generated", body["method"])
+					_, _ = io.WriteString(w, `{"object":"extraction","model":"registered","data":[]}`)
+				} else {
+					assert.Equal(t, "/ai/v1/decisions", r.URL.Path)
+					assert.Equal(t, "generated", body["decision_method"])
+					_, _ = io.WriteString(w, `{"model":"registered","answers":[],"usage":{"input_tokens":0,"output_tokens":0}}`)
+				}
+			}))
+			defer server.Close()
+			client, err := NewInferenceClient(server.URL, nil)
+			require.NoError(t, err)
+			if extraction {
+				var request oapi.GeneratedExtractionRequest
+				require.NoError(t, json.Unmarshal([]byte(`{"method":"generated","generator":{"provider":"antfly","model":"registered"},"probabilities":"verdict_only","inputs":[{"content":"source"}],"schema":{"entities":["person"]}}`), &request))
+				_, err = client.ExtractGenerated(context.Background(), request)
+			} else {
+				var request oapi.GeneratedDecideRequest
+				require.NoError(t, json.Unmarshal([]byte(`{"decision_method":"generated","generator":{"provider":"antfly","model":"registered"},"probabilities":"verdict_only","input":"source","questions":[{"name":"answer","type":"predicate","instructions":"Is it present?"}]}`), &request))
+				_, err = client.DecideGenerated(context.Background(), request)
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestInferenceDecidePreservesTextAndMultimodalEvidence(t *testing.T) {
+	for _, input := range []string{
+		`"Inspect this item"`,
+		`[{"role":"user","content":[{"type":"input_text","text":"Inspect"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo=","detail":"auto"}]}]`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/ai/v1/decisions", r.URL.Path)
+				var request struct {
+					Input json.RawMessage `json:"input"`
+				}
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+				assert.JSONEq(t, input, string(request.Input))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"model":"vision","answers":[],"usage":{"input_tokens":2,"output_tokens":0}}`)
+			}))
+			defer server.Close()
+			client, err := NewInferenceClient(server.URL, nil)
+			require.NoError(t, err)
+			var evidence oapi.DecisionEvidence
+			require.NoError(t, json.Unmarshal([]byte(input), &evidence))
+			_, err = client.Decide(context.Background(), oapi.InferenceDecideRequest{Model: "deciders/visual", Input: evidence})
+			require.NoError(t, err)
+		})
+	}
+}

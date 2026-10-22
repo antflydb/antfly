@@ -40,12 +40,10 @@ recovery protocol is introduced.
 
 ## Non-Goals
 
-- No review queue or curation UI. The REVIEW decision band exists in the
-  scoring model, and a curator can record an override through the resolution
-  API (see "Sync and visibility contract"), but a queue / UI / label-capture
-  surface on top of that is not built.
-- No learned (model-backed) resolver. The deterministic scorer ships first and
-  doubles as the label factory for a future learned one.
+- No curation UI. Bounded review resources expose REVIEW mentions and accept
+  durable curator decisions; applications supply their own workflow.
+- No learned scorer weights. Optional model adjudication of REVIEW uses a frozen
+  typed-decision policy; the deterministic matcher and its weights remain explicit.
 - No two-phase-commit coupling of entity writes and edge writes. Entity and
   edge writes are decoupled and fail closed on hydration (see "Cross-Shard
   Placement").
@@ -200,8 +198,8 @@ to the `else` level.
 ### 3. Decision
 
 `probability >= match` -> MATCH (link to best candidate).
-`probability >= review` -> REVIEW (recorded for curator override; produces no
-durable canonical link until a curator resolves it).
+`probability >= review` -> REVIEW (eligible for configured model adjudication or
+curator override; produces no durable canonical link while it remains REVIEW).
 otherwise -> NO_MATCH (mint a new entity).
 
 `Scorer.explain()` returns the matched level per comparison, which is both the
@@ -218,6 +216,160 @@ blocking already cuts candidates to ~k, so the model would only score
 mention x k. The hard part is labels: the deterministic resolver already
 bootstraps high-confidence matches/non-matches, which is the intended label
 source once human review is added on top.
+
+### Model adjudication of REVIEW (#1176)
+
+A resolver can attach a frozen `adjudicate` policy to its deterministic scorer.
+The matcher stays pure and nominates its best candidate. The managed resolution
+stage calls the ordinary decision asset producer through an injected executor.
+The same implementation serves embedded Lite, Directory, distributed resolution,
+and ephemeral query resolution. There is no second model/provider client.
+
+```json
+{
+  "name": "concepts",
+  "table": "concepts",
+  "source_artifact": "mentions",
+  "resolution_artifact": "resolved",
+  "key_template": "concept/{{ uslug _entity.text }}",
+  "candidate_search": "prefix",
+  "scorer": {
+    "comparisons": [{
+      "name": "name",
+      "left": "m.text",
+      "right": "c.canonical_name",
+      "levels": [
+        {"when": "exact", "weight": 8},
+        {"when": "jaro_winkler > 0.85", "weight": 1},
+        {"else": true, "weight": -8}
+      ]
+    }],
+    "combine": {"bias": 0},
+    "decision": {"match": 0.95, "review": 0.6}
+  },
+  "adjudicate": {
+    "decider": {"provider": "antfly", "model": "convaiinnovations/laya"},
+    "template": "A: {{m.text}} — {{m.description}}\nB: {{c.canonical_name}} — {{c.description}}",
+    "question": {
+      "type": "choice",
+      "name": "same",
+      "instructions": "Do these names and descriptions identify the same entity? Different products and different versions are different entities.",
+      "choices": [{"value": "same"}, {"value": "different"}]
+    },
+    "accept": {"choice": "same", "min_probability": 0.9},
+    "reject": {"choice": "different", "min_probability": 0.9},
+    "on_failure": "review",
+    "max_pairs": 32,
+    "max_input_bytes": 16384,
+    "timeout_ms": 10000,
+    "budget_ms": 10000
+  }
+}
+```
+
+This is a resolver declaration nested in a graph config, not a complete graph
+index request. ANN blocking still requires the normal candidate index and mention
+embedding configuration. The model name is an example, not an identity-precision
+qualification. Measure false merges and abstention on your own held-out pairs.
+Neither cosine similarity nor a typed model's confidence is a measured precision
+guarantee. `embedding_similarity` cannot satisfy this probability-based policy.
+
+**Selection and outcomes.** The resolver retains its best deterministic candidate
+policy. Equal scores use table/key order, independent of provider enumeration.
+MATCH and NO_MATCH do not call the model. Only the best scored REVIEW pair is
+judged, at most once per mention in a source execution. A REVIEW caused by an
+unavailable redirect survivor cannot be repaired by model judgment. Type/label
+admission, explicit aliases, durable merges and curator overrides retain priority;
+curated mentions do not incur adjudication calls.
+
+An accepted choice links through the same validated survivor and canonical fields
+as MATCH. A confident configured rejection produces `new`. A response below both
+thresholds abstains and stays REVIEW. Without `reject`, every non-accepted answer
+stays REVIEW. Failure and exhausted budgets default to REVIEW; `on_failure: mint`
+explicitly opts into a new identity on those outcomes. Cancellation and ownership
+errors propagate without publishing a fallback. REVIEW has a provisional key but
+is withheld from promotion; `listPendingReviews` provides the existing internal
+listing, not a public paginated review service.
+
+**Authoritative evidence.** Each judged entity carries `adjudication` alongside its
+final decision. Evidence records the policy hash, complete execution/source hash,
+input and candidate fingerprints, candidate endpoint, original deterministic
+probability, outcome/failure, and the normalized decision response (resolved model,
+full distribution, usage and producer provenance when supplied). The original
+resolution confidence remains the deterministic score; model probabilities are
+separate evidence. Frozen provider credentials are never included in evidence or
+public identity inspection. A provider's mutable model name is not an exact asset
+revision; use a pinned identity where the provider supports one.
+
+The receipt is outside `_resolution_work` and survives disabled retention, cache
+loss and portable backup. Recovery of the same source/execution reuses committed
+identity and evidence without candidate search, embedding, or model inference.
+The existing source transaction publishes the decision and downstream replay
+handoff atomically. A crash before publication may repeat inference; execution is
+not exactly-once. A committed failure is replay-stable too. Retry it by explicitly
+re-resolving, rather than relying on a later drain to flip identity.
+
+Policy changes participate in material config comparison, advance the effective
+resolver generation, and use ordinary bounded corpus backfill and inline graph
+replacement. A generation bump explicitly revisits committed evidence. Changed
+source extraction also creates a new execution. Destination edits affect future
+decisions; they do not silently revise committed model verdicts. Candidate/survivor
+identity fields and selected description assets are rechecked after model execution;
+concurrent changes return Busy for retry. Existing source/config/override read-set
+and ordered-publication checks fence stale publication. Databases using this policy
+require reader epoch 5; older readers must reject the database before parsing.
+
+**Description inputs.** Extraction mentions may supply `description` and a numeric
+`description_embedding`; candidate document fields supply the corresponding text
+and vector. The existing cosine comparator handles explicitly supplied description vectors.
+ANN hydration remains scoped to name vectors; it never substitutes a name vector
+for a missing description vector. Supply both description vectors in a compatible
+model space; description-vector generation is an upstream/application concern.
+Missing description comparisons should use a neutral `else` weight when the desired
+fallback is name-only. Templates interpolate `m.text`, `m.canonical_text`, `m.label`,
+`m.description`, `c.canonical_name`, `c.label`, and `c.description`; absent text
+renders empty. This interpolation language does not execute helpers or scripts.
+
+Optional `description_inputs` binds asset artifacts explicitly:
+
+```json
+{"description_inputs": {
+  "mention_artifact": "mention_descriptions",
+  "candidate_artifact": "concept_description"
+}}
+```
+
+Place this object inside `adjudicate`. The mention asset belongs to the source
+document and contains a JSON object such as `{"e0":"A search database"}`, keyed
+by extraction-local ids. It is supported for asset-scoped resolvers and cannot be
+the extraction or resolution stream itself. Its publication/deletion re-drives the
+owning extraction through the existing resolution journal, with its contents or
+absence included in the execution fingerprint. The candidate asset is a text
+asset on the canonical candidate document, such as a generator enrichment output.
+It is projected explicitly and rechecked after inference. Missing assets fall back
+to directly supplied description fields, then names. Candidate asset updates affect
+future decisions; bump the resolver generation to revisit earlier decisions.
+
+Resolution never waits for a description producer or its own future entity's
+promotion. Mention context must already be available; candidate descriptions may
+come from previously promoted entities. This avoids a promotion/description
+readiness cycle. No automatic retrospective candidate-dependency scan is introduced.
+
+**Bounded execution and queries.** `max_pairs` bounds model invocations per source,
+`max_input_bytes` bounds rendered text, `timeout_ms` bounds an individual call, and
+`budget_ms` bounds the source's total model-time allowance. Calls use the shared
+decision executor's token, memory, rate, and provider capability limits. Query
+resolution applies the same policy against an ephemeral store and returns evidence
+without writing artifacts, promoting entities or recording curator overrides. Its
+model costs are bounded by the resolver policy too.
+
+This extension resolves mentions; it does not infer a global merge of established
+keys, reconsider every old mention after a new description, or merge a transitive
+component of positive model pairs. Use the existing explicit key-merge API or an
+explicit corpus re-resolution for those operations. A rejected homonym still uses
+the configured key template: identical rendered keys are not disambiguated by a
+pairwise model rejection. Multi-candidate arbitration remains a separate extension; the curation
+resources below expose unresolved REVIEW mentions.
 
 ### Why not a general scripting language
 
@@ -711,8 +863,9 @@ To merge an existing key after ingestion, call
 or Python `db.merge_resolver_keys(resolver, old, new)`, or Go
 `db.MergeResolverKeysJSON(resolver, requestJSON)`. This atomically persists the
 redirect and its corpus-backfill cursor, bumps the resolver generation, and
-returns before replay. Repeat requests are idempotent; replacing an existing
-redirect is rejected (merge its canonical target instead). `run_until_idle`
+returns before replay. Repeat requests are idempotent; re-pointing an existing
+redirect requires `replace:true`. Optional `pin_distinct:true` pins the former
+target apart from the corrected identity. `run_until_idle`
 then re-resolves stored extraction artifacts and replaces their mention and
 relation edge contributions. It retains unrelated graph contributors. Reopen
 resumes pending backfill from the durable catalog/cursor. Concurrent rendering
@@ -726,8 +879,8 @@ application references outside resolution artifacts need their own migration.
 Human-curated per-document overrides keep their existing precedence. Source
 artifacts must still exist for replay. Treat a template/helper change as an
 identity migration; aliases preserve old query seeds while replay converges.
-Reapplying an old inline resolver config can replace its alias list, so keep
-migration aliases in the application configuration too.
+Explicit unmerges mask an inline alias across configuration replay; update
+declarative aliases when deliberately migrating the namespace.
 
 ## Embedding merge recipe and ordering
 
@@ -876,8 +1029,8 @@ Callers can keep reapplying declarative index configs on open without reading
 curated merges first. Replaying an identical native index config on an existing
 index is idempotent, including after close/reopen; a different physical config
 is rejected. Durable merges take precedence over an inline redirect of
-the same source. Removing a resolver deliberately removes its associated merge
-state; merely replacing its configuration does not. Splits and portable backups copy both catalogs. Memory/file restore and live
+the same source. Retiring a resolver retains its associated identity state; explicit identity
+deletion is allowed only after every declaring index has retired it. Splits and portable backups copy both catalogs. Memory/file restore and live
 import validate and preserve durable merge state. Once merges exist, changes to
 `table` or `key_template` are rejected with a namespace diagnostic; callers must
 explicitly reset or migrate the identities before changing their namespace
@@ -901,7 +1054,8 @@ The namespace request contains `table`, `key_template`, and exactly one of:
   namespace; omitting it leaves no inline aliases. This is also the explicit
   way to change aliases after a namespace fence has been installed.
 - `key_map:[{"key":"concept/old","target":"topic/old"}, ...]`: map every
-  stored inline/durable alias source and target into the new namespace. Incomplete
+  stored inline/durable alias source and target, suppression key, unmerge mask
+  and distinct-pair endpoint into the new namespace. Incomplete
   maps, empty keys, duplicate sources, resulting duplicate aliases and cycles
   fail before mutation. Existing merges are transformed, preserving identity
   relationships rather than deleting the resolver.
@@ -1411,3 +1565,356 @@ Internal predecessor contracts remain retired so replay can recognize old
 resolution artifacts without executing the old resolver. They do not appear in
 public resolver or identity listings. Databases containing staged contracts
 require resolver reader version 3; older readers reject them before parsing.
+
+
+## Resolver curation resources
+
+Resolver curation is table-owned durable policy, independent of the graph indexes
+that declare execution. Unmerge removes only the selected *direct* redirect:
+`A → B → C`, followed by unmerge of `B`, leaves `A → B`. Unmerge of a missing
+redirect is a no-op. Re-point uses `replace:true`; it preserves the former
+survivor rather than turning that survivor into another redirect. Optional
+`pin_distinct:true` on unmerge or re-point forbids rejoining the separated
+components through another alias, candidate, or model adjudication. Redirect
+admission validates the entire graph before publication.
+
+An explicit unmerge also records restoration of the original rendered identity.
+Replay bypasses fuzzy matching and an old promotion tombstone for that identity,
+restores its canonical document, and replaces the source's mention/relation
+contributions. Other graph producers and other source tables keep their
+contributions. A subsequent explicit merge can redirect the restored identity.
+
+Declarative resolver configuration accepts:
+
+```json
+"suppress": {
+  "keys": ["concept/note", "concept/content"],
+  "texts": ["Note", "Content"],
+  "min_text_chars": 3
+}
+```
+
+Runtime additions/removals live separately from the declarative configuration.
+Text comparison uses the resolver's Unicode slug normalization; minimum length
+counts Unicode scalars after trimming ASCII whitespace. Text/length checks run
+before key rendering, embedding, candidate lookup, and adjudication. Rendered-key
+suppression runs before candidate lookup or minting. The resolution retains an
+explainable `decision:"suppressed"` and `suppression_reason`, but creates no
+canonical edge or entity. Suppressed existing mentions remove their former
+resolver-owned edge contributions on replay. Existing promoted originals receive
+a scoped `resolver_suppressed_by` marker; suppression never creates a document
+solely to hold that marker. Unsuppress removes runtime rules and replays under
+the remaining declarative policy. Suppressed keys cannot be redirect targets.
+
+Promotion records alias contributions by source resolver, rendered identity and
+spelling. Re-point/unmerge/suppression detach that contribution using conditional
+writes in the same atomic entity batch. Concurrent contributions survive; older
+curation intents cannot overwrite a newer correction. Aliases that predate
+ownership tracking remain conservative: un-attributable legacy aliases are
+preserved, while aliases introduced by a tracked correction can be removed.
+Destination reads are deduplicated and run with at most 16 concurrent lookups.
+They fence both content and absence; conflicts retry ordinary replay rather than
+advancing the source receipt with a partial promotion.
+
+The HTTP surface uses the following table resources. Every route also exists at
+`/databases/{database}/namespaces/{namespace}/tables/{table}/...`.
+
+| Resource under `/tables/{table}` | Operations |
+| --- | --- |
+| `/resolvers` | GET active and retired identities |
+| `/resolvers/{resolver}` | GET configuration, curation revision and replay progress; DELETE a retired identity |
+| `/resolvers/{resolver}:render` | POST a mention to preview its minted/canonical key and suppression |
+| `/resolvers/{resolver}:resolve` | POST text or extraction for ephemeral resolution through the serving policy |
+| `/resolvers/{resolver}:namespace` | POST an explicit namespace mapping/reset |
+| `/resolvers/{resolver}/redirects` | GET direct redirects and distinct pins; POST `{from,to,replace?,pin_distinct?}` |
+| `/resolvers/{resolver}/redirects/{key}` | DELETE a direct redirect; optional `?pin_distinct=true` |
+| `/resolvers/{resolver}/suppressions` | GET configured/runtime rules; POST `{keys,texts}` or atomic `{add,remove}` selections |
+| `/resolvers/{resolver}/suppressions/{key}` | DELETE runtime key suppression |
+| `/resolvers/{resolver}/reviews` | GET a bounded page; `cursor` and `limit` (1–256) |
+| `/resolvers/{resolver}/reviews/{id}` | POST `{decision:"match"|"new"|"suppressed",key?,table?}` |
+| `/entities/{key}/redirects` | GET resolver state targeting an entity table/key |
+| `/entities/{key}:merge` | POST `{into,replace?,pin_distinct?}` across matching resolver namespaces |
+| `/entities/{key}:unmerge`, `:suppress`, `:unsuppress` | POST corrections across those namespaces |
+
+Keys and review IDs are single URL-encoded path components. Review IDs bind the
+source key, mention ID and exact resolution artifact hash; a stale decision
+returns Conflict. Review operations use the owner's raw-artifact policy gate:
+tables with active row security fail closed until review paging supports bound
+row-policy evaluation. Review pages use keyset cursors, visit at most 256 storage keys
+per owner request, and never load the entire corpus. Empty pages can carry a
+continuation cursor. Decisions atomically append the override and ordinary
+source replay record. A curator's suppressed/rejected decision persists through
+replay and has `suppression_reason:"curator"`. A per-mention rejection removes
+that mention's graph contribution and preserves existing canonical aliases,
+which can still be used by other mentions; global key/text suppression owns
+destination alias cleanup and scoped retirement.
+
+Per-resolver policy mutations publish through the source table's authoritative
+metadata CAS until namespace adoption. Entity corrections publish through one
+destination-table CAS; source projections enqueue ordinary resolver backfill.
+Entity writes require destination write permission, and entity-state GET requires
+destination read permission. Background propagation uses internal metadata
+authority and does not delegate source-table authorization to the caller.
+Native Lite curation retains per-resolver atomicity.
+Entity inspection returns redirects, key suppressions, distinct pins and
+unmerged keys for the requested redirect component; text suppressions and
+unrelated keys remain available only through the source resolver resources.
+HTTP and embedded entity inspection share this projection.
+Serving `:resolve` preflights read permission on its destination and executed
+sibling destinations using the admitted credential, including API-key scopes.
+Redirect survivor tables bind through the same authorization boundary. Candidate
+lookups, prefix scans, ANN searches and description assets apply the destination
+row predicate before projecting results; projected assets never authorize a read
+using a separate primary-document snapshot. Background replay continues to use
+its own stored destination grants.
+
+Review receipts retain the curator's selected identity. Replay follows its
+current redirect chain when emitting graph and promotion endpoints, so a later
+merge moves reviewed links and unmerge restores them. Resolver redirects never
+rewrite an override in a different entity table. Go revision-fence request fields
+preserve presence explicitly: `nil` omits the guard; a pointer to zero fences the
+first edit just as `expected_revision:0` does on the wire.
+Retired identities accept and retain policy without running resolution or
+promotion. Remote replay progress remains pending until an index declares
+execution again; waiting never reactivates a retired identity.
+Durable deletion markers prevent offline owners from resurrecting dropped
+identities; native backup carries both policy and consumed deletion fences.
+
+A mutation returns the accepted revision and replay sequence immediately (HTTP
+202 while pending). `replay_sequence_kind` distinguishes a resolver revision
+from a source-journal review decision. `wait:{timeout_ms:...}` bounds observation
+of detached replay; a timeout leaves the accepted mutation intact. The remaining
+observation budget bounds metadata reads and remote owner RPC timeouts. Before
+admission, cancellation and deadlines reject the request normally. After acceptance,
+an unavailable progress read (including deletion, cancellation or deadline expiry)
+returns HTTP 202 with the accepted commit receipt, `applied:false`, and
+`progress.observation_error`. Observation failures never retry the mutation.
+Resolver GET
+reports per-group revision, freshness, durable backfill and resolution/promotion
+watermarks. An idle watermark alone does not prove the new revision is applied.
+If cached/heartbeat status omits resolver diagnostics, lags an accepted revision,
+or has not reached an accepted review journal sequence,
+status obtains compact observations from the current mutation owners, with at
+most 16 concurrent shard requests. Probe selection and completion share the
+same revision and resolution/promotion sequence requirements, so an idle
+heartbeat below the accepted sequence cannot suppress a current-owner probe.
+Polling never drains replay on a request
+worker. A shard with no runtime completes only with a durable proof of no
+primary records and no derived replay sequence; absent observations alone never
+prove completion. Native `pending_work_stats` includes these per-resolver revisions under
+`resolver_curation`.
+Generation-aware input reads dispatch by physical artifact family. Extraction
+heads govern asset roots and units; chunk heads govern chunks. Resolution
+outputs retain physical reads and exact absence/value preconditions, including
+when ordered replay recomputes an existing result after a curator decision.
+Ordered publication notifies detached resolution and promotion workers after
+its journal and receipt commit, so the final publication progresses without a
+later primary write. Catalog effect capabilities come from the captured
+producer/resolver definitions (15 for receipts, 16 for grouped ownership),
+retaining any already-installed extension. They are independent of the durable
+reader floor: reviews require curation reader 6 and preserve higher floors,
+including when an accepted decision is retried at a new Raft position.
+Busy is HTTP 429 with `Retry-After`; capacity and metadata unavailability are
+explicit retry states. Curation needs table-write authorization; namespace
+migration additionally requires administrative route admission and authority to
+write the destination before grants are resealed.
+
+Namespace migration remaps all key-valued negative policy too. Incomplete maps
+fail before publication. `reset_merges:true` requires `reset_curation:true` when
+key-valued curation exists; text suppression and minimum length remain meaningful
+and are preserved. Runtime curation, including namespace migration of negative policy, requires
+minimum reader epoch 6. Ordinary configurations without these features retain their
+existing reader requirement.
+
+C exposes `antfly_db_unmerge_resolver_key_json`,
+`antfly_db_suppress_resolver_keys_json` (atomic add/remove selections),
+`antfly_db_unsuppress_resolver_key_json`, `antfly_db_resolver_curation_json`,
+`antfly_db_resolver_reviews_json`, `antfly_db_curate_entity_json` and the named
+`antfly_db_entity_{merge,unmerge,suppress,unsuppress,redirects}_json` calls alongside the
+existing render/resolve/list/drop/namespace family. Native entity requests carry
+`action:"redirects"|"merge"|"unmerge"|"suppress"|"unsuppress"` and optional
+`into`; review requests carry `operation:"reviews"|"review"` and `resolver`.
+Go, Rust, Python and Node embedded bindings expose these JSON operations. Remote
+Go, TypeScript, Python and Rust clients share the generated public schemas and
+namespaced operations; successful accepted replay is returned without automatic
+mutation retries.
+
+
+The server stores authoritative entity corrections on the destination table,
+keyed by the exact key template. A correction commits once across the matching
+namespaces (`atomicity: "namespace"`); the response lists asynchronous source replay
+progress. Adding a source resolver reads the current namespace in its metadata
+admission transaction, so its first document inherits existing corrections.
+
+A durable namespace-to-consumer index is maintained by table admission,
+replacement and removal. Metadata lifecycle rounds advance at most 16 dependent
+records per Raft transaction, atomically publishing source projections and the
+resume cursor. A bounded bootstrap rebuilds the index for legacy tables. Both
+the dependency index and pending work survive metadata snapshots and restarts.
+Destination deletion retires obsolete dependency rows in the same bounded
+metadata lifecycle. Adoption checks its catalog cut so concurrent source edits
+cannot disappear when legacy corrections move to the namespace.
+Resolution artifacts record `namespace_curation_generation`; stale cached work
+cannot cross that generation. Identical legacy runtime corrections are folded
+when the namespace is adopted, and conflicting redirect targets reject adoption
+with `ResolverNamespaceMigrationConflict`. Source projections are derived views;
+per-resolver runtime edits return `ResolverNamespaceCurationRequired` after
+adoption. Inline aliases remain source configuration, applied before shared
+namespace corrections. Lite retains its local resolver curation contract.
+
+Namespace projection is read-only; reverse dependency edges change only after
+table admission succeeds, in the same metadata transaction. Updates apply the edge
+set difference, so policy-only replay pages do not rewrite unchanged edges.
+Resolver resources read only their source definition and ranges. Source policy
+mutations additionally resolve and inspect their destination against the source
+metadata cut; logical catalog revisions and physical metadata cuts remain separate
+clocks. Entity requests read one destination and seek its declared-target consumer
+index; progress polling reads only the source table and its ranges. Consumer pages visit
+at most 16 edges and stop after a 1 MiB source-record budget (one record may be up
+to 8 MiB). Cursors bind the destination identity, entity key, and catalog revision.
+Declared-target edges retain qualified logical names independently of physical
+owner IDs, so destination recreation does not hide existing consumers. Legacy
+catalog discovery uses bounded table pages until the v2 bootstrap is durable.
+Each page owns a scratch arena that is released before the next read. Discovery
+retains only compact consumer identities and the folded namespace policy; GET
+does not retain observation identities. Legacy folds replace and free the prior
+aggregate. Mutations validate full consumer policies in a second pass over the
+same revision-fenced cut before CAS, so memory does not accumulate source schemas
+or unrelated index declarations across pages.
+Initial ownership is published even when a requested correction matches folded
+legacy policy. An entity merge matching an inline alias materializes a shared
+redirect for consumers that lack that local alias. Subsequent identical requests
+are idempotent once the authority and correction are durable.
+Every changed namespace fences its validated consumer cut, including local alias
+edits. Source policy edits racing ownership publication are rejected at apply
+with an exact no-commit receipt, instead of being overwritten by projection;
+ordinary definition edits and unchanged legacy policy still inherit authority. Incompatible alias cycles, distinct pins, and suppressed redirect targets
+are rejected before proposal and rechecked before any apply writes. A rejected
+namespace CAS retains one digest and exact Raft term/index per destination, allowing a certified
+retry without treating a committed outcome as retryable; acceptance or deletion
+clears it. Semantic rejection cannot stall metadata apply. Standalone and Raft preserve
+the same typed admission conflict through transport and return HTTP 409. A
+forwarded conflict is definitive only with an explicit non-admission outcome.
+
+Destination namespace records are private metadata and are excluded from index
+reconciliation and public table/index resources. Owner route discovery shares
+the caller's absolute deadline and cancellation token, including peer-cache
+refresh and periodic checkpoints through metadata routing scans.
+
+Curator REVIEW decisions use a private ordered data-Raft command. The artifact,
+configuration, policy bundle and prior override are checked at apply; override,
+outcome receipt, source replay and ordered marker commit together. Retrying an
+older decision cannot replace a newer override. Public batch JSON cannot submit
+this control. Native/Lite decisions use the same atomic batch and full HA
+mutation stream; HA payload versions 22/23 reject older decoders before apply.
+Metadata protocol 35, data batch protocol 24 and native reader 9
+fence the new state during upgrades.
+
+Native resolver owners retain the full candidate interface through a borrowed,
+layout-checked same-toolchain view (kernel owner ABI 81). Batch catalog bindings,
+bulk reads, generated adjudication, model revisions, descriptions, and caches
+survive the boundary. Batch leases and callback error identities retain their
+originating owner. Resolver review entry points dispatch through the storage
+engine rather than reading the control proxy's store.
+
+### Curation attribution and entity proposals
+
+Entity suppression accepts `absorbed: reject | release | suppress` (default
+`reject`). Release removes every transitive redirect into the selected target;
+`pin_distinct: true` also pins every released source against that target.
+Cascade suppression removes the same redirects and suppresses their source keys.
+The planner computes the component before changing any edge, then publishes one
+policy edit. Removed configured aliases stay masked. Unsuppression never restores
+a redirect or unsuppresses other keys implicitly.
+
+Curation writes accept UTF-8 `actor` (256 bytes) and `reason` (4096 bytes). The
+admission owner stamps origin, creation time and the committed policy revision; clients
+cannot supply a server origin through entity/redirect writes. Read projections attach
+provenance to redirects and distinct pairs. Runtime suppressions retain the compatible
+`keys`/`texts` sets and add attributed `entries`/`text_entries`. Cascades name their
+original target in `cascade_from`; review acceptance names its proposal in
+`proposal_id`. Attribution remains sparse when no origin was recorded; reading a policy
+never synthesizes per-key origins. Records may have zero creation time/revision;
+table-level proposals can also have revision zero until an individual policy edit is
+recorded. Mention-review provenance requires reader version 10; newly serialized
+curation state and queue receipts require reader version 11. Cluster metadata writers
+require coordinated decoder version 37 before publishing resolver policy or proposal
+queues, including queue-only and retired resolver metadata restored from backups.
+
+`/tables/{entity_table}/curation/proposals` is the entity-level review surface;
+it does not replace mention-level resolver reviews. Create a typed entity action
+(`merge`, `unmerge`, `suppress`, `unsuppress`, or `distinct`), inspect/list it, then
+accept or reject it. Both default and database/namespace-qualified routes are
+available. Accept uses the entity planner and returns its curation result. A
+merge rejection can atomically pin the proposed pair distinct. Accepted effects
+carry `origin: review`. Direct entity corrections supersede affected open
+proposals. Lite resolver-level edits settle the same destination queue through
+atomic source receipts. HTTP source-only edits are rejected with
+`ResolverNamespaceCurationRequired` once a namespace has entity proposals;
+clients use the entity resources so policy and queue changes share one CAS. The same
+ownership check runs inside the primary metadata transaction, so proposal
+creation racing a source write cannot bypass it. Ownership checks index only
+namespace templates and proposal keys, with one index per destination table.
+Terminal proposals retain their identity: repeated screening does not
+reopen a rejection, and repeated acceptance does not override a later correction.
+
+The stable ID hashes the action and length-framed JSON keys, excluding confidence,
+evidence and options. Distinct-pair IDs are symmetric. Listing uses ordered IDs for
+keyset pagination, with a default open-state filter and pages of 1–256 records. Evidence
+is bounded at 16 KiB, 4096 JSON values and depth 32; confidence must be finite and
+between zero and one. Each table queue has a 4096-record, 4 MiB budget. Admission
+reserves the maximum escaped decision attribution for every open proposal, so rejecting
+or superseding admitted work never runs out of queue space. The HTTP path also reserves
+this growth in both definitions of its bounded metadata CAS. Size checks use a counting
+writer with fixed scratch space. Interrupted Lite decisions have a separately bounded
+envelope sized for both copies of frozen attribution. Budget exhaustion is explicit; no
+existing decision is silently evicted. Queue records are metadata, never resolver
+declarations, and inference admission parses only execution policy, skipping proposal
+evidence and attribution history. Index configuration walkers share an opaque boundary
+for `_curation_proposals`, `_resolver_curation`, and `_resolver_namespaces`: enrichment
+and resolver discovery skip these subtrees without allocating producer state, and
+authorization sealing and namespace edits preserve their payloads verbatim as JSON
+values. Configuration-shaped evidence cannot install producers, require destination
+credentials, or be rewritten as a live resolver declaration.
+
+HTTP stores proposals alongside destination namespace authority. Accept/reject and their
+policy effects share one destination-table metadata CAS, including catalog retries and
+Raft replay. Queue-only edits leave resolver policy revisions unchanged and do not
+enqueue resolver work. Lite retains the existing per-resolver atomicity of entity
+actions: each accepted effect and its decision receipt share one catalog publication. A
+durable pending decision fences competing decisions and resolver namespace migrations,
+including same-table resets and migrations into its destination. It supports resuming a
+partial fanout after reopening. Namespace migration reconciles dirty supersessions
+before removing their source receipts; healthy migrations inspect only the old and new
+destination manifests. Every queue writer first reconciles a dirty manifest across all
+source namespaces, including unrelated entity and resolver edits. Recovery indexes open
+IDs once and releases each source catalog's scratch memory before reading the next
+source. Edits that do not affect proposals skip extra queue publications. `complete` set to false means the caller should retry the same decision. Effect options and attribution
+remain frozen, while revision fences and wait budgets belong to the current request. A
+newly created Lite queue receives a durable random identity. Source receipts are bound
+to that queue identity as well as the public proposal ID. Dropping and recreating a
+destination therefore cannot reuse its prior source receipts. Backups preserve the
+identity and reopen/retry preserves completed decisions. Persisted nonempty Lite queues
+require this identity; there is no migration path for unreleased unscoped queues.
+Inference ignores this receipt metadata.
+
+HTTP initial decisions and terminal retries return the same decision envelope,
+including the proposal, `changed`, `complete`, `applied`, and per-consumer results.
+HTTP terminal retries observe current authoritative namespace revisions using
+paged consumer discovery without replanning or republishing policy. A pending
+replay returns HTTP 202 and honors the retry's `wait` budget; a plain rejection
+has no replay and returns HTTP 200 with empty results. Lite uses the ordinary
+post-commit replay observer after releasing writer admission. Ordered/HA
+maintenance is rejected by the raw embedded queue path rather than bypassing
+ordered mutation admission.
+
+The C ABI and Rust embedded crate expose `propose_curation_json`,
+`list_curation_proposals_json`, `get_curation_proposal_json`, and
+`decide_curation_proposal_json`. Lite decisions include `accept: true | false`;
+HTTP uses the `:accept` and `:reject` resources. Public HTTP SDKs are generated from
+`specs/openapi/antfly/resolvers.yaml` and `metadata.yaml`.
+
+The HTTP convenience clients expose Go `ProposeCuration` / scoped variants,
+TypeScript `curationProposals` / `namespaceCurationProposals`, and Python
+`curation_proposals` with `in_namespace`. Entity suppression uses the typed
+`EntitySuppressRequest` in each SDK, including its absorbed-key disposition.

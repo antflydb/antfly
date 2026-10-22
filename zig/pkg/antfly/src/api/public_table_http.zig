@@ -171,6 +171,9 @@ pub const TableApi = struct {
         GraphMetricMaterializationRejected,
         GraphMetricQueryBudgetExceeded,
         QueryCandidateBudgetExceeded,
+        DecisionLimitExceeded,
+        ValueSearchRequiresScan,
+        ValueSearchLimitExceeded,
         RerankerCandidateLimitExceeded,
         GraphWorkBudgetExceeded,
         GraphMinWeightDomainViolation,
@@ -180,6 +183,7 @@ pub const TableApi = struct {
         GraphAnchorFilterRequiresIndex,
         GraphMatchOperationLimitExceeded,
         GraphQueryModeUnsupported,
+        GraphStartIdentityRequired,
         GraphExternalAliasDocumentFilterUnsupported,
         GraphExternalAliasSourceUnsupported,
         GraphReverseVariablePathUnsupported,
@@ -1387,6 +1391,10 @@ fn graphQueryUnsupportedBodyForDiagnostic(
 }
 
 fn graphQueryUnsupportedMessage(reason: []const u8) []const u8 {
+    if (std.mem.eql(u8, reason, "qualified_start_identity_required"))
+        return "incoming traversal on a cross-table resolver graph requires start.identities with an explicit table and key; bare keys name source-table documents";
+    if (std.mem.eql(u8, reason, "deduplicate_nodes_must_be_true"))
+        return "coordinator graph traversal requires deduplicate_nodes=true; use one traversal per seed with include_paths=true to retain seed provenance";
     if (std.mem.eql(u8, reason, "expand_strategy_not_supported"))
         return "expand_strategy is a legacy graph_searches result-merging control; remove it when using graph_queries and consume the named typed graph_results directly";
     if (std.mem.eql(u8, reason, "legacy_graph_searches_not_supported"))
@@ -1430,18 +1438,18 @@ fn canonicalGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUn
         if (fallback == null) fallback = .{ .operation = operation_name, .feature = mode };
         const params = value.get(mode) orelse continue;
         if (params != .object) continue;
-        if (jsonString(params.object, "direction")) |direction| {
-            if (!std.mem.eql(u8, direction, "out")) return .{
-                .operation = operation_name,
-                .feature = mode,
-                .reason = "direction_must_be_out",
-            };
-        }
         if (std.mem.eql(u8, mode, "traverse") and jsonBool(params.object, "deduplicate_nodes") == false) {
             return .{
                 .operation = operation_name,
                 .feature = mode,
                 .reason = "deduplicate_nodes_must_be_true",
+            };
+        }
+        if (jsonString(params.object, "direction")) |direction| {
+            if (!std.mem.eql(u8, direction, "out")) return .{
+                .operation = operation_name,
+                .feature = mode,
+                .reason = "direction_must_be_out",
             };
         }
         if (params.object.get("start")) |selector| {
@@ -1466,6 +1474,11 @@ fn legacyGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUnsup
         if (fallback == null) fallback = .{ .operation = operation_name, .feature = mode };
         if (value.get("params")) |params| {
             if (params == .object) {
+                if (jsonBool(params.object, "deduplicate_nodes") == false) return .{
+                    .operation = operation_name,
+                    .feature = mode,
+                    .reason = "deduplicate_nodes_must_be_true",
+                };
                 if (jsonString(params.object, "direction")) |direction| {
                     if (!std.mem.eql(u8, direction, "out")) return .{
                         .operation = operation_name,
@@ -1473,11 +1486,6 @@ fn legacyGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUnsup
                         .reason = "direction_must_be_out",
                     };
                 }
-                if (jsonBool(params.object, "deduplicate_nodes") == false) return .{
-                    .operation = operation_name,
-                    .feature = mode,
-                    .reason = "deduplicate_nodes_must_be_true",
-                };
             }
         }
         if (value.get("start_nodes")) |selector| {
@@ -1984,6 +1992,9 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table graph MATCH operation limit exceeded table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphMatchOperationLimitExceededBody(alloc, body), .json = true };
             },
+            error.GraphStartIdentityRequired => {
+                return .{ .status = 422, .body = try graphQueryCapabilityUnsupportedBody(alloc, body, "qualified_start_identity_required"), .json = true };
+            },
             error.GraphQueryModeUnsupported => {
                 std.log.warn("public table graph mode lacks exact public execution table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphQueryUnsupportedBody(alloc, body), .json = true };
@@ -2035,6 +2046,9 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
                 return try queryDependencyErrorOwnedResponse(alloc, 502, "query_embedding_upstream_failure", "query embedding provider failed", false);
             },
+            error.ValueSearchRequiresScan => return try queryDependencyErrorOwnedResponse(alloc, 422, "value_verification_requires_scan", "no compatible indexed candidate plan; explicitly permit scans with execution.value_verification.allow_scan", false),
+            error.ValueSearchLimitExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "value_verification_limit_exceeded", "logical value search exceeded its verification budget", false),
+            error.DecisionLimitExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "decision_limit_exceeded", "decision evaluation budget exceeded", false),
             error.RerankRateLimited => {
                 return try queryDependencyErrorOwnedResponse(alloc, 429, "reranker_rate_limited", "reranker rate limited", true);
             },
@@ -4375,6 +4389,7 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.EmbedRateLimited, .status = 429, .body = "{\"code\":\"query_embedding_rate_limited\",\"error\":\"query_embedding_rate_limited\",\"message\":\"query embedding rate limited\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
         .{ .err = error.DistributedQueryUnavailable, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
+        .{ .err = error.DecisionLimitExceeded, .status = 422, .body = "{\"code\":\"decision_limit_exceeded\",\"error\":\"decision_limit_exceeded\",\"message\":\"decision evaluation budget exceeded\",\"retryable\":false}", .json = true },
         .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "{\"code\":\"query_embedding_upstream_failure\",\"error\":\"query_embedding_upstream_failure\",\"message\":\"query embedding provider failed\",\"retryable\":false}", .json = true },
         .{ .err = error.IndexRebuilding, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
         .{ .err = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
@@ -5191,6 +5206,13 @@ test "unsupported graph diagnostics identify the rejected operation feature" {
         message: ?[]const u8 = null,
     };
     const cases = [_]Case{
+        .{
+            .body = "{\"graph_queries\":{\"incoming\":{\"index\":\"g\",\"traverse\":{\"start\":{\"identities\":[{\"table\":\"entities\",\"key\":\"concept/a\"}]},\"direction\":\"in\",\"deduplicate_nodes\":false}}}}",
+            .operation = "incoming",
+            .feature = "traverse",
+            .reason = "deduplicate_nodes_must_be_true",
+            .message = "coordinator graph traversal requires deduplicate_nodes=true; use one traversal per seed with include_paths=true to retain seed provenance",
+        },
         .{
             .body = "{\"expand_strategy\":\"union\",\"graph_queries\":{}}",
             .operation = "$request",

@@ -98,13 +98,22 @@ export {
 export type {
   Chunk,
   ChunkConfig,
+  ChunkEmbeddingContext,
+  ChunkEmbeddingObject,
+  ChunkEmbeddingRequest,
+  ChunkEmbeddingResponse,
+  ChunkEmbeddingStreamEvent,
+  ChunkEmbeddingTarget,
   ChunkRequest,
   ChunkResponse,
+  ChunkSourceReference,
   ClassificationResult,
   Config as InferenceRuntimeConfig,
   ContentPart,
   ContentSecurityConfig,
   Credentials,
+  DecideRequest,
+  DecideResponse,
   EmbedInput,
   EmbedRequest,
   EmbedResponse,
@@ -116,6 +125,8 @@ export type {
   ExtractResponse,
   ExtractV2Request,
   GenerateChunk,
+  GeneratedDecideRequest,
+  GeneratedExtractRequest,
   GenerateRequest,
   GenerateResponse,
   ImageURL,
@@ -124,6 +135,7 @@ export type {
   InferenceConfig,
   InferenceError,
   Level,
+  MediaChunkPolicy,
   ModelsResponse,
   RequestOptions,
   RerankDocument,
@@ -515,6 +527,11 @@ export {
 import { Client } from "./sdk.js";
 export default Client;
 
+export type {
+  InferenceGatewayCatalog,
+  InferenceGatewayModel,
+  InferenceGatewayOperation,
+} from "./client.js";
 export { ChatGPTConnectionError } from "./client.js";
 export * from "./models.js";
 export type {

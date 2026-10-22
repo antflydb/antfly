@@ -71,6 +71,12 @@ jobs:
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
   zig:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     needs: approve
     if: contains(fromJSON(needs.approve.outputs.suites), 'zig') || contains(fromJSON(needs.approve.outputs.suites), 'full')
     uses: ./.github/workflows/zig-tests.yml
@@ -152,9 +158,29 @@ jobs:
       base_sha: ${{ needs.approve.outputs.base_sha }}
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
+  linux-release:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'linux-release')
+    uses: ./.github/workflows/qualify-linux-release.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+  apple-video:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'apple-video')
+    uses: ./.github/workflows/zig-apple-video.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
   result:
     name: PR CI result
-    needs: [approve, policy, zig, sdks, proxy, operator, scale, gpu, vopr, darwin]
+    needs: [approve, policy, zig, sdks, proxy, operator, scale, gpu, vopr, darwin, linux-release, apple-video]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

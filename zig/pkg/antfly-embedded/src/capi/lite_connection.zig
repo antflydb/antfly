@@ -460,6 +460,8 @@ pub const Owner = struct {
     const MaintenanceKey = struct { table_id: u64, incarnation: u128 };
     const MaintenanceSchedule = struct {
         shadow_next: bool = true,
+        source_recovery_next: bool = true,
+        next_source_recovery_ns: i96 = 0,
         live: bool = true,
         ttl: h.db_mod.types.TTLCleanupStats = .{},
         last_ttl_error: ?anyerror = null,
@@ -673,6 +675,10 @@ pub const Owner = struct {
                 const stats = runtime.stats();
                 if (stats.applied_sequence < @max(target, stats.target_sequence)) return true;
             } else if (try state.loadAppliedSequence(alloc, database.core.store, "promotion") < target) return true;
+            // Catalog backfills also advance durable cursors without adding
+            // replay records. Inspect both keys in one committed view only
+            // after the cheap watermark checks have ruled out other debt.
+            if (try @import("../storage/db/resolution_runtime.zig").hasDurableReresolveBacklog(database.core.store)) return true;
         }
         return false;
     }
@@ -935,6 +941,27 @@ pub const Owner = struct {
         // TTL is a short publication for the selected table, never a drain of
         // every namespace under one file lease.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
+        // Legacy receipt recovery owns durable source-replay cursors even
+        // after every ordinary journal watermark is caught up. Advance one
+        // bounded control page on the live coordinator, where the connection
+        // and path fences already serialize journal/cursor publication. Never
+        // run providers or construct replacement generations under this gate.
+        if (self.options.open_mode == .writer and schedule.source_recovery_next and now >= schedule.next_source_recovery_ns) {
+            const recovered = try database.repairRecoverableStartupIndexFailures(alloc, 1, .{ .source_replay_only = true });
+            // A completed source cursor may still await an idle vector
+            // certificate. Keep detached maintenance eligible to publish it;
+            // source control itself never builds files under this fence.
+            if (recovered.remaining != 0) self.maintenance_pending = true;
+            if (recovered.attempted != 0 or recovered.repaired != 0) {
+                schedule.source_recovery_next = false;
+                self.notifyMutation();
+                return true;
+            }
+            // Paused/future work must not turn idle connections into a hot
+            // polling loop. The next selected namespace still audits it.
+            schedule.next_source_recovery_ns = now + std.time.ns_per_s;
+        }
+        schedule.source_recovery_next = true;
         var ttl_more = false;
         if (now >= schedule.next_ttl_ns) {
             // Each namespace owns its cleanup cadence. Failure still consumes

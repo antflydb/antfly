@@ -1,0 +1,454 @@
+openapi: 3.0.3
+info:
+  title: Resolver curation
+  version: v1alpha1
+components:
+  schemas:
+    ResolverWait:
+      type: object
+      additionalProperties: false
+      properties:
+        timeout_ms: {type: integer, format: uint32, minimum: 1, maximum: 300000, default: 1000}
+      description: Wait for observed replay completion up to this timeout. A timeout returns accepted state with applied=false; it does not undo the mutation.
+    CurationOrigin:
+      type: object
+      description: Server-owned provenance. Clients supply actor and reason on writes. Zero time/revision denote legacy records whose creation is unknown.
+      properties:
+        origin: {type: string, enum: [manual, adjudicator, review, cascade, config]}
+        actor: {type: string, maxLength: 256, description: "UTF-8 client attribution, limited to 256 bytes."}
+        reason: {type: string, maxLength: 4096, description: "UTF-8 explanation, limited to 4096 bytes."}
+        created_at_ms: {type: integer, format: uint64}
+        revision: {type: integer, format: uint64}
+        proposal_id: {type: string, nullable: true}
+        cascade_from: {type: string, nullable: true}
+    CurationSuppressionEntry:
+      type: object
+      required: [key, origin]
+      properties:
+        key: {type: string}
+        origin: {$ref: '#/components/schemas/CurationOrigin'}
+    RuntimeResolverSuppression:
+      type: object
+      properties:
+        keys: {type: array, items: {type: string}}
+        texts: {type: array, items: {type: string}}
+        min_text_chars: {type: integer, format: uint32}
+        entries: {type: array, items: {$ref: '#/components/schemas/CurationSuppressionEntry'}}
+        text_entries: {type: array, items: {$ref: '#/components/schemas/CurationSuppressionEntry'}}
+    EntitySuppressRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        absorbed: {type: string, enum: [reject, release, suppress], default: reject, description: "Reject absorbed keys, release all transitive redirect sources, or suppress them with cascade provenance. Unsuppress never restores redirects."}
+        pin_distinct: {type: boolean, default: false, description: "With absorbed=release, pin each released source distinct from the target."}
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+        expected_revision: {type: integer, format: uint64, x-go-type-skip-optional-pointer: false}
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    EntityDistinctRequest:
+      type: object
+      additionalProperties: false
+      required: [into]
+      properties:
+        expected_revision: {type: integer, format: uint64, x-go-type-skip-optional-pointer: false}
+        into: {type: string}
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    CurationProposalOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        replace: {type: boolean, default: false}
+        pin_distinct: {type: boolean, default: false}
+        absorbed: {type: string, enum: [reject, release, suppress], default: reject}
+    CurationProposalRequest:
+      type: object
+      additionalProperties: false
+      required: [action, key]
+      properties:
+        action: {type: string, enum: [merge, unmerge, suppress, unsuppress, distinct]}
+        key: {type: string, minLength: 1, maxLength: 16384}
+        into: {type: string, nullable: true}
+        options: {$ref: '#/components/schemas/CurationProposalOptions'}
+        confidence: {type: number, format: double, minimum: 0, maximum: 1, nullable: true, x-go-type-skip-optional-pointer: false}
+        evidence: {type: object, additionalProperties: true, nullable: true, description: "At most 16 KiB, 4096 values and depth 32."}
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+    CurationProposal:
+      type: object
+      required: [id, action, key, state, origin]
+      properties:
+        id: {type: string}
+        action: {type: string, enum: [merge, unmerge, suppress, unsuppress, distinct]}
+        key: {type: string}
+        into: {type: string, nullable: true}
+        options: {$ref: '#/components/schemas/CurationProposalOptions'}
+        confidence: {type: number, format: double, nullable: true, x-go-type-skip-optional-pointer: false}
+        evidence: {type: object, additionalProperties: true, nullable: true}
+        origin: {$ref: '#/components/schemas/CurationOrigin'}
+        state: {type: string, enum: [open, accepted, rejected, superseded]}
+        decided: {nullable: true, allOf: [{$ref: '#/components/schemas/CurationOrigin'}]}
+    CurationProposalDecisionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        options:
+          allOf: [{$ref: '#/components/schemas/CurationProposalOptions'}]
+          x-go-type-skip-optional-pointer: false
+        pin_distinct: {type: boolean, default: false, description: "On rejection of a merge, pin the proposed pair distinct in the same commit."}
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+        expected_revision: {type: integer, format: uint64, x-go-type-skip-optional-pointer: false}
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    CurationProposalPage:
+      type: object
+      required: [proposals]
+      properties:
+        proposals: {type: array, items: {$ref: '#/components/schemas/CurationProposal'}}
+        next_cursor: {type: string, nullable: true}
+    CurationProposalDecisionResult:
+      type: object
+      properties:
+        proposal: {$ref: '#/components/schemas/CurationProposal'}
+        complete: {type: boolean}
+        changed: {type: boolean}
+        atomicity: {type: string, enum: [namespace, resolver]}
+        applied: {type: boolean}
+        results: {type: array, items: {type: object, additionalProperties: true}}
+    ResolverRedirect:
+      type: object
+      required: [key, target]
+      properties:
+        key: {type: string}
+        target: {type: string}
+        origin: {$ref: '#/components/schemas/CurationOrigin'}
+    ResolverDistinctPair:
+      type: object
+      required: [from, to]
+      properties:
+        from: {type: string}
+        to: {type: string}
+        origin: {$ref: '#/components/schemas/CurationOrigin'}
+    ResolverSuppressionSelection:
+      type: object
+      additionalProperties: false
+      properties:
+        keys: {type: array, maxItems: 100000, items: {type: string, minLength: 1, maxLength: 16384}}
+        texts: {type: array, maxItems: 100000, items: {type: string, minLength: 1, maxLength: 16384}}
+    ResolverMergeRequest:
+      type: object
+      additionalProperties: false
+      required: [from, to]
+      properties:
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+        from: {type: string, minLength: 1, maxLength: 16384}
+        to: {type: string, minLength: 1, maxLength: 16384}
+        replace: {type: boolean, default: false}
+        pin_distinct: {type: boolean, default: false, description: "Pin the replaced former target distinct. Requires an existing different redirect and replace=true."}
+        expected_revision:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    ResolverUnmergeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+        pin_distinct: {type: boolean, default: false}
+        expected_revision:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    ResolverSuppressionRequest:
+      type: object
+      additionalProperties: false
+      description: Add keys or normalized texts. The add/remove form updates both sets in one revision. Runtime removals do not override declarative suppression.
+      properties:
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+        keys: {type: array, maxItems: 100000, items: {type: string, minLength: 1, maxLength: 16384}}
+        texts: {type: array, maxItems: 100000, items: {type: string, minLength: 1, maxLength: 16384}}
+        add: {$ref: '#/components/schemas/ResolverSuppressionSelection'}
+        remove: {$ref: '#/components/schemas/ResolverSuppressionSelection'}
+        expected_revision:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    ResolverCurationState:
+      type: object
+      properties:
+        version: {type: integer, enum: [1]}
+        suppress: {$ref: '#/components/schemas/RuntimeResolverSuppression'}
+        distinct: {type: array, items: {$ref: '#/components/schemas/ResolverDistinctPair'}}
+        removed_aliases: {type: array, items: {type: string}, description: "Explicitly restored identities; declarative aliases and promotion tombstones cannot recreate the removed redirect."}
+    ResolverReplayStage:
+      type: object
+      properties:
+        enabled: {type: boolean}
+        target_sequence: {type: integer, format: uint64}
+        applied_sequence: {type: integer, format: uint64}
+        catch_up_required: {type: boolean}
+        blocked: {type: boolean}
+        blocked_reason: {type: string}
+        error_count: {type: integer, format: uint64}
+    ResolverGroupProgress:
+      type: object
+      required: [group_id, available, fresh, curation_revision, config_generation, effective_generation, backfill_pending, resolution, promotion]
+      properties:
+        group_id: {type: integer, format: uint64}
+        available: {type: boolean}
+        fresh: {type: boolean}
+        curation_revision: {type: integer, format: uint64}
+        config_generation: {type: integer, format: uint64}
+        effective_generation: {type: integer, format: uint64}
+        backfill_pending: {type: boolean}
+        resolution: {$ref: '#/components/schemas/ResolverReplayStage'}
+        promotion: {$ref: '#/components/schemas/ResolverReplayStage'}
+    ResolverReplayProgress:
+      type: object
+      required: [applied, shards]
+      properties:
+        applied: {type: boolean}
+        shards: {type: array, items: {$ref: '#/components/schemas/ResolverGroupProgress'}}
+        observation_error:
+          type: string
+          description: Progress observation failure after acceptance; the metadata commit remains valid and applied is false.
+    ResolverSummary:
+      type: object
+      required: [name, source_table, entity_table, declaring_indexes, retired, revision, redirects, curation]
+      properties:
+        name: {type: string}
+        source_table: {type: string}
+        entity_table: {type: string}
+        key_template: {type: string}
+        declaring_indexes: {type: array, items: {type: string}}
+        retired: {type: boolean}
+        config:
+          nullable: true
+          allOf: [{$ref: 'indexes.yaml#/components/schemas/GraphResolverConfig'}]
+        revision: {type: integer, format: uint64}
+        namespace_generation: {type: integer, format: uint64}
+        redirects: {type: array, items: {$ref: '#/components/schemas/ResolverRedirect'}}
+        curation: {$ref: '#/components/schemas/ResolverCurationState'}
+        progress: {$ref: '#/components/schemas/ResolverReplayProgress'}
+    ResolverList:
+      type: object
+      required: [resolvers]
+      properties:
+        resolvers: {type: array, items: {$ref: '#/components/schemas/ResolverSummary'}}
+    ResolverRedirectList:
+      type: object
+      required: [redirects, distinct, revision]
+      properties:
+        redirects: {type: array, items: {$ref: '#/components/schemas/ResolverRedirect'}}
+        distinct: {type: array, items: {$ref: '#/components/schemas/ResolverDistinctPair'}}
+        revision: {type: integer, format: uint64}
+    ResolverSuppressionList:
+      type: object
+      required: [configured, runtime, revision]
+      properties:
+        configured: {$ref: 'indexes.yaml#/components/schemas/GraphResolverSuppressionConfig'}
+        runtime: {$ref: '#/components/schemas/RuntimeResolverSuppression'}
+        revision: {type: integer, format: uint64}
+    ResolverMutationResult:
+      type: object
+      required: [resolver, changed, revision, replay_sequence, replay_sequence_kind, applied]
+      properties:
+        resolver: {type: string}
+        changed: {type: boolean}
+        revision: {type: integer, format: uint64}
+        replay_sequence: {type: integer, format: uint64}
+        replay_sequence_kind: {type: string, enum: [resolver_revision, source_journal]}
+        metadata_commit: {type: object, nullable: true, additionalProperties: true}
+        applied: {type: boolean}
+        progress: {$ref: '#/components/schemas/ResolverReplayProgress'}
+    ResolverRenderRequest:
+      type: object
+      additionalProperties: false
+      required: [text, label]
+      properties:
+        text: {type: string}
+        label: {type: string}
+        local_id: {type: string, default: query}
+    ResolverRenderResponse:
+      type: object
+      required: [minted_key, key, table, config_generation, suppressed]
+      properties:
+        minted_key: {type: string}
+        key: {type: string}
+        table: {type: string}
+        config_generation: {type: integer, format: uint64}
+        suppressed: {type: boolean}
+    ResolverResolveRequest:
+      type: object
+      additionalProperties: false
+      description: Supply exactly one of text or extraction. Text uses this resolver's configured extractor. Resolution is ephemeral and uses the serving policy, candidate namespace and typed adjudicator without publishing artifacts or entities.
+      properties:
+        text: {type: string}
+        extraction: {type: object, additionalProperties: true}
+      minProperties: 1
+      maxProperties: 1
+    ResolverAdjudicationEvidence:
+      type: object
+      additionalProperties: true
+      properties:
+        execution_hash: {type: string}
+        specification_hash: {type: string}
+        input_hash: {type: string}
+        candidate_hash: {type: string}
+        candidate_table: {type: string}
+        candidate_key: {type: string}
+        deterministic_probability: {type: number, format: double}
+        status: {type: string, enum: [accepted, rejected, abstained, failed, budget_exhausted]}
+        response: {type: object, nullable: true, additionalProperties: true}
+        failure: {type: string, nullable: true}
+    ResolverResolvedEntity:
+      type: object
+      required: [local_id, doc_ref, confidence, decision]
+      properties:
+        local_id: {type: string}
+        doc_ref:
+          type: object
+          required: [table, key]
+          properties:
+            table: {type: string}
+            key: {type: string}
+            storage_table: {type: string}
+        confidence: {type: number, format: double}
+        decision: {type: string, enum: [new, match, review, suppressed]}
+        label: {type: string}
+        canonical_name: {type: string}
+        surface_form: {type: string}
+        rendered_key: {type: string}
+        redirected_from: {type: string}
+        suppressed: {type: boolean}
+        suppression_reason: {type: string, enum: [key, text, min_text_chars, curator]}
+        identity_restored: {type: boolean}
+        adjudication: {$ref: '#/components/schemas/ResolverAdjudicationEvidence'}
+    ResolverResolveResponse:
+      type: object
+      required: [extraction, resolution]
+      properties:
+        extraction: {type: object, additionalProperties: true}
+        resolution:
+          type: object
+          required: [config_generation, entities]
+          properties:
+            config_generation: {type: integer, format: uint64}
+            skipped_mentions: {type: integer, minimum: 0}
+            entities: {type: array, items: {$ref: '#/components/schemas/ResolverResolvedEntity'}}
+            _resolution_work: {type: object, additionalProperties: true}
+    ResolverReview:
+      type: object
+      required: [id, source_key, local_id, label, surface_form, key, confidence]
+      properties:
+        id: {type: string, description: "Opaque revision-bound review identity; treat it as a single URL-encoded path component."}
+        source_key: {type: string}
+        local_id: {type: string}
+        label: {type: string}
+        surface_form: {type: string}
+        key: {type: string}
+        table: {type: string}
+        confidence: {type: number, format: double}
+        config_generation: {type: integer, format: uint64}
+        adjudication: {$ref: '#/components/schemas/ResolverAdjudicationEvidence'}
+    ResolverReviewPage:
+      type: object
+      required: [reviews]
+      properties:
+        reviews: {type: array, items: {$ref: '#/components/schemas/ResolverReview'}}
+        next_cursor: {type: string, nullable: true}
+    ResolverReviewDecision:
+      type: object
+      additionalProperties: false
+      required: [decision]
+      properties:
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+        decision: {type: string, enum: [match, new, suppressed]}
+        key: {type: string}
+        table: {type: string}
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    ResolverNamespaceRequest:
+      type: object
+      additionalProperties: false
+      required: [table, key_template]
+      description: Explicit namespace migration. Choose reset_merges=true or a complete key_map. Runtime suppressions and distinct pins must be remapped too, or explicitly reset with reset_curation=true.
+      properties:
+        table: {type: string}
+        key_template: {type: string}
+        reset_merges: {type: boolean, default: false}
+        reset_curation: {type: boolean, default: false}
+        key_map: {type: array, items: {$ref: '#/components/schemas/ResolverRedirect'}}
+        aliases: {type: array, items: {$ref: '#/components/schemas/ResolverRedirect'}}
+        expected_revision:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    EntityMergeRequest:
+      type: object
+      additionalProperties: false
+      required: [into]
+      properties:
+        expected_revision: {type: integer, format: uint64, x-go-type-skip-optional-pointer: false}
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+        into: {type: string, minLength: 1}
+        replace: {type: boolean, default: false}
+        pin_distinct: {type: boolean, default: false}
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    EntityCurationResult:
+      type: object
+      required: [entity_table, key, complete, atomicity, results]
+      properties:
+        entity_table: {type: string}
+        key: {type: string}
+        complete: {type: boolean}
+        atomicity:
+          type: string
+          enum: [namespace, source_table, resolver]
+          description: Server entity corrections commit once on the destination table, atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
+        results:
+          type: array
+          items:
+            type: object
+            required: [source_table, resolver]
+            properties:
+              source_table: {type: string}
+              resolver: {type: string}
+              key_template: {type: string}
+              canonical_key: {type: string}
+              curation: {type: object, additionalProperties: true}
+              revision: {type: integer, format: uint64}
+              absorbed:
+                type: array
+                items:
+                  type: object
+                  required: [key, disposition]
+                  properties:
+                    key: {type: string}
+                    disposition: {type: string, enum: [release, suppress]}
+              changed: {type: boolean}
+              replay_sequence: {type: integer, format: uint64}
+              applied: {type: boolean}
+              retired: {type: boolean}
+              error: {type: string}
+              redirects: {type: array, items: {$ref: '#/components/schemas/ResolverRedirect'}}
+              distinct: {type: array, items: {$ref: '#/components/schemas/ResolverDistinctPair'}}
+              configured_suppressed: {type: boolean}
+              runtime_suppressed: {type: boolean}

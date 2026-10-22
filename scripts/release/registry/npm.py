@@ -27,13 +27,7 @@ from .model import RegistryError
 OpenURL = Callable[..., Any]
 
 
-def package_document(
-    package: str, opener: OpenURL = urllib.request.urlopen
-) -> dict[str, Any] | None:
-    if not package:
-        raise RegistryError("npm registry lookup requires a package")
-    encoded = urllib.parse.quote(package, safe="")
-    url = f"https://registry.npmjs.org/{encoded}"
+def _document(url: str, opener: OpenURL) -> dict[str, Any] | None:
     request = urllib.request.Request(
         url,
         headers={
@@ -55,17 +49,30 @@ def package_document(
     return document
 
 
+def package_document(
+    package: str, opener: OpenURL = urllib.request.urlopen
+) -> dict[str, Any] | None:
+    if not package:
+        raise RegistryError("npm registry lookup requires a package")
+    encoded = urllib.parse.quote(package, safe="")
+    return _document(f"https://registry.npmjs.org/{encoded}", opener)
+
+
 def dist_tag(
     package: str, tag: str, opener: OpenURL = urllib.request.urlopen
 ) -> str | None:
-    if not tag:
-        raise RegistryError("npm dist-tag lookup requires a tag")
-    document = package_document(package, opener)
-    if document is None:
+    if not package or not tag:
+        raise RegistryError("npm dist-tag lookup requires a package and tag")
+    # Full package metadata is CDN-cached for minutes after a successful publish.
+    # Use the same dedicated tag endpoint as npm dist-tag ls for fresh readback.
+    encoded = urllib.parse.quote(package, safe="")
+    tags = _document(
+        f"https://registry.npmjs.org/-/package/{encoded}/dist-tags", opener
+    )
+    if tags is None:
         return None
-    tags = document.get("dist-tags")
-    if not isinstance(tags, dict):
-        raise RegistryError("npm package metadata has no dist-tags object")
+    if any(not isinstance(value, str) or not value for value in tags.values()):
+        raise RegistryError("npm registry returned invalid dist-tags")
     version = tags.get(tag)
     if version is None:
         return None

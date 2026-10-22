@@ -15,6 +15,10 @@
 # limitations under the License.
 
 import math
+import io
+import sys
+from pathlib import Path
+from unittest import mock
 import copy
 import unittest
 
@@ -25,6 +29,49 @@ else:
 
 
 class ComparisonContracts(unittest.TestCase):
+    def test_post_declares_bounded_inference_budget_and_transport_timeout(self):
+        with mock.patch.object(
+            compare.urllib.request, "urlopen", return_value=io.BytesIO(b'{"ok":true}')
+        ) as opened:
+            self.assertEqual(
+                compare.post(
+                    "http://localhost", "/embed", {"input": ["x"]}, timeout=6.3278
+                ),
+                {"ok": True},
+            )
+        request = opened.call_args.args[0]
+        self.assertEqual(request.get_header("X-antfly-inference-timeout-ms"), "6327")
+        self.assertEqual(opened.call_args.kwargs["timeout"], 6.3278)
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+
+    def test_post_rejects_invalid_budget_before_network_io(self):
+        with mock.patch.object(compare.urllib.request, "urlopen") as opened:
+            for budget in (0, -1, math.inf, math.nan, 3600.001):
+                with self.subTest(budget=budget):
+                    with self.assertRaises(ValueError):
+                        compare.post("http://localhost", "/embed", {}, timeout=budget)
+            opened.assert_not_called()
+
+    def test_deadline_probe_rejects_unverified_worker_disconnect(self):
+        with mock.patch("sys.path", [str(Path(__file__).resolve().parent), *sys.path]):
+            import video_deadline_qualification as probe
+
+        self.assertEqual(
+            probe.restart_generation(
+                "inference worker stopped unexpectedly; restarting generation=2 delay_ms=100 term=.{ .exited = 86 }"
+            ),
+            2,
+        )
+        for text in (
+            "",
+            "restarting generation=2 exited = 86",
+            "inference worker stopped unexpectedly; restarting generation=2 exited = 1",
+            "inference worker stopped unexpectedly; restarting generation=1 exited = 86",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    probe.restart_generation(text)
+
     def test_case_selection_and_long_sample_controls(self):
         short = {"name": "short", "text": "x", "token_ids": [1] * 512}
         long = {"name": "long", "text": "x", "token_ids": [1] * 8192}
@@ -146,6 +193,78 @@ class ComparisonContracts(unittest.TestCase):
         for bad in bads:
             with self.assertRaises(ValueError):
                 compare.compare_reference(bad, expected)
+
+
+class CudaRouteTests(unittest.TestCase):
+    def test_qualification_requires_executed_routes(self):
+        routes = compare.cuda_routes(
+            "extended_flash_launches_total=3 extended_flash_launches_total=9 embedding_graph_replays_total=4 native_vision_launches_total=2 media_batches_total=1 fused_backbone_launches_total=96 packed_ple_groups_total=2 packed_head_launches_total=24 packed_gelu_launches_total=24 tuned_gemm_calls_total=100 vision_residual_launches_total=32 vision_graph_replays_total=2 spatial_pool_launches_total=4 short_cudnn_attention_launches_total=2 audio_constant_hits_total=12 patch_rows_written_total=3600"
+        )
+        self.assertEqual(routes["extended_flash"], 9)
+        with self.assertRaisesRegex(ValueError, "tuned_gemm"):
+            compare.require_cuda_routes(
+                compare.cuda_routes(
+                    "gemm_tuning_declines_total=9 cublaslt_matmuls_total=9"
+                ),
+                ["tuned_gemm"],
+            )
+        compare.require_cuda_routes(
+            routes,
+            [
+                "extended_flash",
+                "graph_replay",
+                "native_vision",
+                "media_batch",
+                "fused_backbone",
+                "packed_ple",
+                "packed_heads",
+                "packed_gelu",
+                "tuned_gemm",
+                "vision_residual",
+                "vision_graph",
+                "spatial_pool",
+                "short_attention",
+                "audio_constants",
+                "patch_into",
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "fused_vision"):
+            compare.require_cuda_routes(routes, ["fused_vision"])
+        self.assertEqual(
+            compare.cuda_routes("extended_flash_launches_total=9garbage")[
+                "extended_flash"
+            ],
+            0,
+        )
+
+
+class PrecisionTests(unittest.TestCase):
+    def test_bf16_reference_requires_declared_pooling(self):
+        result = {
+            "suite_sha256": "suite",
+            "checkpoint_receipt_sha256": "weights",
+            "precision": "bfloat16",
+            "status": "pass",
+            "cases": {},
+            "measurement_mode": "encoder",
+            "decision": {"status": "not_run"},
+        }
+        with self.assertRaisesRegex(ValueError, "F32 pooling"):
+            compare.compare_reference(result, result)
+        result["pooling_precision"] = "float32"
+        self.assertEqual(
+            compare.compare_reference(result, result)["decision_status"], "not_run"
+        )
+
+    def test_backend_precision_is_explicit_and_cannot_cross_recipes(self):
+        for backend in ("cuda", "torch-cuda"):
+            self.assertEqual(compare.execution_precision(backend), "bfloat16")
+            with self.assertRaises(ValueError):
+                compare.execution_precision(backend, "float32")
+        for backend in ("native", "metal", "cpu", "mps"):
+            self.assertEqual(compare.execution_precision(backend), "float32")
+            with self.assertRaises(ValueError):
+                compare.execution_precision(backend, "bfloat16")
 
 
 if __name__ == "__main__":

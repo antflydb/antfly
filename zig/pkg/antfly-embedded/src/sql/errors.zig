@@ -79,6 +79,13 @@ pub fn notNull(context: ?*Context, name: []const u8) anyerror {
     return error.SqlNotNullViolation;
 }
 
+/// Data/cardinality failures belong to their logical row. Speculative batch
+/// evaluation must replay its scalar prefix; resource and control errors abort.
+pub fn isRowEvaluationError(err: anyerror) bool {
+    const code = describe(err).code;
+    return std.mem.startsWith(u8, code, "22") or std.mem.startsWith(u8, code, "21") or err == error.SqlTypeMismatch;
+}
+
 pub fn describe(err: anyerror) Diagnostic {
     return switch (err) {
         error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => .{ .code = "22023", .message = "The read requirements or write receipt do not match this table generation.", .retryable = false },
@@ -166,6 +173,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SavepointLimitExceeded => .{ .code = "54000", .message = "The transaction savepoint limit was exceeded.", .hint = "Release earlier savepoints before creating more.", .retryable = false },
         error.ExternalLakeReadOnly => .{ .code = "25006", .message = "External lake tables are read-only.", .retryable = false },
         error.ExternalLakeSnapshotMismatch => .{ .code = "40001", .message = "The pinned external lake snapshot changed.", .retryable = true },
+        error.StandaloneLiteCatalogRequiresApi => .{ .code = "0A000", .message = "This Lite catalog is owned by standalone.", .hint = "Use antfly standalone and the /db/v1 API for catalog changes.", .retryable = false },
         error.UnsupportedSqlExecution, error.UnsupportedSqlShape => .{ .code = "0A000", .message = "This SQL statement or expression is not supported.", .hint = "Use a supported relational SELECT, INSERT, UPDATE, or DELETE statement." },
         error.SqlSchemaRewriteRequiresMetadataOwner => .{ .code = "0A000", .message = "This schema rewrite requires the metadata-owned SQL endpoint.", .hint = "Submit the DDL to the metadata API; no rewrite job was admitted on this data node.", .retryable = false },
         error.RowPolicyUnsupported, error.RowPolicyTopologyUnsupported => .{ .code = "0A000", .message = "Row policy publication is not supported for this table shape.", .hint = "Remove unsupported indexes or topology features before enabling the policy; no publication was started.", .retryable = false },
@@ -298,4 +306,9 @@ test "durable SQL destination credential rejection is forbidden, not internal" {
     try std.testing.expectEqual(@as(u16, 403), value.httpStatus());
     try std.testing.expectEqual(@as(?bool, false), value.retryable);
     try std.testing.expect(std.mem.indexOf(u8, value.message, "StoredDestinationAuthorizationRevoked") == null);
+}
+
+test "SQL row evaluation classification preserves resource and control failures" {
+    for ([_]anyerror{ error.SqlInvalidTextRepresentation, error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.SqlCardinalityViolation, error.SqlArraySubscriptError, error.SqlInvalidPowerArgument }) |err| try std.testing.expect(isRowEvaluationError(err));
+    for ([_]anyerror{ error.OutOfMemory, error.QueryCanceled, error.DeadlineExceeded, error.SqlProgramLimitExceeded, error.ArtifactIntegrityMismatch, error.InvalidSqlBackendResponse }) |err| try std.testing.expect(!isRowEvaluationError(err));
 }

@@ -6,6 +6,37 @@ info:
     Antfly inference is a local inference server for GGUF, safetensors, and ONNX models (ONNX graphs are
     parsed natively, without ONNX Runtime), running on CPU, Metal, or CUDA.
 
+    ## Named inference gateway
+
+    Database nodes also serve a gateway at `/ai/v1` independently of local model
+    availability. Select configured targets explicitly with canonical names such
+    as `generators/support`, `deciders/triage`, `embedders/dense`, and `readers/ocr`.
+    Bare names resolve within the endpoint task; a collision with a local model
+    fails explicitly. Use `local/owner/model` for an explicit local artifact or
+    `connections/name/models/owner/model` for an Antfly runtime connection.
+
+    Named targets cover generation and chains, typed decisions, embeddings,
+    reranking, chunking, OCR, extraction, rewriting, transcription, speech
+    synthesis and traditional ML. Existing task envelopes and feature schemas
+    are preserved. OpenAI-compatible chat adapters forward tool history,
+    supported structured output, usage and genuine incremental SSE.
+
+    Backend feature declarations in `inference_capabilities` are intersected
+    with adapter support. Unknown support cannot qualify a required feature.
+    Chains validate every candidate before execution, use at most eight total
+    attempts and share one deadline/cancellation chain. Fallback requires an
+    explicit condition on the failed link and is restricted to transient
+    upstream responses. Timeouts require `on_timeout`; refusals, invalid input,
+    authentication failures and committed responses never switch models.
+    Embedding and decision cross-model failover are disabled.
+
+    Session handles are credential-bound and pinned to a physical connection.
+    Multi-replica deployments must preserve gateway/proxy affinity using the
+    returned `X-Antfly-Inference-Affinity` handle. Unknown sessions fail closed.
+    Task capabilities are independent of catalog freshness and availability;
+    offline upstreams do not remove configured aliases. Request IDs and
+    per-attempt telemetry contain target identities and actual usage only.
+
     ## What is Antfly inference
 
     Antfly inference provides local ML inference with an OpenAI-compatible API:
@@ -147,9 +178,21 @@ paths:
                 $ref: '#/components/schemas/Error'
   /chunk:
     post:
-      summary: Chunk text into smaller segments
+      summary: Chunk content with optional model-aware embeddings
       description: |
-        Splits text into smaller chunks with the built-in fixed chunker.
+        Splits content into chunks. Without `embedding`, the fixed chunker and
+        legacy response remain unchanged. With `embedding`, the resolved target
+        model constrains boundaries for text, PDF pages, images or explicit tiles,
+        composited GIF frames, audio windows and consecutive video windows.
+
+        Each model-aware result pairs source coordinates and an optional vector
+        or error. `include_content` independently controls payload inclusion;
+        video uses the original source and sampling recipe. `execute: false`
+        plans without executing the embedding model. `stream: true` delivers
+        bounded NDJSON records followed by terminal coverage. A cap, gap or lost
+        terminal record must not be treated as complete source coverage.
+        Continuations bind the original source version and semantic plan;
+        retries may deterministically recompute and must deduplicate chunk IDs.
 
         ## Models
 
@@ -167,13 +210,27 @@ paths:
               $ref: '#/components/schemas/ChunkRequest'
       responses:
         '200':
-          description: Text chunked successfully
+          description: Content chunked with optional model-aware embeddings
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ChunkResponse'
+                $ref: '#/components/schemas/ChunkOperationResponse'
+            application/x-ndjson:
+              schema:
+                description: Newline-delimited events followed by a terminal coverage response; EOF alone is not completion.
+                oneOf:
+                  - $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingStartEvent'
+                  - $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingEvent'
+                  - $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingTerminalEvent'
+                  - $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingInitializationErrorEvent'
         '400':
           description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Source version, continuation plan or required model identity changed; replan against the intended generation.
           content:
             application/json:
               schema:
@@ -1112,7 +1169,7 @@ paths:
     post:
       operationId: decide
       summary: Answer named decision questions
-      description: Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
+      description: Execute text or multimodal evidence through named deciders, or an Antfly text batch. OpenAI and Jev adapters support images; native deciders require text. Embedding similarity supports choice and multi_choice;
         trained decision models support choice, score and predicate. Answer variants distinguish trained
         probabilities from raw cosine similarities.
       tags:
@@ -1122,7 +1179,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/DecideRequest'
+              $ref: '../ai/decision.yaml#/components/schemas/DecisionRequest'
       responses:
         '200':
           description: Named decision answers, diagnostics and aggregate token usage
@@ -1176,7 +1233,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '../ai/extraction.yaml#/components/schemas/ExtractionRequest'
+              $ref: '../ai/extraction.yaml#/components/schemas/ExtractionInputRequest'
       responses:
         '200':
           description: Extraction completed successfully
@@ -1228,6 +1285,82 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+  /models/instances:
+    get:
+      summary: List model instances
+      description: Inspect this inference server's shared model cache without loading models or extending idle eviction deadlines. Each incarnation appears once, even when it supports multiple tasks.
+      operationId: listModelInstances
+      tags: [Models]
+      responses:
+        '200':
+          description: Loaded and loading model instances
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInstanceList'
+    post:
+      summary: Load a model instance
+      description: Prepare the instance used by the requested task. Reuses an existing compatible instance. Normal idle eviction still applies; loading does not pin weights or guarantee device residency.
+      operationId: loadModelInstance
+      tags: [Models]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelInstanceLoadRequest'
+      responses:
+        '200':
+          description: Prepared model instance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInstance'
+        '400':
+          description: Invalid model or unsupported task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+  /models/instances/{instance_id}:
+    delete:
+      summary: Unload a model instance
+      description: Evict one exact incarnation from the shared server cache. A stale ID is an idempotent miss and never evicts a replacement. Loading, busy, and startup-managed instances cannot be unloaded.
+      operationId: unloadModelInstance
+      tags: [Models]
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Instance unloaded or already absent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInstanceUnloadResponse'
+        '400':
+          description: Malformed instance ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Instance is loading, has active owners, or is managed by startup configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /models:
     get:
       summary: List available models
@@ -1457,6 +1590,72 @@ components:
           schema:
             $ref: '#/components/schemas/TransientCapacityError'
   schemas:
+    ModelInstance:
+      type: object
+      description: One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private.
+      required: [id, model, tasks, state, active_handles, startup_managed, unloadable, residency_mode, idle_ms]
+      properties:
+        id:
+          type: string
+          description: Opaque incarnation identifier; changes after eviction and reload.
+        model:
+          type: string
+        tasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelKind'
+        state:
+          type: string
+          enum: [loading, loaded]
+        active_handles:
+          type: integer
+          format: int64
+          description: Internal owners or loading waiters preventing eviction. This is not a count of HTTP requests.
+        startup_managed:
+          type: boolean
+        unloadable:
+          type: boolean
+          description: Whether an unload would be permitted at snapshot time; concurrent use can change this.
+        unload_blocked_reason:
+          type: string
+          enum: [loading, in_use, startup_managed]
+        backend:
+          type: string
+          description: Selected execution backend, when known.
+        residency_mode:
+          type: string
+          enum: [backend_managed, streamed, resident]
+          description: Weight residency policy; loaded does not imply full device residency.
+        idle_ms:
+          type: integer
+          format: int64
+          description: Elapsed milliseconds since last use, not a wall-clock timestamp.
+    ModelInstanceList:
+      type: object
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelInstance'
+    ModelInstanceLoadRequest:
+      type: object
+      required: [model, task]
+      properties:
+        model:
+          type: string
+        task:
+          $ref: '#/components/schemas/ModelKind'
+    ModelInstanceUnloadResponse:
+      type: object
+      required: [outcome]
+      properties:
+        outcome:
+          type: string
+          enum: [unloaded, already_unloaded]
     Error:
       type: object
       required:
@@ -1588,6 +1787,10 @@ components:
       type: object
       required: [object, predictors]
       properties:
+        public_inference_enabled:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: Whether public inference execution is enabled on this deployment.
         object:
           type: string
           enum: [list]
@@ -1607,11 +1810,26 @@ components:
       $ref: '../shared/generating.yaml#/components/schemas/MediaContentPart'
     ContentPart:
       $ref: '../shared/generating.yaml#/components/schemas/ContentPart'
+    EmbeddingContentInput:
+      type: object
+      description: One ordered input producing one combined embedding. Supported by EmbeddingGemma 2. Text, image, and audio parts may be combined in order. On Linux CUDA, a group containing one video/mp4 media part produces one clip embedding using NVDEC; mixed video groups are unsupported. Video requires progressive SDR H.264 MP4, at most 60 seconds and 256 MiB, subject to narrower request limits. Sampling uses 1 FPS capped uniformly to 32 frames, with at most 140 visual tokens per frame. The expanded input, including task prompts, BOS/EOS, and media tokens, must fit within 8192 tokens. Overflow is rejected without truncation.
+      required: [content]
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          description: Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part.
+        content:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            $ref: '../shared/generating.yaml#/components/schemas/ContentPart'
     EmbeddingGroup:
       type: object
       additionalProperties: false
       required: [content]
-      description: EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens.
+      description: EmbeddingGemma 2 ordered text, image, audio and video parts producing one joint vector. CPU/Metal video accepts video/mp4, video/quicktime, video/webm or video/mp2t, using 1 FPS sampling, a uniform 32-frame cap and up to 140 soft tokens per frame. Linux CUDA video uses NVDEC and requires one standalone progressive SDR H.264 video/mp4 part, without a title or other parts, at most 60 seconds and 256 MiB subject to narrower request limits. The expanded sequence including all media soft tokens must fit 8192 tokens.
       properties:
         title:
           type: string
@@ -1643,8 +1861,11 @@ components:
             - a single string
             - an array of strings
             - an array of OpenAI-style content parts for multimodal embedding
-            - an array of ordered groups for EmbeddingGemma 2, one vector per group
-          oneOf:
+            - an object with an ordered content array, producing one embedding
+            - an array of ordered content objects, producing one embedding per object
+            Legacy arrays of content parts continue to produce one embedding per part.
+          # Keep legacy variants first so generated Go union helpers retain their names.
+          anyOf:
             - type: string
               description: Single text string
             - type: array
@@ -1658,9 +1879,14 @@ components:
             - type: array
               minItems: 1
               maxItems: 128
-              description: Ordered groups. Legacy flat content parts continue to produce one vector per part.
               items:
                 $ref: '#/components/schemas/EmbeddingGroup'
+            - $ref: '#/components/schemas/EmbeddingContentInput'
+            - type: array
+              minItems: 1
+              maxItems: 128
+              items:
+                $ref: '#/components/schemas/EmbeddingContentInput'
         encoding_format:
           type: string
           description: Encoding format for the embeddings (only "float" supported)
@@ -1669,16 +1895,18 @@ components:
             - float
         dimensions:
           type: integer
-          description: Optional truncation size for dense embeddings. EmbeddingGemma 2 supports 768, 512, 256, or 128 only. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
+          description: Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). EmbeddingGemma 2 is trained for 768, 512, 256, and 128 dimensions. Not supported for sparse models.
         task_type:
           type: string
-          description: "Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 uses the official prefix for each listed task, defaulting to RETRIEVAL_DOCUMENT. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction."
+          description: "Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 applies its official prompt for each of the eight task types to text-bearing inputs and rejects custom instructions. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction."
           enum:
             - RETRIEVAL_QUERY
             - RETRIEVAL_DOCUMENT
             - QUESTION_ANSWERING
             - FACT_VERIFICATION
+            - FACT_CHECKING
             - CODE_RETRIEVAL_QUERY
+            - CODE_RETRIEVAL
             - CLASSIFICATION
             - CLUSTERING
             - SEMANTIC_SIMILARITY
@@ -1717,6 +1945,10 @@ components:
         - model
         - usage
       properties:
+        backend:
+          type: string
+          nullable: true
+          description: Execution backend reported for EmbeddingGemma 2 qualification. CUDA requests fail if the resident text encoder cannot execute; this field does not describe preprocessing placement.
         model_identity:
           type: string
           description: EmbeddingGemma 2 SHA256 identity of actual weights, tokenizer, processor and recipe. Dimensions and retrieval roles must also match index configuration.
@@ -1845,6 +2077,20 @@ components:
       $ref: '../shared/chunking.yaml#/components/schemas/InferenceChunkConfig'
     ChunkRequest:
       $ref: '../shared/chunking.yaml#/components/schemas/InferenceChunkRequest'
+    ChunkEmbeddingTarget:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingTarget'
+    MediaChunkPolicy:
+      $ref: '../shared/chunking.yaml#/components/schemas/MediaChunkPolicy'
+    ChunkSourceReference:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkSourceReference'
+    ChunkEmbeddingContext:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingContext'
+    ChunkEmbeddingResponse:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingResponse'
+    ChunkOperationResponse:
+      oneOf:
+        - $ref: '#/components/schemas/ChunkResponse'
+        - $ref: '#/components/schemas/ChunkEmbeddingResponse'
     ChunkResponse:
       type: object
       required:
@@ -2514,6 +2760,9 @@ components:
           type: string
           description: Force specific language for transcription (optional, model-dependent)
           example: en
+        timestamps:
+          type: boolean
+          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
         diarization:
           type: boolean
           description: Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
@@ -2606,6 +2855,9 @@ components:
           type: string
           description: Force the transcript language (ISO 639-1). Omit for automatic detection.
           example: en
+        timestamps:
+          type: boolean
+          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
         cleanup_model:
           type: string
           description: Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
@@ -3046,6 +3298,31 @@ components:
       type: object
       description: Information about a model including its capabilities
       properties:
+        chunking_limits:
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+          description: |
+            Effective model-aware chunk operational ceilings for working/output/event
+            bytes, chunk/dependency/index counts and remote fetched bytes, requests
+            and cache bytes. Independent of model token limits and object length.
+            Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>.
+            Scoped and unscoped embedding discovery expose the same values.
+        inference_capabilities:
+          type: object
+          additionalProperties: true
+          description: Resolved executor/task facts; generation bits are false when the selected executor does not implement them.
+          properties:
+            version: { type: integer }
+            task: { type: string }
+            generation_grammar_v1: { type: boolean }
+            generation_token_logprobs_v1: { type: boolean }
+        model_revision:
+          type: string
+          minLength: 64
+          maxLength: 64
+          description: Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights.
         qualified_limits:
           type: object
           additionalProperties: true
@@ -3091,6 +3368,10 @@ components:
         - readers
         - transcribers
       properties:
+        public_inference_enabled:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
         object:
           type: string
           enum:
@@ -3307,6 +3588,16 @@ components:
           items:
             $ref: '#/components/schemas/ChatMessage'
           description: Conversation messages (OpenAI-compatible format)
+        logprobs:
+          type: boolean
+          default: false
+          description: Return actual token log-probabilities for non-streaming native grammar decoding. Incompatible routes reject the request.
+        top_logprobs:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 64
+          description: Bounded alternatives per decoded token; retained evidence also has a hard byte ceiling.
         max_tokens:
           type: integer
           minimum: 1
@@ -3547,7 +3838,11 @@ components:
             $ref: '#/components/schemas/GenerateChoice'
           description: List of completion choices (currently always 1)
         usage:
-          $ref: '#/components/schemas/GenerateUsage'
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          description: Provider-reported token usage, or null when the provider does not supply it.
+          allOf:
+            - $ref: '#/components/schemas/GenerateUsage'
         speculation:
           x-go-type-skip-optional-pointer: false
           nullable: true

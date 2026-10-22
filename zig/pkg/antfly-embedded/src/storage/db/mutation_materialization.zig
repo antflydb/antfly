@@ -6228,7 +6228,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => null,
                 }
             else
@@ -6877,7 +6877,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => null,
                 }
             else
@@ -7059,6 +7059,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .new => "new",
                 .match => "match",
                 .review => "review",
+                .suppressed => "suppressed",
             };
         }
 
@@ -8274,7 +8275,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !?[]u8 {
             if (request.source_template.len > 0) {
                 const rendered = renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => return null,
                 };
                 errdefer alloc.free(rendered);
@@ -8796,7 +8797,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => null,
                 }
             else
@@ -10126,6 +10127,32 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     cfg,
                 );
                 defer freeGraphWrites(alloc, mention_edge_writes);
+                if (source.mapping.source_template.len > 0) {
+                    const raw_doc = try storeDocumentValueForGraphSource(alloc, store, index_manager, parsed_key.doc_key, if (options.repair_ctx) |ctx| ctx.relational_base_rows else false);
+                    defer if (raw_doc) |value| alloc.free(value);
+                    var parsed_doc = if (raw_doc) |value| try std.json.parseFromSlice(std.json.Value, alloc, value, .{}) else null;
+                    defer if (parsed_doc) |*value| value.deinit();
+                    const doc_value: ?std.json.Value = if (parsed_doc) |value| value.value else null;
+                    const renderer = @import("graph_restore_materialization.zig").renderGraphArtifactTemplateAlloc;
+                    for (mention_edge_writes, 0..) |*write, item_index| {
+                        var item: std.json.ObjectMap = .empty;
+                        defer item.deinit(alloc);
+                        try item.put(alloc, "id", .{ .string = write.target });
+                        try item.put(alloc, "target", .{ .string = write.target });
+                        try item.put(alloc, "source", .{ .string = parsed_key.doc_key });
+                        const endpoint = try renderer(alloc, source.mapping.source_template, parsed_key.doc_key, doc_value, .{ .object = item }, item_index, source.artifact_name, "application/json", .null);
+                        errdefer alloc.free(endpoint);
+                        if (endpoint.len == 0) return error.InvalidGraphEdges;
+                        const edge_id = try renderer(alloc, source.mapping.edge_id_template, parsed_key.doc_key, doc_value, .{ .object = item }, item_index, source.artifact_name, "application/json", .null);
+                        errdefer alloc.free(edge_id);
+                        if (edge_id.len == 0) return error.InvalidGraphEdges;
+                        const owner = try alloc.dupe(u8, parsed_key.doc_key);
+                        alloc.free(write.source);
+                        write.source = endpoint;
+                        write.owner_document = owner;
+                        write.edge_id = edge_id;
+                    }
+                }
                 for (mention_edge_writes) |write| {
                     const key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
                     var key_owned = true;
@@ -10264,50 +10291,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             mention_edge_type: []const u8,
             cfg: *const index_manager_mod.ResolverConfig,
         ) ![]types.GraphEdgeWrite {
-            var parsed_resolution = resolver_lib.parseResolution(alloc, resolution_raw) catch return try alloc.alloc(types.GraphEdgeWrite, 0);
-            defer parsed_resolution.deinit();
-            var parsed_extraction: ?resolver_lib.ParsedEntities = if (extraction_raw) |raw|
-                resolver_lib.parseExtractionEntities(alloc, raw) catch null
-            else
-                null;
-            defer if (parsed_extraction) |*parsed| parsed.deinit();
-
-            var aggregates = std.ArrayListUnmanaged(MentionEdgeAggregate).empty;
-            defer {
-                for (aggregates.items) |*aggregate| aggregate.deinit(alloc);
-                aggregates.deinit(alloc);
-            }
-            for (parsed_resolution.entities) |entity| {
-                if (!resolutionDecisionCreatesCanonicalEdge(entity.decision)) continue;
-                if (entity.doc_ref.key.len == 0) continue;
-                const mention_confidence = if (parsed_extraction) |parsed|
-                    extractionConfidenceForLocalId(parsed.entities, entity.local_id) orelse entity.confidence
-                else
-                    entity.confidence;
-                const mention_artifact_key = try resolutionMentionArtifactKeyAlloc(alloc, doc_key, cfg.source_artifact, cfg.resolution_artifact, entity.local_id);
-                var mention_key_owned = true;
-                errdefer if (mention_key_owned) alloc.free(mention_artifact_key);
-                const aggregate = try findOrAppendMentionEdgeAggregate(alloc, &aggregates, entity.doc_ref.key, entity.doc_ref.table);
-                try aggregate.appendMentionArtifactKey(alloc, mention_artifact_key);
-                mention_key_owned = false;
-                aggregate.mention_confidence = @max(aggregate.mention_confidence, mention_confidence);
-            }
-
-            var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
-            errdefer freeGraphWrites(alloc, writes.items);
-            for (aggregates.items) |aggregate| {
-                const metadata = try mentionEdgeMetadataJsonAlloc(alloc, aggregate);
-                errdefer alloc.free(metadata);
-                try writes.append(alloc, .{
-                    .index_name = try alloc.dupe(u8, index_name),
-                    .source = try alloc.dupe(u8, doc_key),
-                    .target = try alloc.dupe(u8, aggregate.target),
-                    .edge_type = try alloc.dupe(u8, mention_edge_type),
-                    .weight = cfg.fusedMentionWeight(aggregate.mention_confidence),
-                    .metadata_json = metadata,
-                });
-            }
-            return try writes.toOwnedSlice(alloc);
+            return @import("graph_mention_projection.zig").writesAlloc(alloc, index_name, doc_key, resolution_raw, extraction_raw, mention_edge_type, cfg, true);
         }
 
         pub fn mentionEvidencePayloadAlloc(
@@ -11412,7 +11396,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !?[]template_mod.ContentPart {
             if (request.source_template.len == 0) return null;
             const parts = renderSourceTemplateParts(alloc, db, request.source_template, doc_value, max_media_parts) catch |err| switch (err) {
-                error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                 else => return null,
             };
             if (parts.len == 0) {
@@ -11518,7 +11502,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn resolutionDecisionCreatesCanonicalEdge(decision: resolver_lib.Decision) bool {
             return switch (decision) {
                 .new, .match => true,
-                .review => false,
+                .review, .suppressed => false,
             };
         }
 
@@ -12082,7 +12066,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             doc_key: []const u8,
             relational_base_rows: bool,
         ) !?[]u8 {
-            const internal_doc_key = if (relational_base_rows)
+            const internal_doc_key = if (relational_base_rows and !@import("group_source_identity.zig").isAnchor(doc_key))
                 try relational_store.keyAlloc(alloc, doc_key)
             else
                 try internal_keys.documentKeyAlloc(alloc, doc_key);
@@ -12334,7 +12318,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
                 if (entry.source_template.len > 0) {
                     const rendered = renderSourceTemplateText(S.ownerField(db, "alloc").*, db, entry.source_template, doc_value) catch |err| switch (err) {
-                        error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                        error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                         else => continue,
                     };
                     defer S.ownerField(db, "alloc").*.free(rendered);
@@ -12364,7 +12348,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
                 if (request.source_template.len > 0) {
                     const rendered = renderSourceTemplateText(alloc, db, request.source_template, (try document.logicalJson()).?) catch |err| switch (err) {
-                        error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                        error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                         else => continue,
                     };
                     defer alloc.free(rendered);

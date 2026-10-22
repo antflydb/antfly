@@ -79,6 +79,13 @@ const (
 	OperationRerank          OperationType = "rerank"
 	OperationRecognize       OperationType = "recognize"
 	OperationExtract         OperationType = "extract"
+	OperationRead            OperationType = "read"
+	OperationRewrite         OperationType = "rewrite"
+	OperationTranscribe      OperationType = "transcribe"
+	OperationDictate         OperationType = "dictate"
+	OperationSessions        OperationType = "transcription.sessions"
+	OperationSynthesize      OperationType = "synthesize"
+	OperationPredict         OperationType = "predict"
 	OperationDecide          OperationType = "decide"
 	OperationGenerate        OperationType = "generate"
 	OperationChatCompletions OperationType = "chat.completions"
@@ -92,6 +99,13 @@ var ValidOperationTypes = []OperationType{
 	OperationRerank,
 	OperationRecognize,
 	OperationExtract,
+	OperationRead,
+	OperationRewrite,
+	OperationTranscribe,
+	OperationDictate,
+	OperationSessions,
+	OperationSynthesize,
+	OperationPredict,
 	OperationDecide,
 	OperationGenerate,
 	OperationChatCompletions,

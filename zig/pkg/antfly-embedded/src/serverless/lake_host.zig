@@ -24,6 +24,8 @@ pub const OpenedObjectStore = stores.OpenedObjectStore;
 pub const SnapshotPin = struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void, deinit: *const fn (*anyopaque) void };
 
 pub const OpenOptions = struct {
+    /// Internal public identity epoch negotiated by the native publication.
+    row_identity_version: ?u8 = null,
     snapshot_pin_resolver: ?struct { ptr: *const anyopaque, acquire: *const fn (*const anyopaque, std.mem.Allocator, binding.Binding, []const u8, []const u8, catalog.types.Context) anyerror!?SnapshotPin } = null,
     file_bucket: []const u8 = "antfly",
     resolver: ?Resolver = null,

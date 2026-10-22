@@ -65,7 +65,8 @@ pub fn jsonMaterializedSource(batches: []const rowsource.ColumnBatch) !BatchSour
 pub fn validateLocalBatch(kind: rowsource.SourceKind, batch: rowsource.ColumnBatch) !void {
     if (kind != .relational_store and kind != .json_materialized) return error.InvalidLocalRowSource;
     try batch.validate();
-    for (batch.row_refs) |row_ref| {
+    for (0..batch.rowCount()) |row_index| {
+        const row_ref = batch.rowRef(row_index);
         switch (row_ref) {
             .relational_key => |key| {
                 if (key.len == 0) return error.InvalidLocalRowSource;

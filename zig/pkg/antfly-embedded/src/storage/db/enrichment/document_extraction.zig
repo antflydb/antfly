@@ -327,10 +327,10 @@ const Allocator = std.mem.Allocator;
 
 pub const pdf_runtime_available = builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !builtin.is_test and !build_options.bench_minimal_deps;
 
-pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) u64 {
+pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) !u64 {
     if (comptime builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !build_options.bench_minimal_deps) {
         if (remote_content) |remote| {
-            var snapshot = remote.acquire();
+            var snapshot = try remote.acquire();
             defer snapshot.deinit();
             if (snapshot.config.security) |security| {
                 if (security.max_download_size_bytes) |value| return value;
@@ -343,7 +343,7 @@ pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.Re
 pub fn inlineDataUriSourceTooLarge(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !bool {
     if (!scraping.data_uri.hasScheme(source_text)) return false;
     const decoded_len = scraping.dataUriDecodedSize(source_text) catch return false;
-    return @as(u64, @intCast(decoded_len)) > effectiveRemoteContentMaxDownloadSize(remote_content);
+    return @as(u64, @intCast(decoded_len)) > try effectiveRemoteContentMaxDownloadSize(remote_content);
 }
 
 pub fn validateInlineSourceSize(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !void {
@@ -1316,11 +1316,28 @@ pub fn assessOcrQuality(text: []const u8, config: OcrQualityConfig) OcrQuality {
     var sampled_words: usize = 0;
     var suspicious_words: usize = 0;
     var words = std.mem.tokenizeAny(u8, trimmed, &std.ascii.whitespace);
-    while (words.next()) |word| {
-        word_count += 1;
-        if (sampled_words >= config.garbled_sample_words) continue;
-        sampled_words += 1;
-        if (word.len == 1 and std.mem.indexOfScalar(u8, ".-Xxv:", word[0]) == null) suspicious_words += 1;
+    while (words.next() != null) word_count += 1;
+    // A spaced heading must not condemn an otherwise readable page, and a
+    // clean heading must not hide corruption later in it. Take one sample
+    // per word interval without retaining token slices. Deterministic jitter
+    // avoids aliasing repeated rows or sentences at a fixed word stride.
+    if (config.garbled_sample_words > 0 and word_count > 0) {
+        const stride = word_count / config.garbled_sample_words +
+            @intFromBool(word_count % config.garbled_sample_words != 0);
+        var random = std.Random.DefaultPrng.init(0);
+        var interval_start: usize = 0;
+        var next_sample = random.random().uintLessThan(usize, @min(stride, word_count));
+        var word_index: usize = 0;
+        words = std.mem.tokenizeAny(u8, trimmed, &std.ascii.whitespace);
+        while (words.next()) |word| : (word_index += 1) {
+            if (word_index != next_sample) continue;
+            sampled_words += 1;
+            if (word.len == 1 and std.mem.indexOfScalar(u8, ".-Xxv:", word[0]) == null) suspicious_words += 1;
+            if (stride >= word_count - interval_start) break;
+            interval_start += stride;
+            next_sample = interval_start +
+                random.random().uintLessThan(usize, @min(stride, word_count - interval_start));
+        }
     }
     if (sampled_words > 0) out.single_char_word_ratio = @as(f64, @floatFromInt(suspicious_words)) / @as(f64, @floatFromInt(sampled_words));
     out.garbled = word_count >= config.garbled_min_words and out.single_char_word_ratio > config.max_single_char_word_ratio;
@@ -1453,6 +1470,10 @@ pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
     if (!embedded.font_corrupted and !embedded.replacement_corrupted and
         ocr.non_whitespace_chars *| 2 < embedded.non_whitespace_chars) return false;
     if (embedded.needsFallback() != ocr.needsFallback()) return !ocr.needsFallback();
+    // Both candidates pass every configured check. Sampling differences or
+    // extra OCR text do not establish an improvement over readable source text.
+    // Forced mode guarantees an attempt; it does not bypass source retention.
+    if (!embedded.needsFallback()) return false;
     if (embedded.failureCount() != ocr.failureCount()) return ocr.failureCount() < embedded.failureCount();
     if (embedded.replacement_char_ratio != ocr.replacement_char_ratio) return ocr.replacement_char_ratio < embedded.replacement_char_ratio;
     if (embedded.corrupted_line_ratio != ocr.corrupted_line_ratio) return ocr.corrupted_line_ratio < embedded.corrupted_line_ratio;
@@ -1504,6 +1525,81 @@ pub fn mergeOcrWithEmbeddedNumericRowsAlloc(alloc: Allocator, embedded_text: []c
     );
 }
 
+const EmbeddedNumericRow = struct {
+    corrupted: bool = false,
+    fragmented_prose: bool = false,
+    has_bare_digits: bool = false,
+
+    fn numericToken(self: @This(), raw: []const u8) ?[]const u8 {
+        if (self.corrupted) return null;
+        const token = normalizedNumericToken(raw) orelse return null;
+        if (self.fragmented_prose and isBareNumericGlyph(raw, token)) return null;
+        return token;
+    }
+};
+
+fn isBareNumericGlyph(raw: []const u8, normalized: []const u8) bool {
+    // Attached signs, currency and percentages are value syntax, rather than
+    // isolated digit glyphs. Keep the normalized key and original formatting.
+    return normalized.len == 1 and std.ascii.isDigit(normalized[0]) and
+        std.mem.indexOfAny(u8, raw, "$%") == null;
+}
+
+fn assessEmbeddedNumericRow(line: []const u8) EmbeddedNumericRow {
+    const config = OcrQualityConfig{ .min_content_chars = 0 };
+    const quality = assessOcrQuality(line, config);
+    if (quality.font_corrupted or quality.replacement_corrupted) return .{ .corrupted = true };
+    // Rows are usually shorter than the page-level garbled-word minimum.
+    // Count alphabetic tokens independently so numeric cells neither signal
+    // fragmentation nor dilute evidence of a broken label. Also require a
+    // sustained run of fragments: interleaved labels such as "Class A Class B"
+    // and letter/value pairs are reliable even with many single-letter tokens.
+    var words = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
+    var alphabetic_words: usize = 0;
+    var single_letters: usize = 0;
+    var fragment_run: usize = 0;
+    var run_has_lowercase = false;
+    var has_fragmented_word = false;
+    var has_bare_digits = false;
+    while (words.next()) |raw_word| {
+        if (normalizedNumericToken(raw_word)) |token| {
+            if (isBareNumericGlyph(raw_word, token)) has_bare_digits = true;
+        }
+        const word = std.mem.trim(u8, raw_word, ".,!?;:\"'()[]{}");
+        if (word.len == 0) continue;
+        var alphabetic = true;
+        for (word) |byte| {
+            if (!std.ascii.isAlphabetic(byte)) {
+                alphabetic = false;
+                break;
+            }
+        }
+        if (!alphabetic) {
+            fragment_run = 0;
+            run_has_lowercase = false;
+            continue;
+        }
+        alphabetic_words += 1;
+        if (word.len == 1 and std.ascii.isAlphabetic(word[0]) and
+            std.mem.indexOfScalar(u8, "Xxv", word[0]) == null)
+        {
+            single_letters += 1;
+            fragment_run += 1;
+            run_has_lowercase = run_has_lowercase or std.ascii.isLower(word[0]);
+            // All-uppercase single-letter column headings are not prose.
+            if (fragment_run >= 4 and run_has_lowercase) has_fragmented_word = true;
+        } else {
+            fragment_run = 0;
+            run_has_lowercase = false;
+        }
+    }
+    return .{
+        .fragmented_prose = has_fragmented_word and
+            @as(f64, @floatFromInt(single_letters)) / @as(f64, @floatFromInt(alphabetic_words)) > config.max_single_char_word_ratio,
+        .has_bare_digits = has_bare_digits,
+    };
+}
+
 fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
     alloc: Allocator,
     embedded_text: []const u8,
@@ -1514,17 +1610,22 @@ fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
     var candidate_counts = std.StringHashMapUnmanaged(u32).empty;
     defer candidate_counts.deinit(alloc);
     var reference_occurrences: usize = 0;
-    var tokens = std.mem.tokenizeAny(u8, embedded_text, &std.ascii.whitespace);
-    while (tokens.next()) |raw| {
-        const token = normalizedNumericToken(raw) orelse continue;
-        reference_occurrences +|= 1;
-        if (reference_occurrences > max_token_occurrences)
-            return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
-        const entry = try candidate_counts.getOrPut(alloc, token);
-        if (!entry.found_existing) {
-            if (candidate_counts.count() > max_unique_tokens)
+    var tokens = std.mem.tokenizeAny(u8, "", &std.ascii.whitespace);
+    var reference_lines = std.mem.splitScalar(u8, embedded_text, '\n');
+    while (reference_lines.next()) |line| {
+        const row = assessEmbeddedNumericRow(line);
+        tokens = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
+        while (tokens.next()) |raw| {
+            const token = row.numericToken(raw) orelse continue;
+            reference_occurrences +|= 1;
+            if (reference_occurrences > max_token_occurrences)
                 return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
-            entry.value_ptr.* = 0;
+            const entry = try candidate_counts.getOrPut(alloc, token);
+            if (!entry.found_existing) {
+                if (candidate_counts.count() > max_unique_tokens)
+                    return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
+                entry.value_ptr.* = 0;
+            }
         }
     }
     var candidate_occurrences: usize = 0;
@@ -1545,11 +1646,18 @@ fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
     var lines = std.mem.splitScalar(u8, embedded_text, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
+        const row = assessEmbeddedNumericRow(line);
+        if (row.corrupted) {
+            previous_line = null;
+            previous_line_has_numeric = false;
+            previous_appended = false;
+            continue;
+        }
         var numeric_count: usize = 0;
         var missing_count: usize = 0;
         tokens = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
         while (tokens.next()) |raw| {
-            const token = normalizedNumericToken(raw) orelse continue;
+            const token = row.numericToken(raw) orelse continue;
             numeric_count += 1;
             if (candidate_counts.getPtr(token)) |count| {
                 if (count.* > 0) {
@@ -1558,6 +1666,26 @@ fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
                 }
             }
             missing_count += 1;
+        }
+        if (row.fragmented_prose and (row.has_bare_digits or numeric_count == 0)) {
+            // Mixed rows must not reintroduce rejected digit fragments or
+            // become a broken header for the next row. Recover only intact
+            // values, retaining signs, currency and duplicate occurrences.
+            if (missing_count > 0) {
+                var separator: []const u8 = "";
+                tokens = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
+                while (tokens.next()) |raw| {
+                    if (row.numericToken(raw) == null) continue;
+                    try retained.appendSlice(alloc, separator);
+                    try retained.appendSlice(alloc, raw);
+                    separator = " ";
+                }
+                try retained.append(alloc, '\n');
+            }
+            previous_line = null;
+            previous_line_has_numeric = false;
+            previous_appended = false;
+            continue;
         }
         if (missing_count > 0) {
             // Retain the complete source line, even when OCR matched some of
@@ -1612,23 +1740,28 @@ fn numericTokenRecallAllocWithLimits(
     var remaining = std.StringHashMapUnmanaged(u32).empty;
     defer remaining.deinit(alloc);
     var reference_count: usize = 0;
-    var tokens = std.mem.tokenizeAny(u8, reference, &std.ascii.whitespace);
-    while (tokens.next()) |raw| {
-        const token = normalizedNumericToken(raw) orelse continue;
-        reference_count +|= 1;
-        if (reference_count > max_token_occurrences)
-            return .{ .reference_count = reference_count, .recall = 0, .complete = false };
-        // Keys borrow from `reference`, which outlives this page-local map.
-        // Avoid one allocation per table cell while preserving duplicate
-        // counts for recall.
-        const entry = try remaining.getOrPut(alloc, token);
-        if (!entry.found_existing) {
-            if (remaining.count() > max_unique_tokens)
+    var tokens = std.mem.tokenizeAny(u8, "", &std.ascii.whitespace);
+    var reference_lines = std.mem.splitScalar(u8, reference, '\n');
+    while (reference_lines.next()) |line| {
+        const row = assessEmbeddedNumericRow(line);
+        tokens = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
+        while (tokens.next()) |raw| {
+            const token = row.numericToken(raw) orelse continue;
+            reference_count +|= 1;
+            if (reference_count > max_token_occurrences)
                 return .{ .reference_count = reference_count, .recall = 0, .complete = false };
-            entry.key_ptr.* = token;
-            entry.value_ptr.* = 0;
+            // Keys borrow from `reference`, which outlives this page-local map.
+            // Avoid one allocation per table cell while preserving duplicate
+            // counts for recall.
+            const entry = try remaining.getOrPut(alloc, token);
+            if (!entry.found_existing) {
+                if (remaining.count() > max_unique_tokens)
+                    return .{ .reference_count = reference_count, .recall = 0, .complete = false };
+                entry.key_ptr.* = token;
+                entry.value_ptr.* = 0;
+            }
+            entry.value_ptr.* +|= 1;
         }
-        entry.value_ptr.* +|= 1;
     }
     if (reference_count == 0) return .{ .reference_count = 0, .recall = 1.0 };
 
@@ -4986,6 +5119,31 @@ test "OCR quality fallback covers born digital scanned garbled and encoding fail
     }).failureCount());
 }
 
+test "OCR quality distinguishes a spaced heading from corruption throughout the body" {
+    const Text = struct {
+        fn repeat(comptime text: []const u8, comptime count: usize) [text.len * count]u8 {
+            var out: [text.len * count]u8 = undefined;
+            for (0..count) |i| @memcpy(out[i * text.len ..][0..text.len], text);
+            return out;
+        }
+    };
+    const config = OcrQualityConfig{};
+    const sentence = "The report documents completed deliveries and verified records for every district. ";
+    const readable_body = Text.repeat(sentence, 24);
+    const decorated_page = Text.repeat("D E C O R A T I V E ", 4) ++ "\n" ++ readable_body;
+    const decorated = assessOcrQuality(decorated_page, config);
+    try std.testing.expect(!decorated.needsFallback());
+
+    // Fixed-stride sampling must not repeatedly select only "I".
+    const repeated_prose = Text.repeat("The report says I am prepared today ", 50);
+    try std.testing.expect(!assessOcrQuality(&repeated_prose, config).needsFallback());
+
+    // The first fifty words are ordinary prose; most subsequent words are
+    // broken glyphs, so prefix-only sampling would miss the damaged body.
+    const damaged_page = Text.repeat(sentence, 5) ++ "\n" ++ Text.repeat("b c d e f g h j k l m n ", 40);
+    try std.testing.expect(assessOcrQuality(damaged_page, config).garbled);
+}
+
 test "OCR pending metadata construction is allocation-failure safe" {
     const Runner = struct {
         fn run(alloc: Allocator) !void {
@@ -5014,6 +5172,46 @@ test "OCR text selection retains embedded text on ties and chooses a better tran
     try std.testing.expect(trivial_ocr.too_short);
     try std.testing.expect(!embedded.too_short);
     try std.testing.expect(!preferOcrText(embedded, trivial_ocr));
+}
+
+test "OCR text selection retains clean embedded content despite sampled ratios and OCR length" {
+    const alloc = std.testing.allocator;
+    const prefix = "The report documents completed deliveries and verified records for every district. ";
+    const certification = "I certify these figures and confirm their accuracy. ";
+    const embedded = z17RepeatString(prefix, 5) ++ z17RepeatString(certification, 8);
+    // Both a shorter incomplete result and a longer repetitive result omit
+    // the certification, while scoring better on single-character words.
+    const candidates = [_][]const u8{ z17RepeatString(prefix, 8), z17RepeatString(prefix, 16) };
+    for ([_]usize{ 0, 25, 50, 100 }) |sample_words| {
+        const config = OcrQualityConfig{ .garbled_sample_words = sample_words };
+        const embedded_quality = assessOcrQuality(embedded, config);
+        try std.testing.expect(!embedded_quality.needsFallback());
+        for (candidates) |ocr| {
+            const ocr_quality = assessOcrQuality(ocr, config);
+            try std.testing.expect(!ocr_quality.needsFallback());
+            if (sample_words == 50)
+                try std.testing.expect(embedded_quality.single_char_word_ratio > ocr_quality.single_char_word_ratio);
+            try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(
+                alloc,
+                embedded,
+                ocr,
+                embedded_quality,
+                ocr_quality,
+            ));
+        }
+    }
+
+    const table = "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
+    const missing_cells = "The report summarizes quarterly performance in complete readable prose without reproducing the individual numeric table cells.";
+    const table_quality = assessOcrQuality(table, .{});
+    try std.testing.expect(!table_quality.needsFallback());
+    try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(
+        alloc,
+        table,
+        missing_cells,
+        table_quality,
+        assessOcrQuality(missing_cells, .{}),
+    ));
 }
 
 test "OCR text selection checks availability before quality ratios" {
@@ -5045,10 +5243,13 @@ test "OCR text selection checks availability before quality ratios" {
 test "OCR text selection preserves dense embedded numeric tables" {
     const alloc = std.testing.allocator;
     const config = OcrQualityConfig{};
-    const embedded_text = "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
+    // The prose needs OCR, while the decoded table values remain reliable.
+    const embedded_text = "T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h\n" ++
+        "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
     const missing_cells = "Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.";
     const preserved_cells = "Quarter Revenue Cost Margin Q1 101 81 20 Q2 115 90 25 Q3 124 94 30 Q4 140 100 40 with complete table values and readable prose.";
     const embedded = assessOcrQuality(embedded_text, config);
+    try std.testing.expect(embedded.needsFallback());
     const missing = assessOcrQuality(missing_cells, config);
     const preserved = assessOcrQuality(preserved_cells, config);
     try std.testing.expectEqual(OcrTextChoice.ocr_with_embedded_numeric_rows, try chooseOcrTextForContentAlloc(alloc, embedded_text, missing_cells, embedded, missing));
@@ -5060,6 +5261,143 @@ test "OCR text selection preserves dense embedded numeric tables" {
     try std.testing.expect(std.mem.indexOf(u8, merged, "Q1 101 81 20") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, "Q4 140 100 40") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, "numeric accuracy") != null);
+}
+
+test "numeric recovery rejects broken prose but preserves readable rows and single-digit cells" {
+    const alloc = std.testing.allocator;
+    const broken = "T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h";
+    const ocr = "The service netted 120 tickets at $50 each. The transcription preserves the complete sentence.";
+    const config = OcrQualityConfig{};
+    try std.testing.expectEqual(OcrTextChoice.ocr, try chooseOcrTextForContentAlloc(
+        alloc,
+        broken,
+        ocr,
+        assessOcrQuality(broken, config),
+        assessOcrQuality(ocr, config),
+    ));
+    const without_broken = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, broken, ocr);
+    defer alloc.free(without_broken);
+    try std.testing.expectEqualStrings(ocr, without_broken);
+
+    const digit_cells = "A 1 2 3 4 5 6 7 8 9 1 2 3 4 5 6 7 8 9 1 2 3 4 5";
+    const amounts = "Fees -12 -12 $500";
+    const embedded = broken ++ "\nAccount Charges Credits\n" ++ digit_cells ++ "\n" ++ amounts;
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, broken) == null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "Account Charges Credits\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, digit_cells) != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, amounts) != null);
+}
+
+test "numeric recovery rejects short fragmented labels without counting numeric cells as prose" {
+    const alloc = std.testing.allocator;
+    const ocr = "Total 120. Total 120. Total 120. Total 120. These totals are verified and preserved in the transcription.";
+    const broken_rows = [_][]const u8{
+        "T o t a l 1 2 0",
+        "T o t a l, 1 2 0",
+        "T o t a l 1 2 0 1 2 0 1 2 0 1 2 0 1 2 0 1 2 0",
+    };
+    for (broken_rows) |broken| {
+        const embedded = try std.fmt.allocPrint(alloc, "{s}\n{s}\n{s}\n{s}", .{ broken, broken, broken, broken });
+        defer alloc.free(embedded);
+        const recall = try numericTokenRecallAlloc(alloc, embedded, ocr);
+        try std.testing.expectEqual(@as(usize, 0), recall.reference_count);
+        try std.testing.expectEqual(OcrTextChoice.ocr, try chooseOcrTextForContentAlloc(
+            alloc,
+            embedded,
+            ocr,
+            assessOcrQuality(embedded, .{}),
+            assessOcrQuality(ocr, .{}),
+        ));
+        const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
+        defer alloc.free(merged);
+        try std.testing.expectEqualStrings(ocr, merged);
+    }
+
+    const reliable = "A 1 2 3\nA B C 4 5 6\nFees -12 -12 $500\nAccount Charges Credits 7 8 9";
+    const recall = try numericTokenRecallAlloc(alloc, reliable, "");
+    try std.testing.expectEqual(@as(usize, 12), recall.reference_count);
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, reliable, ocr);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, reliable) != null);
+}
+
+test "numeric recovery retains single letter class labels and their balances" {
+    const alloc = std.testing.allocator;
+    const embedded = "Class A Class B 101 201\nClass C Class D 102 202\nClass E Class F 103 203\nClass G Class H 104 204";
+    const ocr = "The report describes the share classes and their balances. It summarizes the results in readable prose without reproducing the individual values.";
+    const recall = try numericTokenRecallAlloc(alloc, embedded, ocr);
+    try std.testing.expectEqual(@as(usize, 8), recall.reference_count);
+    try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(
+        alloc,
+        embedded,
+        ocr,
+        assessOcrQuality(embedded, .{}),
+        assessOcrQuality(ocr, .{}),
+    ));
+    const damaged = "T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h\n" ++ embedded;
+    const damaged_quality = assessOcrQuality(damaged, .{});
+    try std.testing.expect(damaged_quality.needsFallback());
+    try std.testing.expectEqual(OcrTextChoice.ocr_with_embedded_numeric_rows, try chooseOcrTextForContentAlloc(
+        alloc,
+        damaged,
+        ocr,
+        damaged_quality,
+        assessOcrQuality(ocr, .{}),
+    ));
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, embedded) != null);
+
+    // Consecutive uppercase columns and letter/value pairs are table structure.
+    const labelled_cells = "A B C D 11 12 13 14\nGrade A 10 B 20 C 30 D 40";
+    const cell_recall = try numericTokenRecallAlloc(alloc, labelled_cells, "");
+    try std.testing.expectEqual(@as(usize, 8), cell_recall.reference_count);
+    const merged_cells = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, labelled_cells, ocr);
+    defer alloc.free(merged_cells);
+    try std.testing.expect(std.mem.indexOf(u8, merged_cells, labelled_cells) != null);
+}
+
+test "numeric recovery preserves intact coefficients beside lowercase variable labels" {
+    const alloc = std.testing.allocator;
+    const embedded = "Coefficients a b c d 101 201 301 401\nCoefficients a b c d 102 202 302 402\nCoefficients a b c d 103 203 303 403";
+    const ocr = "The table lists measured coefficients for several experiments, with each row describing four independent input parameters and their recorded observations.";
+    const embedded_quality = assessOcrQuality(embedded, .{});
+    try std.testing.expect(embedded_quality.needsFallback());
+    const recall = try numericTokenRecallAlloc(alloc, embedded, ocr);
+    try std.testing.expectEqual(@as(usize, 12), recall.reference_count);
+    try std.testing.expectEqual(OcrTextChoice.ocr_with_embedded_numeric_rows, try chooseOcrTextForContentAlloc(
+        alloc,
+        embedded,
+        ocr,
+        embedded_quality,
+        assessOcrQuality(ocr, .{}),
+    ));
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.startsWith(u8, merged, ocr));
+    try std.testing.expect(std.mem.indexOf(u8, merged, embedded) != null);
+    const complete_recall = try numericTokenRecallAlloc(alloc, embedded, embedded);
+    try std.testing.expectEqual(@as(f64, 1.0), complete_recall.recall);
+}
+
+test "numeric recovery separates intact values from broken digits and headers" {
+    const alloc = std.testing.allocator;
+    const embedded = "T o t a l 1 2 0 year 2025 balance -12 -12 $5 7.5%\nT o t a l\nFees 101";
+    const ocr = "The readable transcription preserves the report's narrative but omits its numeric values.";
+    const recall = try numericTokenRecallAlloc(alloc, embedded, ocr);
+    try std.testing.expectEqual(@as(usize, 6), recall.reference_count);
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "2025 -12 -12 $5 7.5%\nFees 101") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "T o t a l") == null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "1 2 0") == null);
+
+    const complete_ocr = ocr ++ " 2025 -12 -12 $5 7.5% 101";
+    const complete = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, complete_ocr);
+    defer alloc.free(complete);
+    try std.testing.expectEqualStrings(complete_ocr, complete);
 }
 
 test "numeric recall limits preserve embedded text without exhausting scratch memory" {
@@ -5288,6 +5626,7 @@ test "OCR numeric hybrid preserves fragmented single-value lines" {
     const alloc = std.testing.allocator;
     const config = OcrQualityConfig{};
     const embedded_text =
+        \\T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h
         \\Classified references
         \\Alpha listing
         \\101
@@ -5308,6 +5647,7 @@ test "OCR numeric hybrid preserves fragmented single-value lines" {
     ;
     const ocr_text = "The OCR transcription makes every classified listing readable and preserves the descriptive prose, but the small reference values are absent from the clearer transcription.";
     const embedded_quality = assessOcrQuality(embedded_text, config);
+    try std.testing.expect(embedded_quality.needsFallback());
     const ocr_quality = assessOcrQuality(ocr_text, config);
     try std.testing.expectEqual(
         OcrTextChoice.ocr_with_embedded_numeric_rows,

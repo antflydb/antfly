@@ -1,0 +1,133 @@
+{
+  "version": 1,
+  "purpose": "Expanded AV1 pretrained reference preservation; no relevance labels",
+  "documents": [
+    {
+      "id": "av1-c0-8",
+      "path": "av1-c0-8.webm",
+      "sha256": "a9196cf53fdc71f8fbd573fa44bc95313f8faa62f896a8bc32a1cea9550458de",
+      "provenance": {
+        "title": "Antfly generated AV1 expanded-format pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "5b79ab124f70b479c7a66b83ac23aad99c1a4a0505cdfd30133b60f3681b7846",
+        "source": "zig/lib/video/testdata/av1-extended/av1-c0-8.ivf",
+        "generation": "zig/lib/video/scripts/generate_av1_extended_fixtures.py",
+        "muxer": "tools/embeddinggemma2/generate_av1_model_corpus.py (packet-preserving WebM)"
+      }
+    },
+    {
+      "id": "av1-c0-12",
+      "path": "av1-c0-12.webm",
+      "sha256": "a7353c1acaf114ae9d8cfec9c58cdac2b53e88cfefc8f070167dc36961f3f750",
+      "provenance": {
+        "title": "Antfly generated AV1 expanded-format pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "7ea4038e4a6550991370b85063776580fa99febe5b1812f65b17cafac33a19bb",
+        "source": "zig/lib/video/testdata/av1-extended/av1-c0-12.ivf",
+        "generation": "zig/lib/video/scripts/generate_av1_extended_fixtures.py",
+        "muxer": "tools/embeddinggemma2/generate_av1_model_corpus.py (packet-preserving WebM)"
+      }
+    },
+    {
+      "id": "av1-c1-12",
+      "path": "av1-c1-12.webm",
+      "sha256": "58e553be16246f0f62fdacf5b1615792de1f5989d9e8011f4f15570e9608a7e6",
+      "provenance": {
+        "title": "Antfly generated AV1 expanded-format pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "f37d53805f77969684f4e2ff0c514c853e920c8d7291de753fb35a47fe48d9e1",
+        "source": "zig/lib/video/testdata/av1-extended/av1-c1-12.ivf",
+        "generation": "zig/lib/video/scripts/generate_av1_extended_fixtures.py",
+        "muxer": "tools/embeddinggemma2/generate_av1_model_corpus.py (packet-preserving WebM)"
+      }
+    },
+    {
+      "id": "av1-c2-8",
+      "path": "av1-c2-8.webm",
+      "sha256": "f09b08acee0b12892574d810fb7bf34c78033debb750a8b87fd809ec569ab27d",
+      "provenance": {
+        "title": "Antfly generated AV1 expanded-format pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "2b783a586322c68f58b657126145917eefd5bb2980b765dd7d6db8a2b7ed7b43",
+        "source": "zig/lib/video/testdata/av1-extended/av1-c2-8.ivf",
+        "generation": "zig/lib/video/scripts/generate_av1_extended_fixtures.py",
+        "muxer": "tools/embeddinggemma2/generate_av1_model_corpus.py (packet-preserving WebM)"
+      }
+    },
+    {
+      "id": "av1-c2-10",
+      "path": "av1-c2-10.webm",
+      "sha256": "3c253a7ae6cb946ad30f6b4b42dee238c19b67f50c6e8ad3ec4e0f75b94ef209",
+      "provenance": {
+        "title": "Antfly generated AV1 expanded-format pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "d07359f16c434967e8fec69550940448f232f7475b2a3b0892aced2f8bfbd026",
+        "source": "zig/lib/video/testdata/av1-extended/av1-c2-10.ivf",
+        "generation": "zig/lib/video/scripts/generate_av1_extended_fixtures.py",
+        "muxer": "tools/embeddinggemma2/generate_av1_model_corpus.py (packet-preserving WebM)"
+      }
+    },
+    {
+      "id": "av1-c2-12",
+      "path": "av1-c2-12.webm",
+      "sha256": "3da76fcdf6e96c5c69ae8944891e519c1ddd1cde5275e6ed051c13290f7a125f",
+      "provenance": {
+        "title": "Antfly generated AV1 expanded-format pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "cebbbf2b7e8a1bf361ea4376cc1682192406b784a7b1ae0c3bec80c4628b9c81",
+        "source": "zig/lib/video/testdata/av1-extended/av1-c2-12.ivf",
+        "generation": "zig/lib/video/scripts/generate_av1_extended_fixtures.py",
+        "muxer": "tools/embeddinggemma2/generate_av1_model_corpus.py (packet-preserving WebM)"
+      }
+    },
+    {
+      "id": "av1-c3-8",
+      "path": "av1-c3-8.webm",
+      "sha256": "4c436a1b74525e47da2d20496c23cd3de109b9d94ad449be9483d72074539770",
+      "provenance": {
+        "title": "Antfly generated AV1 expanded-format pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "9073e31633113350c389ba15ab492d21f46de5aaa01a6c05281abc70bf9f4286",
+        "source": "zig/lib/video/testdata/av1-extended/av1-c3-8.ivf",
+        "generation": "zig/lib/video/scripts/generate_av1_extended_fixtures.py",
+        "muxer": "tools/embeddinggemma2/generate_av1_model_corpus.py (packet-preserving WebM)"
+      }
+    },
+    {
+      "id": "av1-c3-10",
+      "path": "av1-c3-10.webm",
+      "sha256": "2919444a2d4fea60aad0601301d78201f41a01eeb2a33c11e1865dfe607ee0d9",
+      "provenance": {
+        "title": "Antfly generated AV1 expanded-format pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "f225af821cf71e493a05494d7dde326d27db0c6f97be78ccb262f6b8575ff437",
+        "source": "zig/lib/video/testdata/av1-extended/av1-c3-10.ivf",
+        "generation": "zig/lib/video/scripts/generate_av1_extended_fixtures.py",
+        "muxer": "tools/embeddinggemma2/generate_av1_model_corpus.py (packet-preserving WebM)"
+      }
+    },
+    {
+      "id": "av1-c3-12",
+      "path": "av1-c3-12.webm",
+      "sha256": "2f11f520cecb5443c8c25ead81883f9e5598bddfdaa50b7665aa809494919dac",
+      "provenance": {
+        "title": "Antfly generated AV1 expanded-format pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "d7735dd2154614f8f1c8d32e54922db42b38ed6d3c6440b59a66ac53c34077a0",
+        "source": "zig/lib/video/testdata/av1-extended/av1-c3-12.ivf",
+        "generation": "zig/lib/video/scripts/generate_av1_extended_fixtures.py",
+        "muxer": "tools/embeddinggemma2/generate_av1_model_corpus.py (packet-preserving WebM)"
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "colour",
+      "text": "A colourful pattern with moving shapes."
+    },
+    {
+      "id": "gray",
+      "text": "A grayscale pattern."
+    }
+  ]
+}

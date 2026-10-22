@@ -12,7 +12,7 @@ import type {
   RetrievalAgentSteps,
   SSEStepStarted,
 } from "@antfly/sdk";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { streamAnswer } from "../utils";
 
 /** Per-turn state for a chat conversation */
@@ -81,6 +81,8 @@ export function useChatStream() {
   const turnsRef = useRef<ChatTurn[]>([]);
   const nextTurnIdRef = useRef(0);
 
+  useEffect(() => () => abortControllerRef.current?.abort(), []);
+
   // Keep ref in sync with state
   turnsRef.current = turns;
 
@@ -89,6 +91,9 @@ export function useChatStream() {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
+
+    const requestController = new AbortController();
+    abortControllerRef.current = requestController;
 
     // Build messages history from completed turns
     const messages: ChatMessage[] = [];
@@ -125,6 +130,7 @@ export function useChatStream() {
     setIsStreaming(true);
 
     const updateTurn = (updater: (turn: ChatTurn) => ChatTurn) => {
+      if (requestController.signal.aborted) return;
       setTurns((prev) => prev.map((t) => (t.id === turnId ? updater(t) : t)));
     };
 
@@ -146,92 +152,99 @@ export function useChatStream() {
           limit: config.limit ?? 10,
         },
       ],
-      steps: config.steps ?? {
-        generation: {
-          ...(config.systemPrompt ? { system_prompt: config.systemPrompt } : {}),
-        },
-        classification: {},
-        followup: {
-          ...(config.followUpCount ? { count: config.followUpCount } : {}),
-        },
-        confidence: {},
-        ...(config.tools ? { tools: config.tools } : {}),
+      steps: {
+        ...(config.steps ?? {
+          generation: {},
+          classification: {},
+          followup: { ...(config.followUpCount ? { count: config.followUpCount } : {}) },
+          confidence: {},
+        }),
+        ...(config.systemPrompt && (!config.steps || config.steps.generation)
+          ? { generation: { ...config.steps?.generation, system_prompt: config.systemPrompt } }
+          : {}),
       },
+      ...(config.tools ? { tools: config.tools } : {}),
       ...(config.maxInternalIterations
         ? { max_internal_iterations: config.maxInternalIterations }
         : {}),
     };
 
     try {
-      const controller = await streamAnswer(config.url, request, config.headers || {}, {
-        onClassification: (data) => {
-          updateTurn((t) => ({ ...t, classification: data }));
+      await streamAnswer(
+        config.url,
+        request,
+        config.headers || {},
+        {
+          onClassification: (data) => {
+            updateTurn((t) => ({ ...t, classification: data }));
+          },
+          onHit: (hit) => {
+            updateTurn((t) => ({ ...t, hits: [...t.hits, hit] }));
+          },
+          onReasoning: (chunk) => {
+            updateTurn((t) => ({ ...t, reasoningText: t.reasoningText + chunk }));
+          },
+          onStepStarted: (step) => {
+            updateTurn((t) => ({ ...t, activeSteps: [...t.activeSteps, step] }));
+          },
+          onStepCompleted: (step) => {
+            updateTurn((t) => ({
+              ...t,
+              steps: [...t.steps, step],
+              activeSteps: t.activeSteps.filter((s) => s.id !== step.id),
+              toolCallsMade: t.toolCallsMade + 1,
+            }));
+          },
+          onGeneration: (chunk) => {
+            updateTurn((t) => ({ ...t, assistantMessage: t.assistantMessage + chunk }));
+          },
+          onConfidence: (data) => {
+            updateTurn((t) => ({ ...t, confidence: data }));
+          },
+          onFollowup: (question) => {
+            updateTurn((t) => ({ ...t, followUpQuestions: [...t.followUpQuestions, question] }));
+          },
+          onComplete: () => {
+            updateTurn((t) => ({ ...t, isStreaming: false }));
+            if (!requestController.signal.aborted) setIsStreaming(false);
+          },
+          onError: (err) => {
+            const message = err instanceof Error ? err.message : String(err);
+            updateTurn((t) => ({ ...t, error: message, isStreaming: false }));
+            if (!requestController.signal.aborted) setIsStreaming(false);
+          },
+          onRetrievalAgentResult: (result) => {
+            updateTurn((t) => ({
+              ...t,
+              assistantMessage: result.generation ?? t.assistantMessage,
+              hits: result.hits ?? t.hits,
+              followUpQuestions: result.followup_questions ?? t.followUpQuestions,
+              classification: result.classification ?? t.classification,
+              clarification:
+                result.questions === undefined ? t.clarification : (result.questions[0] ?? null),
+              appliedFilters: result.applied_filters ?? t.appliedFilters,
+              steps: result.steps ?? t.steps,
+              toolCallsMade: result.tool_calls_made ?? t.toolCallsMade,
+              activeSteps: [],
+              confidence:
+                result.generation_confidence !== undefined && result.context_relevance !== undefined
+                  ? {
+                      generation_confidence: result.generation_confidence,
+                      context_relevance: result.context_relevance,
+                    }
+                  : t.confidence,
+              isStreaming: false,
+            }));
+            if (!requestController.signal.aborted) setIsStreaming(false);
+          },
         },
-        onHit: (hit) => {
-          updateTurn((t) => ({ ...t, hits: [...t.hits, hit] }));
-        },
-        onReasoning: (chunk) => {
-          updateTurn((t) => ({ ...t, reasoningText: t.reasoningText + chunk }));
-        },
-        onStepStarted: (step) => {
-          updateTurn((t) => ({ ...t, activeSteps: [...t.activeSteps, step] }));
-        },
-        onStepCompleted: (step) => {
-          updateTurn((t) => ({
-            ...t,
-            steps: [...t.steps, step],
-            activeSteps: t.activeSteps.filter((s) => s.id !== step.id),
-            toolCallsMade: t.toolCallsMade + 1,
-          }));
-        },
-        onGeneration: (chunk) => {
-          updateTurn((t) => ({ ...t, assistantMessage: t.assistantMessage + chunk }));
-        },
-        onConfidence: (data) => {
-          updateTurn((t) => ({ ...t, confidence: data }));
-        },
-        onFollowup: (question) => {
-          updateTurn((t) => ({ ...t, followUpQuestions: [...t.followUpQuestions, question] }));
-        },
-        onComplete: () => {
-          updateTurn((t) => ({ ...t, isStreaming: false }));
-          setIsStreaming(false);
-        },
-        onError: (err) => {
-          const message = err instanceof Error ? err.message : String(err);
-          updateTurn((t) => ({ ...t, error: message, isStreaming: false }));
-          setIsStreaming(false);
-        },
-        onRetrievalAgentResult: (result) => {
-          updateTurn((t) => ({
-            ...t,
-            assistantMessage: result.generation || "",
-            hits: result.hits || [],
-            followUpQuestions: result.followup_questions || [],
-            classification: result.classification || null,
-            clarification: result.questions?.[0] || null,
-            appliedFilters: result.applied_filters || [],
-            steps: result.steps || t.steps,
-            toolCallsMade: result.tool_calls_made ?? t.toolCallsMade,
-            activeSteps: [],
-            confidence:
-              result.generation_confidence !== undefined && result.context_relevance !== undefined
-                ? {
-                    generation_confidence: result.generation_confidence,
-                    context_relevance: result.context_relevance,
-                  }
-                : null,
-            isStreaming: false,
-          }));
-          setIsStreaming(false);
-        },
-      });
-
-      abortControllerRef.current = controller;
+        { signal: requestController.signal }
+      );
     } catch (err) {
+      if (requestController.signal.aborted) return;
       const message = err instanceof Error ? err.message : String(err);
       updateTurn((t) => ({ ...t, error: message, isStreaming: false }));
-      setIsStreaming(false);
+      if (!requestController.signal.aborted) setIsStreaming(false);
     }
   }, []);
 

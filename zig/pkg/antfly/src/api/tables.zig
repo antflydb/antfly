@@ -14,6 +14,7 @@
 // limitations.
 
 const std = @import("std");
+const index_metadata = @import("antfly_local_sources").api_index_metadata;
 const group_ids = @import("antfly_local_sources").common_group_ids;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_admin = @import("../metadata/admin.zig");
@@ -781,6 +782,7 @@ pub const DefinitionCache = struct {
         schema: ?schema_openapi.TableSchema,
         read_schema: ?schema_openapi.TableSchema,
         declared: ?[]const runtime_schema_mod.FieldCapability,
+        runtime_schema: ?runtime_schema_mod.TableSchema,
         capabilities: ?[]const metadata_openapi.FieldCapability,
         fn size(self: *const Entry) usize {
             return @sizeOf(Entry) + self.arena.queryCapacity();
@@ -804,18 +806,21 @@ pub const DefinitionCache = struct {
             defer scratch.deinit();
             const temporary = scratch.allocator();
             const schema_json = if (table.read_schema_json.len > 0) table.read_schema_json else effectiveSchemaJson(table.schema_json);
-            const declared: ?[]const runtime_schema_mod.FieldCapability = declared: {
+            const runtime: ?runtime_schema_mod.TableSchema = runtime: {
                 const parsed = schema_mod.parseValidatedTableSchema(temporary, schema_json) catch |err| {
                     if (err == error.OutOfMemory) return err;
-                    break :declared null;
+                    break :runtime null;
                 };
-                const runtime = schema_mod.deriveRuntimeTableSchema(temporary, parsed) catch |err| {
+                const derived = schema_mod.deriveRuntimeTableSchema(temporary, parsed) catch |err| {
                     if (err == error.OutOfMemory) return err;
-                    break :declared null;
+                    break :runtime null;
                 };
-                const capabilities = try runtime_schema_mod.fieldCapabilitiesAlloc(temporary, runtime);
-                break :declared try runtime_schema_mod.cloneFieldCapabilitiesAlloc(a, capabilities);
+                // Keep the same immutable routing model as executable queries.
+                // Durable round-trip owns every string inside the bounded cache.
+                const encoded = try runtime_schema_mod.serializeSchema(temporary, derived);
+                break :runtime try runtime_schema_mod.deserializeSchema(a, encoded);
             };
+            const declared = if (runtime) |value| try runtime_schema_mod.fieldCapabilitiesAlloc(a, value) else null;
             entry.* = .{
                 .alloc = alloc,
                 .arena = arena,
@@ -823,7 +828,8 @@ pub const DefinitionCache = struct {
                 .schema = try cloneSchemaProjection(?schema_openapi.TableSchema, a, try parseOptionalTableSchema(temporary, table.schema_json)),
                 .read_schema = if (table.read_schema_json.len > 0) try cloneSchemaProjection(schema_openapi.TableSchema, a, try parseTableSchema(temporary, table.read_schema_json)) else null,
                 .declared = declared,
-                .capabilities = if (declared) |caps| try cloneSchemaProjection([]const metadata_openapi.FieldCapability, a, try generatedFieldCapabilitiesFromSchema(temporary, caps, null)) else null,
+                .runtime_schema = runtime,
+                .capabilities = if (declared) |caps| try cloneSchemaProjection([]const metadata_openapi.FieldCapability, a, try generatedFieldCapabilitiesFromSchema(temporary, caps, null, runtime.?)) else null,
             };
             // Entry fields above can grow the local arena after its first copy.
             entry.arena = arena;
@@ -1943,7 +1949,7 @@ fn buildTableStatusWithRanges(
         } else null,
         .replication_sources = try parseReplicationSources(alloc, snapshot, table, include_replication_runtime),
         .field_capabilities = if (definition) |value|
-            if (observedDynamicFieldCapabilitySetsFromStatus(storage_status).len == 0) value.capabilities else if (value.declared) |declared| try generatedFieldCapabilitiesFromSchema(alloc, declared, storage_status) else null
+            if (observedDynamicFieldCapabilitySetsFromStatus(storage_status).len == 0) value.capabilities else if (value.declared) |declared| try generatedFieldCapabilitiesFromSchema(alloc, declared, storage_status, value.runtime_schema.?) else null
         else
             try generatedFieldCapabilitiesAlloc(alloc, table, storage_status),
         .storage_status = .{
@@ -1973,14 +1979,14 @@ fn generatedFieldCapabilitiesAlloc(
     const schema_capabilities = try runtime_schema_mod.fieldCapabilitiesAlloc(alloc, runtime_schema);
     defer runtime_schema_mod.freeFieldCapabilities(alloc, schema_capabilities);
 
-    return try generatedFieldCapabilitiesFromSchema(alloc, schema_capabilities, storage_status);
+    return try generatedFieldCapabilitiesFromSchema(alloc, schema_capabilities, storage_status, runtime_schema);
 }
 
-fn generatedFieldCapabilitiesFromSchema(alloc: std.mem.Allocator, schema_capabilities: []const runtime_schema_mod.FieldCapability, storage_status: ?TableStorageStatus) ![]const metadata_openapi.FieldCapability {
+fn generatedFieldCapabilitiesFromSchema(alloc: std.mem.Allocator, schema_capabilities: []const runtime_schema_mod.FieldCapability, storage_status: ?TableStorageStatus, runtime: runtime_schema_mod.TableSchema) ![]const metadata_openapi.FieldCapability {
     var out = std.ArrayListUnmanaged(GeneratedFieldCapability).empty;
     var capability_index = GeneratedFieldCapabilityIndex.empty;
     defer freeGeneratedFieldCapabilityIndex(alloc, &capability_index);
-    errdefer freeGeneratedFieldCapabilitiesFromList(alloc, &out);
+    defer freeGeneratedFieldCapabilitiesFromList(alloc, &out);
     for (schema_capabilities) |capability| {
         try appendGeneratedFieldCapability(alloc, &out, &capability_index, try generatedFieldCapabilityAlloc(alloc, capability));
     }
@@ -1991,10 +1997,11 @@ fn generatedFieldCapabilitiesFromSchema(alloc: std.mem.Allocator, schema_capabil
         }
     }
 
-    return try generatedFieldCapabilitiesPublicSliceAlloc(alloc, &out);
+    return try generatedFieldCapabilitiesPublicSliceAlloc(alloc, &out, runtime);
 }
 
 const GeneratedFieldCapability = struct {
+    logical_field: ?[]const u8 = null,
     name: ?[]const u8 = null,
     field: ?[]const u8 = null,
     path_pattern: ?[]const u8 = null,
@@ -2192,6 +2199,10 @@ fn mergeGeneratedFieldCapability(
     existing: *GeneratedFieldCapability,
     incoming: GeneratedFieldCapability,
 ) !void {
+    if (!optionalStringEql(existing.logical_field, incoming.logical_field)) {
+        if (existing.logical_field) |value| alloc.free(@constCast(value));
+        existing.logical_field = null;
+    }
     try intersectOwnedQueryModes(alloc, &existing.query_modes, incoming.query_modes);
     existing.sortable = existing.sortable and incoming.sortable;
     try replaceOwnedStringIfDifferent(alloc, &existing.doc_value_coverage, runtime_schema_mod.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage));
@@ -2239,36 +2250,199 @@ fn freeOwnedStringSliceFromList(alloc: std.mem.Allocator, values: *std.ArrayList
     values.deinit(alloc);
 }
 
-fn generatedFieldCapabilitiesPublicSliceAlloc(
-    alloc: std.mem.Allocator,
-    capabilities: *std.ArrayListUnmanaged(GeneratedFieldCapability),
-) ![]const metadata_openapi.FieldCapability {
-    const public = try alloc.alloc(metadata_openapi.FieldCapability, capabilities.items.len);
-    errdefer alloc.free(public);
-    for (capabilities.items, 0..) |capability, i| {
-        public[i] = .{
-            .name = capability.name,
-            .field = capability.field,
-            .path_pattern = capability.path_pattern,
-            .field_pattern = capability.field_pattern,
-            .match_mapping_type = capability.match_mapping_type,
-            .emitted_name = capability.emitted_name,
-            .document_schema = capability.document_schema,
-            .type = capability.type,
-            .query_modes = capability.query_modes,
-            .sortable = capability.sortable,
-            .provenance = capability.provenance,
-            .missing_null_policy = capability.missing_null_policy,
-            .sort_lifecycle_state = capability.sort_lifecycle_state,
-            .analyzer = capability.analyzer,
-            .index_sort_position = capability.index_sort_position,
-            .index_sort_order = capability.index_sort_order,
-        };
-        if (capability.doc_value_coverage.len > 0) alloc.free(@constCast(capability.doc_value_coverage));
-        if (capability.queryability_state.len > 0) alloc.free(@constCast(capability.queryability_state));
+const PublicFieldKind = enum { source, reserved, computed, template, unassociated };
+const PublicFieldGroup = struct {
+    field: ?[]const u8,
+    kind: PublicFieldKind,
+    string_values: bool = false,
+    autocomplete_candidate: bool = false,
+    sortable_candidate: bool = false,
+    representations: std.ArrayListUnmanaged(metadata_openapi.FieldRepresentation) = .empty,
+    fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        if (self.field) |field| a.free(@constCast(field));
+        for (self.representations.items) |representation| freePublicFieldRepresentation(a, representation);
+        self.representations.deinit(a);
     }
-    capabilities.deinit(alloc);
-    return public;
+};
+
+fn publicFieldGroup(a: std.mem.Allocator, groups: *std.ArrayListUnmanaged(PublicFieldGroup), index: *GeneratedFieldCapabilityIndex, kind: PublicFieldKind, field: ?[]const u8, capability: ?GeneratedFieldCapability) !*PublicFieldGroup {
+    var key: std.ArrayListUnmanaged(u8) = .empty;
+    defer key.deinit(a);
+    try appendCapabilityKeyPart(a, &key, @tagName(kind));
+    try appendCapabilityKeyPart(a, &key, field);
+    if (field == null) {
+        const physical = capability.?;
+        if (kind == .unassociated and (physical.emitted_name orelse physical.field) != null) {
+            try appendCapabilityKeyPart(a, &key, physical.emitted_name orelse physical.field);
+        } else {
+            const identity = try generatedFieldCapabilityAggregationKeyAlloc(a, physical);
+            defer a.free(identity);
+            try appendCapabilityKeyPart(a, &key, identity);
+        }
+    }
+    const owned_key = try key.toOwnedSlice(a);
+    var key_taken = false;
+    defer if (!key_taken) a.free(owned_key);
+    const slot = try index.getOrPut(a, owned_key);
+    if (slot.found_existing) return &groups.items[slot.value_ptr.*];
+    key_taken = true;
+    slot.value_ptr.* = groups.items.len;
+    var group = PublicFieldGroup{ .field = try dupeOptionalString(a, field), .kind = kind };
+    errdefer group.deinit(a);
+    try groups.append(a, group);
+    return &groups.items[slot.value_ptr.*];
+}
+
+// The private aggregation model keeps physical coverage separate across schema
+// variants. Only this presentation layer groups proven source associations.
+fn generatedFieldCapabilitiesPublicSliceAlloc(a: std.mem.Allocator, capabilities: *std.ArrayListUnmanaged(GeneratedFieldCapability), runtime: runtime_schema_mod.TableSchema) ![]const metadata_openapi.FieldCapability {
+    var groups: std.ArrayListUnmanaged(PublicFieldGroup) = .empty;
+    defer {
+        for (groups.items) |*group| group.deinit(a);
+        groups.deinit(a);
+    }
+    var index: GeneratedFieldCapabilityIndex = .empty;
+    defer freeGeneratedFieldCapabilityIndex(a, &index);
+    for (capabilities.items) |*capability| {
+        const reserved = std.mem.eql(u8, capability.provenance, "reserved");
+        const exact_template = std.mem.eql(u8, capability.provenance, "dynamic_template") and capability.field != null;
+        const source = capability.logical_field orelse (if (exact_template) capability.field else null);
+        const reserved_source = if (source) |field| std.mem.eql(u8, field, "_id") or std.mem.eql(u8, field, "_score") else false;
+        const kind: PublicFieldKind = if (reserved) .reserved else if (source != null and !reserved_source) .source else if (std.mem.eql(u8, capability.provenance, "dynamic_template") and capability.field == null) .template else .unassociated;
+        const field = if (reserved) capability.field else if (kind == .source) source else null;
+        const group = try publicFieldGroup(a, &groups, &index, kind, field, capability.*);
+        group.autocomplete_candidate = group.autocomplete_candidate or capability.type == .search_as_you_type;
+        group.sortable_candidate = group.sortable_candidate or capability.sortable;
+        if (kind == .source) group.string_values = group.string_values or switch (capability.type) {
+            .text, .html, .keyword, .link, .substring, .search_as_you_type => true,
+            else => false,
+        };
+        // Reserve before taking ownership, so failed admission leaves the
+        // private representation intact for the caller's ordinary cleanup.
+        try group.representations.ensureUnusedCapacity(a, 1);
+        group.representations.appendAssumeCapacity(takePublicFieldRepresentation(a, capability));
+    }
+    _ = try publicFieldGroup(a, &groups, &index, .computed, "_score", null);
+    for (groups.items) |*group| std.mem.sort(metadata_openapi.FieldRepresentation, group.representations.items, {}, struct {
+        fn less(_: void, left: metadata_openapi.FieldRepresentation, right: metadata_openapi.FieldRepresentation) bool {
+            inline for (.{ "field", "document_schema", "name", "analyzer", "path_pattern", "field_pattern", "match_mapping_type" }) |member| {
+                const order = std.mem.order(u8, @field(left, member) orelse "", @field(right, member) orelse "");
+                if (order != .eq) return order == .lt;
+            }
+            const order = std.mem.order(u8, @tagName(left.type), @tagName(right.type));
+            if (order != .eq) return order == .lt;
+            return std.mem.order(u8, left.provenance, right.provenance) == .lt;
+        }
+    }.less);
+    std.mem.sort(PublicFieldGroup, groups.items, {}, struct {
+        fn less(_: void, left: PublicFieldGroup, right: PublicFieldGroup) bool {
+            const order = std.mem.order(u8, @tagName(left.kind), @tagName(right.kind));
+            if (order != .eq) return order == .lt;
+            const names = std.mem.order(u8, left.field orelse "", right.field orelse "");
+            if (names != .eq) return names == .lt;
+            if (left.field != null or right.field != null) return false;
+            const l = left.representations.items[0];
+            const r = right.representations.items[0];
+            inline for (.{ "field", "name", "path_pattern", "field_pattern", "match_mapping_type" }) |member| {
+                const result = std.mem.order(u8, @field(l, member) orelse "", @field(r, member) orelse "");
+                if (result != .eq) return result == .lt;
+            }
+            return false;
+        }
+    }.less);
+    const result = try a.alloc(metadata_openapi.FieldCapability, groups.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |entry| freePublicGeneratedFieldCapability(a, entry);
+        a.free(result);
+    }
+    for (groups.items, 0..) |*group, i| {
+        var entry = metadata_openapi.FieldCapability{
+            .kind = "",
+            .value_operations = &.{},
+            .sortable = false,
+            .sort_lifecycle_state = "",
+            .sort_requires_scoring = false,
+            .representations = &.{},
+        };
+        errdefer freePublicGeneratedFieldCapability(a, entry);
+        entry.kind = try a.dupe(u8, @tagName(group.kind));
+        const sort = logicalPublicSort(runtime, group.*);
+        entry.sortable = sort.supported;
+        entry.sort_requires_scoring = sort.requires_scoring;
+        entry.sort_lifecycle_state = try a.dupe(u8, sort.state);
+        if (group.string_values) {
+            const autocomplete = group.autocomplete_candidate and runtime_schema_mod.resolveLogicalAutocompleteRoot(runtime, group.field.?) != null;
+            entry.value_operations = try dupeStringSlice(a, if (autocomplete) &.{ "equals", "contains", "matches", "autocomplete" } else &.{ "equals", "contains", "matches" });
+        }
+        entry.representations = try group.representations.toOwnedSlice(a);
+        entry.field = group.field;
+        group.field = null;
+        result[i] = entry;
+        initialized += 1;
+    }
+    return result;
+}
+
+fn logicalPublicSort(runtime: runtime_schema_mod.TableSchema, group: PublicFieldGroup) struct { supported: bool = false, state: []const u8 = "unsupported", requires_scoring: bool = false } {
+    const field = group.field orelse return .{};
+    if (group.kind == .computed and std.mem.eql(u8, field, "_score")) return .{ .supported = true, .state = "queryable", .requires_scoring = true };
+    if (!group.sortable_candidate) return .{};
+    const target = if (group.kind == .reserved and std.mem.eql(u8, field, "_id")) "_id" else target: {
+        if (group.kind != .source) return .{};
+        const selected = runtime_schema_mod.resolveLogicalDocValues(runtime, field) orelse return .{};
+        if (!runtime_schema_mod.mappingIsSortable(selected.mapping)) return .{};
+        break :target selected.field;
+    };
+    var state: ?[]const u8 = null;
+    for (group.representations.items) |representation| {
+        if (representation.field == null or !std.mem.eql(u8, representation.field.?, target)) continue;
+        if (!representation.sortable) return .{};
+        state = if (state) |prior| runtime_schema_mod.conservativeSortLifecycleState(prior, representation.sort_lifecycle_state) else representation.sort_lifecycle_state;
+    }
+    return if (state) |value| .{ .supported = true, .state = value } else .{};
+}
+
+fn takePublicFieldRepresentation(a: std.mem.Allocator, capability: *GeneratedFieldCapability) metadata_openapi.FieldRepresentation {
+    const physical = capability.emitted_name orelse capability.field;
+    if (capability.emitted_name != null) {
+        if (capability.field) |unused| a.free(@constCast(unused));
+    }
+    const result = metadata_openapi.FieldRepresentation{
+        .field = physical,
+        .name = capability.name,
+        .path_pattern = capability.path_pattern,
+        .field_pattern = capability.field_pattern,
+        .match_mapping_type = capability.match_mapping_type,
+        .document_schema = capability.document_schema,
+        .type = capability.type,
+        .query_modes = capability.query_modes,
+        .sortable = capability.sortable,
+        .provenance = capability.provenance,
+        .missing_null_policy = capability.missing_null_policy,
+        .sort_lifecycle_state = capability.sort_lifecycle_state,
+        .analyzer = capability.analyzer,
+        .index_sort_position = capability.index_sort_position,
+        .index_sort_order = capability.index_sort_order,
+        .doc_value_coverage = capability.doc_value_coverage,
+        .queryability_state = capability.queryability_state,
+    };
+    capability.field = null;
+    capability.emitted_name = null;
+    capability.name = null;
+    capability.path_pattern = null;
+    capability.field_pattern = null;
+    capability.match_mapping_type = null;
+    capability.document_schema = null;
+    capability.query_modes = &.{};
+    capability.provenance = "";
+    capability.missing_null_policy = "";
+    capability.sort_lifecycle_state = "";
+    capability.analyzer = null;
+    capability.index_sort_order = null;
+    capability.doc_value_coverage = "";
+    capability.queryability_state = "";
+    return result;
 }
 
 fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
@@ -2290,6 +2464,10 @@ fn generatedFieldCapabilityAlloc(alloc: std.mem.Allocator, capability: runtime_s
     };
     errdefer freeGeneratedFieldCapability(alloc, owned);
 
+    // Synthetic identity/score metadata is not a JSON source string. Its
+    // existing query modes remain explicit instead of advertising value ops.
+    const logical_field = if (std.mem.eql(u8, capability.provenance, "reserved")) null else capability.logical_field;
+    owned.logical_field = try dupeOptionalString(alloc, logical_field);
     owned.name = try dupeOptionalString(alloc, capability.name);
     owned.field = try dupeOptionalString(alloc, capability.field);
     owned.path_pattern = try dupeOptionalString(alloc, capability.path_pattern);
@@ -2355,12 +2533,20 @@ fn freeGeneratedFieldCapabilities(
 }
 
 fn freePublicGeneratedFieldCapability(alloc: std.mem.Allocator, capability: metadata_openapi.FieldCapability) void {
+    if (capability.field) |field| alloc.free(@constCast(field));
+    if (capability.kind.len > 0) alloc.free(@constCast(capability.kind));
+    freeOwnedStringSlice(alloc, capability.value_operations);
+    if (capability.sort_lifecycle_state.len > 0) alloc.free(@constCast(capability.sort_lifecycle_state));
+    for (capability.representations) |representation| freePublicFieldRepresentation(alloc, representation);
+    if (capability.representations.len > 0) alloc.free(@constCast(capability.representations));
+}
+
+fn freePublicFieldRepresentation(alloc: std.mem.Allocator, capability: metadata_openapi.FieldRepresentation) void {
     if (capability.name) |value| alloc.free(@constCast(value));
     if (capability.field) |value| alloc.free(@constCast(value));
     if (capability.path_pattern) |value| alloc.free(@constCast(value));
     if (capability.field_pattern) |value| alloc.free(@constCast(value));
     if (capability.match_mapping_type) |value| alloc.free(@constCast(value));
-    if (capability.emitted_name) |value| alloc.free(@constCast(value));
     if (capability.document_schema) |value| alloc.free(@constCast(value));
     freeOwnedStringSlice(alloc, capability.query_modes);
     if (capability.provenance.len > 0) alloc.free(@constCast(capability.provenance));
@@ -2368,9 +2554,12 @@ fn freePublicGeneratedFieldCapability(alloc: std.mem.Allocator, capability: meta
     if (capability.sort_lifecycle_state.len > 0) alloc.free(@constCast(capability.sort_lifecycle_state));
     if (capability.analyzer) |value| alloc.free(@constCast(value));
     if (capability.index_sort_order) |value| alloc.free(@constCast(value));
+    if (capability.doc_value_coverage.len > 0) alloc.free(@constCast(capability.doc_value_coverage));
+    if (capability.queryability_state.len > 0) alloc.free(@constCast(capability.queryability_state));
 }
 
 fn freeGeneratedFieldCapability(alloc: std.mem.Allocator, capability: GeneratedFieldCapability) void {
+    if (capability.logical_field) |value| alloc.free(@constCast(value));
     if (capability.name) |value| alloc.free(@constCast(value));
     if (capability.field) |value| alloc.free(@constCast(value));
     if (capability.path_pattern) |value| alloc.free(@constCast(value));
@@ -2606,7 +2795,7 @@ fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
 }
 
 fn isReservedIndexMetadataEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
+    return @import("antfly_local_sources").api_local_indexes.isReservedIndexMetadataEntry(name);
 }
 
 fn encodeSingleTableIndex(
@@ -2752,7 +2941,7 @@ fn collectArtifactEnrichmentSummaries(
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 try collectArtifactEnrichmentSummaries(alloc, entry.value_ptr.*, out);
             }
         },
@@ -4546,30 +4735,26 @@ test "metadata.table status encoder canonicalizes embeddings indexes independent
     }
 }
 
-fn testFieldCapabilityByIdentifier(root: std.json.Value, identifier: []const u8) ?std.json.Value {
+fn testFieldRepresentationByIdentifier(root: std.json.Value, identifier: []const u8) ?std.json.Value {
     const capabilities = root.object.get("field_capabilities") orelse return null;
     if (capabilities != .array) return null;
     for (capabilities.array.items) |capability| {
-        if (capability != .object) continue;
-        if (capability.object.get("field")) |field| {
-            if (field == .string and std.mem.eql(u8, field.string, identifier)) return capability;
-        }
-        if (capability.object.get("name")) |name| {
-            if (name == .string and std.mem.eql(u8, name.string, identifier)) return capability;
+        const representations = capability.object.get("representations") orelse continue;
+        for (representations.array.items) |representation| {
+            for ([_][]const u8{ "field", "name" }) |key| {
+                const value = representation.object.get(key) orelse continue;
+                if (value == .string and std.mem.eql(u8, value.string, identifier)) return representation;
+            }
         }
     }
     return null;
 }
 
-fn testGeneratedCapabilityByIdentifier(capabilities: []const metadata_openapi.FieldCapability, identifier: []const u8) ?metadata_openapi.FieldCapability {
-    for (capabilities) |capability| {
-        if (capability.field) |field| {
-            if (std.mem.eql(u8, field, identifier)) return capability;
-        }
-        if (capability.name) |name| {
-            if (std.mem.eql(u8, name, identifier)) return capability;
-        }
-    }
+fn testGeneratedRepresentationByIdentifier(capabilities: []const metadata_openapi.FieldCapability, identifier: []const u8) ?metadata_openapi.FieldRepresentation {
+    for (capabilities) |capability| for (capability.representations) |representation| {
+        if (representation.field) |field| if (std.mem.eql(u8, field, identifier)) return representation;
+        if (representation.name) |name| if (std.mem.eql(u8, name, identifier)) return representation;
+    };
     return null;
 }
 
@@ -4604,7 +4789,7 @@ test "metadata.table generated field capabilities include schema dynamic templat
     const capabilities = (try generatedFieldCapabilitiesAlloc(std.testing.allocator, &table, null)) orelse return error.TestUnexpectedResult;
     defer freeGeneratedFieldCapabilities(std.testing.allocator, capabilities);
 
-    const created = testGeneratedCapabilityByIdentifier(capabilities, "created") orelse return error.TestUnexpectedResult;
+    const created = testGeneratedRepresentationByIdentifier(capabilities, "created") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("created_at", created.path_pattern.?);
     try std.testing.expectEqual(metadata_openapi.AntflyType.datetime, created.type);
     try std.testing.expect(testStringSliceContains(created.query_modes, "exact"));
@@ -4635,10 +4820,10 @@ test "metadata.table status exposes stable field capabilities" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
 
-    const id_capability = testFieldCapabilityByIdentifier(parsed.value, "_id") orelse return error.TestUnexpectedResult;
+    const id_capability = testFieldRepresentationByIdentifier(parsed.value, "_id") orelse return error.TestUnexpectedResult;
     try std.testing.expect(id_capability.object.get("sortable").?.bool);
 
-    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    const created = testFieldRepresentationByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("created_at", created.object.get("path_pattern").?.string);
     try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
     try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "exact"));
@@ -4734,7 +4919,7 @@ test "metadata.table status promotes schema capability when runtime coverage is 
     defer std.testing.allocator.free(encoded);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
-    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    const created = testFieldRepresentationByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
     try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "exact"));
     try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "range"));
@@ -4787,7 +4972,7 @@ test "metadata.table status promotes schema geo capability when runtime coverage
     defer std.testing.allocator.free(encoded);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
-    const location = testFieldCapabilityByIdentifier(parsed.value, "location") orelse return error.TestUnexpectedResult;
+    const location = testFieldRepresentationByIdentifier(parsed.value, "location") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("geopoint", location.object.get("type").?.string);
     try std.testing.expect(testJsonArrayContainsString(location.object.get("query_modes").?, "geo"));
     try std.testing.expect(!location.object.get("sortable").?.bool);
@@ -4839,7 +5024,7 @@ test "metadata.table status does not promote mismatched index sort runtime capab
     defer std.testing.allocator.free(encoded);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
-    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    const created = testFieldRepresentationByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
     try std.testing.expectEqualStrings("declared", created.object.get("sort_lifecycle_state").?.string);
     try std.testing.expect(created.object.get("index_sort_position") == null);
@@ -4895,7 +5080,7 @@ test "metadata.table status does not advertise changed index sort direction befo
     defer std.testing.allocator.free(encoded);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
-    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    const created = testFieldRepresentationByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
     try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "exact"));
     try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "range"));
@@ -4977,7 +5162,7 @@ test "metadata.table status merges observed capabilities conservatively" {
     defer std.testing.allocator.free(encoded);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
-    const price = testFieldCapabilityByIdentifier(parsed.value, "price") orelse return error.TestUnexpectedResult;
+    const price = testFieldRepresentationByIdentifier(parsed.value, "price") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("numeric", price.object.get("type").?.string);
     try std.testing.expect(testJsonArrayContainsString(price.object.get("query_modes").?, "exact"));
     try std.testing.expect(testJsonArrayContainsString(price.object.get("query_modes").?, "range"));
@@ -6587,4 +6772,102 @@ test "external lake public aggregate recipes expand through schema derivation" {
         "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"aggregates\":[{\"name\":\"n\",\"op\":\"count\"},{\"name\":\"n\",\"op\":\"count\"}]}",
     };
     for (invalid) |body| try std.testing.expectError(error.InvalidCreateTableRequest, validatePublicAlgebraicIndexJson(a, body));
+}
+
+test "logical field public capability ownership groups sources and bounds failures" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const runtime = runtime_schema_mod.TableSchema{
+                .exact_fields = &.{
+                    .{ .source_field = "title", .field = "title", .mapping = .{ .field_type = .text } },
+                    .{ .source_field = "title", .field = "title._keyword", .mapping = .{ .field_type = .keyword, .analyzer = "keyword", .doc_values = true, .sortable = true } },
+                    .{ .source_field = "title", .field = "title.suggest", .mapping = .{ .field_type = .search_as_you_type, .analyzer = "search_as_you_type" } },
+                },
+                .dynamic_templates = &.{.{ .name = "other_strings", .path_match = "other.*", .mapping = .{ .field_type = .keyword } }},
+            };
+            const native = try runtime_schema_mod.fieldCapabilitiesAlloc(a, runtime);
+            defer runtime_schema_mod.freeFieldCapabilities(a, native);
+            var capabilities: std.ArrayListUnmanaged(GeneratedFieldCapability) = .empty;
+            defer freeGeneratedFieldCapabilitiesFromList(a, &capabilities);
+            for (native) |capability| {
+                try capabilities.ensureUnusedCapacity(a, 1);
+                capabilities.appendAssumeCapacity(try generatedFieldCapabilityAlloc(a, capability));
+            }
+            try capabilities.ensureUnusedCapacity(a, 1);
+            capabilities.appendAssumeCapacity(try generatedFieldCapabilityAlloc(a, runtime_schema_mod.observedDynamicFieldCapability(null, "mystery._keyword", .{ .field_type = .keyword })));
+            const public = try generatedFieldCapabilitiesPublicSliceAlloc(a, &capabilities, runtime);
+            defer freeGeneratedFieldCapabilities(a, public);
+            try std.testing.expectEqual(@as(usize, 5), public.len);
+            var sources: usize = 0;
+            for (public) |capability| {
+                if (std.mem.eql(u8, capability.kind, "source")) {
+                    sources += 1;
+                    try std.testing.expectEqualStrings("title", capability.field.?);
+                    try std.testing.expectEqual(@as(usize, 3), capability.representations.len);
+                    try std.testing.expectEqual(@as(usize, 4), capability.value_operations.len);
+                    try std.testing.expect(capability.sortable);
+                    try std.testing.expectEqualStrings("declared", capability.sort_lifecycle_state);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), capability.value_operations.len);
+                    if (std.mem.eql(u8, capability.kind, "computed")) {
+                        try std.testing.expectEqualStrings("_score", capability.field.?);
+                        try std.testing.expect(capability.sortable and capability.sort_requires_scoring);
+                    } else if (std.mem.eql(u8, capability.kind, "unassociated")) {
+                        try std.testing.expect(capability.field == null);
+                        try std.testing.expectEqualStrings("mystery._keyword", capability.representations[0].field.?);
+                    } else if (std.mem.eql(u8, capability.kind, "template")) try std.testing.expect(capability.field == null);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 1), sources);
+            const encoded = try std.json.Stringify.valueAlloc(a, public, .{ .emit_null_optional_fields = false });
+            defer a.free(encoded);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "logical_field") == null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "emitted_name") == null);
+            // The same executable resolver rejects two keyword alternatives.
+            const ambiguous = runtime_schema_mod.TableSchema{ .exact_fields = &.{ runtime.exact_fields[0], runtime.exact_fields[1], .{ .source_field = "title", .field = "title.raw", .mapping = runtime.exact_fields[1].mapping } } };
+            const title_representations = for (public) |entry| {
+                if (entry.field != null and std.mem.eql(u8, entry.field.?, "title")) break entry.representations;
+            } else unreachable;
+            var group = PublicFieldGroup{ .field = "title", .kind = .source, .sortable_candidate = true };
+            group.representations.items = @constCast(title_representations);
+            group.representations.capacity = title_representations.len;
+            try std.testing.expect(!logicalPublicSort(ambiguous, group).supported);
+            try std.testing.expect(logicalPublicSort(runtime, group).supported);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(failing.allocator(), Fixture.run, .{});
+}
+
+test "resolver curation HTTP enrichment summaries exclude opaque metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"_curation_proposals":{"enrichments":[{"name":"fake"}]},"_resolver_curation":{"enrichments":[{"name":"fake"}]},"_resolver_namespaces":{"enrichments":[{"name":"fake"}]},"index":{"enrichments":[{"name":"live"}]}}
+    , .{});
+    var summaries = std.json.Array.init(a);
+    try collectArtifactEnrichmentSummaries(a, root, &summaries);
+    try std.testing.expectEqual(@as(usize, 1), summaries.items.len);
+    try std.testing.expectEqualStrings("live", summaries.items[0].object.get("name").?.string);
+}
+
+test "system catalog cached capabilities retain shorthand scalar source names" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"size":{"type":"number","x-antfly-types":["numeric"]},"modified_at":{"type":"string","x-antfly-types":["datetime"]}}}}}}
+    ;
+    const entry = try DefinitionCache.Entry.create(a, @splat(0), &.{ .table_id = 1, .name = "docs", .schema_json = schema });
+    defer entry.release();
+    for ([_][]const u8{ "size", "modified_at" }) |name| {
+        var found = false;
+        for (entry.capabilities.?) |capability| {
+            if (capability.field) |field| if (std.mem.eql(u8, name, field)) {
+                try std.testing.expect(!capability.sortable);
+                found = true;
+            };
+        }
+        try std.testing.expect(found);
+    }
 }

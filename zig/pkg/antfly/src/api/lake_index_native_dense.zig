@@ -25,7 +25,10 @@ const rebuild = @import("../serverless/build/lake_rebuild.zig");
 const A = std.mem.Allocator;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
-pub const metadata_version: u16 = 2;
+pub const metadata_version: u16 = 4;
+pub fn supportsMetadata(version: u16) bool {
+    return version == 2 or version == 3 or version == metadata_version;
+}
 pub const Root = struct {
     version: u16 = metadata_version,
     binding: local.serverless_segment_source_binding.Binding,
@@ -35,16 +38,21 @@ pub const Root = struct {
     generation: files.Root,
     recipe: [32]u8 = @splat(0),
     file_states: []const state.File = &.{},
+    file_directory: ?@import("../serverless/graph_segment/page_tree.zig").Ref = null,
 };
 pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
-    if (ref.kind != .vector_segment or ref.metadata_version != metadata_version or ref.byte_len > files.max_root_bytes) return error.InvalidNativeLakeDenseRoot;
+    if (ref.kind != .vector_segment or !supportsMetadata(ref.metadata_version) or ref.byte_len > files.max_root_bytes) return error.InvalidNativeLakeDenseRoot;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cache);
     defer a.free(bytes);
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
-    if (root.version != metadata_version or root.binding.sidecar_kind != .vector or root.binding.column_bindings.len != 1 or root.config_json.len > 256 * 1024 or root.dims == 0 or root.dims > 65536) return error.InvalidNativeLakeDenseRoot;
+    if (root.version != ref.metadata_version or root.binding.sidecar_kind != .vector or root.binding.column_bindings.len != 1 or root.config_json.len > 256 * 1024 or root.dims == 0 or root.dims > 65536) return error.InvalidNativeLakeDenseRoot;
     try root.binding.validate();
     try root.generation.validate();
     try state.validate(root.file_states, root.generation.domain);
+    if (root.file_directory) |directory| {
+        try directory.validate();
+        if (root.version < 3 or root.file_states.len != 0) return error.InvalidNativeLakeFileState;
+    }
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeDenseRoot;
     if (!std.mem.eql(u8, &scope.domain, &root.generation.domain)) return error.InvalidNativeLakeDenseRoot;
     return root;
@@ -72,7 +80,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer producer.deinit();
         producer.memo = provider.vector_memo;
         const prior = for (reusable) |declaration| {
-            if (declaration.artifact.kind == .vector_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, wanted.name) and rebuild.bindingsEqual(binding, declaration.binding)) break declaration;
+            if (declaration.artifact.kind == .vector_segment and supportsMetadata(declaration.artifact.metadata_version) and std.mem.eql(u8, declaration.name, wanted.name) and rebuild.bindingsEqual(binding, declaration.binding)) break declaration;
         } else null;
         if (prior) |declaration| {
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
@@ -82,7 +90,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
         }
         const seed: ?Root = for (candidates) |declaration| {
-            if (declaration.artifact.kind != .vector_segment or declaration.artifact.metadata_version != metadata_version or !std.mem.eql(u8, declaration.name, wanted.name)) continue;
+            if (declaration.artifact.kind != .vector_segment or !supportsMetadata(declaration.artifact.metadata_version) or !std.mem.eql(u8, declaration.name, wanted.name)) continue;
             var previous_binding = declaration.binding;
             previous_binding.snapshot_id = binding.snapshot_id;
             if (!rebuild.bindingsEqual(binding, previous_binding)) continue;
@@ -90,10 +98,19 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (!std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.generation.domain, &store.upload_scope.?.domain)) continue;
             break root;
         } else null;
-        var plan = try state.Plan.init(a, ca, provider, if (seed) |root| root.file_states else &.{});
+        if (provider.resume_work) |work| if (work.file != null and seed != null) {
+            const accepted = for (candidates) |declaration| {
+                if (work.trusts(store.*, declaration.artifact) and std.mem.eql(u8, declaration.name, wanted.name)) break true;
+            } else false;
+            if (!accepted) return error.InvalidNativeLakeFileState;
+        };
+        const appending = if (provider.resume_work) |work| work.file != null else false;
+        const previous_states = if (appending) &.{} else if (seed) |root| if (root.file_directory != null and !state.canUseDelta(provider, root.binding.snapshot_id)) try state.directoryFiles(ca, store.*, root.file_directory.?, root.generation.domain, cancellation) else root.file_states else &.{};
+        var plan = try state.Plan.initPaged(a, ca, provider, previous_states, if (seed) |root| root.file_directory else null, seed != null, if (seed) |root| state.canUseDelta(provider, root.binding.snapshot_id) else false);
         defer plan.deinit();
         var tracker = try state.Tracker.init(a, ca, &plan, store, cancellation);
         defer tracker.deinit();
+        tracker.cumulative_bytes = if (provider.resume_work) |work| &work.native_keys_left else null;
         const io = provider.context.io orelse return error.UnsupportedSqlExecution;
         var random: [16]u8 = undefined;
         try io.randomSecure(&random);
@@ -129,13 +146,18 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             try index.activateExperimentalPostingReads(0);
             try index.enableNativePostingMutationStore();
         }
+        var baseline_vectors = if (seed != null) try vectors.pinNativeCheckpoint() else null;
+        defer if (baseline_vectors) |*cut| cut.deinit();
+        var baseline_postings = if (seed != null) (try index.nativeBackupGeneration(a, 0)) orelse return error.InvalidNativeLakeDenseRoot else null;
+        defer if (baseline_postings) |*cut| cut.deinit();
         if (seed == null) try index.beginBulkIngestSession();
         var finished = false;
         defer if (!finished and seed == null) index.abortBulkIngestSession();
         var identities: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer identities.deinit(budget.allocator());
         if (seed) |root| {
-            var deletes: state.Deletes = .{ .files = root.file_states, .current = &plan };
+            var deletes: state.Deletes = .{ .files = if (appending) &.{} else if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan };
+            defer deletes.deinit();
             while (try deletes.next(a, store.*, cancellation)) |keys| {
                 defer a.free(keys);
                 var ids: std.ArrayList(u64) = .empty;
@@ -171,18 +193,20 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
         }
         var input_provider = provider.*;
-        input_provider.only_files = plan.changed;
+        input_provider.only_plan = &plan;
         input_provider.enrichment_columns = @import("lake_enrichment_units.zig").configured(producer.config, "template") != null;
         const rows = try input_provider.provider().open_with_cancellation_fn.?(input_provider.provider().ptr, a, binding, cancellation);
         defer rows.deinit(a);
-        var input: u64 = 512 * 1024 * 1024;
+        var input_remaining: u64 = 512 * 1024 * 1024;
+        const input = if (provider.resume_work) |work| &work.native_input_left else &input_remaining;
         while (try rows.next(a)) |batch| {
             var page_arena = std.heap.ArenaAllocator.init(a);
             defer page_arena.deinit();
             const pa = page_arena.allocator();
             var writes: std.ArrayList(hbc.BatchInsertItem) = .empty;
             var unit_records: std.StringHashMapUnmanaged([]const u8) = .empty;
-            for (batch.row_refs, 0..) |ref, ordinal| {
+            for (0..batch.rowCount()) |ordinal| {
+                const ref = batch.rowRef(ordinal);
                 try cancellation.check();
                 try provider.context.ensureActive();
                 const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{ordinal} };
@@ -202,7 +226,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         defer index.alloc.free(existing);
                         return error.NativeLakeVectorIdentityCollision;
                     };
-                    try stores.chargeReadBudget(&input, @as(u64, dims) * 4 + 128);
+                    try stores.chargeReadBudget(input, @as(u64, dims) * 4 + 128);
                     try writes.append(pa, .{ .vector_id = id, .vector = vector, .metadata = key });
                 }
             }
@@ -235,15 +259,26 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         try index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{ .flatten = flatten, .make_authoritative = true });
         var checkpoint = (try index.nativeBackupGeneration(a, 0)) orelse return error.InvalidNativeLakeDenseRoot;
         defer checkpoint.deinit();
-        var output_bytes: u64 = 1024 * 1024 * 1024;
-        const posting_generation = try publishGeneration(a, ca, &checkpoint, store, cancellation, &output_bytes, if (seed) |root| .{ .root = root.generation } else null);
+        var output_remaining: u64 = 1024 * 1024 * 1024;
+        const output_bytes: files.OutputBudget = .{ .generation = &output_remaining, .work = if (provider.resume_work) |work| &work.native_output_left else null };
+        var navigation: @import("lake_index_native_directory.zig").Navigation = .{ .allocator = a };
+        defer navigation.deinit();
         var vector_checkpoint = try vectors.pinNativeCheckpoint();
         defer vector_checkpoint.deinit();
-        const vector_generation = try files.publishCheckpoint(a, ca, &vector_checkpoint, store, cancellation, &output_bytes, if (seed) |root| .{ .root = root.generation, .prefix = "vectors/" } else null);
-        const generation = try combineVectors(ca, posting_generation, vector_generation);
-        const root: Root = .{ .binding = binding, .config_json = config.config_json, .dims = dims, .metric = metric, .generation = generation, .recipe = recipe, .file_states = plan.files };
+        const generation = if (seed != null and seed.?.generation.version == 2) delta: {
+            const before = try combineExtents(ca, try generationExtents(ca, &baseline_postings.?), try files.checkpointExtents(ca, &baseline_vectors.?, "vectors/"));
+            const after = try combineExtents(ca, try generationExtents(ca, &checkpoint), try files.checkpointExtents(ca, &vector_checkpoint, "vectors/"));
+            break :delta try files.publishExtentDelta(a, ca, checkpoint.storage, before, after, seed.?.generation, store, cancellation, output_bytes);
+        } else full: {
+            const posting_generation = try publishGeneration(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .navigation = &navigation } else null);
+            const vector_generation = try files.publishCheckpoint(a, ca, &vector_checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .prefix = "vectors/", .navigation = &navigation } else null);
+            const staging_generation = try combineVectors(ca, posting_generation, vector_generation);
+            break :full try @import("lake_index_native_directory.zig").persist(a, ca, store, staging_generation, if (seed) |root| root.generation else null, cancellation, if (provider.resume_work) |work| &work.native_output_left else null);
+        };
+        const root: Root = .{ .binding = binding, .config_json = config.config_json, .dims = dims, .metric = metric, .generation = generation, .recipe = recipe, .file_states = if (!plan.isPaged()) plan.files else &.{}, .file_directory = if (plan.isPaged()) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > files.max_root_bytes) return error.NativeLakeFilesTooLarge;
+        if (provider.resume_work) |work| try stores.chargeReadBudget(&work.native_output_left, bytes.len);
         var uploaded = try store.putWithCancellation(bytes, cancellation);
         defer uploaded.deinit(store.allocator);
         const declaration: Declared = .{ .name = wanted.name, .binding = binding, .artifact = .{ .kind = .vector_segment, .name = wanted.name, .metadata_version = metadata_version, .artifact_id = uploaded.artifact_id, .byte_len = uploaded.byte_len, .checksum = uploaded.checksum } };
@@ -263,7 +298,34 @@ pub fn vectorId(key: []const u8) u64 {
     hash.final(&digest);
     return std.mem.readInt(u64, digest[0..8], .little);
 }
-pub fn publishGeneration(a: A, out: A, checkpoint: *const local.storage_hbc_adapter.HBCIndex.NativeBackupGeneration, store: *stores.ArtifactStore, cancellation: Cancellation, budget: *u64, reuse: ?files.Reuse) !files.Root {
+fn combineExtents(out: A, postings: []const files.Extent, vectors: []const files.Extent) ![]files.Extent {
+    const result = try out.alloc(files.Extent, postings.len + vectors.len);
+    @memcpy(result[0..postings.len], postings);
+    @memcpy(result[postings.len..], vectors);
+    files.sortExtents(result);
+    return result;
+}
+fn generationExtents(out: A, checkpoint: *const local.storage_hbc_adapter.HBCIndex.NativeBackupGeneration) ![]files.Extent {
+    const posting = local.storage_posting_segment_store;
+    const result = try out.alloc(files.Extent, 3 + checkpoint.segment_generations.len + checkpoint.sealed_wal_count);
+    result[0] = .{ .path = "posting-segments/CURRENT", .bytes = checkpoint.current_bytes.len, .data = checkpoint.current_bytes };
+    result[1] = .{ .path = "posting-segments/" ++ posting.authority_name, .bytes = posting.authority_value.len, .data = posting.authority_value };
+    var n: usize = 2;
+    for (checkpoint.segment_generations) |generation| {
+        const physical = try posting.checkpointSegmentPathAlloc(out, checkpoint.root_dir, generation);
+        result[n] = .{ .path = try std.fmt.allocPrint(out, "posting-segments/segment-{d}.afps", .{generation}), .physical = physical, .bytes = try checkpoint.storage.fileSize(physical) };
+        n += 1;
+    }
+    for (checkpoint.sealed_wals[0..checkpoint.sealed_wal_count]) |extent| {
+        result[n] = .{ .path = try std.fmt.allocPrint(out, "posting-segments/wal-{d}.afpw", .{extent.generation}), .physical = try posting.checkpointWalPathAlloc(out, checkpoint.root_dir, extent.generation), .bytes = extent.committed_bytes, .append_only = true };
+        n += 1;
+    }
+    result[n] = .{ .path = try std.fmt.allocPrint(out, "posting-segments/wal-{d}.afpw", .{checkpoint.wal_generation}), .physical = try posting.checkpointWalPathAlloc(out, checkpoint.root_dir, checkpoint.wal_generation), .bytes = checkpoint.wal_committed_bytes, .append_only = true };
+    files.sortExtents(result);
+    return result;
+}
+
+pub fn publishGeneration(a: A, out: A, checkpoint: *const local.storage_hbc_adapter.HBCIndex.NativeBackupGeneration, store: *stores.ArtifactStore, cancellation: Cancellation, budget: anytype, reuse: ?files.Reuse) !files.Root {
     var result: std.ArrayList(files.File) = .empty;
     const posting = local.storage_posting_segment_store;
     try result.append(out, try files.publishBytes(out, "posting-segments/CURRENT", checkpoint.current_bytes, store, cancellation, budget, reuse));

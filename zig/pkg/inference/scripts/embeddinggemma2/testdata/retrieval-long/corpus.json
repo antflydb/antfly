@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "purpose": "52 second full-pipeline reference preservation and completed latency; unlabelled queries",
+  "documents": [
+    {
+      "id": "sintel-52s",
+      "path": "sintel-52s.mp4",
+      "sha256": "bc0b86d65aa4ed3de49dcc062d0d5ef99a85695aa619e2dfd5dfce389581ab11",
+      "provenance": {
+        "title": "Sintel trailer",
+        "attribution": "Blender Foundation, durian.blender.org",
+        "license": "CC BY 3.0",
+        "source": "https://download.blender.org/durian/trailer/sintel_trailer-480p.mp4",
+        "source_sha256": "b670602fa00934ca27c4351bb0efe7ea7a07fae57284e44226025eeed7c51254",
+        "start_seconds": 0,
+        "duration_seconds": 52.208333,
+        "encoding_command": [
+          "-v",
+          "error",
+          "-y",
+          "-i",
+          "/private/tmp/sintel-trailer-480p.mp4",
+          "-an",
+          "-vf",
+          "scale=480:320",
+          "-r",
+          "24",
+          "-c:v",
+          "libx264",
+          "-profile:v",
+          "high",
+          "-crf",
+          "22",
+          "-pix_fmt",
+          "yuv420p",
+          "-x264-params",
+          "keyint=48:min-keyint=48:scenecut=0:bframes=2:ref=4",
+          "-colorspace",
+          "smpte170m",
+          "-color_primaries",
+          "bt709",
+          "-color_trc",
+          "bt709",
+          "-color_range",
+          "tv",
+          "sintel-52s.mp4"
+        ]
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "q0",
+      "text": "A person outdoors in a rocky landscape."
+    },
+    {
+      "id": "q1",
+      "text": "A close-up of a person talking."
+    },
+    {
+      "id": "q2",
+      "text": "A dragon moving through a scene."
+    },
+    {
+      "id": "q3",
+      "text": "People moving in a village."
+    }
+  ]
+}

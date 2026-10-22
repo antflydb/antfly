@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from subprocess_watchdog import run_with_progress_deadline
 
 import antfly_embedded
 from antfly_embedded._library import find_library
@@ -147,20 +148,31 @@ def test_index_readiness_visible_on_open_and_status_only_handles(aflite_path) ->
 @pytest.mark.parametrize("wait_mode", ["run_until_idle", "full_index"])
 def test_external_dense_index_wait_finishes(aflite_path, wait_mode: str) -> None:
     # The DocStore unit test proves the lock order. Exercise the real Lite
-    # workload here with a child-process deadline for each wait mode.
+    # workload here with a deadline for each native call, not for all 16
+    # batches combined. A slow runner must still detect an actual stalled call.
     library = find_library()
     assert library is not None
     env = os.environ.copy()
     env["ANTFLY_LIBRARY"] = str(library)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(Path(__file__).parents[1] / "src"), env.get("PYTHONPATH"))))
-    result = subprocess.run(
-        [sys.executable, __file__, str(aflite_path), wait_mode],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-        env=env,
-    )
+    try:
+        result = run_with_progress_deadline(
+            [sys.executable, __file__, str(aflite_path), wait_mode],
+            env=env,
+            progress_prefix=f"{wait_mode}:",
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # The watchdog kills and joins the child before raising. Preserve its
+        # native diagnostics; pytest otherwise reports only the command, hiding
+        # whether this was a replay stall, startup panic, or teardown failure.
+        def output(value: str | bytes | None) -> str:
+            return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+
+        pytest.fail(
+            f"{wait_mode} made no progress for 30 seconds\nstdout:\n{output(exc.stdout)}\nstderr:\n{output(exc.stderr)}",
+            pytrace=False,
+        )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -190,14 +202,19 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
                     ),
                 }
             )
-        for batch in batches:
+        for ordinal, batch in enumerate(batches):
+            print(f"{wait_mode}: batch {ordinal} write", flush=True)
             inserts = {key: {field: expand(value) for field, value in doc.items()} for key, doc in batch.items()}
             request: dict[str, object] = {"inserts": inserts}
             if wait_mode == "full_index":
                 request["sync_level"] = "full_index"
             db.batch_json(request)
             if wait_mode == "run_until_idle":
+                print(f"{wait_mode}: batch {ordinal} drain", flush=True)
                 db.run_until_idle()
+            print(f"{wait_mode}: batch {ordinal} complete", flush=True)
+        print(f"{wait_mode}: closing", flush=True)
+    print(f"{wait_mode}: closed", flush=True)
 
 
 if __name__ == "__main__":
@@ -754,9 +771,10 @@ def test_index_upgrade_and_retired_identity_management(tmp_path, storage, order)
         db.merge_resolver_keys("concepts", "entity/ada", "entity/canonical")
         db.run_until_idle()
         reader_version = db.capabilities()["minimum_reader_version"]
-        # Inline graph resolver ownership uses the epoch-3 format; the fence
-        # must survive upgrades, retirement and reopening without weakening.
-        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 3
+        # Durable curation requires epoch 6. Newer persisted features may
+        # raise that fence; the observed fence must never weaken on upgrade.
+        assert reader_version >= 6
+        assert reader_version == db.status()["capabilities"]["minimum_reader_version"]
         with pytest.raises(antfly_embedded.InvalidArgumentError, match="retire"):
             db.drop_resolver_identity("concepts")
         upgraded = json.loads(json.dumps(config))
@@ -1442,7 +1460,8 @@ def test_inline_resolver_background_work_settles_after_writes(aflite_path, promo
                     and graph_name in {index["name"] for index in docs.list_indexes()}
                 ):
                     break
-                assert time.monotonic() < deadline, stats
+                if time.monotonic() >= deadline:
+                    pytest.fail(f"background resolver work did not settle: {json.dumps(stats, sort_keys=True)}")
                 time.sleep(0.1)
             assert docs.edges(graph_name, "d0", "about", antfly_embedded.GraphDirection.OUT)
             sequence = stats["derived_target_sequence"]
@@ -1490,3 +1509,69 @@ def test_native_child_replacement_replays_generated_artifacts_beside_idle_root(t
             assert [
                 base64.b64decode(edge["target_b64"]).decode() for edge in table.edges("new", "claim", "mentions", 0)
             ] == ["entity/ada"]
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_qualified_incoming_graph_starts_preserve_table_and_path(tmp_path, storage):
+    path = tmp_path / ("qualified.aflite" if storage == antfly_embedded.Storage.LITE else "qualified")
+    with _open_graph_test(path, antfly_embedded.OpenOptions(storage=storage)) as db:
+        db.add_index({"name": "graph", "kind": "graph", "config_json": "{}"})
+        db.batch_json(
+            {
+                "inserts": {"a": {}, "b": {}},
+                "graph_writes": [
+                    {
+                        "index_name": "graph",
+                        "source": "a",
+                        "target": "shared",
+                        "edge_type": "about",
+                        "metadata_json": '{"target_table":"concepts"}',
+                    },
+                    {
+                        "index_name": "graph",
+                        "source": "b",
+                        "target": "shared",
+                        "edge_type": "about",
+                        "metadata_json": '{"target_table":"other_concepts"}',
+                    },
+                ],
+                "sync_level": "full_index",
+            }
+        )
+        local = db.search(
+            {
+                "graph_queries": {
+                    "outgoing": {
+                        "index": "graph",
+                        "traverse": {
+                            "start": {"identities": [{"table": "docs", "key": "a"}]},
+                            "direction": "out",
+                            "edge_types": ["about"],
+                            "max_depth": 1,
+                        },
+                    }
+                }
+            }
+        )["responses"][0]["graph_results"]["outgoing"]["nodes"]
+        assert [(node["table"], node["key"]) for node in local] == [("concepts", "shared")]
+        for table, expected in (("concepts", ["a"]), ("other_concepts", ["b"]), ("unknown", [])):
+            result = db.search(
+                {
+                    "graph_queries": {
+                        "incoming": {
+                            "index": "graph",
+                            "traverse": {
+                                "start": {"identities": [{"table": table, "key": "shared"}]},
+                                "direction": "in",
+                                "edge_types": ["about"],
+                                "max_depth": 1,
+                                "include_paths": True,
+                            },
+                        }
+                    }
+                }
+            )
+            nodes = result["responses"][0]["graph_results"]["incoming"]["nodes"]
+            assert [node["key"] for node in nodes] == expected
+            if nodes:
+                assert nodes[0]["path"][0]["table"] == table

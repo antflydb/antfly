@@ -51,7 +51,7 @@ pub const Manifest = struct {
                     return error.DuplicateSidecarArtifactDeclaration;
                 }
                 if (std.mem.eql(u8, previous.artifact.artifact_id, artifact.artifact.artifact_id) and
-                    !artifact_ref.areGraphArtifactAliases(previous.artifact, artifact.artifact))
+                    !artifact_ref.areArtifactAliases(previous.artifact, artifact.artifact))
                 {
                     return error.DuplicateSidecarArtifactDeclaration;
                 }
@@ -369,4 +369,15 @@ test "sidecar manifest validates declared artifacts against pinned base source" 
         error.SidecarSourceBindingMismatch,
         validateManifestAgainstBaseSource(.{ .artifacts = &[_]DeclaredArtifact{stale} }, descriptor),
     );
+}
+
+test "serverless aggregate pack manifest accepts exact logical aliases only" {
+    const binding: source_binding.Binding = .{ .sidecar_kind = .algebraic, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe" };
+    const first: DeclaredArtifact = .{ .name = "stats.count", .binding = binding, .artifact = .{ .kind = .algebraic_segment, .metadata_version = 6, .name = "stats.count", .artifact_id = "pack", .checksum = "checksum", .byte_len = 128 } };
+    var second = first;
+    second.name = "stats.sum";
+    second.artifact.name = second.name;
+    try (Manifest{ .artifacts = &.{ first, second } }).validate();
+    second.artifact.byte_len += 1;
+    try std.testing.expectError(error.DuplicateSidecarArtifactDeclaration, (Manifest{ .artifacts = &.{ first, second } }).validate());
 }

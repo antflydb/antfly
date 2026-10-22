@@ -110,6 +110,50 @@ pub fn nowNs() u64 {
     return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
 }
 
+/// Request-owned token accounting. Explicit input estimates support non-text
+/// inputs; excess provider usage becomes shared debt even for a fresh caller.
+/// Failed attempts retain their reservations, and successful calls never refund.
+pub const TokenReservation = struct {
+    limiter: *Limiter,
+    input_tokens: u64,
+    output_tokens: u64 = 0,
+    charged: u64 = 0,
+
+    pub fn observer(self: *@This()) httpx.AttemptObserver {
+        return .{ .ptr = self, .before = before, .after = after, .output_tokens = self.output_tokens };
+    }
+    fn before(ptr: *anyopaque, context: httpx.AttemptObserver.Context) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const cost = self.input_tokens +| self.output_tokens;
+        try self.limiter.beforeCost(context, cost);
+        self.charged = cost;
+    }
+    fn after(ptr: *anyopaque, response: ?*const httpx.Response) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        // Reconcile before releasing concurrency so a following request cannot
+        // observe a replenished slot without the completed request's token debt.
+        if (response) |res| if (res.body) |body| {
+            const Usage = struct { usage: struct { input_tokens: u64, output_tokens: u64 } };
+            var buffer: [4096]u8 = undefined;
+            var storage = std.heap.BufferFirstAllocator.init(&buffer, std.heap.smp_allocator);
+            if (std.json.parseFromSlice(Usage, storage.allocator(), body, .{ .ignore_unknown_fields = true })) |parsed| {
+                defer parsed.deinit();
+                self.reconcile(parsed.value.usage.input_tokens, parsed.value.usage.output_tokens);
+            } else |_| {}
+        };
+        Limiter.after(self.limiter, response);
+    }
+    pub fn reconcile(self: *@This(), input_tokens: u64, output_tokens: u64) void {
+        const actual = input_tokens +| output_tokens;
+        if (actual <= self.charged) return;
+        sync.lockYielding(&self.limiter.mutex);
+        defer self.limiter.mutex.unlock();
+        self.limiter.refill(nowNs());
+        if (self.limiter.policy.tokens_per_minute != 0) self.limiter.tokens -= @floatFromInt(actual - self.charged);
+        self.charged = actual;
+    }
+};
+
 pub const Limiter = struct {
     mutex: std.atomic.Mutex = .unlocked,
     policy: Policy,
@@ -133,6 +177,10 @@ pub const Limiter = struct {
         // Conservative text accounting: serialized UTF-8 bytes plus the output
         // cap. No refund on failure; retries consume independent reservations.
         const cost = @as(u64, @intCast(context.body_bytes)) +| context.output_tokens;
+        return self.beforeCost(context, cost);
+    }
+
+    fn beforeCost(self: *Limiter, context: httpx.AttemptObserver.Context, cost: u64) !void {
         if (self.policy.tokens_per_minute != 0 and cost > self.policy.tokens_per_minute)
             return error.ProviderTokenBudgetExceeded;
         while (true) {
@@ -170,13 +218,18 @@ pub const Limiter = struct {
         if (self.policy.max_concurrency != 0 and self.in_flight >= self.policy.max_concurrency)
             return std.time.ns_per_ms;
         if (self.policy.requests_per_minute != 0 and self.requests < 1)
-            return @max(1, @as(u64, @intFromFloat(@ceil((1 - self.requests) * minute / @as(f64, @floatFromInt(self.policy.requests_per_minute))))));
+            return boundedWait((1 - self.requests) * minute / @as(f64, @floatFromInt(self.policy.requests_per_minute)));
         if (self.policy.tokens_per_minute != 0 and self.tokens < @as(f64, @floatFromInt(cost)))
-            return @max(1, @as(u64, @intFromFloat(@ceil((@as(f64, @floatFromInt(cost)) - self.tokens) * minute / @as(f64, @floatFromInt(self.policy.tokens_per_minute))))));
+            return boundedWait((@as(f64, @floatFromInt(cost)) - self.tokens) * minute / @as(f64, @floatFromInt(self.policy.tokens_per_minute)));
         if (self.policy.requests_per_minute != 0) self.requests -= 1;
         if (self.policy.tokens_per_minute != 0) self.tokens -= @floatFromInt(cost);
         self.in_flight += 1;
         return 0;
+    }
+
+    fn boundedWait(value: f64) u64 {
+        if (value >= @as(f64, @floatFromInt(std.math.maxInt(u64)))) return std.math.maxInt(u64);
+        return @max(1, @as(u64, @intFromFloat(@ceil(value))));
     }
 
     fn after(ptr: *anyopaque, response: ?*const httpx.Response) void {
@@ -581,4 +634,28 @@ test "provider quotas observe every retry and retain the permit through streamed
     try std.testing.expectEqual(state.starts, state.finishes);
     try std.testing.expectEqual(@as(usize, 0), state.active);
     try std.testing.expectEqual(@as(usize, 8), state.writes);
+}
+
+test "decision functions quota reservations reconcile actual usage before releasing concurrency" {
+    var limiter = Limiter.init(.{ .tokens_per_minute = 1000, .max_concurrency = 1 });
+    var reservation: TokenReservation = .{ .limiter = &limiter, .input_tokens = 400 };
+    const observer = reservation.observer();
+    const Cancel = struct {
+        fn no(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    try observer.before(observer.ptr, .{ .io = std.testing.io, .deadline_ms = null, .cancellation_ptr = &limiter, .is_cancelled = Cancel.no, .body_bytes = 1, .output_tokens = 0 });
+    try std.testing.expectEqual(@as(u64, 400), reservation.charged);
+    var response = httpx.Response.init(std.testing.allocator, 200);
+    defer response.deinit();
+    response.body = "{\"usage\":{\"input_tokens\":10000,\"output_tokens\":5},\"answers\":\"invalid\"}";
+    observer.after(observer.ptr, &response);
+    try std.testing.expectEqual(@as(u32, 0), limiter.in_flight);
+    try std.testing.expect(limiter.tokens < -8000);
+    try std.testing.expect(limiter.tryReserve(limiter.last_ns, 400) > 0);
+    const debt = limiter.tokens;
+    reservation.reconcile(10000, 5);
+    try std.testing.expectEqual(debt, limiter.tokens);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), Limiter.boundedWait(1e100));
 }
