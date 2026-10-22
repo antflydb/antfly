@@ -4452,6 +4452,11 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 	orchestrationURLs := map[string]string{
 		strconv.FormatInt(int64(standalone.NodeID), 16): fmt.Sprintf("http://%s:%d", serviceDNSName(standaloneStatefulSetName(cluster), cluster.Namespace, r.ClusterDomain), standalone.MetadataAPI.Port),
 	}
+	if cluster.Spec.Storage.Engine == "lite" {
+		// Lite owns its metadata in the file and rejects network metadata peers.
+		// Keep this empty even when spec.config supplies peer URLs.
+		orchestrationURLs = map[string]string{}
+	}
 
 	completeConfig := map[string]any{
 		"storage": standaloneRuntimeStorageConfig(cluster),

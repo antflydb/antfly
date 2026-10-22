@@ -141,6 +141,50 @@ slice and host headroom without invoking reclaimers), keeps output credit
 pinned, and retries rendering once with one worker. No model invocation is
 replayed; deadlines, transforms, page identities, and output caps stay in force.
 
+## Extraction and decoder correctness
+
+Text reconstruction preserves authored spaces within a tracked `TJ` operation
+instead of inferring a word boundary between every adjusted glyph. This applies
+only to adjacent single-codepoint fragments whose gaps match consistent
+positioning on both sides of authored whitespace in the same glyph group.
+Multi-glyph labels and numeric cells separate groups, so tracking in prose does
+not propagate into table cells. Other gaps and independent operations retain
+their existing separation rules.
+
+The macOS compatibility renderer uses the native planner's admitted integer
+canvas. Its drawing transform is computed in logical page coordinates, then
+scaled explicitly, including translation and quarter-turn rotation. Rendering
+above or below 72 DPI must preserve page content, not merely return the planned
+number of pixels. This does not raise spatial, scratch, or retained-output caps.
+
+Simple Type1 and TrueType fonts use one-byte character codes even when an
+oversized ToUnicode codespace suggests otherwise. Type0 composite fonts retain
+their multibyte decoding. ToUnicode mappings, including ligatures, and encoding
+fallbacks still apply to each decoded character code.
+
+Embedded-text quality assessment samples bounded intervals across the page,
+with deterministic offsets to avoid repeatedly sampling the same position in
+repeated prose. A spaced heading alone should not condemn readable body text;
+a clean prefix should not hide corruption later in the page. When both embedded
+and OCR text pass the configured quality checks, retain the embedded text;
+sampled-ratio differences and a longer OCR result do not establish an improvement.
+Forced OCR still guarantees an attempt, with selection subject to these checks.
+
+Numeric recovery rejects bare digit fragments in broken prose rather than
+appending them to a better OCR transcription. Alphabetic fragmentation requires
+at least four consecutive letter fragments including lowercase text. It does
+not disqualify intact values: multi-character tokens and attached signs,
+currency, and percentages remain eligible even beside lowercase variable labels.
+Rows with intact values retain their source labels and duplicate occurrences;
+mixed rows contribute only trusted values and cannot become broken headers.
+Numeric cells neither dilute broken labels nor count as fragmented prose.
+These policies do not depend on a particular OCR
+model, and their existing thresholds and work limits remain in force.
+
+Florence's persistent decoder cross-attention cache owns borrowed Metal
+projection outputs before another layer or frame can reuse the projection
+scratch. Already-owned outputs and non-Metal backends do not incur that copy.
+
 ## Long-term architecture
 
 ```text
