@@ -40,6 +40,14 @@ from helpers import wait_until
 pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 
+def _has_cached_runtime_observation(value):
+    """A retained serving proof is not a new sample of worker progress."""
+    return value.get("status", {}).get("runtime_source") == "cached_snapshot" or any(
+        shard.get("runtime_source") == "cached_snapshot"
+        for shard in value.get("shard_status", {}).values()
+    )
+
+
 class DenseEmbeddingServer(InferenceEmbeddingServer):
     @staticmethod
     def _vector_for_text(text: str) -> list[float]:
@@ -189,7 +197,10 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                     state.get("catch_up_applied_sequence", 0) or 0,
                 )
                 now = time.monotonic()
-                if any(
+                # Busy owners can return a retained serving snapshot while
+                # replay advances. Repeated cached counts cannot prove worker
+                # inactivity; the unchanged total deadline still bounds them.
+                if _has_cached_runtime_observation(value) or any(
                     current > previous
                     for current, previous in zip(progress, last_progress)
                 ):
@@ -237,9 +248,13 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                     )
                 )
                 now = time.monotonic()
-                if not graph_progress or any(
-                    current > previous
-                    for current, previous in zip(progress, graph_progress)
+                if (
+                    _has_cached_runtime_observation(value)
+                    or not graph_progress
+                    or any(
+                        current > previous
+                        for current, previous in zip(progress, graph_progress)
+                    )
                 ):
                     graph_progress_at = now
                 graph_progress = tuple(
