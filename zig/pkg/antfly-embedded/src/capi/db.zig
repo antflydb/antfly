@@ -610,7 +610,8 @@ pub fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
 /// Reopened namespaces share the root's inference provider and replay options,
 /// but restore their own catalog's enrichment runtime before accepting writes.
 pub fn refreshLiteManagedEmbeddingRuntimeForDatabase(handle: *Handle, database: *db_mod.DB) !void {
-    if (handle.lite_profile != .native) return;
+    const root = handle.parent_handle orelse handle;
+    if (handle.lite_profile != .native and !root.embedded_native_providers) return;
     // A read-only/status-only handle has nothing to reconcile toward, and
     // `db.reconfigureEnrichmentRuntime` unconditionally fails with
     // `error.ReadOnly` on one -- before it even looks at whether there is
@@ -2372,19 +2373,25 @@ pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
     errdefer @import("io_lifetime.zig").release();
     const alloc = std.heap.c_allocator;
     var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .prefer_existing_identity_namespace = true, .online_source_authority = .native });
-    errdefer db.close();
+    var handle_owns_db = false;
+    errdefer if (!handle_owns_db) db.close();
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
-    errdefer alloc.destroy(handle);
+    errdefer if (!handle_owns_db) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
         .io_lifetime_lease = true,
+        .embedded_native_providers = true,
         .db = db,
         .embedded_path = try alloc.dupe(u8, path),
     };
-    @import("tables.zig").loadCatalog(handle) catch |err| {
-        alloc.free(handle.embedded_path.?);
-        return err;
-    };
+    handle_owns_db = true;
+    errdefer {
+        handle.io_lifetime_lease = false; // the outer error path releases it
+        handle.lease_snapshot = true;
+        handles.closeHandle(handle);
+    }
+    try refreshLiteManagedEmbeddingRuntime(handle);
+    try @import("tables.zig").loadCatalog(handle);
     handle.database().*.startResidentBackgroundWorkersIfNeeded();
     return handle;
 }
@@ -2881,22 +2888,32 @@ pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOpti
     var options = dbOpenOptionsFromResolved(resolved, false);
     options.identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 };
     options.prefer_existing_identity_namespace = true;
+    // Restore providers before any generated replay can start. Resolution and
+    // other optional runtimes may still be constructed by the ordinary open.
+    if (resolved.profile == .native) options.enrichment = null;
     var db = try db_mod.DB.open(alloc, path, options);
-    errdefer db.close();
+    var handle_owns_db = false;
+    errdefer if (!handle_owns_db) db.close();
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
-    errdefer alloc.destroy(handle);
+    errdefer if (!handle_owns_db) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
         .io_lifetime_lease = true,
+        .embedded_native_providers = resolved.profile == .native,
         .db = db,
         .open_mode = resolved.open_mode,
         .embedded_path = try alloc.dupe(u8, path),
         .embedded_open_options = options,
+        .lite_generated_enrichment_replay = resolved.generated_enrichment_replay,
     };
-    @import("tables.zig").loadCatalog(handle) catch |err| {
-        alloc.free(handle.embedded_path.?);
-        return err;
-    };
+    handle_owns_db = true;
+    errdefer {
+        handle.io_lifetime_lease = false; // the outer error path releases it
+        handle.lease_snapshot = true;
+        handles.closeHandle(handle);
+    }
+    try refreshLiteManagedEmbeddingRuntime(handle);
+    try @import("tables.zig").loadCatalog(handle);
     handle.database().*.startResidentBackgroundWorkersIfNeeded();
     return handle;
 }

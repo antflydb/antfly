@@ -30,8 +30,8 @@ import antfly_embedded as af
 
 @pytest.mark.parametrize("storage", [af.Storage.LITE, af.Storage.DIRECTORY])
 @pytest.mark.parametrize("child", [False, True], ids=["root", "table"])
-@pytest.mark.parametrize("drive", [False, True], ids=["background", "idle"])
-def test_grouped_sources_drive_downstream_graph_without_waiting_write(require_native, tmp_path, storage, child, drive):
+@pytest.mark.parametrize("completion", ["background", "idle", "visibility"])
+def test_grouped_sources_drive_downstream_graph(require_native, tmp_path, storage, child, completion):
     inputs = []
     errors = []
 
@@ -94,7 +94,8 @@ def test_grouped_sources_drive_downstream_graph_without_waiting_write(require_na
     try:
         options = af.OpenOptions(storage=storage, profile=af.Profile.NATIVE, generated_enrichment_replay=True)
         path = tmp_path / ("groups.aflite" if storage == af.Storage.LITE else "groups")
-        with af.create_with_options(path, options) as db:
+        opener = af.create_with_options if storage == af.Storage.LITE else af.open_with_options
+        with opener(path, options) as db:
             db.create_table("concepts", {})
             if child:
                 db.create_table("history", {})
@@ -206,10 +207,12 @@ def test_grouped_sources_drive_downstream_graph_without_waiting_write(require_na
                     },
                     "three": {"thread_id": "t1", "turn_id": "u2", "ordinal": 4, "speaker": "user", "text": "turn-two"},
                 }
-                table.batch_json({"inserts": rows, "sync_level": "write"})
-                if drive:
+                table.batch_json(
+                    {"inserts": rows, "sync_level": "enrichments" if completion == "visibility" else "write"}
+                )
+                if completion == "idle":
                     table.run_until_idle()
-                deadline = time.monotonic() + (0 if drive else 30)
+                deadline = time.monotonic() + (0 if completion == "idle" else 30)
                 edges = table.edges("turn_graph", "thread/t1", "about", 0)
                 while time.monotonic() < deadline:
                     edges = table.edges("turn_graph", "thread/t1", "about", 0)
@@ -225,6 +228,22 @@ def test_grouped_sources_drive_downstream_graph_without_waiting_write(require_na
                 assert any("turn-one" in text and "answer" in text for text in inputs), inputs
                 assert any("turn-two" in text for text in inputs), inputs
                 assert all("excluded-tool" not in text for text in inputs), inputs
+            finally:
+                if child:
+                    table.close()
+        # A reopened native handle must restore the producer before consuming
+        # a new group revision, including a directory-backed child namespace.
+        with af.open_with_options(path, options) as reopened:
+            table = reopened.open_table("history") if child else reopened
+            try:
+                table.batch_json(
+                    {"inserts": {"three": {**rows["three"], "text": "turn-two after-reopen"}}, "sync_level": "write"}
+                )
+                table.run_until_idle()
+                edges = table.edges("turn_graph", "thread/t1", "about", 0)
+                assert len(edges) == 2, (edges, inputs, table.pending_work_stats())
+                assert any("after-reopen" in text for text in inputs), inputs
+                assert not errors, errors
             finally:
                 if child:
                     table.close()

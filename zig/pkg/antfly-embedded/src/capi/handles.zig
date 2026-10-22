@@ -93,6 +93,9 @@ pub const Handle = struct {
     owned_lite_backend: ?lite_backend.Handle = null,
     owned_lite_runtime: ?db_mod.background_runtime.BackendRuntimeHandle = null,
     lite_profile: ?lite_backend.Profile = null,
+    /// Directory-backed native handles also restore managed remote providers.
+    /// Hosted handles retain their explicitly supplied execution surface.
+    embedded_native_providers: bool = false,
     lite_inference_status: ?lite_backend.InferenceStatus = null,
     storage_owner_path: ?[]u8 = null,
     storage_owner_managed_config: local_write.OwnerManagedConfig = .{},

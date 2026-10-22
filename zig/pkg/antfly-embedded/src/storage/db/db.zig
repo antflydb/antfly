@@ -7183,12 +7183,15 @@ pub const DB = struct {
     }
     const LocalGroupSourceContext = struct { db: *DB, state: *GroupSourceMaintenanceState };
     fn runGroupSourceSliceWithState(self: *DB, state: *GroupSourceMaintenanceState) !bool {
+        if (!state.slice_mutex.tryLock()) return false;
+        defer state.slice_mutex.unlock();
+        return self.runGroupSourceSliceLocked(state);
+    }
+    fn runGroupSourceSliceLocked(self: *DB, state: *GroupSourceMaintenanceState) !bool {
         // A table-wide coordinator must drive partial owners. The native
         // worker can certify membership only for an unpartitioned Lite DB.
         if (self.core.byteRange().start.len != 0 or self.core.byteRange().end.len != 0) return false;
         if (self.open_mode != .writer or self.core.index_manager.minimum_reader_version.load(.acquire) < 8 or self.group_source_owner.stopping.load(.acquire)) return false;
-        if (!state.slice_mutex.tryLock()) return false;
-        defer state.slice_mutex.unlock();
         if (try self.maintenanceRequiresOrderedApply()) return false;
         try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
         var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, self.runtime_alloc, 1) else null;
@@ -8537,6 +8540,30 @@ pub const DB = struct {
     /// turning one request into unbounded CPU/provider work.
     pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (comptime storage_engine.enabled) return storage_engine.call("batchInternal", .{ self, req, profile, opts });
+        if (opts.visibility_completion != null or !opts.wait_for_sync_level or
+            (req.sync_level != .enrichments and req.sync_level != .full_index) or !self.core.index_manager.hasGroupSources())
+            return self.batchInternalCommit(req, profile, opts);
+        var completion: execution_resources.BatchVisibilityCompletion = .{};
+        defer completion.deinit(self.alloc);
+        var commit_opts = opts;
+        commit_opts.visibility_completion = &completion;
+        try self.batchInternalCommit(req, profile, commit_opts);
+        if (completion.sequence) |sequence| {
+            // Group visibility can publish more control mutations. Release the
+            // large preparation/commit frame before driving those writes; small
+            // host stacks must never contain two nested commit frames.
+            const started = monotonicTimeNs();
+            defer if (profile) |active| {
+                const elapsed = monotonicTimeNs() - started;
+                active.total_ns += elapsed;
+                active.sync_wait_ns += elapsed;
+                active.wait_sync_ns += elapsed;
+            };
+            try self.waitForSyncLevelWithCancellation(completion.sync_level, sequence, completion.targets, opts.visibility_cancellation, completion.enrichment_fully_precomputed);
+        }
+    }
+
+    noinline fn batchInternalCommit(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         try types.validateGraphEndpointCleanupCommand(req);
         for (req.writes) |write| if ((@import("group_source_identity.zig").isAnchor(write.key) or @import("group_source_transfer.zig").isKey(write.key))) return error.InvalidBatchRequest;
         for (req.deletes) |document| if ((@import("group_source_identity.zig").isAnchor(document) or @import("group_source_transfer.zig").isKey(document))) return error.InvalidBatchRequest;
@@ -32842,25 +32869,29 @@ pub const DB = struct {
             if (self.resolution_runtime == null) try self.initResolutionRuntime();
             if (self.promotion_runtime == null) try self.initPromotionRuntime();
         }
-        const group_state = options.group_source_state orelse &self.group_source_owner.state;
-        if (self.async_context.replay_publication == null) {
-            const state = group_state;
-            while (!state.slice_mutex.tryLock()) {
-                try ensureSnapshotActive(options.cancellation);
-                platform_time.yieldNow();
+        {
+            const group_state = options.group_source_state orelse &self.group_source_owner.state;
+            const drive_groups = self.async_context.replay_publication == null;
+            if (drive_groups) {
+                // A manual drain owns this producer lane until its fair round
+                // and downstream replay settle. A busy resident slice must not
+                // be mistaken for proof of idle, nor race the idle-round count.
+                while (!group_state.slice_mutex.tryLock()) {
+                    try ensureSnapshotActive(options.cancellation);
+                    platform_time.yieldNow();
+                }
+                group_state.idle_definitions = 0;
             }
-            state.idle_definitions = 0;
-            state.slice_mutex.unlock();
-        }
-        while (true) {
-            try ensureSnapshotActive(options.cancellation);
-            if (options.deadline_ns) |deadline| if (monotonicTimeNs() >= deadline) return error.RunUntilIdleDidNotConverge;
-            // Detached snapshots may compute providers but cannot issue group
-            // control commands from their old checkpoint. Their connection
-            // owner drives that bounded work on the live coordinator instead.
-            const group_pending = if (self.async_context.replay_publication == null) try self.runGroupSourceSliceWithState(group_state) else false;
-            try self.drainReplayStagesUntilStableWithOptions(options);
-            if (!group_pending or options.bounded_replay) break;
+            defer if (drive_groups) group_state.slice_mutex.unlock();
+            while (true) {
+                try ensureSnapshotActive(options.cancellation);
+                if (options.deadline_ns) |deadline| if (monotonicTimeNs() >= deadline) return error.RunUntilIdleDidNotConverge;
+                // Detached snapshots compute providers; their connection owner
+                // issues group commands on the current coordinator instead.
+                const group_pending = if (drive_groups) try self.runGroupSourceSliceLocked(group_state) else false;
+                try self.drainReplayStagesUntilStableWithOptions(options);
+                if (!group_pending or options.bounded_replay) break;
+            }
         }
         if (options.drain_graph_replacements) {
             const replacement_catalog_generation = self.core.index_manager.write_plan_generation.load(.acquire);
