@@ -65,6 +65,17 @@ pub const Build = struct {
     fn pageStore(self: *Build, reads: *u64, writes: *u64) Pages {
         return .{ .domain = self.root.domain, .attempt = self.store.upload_scope.?.attempt, .artifacts = &self.store, .remaining_read_bytes = reads, .remaining_write_bytes = writes, .streaming = true, .cancellation = self.token };
     }
+    fn replayable(raw: *anyopaque, binding: local.serverless_segment_source_binding.Binding) bool {
+        const self: *Build = @ptrCast(@alignCast(raw));
+        const spool = self.spool orelse return false;
+        for (binding.column_bindings) |name| {
+            const covered = for (spool.columns) |candidate| {
+                if (std.mem.eql(u8, name, candidate)) break true;
+            } else false;
+            if (!covered) return false;
+        }
+        return true;
+    }
     fn open(raw: *anyopaque, a: A, binding: local.serverless_segment_source_binding.Binding, file: ?usize, token: Token, phase: ?*const stores.IoPhase) !rows.Source {
         const self: *Build = @ptrCast(@alignCast(raw));
         if (self.spool) |spool| return spool.open(a, binding, file, token, phase);
@@ -239,7 +250,7 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     self.provider.statistics = null;
     self.provider.skip_indexes = &.{};
     self.provider.expected_delete_objects = null;
-    self.provider.fragment_rows = .{ .ptr = self, .open = Build.open };
+    self.provider.fragment_rows = .{ .ptr = self, .open = Build.open, .replayable = Build.replayable };
     const nav = try navigation.build(a, out, &self.store, &self.provider, prior_navigation, self.token);
     self.provider.native_delta = nav.delta;
     self.provider.replay_recommended = true;
@@ -864,7 +875,7 @@ const Spool = struct {
             const self: *Cursor = @ptrCast(@alignCast(raw));
             const page = self.page orelse return null;
             page.retain();
-            return .{ .ptr = page, .release_fn = Gather.release, .retained_bytes = page.arena.queryCapacity() };
+            return .{ .ptr = page, .release_fn = Gather.release, .retained_bytes = page.retainedBytes() };
         }
         fn close(raw: *anyopaque, a: A) void {
             const self: *Cursor = @ptrCast(@alignCast(raw));
@@ -1077,7 +1088,7 @@ const Gather = struct {
         const self: *Gather = @ptrCast(@alignCast(raw));
         const page = self.page orelse return null;
         page.retain();
-        return .{ .ptr = page, .release_fn = release, .retained_bytes = page.arena.queryCapacity() };
+        return .{ .ptr = page, .release_fn = release, .retained_bytes = page.retainedBytes() };
     }
     fn close(raw: *anyopaque, a: A) void {
         const self: *Gather = @ptrCast(@alignCast(raw));
@@ -1443,6 +1454,29 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
     try std.testing.expect(native.spool != null);
     if (fused) try std.testing.expectEqual(@as(u64, if (selective) 17 else row_count), native.spool.?.adoption_rows);
     try std.testing.expectEqual(@as(u64, if (fused) 0 else 1), native.spool.?.source_passes);
+    {
+        const Replay = @import("lake_index_build_replay.zig").Replay;
+        var replay = Replay.init(a, &native.provider, &.{"body"});
+        defer replay.deinit();
+        replay.max_spill_bytes = 1;
+        const bound: local.serverless_segment_source_binding.Binding = .{ .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = native.source.inventory.source_id, .snapshot_id = native.source.inventory.snapshot_id, .schema_fingerprint = native.source.inventory.schema_fingerprint, .sidecar_kind = .text, .index_config_hash = "direct-replay", .column_bindings = &.{"body"} };
+        const file = for (native.fragments, 0..) |fragment, i| {
+            if (fragment.count != 0 and native.spool.?.needed[i]) break i;
+        } else return error.TestUnexpectedResult;
+        const first = (try replay.open(a, bound, file, .none)).?;
+        const second = (try replay.open(a, bound, file, .none)).?;
+        defer second.deinit(a);
+        const left = (try first.next(a)).?;
+        const held = (try first.retainColumns(a)).?;
+        defer held.release();
+        first.deinit(a);
+        const right = (try second.next(a)).?;
+        try std.testing.expectEqual(left.rowCount(), right.rowCount());
+        for (0..left.rowCount()) |row| try std.testing.expectEqualStrings(try left.columns[0].bytesAt(row), try right.columns[0].bytesAt(row));
+        try std.testing.expect(replay.direct and replay.run == null);
+        try std.testing.expectEqual(@as(u64, 0), replay.manager.live_bytes);
+        try std.testing.expectEqual(@as(usize, 1), replay.direct_replays);
+    }
     // Two independent configurations reuse the same decoded first tile even
     // when their projections differ. Closing either cursor cannot invalidate
     // the other's borrowed vectors or cached dependencies.
@@ -1601,4 +1635,27 @@ test "external lake hashed payload capture clusters spilled pages for repeated c
 }
 test "external lake broad typed spool clusters random coordinates without verification capture" {
     try broadSpoolScenario(false, false, true);
+}
+
+test "external lake borrowed fragment leases report complete retained ownership" {
+    const a = std.testing.allocator;
+    const Page = local.storage_db_types.ColumnSourcePage;
+    const parent = try a.create(Page);
+    parent.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = 4 };
+    defer parent.release();
+    const wide = try parent.arena.allocator().alloc(u8, 5 * 1024 * 1024);
+    @memset(wide, 'x');
+    const columns = try parent.arena.allocator().alloc(rows.ColumnVector, 2);
+    columns[0] = .{ .name = "body", .values = .{ .bytes = &.{ "a", "b", "c", "d" } } };
+    const wide_values = try parent.arena.allocator().alloc([]const u8, 4);
+    @memset(wide_values, wide);
+    columns[1] = .{ .name = "wide", .values = .{ .bytes = wide_values } };
+    parent.columns = columns;
+    const selected = try Page.gatherProjectedPositions(a, &.{ .{ .page = parent, .row = 0 }, .{ .page = parent, .row = 1 } }, &.{0});
+    defer selected.release();
+    try std.testing.expect(selected.owner != null);
+    var cursor: Spool.Cursor = .{ .a = a, .owner = undefined, .binding = undefined, .file = null, .token = .none, .store = undefined, .page = selected };
+    const lease = (try Spool.Cursor.retain(&cursor, a)).?;
+    defer lease.release();
+    try std.testing.expect(lease.retained_bytes >= selected.retainedBytes());
 }

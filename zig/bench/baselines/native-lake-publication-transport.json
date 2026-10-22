@@ -262,6 +262,17 @@
     "replay_capture_owner": "retained reference through spool teardown",
     "range_flights": "shared containing immutable physical intervals without requiring residency",
     "bulk_leaf_delta_page_writes_less_than": 4,
-    "three_logical_128_byte_seeks_with_duplicate_and_16_byte_gap_charge": 400
+    "three_logical_128_byte_seeks_with_duplicate_and_16_byte_gap_charge": 400,
+    "ordered_navigation_cache": "shared decoded full-reference leases; warm logical reads remain charged",
+    "predicate_tile_consumers": "dense, deferred text and sparse",
+    "immutable_fragment_replay": "projected independent cursors without secondary spill encoding",
+    "sealed_replay_decoded_pages": 8,
+    "sealed_replay_decoded_bytes_max": 8388608,
+    "sealed_replay_decoded_budget_fraction": 0.25,
+    "column_retention_accounting": "complete parent ownership chain",
+    "manifest_prefetch_allocator": "enclosing build/host quotas preserved alongside scheduler reservation",
+    "navigation_resident_bytes_max": 16777216,
+    "navigation_resident_entries_max": 256,
+    "navigation_residency": "separate from compact file-order and planning metadata"
   }
 }

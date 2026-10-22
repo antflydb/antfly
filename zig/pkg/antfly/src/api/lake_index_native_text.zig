@@ -441,7 +441,7 @@ pub const ManifestReader = struct {
     store: stores.ArtifactStore,
     domain: [32]u8,
     token: Cancellation,
-    speculative: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 0 },
+    speculative: local.sql_memory_budget = undefined,
     pending: ?struct { ref: artifacts.ChunkRef, task: local.sql_parallel_scheduler.Task(anyerror![]u8), scheduler: *local.sql_parallel_scheduler.Scheduler, reservation: usize } = null,
     pub fn deinit(self: *ManifestReader) void {
         if (self.pending) |*pending| {
@@ -467,11 +467,11 @@ pub const ManifestReader = struct {
         const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(self.a) orelse return;
         const bytes: usize = @intCast(ref.byte_len);
         if (available < bytes * 3 + 64 * 1024) return;
-        // Optional retained memory has its own node reservation. It must not
-        // consume the already-admitted reducer quota, even while in flight.
+        // Scheduler admission and the allocator chain enforce different limits.
+        // Keep every enclosing build/host quota while reclaiming arena storage.
         const reservation = bytes * 2 + 64 * 1024;
         if (!scheduler.reservePull(0, reservation)) return;
-        self.speculative.limit = reservation;
+        self.speculative = .{ .backing = local.sql_memory_budget.reclaimingAllocator(self.a), .limit = reservation };
         const task = scheduler.submitIoTransient(phase.io, 0, fetch, .{ self, ref }) orelse {
             scheduler.releasePull(0, reservation);
             return;
@@ -2616,8 +2616,8 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
     try probe.entered.wait(std.testing.io);
     manifests.deinit();
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
-    // Required work keeps its whole quota while prefetch is in flight and
-    // after successful completion; only node-admitted optional state is held.
+    // Concurrent required allocations can exhaust the enclosing quota. Drain
+    // declined speculation and retry after that capacity becomes available.
     {
         const Limits = @import("../serverless/build/lake_build_limits.zig");
         var budget = try Limits.WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 1024 * 1024 });
@@ -2646,11 +2646,20 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
         var required = std.heap.ArenaAllocator.init(bounded);
         const recovered = try manifests.load(required.allocator(), ref);
         try std.testing.expectEqualStrings("one", recovered.file.id);
-        try std.testing.expectEqual(before, probe.reads.load(.acquire));
+        try std.testing.expectEqual(before + 1, probe.reads.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
         try std.testing.expect(manifests.pending == null and probe.execution.active);
         try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
         required.deinit();
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        manifests.prefetch(ref);
+        try std.testing.expect(manifests.pending != null);
+        while (!manifests.pending.?.task.isComplete()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        try std.testing.expect(budget.live_bytes >= ref.byte_len);
+        try std.testing.expectError(error.OutOfMemory, bounded.alloc(u8, budget.max_live_bytes));
+        const cached_reads = probe.reads.load(.acquire);
+        _ = try manifests.load(arena.allocator(), ref);
+        try std.testing.expectEqual(cached_reads, probe.reads.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
     }
     // A completed result retains its independent node reservation until join.

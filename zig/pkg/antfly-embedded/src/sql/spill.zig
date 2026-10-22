@@ -2523,6 +2523,20 @@ pub const Sequential = struct {
             self.offset += block.count();
             return block;
         }
+        /// Resume only at a whole-block boundary captured from this sealed run.
+        /// Independent decoded-page caches never need to scan skipped blocks.
+        pub fn position(self: *const Reader) Position {
+            return .{ .row = self.offset, .byte = self.run.read_offset };
+        }
+        pub fn seekPosition(self: *Reader, at: Position) !void {
+            if (at.row > self.end or at.byte > self.run.file.size) return error.InvalidSqlSpill;
+            self.offset = at.row;
+            self.run.read_first = at.row;
+            self.run.read_offset = at.byte;
+            self.run.read_rows = &.{};
+            self.run.read_single_offset = null;
+            _ = self.run.read_arena.reset(.free_all);
+        }
         pub fn deinit(self: *Reader) void {
             self.run.file.manager.allocator().free(self.run.file.read_buffer);
             self.run.read_arena.deinit();

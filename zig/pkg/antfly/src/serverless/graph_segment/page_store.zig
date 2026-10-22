@@ -24,6 +24,8 @@ const refs = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 
 pub const ReadCache = struct {
     ptr: *anyopaque,
+    decoded_read: ?*const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, [32]u8, tree.Ref, CancellationToken, *u64) anyerror!tree.Page = null,
+    decoded_many: ?*const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, [32]u8, []const tree.Ref, []tree.Page, CancellationToken, *u64) anyerror!void = null,
     /// Own every output on success; release every partial output on failure.
     read_many: ?*const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, [32]u8, []const tree.Ref, [][]u8, CancellationToken, *u64) anyerror!void = null,
     read: *const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, refs.ArtifactRef, u64, usize, [32]u8, CancellationToken, *u64) anyerror![]u8,
@@ -58,7 +60,7 @@ pub const PageStore = struct {
     }
 
     pub fn store(self: *PageStore) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .ptr = self, .get = get, .read_many = if (self.io != null and self.read_phase == null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
+        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .decoded_page = if (self.read_cache != null and self.read_cache.?.decoded_read != null) .{ .ptr = self, .read = readDecoded } else null, .ptr = self, .get = get, .read_many = if (self.io != null and self.read_phase == null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
     }
 
     pub fn namespaceDomain(namespace: []const u8) [32]u8 {
@@ -153,9 +155,16 @@ pub const PageStore = struct {
         return self.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, id, ref.offset(), ref.bytes, self.cancellation);
     }
 
+    fn readDecoded(raw: *anyopaque, a: std.mem.Allocator, ref: tree.Ref) !tree.Page {
+        const self: *PageStore = @ptrCast(@alignCast(raw));
+        const cache = self.read_cache.?;
+        return cache.decoded_read.?(cache.ptr, a, self.artifacts, self.domain, ref, self.cancellation, self.remaining_read_bytes);
+    }
+
     fn readMany(raw: *anyopaque, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.Page) !void {
         const self: *PageStore = @ptrCast(@alignCast(raw));
         if (refs_.len != output.len or refs_.len > tree.max_read_batch or self.read_phase != null) return error.InvalidGraphPage;
+        if (self.read_cache) |cache| if (cache.decoded_many) |many| return many(cache.ptr, a, self.artifacts, self.domain, refs_, output, self.cancellation, self.remaining_read_bytes);
         var bytes: u64 = 0;
         for (refs_) |ref| {
             try ref.validate();

@@ -708,6 +708,19 @@ pub const Identities = struct {
         const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = if (self.row_resolver) |resolver| resolver.source else source, .snapshot_id = if (self.row_resolver) |resolver| resolver.snapshot else snapshot, .file_id = file.file, .row_group_ordinal = block.group, .row_ordinal = (block.high << corpus.physical.shift) | low } };
         return if (self.row_resolver) |resolver| try resolver.from_index(resolver.ptr, a, ref) else ref;
     }
+    /// Resolve one native candidate tile through a single relocation operation.
+    pub fn physicalRows(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, ordinals: []const u32, source: []const u8, snapshot: []const u8) ![]const local.storage_rowsource_types.RowRef {
+        if (ordinals.len > 128) return error.InvalidNativeLakeTextCorpus;
+        var original = self;
+        original.row_resolver = null;
+        const refs = try a.alloc(local.storage_rowsource_types.RowRef, ordinals.len);
+        for (ordinals, refs) |doc_ordinal, *ref| ref.* = try original.physicalRow(a, cache, store, cached, doc_ordinal, if (self.row_resolver) |resolver| resolver.source else source, if (self.row_resolver) |resolver| resolver.snapshot else snapshot);
+        if (self.row_resolver) |resolver| {
+            if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, true);
+            for (refs) |*ref| ref.* = try resolver.from_index(resolver.ptr, a, ref.*);
+        }
+        return refs;
+    }
     pub fn sourcePhysicalRow(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, span: corpus.source_spans.Span, ordinal_value: u32, source: []const u8, snapshot: []const u8) !local.storage_rowsource_types.RowRef {
         const item: FileSpan = .{ .file = span.file.id, .span = .{ .lower = 0, .upper = span.file_rows, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = span.physical.artifact_id, .checksum = span.physical.checksum, .byte_len = span.physical.byte_len }, .expected_rows = span.file_rows } };
         const identities: Identities = .{ .offsets = &.{}, .spans = &.{item} };
@@ -1154,19 +1167,45 @@ fn PredicateResolver(comptime Set: type) type {
                         errdefer result.deinit();
                         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.resolver.server.lake_read_cache, .scope = self.resolver.store_identity, .context = self.resolver.read_context };
                         var iterator = candidates.?.iterator();
-                        var checked: usize = 0;
-                        while (iterator.next()) |local_ordinal| : (checked += 1) {
-                            if (checked % 64 == 0) try self.resolver.context.ensureActive();
-                            if (local_ordinal >= count) return error.InvalidNativeLakeTextCorpus;
-                            if (!self.predicate.canProbeMembership()) {
+                        var tile_budget: local.sql_memory_budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = 4 * 1024 * 1024 };
+                        var scratch = std.heap.ArenaAllocator.init(tile_budget.allocator());
+                        defer scratch.deinit();
+                        while (true) {
+                            try self.resolver.context.ensureActive();
+                            var ordinals: [128]u32 = undefined;
+                            var local_ordinals: [128]u32 = undefined;
+                            var size: usize = 0;
+                            while (size < ordinals.len) {
+                                const local_ordinal = iterator.next() orelse break;
+                                if (local_ordinal >= count) return error.InvalidNativeLakeTextCorpus;
+                                local_ordinals[size] = local_ordinal;
+                                ordinals[size] = try std.math.add(u32, offset, local_ordinal);
+                                size += 1;
+                            }
+                            if (size == 0) break;
+                            const admitted = tile: {
+                                if (!self.predicate.canProbeMembership()) break :tile false;
+                                _ = scratch.reset(.free_all);
+                                const refs = self.resolver.identities.physicalRows(scratch.allocator(), &self.cache, self.resolver.store, cached, ordinals[0..size], self.resolver.source.inventory.source_id, self.resolver.source.inventory.snapshot_id) catch |err| {
+                                    if (err == error.OutOfMemory and tile_budget.isExhausted()) break :tile false;
+                                    return err;
+                                };
+                                var allowed: [128]bool = undefined;
+                                self.predicate.containsMany(refs, allowed[0..size]) catch |err| {
+                                    if (err == error.ArtifactReadBudgetExceeded or err == error.QueryCandidateBudgetExceeded or (err == error.OutOfMemory and tile_budget.isExhausted())) break :tile false;
+                                    return err;
+                                };
+                                for (local_ordinals[0..size], allowed[0..size]) |ordinal, keep| if (keep) try result.add(ordinal);
+                                break :tile true;
+                            };
+                            if (!admitted) {
+                                // Discard all partial probe output before exposing exact fallback.
+                                _ = scratch.reset(.free_all);
                                 try self.materialize();
                                 const slice = try self.materialized.?.sliceRebased(a, offset, @as(u64, offset) + count);
                                 result.deinit();
                                 return slice;
                             }
-                            const ordinal_value = try std.math.add(u32, offset, local_ordinal);
-                            const row = try self.resolver.identities.physicalRow(self.a, &self.cache, self.resolver.store, cached, ordinal_value, self.resolver.source.inventory.source_id, self.resolver.source.inventory.snapshot_id);
-                            if (try self.predicate.contains(row)) try result.add(local_ordinal);
                         }
                         return result;
                     }
@@ -2131,4 +2170,52 @@ test "external lake rebuilt predicate blocks translate into retained text coordi
     try std.testing.expectEqual(@as(u64, 2), broad.cardinality());
     try std.testing.expect(broad.contains(0) and broad.contains(1));
     try std.testing.expectEqual(@as(u8, 2), marker);
+}
+
+test "external lake text candidate tiles batch shuffled duplicate relocation without scalar map probes" {
+    const a = std.testing.allocator;
+    const Ref = local.storage_rowsource_types.RowRef;
+    const Mapping = struct {
+        batches: usize = 0,
+        fn one(_: *anyopaque, _: A, _: Ref) !Ref {
+            return error.TestUnexpectedResult;
+        }
+        fn many(raw: *anyopaque, out: A, refs: []const Ref, forward: bool) ![]const Ref {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batches += 1;
+            try std.testing.expect(forward);
+            const result = try out.dupe(Ref, refs);
+            for (result) |*ref| {
+                try std.testing.expectEqualStrings("old", ref.external.snapshot_id);
+                ref.external.snapshot_id = "new";
+                ref.external.file_id = "current";
+                ref.external.row_ordinal = 7 - ref.external.row_ordinal;
+            }
+            return result;
+        }
+        fn file(_: *anyopaque, _: A, _: []const u8) !?[]const u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn digest(_: *anyopaque, _: A, _: []const u8) ![]const u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn rank(_: *anyopaque, _: A, _: Ref) !u64 {
+            return error.TestUnexpectedResult;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var mapping: Mapping = .{};
+    const blocks = [_]corpus.physical.Block{.{ .group = 0, .high = 0, .base = 0, .count = 8, .lower = 0 }};
+    const identities: Identities = .{ .offsets = &.{}, .spans = &.{.{ .file = "original", .span = .{ .lower = 0, .upper = 8, .rows = &blocks } }}, .row_resolver = .{ .ptr = &mapping, .source = "source", .snapshot = "old", .current_source = "source", .current_snapshot = "new", .rows = 8, .from_index = Mapping.one, .to_index = Mapping.one, .translate_many = Mapping.many, .file = Mapping.file, .digest = Mapping.digest, .tie_rank = Mapping.rank, .close = Mapping.close } };
+    var live: LiveRowsCache = .{};
+    defer live.deinit(a);
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = undefined, .scope = @splat(1), .context = .{} };
+    const refs = try identities.physicalRows(region.allocator(), &live, undefined, cached, &.{ 7, 1, 1, 3 }, "source", "new");
+    try std.testing.expectEqual(@as(usize, 1), mapping.batches);
+    for (refs, [_]u64{ 0, 6, 6, 4 }) |ref, row| {
+        try std.testing.expectEqual(row, ref.external.row_ordinal);
+        try std.testing.expectEqualStrings("new", ref.external.snapshot_id);
+    }
 }

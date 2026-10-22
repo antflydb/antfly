@@ -45,6 +45,7 @@ pub fn init(self: *Self, a: A, provider: *Provider, binding: local.serverless_se
         buffer.* = Replay.init(a, &self.provider, binding.column_bindings);
         buffer.budget.limit = memory;
         buffer.budget.backing = self.budget.allocator();
+        buffer.cache_peers = &self.buffers;
         buffer.max_spill_bytes = disk;
         if (index != 0) self.buffers[index - 1].sibling = buffer;
         self.initialized += 1;

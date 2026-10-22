@@ -889,7 +889,7 @@ pub const Reader = struct {
         self.* = .{ .root = root, .pages = undefined, .cached = cached };
         self.pages = .{ .domain = root.domain, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.remaining_reads, .remaining_write_bytes = &self.remaining_writes };
         if (cached) |shared| {
-            self.pages.read_cache = .{ .ptr = self, .read = readPage, .read_many = readPages };
+            self.pages.read_cache = .{ .ptr = self, .read = readPage, .read_many = readPages, .decoded_read = readDecoded, .decoded_many = readDecodedMany };
             self.pages.io = shared.context.io;
         }
         self.cursor = try tree.Cursor.init(a, self.pages.store(), root.page, lower, upper);
@@ -897,6 +897,24 @@ pub const Reader = struct {
     /// Enclosed immutable subtrees carry exact counts without leaf reads.
     pub fn countRange(self: *Reader, a: A, lower: []const u8, upper: ?[]const u8) !u64 {
         return tree.countRange(a, self.pages.store(), self.root.page, lower, upper);
+    }
+    fn readDecoded(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, ref: tree.Ref, token: Cancellation, remaining: *u64) !tree.Page {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        try token.check();
+        try self.cached.?.context.ensureActive();
+        try stores.chargeReadBudget(remaining, ref.bytes);
+        const reader: @import("lake_index_navigation_pages.zig").Reader = .{ .store = store.*, .domain = domain, .token = token, .cached = self.cached.? };
+        return reader.read(a, ref, null);
+    }
+    fn readDecodedMany(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, refs_: []const tree.Ref, output: []tree.Page, token: Cancellation, remaining: *u64) !void {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        const reader: @import("lake_index_navigation_pages.zig").Reader = .{ .store = store.*, .domain = domain, .token = token, .cached = self.cached.? };
+        const Charge = struct {
+            fn charge(ptr: *anyopaque, bytes: u64) !void {
+                try stores.chargeReadBudget(@ptrCast(@alignCast(ptr)), bytes);
+            }
+        };
+        return reader.many(a, refs_, output, .{ .ptr = remaining, .charge = Charge.charge });
     }
     fn readPages(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, refs_: []const tree.Ref, output: [][]u8, token: Cancellation, remaining: *u64) !void {
         const self: *Reader = @ptrCast(@alignCast(raw));

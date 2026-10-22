@@ -575,3 +575,39 @@ duplicate inputs preserve their positions, and conjunctions short-circuit only
 rows already rejected. Tile work is admitted before probing. Exhausted point-read
 allowance discards partial tile output and selects complete exact predicate
 materialization. Integrity, snapshot and cancellation failures still propagate.
+
+Ordered forward/reverse readers share immutable decoded navigation pages across
+predicate tiles and queries. Ordered and row-map page residency shares a separate
+16 MiB/256-entry navigation pool (at most one quarter of the encoded-cache
+allowance), so pinned tree paths cannot displace compact file-order metadata.
+Loading still uses bounded shared decode admission. Keys include the store scope, reclamation domain,
+full page commitment and packed locator. A warm lease still checks the caller's
+live authority, cancellation and logical read allowance. Cold decoded waves use
+the same coalesced encoded range path; cache loading pressure falls back to a
+required independently owned page. No request-owned descriptors enter the cache.
+
+Deferred text/sparse predicate producers use bounded 128-candidate tiles for
+native-to-current relocation and reverse membership, matching the vector
+residual path. Scratch is reclaimed per tile. A probe or scratch allowance decline
+discards all partial output before complete exact materialization; snapshot,
+integrity and genuine backing allocation failures remain errors.
+
+Verified fragment spools advertise an explicit independently replayable typed
+source capability. Serial and file-major replay open projected cursors directly
+over that frozen route instead of encoding a second spill run. Ordinary sealed
+disk replays share up to eight decoded typed pages, bounded by 8 MiB and one
+quarter of their replay quota, with exact whole-block resume positions. Page and
+column leases retain the replay until release, including after cursor close;
+reset cannot retire a leased file or allocator. Cache eviction preserves consumer
+leases. Frozen runs in one file-major window can reclaim each other's optional
+residency on known quota exhaustion. Reclamation releases the current cache lock
+before acquiring peer locks, so it cannot form lock cycles. A later file cannot
+be denied solely by an earlier file's idle cache.
+
+All page-retention capabilities report the entire parent ownership chain, so a
+small projected descriptor cannot conceal a large payload/dictionary. Manifest
+prefetch uses an independently bounded child allocator that preserves every
+enclosing build and host quota, in addition to its scheduler reservation. A
+point-in-time headroom observation never authorizes allocation outside that
+chain. Concurrent required work can decline speculation; joining it releases all
+state before retrying the required read.

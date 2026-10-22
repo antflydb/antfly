@@ -34,6 +34,9 @@ pub const Provider = struct {
     fragment_rows: ?struct {
         ptr: *anyopaque,
         open: *const fn (*anyopaque, A, bindings.Binding, ?usize, Cancellation, ?*const stores.IoPhase) anyerror!rows.Source,
+        /// Immutable independently seekable typed pages can serve replay cursors
+        /// directly, with their operation-owned quota and complete coordinate cut.
+        replayable: ?*const fn (*anyopaque, bindings.Binding) bool = null,
     } = null,
 
     fragment_views: []const FragmentView = &.{},
@@ -201,7 +204,7 @@ pub const Provider = struct {
         if (self.replay) |replay| {
             var projected = binding;
             projected.column_bindings = names.items;
-            if (try replay.openFor(a, projected, self.only_file, cancellation, self.replay_consumer)) |source| return source;
+            if (try replay.openForUsingIo(a, projected, self.only_file, cancellation, self.replay_consumer, self.io_phase)) |source| return source;
         }
         if (self.fragment_rows) |fragments| {
             var projected = binding;

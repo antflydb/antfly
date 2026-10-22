@@ -483,7 +483,7 @@ const ReadLane = struct {
         var count: usize = 0;
         for (refs, 0..) |ref, i| {
             try self.owner.cached.context.ensureActive();
-            if (self.owner.cached.cache.decoded.lookup(self.decodedKey(ref))) |lease| {
+            if (self.owner.cached.cache.navigation.lookup(self.decodedKey(ref))) |lease| {
                 ready[i] = leasedPage(lease);
             } else {
                 missing[count] = ref;
@@ -593,7 +593,7 @@ const ReadLane = struct {
             }
         };
         var loader: Loader = .{ .lane = lane, .ref = ref };
-        const cache = &self.cached.cache.decoded;
+        const cache = &self.cached.cache.navigation;
         // Optional planning never leads a shared flight with its narrower
         // allowance: required readers must not inherit a planner's decline.
         if (lane.allowance != null) {
@@ -786,14 +786,14 @@ test "external lake index scoped views distinguish same snapshot labels and immu
     // applies to a warm hit. Cache pressure falls back to the required read.
     var first_page = try Owner.decodedPage(&owner, a, current.current.by_id.?);
     first_page.deinit(a);
-    const hits = serving_cache.decoded.hits;
+    const hits = serving_cache.navigation.hits;
     var second_page = try Owner.decodedPage(&owner, a, current.current.by_id.?);
     second_page.deinit(a);
-    try std.testing.expectEqual(hits + 1, serving_cache.decoded.hits);
+    try std.testing.expectEqual(hits + 1, serving_cache.navigation.hits);
     owner.cached.context.deadline_ns = 0;
     try std.testing.expectError(error.DeadlineExceeded, Owner.decodedPage(&owner, a, current.current.by_id.?));
     owner.cached.context.deadline_ns = null;
-    serving_cache.decoded.max_loading_bytes = 0;
+    serving_cache.navigation.max_loading_bytes = 0;
     var fallback = try Owner.decodedPage(&owner, a, old.current.by_id.?);
     fallback.deinit(a);
     const body = try Owner.bindIndex(&owner, "body");
@@ -809,7 +809,7 @@ test "external lake index scoped views distinguish same snapshot labels and immu
     // of which pages the parallel translation above happened to warm.
     serving_cache.deinit();
     serving_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
-    serving_cache.decoded.max_loading_bytes = 0;
+    serving_cache.navigation.max_loading_bytes = 0;
     var declined: Source.TranslationAllowance = .{ .remaining_reads = 0, .required_reserve = 0 };
     const before = owner.reads;
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, body.translate_many_bounded.?(body.ptr, oa, &.{ref}, true, &declined));
