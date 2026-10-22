@@ -989,13 +989,13 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
         return guard;
     };
     if (lock_handle.embedded_path != null) {
-        @import("sql_commit.zig").recover(lock_handle) catch {
-            guard.leave();
-            return null;
+        @import("sql_commit.zig").recover(lock_handle) catch |err| {
+            guard.entry_error = capi.mapError(err);
+            return guard;
         };
-        @import("sql_ddl.zig").recover(lock_handle) catch {
-            guard.leave();
-            return null;
+        @import("sql_ddl.zig").recover(lock_handle) catch |err| {
+            guard.entry_error = capi.mapError(err);
+            return guard;
         };
     }
     return guard;
