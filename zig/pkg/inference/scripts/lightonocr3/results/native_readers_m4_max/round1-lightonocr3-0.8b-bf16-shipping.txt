@@ -1,0 +1,63 @@
+1/60 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=2558 text=# EXPRESS DELIVERY
+
+## SHIP TO:
+Avery Chen  
+184 Cedar Street  
+Portland OR 97205
+
+**Tracking:** 987654321012  
+**Weight:** 2.40 kg  
+**Service:** NEXT DAY
+LIGHTONOCR3 warm_run=0 ms=2183 text=# EXPRESS DELIVERY
+
+## SHIP TO:
+Avery Chen  
+184 Cedar Street  
+Portland OR 97205
+
+**Tracking:** 987654321012  
+**Weight:** 2.40 kg  
+**Service:** NEXT DAY
+LIGHTONOCR3 warm_run=1 ms=2206 text=# EXPRESS DELIVERY
+
+## SHIP TO:
+Avery Chen  
+184 Cedar Street  
+Portland OR 97205
+
+**Tracking:** 987654321012  
+**Weight:** 2.40 kg  
+**Service:** NEXT DAY
+LIGHTONOCR3 warm_run=2 ms=2213 text=# EXPRESS DELIVERY
+
+## SHIP TO:
+Avery Chen  
+184 Cedar Street  
+Portland OR 97205
+
+**Tracking:** 987654321012  
+**Weight:** 2.40 kg  
+**Service:** NEXT DAY
+OK
+1 selected; 1 passed; 0 skipped.
+        9.18 real         1.18 user         1.32 sys
+           270876672  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               95674  page reclaims
+                  11  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   8  signals received
+                   4  voluntary context switches
+               24185  involuntary context switches
+         19632671822  instructions retired
+          9489017275  cycles elapsed
+          1172211872  peak memory footprint

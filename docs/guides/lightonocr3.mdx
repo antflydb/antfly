@@ -316,3 +316,53 @@ the complete earlier four-page round are retained in
 BF16 projection inputs did not show a consistent latency benefit in these
 runs, so F32 remains the default. These smoke checks qualify transcription
 agreement on the fixtures, rather than a corpus-wide OCR accuracy score.
+
+## Native Antfly reader comparison
+
+A subsequent comparison at runtime revision `b037bec202` used the same native
+encoded-image reader API for Florence-2-base Q4_K and both LightOn models.
+The shared M4 Max had 36 GiB of unified memory. Each page received six warm
+requests across two opposite model orders, with one resident model at a time.
+Times include image preprocessing, inference, and output handling; HTTP,
+PDF rendering, embedding, and indexing are excluded.
+
+| Model | Weight bytes, decimal GB | Invoice median | Receipt median | Letter median | Shipping median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Florence-2-base Q4_K | 0.142 | 0.400 s | 0.556 s | 0.488 s | 0.505 s |
+| LightOnOCR-3-0.8B BF16 | 1.706 | 0.906 s | 5.590 s | 1.945 s | 2.178 s |
+| LightOnOCR-3-4B BF16 | 9.079 | 1.885 s | 9.600 s | Resource limit | 4.288 s |
+
+For the complete four-page workload, serial throughput was **2.055 pages/s**
+for Florence versus **0.377 pages/s** for LightOn 0.8B, a 5.46× difference.
+On just the invoice, receipt, and shipping pages completed by all three,
+throughput was **2.056, 0.345, and 0.191 pages/s**, respectively. Throughput is
+completed requests divided by total warm request time; it is not a concurrent
+serving measurement or the reciprocal of a page's median latency.
+
+Florence recovered 18 of the 20 required fields across all four pages: it read
+`Antfly` as `Antify` and receipt `40872` as `4087E`. LightOn 0.8B recovered all
+20 fields, with zero plain-text CER on these fixtures after removing markup and
+normalizing whitespace. The 4B model recovered all 15 fields on its three
+completed pages, but both letter attempts returned `ResourceLimitExceeded`.
+The test used a 13 GiB process envelope, 24 GiB shared host/combined limits,
+and model-derived backend budgets. No failed page is counted as completed work.
+
+The inputs and output budgets match, but precision and model-native resizing
+and output formatting differ. LightOn emits Markdown/HTML, which can require
+more generated tokens than Florence's plain OCR text. Four synthetic pages
+are a smoke comparison, not an OCR accuracy leaderboard.
+
+Reproduce with a ReleaseFast inference test executable:
+
+```bash
+python3 zig/pkg/inference/scripts/lightonocr3/benchmark_antfly_readers.py \
+  --native-test /absolute/path/to/inference-test \
+  --florence-dir /absolute/path/to/florence-2-base \
+  --lighton08-dir /absolute/path/to/lightonocr3-0.8b \
+  --lighton4-dir /absolute/path/to/lightonocr3-4b \
+  --output-dir /tmp/native-reader-comparison
+```
+
+The report, executable hash, checkpoint configurations, output text, raw timing
+samples, and logs are retained in
+`zig/pkg/inference/scripts/lightonocr3/results/native_readers_m4_max/`.

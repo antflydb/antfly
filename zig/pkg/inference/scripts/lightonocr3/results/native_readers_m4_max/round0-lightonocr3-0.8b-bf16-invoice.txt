@@ -1,0 +1,43 @@
+1/60 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=1914 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+LIGHTONOCR3 warm_run=0 ms=907 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+LIGHTONOCR3 warm_run=1 ms=913 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+LIGHTONOCR3 warm_run=2 ms=919 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+OK
+1 selected; 1 passed; 0 skipped.
+        4.67 real         0.73 user         0.86 sys
+           264060928  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               78822  page reclaims
+                2264  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   5  signals received
+                   8  voluntary context switches
+               15865  involuntary context switches
+         14861916120  instructions retired
+          6125861827  cycles elapsed
+           868075608  peak memory footprint

@@ -1,0 +1,131 @@
+1/60 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=6041 text=# ANTFLY MARKET
+
+Receipt 40872  
+Date: 2026-10-21
+
+<table>
+  <tr>
+    <td>Coffee</td>
+    <td>USD 4.50</td>
+  </tr>
+  <tr>
+    <td>Notebook</td>
+    <td>USD 7.25</td>
+  </tr>
+  <tr>
+    <td>Subtotal</td>
+    <td>USD 11.75</td>
+  </tr>
+  <tr>
+    <td>Tax</td>
+    <td>USD 0.94</td>
+  </tr>
+  <tr>
+    <td>Total</td>
+    <td>USD 12.69</td>
+  </tr>
+</table>
+LIGHTONOCR3 warm_run=0 ms=5718 text=# ANTFLY MARKET
+
+Receipt 40872  
+Date: 2026-10-21
+
+<table>
+  <tr>
+    <td>Coffee</td>
+    <td>USD 4.50</td>
+  </tr>
+  <tr>
+    <td>Notebook</td>
+    <td>USD 7.25</td>
+  </tr>
+  <tr>
+    <td>Subtotal</td>
+    <td>USD 11.75</td>
+  </tr>
+  <tr>
+    <td>Tax</td>
+    <td>USD 0.94</td>
+  </tr>
+  <tr>
+    <td>Total</td>
+    <td>USD 12.69</td>
+  </tr>
+</table>
+LIGHTONOCR3 warm_run=1 ms=5782 text=# ANTFLY MARKET
+
+Receipt 40872  
+Date: 2026-10-21
+
+<table>
+  <tr>
+    <td>Coffee</td>
+    <td>USD 4.50</td>
+  </tr>
+  <tr>
+    <td>Notebook</td>
+    <td>USD 7.25</td>
+  </tr>
+  <tr>
+    <td>Subtotal</td>
+    <td>USD 11.75</td>
+  </tr>
+  <tr>
+    <td>Tax</td>
+    <td>USD 0.94</td>
+  </tr>
+  <tr>
+    <td>Total</td>
+    <td>USD 12.69</td>
+  </tr>
+</table>
+LIGHTONOCR3 warm_run=2 ms=5652 text=# ANTFLY MARKET
+
+Receipt 40872  
+Date: 2026-10-21
+
+<table>
+  <tr>
+    <td>Coffee</td>
+    <td>USD 4.50</td>
+  </tr>
+  <tr>
+    <td>Notebook</td>
+    <td>USD 7.25</td>
+  </tr>
+  <tr>
+    <td>Subtotal</td>
+    <td>USD 11.75</td>
+  </tr>
+  <tr>
+    <td>Tax</td>
+    <td>USD 0.94</td>
+  </tr>
+  <tr>
+    <td>Total</td>
+    <td>USD 12.69</td>
+  </tr>
+</table>
+OK
+1 selected; 1 passed; 0 skipped.
+       23.22 real         2.49 user         2.30 sys
+           263782400  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               96789  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   4  signals received
+                   1  voluntary context switches
+               57550  involuntary context switches
+         31758913302  instructions retired
+         18414343533  cycles elapsed
+          1032931464  peak memory footprint
