@@ -4597,3 +4597,41 @@ cases and Windows cross-compilation passed. The report records these final
 validation hashes separately; its performance measurements remain pinned to the
 earlier measured binaries. Failed deferred drains join and discard remaining
 borrowers before retiring any manifest page, including failures inside cleanup.
+
+The [conditional-projection qualification](bench/results/grep-conditional-projection-summary.json)
+compares the merged rolling-lane binary with bounded verified-image descriptors
+and cross-manifest worker refill. Five alternating fixture rounds produced these
+medians (baseline → candidate):
+
+| Fixture | macOS elapsed | Constrained Linux elapsed |
+|---|---:|---:|
+| 128 large images, cold | 454 → 525 ms | 415 → 475 ms |
+| 128 large images, warm | 229 → 205 ms | 210 → 239 ms |
+| 24 single-row pages, slow first parent, cold | 1,872 → 998 ms | 1,767 → 922 ms |
+| 24 single-row pages, warm | 720 → 674 ms | 690 → 658 ms |
+
+For the large-image warm fixture, median CLI child CPU falls from 117.6 to
+17.1 ms on macOS and 187.8 to 33.0 ms in Linux; peak RSS falls from 24.7 to
+7.1 MiB and 40.2 to 16.8 MiB. Projected image bytes fall from 44,742,400 to
+zero on macOS and 5,243,250 in Linux. The bounded best-effort descriptor cache
+can lose facts to collisions or racing writes; those cases safely materialize
+source again. Warm zero-transfer and lower elapsed time are therefore not
+guaranteed. Cold large-image latency regresses, and tiny-image warm child CPU
+increases. Both variants already make zero warm provider calls.
+
+These are generated-image/constant-score loopback fixtures with 20 ms artificial
+HTTP delays. Linux runs in a two-CPU, 1-GiB container in the existing VM on the
+same physical Mac. The server fixture's hashing contributes to wall time but
+not CLI child CPU. The native server implementation still reads and hashes
+selected values; these measurements do not establish server CPU/storage savings,
+live-provider token savings, or independent cross-host performance. The compact
+report pins binary and driver hashes; raw trials and logs remain ignored.
+
+Final qualification passed 285 Linux CLI cases (three platform skips), all
+28 macOS media cases, 151 query-contract tests with zero leaks, and 27 native
+server cases (seven opt-in benchmark skips). The native cases include single-
+and two-shard delivery, warm omission, current-value changes, authorization,
+revision and snapshot fences. SDK, MCP/OpenAPI, packaging and boundary checks
+also pass. The broad macOS suite has an intermittent watcher assertion; affected
+cases pass in isolation, and the inventory-visit failure reproduces on the merged
+baseline. The report preserves this qualification and exact artifact hashes.

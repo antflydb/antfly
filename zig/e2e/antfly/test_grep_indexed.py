@@ -2640,11 +2640,20 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
                 if "_source_projection" in hit
             ]
             assert len(conditional) == parents, responses[2:]
+            # Descriptor writes are a bounded best-effort cache. Collisions or
+            # racing writers may require a full value; they cannot change the
+            # warm decision result or send a descriptor to the provider.
+            assert any(
+                hit["_source_projection"]["payloads.image"]["state"] == "unchanged"
+                for hit in conditional
+            ), responses[2:]
             for hit in conditional:
-                assert (
-                    hit["_source_projection"]["payloads.image"]["state"] == "unchanged"
-                )
-                assert "image" not in hit["_source"].get("payloads", {})
+                state = hit["_source_projection"]["payloads.image"]["state"]
+                assert state in {"value", "unchanged"}
+                if state == "unchanged":
+                    assert "image" not in hit["_source"].get("payloads", {})
+                else:
+                    assert hit["_source"]["payloads"]["image"]
 
     finally:
         for server, thread in zip((query, provider), threads, strict=True):
