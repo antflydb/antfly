@@ -22951,3 +22951,52 @@ receipts; prepared-lifetime-verified.json retains the final source snapshots.
 The 970-source production boundary, generated errors, control catalog, formatting
 and whitespace checks pass. Full linked owner-image, object-engine, crash,
 scheduler shutdown and cross-engine performance qualification remain open.
+
+### Caller-owned scheduled candidate drain
+
+`DB.drainPreparedAssembliesWithAdmission` adds an explicit closing phase for a
+caller that still owns runnable capacity needed by an active candidate. It
+requires the original admission port's finite deadline and checked execution-wait
+boundary. The phase fences candidate operations, returns unused replay credits
+and live dependency pins, and leaves physical DB/worker teardown to its existing
+closing owner. Callers must fence general DB admission and keep the DB and output
+allocators alive until their mandatory cleanup completes.
+
+The registry now separates closing intent, its current finisher and a detached
+pending list. `tryClose` never waits for an active guard or competing retirement
+callback. The controlled phase lends runnable ownership only during those waits,
+polls the original lifetime while parked, and always rejoins the original wait
+boundary before another retirement attempt. It performs callback cleanup under
+running ownership, never around a whole backend/close call, and creates no new
+execution owner, deadline or resource reservation.
+
+Begin, parked-lifetime and reentry failures leave the registry fenced and
+resumable. Completed callbacks stay completed; the pending list continues to own
+remaining references, including a tail concurrently retired by its caller. An
+original cleanup owner can retry without repeating callbacks or losing the DB
+obligation. Missing execution-wait or finite-deadline metadata refuses controlled
+retirement before callbacks. Compatibility close continues to serve quiesced
+callers whose ownership cannot prevent the drained work from executing.
+
+Native ABI 70 and storage-owner ABI 128 fence the private owner/method changes.
+Durable formats, reader floors and default activation are unchanged. This is the
+retained-candidate drain phase; lending/ownership for other worker/cache/IO joins,
+route ownership, executable recovery funding and complete mandatory completion
+remain open, along with required-PREPARE orchestration and remaining guards,
+counters, backend metadata and scheduler/engine qualification. Strong required
+providers remain disabled. Full Linux qualification remains waived; Linux uses
+the pinned Nix/glibc Zig toolchain.
+
+Pinned Debug qualification passes 10 focused lifetime/drain cases, 85 required DB
+cases, 15 backlog cases, 51 error/identity companions and five native ABI cases:
+166 executions with no failures, skips or leaks. The real scheduler case lends
+the sole ordinary slot while protected health and cleanup capacity remain
+available. Failure coverage includes begin/reentry rejection, deadline expiry
+while parked, missing original metadata and a partially retired detached tail.
+Physical DB close follows the controlled phase after grants have finished.
+
+All 5,502 native/schema source inputs match prepared-drain-v2 in the cumulative
+receipts; prepared-drain-verified.json retains the final source snapshots. The
+970-source production boundary, generated errors, control catalog, formatting
+and whitespace checks pass. The first diagnostic run is not final qualification.
+Full physical shutdown ownership and the broader design remain open.

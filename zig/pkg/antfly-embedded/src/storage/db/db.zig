@@ -6174,6 +6174,18 @@ pub const DB = struct {
         self.embedding_activity.clear(self.alloc);
     }
 
+    /// Closing phase for a caller holding runnable capacity needed by an
+    /// active candidate. Controls must retain the original finite lifetime
+    /// and execution-wait boundary. Success retires candidate dependencies,
+    /// not the physical DB or its other worker owners.
+    /// Failure keeps the fenced owner for the original cleanup path to retry.
+    pub fn drainPreparedAssembliesWithAdmission(self: *DB, original: @import("../../common/read_admission.zig").Port) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("drainPreparedAssembliesWithAdmission", .{ self, original });
+        if (self.closed) return;
+        self.async_context.background_closing.store(true, .release);
+        if (self.local_execution.retained_preparation_owner) |owner| try owner.closeWithAdmission(original);
+    }
+
     fn stopRetainedPreparations(self: *DB) void {
         self.async_context.background_closing.store(true, .release);
         if (self.local_execution.retained_preparation_owner) |owner| {
@@ -148985,4 +148997,103 @@ test "db prepared transaction effects required assembly prepared lifetime close 
     try std.testing.expect(!owner.closed.load(.acquire));
     try std.testing.expect(plan.backlog_admission.?.reservation != null);
     access.deinit();
+}
+
+test "db prepared transaction effects required assembly prepared lifetime drain lends the sole ordinary scheduler slot" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    const runnable = @import("../../common/runnable_scheduler.zig");
+    const now = @import("antfly_platform").time.monotonicNs;
+    var directory = try TestDirectory.init("prepared-drain-runnable");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    defer db.close();
+    try F.seed(&db, false, false);
+    var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+    defer plan.deinit();
+    var access = try plan.enterLifetime();
+    defer access.deinit();
+    const owner = access.guard.?.owner;
+    var scheduler = try runnable.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .read_isolation = false, .max_operations = 16, .max_wait_ms = 5000 });
+    defer scheduler.close();
+    try scheduler.config.validateManagedCleanupCapacity();
+    var validation: runnable.Execution = .{};
+    defer validation.finish();
+    try validation.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = now, .retained_bytes = 100, .allow_wait = true }, .query);
+    try validation.park(.resource_blocked);
+    var closing: runnable.Execution = .{};
+    defer closing.finish();
+    try closing.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = now, .retained_bytes = 100, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .query);
+    var health: runnable.Execution = .{};
+    defer health.finish();
+    try health.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = now, .retained_bytes = 100, .allow_wait = false }, .control);
+    const Worker = struct {
+        execution: *runnable.Execution,
+        access: *@import("prepared_lifetime.zig").Access,
+        owner: *@import("prepared_lifetime.zig").Owner,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            defer self.execution.finish();
+            defer self.access.deinit();
+            while (!self.owner.closing.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            self.execution.enter(.query) catch |cause| {
+                self.failure = cause;
+                return;
+            };
+            self.access.checkLifetime() catch |cause| {
+                if (cause != error.Canceled) self.failure = cause;
+                return;
+            };
+            self.failure = error.TestUnexpectedResult;
+        }
+    };
+    const Wait = struct {
+        execution: *runnable.Execution,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.execution.checkLifetime();
+            const entry = &self.execution.entry.?;
+            if (entry.scheduler.?.state(entry) != .running) return error.InvalidRunnableTransition;
+        }
+        fn lifetime(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.execution.checkLifetime();
+        }
+        fn deadline(ptr: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.execution.entry.?.options.deadline_ns;
+        }
+        fn begin(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.begins += 1;
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ends += 1;
+            try self.execution.enter(.query);
+        }
+    };
+    var worker: Worker = .{ .execution = &validation, .access = &access, .owner = owner };
+    var wait: Wait = .{ .execution = &closing };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) thread.join();
+    var payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &wait, .vtable = &.{ .checkpoint = Wait.checkpoint, .check_lifetime = Wait.lifetime, .deadline_ns = Wait.deadline }, .execution_wait = .{ .ptr = &wait, .begin = Wait.begin, .end = Wait.end } };
+    try db.drainPreparedAssembliesWithAdmission(.init(&payload));
+    thread.join();
+    joined = true;
+    try std.testing.expect(worker.failure == null);
+    try std.testing.expect(wait.begins > 0 and wait.begins == wait.ends);
+    try std.testing.expectEqual(runnable.State.running, scheduler.state(&closing.entry.?));
+    try std.testing.expectEqual(runnable.State.running, scheduler.state(&health.entry.?));
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+    try std.testing.expect(owner.closed.load(.acquire));
+    try std.testing.expect(plan.backlog_admission.?.reservation == null);
+    closing.finish();
+    health.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    db.close();
 }

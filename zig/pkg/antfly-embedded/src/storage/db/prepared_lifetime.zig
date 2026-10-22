@@ -27,6 +27,8 @@ pub const Owner = struct {
     closed: std.atomic.Value(bool) = .init(false),
     active: std.atomic.Value(usize) = .init(0),
     first: ?*Node = null,
+    pending: ?*Node = null,
+    finishing: std.atomic.Value(bool) = .init(false),
 
     /// The metadata allocator must outlive the owner and every registration.
     /// DBs use a process allocator, independently of their runtime.
@@ -67,37 +69,92 @@ pub const Owner = struct {
         self.ref();
         return node;
     }
-    /// Fence new work, drain active operations, and revoke idle registrations.
-    /// Retirement callbacks never run under the registry lock.
-    pub fn close(self: *Owner) void {
+    /// Fence new work and perform ready retirement under the caller's running
+    /// ownership. Never wait for active guards or another retirement callback.
+    /// Partial progress remains owned by `pending` across every retry/error.
+    pub fn tryClose(self: *Owner) bool {
         self.lock();
-        const already_closing = self.closing.swap(true, .acq_rel);
-        self.mutex.unlock();
-        if (already_closing) {
-            while (!self.closed.load(.acquire)) time.yieldNow();
-            return;
-        }
-        const head = while (true) {
-            self.lock();
-            if (self.active.load(.acquire) == 0) {
-                const first = self.first;
-                self.first = null;
-                var node = first;
-                while (node) |entry| : (node = entry.next) entry.linked = false;
-                self.mutex.unlock();
-                break first;
-            }
+        self.closing.store(true, .release);
+        if (self.closed.load(.acquire)) {
             self.mutex.unlock();
-            time.yieldNow();
-        };
-        var node = head;
-        while (node) |entry| {
-            const next = entry.next;
-            entry.finishRetirement(entry.beginRetirement());
-            entry.unref(); // Detached list reference.
-            node = next;
+            return true;
+        }
+        if (self.finishing.load(.acquire) or self.active.load(.acquire) != 0) {
+            self.mutex.unlock();
+            return false;
+        }
+        self.finishing.store(true, .release);
+        if (self.pending == null) {
+            self.pending = self.first;
+            self.first = null;
+            var node = self.pending;
+            while (node) |entry| : (node = entry.next) entry.linked = false;
+        }
+        self.mutex.unlock();
+        defer self.finishing.store(false, .release);
+        while (self.pending) |entry| {
+            const winner = entry.beginRetirement();
+            if (!winner and entry.state.load(.acquire) != .retired) return false;
+            // No new guards can enter after the fence; detached nodes still
+            // have their list reference until their callback completes.
+            std.debug.assert(entry.active.load(.acquire) == 0);
+            entry.finishRetirement(winner);
+            self.pending = entry.next;
+            entry.unref();
         }
         self.closed.store(true, .release);
+        return true;
+    }
+
+    fn readyToClose(self: *Owner) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed.load(.acquire)) return true;
+        if (self.finishing.load(.acquire) or self.active.load(.acquire) != 0) return false;
+        if (self.pending) |entry| if (entry.state.load(.acquire) == .retiring) return false;
+        return true;
+    }
+
+    /// Compatibility shutdown for a caller whose execution ownership cannot
+    /// prevent the drained work from progressing. Scheduled callers use the
+    /// explicit original boundary below; no ambient authority is inferred.
+    pub fn close(self: *Owner) void {
+        while (!self.tryClose()) time.yieldNow();
+    }
+
+    /// Lend only across an actual guard/retirement wait, then rejoin before
+    /// invoking callbacks or releasing list references. The original finite
+    /// lifetime bounds the wait. Every failure leaves fenced, resumable state.
+    pub fn closeWithAdmission(self: *Owner, original: admission.Port) !void {
+        self.ref();
+        defer self.release();
+        self.lock();
+        self.closing.store(true, .release);
+        self.mutex.unlock();
+        var trace: admission.RejectionTrace = .{};
+        const control = trace.bind(original).?;
+        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        while (true) {
+            try control.checkpoint();
+            if (self.tryClose()) return;
+            try boundary.beginWait();
+            var failure: ?anyerror = null;
+            while (!self.readyToClose()) {
+                control.checkLifetime() catch |cause| {
+                    failure = trace.failure orelse cause;
+                    break;
+                };
+                time.yieldNow();
+            }
+            // Rejoin exactly once even after cancellation while parked. No
+            // callback/metadata retirement is attempted after failed reentry.
+            boundary.endWait() catch |cause| {
+                if (failure) |first| return first;
+                return trace.failure orelse cause;
+            };
+            if (failure) |cause| return cause;
+        }
     }
 };
 
@@ -346,4 +403,157 @@ test "prepared lifetime registration allocation failures and original rejections
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+}
+
+test "prepared lifetime execution drain preserves begin end failures and retryable retirement" {
+    const Case = enum { success, begin_failure, end_failure, deadline_in_wait };
+    const F = struct {
+        case: Case,
+        access: *Access,
+        running: bool = true,
+        begins: usize = 0,
+        ends: usize = 0,
+        callbacks: usize = 0,
+        retired_parked: bool = false,
+        now: u64 = 0,
+        fn check(ptr: *anyopaque) !void {
+            const f: *@This() = @ptrCast(@alignCast(ptr));
+            if (f.now >= 1000) return error.DeadlineExceeded;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn begin(ptr: *anyopaque) !void {
+            const f: *@This() = @ptrCast(@alignCast(ptr));
+            f.begins += 1;
+            if (f.case == .begin_failure) return error.DeadlineExceeded;
+            f.running = false;
+            if (f.case == .deadline_in_wait) f.now = 1000 else f.access.deinit();
+        }
+        fn end(ptr: *anyopaque) !void {
+            const f: *@This() = @ptrCast(@alignCast(ptr));
+            f.ends += 1;
+            if (f.case == .end_failure) return error.Canceled;
+            f.running = true;
+        }
+        fn retire(ptr: *anyopaque) void {
+            const f: *@This() = @ptrCast(@alignCast(ptr));
+            f.callbacks += 1;
+            f.retired_parked = !f.running;
+        }
+    };
+    for (std.enums.values(Case)) |case| {
+        const owner = try Owner.create(std.testing.allocator);
+        defer owner.release();
+        defer owner.close();
+        var access: Access = .{ .guard = try owner.enter() };
+        defer access.deinit();
+        var f: F = .{ .case = case, .access = &access };
+        const node = try owner.register(std.testing.allocator, &f, F.retire);
+        defer node.release();
+        var payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.begin, .end = F.end } };
+        const result = owner.closeWithAdmission(.init(&payload));
+        switch (case) {
+            .success => {
+                try result;
+                try std.testing.expectEqual(@as(usize, 1), f.callbacks);
+            },
+            .begin_failure, .end_failure, .deadline_in_wait => {
+                if (case != .end_failure) try std.testing.expectError(error.DeadlineExceeded, result) else try std.testing.expectError(error.Canceled, result);
+                try std.testing.expect(owner.closing.load(.acquire) and !owner.closed.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 0), f.callbacks);
+                try std.testing.expectError(error.Canceled, node.enter());
+                // The original cleanup owner retries; no replacement execution
+                // or lease is acquired by the registry after reentry fails.
+                access.deinit();
+                f.running = true;
+                owner.close();
+                try std.testing.expectEqual(@as(usize, 1), f.callbacks);
+            },
+        }
+        try std.testing.expect(!f.retired_parked);
+        try std.testing.expectEqual(@as(usize, 1), f.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .begin_failure) 0 else 1), f.ends);
+    }
+}
+
+test "prepared lifetime execution drain retains a detached tail after competing retirement and wait failure" {
+    const F = struct {
+        slow: ?*Node = null,
+        fast_started: std.atomic.Value(bool) = .init(false),
+        slow_started: std.atomic.Value(bool) = .init(false),
+        allow: std.atomic.Value(bool) = .init(false),
+        fast_calls: usize = 0,
+        slow_calls: usize = 0,
+        fn fast(ptr: *anyopaque) void {
+            const f: *@This() = @ptrCast(@alignCast(ptr));
+            f.fast_calls += 1;
+            f.fast_started.store(true, .release);
+            while (!f.slow_started.load(.acquire)) time.yieldNow();
+        }
+        fn slowRetire(ptr: *anyopaque) void {
+            const f: *@This() = @ptrCast(@alignCast(ptr));
+            f.slow_calls += 1;
+            f.slow_started.store(true, .release);
+            while (!f.allow.load(.acquire)) time.yieldNow();
+        }
+        fn run(f: *@This()) void {
+            while (!f.fast_started.load(.acquire) and !f.allow.load(.acquire)) time.yieldNow();
+            f.slow.?.release();
+        }
+        fn fail(_: *anyopaque) !void {
+            return error.NotFound;
+        }
+        fn end(_: *anyopaque) !void {}
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+    };
+    const owner = try Owner.create(std.testing.allocator);
+    defer owner.release();
+    defer owner.close();
+    var f: F = .{};
+    f.slow = try owner.register(std.testing.allocator, &f, F.slowRetire);
+    const fast = try owner.register(std.testing.allocator, &f, F.fast);
+    defer fast.release();
+    const thread = try std.Thread.spawn(.{}, F.run, .{&f});
+    var joined = false;
+    defer {
+        f.allow.store(true, .release);
+        if (!joined) thread.join();
+    }
+    try std.testing.expect(!owner.tryClose());
+    try std.testing.expectEqual(@as(usize, 1), f.fast_calls);
+    try std.testing.expect(owner.pending == f.slow);
+    var payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.fail, .end = F.end } };
+    try std.testing.expectError(error.NotFound, owner.closeWithAdmission(.init(&payload)));
+    try std.testing.expect(!owner.closed.load(.acquire));
+    f.allow.store(true, .release);
+    thread.join();
+    joined = true;
+    owner.close();
+    try std.testing.expectEqual(@as(usize, 1), f.fast_calls);
+    try std.testing.expectEqual(@as(usize, 1), f.slow_calls);
+    try std.testing.expect(owner.pending == null);
+}
+
+test "prepared lifetime execution drain requires original finite wait metadata" {
+    const owner = try Owner.create(std.testing.allocator);
+    defer owner.release();
+    defer owner.close();
+    var probe: Probe = .{ .owner = owner };
+    const node = try owner.register(std.testing.allocator, &probe, Probe.retire);
+    defer node.release();
+    const F = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var payload: admission.Payload = .{ .ptr = &probe, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check } };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, owner.closeWithAdmission(.init(&payload)));
+    payload.execution_wait = .{ .ptr = &probe, .begin = F.check, .end = F.check };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, owner.closeWithAdmission(.init(&payload)));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls.load(.acquire));
+    try std.testing.expect(owner.closing.load(.acquire) and !owner.closed.load(.acquire));
+    owner.close();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
 }
