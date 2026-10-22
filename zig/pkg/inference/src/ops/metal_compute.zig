@@ -1248,7 +1248,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     active_prefill_frame_tail_contract: ?ops.PlannedLayerContract = null,
     active_deberta_encoder_frame_plan_key: ?ActiveDebertaEncoderFramePlanKey = null,
     qwen35_ocr_deferred_attention: bool = false,
-    lightonocr3_4b_projections: bool = false,
+    lightonocr3_projections: bool = false,
     pending_prefill_kv_device_seeds: std.ArrayListUnmanaged(PendingKvDeviceSeed) = .empty,
     timing_stats: ops.NativeQuantTimingStats = .{},
     boundary_scope: ops.gliner_boundary_device.ScopeAccounting = .{},
@@ -1656,6 +1656,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!prepared.complete()) return false;
         self.a4b_prepared_moe_layers[request.layer_index] = prepared;
         return true;
+    }
+
+    pub fn beginQwen35LinearBatch(cb: *const ops.ComputeBackend, rows: usize) !bool {
+        if (cb.kind() != .metal or getenvBool("TERMITE_METAL_DISABLE_QWEN35_RECURRENT_CORE")) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const rc = metal_runtime_mod.termite_metal_decode_runtime_qwen35_core_batch_begin(self.provider_impl.raw_decode_runtime, rows);
+        if (rc < 0) return error.Qwen35MetalCoreFailed;
+        return rc == 1;
+    }
+
+    pub fn endQwen35LinearBatch(cb: *const ops.ComputeBackend) !void {
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (metal_runtime_mod.termite_metal_decode_runtime_qwen35_core_batch_end(self.provider_impl.raw_decode_runtime) != 0) return error.Qwen35MetalCoreFailed;
+    }
+
+    pub fn abortQwen35LinearBatch(cb: *const ops.ComputeBackend) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        metal_runtime_mod.termite_metal_decode_runtime_qwen35_core_batch_abort(self.provider_impl.raw_decode_runtime);
     }
 
     /// The qualified 128-channel DeltaNet core has no host readbacks. Each
@@ -4924,6 +4942,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const SegmentControlCache = struct { raw: []i32, batch: u32, seq_len: u32, apply_dropout: bool, dropout_seed: u64, device: CT };
 
     pub fn deinit(self: *MetalCompute) void {
+        const Scope = struct {
+            fn execute(raw: *anyopaque) callconv(.c) void {
+                const compute: *MetalCompute = @ptrCast(@alignCast(raw));
+                compute.deinitPooled();
+            }
+        };
+        metal_runtime_mod.termite_metal_with_autorelease_pool(self, Scope.execute);
+    }
+
+    fn deinitPooled(self: *MetalCompute) void {
         if (self.embedding_stage_suspended) return;
         if (self.segment_control_cache) |cached| {
             freeOp(self, cached.device);
@@ -26665,8 +26693,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn gatedFfnNoBiasOp(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        const lighton = self.lightonocr3_4b_projections and request.rows == 1 and
-            request.hidden_size == 2560 and request.intermediate_size == 9216 and request.activation == .silu;
+        const lighton = self.lightonocr3_projections and request.rows == 1 and
+            ((request.hidden_size == 2560 and request.intermediate_size == 9216) or
+                (request.hidden_size == 1024 and request.intermediate_size == 3584)) and request.activation == .silu;
         if (!lighton and (self.data.a4b_inference == null or
             request.rows != 1 or
             !a4bHighMemoryFeatureEnabled(
@@ -35002,7 +35031,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // matmul kernels collapse at this out_dim (tens of ms), while the
         // per-row mmv route stays bandwidth-bound. Split into per-row
         // linear+argmax dispatches instead of one multi-row linear.
-        if (rows >= 2 and rows <= 8 and out_dim >= 32768) per_row: {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        // The qualified OCR vec4 kernel shares BF16 vocabulary weights across
+        // rows. Preserve the per-row workaround for all other dispatchers.
+        const lighton_batch_projection = toBuf(weight).native_dense_dtype == .bf16 and
+            metal_runtime_mod.termite_metal_decode_runtime_lightonocr3_batch_projection_available(self.provider_impl.raw_decode_runtime, rows, in_dim) != 0;
+        if (rows >= 2 and rows <= 8 and out_dim >= 32768 and !lighton_batch_projection) per_row: {
             const choices = try allocator.alloc(u32, rows);
             errdefer allocator.free(choices);
             for (0..rows) |row| {

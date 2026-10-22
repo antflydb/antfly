@@ -222,6 +222,10 @@ pub const Policy = struct {
     /// Maximum time a singleton decode may wait for an already-admitted peer.
     /// The wait is skipped when this is the only active request.
     max_decode_wait_us: u32 = 1_000,
+    /// Opt-in cohort target. The claim gate applies to every contender, so a
+    /// follower cannot bypass the first caller's bounded coalescing window.
+    /// One preserves the existing eager/C2 scheduling policy.
+    decode_coalesce_rows: usize = 1,
     /// Largest prefill issued for a sole request on an otherwise idle model.
     /// Admission budgets scratch at this size before generation starts. The
     /// ceiling remains configurable up to 2048. Model-specific performance
@@ -303,6 +307,7 @@ const PendingDecode = struct {
     kv_position_offset: usize,
     kv_blocks_estimate: usize = 0,
     exclusive_step: bool = false,
+    enqueued_ns: u64 = 0,
 };
 
 fn decodeWorkCompatible(
@@ -532,6 +537,7 @@ pub const NativeGenerateCoordinator = struct {
             .kv_position_offset = kv_position_offset,
             .kv_blocks_estimate = options.kv_blocks_estimate,
             .exclusive_step = options.exclusive_step,
+            .enqueued_ns = if (self.policy.decode_coalesce_rows > 1) platform.time.monotonicNs() else 0,
         });
         if (self.indexOf(lease.request_id)) |entry_idx| {
             self.entries.items[entry_idx].next_decode_work_total_sequence_len = null;
@@ -585,6 +591,7 @@ pub const NativeGenerateCoordinator = struct {
     pub fn decodeCoalesceDelayUs(self: *const NativeGenerateCoordinator, lease: Lease) u32 {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        if (self.policy.decode_coalesce_rows > 1) return 0;
         if (self.policy.max_decode_wait_us == 0) return 0;
         if (self.policy.max_step_items <= 1) return 0;
         if (self.policy.max_active_requests_for_batching) |limit| {
@@ -780,6 +787,22 @@ pub const NativeGenerateCoordinator = struct {
         }
     }
 
+    pub fn stepPollWaitUs(self: *const NativeGenerateCoordinator) u32 {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        return if (self.policy.decode_coalesce_rows > 1) 50 else 0;
+    }
+
+    fn deferDecodeCohort(self: *const NativeGenerateCoordinator, budget: StepBudget, now_ns: u64) bool {
+        if (self.policy.decode_coalesce_rows <= 1 or self.policy.max_decode_wait_us == 0 or
+            self.pending_decode.items.len == 0) return false;
+        const target = @min(self.policy.decode_coalesce_rows, @max(budget.max_items, 1), @max(budget.max_query_tokens, 1), self.entries.items.len);
+        if (target <= 1 or self.pending_decode.items.len >= target) return false;
+        var earliest: u64 = std.math.maxInt(u64);
+        for (self.pending_decode.items) |item| earliest = @min(earliest, item.enqueued_ns);
+        return now_ns < earliest +| (@as(u64, self.policy.max_decode_wait_us) * std.time.ns_per_us);
+    }
+
     /// Unified step claim: replaces the prefill/decode/mixed claim trio with a
     /// single entry point that always packs whatever pending work fits the
     /// budget. The leader is always included; additional items are packed
@@ -805,6 +828,9 @@ pub const NativeGenerateCoordinator = struct {
             const selected = self.pickNextTurn() orelse return false;
             if (selected != lease.request_id) return false;
         }
+
+        if (leader_phase == .decode and self.in_turn == null and self.policy.decode_coalesce_rows > 1 and
+            self.deferDecodeCohort(budget, platform.time.monotonicNs())) return false;
 
         const max_items = @max(budget.max_items, 1);
         const max_query_tokens = @max(budget.max_query_tokens, 1);
@@ -2961,4 +2987,48 @@ test "mixed position decode coalesces a peer returning from its previous step" {
     try std.testing.expectEqual(@as(u32, 1000), coordinator.decodeCoalesceDelayUs(first));
     coordinator.policy.allow_mixed_sequence_lengths = false;
     try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(first));
+}
+
+test "LightOnOCR3 cohort coalescing blocks followers until the full decoder step is ready" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 4, .decode_coalesce_rows = 4, .allow_mixed_sequence_lengths = true });
+    var leases: [4]Lease = undefined;
+    for (&leases) |*lease| lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(std.testing.allocator);
+    for (0..2) |row| try coordinator.enqueueDecodeWork(leases[row], @ptrFromInt(row + 1), 5, 4, 0, .{});
+    // A deliberately future timestamp makes this test independent of host
+    // scheduling delays. Neither leader nor follower can bypass the gate.
+    for (coordinator.pending_decode.items) |*item| item.enqueued_ns = std.math.maxInt(u64) - std.time.ns_per_s;
+    const budget = coordinator.defaultStepBudget();
+    try std.testing.expect(coordinator.deferDecodeCohort(budget, 0));
+    try std.testing.expect(!try coordinator.claimStep(std.testing.allocator, &leases[0], @ptrFromInt(1), .decode, budget, &step));
+    try std.testing.expect(!try coordinator.claimStep(std.testing.allocator, &leases[1], @ptrFromInt(2), .decode, budget, &step));
+    for (2..4) |row| try coordinator.enqueueDecodeWork(leases[row], @ptrFromInt(row + 1), 5 + row, 4 + row, 0, .{});
+    try std.testing.expect(try coordinator.claimStep(std.testing.allocator, &leases[0], @ptrFromInt(1), .decode, budget, &step));
+    try std.testing.expectEqual(@as(usize, 4), step.items.len);
+    coordinator.completeStep(&leases[0], step.items);
+}
+
+test "LightOnOCR3 cohort coalescing bounds sparse waits and shrinks after page retirement" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 4, .decode_coalesce_rows = 4, .allow_mixed_sequence_lengths = true });
+    var leases: [4]Lease = undefined;
+    for (&leases) |*lease| lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    for (0..2) |row| try coordinator.enqueueDecodeWork(leases[row], @ptrFromInt(row + 1), 5, 4, 0, .{});
+    for (coordinator.pending_decode.items) |*item| item.enqueued_ns = 1;
+    const budget = coordinator.defaultStepBudget();
+    try std.testing.expect(coordinator.deferDecodeCohort(budget, std.time.ns_per_us));
+    try std.testing.expect(!coordinator.deferDecodeCohort(budget, std.time.ns_per_ms + 1));
+    coordinator.release(leases[2]);
+    coordinator.release(leases[3]);
+    try std.testing.expect(!coordinator.deferDecodeCohort(budget, 1));
+    try std.testing.expectEqual(@as(u32, 50), coordinator.stepPollWaitUs());
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(std.testing.allocator);
+    try std.testing.expect(try coordinator.claimStep(std.testing.allocator, &leases[0], @ptrFromInt(1), .decode, budget, &step));
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    coordinator.completeStep(&leases[0], step.items);
 }

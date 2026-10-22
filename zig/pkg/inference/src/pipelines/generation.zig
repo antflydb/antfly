@@ -1265,11 +1265,17 @@ pub const KvMutationResult = struct {
 pub const OwnedBatchDecodeContext = struct {
     allocator: std.mem.Allocator,
     kv_batch: ?[]gpt_arch.DecodeContext.KvBatchView = null,
+    mrope_positions: ?[]u32 = null,
+    qwen35_linear_batch: ?[]?*gpt_arch.Qwen35LinearCache = null,
     context: gpt_arch.DecodeContext,
 
     pub fn deinit(self: *OwnedBatchDecodeContext) void {
         if (self.kv_batch) |batch| self.allocator.free(batch);
+        if (self.mrope_positions) |positions| self.allocator.free(positions);
+        if (self.qwen35_linear_batch) |caches| self.allocator.free(caches);
         self.kv_batch = null;
+        self.mrope_positions = null;
+        self.qwen35_linear_batch = null;
     }
 };
 
@@ -2360,6 +2366,7 @@ pub const NativeDecodeState = struct {
     moe_runtime: runtime.moe.runtime.MoeRuntime,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     qwen35_linear_cache: ?gpt_arch.Qwen35LinearCache = null,
+    batched_decode_steps: usize = 0,
     gemma4_layer_spec_cache: gpt_arch.Gemma4LayerSpecCache = .{},
     deepseek_v4_compressed_cache: ?gpt_arch.DeepSeekV4CompressedCache = null,
     force_full_recompute: bool = false,
@@ -3075,6 +3082,16 @@ pub fn buildOwnedBatchDecodeContext(
         };
     }
 
+    const caches: ?[]?*gpt_arch.Qwen35LinearCache = if (first_ctx.qwen35_linear_cache != null)
+        try allocator.alloc(?*gpt_arch.Qwen35LinearCache, states.len)
+    else
+        null;
+    errdefer if (caches) |owned| allocator.free(owned);
+    const positions: ?[]u32 = if (first_ctx.mrope_positions != null)
+        try allocator.alloc(u32, states.len * 3)
+    else
+        null;
+    errdefer if (positions) |owned| allocator.free(owned);
     const batch = try allocator.alloc(gpt_arch.DecodeContext.KvBatchView, states.len);
     errdefer allocator.free(batch);
 
@@ -3087,6 +3104,13 @@ pub fn buildOwnedBatchDecodeContext(
         if (ctx.kv_sequence_len != first_ctx.kv_sequence_len) return error.IncompatibleBatchDecodeContext;
         if (ctx.kv_position_offset != first_ctx.kv_position_offset) return error.IncompatibleBatchDecodeContext;
 
+        if ((ctx.qwen35_linear_cache != null) != (caches != null) or
+            (ctx.mrope_positions != null) != (positions != null)) return error.IncompatibleBatchDecodeContext;
+        if (positions) |owned| {
+            const axes = ctx.mrope_positions.?;
+            for (0..3) |axis| owned[axis * states.len + idx] = axes[axis];
+        }
+        if (caches) |owned| owned[idx] = ctx.qwen35_linear_cache;
         batch[idx] = .{
             .kv_cache = .{
                 .sequence_id = ctx.kv_cache.?.sequence_id,
@@ -3107,7 +3131,11 @@ pub fn buildOwnedBatchDecodeContext(
     return .{
         .allocator = allocator,
         .kv_batch = batch,
+        .qwen35_linear_batch = caches,
+        .mrope_positions = positions,
         .context = .{
+            .qwen35_linear_batch = caches,
+            .mrope_positions = positions,
             .attention_mode = first_ctx.attention_mode,
             .total_sequence_len = first_ctx.total_sequence_len,
             .query_sequence_len = first_ctx.query_sequence_len,
@@ -3166,13 +3194,35 @@ pub fn buildOwnedMixedBatchDecodeContext(
         break :blk max_len;
     };
 
+    var caches: ?[]?*gpt_arch.Qwen35LinearCache = null;
+    for (items) |item| if (item.state.qwen35_linear_cache != null) {
+        caches = try allocator.alloc(?*gpt_arch.Qwen35LinearCache, items.len);
+        break;
+    };
+    errdefer if (caches) |owned| allocator.free(owned);
     const batch = try allocator.alloc(gpt_arch.DecodeContext.KvBatchView, items.len);
     errdefer allocator.free(batch);
 
+    // Axis-major positions for a decoder cohort can differ by page because
+    // the visual prefix consumes different spatial positions.
+    var positions: ?[]u32 = null;
+    errdefer if (positions) |owned| allocator.free(owned);
+    for (items) |item| {
+        if (item.state.qwen3vl_mrope_position_delta != null) {
+            if (max_query_seq_len != 1) return error.Qwen3VlMixedBatchMropeUnsupported;
+            positions = try allocator.alloc(u32, items.len * 3);
+            break;
+        }
+    }
     for (items, 0..) |item, idx| {
         var decode_runtime = BorrowedDecodeStateRuntime.init(item.state);
         const ctx = decode_runtime.makeDecodeContext(item.total_sequence_len, item.query_sequence_len);
         if (!ctx.usesPagedKv()) return error.MixedBatchDecodeModes;
+        if (positions) |owned| {
+            const axes = ctx.mrope_positions orelse return error.Qwen3VlMropePositionsRequired;
+            for (0..3) |axis| owned[axis * items.len + idx] = axes[axis];
+        }
+        if (caches) |owned| owned[idx] = ctx.qwen35_linear_cache;
         batch[idx] = .{
             .kv_cache = .{
                 .sequence_id = ctx.kv_cache.?.sequence_id,
@@ -3202,7 +3252,11 @@ pub fn buildOwnedMixedBatchDecodeContext(
     return .{
         .allocator = allocator,
         .kv_batch = batch,
+        .qwen35_linear_batch = caches,
+        .mrope_positions = positions,
         .context = .{
+            .qwen35_linear_batch = caches,
+            .mrope_positions = positions,
             .attention_mode = .paged_prefill,
             .total_sequence_len = max_total_seq_len,
             .query_sequence_len = max_query_seq_len,
@@ -3729,7 +3783,11 @@ pub const NativeGenerationPipeline = struct {
             prepared.deinit(&self.cb);
         };
         var prepared_qwen3vl_prompt: ?qwen3vl_projector.PreparedPrompt = null;
-        defer if (prepared_qwen3vl_prompt) |*prepared| prepared.deinit(&self.cb);
+        defer if (prepared_qwen3vl_prompt) |*prepared| {
+            if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.execution_lock) |mutex| mutex.unlock();
+            prepared.deinit(&self.cb);
+        };
 
         const prompt_token_count = blk: {
             if (!has_images and !has_audio) break :blk actual_prompt_tokens;
@@ -3909,6 +3967,8 @@ pub const NativeGenerationPipeline = struct {
                 if (!self.gpt_config.isMultimodal()) return error.InvalidModelForGeneration;
                 const model_dir = self.model_dir orelse return error.MissingModelDirForMultimodal;
                 if (self.gpt_config.family == .qwen3_vl or self.gpt_config.hasQwen35VisionArchitectureContract()) {
+                    if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+                    defer if (self.execution_lock) |mutex| mutex.unlock();
                     if (!decode_state.isPaged()) return error.InvalidModelForGeneration;
                     if (images.len == 0 or images.len > 8) return error.ImageLimitExceeded;
                     const per_image_budget = expanded_prompt_token_limit / images.len;
@@ -10844,6 +10904,12 @@ pub const NativeGenerationPipeline = struct {
         max_query_seq_len: usize,
 
         fn publish(self: @This(), claimed: []const runtime.scheduler.native_generate.StepItem) void {
+            if (claimed.len > 1) for (claimed) |item| {
+                if (item.phase == .decode) {
+                    const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                    work.decode_state.batched_decode_steps += 1;
+                }
+            };
             if (self.greedy_tokens) |tokens| {
                 for (claimed, tokens) |item, token| {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
@@ -10867,6 +10933,37 @@ pub const NativeGenerationPipeline = struct {
         }
         defer if (self.execution_lock) |mutex| mutex.unlock();
 
+        // A cohort worker can encode hundreds of steps. Drain Objective-C
+        // temporaries at each completed step, while still owning the encoder,
+        // rather than retaining driver objects until the whole page retires.
+        if (comptime build_options.enable_metal) {
+            if (self.cb.kind() == .metal and self.gpt_config.hasQwen35VisionArchitectureContract() and
+                !platform.env.getenvBool("TERMITE_METAL_DISABLE_QWEN35_STEP_POOL"))
+            {
+                const Scope = struct {
+                    pipeline: *NativeGenerationPipeline,
+                    scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
+                    lease: *runtime.scheduler.native_generate.Lease,
+                    claimed: []const runtime.scheduler.native_generate.StepItem,
+                    fn execute(raw: *anyopaque) callconv(.c) void {
+                        const scope: *@This() = @ptrCast(@alignCast(raw));
+                        scope.pipeline.executeClaimedStepPooled(scope.scheduler, scope.lease, scope.claimed);
+                    }
+                };
+                var scope = Scope{ .pipeline = self, .scheduler = scheduler, .lease = lease, .claimed = claimed };
+                @import("../backends/metal_runtime.zig").termite_metal_with_autorelease_pool(&scope, Scope.execute);
+                return;
+            }
+        }
+        self.executeClaimedStepPooled(scheduler, lease, claimed);
+    }
+
+    fn executeClaimedStepPooled(
+        self: *NativeGenerationPipeline,
+        scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
+        lease: *runtime.scheduler.native_generate.Lease,
+        claimed: []const runtime.scheduler.native_generate.StepItem,
+    ) void {
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
 
         const result = self.forwardScheduledStep(claimed) catch |err| {
@@ -11057,6 +11154,7 @@ fn runStepLoop(
     var step = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
     defer step.deinit(allocator);
     var wait_error = initial_wait_error;
+    const poll_wait_us = scheduler.stepPollWaitUs();
 
     while (!driver.isReady()) {
         if (wait_error) |err| {
@@ -11081,7 +11179,7 @@ fn runStepLoop(
         if (claimed) {
             driver.execute(scheduler, lease, step.items);
         } else {
-            io.sleep(std.Io.Duration.fromMilliseconds(0), .awake) catch |err| {
+            io.sleep(std.Io.Duration.fromMicroseconds(poll_wait_us), .awake) catch |err| {
                 wait_error = err;
             };
         }
@@ -15825,4 +15923,50 @@ test "raw token bytes keep grammar streaming aligned with the constrained output
     try std.testing.expect(try emitDecodedDeltaForTokenizer(tokenizer, a, &.{ 0, 1 }, &state, Fixture.emit, &fixture));
     try std.testing.expectEqualStrings("x 1", fixture.bytes.items);
     try std.testing.expectEqualStrings("x 1", state.emitted_text);
+}
+
+test "LightOnOCR3 decoder cohorts preserve page caches and heterogeneous image positions" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 });
+    const cfg = gpt_mod.Config{ .family = .qwen3_5, .hidden_size = 4, .num_hidden_layers = 1, .qwen35_has_linear_attention = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 2, .qwen35_linear_value_head_dim = 2, .qwen35_linear_conv_kernel_dim = 4 };
+    var first = NativeDecodeState.initPaged(allocator, &manager, pool, null);
+    defer first.deinit();
+    var second = NativeDecodeState.initPaged(allocator, &manager, pool, null);
+    defer second.deinit();
+    try first.ensureQwen35LinearCache(cfg);
+    try second.ensureQwen35LinearCache(cfg);
+    try first.notePrefill(6);
+    try second.notePrefill(10);
+    first.qwen3vl_mrope_position_delta = -3;
+    second.qwen3vl_mrope_position_delta = -6;
+    first.qwen35_linear_cache.?.layers[0].recurrent[0] = 42;
+    second.qwen35_linear_cache.?.layers[0].recurrent[0] = 99;
+    var cohort = try buildOwnedMixedBatchDecodeContext(allocator, &.{
+        .{ .state = &first, .total_sequence_len = 7, .query_sequence_len = 1, .kv_sequence_len = 6, .kv_position_offset = 0, .attention_mode = .paged_decode },
+        .{ .state = &second, .total_sequence_len = 11, .query_sequence_len = 1, .kv_sequence_len = 10, .kv_position_offset = 0, .attention_mode = .paged_decode },
+    });
+    defer cohort.deinit();
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 3, 4, 3, 4 }, cohort.context.mrope_positions.?);
+    try std.testing.expectEqual(&first.qwen35_linear_cache.?, cohort.context.qwen35_linear_batch.?[0].?);
+    try std.testing.expectEqual(&second.qwen35_linear_cache.?, cohort.context.qwen35_linear_batch.?[1].?);
+    cohort.context.qwen35_linear_batch.?[0].?.reset();
+    try std.testing.expectEqual(@as(f32, 99), second.qwen35_linear_cache.?.layers[0].recurrent[0]);
+    var tail = try buildOwnedMixedBatchDecodeContext(allocator, &.{
+        .{ .state = &second, .total_sequence_len = 12, .query_sequence_len = 1, .kv_sequence_len = 11, .kv_position_offset = 0, .attention_mode = .paged_decode },
+    });
+    defer tail.deinit();
+    try std.testing.expect(tail.context.kv_batch == null);
+    try std.testing.expectEqual(&second.qwen35_linear_cache.?, tail.context.qwen35_linear_cache.?);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 5, 5 }, tail.context.mrope_positions.?);
+    var peer = NativeDecodeState.initPaged(allocator, &manager, pool, null);
+    defer peer.deinit();
+    try peer.ensureQwen35LinearCache(cfg);
+    try peer.notePrefill(6);
+    peer.qwen3vl_mrope_position_delta = -1;
+    var uniform = try buildOwnedBatchDecodeContext(allocator, &.{ &first, &peer }, 7, 1);
+    defer uniform.deinit();
+    try std.testing.expectEqualSlices(u32, &.{ 3, 5, 3, 5, 3, 5 }, uniform.context.mrope_positions.?);
+    try std.testing.expectEqual(&peer.qwen35_linear_cache.?, uniform.context.qwen35_linear_batch.?[1].?);
 }

@@ -6193,10 +6193,12 @@ fn makeMetalHostedComputeBackend(
     );
     compute.require_f32_linears = self.arch_config == .embedding_gemma2;
     compute.qwen35_ocr_deferred_attention = switch (self.arch_config) {
-        .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32,
+        .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and
+            ((cfg.hidden_size == 1024 and cfg.intermediate_size == 3584 and cfg.num_hidden_layers == 24) or
+                (cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32)),
         else => false,
     };
-    compute.lightonocr3_4b_projections = compute.qwen35_ocr_deferred_attention;
+    compute.lightonocr3_projections = compute.qwen35_ocr_deferred_attention;
     // The shared provider belongs to this model, and init holds its execution
     // lease. Configure encoder normalization before any device work is queued.
     if (compute.provider_impl.raw_decode_runtime) |raw| {
@@ -6208,7 +6210,7 @@ fn makeMetalHostedComputeBackend(
             else => false,
         };
         @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(raw, @intFromBool(qwen35_ocr));
-        @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_lightonocr3_4b_projections(raw, @intFromBool(compute.lightonocr3_4b_projections));
+        @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_lightonocr3_projections(raw, @intFromBool(compute.lightonocr3_projections));
     }
     return compute.ownedComputeBackend();
 }

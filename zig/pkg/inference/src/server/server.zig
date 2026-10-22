@@ -7466,12 +7466,27 @@ pub const Node = struct {
         text: []u8,
         prompt_tokens: usize,
         completion_tokens: usize,
+        native_execution_id: u64 = 0,
 
         pub fn deinit(self: *Qwen3VlReadResult, allocator: std.mem.Allocator) void {
             allocator.free(self.text);
             self.* = undefined;
         }
     };
+
+    fn qwenReadExecution(allocator: std.mem.Allocator, results: []const Qwen3VlReadResult) !readers_api.BatchExecution {
+        var execution = readers_api.BatchExecution{ .requested_items = results.len };
+        var native_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer native_ids.deinit(allocator);
+        for (results) |result| {
+            if (result.native_execution_id != 0) {
+                execution.native_items += 1;
+                try native_ids.put(allocator, result.native_execution_id, {});
+            } else execution.serial_items += 1;
+        }
+        execution.native_batches = native_ids.count();
+        return execution;
+    }
 
     fn qwen3VlEncodedReadBatchResult(
         allocator: std.mem.Allocator,
@@ -7492,10 +7507,455 @@ pub const Node = struct {
             item.source_fingerprint = if (image.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
             item.page_number = image.page_number;
         }
-        return .{
-            .items = out,
-            .execution = .{ .requested_items = out.len, .serial_items = out.len },
+        const execution = try qwenReadExecution(allocator, results);
+        return .{ .items = out, .execution = execution };
+    }
+
+    const ConcurrentOcrBenchTask = struct {
+        node: *Node,
+        model_dir: []const u8,
+        images: []const []const u8,
+        references: []const []const u8,
+        max_tokens: usize,
+        requests: usize,
+        offset: usize,
+        stride: usize,
+        pages_per_request: usize,
+        completed: usize = 0,
+        native_items: usize = 0,
+        failure: ?anyerror = null,
+        elapsed_ns: u64 = 0,
+        latencies: []u64,
+        start: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            self.runInner() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn runInner(self: *@This()) !void {
+            const allocator = std.heap.smp_allocator;
+            var index = self.offset;
+            while (index < self.requests) : (index += self.stride) {
+                var images: [8]readers_api.EncodedImage = undefined;
+                for (images[0..self.pages_per_request], 0..) |*image, page| {
+                    image.* = .{ .bytes = self.images[(index * self.pages_per_request + page) % self.images.len], .mime_type = "image/png" };
+                }
+                const begin = embedTimingNowNs();
+                var result = try self.node.readEncodedImagesReportedDirect(allocator, self.model_dir, .{ .images = images[0..self.pages_per_request], .max_tokens = @intCast(self.max_tokens) });
+                defer result.deinit(allocator);
+                self.latencies[index] = @intCast(embedTimingNowNs() - begin);
+                for (result.items, 0..) |item, page| {
+                    const expected = self.references[(index * self.pages_per_request + page) % self.images.len];
+                    if (!std.mem.eql(u8, expected, item.text)) {
+                        std.debug.print("OCR_CONCURRENCY mismatch request={d} page={d} expected={s} actual={s}\n", .{ index, page, expected, item.text });
+                        return error.ConcurrentOcrOutputMismatch;
+                    }
+                }
+                self.completed += result.items.len;
+                self.native_items += result.execution.native_items;
+            }
+        }
+    };
+
+    fn benchmarkConcurrentOcr(node: *Node, model_dir: []const u8, fixture: []const u8, max_tokens: usize) !void {
+        const concurrency = platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_CONCURRENCY") orelse return;
+        if (concurrency == 0 or concurrency > 16) return error.InvalidBenchmarkConcurrency;
+        const requests = platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_REQUESTS") orelse 16;
+        const pages_per_request = platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_PAGES_PER_REQUEST") orelse 1;
+        if (requests == 0 or pages_per_request == 0 or pages_per_request > 8) return error.InvalidBenchmarkConcurrency;
+        const allocator = std.heap.smp_allocator;
+        const io = std.testing.io;
+        var image_list = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (image_list.items) |bytes| allocator.free(bytes);
+            image_list.deinit(allocator);
+        }
+        if (platform.env.getenv("ANTFLY_TEST_LIGHTONOCR3_IMAGES_JSON")) |raw| {
+            const paths = try std.json.parseFromSlice([]const []const u8, allocator, raw, .{});
+            defer paths.deinit();
+            for (paths.value) |path| {
+                const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024));
+                errdefer allocator.free(bytes);
+                try image_list.append(allocator, bytes);
+            }
+        } else {
+            const bytes = try allocator.dupe(u8, fixture);
+            errdefer allocator.free(bytes);
+            try image_list.append(allocator, bytes);
+        }
+        if (image_list.items.len == 0) return error.InvalidBenchmarkCorpus;
+        const references = try allocator.alloc([]const u8, image_list.items.len);
+        defer allocator.free(references);
+        var reference_count: usize = 0;
+        defer for (references[0..reference_count]) |text| allocator.free(text);
+        for (image_list.items, references) |image, *reference| {
+            var result = try node.readEncodedImagesReportedDirect(allocator, model_dir, .{ .images = &.{.{ .bytes = image, .mime_type = "image/png" }}, .max_tokens = @intCast(max_tokens) });
+            defer result.deinit(allocator);
+            reference.* = try allocator.dupe(u8, result.items[0].text);
+            reference_count += 1;
+            const encoded = try std.json.Stringify.valueAlloc(allocator, .{ .image_index = reference_count - 1, .text = reference.* }, .{});
+            defer allocator.free(encoded);
+            std.debug.print("OCR_REFERENCE {s}\n", .{encoded});
+        }
+        const latencies = try allocator.alloc(u64, requests);
+        defer allocator.free(latencies);
+        @memset(latencies, 0);
+        var start = std.atomic.Value(bool).init(false);
+        var tasks: [16]ConcurrentOcrBenchTask = undefined;
+        var threads: [16]std.Thread = undefined;
+        var spawned: usize = 0;
+        var spawn_error: ?anyerror = null;
+        const begin = embedTimingNowNs();
+        for (0..concurrency) |worker| {
+            tasks[worker] = .{ .node = node, .model_dir = model_dir, .images = image_list.items, .references = references, .max_tokens = max_tokens, .requests = requests, .offset = worker, .stride = concurrency, .pages_per_request = pages_per_request, .latencies = latencies, .start = &start };
+            threads[worker] = std.Thread.spawn(.{}, ConcurrentOcrBenchTask.run, .{&tasks[worker]}) catch |err| {
+                spawn_error = err;
+                break;
+            };
+            spawned += 1;
+        }
+        start.store(true, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+        if (spawn_error) |err| return err;
+        const elapsed = embedTimingNowNs() - begin;
+        var completed: usize = 0;
+        var native_items: usize = 0;
+        for (tasks[0..spawned]) |task| {
+            if (task.failure) |err| return err;
+            completed += task.completed;
+            native_items += task.native_items;
+        }
+        if (completed != requests * pages_per_request) return error.IncompleteBenchmark;
+        std.mem.sort(u64, latencies, {}, std.sort.asc(u64));
+        std.debug.print("OCR_CONCURRENCY concurrency={d} requests={d} pages_per_request={d} completed={d} elapsed_ms={d} pages_per_second={d:.4} p50_ms={d} p95_ms={d} native_items={d} parity=true\n", .{ concurrency, requests, pages_per_request, completed, elapsed / std.time.ns_per_ms, @as(f64, @floatFromInt(completed)) * 1e9 / @as(f64, @floatFromInt(elapsed)), latencies[requests / 2] / std.time.ns_per_ms, latencies[@min(requests - 1, requests * 95 / 100)] / std.time.ns_per_ms, native_items });
+    }
+
+    // A pinned loaded generation is part of the grouping identity. Payloads
+    // and caller control remain borrowed until submitBatchControlled rejoins.
+    const LightOnReadPayload = struct {
+        model: *model_manager_mod.LoadedModel,
+        model_path: []const u8,
+        image: []const u8,
+        prompt: []const u8,
+        max_tokens: i32,
+        control: InferenceExecutionControl,
+    };
+
+    fn lightOnOcrPolicy(self: *const Node) runtime.scheduler.native_generate.Policy {
+        var policy = self.config.generation_batching.schedulerPolicy();
+        policy.max_step_items = effectiveLightOnReadRows();
+        policy.max_active_requests_for_batching = effectiveLightOnReadWindow();
+        policy.allow_mixed_sequence_lengths = true;
+        policy.max_decode_wait_us = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_DECODE_WAIT_US") orelse self.config.generation_batching.max_decode_wait_us, 10000));
+        policy.decode_coalesce_rows = policy.max_step_items;
+        return policy;
+    }
+
+    fn readLightOnImagesViaBroker(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model: *model_manager_mod.LoadedModel,
+        model_path: []const u8,
+        images: []const []const u8,
+        prompt: []const u8,
+        max_tokens: i32,
+        control: InferenceExecutionControl,
+    ) ![]Qwen3VlReadResult {
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, control.io, &owned_io);
+        const payloads = try allocator.alloc(LightOnReadPayload, images.len);
+        defer allocator.free(payloads);
+        const shapes = try allocator.alloc(executor_microbatch.Shape, images.len);
+        defer allocator.free(shapes);
+        const identities = try allocator.alloc(executor_microbatch.Identity, images.len);
+        defer allocator.free(identities);
+        for (images, 0..) |image, index| {
+            payloads[index] = .{ .model = model, .model_path = model_path, .image = image, .prompt = prompt, .max_tokens = max_tokens, .control = control };
+            shapes[index] = .{ .bytes = image.len, .pixels = try measureExecutorDecodedImages(&model.manifest, &.{image}), .tokens = @intCast(max_tokens) };
+            identities[index] = .{};
+        }
+        const Cancel = struct {
+            fn check(raw: *const anyopaque) bool {
+                const active: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                active.check() catch return true;
+                return false;
+            }
         };
+        const owner = std.heap.smp_allocator;
+        const contract = try resolvedInferenceExecutorContract(self, "read", &model.manifest);
+        const window = @min(effectiveLightOnReadWindow(), contract.batch.max_items);
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(
+            LightOnReadPayload,
+            Qwen3VlReadResult,
+            io,
+            owner,
+            .{ .model = model_path, .generation = @intFromPtr(model), .task = .read, .prompt = prompt, .option_key = @intCast(max_tokens), .resource_class = .gpu },
+            .{ .mode = .native, .preferred_items = window, .max_items = window, .max_bytes = @min(readInlineSourceByteCap(self), contract.batch.max_encoded_media_bytes), .max_pixels = contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), .max_tokens = std.math.mul(usize, window, @intCast(max_tokens)) catch std.math.maxInt(usize), .max_wait_us = @max(self.config.executor_microbatch_max_wait_us, @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_WAIT_US") orelse 5000, 20000)) },
+            shapes,
+            identities,
+            try directExecutorDeadline(io, control.deadline_ns),
+            .{ .ptr = &control, .is_cancelled_fn = Cancel.check },
+            payloads,
+            self,
+            executeLightOnReadMicrobatch,
+        );
+        defer owner.free(results);
+        defer for (results) |*result| switch (result.result) {
+            .value => |*value| value.deinit(owner),
+            .item_error => {},
+        };
+        // Recover the original deadline/cancellation error rather than hiding
+        // a timeout behind the broker's cancellation adapter.
+        try control.check();
+        for (results) |result| switch (result.result) {
+            .item_error => |failure| return failure.cause,
+            .value => {},
+        };
+        const output = try allocator.alloc(Qwen3VlReadResult, results.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (output[0..initialized]) |*value| value.deinit(allocator);
+            allocator.free(output);
+        }
+        for (results, output) |result, *value| {
+            value.* = result.result.value;
+            value.text = try allocator.dupe(u8, value.text);
+            value.native_execution_id = if (result.execution == .native_batch) result.execution_id else 0;
+            initialized += 1;
+        }
+        return output;
+    }
+
+    fn executeLightOnReadMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        self.runLightOnReadCohort(items) catch |err| {
+            // Retry smaller physical cohorts only for capacity failures, before
+            // any decoder has executed. Model/data/runtime failures stay visible.
+            if (items.len > 1 and (err == error.ResourceLimitExceeded or err == error.MemoryBudgetExceeded or err == error.MemoryAdmissionDenied or err == error.ResourceTemporarilyUnavailable)) {
+                if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 split_items={d} reason={s}\n", .{ items.len, @errorName(err) });
+                const split = items.len / 2;
+                executeLightOnReadMicrobatch(raw, items[0..split]);
+                executeLightOnReadMicrobatch(raw, items[split..]);
+            } else for (items) |item| if (!item.slot.completed) {
+                item.slot.fail(err);
+            };
+        };
+    }
+
+    const LightOnReadTask = struct {
+        pipeline: generation.NativeGenerationPipeline,
+        payload: *const LightOnReadPayload,
+        item: executor_microbatch.ExecuteItem,
+        lease: runtime.scheduler.native_generate.Lease,
+        image: [1][]const u8,
+        parts: [2]generation.Message.ContentPart,
+        start: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            defer {
+                self.pipeline.scheduler.?.release(self.lease);
+                self.lease.request_id = 0;
+            }
+            const Pooled = struct {
+                fn execute(raw: *anyopaque) callconv(.c) void {
+                    const task: *LightOnReadTask = @ptrCast(@alignCast(raw));
+                    task.runInner() catch |err| task.item.slot.fail(err);
+                }
+            };
+            if (comptime build_options.enable_metal)
+                @import("../backends/metal_runtime.zig").termite_metal_with_autorelease_pool(self, Pooled.execute)
+            else
+                Pooled.execute(self);
+        }
+        fn runInner(self: *@This()) !void {
+            try self.item.control.check();
+            try self.payload.control.check();
+            const messages = [_]generation.Message{.{ .role = "user", .content = self.payload.prompt, .image_bytes = &self.image, .content_parts = &self.parts }};
+            var result = try self.pipeline.generate(&messages, .{ .max_tokens = self.payload.max_tokens, .prefill_chunk_size = self.lease.prefill_chunk_size });
+            defer result.deinit();
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                std.debug.print("LIGHTONOCR3 tokens prompt={d} completion={d}\n", .{ result.prompt_tokens, result.tokens_used });
+                if (result.timing_ms) |timing| std.debug.print("LIGHTONOCR3 phases vision_prepare={d} runtime_prepare={d} prefill={d} decode={d} total={d}\n", .{ timing.multimodal_prepare, timing.runtime_prepare, timing.prefill, timing.decode, timing.total });
+            }
+            if (std.mem.eql(u8, result.finish_reason, "length")) return error.ReadOutputTruncated;
+            try self.item.control.check();
+            try self.payload.control.check();
+            self.item.slot.setValue(Qwen3VlReadResult, .{ .text = try self.item.allocator.dupe(u8, result.text), .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used }, if (self.pipeline.decode_state.?.batched_decode_steps > 0) .native_batch else .serial);
+        }
+    };
+
+    const LightOnCohortMemory = struct {
+        amounts: runtime.tier.memory.AdmissionAmounts = .{},
+        vision_backend_peak: usize = 0,
+
+        fn product(values: []const usize) !usize {
+            var bytes: usize = 1;
+            for (values) |value| bytes = std.math.mul(usize, bytes, value) catch return error.ResourceLimitExceeded;
+            return bytes;
+        }
+        fn add(self: *@This(), cfg: gpt_model_mod.Config, prompt_tokens: usize, output_tokens: usize, decoder: runtime.tier.memory.AdmissionAmounts, vision: runtime.tier.memory.AdmissionAmounts) !void {
+            self.amounts = try self.amounts.merge(decoder);
+            // The execution lock excludes overlapping vision projectors. Keep
+            // their host allocations conservatively additive, but reserve one
+            // backend working set plus each page's retained prompt and history.
+            var retained = vision;
+            retained.backend_scratch_bytes = 0;
+            self.amounts = try self.amounts.merge(retained);
+            self.vision_backend_peak = @max(self.vision_backend_peak, vision.backend_scratch_bytes);
+            const key_dim = try product(&.{ cfg.qwen35_linear_num_key_heads, cfg.qwen35_linear_key_head_dim });
+            const value_dim = try product(&.{ cfg.qwen35_linear_num_value_heads, cfg.qwen35_linear_value_head_dim });
+            const conv_dim = std.math.add(usize, try product(&.{ key_dim, 2 }), value_dim) catch return error.ResourceLimitExceeded;
+            const conv = try product(&.{ conv_dim, cfg.qwen35_linear_conv_kernel_dim, @sizeOf(f32) });
+            const recurrent = try product(&.{ cfg.qwen35_linear_num_value_heads, cfg.qwen35_linear_key_head_dim, cfg.qwen35_linear_value_head_dim, @sizeOf(f32) });
+            const host_state = std.math.add(usize, conv, recurrent) catch return error.ResourceLimitExceeded;
+            // Two convolution histories, one recurrent matrix, and the four
+            // small immutable GPU weights: conv, A_log, dt_bias, gated norm.
+            const side_weights = std.math.add(usize, try product(&.{ cfg.qwen35_linear_num_value_heads, 2 }), value_dim) catch return error.ResourceLimitExceeded;
+            const gpu_state = std.math.add(usize, try product(&.{ conv, 3 }), std.math.add(usize, recurrent, try product(&.{ side_weights, @sizeOf(f32) })) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+            var persistent = runtime.tier.memory.AdmissionAmounts{};
+            for (0..cfg.num_hidden_layers) |layer| if (cfg.layerUsesQwen35LinearAttention(layer)) {
+                persistent.host_scratch_bytes = std.math.add(usize, persistent.host_scratch_bytes, host_state) catch return error.ResourceLimitExceeded;
+                persistent.backend_scratch_bytes = std.math.add(usize, persistent.backend_scratch_bytes, gpu_state) catch return error.ResourceLimitExceeded;
+            };
+            // Projected embeddings can await prefill while another page owns
+            // the runtime; token plans and output buffers also outlive vision.
+            const tokens = std.math.add(usize, prompt_tokens, output_tokens) catch return error.ResourceLimitExceeded;
+            persistent = try persistent.merge(.{
+                .host_scratch_bytes = try product(&.{ tokens, 128 }),
+                .backend_scratch_bytes = try product(&.{ prompt_tokens, cfg.hidden_size, @sizeOf(f32) }),
+            });
+            self.amounts = try self.amounts.merge(persistent);
+        }
+        fn finish(self: @This()) !runtime.tier.memory.AdmissionAmounts {
+            return self.amounts.merge(.{ .backend_scratch_bytes = self.vision_backend_peak });
+        }
+    };
+
+    fn runLightOnReadCohort(self: *Node, items: []const executor_microbatch.ExecuteItem) !void {
+        if (items.len == 0) return;
+        var group_control = executor_microbatch.ExecutionControl{ .items = items };
+        const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group_control, .check_fn = executor_microbatch.ExecutionControl.check });
+        const lane = try items[0].payloadAs(LightOnReadPayload).model.native_reader_execution_lane.acquire(control);
+        defer lane.release();
+        const Scope = struct {
+            node: *Node,
+            items: []const executor_microbatch.ExecuteItem,
+            failure: ?anyerror = null,
+            fn execute(raw: *anyopaque) callconv(.c) void {
+                const scope: *@This() = @ptrCast(@alignCast(raw));
+                scope.node.runLightOnReadCohortPooled(scope.items) catch |err| {
+                    scope.failure = err;
+                };
+            }
+        };
+        var scope = Scope{ .node = self, .items = items };
+        if (comptime build_options.enable_metal)
+            @import("../backends/metal_runtime.zig").termite_metal_with_autorelease_pool(&scope, Scope.execute)
+        else
+            Scope.execute(&scope);
+        if (scope.failure) |err| return err;
+    }
+
+    fn runLightOnReadCohortPooled(self: *Node, items: []const executor_microbatch.ExecuteItem) !void {
+        // This allocator is used by the backend across worker threads. Caller
+        // allocators are only touched after the submitting caller rejoins.
+        const allocator = std.heap.smp_allocator;
+        const first = items[0].payloadAs(LightOnReadPayload);
+        const model = first.model;
+        const cfg = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
+        const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, .metal);
+        var group_control = executor_microbatch.ExecutionControl{ .items = items };
+        const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group_control, .check_fn = executor_microbatch.ExecutionControl.check });
+        const io = items[0].control.io orelse return error.MissingIo;
+
+        const limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(model.session, self.defaultGenerationLimits(.gpu)));
+        var budget = runtime.tier.memory.RunBudget.init(limits);
+        var memory = LightOnCohortMemory{};
+        var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(allocator);
+        defer coordinator.deinit();
+        coordinator.setPolicy(self.lightOnOcrPolicy());
+        coordinator.max_decode_streak_before_prefill = 0;
+        const tasks = try allocator.alloc(LightOnReadTask, items.len);
+        defer allocator.free(tasks);
+        var initialized: usize = 0;
+        defer for (tasks[0..initialized]) |*task| if (task.lease.request_id != 0) coordinator.release(task.lease);
+        for (items, tasks) |item, *task| {
+            const payload = item.payloadAs(LightOnReadPayload);
+            const messages = [_]generation.Message{.{ .role = "user", .content = payload.prompt, .image_bytes = &.{payload.image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = payload.prompt } } }};
+            const estimate = try countPromptTokens(allocator, payload.model_path, model, cfg, &messages, payload.max_tokens);
+            // countPromptTokens owns no retained encode; it only returns shape.
+            const components = [_]runtime.tier.memory.GptGenerationBudgetComponent{.{ .backend = .metal, .kv_dtype = kv_dtype, .config = cfg, .workspace_capacity = model.session.generationWorkspaceCapacity() }};
+            const chunk = try runtime.tier.memory.reserveGptGenerationAtLargestChunk(&budget, &components, estimate.token_count, @intCast(payload.max_tokens), @min(estimate.token_count, 2048));
+            const resource = try runtime.tier.memory.estimateGptGeneration(.metal, kv_dtype, cfg, estimate.token_count, @intCast(payload.max_tokens), chunk);
+            try memory.add(cfg, estimate.token_count, @intCast(payload.max_tokens), runtime.tier.memory.AdmissionAmounts.fromEstimate(resource), try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, .metal, estimate.media_admission));
+            task.* = .{ .pipeline = undefined, .payload = payload, .item = item, .lease = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = payload.prompt.len, .prompt_tokens = estimate.token_count, .prefill_chunk_limit = chunk, .max_tokens = payload.max_tokens }), .image = .{payload.image}, .parts = .{ .{ .image = 0 }, .{ .text = payload.prompt } }, .start = undefined };
+            initialized += 1;
+        }
+        // Shared admission accounts all live page state. Capacity subdivision
+        // above happens before any model/backend mutation or worker launch.
+        const amounts = try memory.finish();
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 admission_items={d} host_scratch={d} backend_scratch={d} kv={d} scratch_limit={d} kv_limit={d}\n", .{ items.len, amounts.host_scratch_bytes, amounts.backend_scratch_bytes, amounts.kvTotalBytes(), limits.scratch_limit_bytes, limits.kv_limit_bytes });
+        var admission = try self.model_manager.acquireGenerationResources(&.{.{ .session = model.session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = amounts } }});
+        defer admission.release();
+        try control.lock(model.nativeGenerationMutex());
+        defer model.unlockNativeGeneration();
+        var cb = try session_factory.getComputeBackendWithBudget(model.session, allocator, &budget);
+        defer cb.deinit();
+        var manager = runtime.kv.manager.KvManager.init(allocator);
+        defer manager.deinit();
+        const pool_config = generation.kvPoolConfig(.metal, kv_dtype, cfg, generationKvSlidingTrimForced());
+        const pool = try manager.addPool(pool_config);
+        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, pool_config);
+        defer storage.deinit();
+        try cb.provisionKvDeviceWriteHook(&storage);
+        const states = try allocator.alloc(generation.NativeDecodeState, items.len);
+        defer allocator.free(states);
+        for (states) |*state| state.* = generation.NativeDecodeState.initPaged(allocator, &manager, pool, model.shared_moe_cache);
+        defer for (states) |*state| state.deinit();
+        var kv_mutex: std.atomic.Mutex = .unlocked;
+        var step_mutex: std.atomic.Mutex = .unlocked;
+        var start = std.atomic.Value(bool).init(false);
+        for (tasks, states) |*task, *state| {
+            state.kv_storage = &storage;
+            state.kv_lock = &kv_mutex;
+            task.start = &start;
+            task.pipeline = .{ .allocator = allocator, .io = io, .cb = cb, .session = model.session, .gpt_config = cfg, .kv_dtype = kv_dtype, .tokenizer = model.getTokenizer(), .add_bos_token = model.manifest.add_bos_token, .bos_token = model.manifest.bos_token, .chat_template = model.chat_tmpl, .model_dir = first.model_path, .decode_state = state, .scheduler = &coordinator, .scheduler_lease = &task.lease, .execution_lock = &step_mutex, .execution_control = control };
+        }
+        // Start together only after all workers exist. A failed spawn cannot
+        // leave an admitted page waiting forever for an unstarted peer.
+        var threads: [16]std.Thread = undefined;
+        var spawned: usize = 0;
+        for (tasks) |*task| {
+            threads[spawned] = std.Thread.spawn(.{}, LightOnReadTask.run, .{task}) catch |err| {
+                task.item.slot.fail(err);
+                coordinator.release(task.lease);
+                task.lease.request_id = 0;
+                continue;
+            };
+            spawned += 1;
+        }
+        start.store(true, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+        if (comptime build_options.enable_metal) {
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                const metal: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(cb.ptr));
+                const raw = metal.provider_impl.raw_decode_runtime;
+                const usage = metal_runtime.runtimeMemorySnapshot(raw);
+                const tensors = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+                const observed = @import("../backends/metal_telemetry.zig").memorySnapshot(true);
+                std.debug.print("LIGHTONOCR3 memory device_allocated={d} bf16_weights={d} f32_weights={d} packed_qkv={d} embeddings={d} scratch={d} tracked={d} scratch_pool={d} tensor_live={d} observed_owned={d} observed_alias={d} frame_gpu_ms={d}\n", .{ metal_runtime.currentAllocatedSize(raw), usage.dense_linear_bf16_weight_bytes, usage.dense_linear_f32_weight_bytes, usage.dense_qkv_packed_bytes, usage.embedding_bytes, usage.scratch_bytes, usage.total_bytes, usage.scratch_pool_bytes, tensors.device_owned_live_bytes, observed[0], observed[6], (usage.frame_gpu_nanos -| metal.runtime_frame_gpu_baseline) / std.time.ns_per_ms });
+            }
+        }
+        const stats = coordinator.stats;
+        const batched = stats.step_batch_size_2_total + stats.step_batch_size_3_4_total + stats.step_batch_size_5_8_total;
+        for (items) |item| if (item.slot.completed and item.slot.err == null) {
+            item.slot.physical_group_key = @intFromPtr(items[0].payload);
+        };
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 cohort_items={d} decode_steps={d} batched_steps={d} singleton_steps={d} decode_items={d}\n", .{ items.len, stats.step_batches_total, batched, stats.step_singleton_batches_total, stats.step_decode_items_total });
     }
 
     fn readQwen3VlImagesWithAdmission(
@@ -7520,6 +7980,10 @@ pub const Node = struct {
             return error.InvalidModelForReading;
 
         const prompt = try resolveGenerativeReadPrompt(&resident_model_handle.get().manifest, requested_prompt);
+        if (resident_model_handle.get().manifest.isLightOnOcr3() and resident_model_handle.get().session.backend() == .metal and
+            platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_BATCH", true) and
+            (try resolvedInferenceExecutorContract(self, "read", &resident_model_handle.get().manifest)).batch.mode == .native)
+            return self.readLightOnImagesViaBroker(allocator, resident_model_handle.get(), model_path, image_datas, prompt, max_tokens, control);
         const out = try allocator.alloc(Qwen3VlReadResult, image_datas.len);
         var filled: usize = 0;
         errdefer {
@@ -8340,6 +8804,23 @@ pub const Node = struct {
             for (items) |item| item.slot.fail(err);
             return;
         };
+        var group_control = executor_microbatch.ExecutionControl{ .items = items };
+        const execution_control = self.bindExecutionControl(items[0].control.io, .{
+            .ptr = &group_control,
+            .check_fn = executor_microbatch.ExecutionControl.check,
+        });
+        // One Metal provider belongs to this pinned reader generation.
+        // Queue compatible groups before admission instead of racing its
+        // fail-fast owner lock or reserving resources for waiting groups.
+        const lane: ?execution_control_mod.ExecutionLane.Lease = if (first.fence.backend() == .metal)
+            first.fence.handle.get().native_reader_execution_lane.acquire(execution_control) catch |err| {
+                for (items) |item| item.slot.fail(err);
+                return;
+            }
+        else
+            null;
+        defer if (lane) |lease| lease.release();
+
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
         self.acquireAdmissionUnits(required_units) catch |err| {
             for (items) |item| item.slot.fail(err);
@@ -8347,11 +8828,6 @@ pub const Node = struct {
         };
         defer self.releaseAdmissionUnits(required_units);
 
-        var group_control = executor_microbatch.ExecutionControl{ .items = items };
-        const execution_control = self.bindExecutionControl(items[0].control.io, .{
-            .ptr = &group_control,
-            .check_fn = executor_microbatch.ExecutionControl.check,
-        });
         const batch = self.runReadImageBatchReportedDirect(
             allocator,
             first.model_path,
@@ -8454,6 +8930,23 @@ pub const Node = struct {
             for (items) |item| item.slot.fail(err);
             return;
         };
+        var group_control = executor_microbatch.ExecutionControl{ .items = items };
+        const execution_control = self.bindExecutionControl(items[0].control.io, .{
+            .ptr = &group_control,
+            .check_fn = executor_microbatch.ExecutionControl.check,
+        });
+        // One Metal provider belongs to this pinned reader generation.
+        // Queue compatible groups before admission instead of racing its
+        // fail-fast owner lock or reserving resources for waiting groups.
+        const lane: ?execution_control_mod.ExecutionLane.Lease = if (first.fence.backend() == .metal)
+            first.fence.handle.get().native_reader_execution_lane.acquire(execution_control) catch |err| {
+                for (items) |item| item.slot.fail(err);
+                return;
+            }
+        else
+            null;
+        defer if (lane) |lease| lease.release();
+
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
         self.acquireAdmissionUnits(required_units) catch |err| {
             for (items) |item| item.slot.fail(err);
@@ -8461,11 +8954,6 @@ pub const Node = struct {
         };
         defer self.releaseAdmissionUnits(required_units);
 
-        var group_control = executor_microbatch.ExecutionControl{ .items = items };
-        const execution_control = self.bindExecutionControl(items[0].control.io, .{
-            .ptr = &group_control,
-            .check_fn = executor_microbatch.ExecutionControl.check,
-        });
         const batch = self.runReadRasterBatchReportedDirect(
             allocator,
             first.model_path,
@@ -18015,6 +18503,10 @@ pub const Node = struct {
                 .data = results_out,
                 .model = body.model,
                 .usage = tokenUsage(prompt_tokens, completion_tokens),
+                .execution = blk: {
+                    const observed = try qwenReadExecution(ctx.allocator, qwen_results);
+                    break :blk .{ .requested_items = @intCast(observed.requested_items), .native_batches = @intCast(observed.native_batches), .native_items = @intCast(observed.native_items), .serial_items = @intCast(observed.serial_items), .rejected_items = 0, .fallback_items = 0 };
+                },
             });
         }
 
@@ -23921,7 +24413,8 @@ fn appendModelInfo(
     const inferred_multi_label = zero_shot_classification and !model_caps.hasCapability(capabilities, "multi_label");
     const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
     const inferred_extraction = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "extraction") and !model_caps.hasCapability(capabilities, "extraction");
-    const effective_native_batch_read = executor_kind == .native_florence_reader and effectiveNativeReadBatchSize() > 1;
+    const effective_native_batch_read = (executor_kind == .native_florence_reader and effectiveNativeReadBatchSize() > 1) or
+        (executor_kind == .native_lighton_reader and effectiveLightOnReadWindow() > 1);
     const inferred_native_batch_read = effective_native_batch_read and !model_caps.hasCapability(capabilities, "native_batch_read");
     const resolved_task_for_executor = normalizedInferenceTask(task);
     const batch_implementation = if (resolved_task_for_executor) |resolved_task|
@@ -24648,6 +25141,7 @@ pub const ResolvedExecutorKind = enum {
     native_dense_embedding,
     native_sparse_embedding,
     native_florence_reader,
+    native_lighton_reader,
     /// Boundary extraction retains its qualified one-item request limit.
     native_gliner_extraction,
     /// Span extraction accepts multiple texts across its schema variants.
@@ -24740,6 +25234,10 @@ pub fn resolvedExecutorKind(
         if (!registered_native_batch) return .compatibility;
         return if (manifest.hasCapability("sparse")) .native_sparse_embedding else .native_dense_embedding;
     }
+    if (std.mem.eql(u8, resolved_task, "read") and manifest.hasTask("read") and manifest.isLightOnOcr3() and
+        build_options.enable_metal and platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_BATCH", true) and
+        effectiveLightOnReadWindow() > 1 and effectiveLightOnReadRows() > 1)
+        return .native_lighton_reader;
     if (std.mem.eql(u8, resolved_task, "read") and manifest.native_arch_hint == .florence)
         return .native_florence_reader;
     if (std.mem.eql(u8, resolved_task, "extract")) {
@@ -24795,13 +25293,14 @@ pub fn resolvedExecutorBatchImplementation(
     const task_max_items = resolvedTaskMaxItems(resolved_task);
     const native_reader = executor_kind == .native_florence_reader and
         effectiveNativeReadBatchSize() > 1;
+    const lighton_reader = executor_kind == .native_lighton_reader;
     const max_items = if (native_reader)
         @min(task_max_items, effectiveNativeReadBatchSize())
     else
         task_max_items;
-    const preferred_items = @min(@as(usize, 8), max_items);
+    const preferred_items = @min(if (lighton_reader) effectiveLightOnReadWindow() else @as(usize, 8), max_items);
     const native = executor_kind == .native_dense_embedding or
-        executor_kind == .native_sparse_embedding or native_reader;
+        executor_kind == .native_sparse_embedding or native_reader or lighton_reader;
     return .{
         .mode = if (max_items == 1) .none else if (native) .native else .serial_compatibility,
         .preferred_items = preferred_items,
@@ -24828,6 +25327,14 @@ pub fn resolvedTaskMaxItems(resolved_task: []const u8) usize {
 
 /// Process-local native reader ceiling shared by catalog publication, linked
 /// capability resolution, and the concrete Florence executor.
+fn effectiveLightOnReadRows() usize {
+    return @min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_ROWS") orelse 4, 1), 8);
+}
+
+fn effectiveLightOnReadWindow() usize {
+    return @min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_WINDOW") orelse 8, 1), 16);
+}
+
 pub fn effectiveNativeReadBatchSize() usize {
     return readers_mod.nativeFlorenceReadBatchSize();
 }
@@ -38123,6 +38630,13 @@ test "LightOnOCR3 read routing preserves image-only and grounding prompts" {
     manifest.tasks = try allocator.alloc([]const u8, 1);
     manifest.tasks[0] = try allocator.dupe(u8, "read");
     try std.testing.expect(isGenerativeReadModel(&manifest));
+    const kind = resolvedExecutorKind("read", &manifest);
+    const batch = resolvedExecutorBatchImplementation("read", kind);
+    if (kind == .native_lighton_reader) {
+        try std.testing.expectEqual(.native, batch.mode);
+        try std.testing.expectEqual(@min(effectiveLightOnReadWindow(), batch.max_items), batch.preferred_items);
+    } else try std.testing.expectEqual(.compatibility, kind);
+
     try std.testing.expect(manifestMatchesModelListingTask("readers", "generator", &manifest));
     try std.testing.expect(!manifestMatchesModelListingTask("generators", "generator", &manifest));
     try std.testing.expectEqualStrings("", try resolveGenerativeReadPrompt(&manifest, null));
@@ -38178,17 +38692,23 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
     const memory_limit_bytes = try std.math.mul(usize, memory_limit_gib orelse 0, 1024 * 1024 * 1024);
     const shared_limit_gib = platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_SHARED_LIMIT_GIB") orelse memory_limit_gib orelse 0;
     const shared_limit_bytes = try std.math.mul(usize, shared_limit_gib, 1024 * 1024 * 1024);
+    const backend_limit_bytes = try std.math.mul(usize, platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_BACKEND_LIMIT_GIB") orelse 0, 1024 * 1024 * 1024);
+    const kv_limit_bytes = try std.math.mul(usize, platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_KV_LIMIT_GIB") orelse 0, 1024 * 1024 * 1024);
+    const scratch_limit_bytes = try std.math.mul(usize, platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_SCRATCH_LIMIT_GIB") orelse 0, 1024 * 1024 * 1024);
     var node = try Node.init(allocator, .{
         .models_dir = models_root,
-        .max_concurrent_requests = 64,
+        .max_concurrent_requests = platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_ADMISSION_UNITS") orelse 64,
         .process_termination_available = true,
         .process_memory_limit_bytes = memory_limit_bytes,
         // A benchmark operator may use the full envelope rather than the
         // automatic shared-pool fraction. The independent live-memory check
         // still enforces process usage, physical availability, and its reserve.
-        .generation_budget_overrides = if (shared_limit_bytes != 0) .{
+        .generation_budget_overrides = if (shared_limit_bytes != 0 or backend_limit_bytes != 0 or kv_limit_bytes != 0 or scratch_limit_bytes != 0) .{
             .host_limit_bytes = shared_limit_bytes,
             .combined_limit_bytes = shared_limit_bytes,
+            .backend_limit_bytes = backend_limit_bytes,
+            .kv_limit_bytes = kv_limit_bytes,
+            .scratch_limit_bytes = scratch_limit_bytes,
         } else .{},
         .process_memory_limit_provenance = if (memory_limit_gib != null) .explicit else .automatic,
     });
@@ -38223,6 +38743,41 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             try std.testing.expectEqualStrings(result.items[0].text, warm.items[0].text);
         }
     }
+    if (platform.env.getenvBool("ANTFLY_TEST_LIGHTONOCR3_HTTP_BATCH")) {
+        // Public HTTP identifiers are contained within models_dir. The
+        // trusted encoded API above accepts the absolute checkpoint path.
+        const previous_models_root = node.config.models_dir;
+        node.config.models_dir = std.fs.path.dirname(model_dir) orelse ".";
+        defer node.config.models_dir = previous_models_root;
+        const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
+        defer allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, fixture);
+        const url = try std.fmt.allocPrint(allocator, "data:image/png;base64,{s}", .{encoded});
+        defer allocator.free(url);
+        const Image = struct { url: []const u8 };
+        const body = try std.json.Stringify.valueAlloc(allocator, .{ .model = std.fs.path.basename(model_dir), .images = [_]Image{ .{ .url = url }, .{ .url = url } }, .max_tokens = request.max_tokens.? }, .{});
+        defer allocator.free(body);
+        var http_request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
+        defer http_request.deinit();
+        try http_request.setJson(body);
+        var ctx = httpx.Context.init(allocator, std.testing.io, &http_request);
+        defer ctx.deinit();
+        var response = try node.readImages(&ctx);
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("LIGHTONOCR3 HTTP failure: {s}\n", .{response.body orelse ""});
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const decoded = try std.json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
+        defer decoded.deinit();
+        const objects = decoded.value.object.get("data").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), objects.len);
+        for (objects) |object| try std.testing.expectEqualStrings(result.items[0].text, object.object.get("text").?.string);
+        if (platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_BATCH", true) and effectiveLightOnReadRows() > 1 and effectiveLightOnReadWindow() > 1) {
+            const execution = decoded.value.object.get("execution").?.object;
+            try std.testing.expectEqual(@as(i64, 2), execution.get("native_items").?.integer);
+        }
+        std.debug.print("LIGHTONOCR3 http_batch_pages=2 parity=true\n", .{});
+    }
+    try Node.benchmarkConcurrentOcr(&node, model_dir, fixture, @intCast(request.max_tokens.?));
     try std.testing.expectEqual(@as(usize, 1), result.items.len);
     try std.testing.expectEqual(@as(usize, 1), result.execution.serial_items);
     try std.testing.expect(result.items[0].text.len > 0);
@@ -39716,4 +40271,41 @@ test "generated constrained native request parsing preserves single and batch sc
     var batch = try parseGenerateBody(api.GenerateBatchRequest, a, batch_raw);
     defer batch.deinit();
     try std.testing.expectEqualStrings("1e-400", batch.value.requests[0].body.response_format.?.json_schema.?.schema.?.map.get("minimum").?.number_string);
+}
+
+test "LightOnOCR3 execution counters distinguish fused pages and singleton tails" {
+    const text = @constCast("page");
+    const results = [_]Node.Qwen3VlReadResult{
+        .{ .text = text, .prompt_tokens = 1, .completion_tokens = 1, .native_execution_id = 7 },
+        .{ .text = text, .prompt_tokens = 2, .completion_tokens = 2, .native_execution_id = 7 },
+        .{ .text = text, .prompt_tokens = 3, .completion_tokens = 3, .native_execution_id = 9 },
+        .{ .text = text, .prompt_tokens = 4, .completion_tokens = 4 },
+    };
+    const observed = try Node.qwenReadExecution(std.testing.allocator, &results);
+    try observed.validate(4);
+    try std.testing.expectEqual(@as(usize, 3), observed.native_items);
+    try std.testing.expectEqual(@as(usize, 2), observed.native_batches);
+    try std.testing.expectEqual(@as(usize, 1), observed.serial_items);
+}
+
+test "LightOnOCR3 cohorts reserve one serialized vision peak and every retained page state" {
+    const cfg = gpt_model_mod.Config{ .family = .qwen3_5, .hidden_size = 4, .num_hidden_layers = 1, .qwen35_has_linear_attention = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 2, .qwen35_linear_value_head_dim = 2, .qwen35_linear_conv_kernel_dim = 4 };
+    var memory = Node.LightOnCohortMemory{};
+    const decoder = runtime.tier.memory.AdmissionAmounts{ .backend_kv_bytes = 13, .backend_scratch_bytes = 7 };
+    const vision = runtime.tier.memory.AdmissionAmounts{ .host_scratch_bytes = 100, .backend_scratch_bytes = 1000 };
+    try memory.add(cfg, 10, 0, decoder, vision);
+    const single = try memory.finish();
+    try memory.add(cfg, 10, 0, decoder, vision);
+    const pair = try memory.finish();
+    try std.testing.expectEqual(@as(usize, 26), pair.backend_kv_bytes);
+    try std.testing.expectEqual(single.host_scratch_bytes * 2, pair.host_scratch_bytes);
+    try std.testing.expectEqual((single.backend_scratch_bytes - 1000) * 2 + 1000, pair.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1974), pair.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 2984), pair.host_scratch_bytes);
+    var admission = runtime.tier.memory.AdmissionController{};
+    const cap = pair.hostTotalBytes() + pair.backendTotalBytes();
+    try std.testing.expectError(error.ResourceLimitExceeded, admission.tryAcquire(.gpu, .{ .combined_limit_bytes = cap - 1 }, pair, false));
+    var lease = try admission.tryAcquire(.gpu, .{ .combined_limit_bytes = cap }, pair, false);
+    lease.release();
+    try std.testing.expectEqual(@as(usize, 0), admission.snapshot().backendTotalBytes());
 }

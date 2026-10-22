@@ -2553,6 +2553,9 @@ pub const LoadedModel = struct {
     embedding_identity_mutex: std.atomic.Mutex = .unlocked,
     chunk_planning_lane: execution_control_mod.ExecutionLane = .{},
     embedding_execution_lane: execution_control_mod.ExecutionLane = .{},
+    /// Queue OCR cohorts before taking their memory leases. Waiting groups
+    /// must not reserve decoder state that only one GPU cohort can use.
+    native_reader_execution_lane: execution_control_mod.ExecutionLane = .{},
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
     sp_tok: ?*sentencepiece.Processor,

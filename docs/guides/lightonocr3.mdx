@@ -33,11 +33,11 @@ encoder with hidden size 1024. The 0.8B model has 24 decoder layers with hidden
 size 1024 and a 12-layer vision encoder with hidden size 768. Both retain
 128-channel recurrent heads, four-tap convolution, and partial M-RoPE.
 
-The 4B Metal path also defers paged-attention completion within the active
+Both Metal models defer paged-attention completion within the active
 decoder frame, avoiding a GPU wait at every full-attention layer. The rollback
 is `TERMITE_METAL_DISABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED=1`.
 
-On M4 Max, the 4B projection path uses SIMD reductions for single-token
+On M4 Max, both projection paths use SIMD reductions for single-token
 projections, including the small recurrent gates, and fuses FFN gate/up
 projection with SiLU. Its wide decode and attention-head RMS normalizations
 also use parallel F32 reductions instead of scanning each row in one lane.
@@ -80,8 +80,15 @@ model's native labeled bounding-box markers, descriptions, and chart tables in
 the result's `text`. These markers use coordinates normalized to 0–1000; they
 are not converted into pixel-coordinate `regions`.
 
-Pages execute serially through the generation runtime, and batch responses
-report serial execution. `/read` currently accepts at most 1024 output tokens
+On Metal, `/read` coalesces compatible pages from the same request and from
+concurrent requests into bounded cohorts. Decoder projections share GPU work;
+each page keeps independent KV, DeltaNet history, and image positions. Pages
+retire independently inside the cohort. Vision projection and prefill retain
+the shared runtime's execution lock. CPU and CUDA readers retain serial page
+execution. Response execution counters report pages that actually participated
+in a multi-page decode step.
+
+`/read` currently accepts at most 1024 output tokens
 per page and rejects truncated output. Use `/generate` with a larger budget
 for dense pages; its content should contain the image and either no text or
 the exact `grounding` keyword, with thinking disabled.
@@ -366,3 +373,111 @@ python3 zig/pkg/inference/scripts/lightonocr3/benchmark_antfly_readers.py \
 The report, executable hash, checkpoint configurations, output text, raw timing
 samples, and logs are retained in
 `zig/pkg/inference/scripts/lightonocr3/results/native_readers_m4_max/`.
+
+## Concurrent reader throughput
+
+Single-page latency and saturated serving throughput measure different things.
+The earlier serial comparison above does not measure Antfly under concurrent
+load. Use the concurrency runner to compare the serial implementation with
+native batching on the same checkpoint, pages, output budget, and machine:
+
+```bash
+python3 zig/pkg/inference/scripts/lightonocr3/benchmark_concurrency.py \
+  --native-test /path/to/compiled/inference-test \
+  --model lighton08=/path/to/LightOnOCR-3-0.8B \
+  --model lighton4=/path/to/LightOnOCR-3-4B \
+  --images zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png \
+    zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png \
+    zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png \
+  --max-tokens 256 --requests 16 --concurrency 1 2 4 8 \
+  --batch-rows 4 --batch-window 8 \
+  --output-dir /tmp/lighton-concurrency
+```
+
+Build the native test executable with Zig 0.17, `-Doptimize=ReleaseFast`,
+`-Dstrip=true`, and `-Dtest-filter=LightOnOCR3`. The runner launches one Node
+per setting and submits concurrent requests to that resident Node. Loading and
+serial reference reads finish before the timed region. Every timed output
+must match its same-model serial reference exactly. The JSON report includes
+wall-clock pages/s, request p50/p95 latency, actual batching counts, model sizes,
+image and executable hashes, hardware, and raw logs. It excludes HTTP, PDF
+rendering, and indexing. Other machine workloads are uncontrolled.
+
+On the qualified M4 Max, small decoder batches also use vectorized BF16
+projection kernels that reuse weights across two to eight rows. Inputs,
+accumulation, and recurrent state remain F32. Small 0.8B batches use parallel
+normalization reductions. Other devices, missing pipelines, and unsupported
+alignment retain the existing dispatcher. For a kernel-only ablation, pass
+`--disable-batch-projections` to the runner or set
+`TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS=1` in the server.
+
+The Metal reader enables batching by default. Server process settings:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `ANTFLY_LIGHTONOCR3_BATCH` | `1` | Set `0` for the serial implementation. |
+| `ANTFLY_LIGHTONOCR3_BATCH_ROWS` | `4` | Maximum pages sharing a decoder step; clamped to 1–8. |
+| `ANTFLY_LIGHTONOCR3_BATCH_WINDOW` | `8` | Maximum resident pages in one cohort; clamped to 1–16. |
+| `ANTFLY_LIGHTONOCR3_BATCH_WAIT_US` | `5000` | Coalescing window in microseconds; capped at 20000, with the node microbatch wait as a floor. |
+| `ANTFLY_LIGHTONOCR3_DECODE_WAIT_US` | Node decode wait (normally `1000`) | Bounded wait for a full decoder step; capped at 10000. Set `0` for eager partial steps. |
+
+The broker groups only the same loaded model generation, prompt, and output
+budget. It honors configured media limits and waits up to the configured
+coalescing window for compatible pages. Admission accounts every page's KV, recurrent history, retained prompt, and
+decoder scratch, plus one serialized vision working set. A capacity failure, including live-memory pressure, splits the cohort before
+execution. The decoder coalescing gate applies to every participant, so a follower
+cannot bypass the wait and launch a partial step. The target shrinks as pages
+finish. These are bounded cohorts: completed pages do not admit replacement
+pages until the entire cohort retires. Waiting cohorts queue before taking memory leases. Existing process limits
+and live-memory checks remain authoritative. Larger cohorts may require a
+larger explicit process envelope and can increase request latency. Sweep both
+batch rows and concurrency on representative pages to select the best setting.
+
+`/generate` and `/generate/batch` retain their existing scheduling behavior;
+these reader optimizations apply to `/read` and its linked encoded-image API.
+
+
+The recurrent decode kernels also distribute Q/K and gated RMS normalization
+across a SIMD group on the qualified M4 Max. Set
+`TERMITE_METAL_DISABLE_QWEN35_CORE_PARALLEL_NORM=1` to restore the scalar
+normalizations. Multi-page recurrence shares five encoder stages while keeping
+all page histories independent; its rollback is
+`TERMITE_METAL_DISABLE_QWEN35_CORE_BATCH=1`. Qualified decoder shapes also reuse input vectors across two or four output
+columns, with an exact shader specialization for each batch size from two to
+eight. `TERMITE_METAL_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS=1` restores the earlier
+vector kernels. Selected eight-row shapes retain the existing F32-input
+TensorOps path ahead of tiling; other qualified shapes can use it as a fallback; `TERMITE_METAL_DISABLE_LIGHTONOCR3_SMALL_MPP=1` disables
+that fallback. `TERMITE_METAL_LIGHTONOCR3_SMALL_MPP=1` forces an experimental
+small-row TensorOps comparison.
+
+Florence-2 Metal readers now queue cohorts before memory admission and provider
+acquisition. On qualified M4 devices, encoders prepare bounded F16 mirrors
+of quantized linear weights (32 MiB per weight) from the first request. This
+throughput policy can increase single-page latency and memory use. Incremental
+decoding keeps its existing policy. Set `TERMITE_METAL_FLORENCE2_ENCODER_MIRRORS=0` to roll
+back this encoder optimization. Operator memory limits still apply. An eight-page
+Florence batch can need a larger scratch reservation than four pages because
+admission also covers the full-prefix decoder fallback.
+
+### Comparison with vLLM Metal
+
+The comparison harness starts a fresh vLLM Metal server per checkpoint, disables
+prefix/processor caches, and gives every image a unique media UUID to avoid
+encoder reuse. It measures completed requests, checks serial-reference output,
+and saves exact versions, checkpoint metadata, image hashes, output and raw server logs.
+Use `benchmark_vllm_metal.py --python /path/to/isolated/python` with matching
+vLLM and vllm-metal releases. Native `benchmark_concurrency.py --reference-report`
+also checks content against the saved cross-runtime references.
+
+The installed vLLM Metal 0.32.0 supports the LightOn models but does not expose a
+Florence-2 adapter. Florence therefore uses a separate MLX-VLM reference. Native
+Florence uses Q4_K weights while that reference uses FP16; this is not a matched
+precision comparison. The current measurements do **not** establish parity for
+all three readers. Earlier complete tuned runs reached about 0.96/0.28/3.20
+pages/s for LightOn 0.8B, LightOn 4B and Florence, against reference runs at
+2.80/0.81/4.90 pages/s. Later adjacent runs under heavier shared-machine load
+measured 0.37 native versus 0.85 vLLM for 0.8B, and 1.16 native versus 1.54 MLX
+for Florence. These are exploratory runs with differing runtime precision,
+not a controlled performance guarantee. Continuous cohort refill and batched
+vision/prefill remain unimplemented. Complete settings, gaps and rejected experiments are retained
+in `zig/pkg/inference/scripts/lightonocr3/results/concurrent_readers_m4_max/README.md`.
