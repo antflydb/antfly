@@ -6388,3 +6388,39 @@ func TestGeneratedTaskLeaseScopeIsolation(t *testing.T) {
 		})
 	}
 }
+
+func TestDecisionProxyPreservesMultimodalEvidence(t *testing.T) {
+	t.Parallel()
+	const body = `{"model":"deciders/visual","input":[{"role":"user","content":[{"type":"input_text","text":"Inspect"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo=","detail":"auto"}]}],"questions":[{"name":"damaged","type":"predicate","instructions":"Damaged?"}]}`
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "default"}, Logger: zap.NewNop()})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/ai/v1/decisions" || req.Header.Get("Authorization") != "Bearer tenant-key" {
+			t.Fatalf("decision route or credentials lost: %s", req.URL.Path)
+		}
+		got, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var expected, actual any
+		if err := json.Unmarshal([]byte(body), &expected); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(got, &actual); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(expected, actual) {
+			t.Fatalf("multimodal evidence changed: %s", got)
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"answers":[]}`)), Request: req}, nil
+	})}
+	p.RegisterEndpoint("http://inference.internal", "default", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://inference.internal", "decide", "deciders/visual")
+	req := httptest.NewRequest(http.MethodPost, "/ai/v1/decisions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer tenant-key")
+	recorder := httptest.NewRecorder()
+	p.handleDecide(recorder, req)
+	if recorder.Code != 200 {
+		t.Fatalf("status %d: %s", recorder.Code, recorder.Body.String())
+	}
+}

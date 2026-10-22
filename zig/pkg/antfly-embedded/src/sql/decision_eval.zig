@@ -198,7 +198,7 @@ fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionPr
                 const name = try decisions.text(pending.args[pending.args.len - 1]);
                 const active = provider orelse return error.DecisionProviderUnavailable;
                 try active.validate(name, questions);
-                try requests.append(a, .{ .decider = name, .questions = questions, .input = try decisions.text(pending.args[0]) });
+                try requests.append(a, .{ .decider = name, .questions = questions, .input = try decisions.Input.fromJson(pending.args[0]) });
                 try demands.append(a, .{ .row = i, .demand = pending });
                 continue;
             };
@@ -260,6 +260,11 @@ const Mock = struct {
     max_batch: usize = 0,
     fail: bool = false,
     fail_after: ?usize = null,
+    expect_messages: bool = false,
+    fn capabilities(ptr: *anyopaque, _: []const u8) !decisions.Capabilities {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return decisions.capabilities(if (self.expect_messages) .openai else .antfly);
+    }
     fn validate(_: *anyopaque, _: []const u8, questions: decisions.Json) !void {
         try decisions.validateQuestions(questions, decisions.capabilities(.antfly));
     }
@@ -270,6 +275,12 @@ const Mock = struct {
         self.max_batch = @max(self.max_batch, requests.len);
         const results = try a.alloc(decisions.Json, requests.len);
         for (requests, results) |request, *result| {
+            if (self.expect_messages) {
+                try std.testing.expect(request.input == .messages);
+                const parts = request.input.messages[0].object.get("content").?.array.items;
+                try std.testing.expectEqualStrings("input_image", parts[0].object.get("type").?.string);
+                try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgo=", parts[0].object.get("image_url").?.string);
+            }
             if (self.expected_source) |table| try std.testing.expectEqualStrings(table, request.source_table);
             const kind = request.questions.object.get("answer").?.object.get("type").?.string;
             const bytes = if (std.mem.eql(u8, kind, "choice"))
@@ -283,7 +294,7 @@ const Mock = struct {
         return results;
     }
     pub fn provider(self: *@This()) decisions.DecisionProvider {
-        return .{ .ptr = self, .validate_fn = Mock.validate, .evaluate_batch_fn = batch };
+        return .{ .ptr = self, .validate_fn = Mock.validate, .evaluate_batch_fn = batch, .capabilities_fn = Mock.capabilities };
     }
 };
 
@@ -527,4 +538,21 @@ test "SQL decision routing selects catalog identity and clears ambiguous relatio
     bound.table = table;
     bound.action = .write;
     try std.testing.expectEqualStrings("private-physical", scopedBackend(backend, bound).decision_provider.?.source_table);
+}
+
+test "decision functions SQL JSONB input preserves multimodal evidence" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compile(a, "SELECT ai_probability($1::jsonb, 'Damaged?', 'vision')", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var types: [1]scalar.Type = .{.{}};
+    const bound = try @import("bound_scalars.zig").bindTyped(alloc, null, compiled.statement, &types, null, &.{});
+    var prepared = try bound.prepareParameters(a, &.{.{ .text = "[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]" }}, .{});
+    defer prepared.deinit();
+    var mock: Mock = .{ .expect_messages = true };
+    try prepared.validateDecisions(alloc, mock.provider());
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), (try evaluatePrepared(alloc, mock.provider(), prepared.projections[0].?, &.{})).value.float, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
 }

@@ -9123,6 +9123,8 @@ pub const DeciderConfig = struct {
     api_key: ?[]const u8 = null,
     max_rows: ?i64 = null,
     max_input_tokens: ?i64 = null,
+    /// Provider/model upper bound on the input-token contribution of one image. Required when sending images through hosted typed deciders, including image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Omit for text-only, native, or generated deciders.
+    max_image_input_tokens: ?i64 = null,
     rate_limit: ?RateLimitConfig = null,
     batch_size: ?i64 = null,
 
@@ -9142,6 +9144,7 @@ pub const DeciderConfig = struct {
         .{ "api_key", "api_key", true },
         .{ "max_rows", "max_rows", true },
         .{ "max_input_tokens", "max_input_tokens", true },
+        .{ "max_image_input_tokens", "max_image_input_tokens", true },
         .{ "rate_limit", "rate_limit", true },
         .{ "batch_size", "batch_size", true },
     };
@@ -9210,6 +9213,10 @@ pub const DeciderConfig = struct {
         }
         if (self.max_input_tokens) |value| {
             try jw.objectField("max_input_tokens");
+            try jw.write(value);
+        }
+        if (self.max_image_input_tokens) |value| {
+            try jw.objectField("max_image_input_tokens");
             try jw.write(value);
         }
         if (self.rate_limit) |value| {
@@ -9305,6 +9312,83 @@ pub const DecisionChoice = struct {
 pub const DecisionChoiceProbability = struct {
     value: []const u8,
     probability: f64,
+};
+
+/// Text or ordered user messages containing text and images. Named OpenAI and Jev deciders accept messages. Native trained, embedding, and generated deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
+pub const DecisionEvidence = std.json.Value;
+
+pub const DecisionEvidenceImage = struct {
+    type: []const u8,
+    /// Base64 data URL (image/png, image/jpeg, image/webp, image/gif), or a public HTTP(S) URL for OpenAI. Antfly never fetches image URLs for decision adapters.
+    image_url: []const u8,
+    detail: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "image_url", "image_url", false },
+        .{ "detail", "detail", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("image_url");
+        try jw.write(self.image_url);
+        if (self.detail) |value| {
+            try jw.objectField("detail");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const DecisionEvidenceMessage = struct {
+    type: ?[]const u8 = null,
+    role: []const u8,
+    content: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", true },
+        .{ "role", "role", false },
+        .{ "content", "content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
+};
+
+pub const DecisionEvidenceText = struct {
+    type: []const u8,
+    text: []const u8,
 };
 
 pub const DecisionInput = struct {
@@ -26600,7 +26684,7 @@ pub const InferenceDecideQuestion = union(enum) {
     }
 };
 
-/// Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB.
+/// Supply exactly one of input (single evidence item) or inputs (text-only Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB.
 pub const InferenceDecideRequest = struct {
     /// Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
     context_version: ?i64 = null,
@@ -26609,7 +26693,7 @@ pub const InferenceDecideRequest = struct {
     model: []const u8,
     /// Pin the exact EmbeddingGemma 2 assets and embedding recipe.
     model_identity: ?[]const u8 = null,
-    input: ?[]const u8 = null,
+    input: ?DecisionEvidence = null,
     inputs: ?[]const DecisionInput = null,
     long_document: ?InferenceDecideLongDocument = null,
     questions: []const InferenceDecideQuestion,

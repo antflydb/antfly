@@ -580,6 +580,7 @@ pub const Config = struct {
         project_id: ?[]u8 = null,
         location: ?[]u8 = null,
         credentials_path: ?[]u8 = null,
+        max_image_input_tokens: ?u64 = null,
         names: []const []u8 = &.{},
         configured_model_types: []const []u8 = &.{},
 
@@ -2091,8 +2092,11 @@ fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Confi
 
 fn parseInferenceConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.InferenceConnectionConfig {
     if (value != .object) return error.InvalidConfig;
-    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "names", "configured_model_types" })) return error.InvalidConfig;
+    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "names", "configured_model_types", "max_image_input_tokens" })) return error.InvalidConfig;
+    const image_tokens = try optionalU64Field(value.object, "max_image_input_tokens");
+    if (image_tokens == 0) return error.InvalidConfig;
     return .{
+        .max_image_input_tokens = image_tokens,
         .provider = try requiredStringFieldDup(alloc, value.object, "provider"),
         .url = try optionalStringFieldDup(alloc, value.object, "url"),
         .api_key = try optionalStringFieldDup(alloc, value.object, "api_key"),
@@ -4049,4 +4053,21 @@ test "provider registry gateway public inference policy defaults off and require
         "{\"public_inference\":{\"enabled\":\"false\"}}",
         "{\"public_inference\":{\"enable\":false}}",
     }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, invalid));
+}
+
+test "provider registry gateway connection image token bounds are positive and optional" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ ",\"max_image_input_tokens\":8192", "" }) |bound| {
+        const input = try std.fmt.allocPrint(a, "{{\"connections\":{{\"vendor\":{{\"kind\":\"inference\",\"capabilities\":[\"models.decide\"],\"inference\":{{\"provider\":\"openai\"{s}}}}}}}}}", .{bound});
+        defer a.free(input);
+        var config = try Config.parseFromSlice(a, input);
+        defer config.deinit();
+        const actual = config.connections.get("vendor").?.inference.?.max_image_input_tokens;
+        try std.testing.expectEqual(if (bound.len == 0) @as(?u64, null) else @as(?u64, 8192), actual);
+    }
+    for ([_][]const u8{ "0", "-1", "\"8192\"" }) |bound| {
+        const input = try std.fmt.allocPrint(a, "{{\"connections\":{{\"vendor\":{{\"kind\":\"inference\",\"capabilities\":[\"models.decide\"],\"inference\":{{\"provider\":\"openai\",\"max_image_input_tokens\":{s}}}}}}}}}", .{bound});
+        defer a.free(input);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, input));
+    }
 }

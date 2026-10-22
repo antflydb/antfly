@@ -264,6 +264,14 @@ from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
 from .decision_choice import DecisionChoice
 from .decision_choice_probability import DecisionChoiceProbability
+from .decision_evidence_image import DecisionEvidenceImage
+from .decision_evidence_image_detail import DecisionEvidenceImageDetail
+from .decision_evidence_image_type import DecisionEvidenceImageType
+from .decision_evidence_message import DecisionEvidenceMessage
+from .decision_evidence_message_role import DecisionEvidenceMessageRole
+from .decision_evidence_message_type import DecisionEvidenceMessageType
+from .decision_evidence_text import DecisionEvidenceText
+from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
@@ -1949,6 +1957,14 @@ __all__ = (
     "DecisionBatchItem",
     "DecisionChoice",
     "DecisionChoiceProbability",
+    "DecisionEvidenceImage",
+    "DecisionEvidenceImageDetail",
+    "DecisionEvidenceImageType",
+    "DecisionEvidenceMessage",
+    "DecisionEvidenceMessageRole",
+    "DecisionEvidenceMessageType",
+    "DecisionEvidenceText",
+    "DecisionEvidenceTextType",
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
