@@ -3297,6 +3297,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .fingerprint = accepted.fingerprint,
                     .replay_next = assembly_replay_next,
                 };
+                prepared_physical.?.completion = try @import("prepared_completion.zig").Owned.capture(output.allocator, materialized_derived_batch, sync_targets, effective_req.sync_level, append_derived_replay, sequence, publication_control);
                 const bindings = try replay_bindings.Bindings.capture(output.allocator, S.ownerField(self, "core").*.store, store_writes.items, delete_keys.items, &prepared_physical.?.bytes, &sequence_sources, assembly_replay_next, publication_control);
                 prepared_physical.?.replay_bindings = bindings;
                 try prepared_physical.?.validateCoverageSequence(replay_bindings.symbolic, publication_control);

@@ -148732,3 +148732,56 @@ test "db prepared transaction effects required completion handoff advances pause
     try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
     try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
 }
+
+test "db prepared transaction effects required assembly prepared completion retains materialized work and refreshes without allocation" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    for ([_]bool{ false, true }) |relational| {
+        var directory = try TestDirectory.init("prepared-completion-owned");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), F.options);
+        defer db.close();
+        if (!relational) try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        try F.seed(&db, relational, true);
+        const before = try F.snapshot(&db);
+        defer F.free(before);
+        var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+        defer plan.deinit();
+        const completion = &plan.completion.?;
+        try std.testing.expect(completion.append_replay);
+        try std.testing.expect(completion.batch != null);
+        try std.testing.expect(completion.batch.?.documents.len > 0);
+        try std.testing.expect(completion.batch.?.deleted_keys.len > 0);
+        try std.testing.expectEqual(plan.bytes.replay.?.sequence, completion.sequence);
+        try completion.validateSequence(plan.bytes.replay.?.sequence);
+        const documents = completion.batch.?.documents.ptr;
+        const targets = completion.targets.target_identities.ptr;
+        if (!relational) {
+            try std.testing.expect(completion.targets.target_scope_known);
+            try std.testing.expect(completion.targets.target_identities.len > 0);
+            // Untyped document writes consume the retained cleaned JSON;
+            // a typed prepared projection is optional on this path.
+            var found = false;
+            for (completion.batch.?.documents) |doc| if (std.mem.eql(u8, doc.key, "row")) {
+                found = true;
+                try std.testing.expect(doc.cleaned_value != null);
+                try std.testing.expect(std.mem.indexOf(u8, doc.cleaned_value.?, "prepared") != null);
+            };
+            try std.testing.expect(found);
+        }
+        _ = db.core.reserveDerivedAppendSequence();
+        try db.refreshTransactionAssembly(&plan, null);
+        try std.testing.expectEqual(documents, completion.batch.?.documents.ptr);
+        try std.testing.expectEqual(targets, completion.targets.target_identities.ptr);
+        try completion.validateSequence(db.core.nextDerivedAppendSequence());
+        const saved = completion.batch.?.sequence;
+        completion.batch.?.sequence += 1;
+        try std.testing.expectError(error.InvalidDerivedSequence, db.refreshTransactionAssembly(&plan, null));
+        try std.testing.expectEqual(saved, plan.bytes.replay.?.sequence);
+        completion.batch.?.sequence = saved;
+        const after = try F.snapshot(&db);
+        defer F.free(after);
+        try std.testing.expectEqualDeep(before, after);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(F.id));
+    }
+}

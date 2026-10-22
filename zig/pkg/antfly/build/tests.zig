@@ -5999,6 +5999,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-prepared-replay-plan-test", "Verify canonical prepared request and accepted-effect replay bounds")
         .dependOn(&addCuratedTestRunArtifact(b, replay_plan_tests, &.{"prepared replay plan"}).step);
+    const prepared_completion_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"prepared completion"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-prepared-completion-test", "Verify retained completion projections and exact convergence target ownership")
+        .dependOn(&addCuratedTestRunArtifact(b, prepared_completion_tests, &.{"prepared completion"}).step);
     const completion_handoff_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"completion handoff"},

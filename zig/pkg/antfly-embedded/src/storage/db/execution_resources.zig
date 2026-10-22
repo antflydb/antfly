@@ -676,27 +676,7 @@ pub const TtlCleanupContext = struct {
     coordinated_port: ?coordinated_ttl.Port = null,
 };
 
-pub const ManagedSyncTargets = struct {
-    full_text_indexes: []const []const u8 = &.{},
-    all_indexes: []const []const u8 = &.{},
-    // Visibility targets are broader than synchronous wait targets: a record
-    // with a missing dependency, or source work that schedules a generated
-    // downstream artifact, still advances that index's convergence target.
-    // Each identity owns its name so target collection does not need a second
-    // parallel allocation solely to manage name lifetime.
-    target_identities: []const IndexTargetVisibility = &.{},
-    target_scope_known: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: Allocator) void {
-        for (self.full_text_indexes) |name| alloc.free(@constCast(name));
-        if (self.full_text_indexes.len > 0) alloc.free(self.full_text_indexes);
-        for (self.all_indexes) |name| alloc.free(@constCast(name));
-        if (self.all_indexes.len > 0) alloc.free(self.all_indexes);
-        for (self.target_identities) |identity| alloc.free(@constCast(identity.index_name));
-        if (self.target_identities.len > 0) alloc.free(self.target_identities);
-        self.* = undefined;
-    }
-};
+pub const ManagedSyncTargets = @import("managed_sync_targets.zig").ManagedSyncTargets;
 
 pub const ManagedIndexCandidate = struct {
     ref: index_manager_mod.ManagedIndexRef,

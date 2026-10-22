@@ -22807,3 +22807,43 @@ in the cumulative integration receipts; earlier failed fixture runs are retained
 as diagnostics. The required-prepare DB, commit-memory and boundary ABI checks
 accompany the focused suite; full linked owner and cross-engine qualification
 remain open.
+
+### Retained completion data
+
+Transaction assembly now owns the post-commit derived batch, when one was
+materialized, plus the sync level, replay decision and exact convergence target
+names and incarnation facts. Capture clones the batch and typed text projections
+into a separately owned arena. The ordinary replay clone intentionally omits
+those projections; retained completion preserves their schema and write-plan
+witnesses so invocation scratch can retire without leaving borrowed roots.
+Preparation does not clone these values on the normal non-assembly write path.
+
+Sequence validation covers both the physical replay and completion batch before
+refresh mutates either one. Successful refresh rebinds both without allocation or
+changing document/target backing arrays. Empty and no-replay assemblies preserve
+their distinct obligations. The sync-target data contract lives in a small module
+shared with execution resources, avoiding a literal dependency on the physical DB
+from retained plans. Native ABI 67 and storage-owner ABI 125 fence the plan layout.
+Durable bytes, reader floors and default activation are unchanged.
+
+This closes the borrowed completion-data gap. It does not grant a retained plan
+execution authority: direct consumption still requires DB/route/execution lifetime,
+funded recovery and derived-log resources, and complete mandatory completion
+ownership. Required-PREPARE orchestration and remaining guards/counters/metadata
+and broader scheduler/engine qualification remain open; strong required providers
+remain disabled. Full Linux qualification remains waived and Linux builds require
+pinned Nix/glibc Zig.
+
+Pinned Debug qualification passes three focused completion cases, 81 required
+DB cases, four replay-notification cases, 51 error/identity companions and five
+native ABI cases: 144 executions with no failures, skips or leaks. Coverage
+includes scratch retirement, nested typed-root/vector/name ownership, every
+output-allocation failure and original checkpoint rejection, document/relational
+assembly without publication, preserved backing arrays through refresh, and
+rejection of an inconsistent completion sequence before physical mutation.
+All native/schema inputs match the final source receipt prepared-completion-v2;
+the diagnostic v1 run is not final qualification. Source-boundary (969 sources),
+generated errors, control catalog, formatting and whitespace checks pass.
+Evidence remains in prepared-completion-verified.json in the cumulative receipts.
+Full linked owner-image, object-engine, crash and cross-engine performance
+qualification remain open.

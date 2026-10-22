@@ -219,6 +219,7 @@ pub const OwnedPhysicalPlan = struct {
     coverage_outcomes: ?@import("prepared_coverage_outcomes.zig").Program = null,
     replay_bindings: ?@import("prepared_replay_bindings.zig").Bindings = null,
     commit_state: @import("prepared_commit_state.zig").State = .{},
+    completion: ?@import("prepared_completion.zig").Owned = null,
     /// This candidate cannot authorize a vote or a direct commit. Its current
     /// sequence is optimistic until refreshed under the owning apply fence.
     preparation: ?struct {
@@ -250,6 +251,7 @@ pub const OwnedPhysicalPlan = struct {
     }
     fn validateDependenciesInner(self: *const OwnedPhysicalPlan, core: anytype, control: ?admission.Port, refreshing: bool) !void {
         try self.commit_state.validate(self.bytes.writes, control);
+        if (self.completion) |*owned| try owned.validateSequence(if (self.bytes.replay) |entry| entry.sequence else owned.sequence);
         const owned = if (self.dependencies) |*value| value else return error.PreparedEffectsRequired;
         try owned.validate(core, control);
         if (self.preparation) |expected| {
@@ -268,6 +270,7 @@ pub const OwnedPhysicalPlan = struct {
     }
 
     pub fn validateCoverageSequence(self: *const OwnedPhysicalPlan, expected: u64, control: ?admission.Port) !void {
+        if (self.completion) |*owned| try owned.validateSequence(expected);
         if (self.coverage_outcomes) |*program| for (program.groups.items) |group| for (group.desired.items) |entry| {
             if (control) |owner| try owner.checkpoint();
             if (entry.sequence != expected) return error.InvalidDerivedSequence;
@@ -275,6 +278,7 @@ pub const OwnedPhysicalPlan = struct {
     }
     pub fn bindReplayPrograms(self: *OwnedPhysicalPlan, previous: u64, next: u64) void {
         self.commit_state.bindReplaySequence(previous, next);
+        if (self.completion) |*owned| owned.bindReplaySequence(previous, next);
         if (self.coverage_outcomes) |*program| for (program.groups.items) |*group| for (group.desired.items) |*entry| {
             entry.sequence = next;
         };
@@ -300,6 +304,7 @@ pub const OwnedPhysicalPlan = struct {
     }
 
     pub fn deinit(self: *OwnedPhysicalPlan) void {
+        if (self.completion) |*owned| owned.deinit();
         if (self.replay_bindings) |*value| value.deinit();
         if (self.counter_deltas) |*program| program.deinit();
         if (self.coverage_outcomes) |*program| program.deinit();
