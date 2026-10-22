@@ -203,16 +203,22 @@ const RagPlaygroundPage: React.FC = () => {
   const handleController = useCallback((controller: AbortController) => {
     requestControllerRef.current = controller;
   }, []);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: Request context changes invalidate the active run and its results.
-  useEffect(() => {
+  const handleRequestContextChange = useCallback(() => {
+    requestControllerRef.current = null;
     setIsLoading(false);
     setError(null);
     setProcessingTime(null);
     dispatchPipeline({ type: "RESET" });
+  }, []);
+  // Source changes remount the request component; settings changes are reported
+  // by AnswerResults, which owns the complete request identity.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Source identity invalidates the pipeline even when no stream has started.
+  useEffect(() => {
+    handleRequestContextChange();
     return () => {
       requestControllerRef.current?.abort();
     };
-  }, [apiUrl, selectedTable, selectedIndex, effectiveGenerator]);
+  }, [apiUrl, selectedTable, selectedIndex, effectiveGenerator, handleRequestContextChange]);
 
   const startTimeRef = useRef<number>(0);
 
@@ -561,6 +567,7 @@ const RagPlaygroundPage: React.FC = () => {
               </Collapsible>
             )}
             onController={handleController}
+            onRequestContextChange={handleRequestContextChange}
             onStreamStart={handleStreamStart}
             onStreamEnd={handleStreamEnd}
             onError={handleError}
@@ -590,6 +597,7 @@ const RagPlaygroundPage: React.FC = () => {
       selectedIndex,
       contextOpen,
       handleController,
+      handleRequestContextChange,
       handleStreamStart,
       handleStreamEnd,
       handleError,

@@ -57,6 +57,10 @@ export interface AnswerResultsProps {
   // Callbacks
   /** Receives a controller before the request starts, including the header wait. */
   onController?: (controller: AbortController) => void;
+  /** Called after request settings change and invalidate active or completed results.
+   * Incidental rerenders and explicit controller aborts do not trigger this event.
+   */
+  onRequestContextChange?: () => void;
   onStreamStart?: () => void;
   onStreamEnd?: () => void;
   onError?: (error: string) => void;
@@ -117,6 +121,7 @@ export default function AnswerResults({
   renderHits,
   renderEvalResult,
   onController,
+  onRequestContextChange,
   onStreamStart,
   onStreamEnd,
   onError: onErrorCallback,
@@ -188,7 +193,8 @@ export default function AnswerResults({
     setEvalResult(null);
     setIsStreaming(false);
     setError(null);
-  }, [requestContext]);
+    onRequestContextChange?.();
+  }, [requestContext, onRequestContextChange]);
 
   // Trigger Answer Agent request when QueryBox is submitted (based on timestamp, not just query value)
   useEffect(() => {

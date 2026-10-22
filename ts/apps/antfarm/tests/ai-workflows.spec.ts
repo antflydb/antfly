@@ -814,6 +814,39 @@ test.describe("AI workflow routes", () => {
     await expect(page.getByRole("button", { name: "Run Query" })).toBeEnabled();
   });
 
+  for (const setting of ["result limit", "system prompt"] as const) {
+    test(`RAG ${setting} changes cancel the stream and reset the pipeline`, async ({ page }) => {
+      await installOpenRetrievalStream(page, "partial old settings answer");
+      await page.goto("/data/playground/rag?table=docs&index=semantic");
+      await page.getByPlaceholder("Enter your question...").fill("What happened?");
+      await page.getByRole("button", { name: "Run Query", exact: true }).click();
+      await expect(page.getByText("partial old settings answer")).toBeVisible();
+      await page
+        .getByRole("button", { name: "Settings", exact: true })
+        .and(page.locator('[data-slot="collapsible-trigger"]'))
+        .click();
+      if (setting === "result limit") {
+        await page
+          .getByText("Result Limit", { exact: true })
+          .locator("..")
+          .getByRole("spinbutton")
+          .fill("20");
+      } else {
+        await page.getByPlaceholder("Custom instructions for the generator...").fill("Be concise.");
+      }
+      await expect(page.getByText("partial old settings answer")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Run Query", exact: true })).toBeEnabled();
+      await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0);
+      await page.getByRole("tab", { name: "Pipeline", exact: true }).click();
+      await expect(page.getByText("Run a query to see the pipeline trace")).toBeVisible();
+      await page.getByRole("tab", { name: "Response", exact: true }).click();
+      await page.getByRole("button", { name: "Run Query", exact: true }).click();
+      await expect(page.getByText("partial old settings answer")).toBeVisible();
+      await page.getByRole("button", { name: "Stop", exact: true }).click();
+      await expect(page.getByText("partial old settings answer")).toBeVisible();
+    });
+  }
+
   test("evaluation cancellation survives switching tables", async ({ page }) => {
     await page.addInitScript(() => {
       const originalFetch = window.fetch.bind(window);

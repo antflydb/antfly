@@ -60,7 +60,7 @@ describe("SDK stream failures reach React state", () => {
     ["chat", () => useChatStream()],
   ] as const)("preserves %s deltas when done omits terminal fields", async (_name, useStream) => {
     mockResponse("event: done\ndata: {}\n\n");
-    const { result } = renderHook(useStream);
+    const { result } = renderHook(() => useStream());
     await act(async () => {
       if ("startStream" in result.current) {
         await result.current.startStream({

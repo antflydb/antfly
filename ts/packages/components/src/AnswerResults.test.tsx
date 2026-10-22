@@ -758,6 +758,7 @@ describe("AnswerResults request ownership", () => {
       return new AbortController();
     });
     const controller = vi.fn();
+    const contextChanged = vi.fn();
     const content = () => (
       <TestWrapper>
         <QueryBox id="question" mode="submit" />
@@ -767,6 +768,7 @@ describe("AnswerResults request ownership", () => {
           generator={{ ...mockGenerator }}
           fields={["content"]}
           onController={controller}
+          onRequestContextChange={() => contextChanged()}
           onStreamEnd={() => {}}
         />
       </TestWrapper>
@@ -780,6 +782,7 @@ describe("AnswerResults request ownership", () => {
     rerender(content());
     expect(signal?.aborted).toBe(false);
     expect(stream).toHaveBeenCalledOnce();
+    expect(contextChanged).not.toHaveBeenCalled();
     act(() => callbacks?.onGeneration?.("still streaming"));
     expect(screen.getByText(/still streaming/)).toBeTruthy();
     unmount();
@@ -796,6 +799,8 @@ describe("AnswerResults request ownership", () => {
       callbacks = nextCallbacks;
       return new AbortController();
     });
+    const contextChanged = vi.fn();
+    const streamEnd = vi.fn();
     const content = (table: string) => (
       <TestWrapper>
         <QueryBox id="question" mode="submit" />
@@ -803,6 +808,8 @@ describe("AnswerResults request ownership", () => {
           id="answer"
           searchBoxId="question"
           table={table}
+          onRequestContextChange={contextChanged}
+          onStreamEnd={streamEnd}
           generator={{ ...mockGenerator }}
           fields={["content"]}
         />
@@ -818,10 +825,50 @@ describe("AnswerResults request ownership", () => {
     rerender(content("other"));
 
     expect(signal?.aborted).toBe(true);
+    expect(contextChanged).toHaveBeenCalledOnce();
+    expect(streamEnd).not.toHaveBeenCalled();
     expect(screen.queryByText("old table answer")).toBeNull();
     act(() => callbacks?.onGeneration?.("late old answer"));
     expect(screen.queryByText("late old answer")).toBeNull();
     expect(stream).toHaveBeenCalledOnce();
+  });
+
+  it("reports invalidation after completion without starting another request", async () => {
+    vi.clearAllMocks();
+    const stream = vi.mocked(utils.streamAnswer);
+    stream.mockImplementation(async (_url, _request, _headers, callbacks) => {
+      callbacks.onGeneration?.("completed answer");
+      callbacks.onComplete?.();
+      return new AbortController();
+    });
+    const contextChanged = vi.fn();
+    const streamEnd = vi.fn();
+    const content = (limit: number) => (
+      <TestWrapper>
+        <QueryBox id="question" mode="submit" />
+        <AnswerResults
+          id="answer"
+          searchBoxId="question"
+          generator={mockGenerator}
+          limit={limit}
+          onRequestContextChange={contextChanged}
+          onStreamEnd={streamEnd}
+        />
+      </TestWrapper>
+    );
+    const { rerender } = render(content(10));
+    await userEvent.type(screen.getByPlaceholderText(/ask a question/i), "test question");
+    await userEvent.click(screen.getByRole("button", { name: /submit/i }));
+    await waitFor(() => expect(screen.getByText("completed answer")).toBeTruthy());
+    expect(contextChanged).not.toHaveBeenCalled();
+    expect(streamEnd).toHaveBeenCalledOnce();
+    rerender(content(20));
+    expect(contextChanged).toHaveBeenCalledOnce();
+    expect(screen.queryByText("completed answer")).toBeNull();
+    expect(streamEnd).toHaveBeenCalledOnce();
+    expect(stream).toHaveBeenCalledOnce();
+    rerender(content(20));
+    expect(contextChanged).toHaveBeenCalledOnce();
   });
 
   it("preserves SSE fields when the terminal result omits them and ends once", async () => {
