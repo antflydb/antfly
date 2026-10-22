@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
@@ -217,6 +218,10 @@ def test_grouped_sources_drive_downstream_graph_without_waiting_write(require_na
                     time.sleep(0.02)
                 assert not errors, errors
                 assert len(edges) == 2, (edges, inputs, table.pending_work_stats())
+                assert {base64.b64decode(edge["target_b64"]).decode() for edge in edges} == {
+                    "concept/ada",
+                    "concept/carol",
+                }
                 assert any("turn-one" in text and "answer" in text for text in inputs), inputs
                 assert any("turn-two" in text for text in inputs), inputs
                 assert all("excluded-tool" not in text for text in inputs), inputs

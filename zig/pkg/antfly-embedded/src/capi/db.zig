@@ -9337,7 +9337,7 @@ test "capi resolver invalid inline declarations reject before replay activity or
     const id = try publishHandle(handle);
     defer antfly_db_close(id);
     const database = handle.database();
-    try database.initResolutionRuntime();
+    if (database.resolution_runtime == null) try database.initResolutionRuntime();
     const mutex = &database.resolution_runtime.?.catch_up_mutex;
     try std.testing.expect(mutex.tryLock());
     defer mutex.unlock();
