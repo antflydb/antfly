@@ -12161,12 +12161,28 @@ const TextConjunctionProducer = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         try self.visibility.control.check();
         if (self.complete.load(.acquire)) |bitmap| return self.visibility.fromComplete(bitmap, alloc, offset, count, candidates);
-        var indexed = if (self.include.producer) |value|
-            try value.produce(value.ptr, alloc, offset, count, candidates)
-        else
-            try self.visibility.fromComplete(&self.include.bitmap, alloc, offset, count, candidates);
-        defer indexed.deinit();
-        var result = try TextLiveVisibilityProducer.produce(self.visibility, alloc, offset, count, &indexed);
+        // Borrowed masks use segment-local coordinates. Keep their owner pinned
+        // through visibility refinement, including allocation/error paths.
+        var borrowed: ?roaring.BorrowedBitmap = null;
+        defer if (borrowed) |*pin| pin.deinit();
+        var owned: ?roaring.RoaringBitmap = null;
+        defer if (owned) |*bitmap| bitmap.deinit();
+        const indexed = if (self.include.producer) |value| blk: {
+            if (value.borrow) |borrow| borrowed = try borrow(value.ptr, offset, count);
+            if (borrowed) |pin| {
+                if (candidates) |_| {
+                    owned = try self.visibility.fromComplete(pin.bitmap, alloc, 0, count, candidates);
+                    break :blk &owned.?;
+                }
+                break :blk pin.bitmap;
+            }
+            owned = try value.produce(value.ptr, alloc, offset, count, candidates);
+            break :blk &owned.?;
+        } else blk: {
+            owned = try self.visibility.fromComplete(&self.include.bitmap, alloc, offset, count, candidates);
+            break :blk &owned.?;
+        };
+        var result = try TextLiveVisibilityProducer.produce(self.visibility, alloc, offset, count, indexed);
         errdefer result.deinit();
         try self.publishComplete();
         return result;
@@ -35150,7 +35166,10 @@ test "text live visibility refines posting candidates and skips an all-visible f
         fail: bool = false,
         broad: enum { forbidden, bitmap, all, keys } = .forbidden,
         broad_calls: usize = 0,
-        indexed_kind: enum { bitmap, lazy } = .bitmap,
+        indexed_kind: enum { bitmap, lazy, borrowed } = .bitmap,
+        borrowed_first: ?*const roaring.RoaringBitmap = null,
+        borrowed_second: ?*const roaring.RoaringBitmap = null,
+        active_borrows: usize = 0,
         indexed_probes: usize = 0,
         fn acquire(raw: ?*anyopaque, _: ?[]const u8) !?PinnedTextSource {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -35183,10 +35202,22 @@ test "text live visibility refines posting candidates and skips an all-visible f
             var bitmap = roaring.RoaringBitmap.init(alloc);
             errdefer bitmap.deinit();
             if (self.indexed_kind == .bitmap) try bitmap.addSortedAscending(&.{ 17, 111, 7000 });
-            return .{ .bitmap = bitmap, .producer = if (self.indexed_kind == .lazy) .{ .ptr = self, .produce = indexed } else null };
+            return .{ .bitmap = bitmap, .producer = if (self.indexed_kind != .bitmap) .{ .ptr = self, .produce = indexed, .borrow = if (self.indexed_kind == .borrowed) borrowIndexed else null } else null };
+        }
+        fn borrowIndexed(raw: *anyopaque, offset: u32, count: u32) !?roaring.BorrowedBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u32, 5000), count);
+            const bitmap = if (offset == 0) self.borrowed_first.? else if (offset == 5000) self.borrowed_second.? else return error.InvalidQueryRequest;
+            self.active_borrows += 1;
+            return .{ .bitmap = bitmap, .cached_cardinality = bitmap.cardinality(), .context = .{ self, self }, .release = releaseIndexed };
+        }
+        fn releaseIndexed(context: [2]*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context[0]));
+            self.active_borrows -= 1;
         }
         fn indexed(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.indexed_kind == .borrowed) return error.UnexpectedMaterialization;
             const input = candidates orelse return error.TestUnexpectedResult;
             var result = roaring.RoaringBitmap.init(alloc);
             errdefer result.deinit();
@@ -35237,6 +35268,14 @@ test "text live visibility refines posting candidates and skips an all-visible f
         }
     };
     var harness = Harness{ .writer = &writer };
+    var first_mask = roaring.RoaringBitmap.init(a);
+    defer first_mask.deinit();
+    try first_mask.addSortedAscending(&.{ 17, 111 });
+    var second_mask = roaring.RoaringBitmap.init(a);
+    defer second_mask.deinit();
+    try second_mask.add(2000);
+    harness.borrowed_first = &first_mask;
+    harness.borrowed_second = &second_mask;
     const executor: SearchTextQueryExecutor = .{
         .ctx = &harness,
         .acquire_text_source = Harness.acquire,
@@ -35278,7 +35317,7 @@ test "text live visibility refines posting candidates and skips an all-visible f
     try std.testing.expectEqualStrings("doc:17", sorted.hits[0].id);
     // Indexed inclusion plus visibility must keep both bitmap and lazy
     // providers on the candidate path, for ranked, count and sorted requests.
-    for ([_]@FieldType(Harness, "indexed_kind"){ .bitmap, .lazy }) |kind| {
+    for ([_]@FieldType(Harness, "indexed_kind"){ .bitmap, .lazy, .borrowed }) |kind| {
         harness.indexed_kind = kind;
         harness.indexed_probes = 0;
         harness.seen = 0;
@@ -35294,6 +35333,14 @@ test "text live visibility refines posting candidates and skips an all-visible f
                 for (filtered.hits) |hit| try std.testing.expect(std.mem.eql(u8, hit.id, "doc:17") or std.mem.eql(u8, hit.id, "doc:7000"));
             }
         }
+        if (kind == .borrowed) {
+            var filtered_req = count_req;
+            filtered_req.filter_query_json = "{\"doc_id\":[\"doc:17\",\"doc:111\",\"doc:7000\"]}";
+            var filtered = try searchTextQuery(a, filtered_req, .match_all, executor);
+            defer filtered.deinit();
+            try std.testing.expectEqual(@as(u64, 2), filtered.total_hits);
+        }
+        try std.testing.expectEqual(@as(usize, 0), harness.active_borrows);
         try std.testing.expectEqual(@as(usize, 0), harness.broad_calls);
         try std.testing.expect(harness.seen <= 24);
         try std.testing.expect(harness.indexed_probes <= 24);
@@ -35387,6 +35434,11 @@ test "text live visibility refines posting candidates and skips an all-visible f
     harness.broad = .forbidden;
     harness.fail = true;
     try std.testing.expectError(error.TestVisibilityFailure, searchTextQuery(a, req, query, executor));
+    harness.indexed_kind = .borrowed;
+    var failed_req = req;
+    failed_req.filter_query_json = "{\"doc_id\":[\"doc:17\",\"doc:111\",\"doc:7000\"]}";
+    try std.testing.expectError(error.TestVisibilityFailure, searchTextQuery(a, failed_req, query, executor));
+    try std.testing.expectEqual(@as(usize, 0), harness.active_borrows);
 }
 
 test "logical value borrowed sorted candidates retain local pins masks and global order" {

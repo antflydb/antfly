@@ -3000,6 +3000,7 @@ const SortedSourceSpans = struct {
         if (span.count < 3) return;
         if (self.run == null) if (self.scratch) |scratch| {
             self.run = try Run.createWithResources(self.allocator, scratch.io, scratch.directory, scratch.resource_manager);
+            self.run.?.preferSequentialReads();
         };
         if (self.run) |run| {
             var bytes: [20]u8 = undefined;
@@ -3186,8 +3187,10 @@ const FileSortedPlan = struct {
         const self = try allocator.create(@This());
         errdefer allocator.destroy(self);
         const records = try Run.createWithResources(allocator, scratch.io, scratch.directory, scratch.resource_manager);
+        records.preferSequentialReads();
         errdefer records.deinit();
         const mapping = try Run.createWithResources(allocator, scratch.io, scratch.directory, scratch.resource_manager);
+        mapping.preferSequentialReads();
         errdefer mapping.deinit();
         const rows = try allocator.alloc(Row, inputs.len);
         errdefer allocator.free(rows);
@@ -4799,6 +4802,7 @@ fn buildExternalSortedMergePlan(alloc: Allocator, inputs: []const MergeInput, fi
     errdefer file.deinit();
     try file.enableUnordered();
     const spool = try FileSortedPlan.Run.createWithResources(alloc, scratch.io, scratch.directory, scratch.resource_manager);
+    spool.preferSequentialReads();
     defer spool.deinit();
     var reads = TypedReadScope.init(alloc);
     defer reads.deinit();
@@ -12345,4 +12349,42 @@ test "ordinal cursor discards its old window after a partial source failure" {
     try std.testing.expectError(error.ReadFailed, cursor.get(1024));
     try std.testing.expectEqual(@as(?u32, 1), try cursor.get(0));
     try std.testing.expectEqual(@as(?u32, 1025), try cursor.get(1024));
+}
+
+test "postings run read cache preserves four warm pages under tight budgets" {
+    if (@import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const Run = @import("postings_run.zig").Run;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    const payload = try a.alloc(u8, 256 * 1024);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i ^ (i >> 14));
+    const Budget = @import("storage/lite/test_allocator.zig").BudgetAllocator;
+    for ([_]usize{ 96 * 1024, 1024 * 1024, 1024 * 1024 }, 0..) |limit, variant| {
+        var budget = Budget{ .backing = a, .limit = limit };
+        {
+            const run = try Run.create(budget.allocator(), std.testing.io, directory);
+            defer run.deinit();
+            if (variant == 2) run.preferSequentialReads();
+            try run.appendSlice(payload);
+            try run.seal(0);
+            const view = try run.view();
+            try std.testing.expectEqual(@as(usize, 0), run.read_buffer.len);
+            for (0..2) |_| {
+                for (0..4) |page| {
+                    const offset = page * 16 * 1024;
+                    var bytes: [32]u8 = undefined;
+                    try view.readInto(offset, &bytes);
+                    try std.testing.expectEqualSlices(u8, payload[offset..][0..bytes.len], &bytes);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 4), run.read_calls);
+            const expected: usize = if (limit < 512 * 1024 or variant == 2) 64 * 1024 else 512 * 1024;
+            try std.testing.expectEqual(expected, run.read_buffer.len);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
 }
