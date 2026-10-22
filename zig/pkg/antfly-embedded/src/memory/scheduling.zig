@@ -43,7 +43,9 @@ fn blocked(err: anyerror) bool {
     };
 }
 fn cleanup(backend: m.Backend, a: A, now: i64, state: m.types.State, executor: Executor) !bool {
-    if ((state.next_resource_check_at == null or state.next_resource_check_at.? > now) and
+    const candidate_index = try backend.get(backend.ptr, a, "entity-candidate-index");
+    const index_complete = if (candidate_index) |row| (try std.json.parseFromSliceLeaky(struct { cursor: ?[]const u8 = null, complete: bool = false }, a, row.json, .{})).complete else false;
+    if (index_complete and (state.next_resource_check_at == null or state.next_resource_check_at.? > now) and
         (state.next_expiry_at == null or state.next_expiry_at.? > now) and
         (try backend.get(backend.ptr, a, "cleanup")) == null and
         (try backend.scan(backend.ptr, a, "dependency/work/", null, 1)).rows.len == 0) return false;

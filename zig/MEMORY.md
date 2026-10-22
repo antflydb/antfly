@@ -259,23 +259,96 @@ is not authority for background global deletion.
 ### External judgments and candidate policy
 
 Identity candidate pages contain immutable entity revisions and grounded views.
-Names/aliases, compact spelling and description overlap are recall signals,
-never calibrated merge confidence. Identity candidates require matching types,
-visibility/owner partitions and version-number signatures, respect explicit
-and shared pinned distinctions, and exclude existing canonical aliases.
-`kind: relationship` permits distinct/versioned concepts and returns the
-allowed predicates for each subject/object type pair, including heterogeneous
-custom ontology domains. Incompatible overrides of the software-team pack
-reject at configuration admission. Paging examines 64 entities at a time and returns
-an explicit cursor/completeness; this bounded lexical/description discovery
-does not claim exhaustive semantic nearest-neighbor search.
+Whole-word names/aliases, compact spelling and character trigrams admit lexical candidates; repeated
+words do not inflate scores, and English stopwords are excluded from token overlap.
+Name overlap is normalized by the smaller unique vocabulary. ASCII compact-name
+trigrams preserve spelling neighbors such as Antfly/AntflyDB; they require at
+least two distinct grams on each side and 0.5 shorter-side overlap. That is a
+retrieval heuristic, not an evaluated identity threshold. Description overlap
+only breaks equal name scores; it cannot admit an unrelated name or outrank a
+stronger name match. These are retrieval signals, never calibrated merge confidence.
+Identity candidates require matching types, visibility/owner partitions and
+version-number signatures, respect explicit and shared pinned distinctions,
+and exclude existing canonical aliases. `kind: relationship` permits distinct/
+versioned concepts and returns the allowed predicates for each subject/object
+pair, including heterogeneous custom ontology domains. Incompatible overrides
+of the software-team pack reject at configuration admission.
+
+New spaces atomically index immutable names and aliases into audience-partitioned
+`entity-candidate-term/` postings. Private postings are owner-specific; team
+postings are shared. A request probes at most 129 term ranges and examines at
+most 64 postings, then point-loads and revalidates current entities, canonical
+identity, distinctions, evidence and visibility before rendering any view.
+Unrelated entities add no primary-table scans. Common names still require
+pagination proportional to their posting fanout, rather than the entire space.
+The continuation binds the seed, candidate kind, principal, space revision,
+term ordinal and posting position. A candidate can recur across term pages;
+consumers deduplicate by canonical ID. Per-page ranking reports dropped matches
+in `omitted`; this is bounded discovery, not a global top-k ranking.
+
+An entity with more than 128 unique name/alias index terms uses one overflow
+posting, avoiding uncontrolled write amplification while preserving discovery.
+Queries always examine the overflow lane. A seed with that much vocabulary uses
+a bounded audience-catalog fallback, without scanning other owners' private rows
+or rejecting previously valid entities.
+Old spaces retain a primary-row fallback for administrators while owner maintenance backfills 16 entities
+per transaction; ordinary readers receive `MemoryCapabilityUnavailable` until
+the audience index is ready. The existing leader/owner scheduler recognizes incomplete index
+debt, resumes after restart, and marks readiness only after the primary pass.
+Concurrent admissions already write postings under the same space CAS. Physical
+entity retirement removes its postings atomically; foreground retention checks
+hide forgotten or expired entities before cleanup. The response distinguishes
+`retrieval: indexed_lexical`, `bounded_audience_fallback`, and the temporary
+administrator-only `bounded_primary_fallback`.
+
+Candidate `seed_view` and item `view` use exactly the default `entity_view`
+rendering: 16 statements within the 8 KiB budget, the same dependencies,
+fingerprint, revision and completeness. The explicit view endpoint permits up
+to 32 statements. A benchmark must pin the candidate page's revision and view
+fingerprints and submit those exact descriptions to the hosted judge. The
+154-case replay validates policy against supplied verdicts; it does not measure
+judge accuracy on projected descriptions. Codex must rerun the merge and relation
+judge evaluation on these projections before switching production retrieval.
+
+The [follow-up integration review](https://github.com/antflydb/antfly/pull/1227#issuecomment-6330615029)
+also requests semantic neighbors. This implementation fixes the full-space scan
+for the normal model-free path, but does **not** implement ANN entity discovery:
+`semantic_discovery: not_indexed` is explicit even when an assertion embedder is
+configured. An assertion embedder does not imply a materialized name/view index,
+and generating every entity embedding during each request would preserve the
+quadratic consolidation cost. Pure semantic synonyms without a shared name, spelling signal or
+alias remain outside lexical discovery.
+
+The intended ANN extension uses Antfly's shared native vector indexes over two
+derived projections (names/aliases and the exact rendered default view), unioned
+with lexical postings before the existing policy gate. It must retain the entity
+revision, model identity/revision, embedding generation, view fingerprint and
+exact dependency references. Owner/leader work builds projections outside writer
+leases, fences dependencies on publication, and resumes a generation backfill
+before advertising indexed readiness. Invalidation/forgetting must exclude stale
+projections immediately, independent of physical cleanup. Routed and embedded
+adapters must expose the same bounded native neighbor operation and partitions;
+no second vector store, client credentials or table scan disguised as ANN. Name
+and description thresholds must be evaluated on the consumer fixtures rather
+than treating the reported 0.80/0.90 values as universal identity policy. This
+remains an implementation gap, not a claimed result of the indexed lexical fix.
 
 Entity proposals use the engine's [shared curation queue (#1233)](https://github.com/antflydb/antfly/pull/1233),
 including stable proposal IDs, irreversible terminal review outcomes, reversible
 merge/unmerge/suppression and reject-with-distinction. Separate service bindings
 pin input entity revisions, configuration and evidence without duplicating
 free-text prompts into the engine queue. Proposal/list/review require admin
-access. An external verdict carries `accept: true`, `false`, or `null` (defer),
+access. On Lite the database owner qualifies. On a remote space, the client
+running proposal listing, background judgment or accept/reject must have the
+existing table-admin permission on that memory space's resolved catalog table.
+Ordinary write permission is insufficient, and the final native publication
+check revalidates the grant. This follows the current shared table authorization
+model: it has read/write/admin, with no narrower curator permission. A future
+space-curator grant must be introduced in that shared model, durable execution
+grants and HTTP/MCP admission together, covering proposal/list/review/curation
+without configuration, source-wide forgetting or embedding publication. It must
+not be simulated by a client-supplied actor or a memory-only authorization bypass.
+An external verdict carries `accept: true`, `false`, or `null` (defer),
 an expected space revision, declared actor, evidence and optional qualified
 model metadata. The authenticated principal remains the authoritative initiator;
 a supplied actor is declared agent attribution. Accept applies the same native

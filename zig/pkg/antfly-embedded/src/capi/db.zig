@@ -10259,3 +10259,40 @@ test "capi native memory refreshed proposal attempts retain immutable explanatio
         }
     }
 }
+
+test "capi native memory indexed candidates retain production views across reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-candidate-index");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    const memory = @import("../memory/service.zig");
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .create, memory.types.Config{}, "create", "");
+    const source: memory.types.ObservationRequest = .{
+        .evidence = &.{.{ .id = "e", .source_id = "test", .source_version = "1", .text = "The approvals reviewer checks approval requests" }},
+        .entities = &.{ .{ .id = "a", .name = "approval reviewer", .evidence = &.{.{ .id = "e" }} }, .{ .id = "b", .name = "approvals reviewer", .evidence = &.{.{ .id = "e" }} } },
+    };
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .observe, source, "observe", "");
+    const claim: memory.types.Assertion = .{ .id = "description", .subject = "b", .predicate = "purpose", .value = "reviews", .statement = "The approvals reviewer checks approval requests", .evidence = &.{.{ .id = "e" }} };
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .assertions, .{ .assertions = &.{claim} }, "describe", "");
+    for (0..2) |attempt| {
+        const result = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try nativeMemoryTestCall(id, temporary, "alice", .entity_candidates, memory.types.EntityCandidateRequest{}, "", "a"), .{});
+        try std.testing.expectEqualStrings("indexed_lexical", result.object.get("retrieval").?.string);
+        const items = result.object.get("items").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), items.len);
+        const view = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try nativeMemoryTestCall(id, temporary, "alice", .entity_view, memory.types.EntityViewRequest{}, "", "b"), .{});
+        try std.testing.expectEqualStrings(view.object.get("fingerprint").?.string, items[0].object.get("view").?.object.get("fingerprint").?.string);
+        if (attempt == 0) {
+            antfly_db_close(id);
+            id = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        }
+    }
+}

@@ -28,6 +28,7 @@ const Store = struct {
     resource_reads: usize = 0,
     reads: usize = 0,
     scans: usize = 0,
+    entity_scans: usize = 0,
     decisions: usize = 0,
     reject_decision: bool = false,
     conflict: bool = false,
@@ -61,6 +62,7 @@ const Store = struct {
     fn scan(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) !m.Page {
         const self: *Store = @ptrCast(@alignCast(ptr));
         self.scans += 1;
+        if (std.mem.eql(u8, prefix, "entity/")) self.entity_scans += 1;
         var rows: std.ArrayList(m.Row) = .empty;
         var it = self.values.iterator();
         while (it.next()) |entry| {
@@ -4273,4 +4275,183 @@ test "memory historical mentions apply canonical entity temporal admission in ev
     // A target already known at the cutoff may be projected normally.
     const later = try store.service("alice", true, 30).execute(a, .episode, "thread", "{\"known_at\":11}", "");
     try std.testing.expect(std.mem.indexOf(u8, later, "future-entity") != null);
+}
+
+test "memory indexed candidates avoid primary scans and description noise and share production views" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{\"max_output_items\":256}", "create", 1);
+    const entities = try a.alloc(m.types.Entity, 256);
+    for (entities, 0..) |*entity, i| entity.* = .{ .id = try std.fmt.allocPrint(a, "unrelated-{d}", .{i}), .name = try std.fmt.allocPrint(a, "unrelated-{d}", .{i}), .evidence = &.{.{ .id = "e" }} };
+    for (0..4) |batch| {
+        for (entities, 0..) |*entity, i| {
+            entity.id = try std.fmt.allocPrint(a, "unrelated-{d}", .{batch * 256 + i});
+            entity.name = entity.id;
+        }
+        const source_evidence: m.types.Evidence = .{ .id = "e", .source_id = "source", .source_version = "1", .text = "The approval reviewer is a review system for approval checks" };
+        _ = try store.service("alice", true, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{source_evidence}, .entities = entities }, .{}), try std.fmt.allocPrint(a, "batch-{d}", .{batch}));
+    }
+    const special = [_]m.types.Entity{
+        .{ .id = "seed", .name = "approval reviewer", .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "match", .name = "approvals reviewer", .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "noise", .name = "banana", .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "alias", .name = "independent", .aliases = &.{"approval reviewer"}, .evidence = &.{.{ .id = "e" }} },
+    };
+    _ = try store.service("alice", true, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{m.types.Evidence{ .id = "e", .source_id = "source", .source_version = "1", .text = "The approval reviewer is a review system for approval checks" }}, .entities = &special }, .{}), "special");
+    const claims = try a.alloc(m.types.Assertion, 12);
+    for (claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "description-{d}", .{i}), .subject = "match", .predicate = try std.fmt.allocPrint(a, "describes-{d}", .{i}), .value = "details", .statement = try std.fmt.allocPrint(a, "The reviewer has detail {d}", .{i}), .evidence = &.{.{ .id = "e" }} };
+    _ = try store.service("alice", true, 4).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "descriptions");
+    _ = try store.service("alice", true, 4).execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"noise-description\",\"subject\":\"noise\",\"predicate\":\"description\",\"value\":\"noise\",\"statement\":\"The approval reviewer is a review system for approval checks\",\"evidence\":[{\"id\":\"e\"}]}]}", "noise-description");
+    const scans = store.entity_scans;
+    const before = store.scans;
+    const result = try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", true, 5).execute(a, .entity_candidates, "seed", "{}", ""), .{});
+    try std.testing.expectEqual(scans, store.entity_scans);
+    // The number of unrelated entities does not add primary or posting probes.
+    try std.testing.expect(store.scans - before < 64);
+    const items = result.object.get("items").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("alias", items[0].object.get("entity").?.object.get("entity").?.object.get("id").?.string);
+    const view = try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", true, 5).execute(a, .entity_view, "match", "{}", ""), .{});
+    const candidate_view = items[1].object.get("view").?;
+    try std.testing.expectEqualStrings(view.object.get("description").?.string, candidate_view.object.get("description").?.string);
+    try std.testing.expectEqualStrings(view.object.get("fingerprint").?.string, candidate_view.object.get("fingerprint").?.string);
+    try std.testing.expectEqual(@as(usize, 13), candidate_view.object.get("dependencies").?.array.items.len);
+}
+
+test "memory indexed candidate pages cover dense postings and bind seed kind principal and revision" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{\"max_output_items\":256}", "create", 1);
+    const entities = try a.alloc(m.types.Entity, 141);
+    for (entities, 0..) |*entity, i| entity.* = .{ .id = try std.fmt.allocPrint(a, "entity-{d}", .{i}), .name = "shared", .visibility = .team, .evidence = &.{.{ .id = "e" }} };
+    const evidence: m.types.Evidence = .{ .id = "e", .source_id = "source", .source_version = "1", .text = "Shared entity observations", .visibility = .team };
+    _ = try store.service("alice", true, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence}, .entities = entities }, .{}), "entities");
+    var cursor: ?[]const u8 = null;
+    var first_cursor: ?[]const u8 = null;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var finished = false;
+    for (0..32) |_| {
+        const request: m.types.EntityCandidateRequest = .{ .limit = 64, .cursor = cursor };
+        const result = try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", true, 3).execute(a, .entity_candidates, "entity-0", try std.json.Stringify.valueAlloc(a, request, .{}), ""), .{});
+        for (result.object.get("items").?.array.items) |item| try seen.put(a, item.object.get("entity").?.object.get("entity").?.object.get("id").?.string, {});
+        const next = result.object.get("next_cursor").?;
+        if (next == .null) {
+            finished = true;
+            break;
+        }
+        cursor = next.string;
+        if (first_cursor == null) first_cursor = cursor;
+    }
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(@as(usize, 140), seen.count());
+    const encoded = try std.json.Stringify.valueAlloc(a, m.types.EntityCandidateRequest{ .cursor = first_cursor }, .{});
+    try std.testing.expectError(error.InvalidMemoryCursor, store.service("alice", true, 3).execute(a, .entity_candidates, "entity-1", encoded, ""));
+    try std.testing.expectError(error.InvalidMemoryCursor, store.service("bob", false, 3).execute(a, .entity_candidates, "entity-0", encoded, ""));
+    const wrong_kind = try std.json.Stringify.valueAlloc(a, m.types.EntityCandidateRequest{ .cursor = first_cursor, .kind = .relationship }, .{});
+    try std.testing.expectError(error.InvalidMemoryCursor, store.service("alice", true, 3).execute(a, .entity_candidates, "entity-0", wrong_kind, ""));
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"later\",\"source_id\":\"later\",\"source_version\":\"1\",\"text\":\"Later\"}]}", "later", 4);
+    try std.testing.expectError(error.MemoryCursorStale, store.service("alice", true, 5).execute(a, .entity_candidates, "entity-0", encoded, ""));
+}
+
+test "memory candidate index backfill resumes through owner scheduling and retirement removes postings" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try externalReviewSetup(&store);
+    const extra = try a.alloc(m.types.Entity, 40);
+    for (extra, 0..) |*entity, i| entity.* = .{ .id = try std.fmt.allocPrint(a, "filler-{d}", .{i}), .name = try std.fmt.allocPrint(a, "filler-{d}", .{i}), .evidence = &.{.{ .id = "e" }} };
+    _ = try store.service("alice", true, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{m.types.Evidence{ .id = "e", .source_id = "fixture", .source_version = "1", .text = "Antfly is the Antfly database" }}, .entities = extra }, .{}), "fillers");
+    // Simulate reopening a space written before the candidate index existed.
+    var remove_keys: std.ArrayList([]const u8) = .empty;
+    var iterator = store.values.keyIterator();
+    while (iterator.next()) |path| if (std.mem.startsWith(u8, path.*, "entity-candidate-")) {
+        try remove_keys.append(a, path.*);
+    };
+    for (remove_keys.items) |path| _ = store.values.remove(path);
+    try std.testing.expectError(error.MemoryCapabilityUnavailable, store.service("alice", false, 3).execute(a, .entity_candidates, "a", "{}", ""));
+    const scans = store.entity_scans;
+    const legacy = try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", true, 3).execute(a, .entity_candidates, "a", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), legacy.object.get("items").?.array.items.len);
+    try std.testing.expectEqual(scans + 1, store.entity_scans);
+    var harness: ScheduledMemory = .{ .store = &store, .now = 4 };
+    var scheduling_cursor: @import("scheduling.zig").Cursor = .{};
+    try harness.tick(&scheduling_cursor);
+    try std.testing.expectEqual(@as(usize, 1), harness.cleanups);
+    const partial = try std.json.parseFromSliceLeaky(std.json.Value, a, store.values.get("entity-candidate-index").?, .{});
+    try std.testing.expect(!partial.object.get("complete").?.bool);
+    try harness.tick(&scheduling_cursor);
+    try harness.tick(&scheduling_cursor);
+    try std.testing.expectEqual(@as(usize, 3), harness.cleanups);
+    const index = try std.json.parseFromSliceLeaky(std.json.Value, a, store.values.get("entity-candidate-index").?, .{});
+    try std.testing.expect(index.object.get("complete").?.bool);
+    const after_backfill = store.entity_scans;
+    _ = try store.service("alice", true, 5).execute(a, .entity_candidates, "a", "{}", "");
+    try std.testing.expectEqual(after_backfill, store.entity_scans);
+    try discard(&store, .forget, "", "{\"evidence_ids\":[\"e\"]}", "forget", 6);
+    try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 7).execute(a, .entity_candidates, "a", "{}", ""));
+    for (0..20) |i| _ = try store.service("alice", true, 8).execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "retire-{d}", .{i}));
+    iterator = store.values.keyIterator();
+    while (iterator.next()) |path| try std.testing.expect(!std.mem.startsWith(u8, path.*, "entity-candidate-term/"));
+}
+
+test "memory candidate overflow preserves wide alias sets without index write amplification" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const aliases = try a.alloc([]const u8, 128);
+    for (aliases, 0..) |*alias, i| alias.* = try std.fmt.allocPrint(a, "vocabulary-{d}", .{i});
+    aliases[127] = "needle";
+    const evidence: m.types.Evidence = .{ .id = "e", .source_id = "source", .source_version = "1", .text = "Wide vocabularies and a needle" };
+    const entities = [_]m.types.Entity{
+        .{ .id = "needle", .name = "needle", .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "wide", .name = "wide", .aliases = aliases, .evidence = &.{.{ .id = "e" }} },
+    };
+    _ = try store.service("alice", true, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence}, .entities = &entities }, .{}), "entities");
+    var postings: usize = 0;
+    var iterator = store.values.keyIterator();
+    while (iterator.next()) |path| if (std.mem.startsWith(u8, path.*, "entity-candidate-term/")) {
+        postings += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 7), postings);
+    // Many foreign private matches cannot affect wide-seed page shape.
+    const foreign = try a.alloc(m.types.Entity, 100);
+    for (foreign, 0..) |*entity, i| entity.* = .{ .id = try std.fmt.allocPrint(a, "foreign-{d}", .{i}), .name = "needle", .evidence = &.{.{ .id = "foreign-evidence" }} };
+    const foreign_evidence: m.types.Evidence = .{ .id = "foreign-evidence", .source_id = "foreign", .source_version = "1", .text = "Private foreign entities" };
+    _ = try store.service("bob", true, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{foreign_evidence}, .entities = foreign }, .{}), "foreign");
+    const primary_scans = store.entity_scans;
+    for ([_][]const u8{ "needle", "wide" }, [_][]const u8{ "wide", "needle" }) |seed, expected| {
+        const result = try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", false, 3).execute(a, .entity_candidates, seed, "{}", ""), .{});
+        try std.testing.expect(result.object.get("next_cursor").? == .null);
+        try std.testing.expectEqual(primary_scans, store.entity_scans);
+        const items = result.object.get("items").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), items.len);
+        try std.testing.expectEqualStrings(expected, items[0].object.get("entity").?.object.get("entity").?.object.get("id").?.string);
+        try std.testing.expectEqualStrings(if (std.mem.eql(u8, seed, "wide")) "bounded_audience_fallback" else "indexed_lexical", result.object.get("retrieval").?.string);
+    }
+}
+
+test "memory indexed spelling neighbors preserve compound names without substring description admission" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const evidence: m.types.Evidence = .{ .id = "e", .source_id = "source", .source_version = "1", .text = "Compound database names and sandbox permissions" };
+    const entities = [_]m.types.Entity{
+        .{ .id = "antfly", .name = "Antfly", .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "antflydb", .name = "AntflyDB", .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "elevated", .name = "elevated sandbox permission", .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "escalated", .name = "escalated permissions", .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "cat", .name = "cat", .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "concatenate", .name = "concatenate", .evidence = &.{.{ .id = "e" }} },
+    };
+    _ = try store.service("alice", true, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence}, .entities = &entities }, .{}), "entities");
+    for ([_][]const u8{ "antfly", "elevated", "cat" }, [_]?[]const u8{ "antflydb", "escalated", null }) |seed, expected| {
+        const result = try std.json.parseFromSliceLeaky(std.json.Value, a, try store.service("alice", true, 3).execute(a, .entity_candidates, seed, "{}", ""), .{});
+        const items = result.object.get("items").?.array.items;
+        try std.testing.expectEqual(@as(usize, if (expected != null) 1 else 0), items.len);
+        if (expected) |id| try std.testing.expectEqualStrings(id, items[0].object.get("entity").?.object.get("entity").?.object.get("id").?.string);
+    }
 }

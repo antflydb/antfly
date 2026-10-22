@@ -26,6 +26,7 @@ const A = std.mem.Allocator;
 const eql = std.mem.eql;
 const curation = @import("antfly_resolver").curation;
 const graph_recall = @import("graph_recall.zig");
+const lexical = @import("lexical.zig");
 const max_dependency_depth: u8 = 32;
 const max_support_work = 65536;
 const resource_check_interval_ms: i64 = 30000;
@@ -201,7 +202,10 @@ pub const Service = struct {
         };
         var output: ?[]const u8 = null;
         switch (action) {
-            .create => try run.put(try configKey(a, run.state.config.generation), run.state.config),
+            .create => {
+                try run.put(try configKey(a, run.state.config.generation), run.state.config);
+                try run.put("entity-candidate-index", Run.CandidateIndex{ .complete = true });
+            },
             .explain => output = try run.explain(id, try parse(prov.ExplainRequest, a, body)),
             .configuration => {
                 const generation = std.fmt.parseInt(u64, id, 10) catch return error.InvalidMemoryRequest;
@@ -1818,17 +1822,160 @@ const Run = struct {
         std.mem.sort([]const u8, result, {}, stringLess);
         return result;
     }
+    const CandidateIndex = struct { cursor: ?[]const u8 = null, complete: bool = false };
+    fn candidateTerms(self: *Run, entity_value: t.Entity) ![][]const u8 {
+        var terms: std.StringHashMapUnmanaged(void) = .empty;
+        const labels = try self.a.alloc([]const u8, entity_value.aliases.len + 1);
+        labels[0] = entity_value.name;
+        @memcpy(labels[1..], entity_value.aliases);
+        for (labels) |label| {
+            const compact = try compactName(self.a, label);
+            if (compact.len > 0) try terms.put(self.a, try std.fmt.allocPrint(self.a, "compact/{s}", .{compact}), {});
+            if (compact.len >= 4) for (0..compact.len - 2) |i| {
+                const gram = compact[i..][0..3];
+                // ASCII spelling features never split a UTF-8 code point.
+                if (std.ascii.isAlphanumeric(gram[0]) and std.ascii.isAlphanumeric(gram[1]) and std.ascii.isAlphanumeric(gram[2])) try terms.put(self.a, try std.fmt.allocPrint(self.a, "gram/{s}", .{gram}), {});
+            };
+            const words = try lexical.tokens(self.a, label);
+            var iterator = words.keyIterator();
+            while (iterator.next()) |token| try terms.put(self.a, try std.fmt.allocPrint(self.a, "word/{s}", .{token.*}), {});
+        }
+        const result = try self.a.alloc([]const u8, terms.count());
+        var iterator = terms.keyIterator();
+        var i: usize = 0;
+        while (iterator.next()) |term| : (i += 1) result[i] = term.*;
+        std.mem.sort([]const u8, result, {}, stringLess);
+        return result;
+    }
+    fn candidateNameScore(left: []const []const u8, right: []const []const u8) f64 {
+        var left_words: usize = 0;
+        var right_words: usize = 0;
+        var left_grams: usize = 0;
+        var right_grams: usize = 0;
+        for (left) |term| {
+            if (std.mem.startsWith(u8, term, "word/")) left_words += 1;
+            if (std.mem.startsWith(u8, term, "gram/")) left_grams += 1;
+        }
+        for (right) |term| {
+            if (std.mem.startsWith(u8, term, "word/")) right_words += 1;
+            if (std.mem.startsWith(u8, term, "gram/")) right_grams += 1;
+        }
+        var l: usize = 0;
+        var r: usize = 0;
+        var matches: usize = 0;
+        var gram_matches: usize = 0;
+        while (l < left.len and r < right.len) {
+            switch (std.mem.order(u8, left[l], right[r])) {
+                .lt => l += 1,
+                .gt => r += 1,
+                .eq => {
+                    if (std.mem.startsWith(u8, left[l], "compact/")) return 2;
+                    if (std.mem.startsWith(u8, left[l], "word/")) matches += 1;
+                    if (std.mem.startsWith(u8, left[l], "gram/")) gram_matches += 1;
+                    l += 1;
+                    r += 1;
+                },
+            }
+        }
+        const denominator = @min(left_words, right_words);
+        const word_score: f64 = if (denominator == 0) 0 else @as(f64, @floatFromInt(matches)) / @as(f64, @floatFromInt(denominator));
+        const gram_denominator = @min(left_grams, right_grams);
+        const gram_score: f64 = if (gram_denominator < 2) 0 else @as(f64, @floatFromInt(gram_matches)) / @as(f64, @floatFromInt(gram_denominator));
+        // A shared three-byte fragment alone is not a useful spelling neighbor.
+        return @max(word_score, if (gram_score >= 0.5) gram_score else 0);
+    }
+    fn candidateScope(self: *Run, id: []const u8, request: t.EntityCandidateRequest) ![]const u8 {
+        const index = (try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{};
+        return std.fmt.allocPrint(self.a, "entity-candidates/{s}/", .{try hash(self.a, .{ id, request.kind, index.complete })});
+    }
+    fn candidatePrefix(self: *Run, record: t.EntityRecord, term: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "entity-candidate-term/{s}/{s}/", .{ try hash(self.a, .{ record.entity.visibility, if (record.entity.visibility == .team) "" else record.owner }), try hash(self.a, term) });
+    }
+    fn candidateAudiencePrefix(self: *Run, record: t.EntityRecord) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "entity-candidate-audience/{s}/", .{try hash(self.a, .{ record.entity.visibility, if (record.entity.visibility == .team) "" else record.owner })});
+    }
+    fn indexCandidate(self: *Run, record: t.EntityRecord, remove_index: bool) !void {
+        const audience_path = try std.fmt.allocPrint(self.a, "{s}{s}", .{ try self.candidateAudiencePrefix(record), try hash(self.a, record.entity.id) });
+        if (remove_index) try self.remove(audience_path) else try self.put(audience_path, .{ .id = record.entity.id });
+        const terms = try self.candidateTerms(record.entity);
+        // Very wide alias vocabularies use one bounded overflow posting rather
+        // than amplifying a single entity into tens of thousands of writes.
+        for (if (terms.len > 128) &[_][]const u8{"overflow"} else terms) |term| {
+            const path = try std.fmt.allocPrint(self.a, "{s}{s}", .{ try self.candidatePrefix(record, term), try hash(self.a, record.entity.id) });
+            if (remove_index) try self.remove(path) else try self.put(path, .{ .id = record.entity.id });
+        }
+    }
+    // Each page examines at most 64 postings, independently of space size.
+    // Term position and physical posting position both survive continuation.
+    fn candidatePage(self: *Run, seed: t.EntityRecord, request: t.EntityCandidateRequest) !Page {
+        const index = (try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{};
+        const scope = try self.candidateScope(seed.entity.id, request);
+        const position = try self.decodeCursor(scope, request.cursor);
+        const name_terms = try self.candidateTerms(seed.entity);
+        if (!index.complete) {
+            if (!self.service.context.admin) return error.MemoryCapabilityUnavailable;
+            // Existing spaces retain the bounded legacy path until the owner
+            // finishes a resumable primary-row backfill under the same CAS.
+            const after = if (position) |value| value[scope.len..] else null;
+            if (after) |value| if (!std.mem.startsWith(u8, value, "entity/")) return error.InvalidMemoryCursor;
+            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "entity/", after, 64);
+            return .{ .rows = page.rows, .next = if (page.next) |next| try std.fmt.allocPrint(self.a, "{s}{s}", .{ scope, next }) else null };
+        }
+        if (name_terms.len > 128) {
+            const prefix = try self.candidateAudiencePrefix(seed);
+            const after = if (position) |value| value[scope.len..] else null;
+            if (after) |value| if (!std.mem.startsWith(u8, value, prefix)) return error.InvalidMemoryCursor;
+            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, after, 64);
+            var rows: std.ArrayList(Row) = .empty;
+            for (page.rows) |row| {
+                const binding = try parse(struct { id: []const u8 }, self.a, row.json);
+                if (try self.service.backend.get(self.service.backend.ptr, self.a, try key(self.a, "entity", binding.id))) |entity_row| try rows.append(self.a, entity_row);
+            }
+            return .{ .rows = rows.items, .next = if (page.next) |next| try std.fmt.allocPrint(self.a, "{s}{s}", .{ scope, next }) else null };
+        }
+        const terms = try self.a.alloc([]const u8, name_terms.len + 1);
+        @memcpy(terms[0..name_terms.len], name_terms);
+        terms[name_terms.len] = "overflow";
+        var term: usize = 0;
+        var after: ?[]const u8 = null;
+        if (position) |value| {
+            const tail = value[scope.len..];
+            const split = std.mem.indexOfScalar(u8, tail, '/') orelse return error.InvalidMemoryCursor;
+            term = std.fmt.parseInt(usize, tail[0..split], 10) catch return error.InvalidMemoryCursor;
+            if (term >= terms.len) return error.InvalidMemoryCursor;
+            if (tail[split + 1 ..].len > 0) after = tail[split + 1 ..];
+        }
+        var rows: std.ArrayList(Row) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var examined: u32 = 0;
+        while (term < terms.len and examined < 64) {
+            const prefix = try self.candidatePrefix(seed, terms[term]);
+            if (after) |value| if (!std.mem.startsWith(u8, value, prefix)) return error.InvalidMemoryCursor;
+            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, after, 64 - examined);
+            examined += @intCast(page.rows.len);
+            for (page.rows) |row| {
+                const binding = try parse(struct { id: []const u8 }, self.a, row.json);
+                if (seen.contains(binding.id)) continue;
+                try seen.put(self.a, binding.id, {});
+                if (try self.service.backend.get(self.service.backend.ptr, self.a, try key(self.a, "entity", binding.id))) |entity_row| try rows.append(self.a, entity_row);
+            }
+            after = page.next;
+            if (after == null) term += 1;
+        }
+        return .{ .rows = rows.items, .next = if (term < terms.len) try std.fmt.allocPrint(self.a, "{s}{d}/{s}", .{ scope, term, after orelse "" }) else null };
+    }
     fn entityCandidates(self: *Run, id: []const u8, request: t.EntityCandidateRequest) ![]const u8 {
         if (request.limit == 0 or request.limit > 64) return error.InvalidMemoryRequest;
         const seed = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
         try self.authorize(seed.owner, seed.entity.visibility);
         if (!try self.entityVisible(seed)) return error.MemoryNotFound;
         const canonical_seed = (try self.canonical(id)) orelse return error.MemoryEntitySuppressed;
-        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "entity/", try self.decodeCursor("entity/", request.cursor), 64);
+        const page = try self.candidatePage(seed, request);
         const seed_distinctions = try self.declaredDistinct(id);
-        const seed_view = try self.entityView(id, .{ .limit = 4 });
+        const seed_view = try self.entityView(id, .{});
+        const seed_terms = try self.candidateTerms(seed.entity);
         var views_complete = seed_view.complete;
-        const Candidate = struct { entity: t.EntityRecord, view: t.EntityView, match_score: f64, predicates: []const []const u8 };
+        const Candidate = struct { entity: t.EntityRecord, view: t.EntityView, match_score: f64, description_score: f64, predicates: []const []const u8 };
         var matches: std.ArrayList(Candidate) = .empty;
         for (page.rows) |row| {
             try self.service.context.check();
@@ -1854,22 +2001,21 @@ const Run = struct {
                 if (candidate_distinctions.contains(canonical_seed)) continue;
             }
             if (request.kind == .identity and !eql(u8, try nameNumbers(self.a, seed.entity.name), try nameNumbers(self.a, candidate.entity.name))) continue;
-            var score = lexical(seed.entity.name, candidate.entity.name);
-            for (candidate.entity.aliases) |alias| score = @max(score, lexical(seed.entity.name, alias));
-            for (seed.entity.aliases) |alias| score = @max(score, lexical(alias, candidate.entity.name));
-            if (eql(u8, try compactName(self.a, seed.entity.name), try compactName(self.a, candidate.entity.name))) score += 1;
-            const candidate_view = try self.entityView(candidate.entity.id, .{ .limit = 4 });
+            const score = candidateNameScore(seed_terms, try self.candidateTerms(candidate.entity));
+            if (score <= 0) continue;
+            const candidate_view = try self.entityView(candidate.entity.id, .{});
             views_complete = views_complete and candidate_view.complete;
-            score = @max(score, lexical(seed_view.description, candidate_view.description));
-            if (score > 0) try matches.append(self.a, .{ .entity = candidate, .view = candidate_view, .match_score = score, .predicates = predicates });
+            try matches.append(self.a, .{ .entity = candidate, .view = candidate_view, .match_score = score, .description_score = try lexical.overlap(self.a, seed_view.description, candidate_view.description), .predicates = predicates });
         }
         std.mem.sort(Candidate, matches.items, {}, struct {
             fn less(_: void, lhs: Candidate, rhs: Candidate) bool {
-                return if (lhs.match_score == rhs.match_score) std.mem.lessThan(u8, lhs.entity.entity.id, rhs.entity.entity.id) else lhs.match_score > rhs.match_score;
+                if (lhs.match_score != rhs.match_score) return lhs.match_score > rhs.match_score;
+                if (lhs.description_score != rhs.description_score) return lhs.description_score > rhs.description_score;
+                return std.mem.lessThan(u8, lhs.entity.entity.id, rhs.entity.entity.id);
             }
         }.less);
         const count = @min(matches.items.len, request.limit);
-        return self.encode(.{ .seed = seed, .seed_view = seed_view, .kind = request.kind, .relationship_predicates = if (self.state.config.ontology_pack == .software_team_v1) &[_][]const u8{ "is_a", "part_of", "alternative_to" } else &[_][]const u8{}, .items = matches.items[0..count], .revision = self.state.revision, .config_generation = self.state.config.generation, .next_cursor = try self.encodeCursor("entity/", page.next), .complete = views_complete and page.next == null and count == matches.items.len, .omitted = matches.items.len - count, .basis = "name_and_grounded_description_matches_not_identity_or_calibrated_confidence" });
+        return self.encode(.{ .seed = seed, .seed_view = seed_view, .kind = request.kind, .relationship_predicates = if (self.state.config.ontology_pack == .software_team_v1) &[_][]const u8{ "is_a", "part_of", "alternative_to" } else &[_][]const u8{}, .items = matches.items[0..count], .revision = self.state.revision, .config_generation = self.state.config.generation, .next_cursor = try self.encodeCursor(try self.candidateScope(id, request), page.next), .complete = views_complete and page.next == null and count == matches.items.len, .omitted = matches.items.len - count, .retrieval = if (!((try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{}).complete) "bounded_primary_fallback" else if (seed_terms.len > 128) "bounded_audience_fallback" else "indexed_lexical", .semantic_discovery = "not_indexed", .basis = "name_matches_description_tiebreaker_not_identity_or_calibrated_confidence" });
     }
     fn proposalOperation(self: *Run, proposal: curation.Proposal, binding: ?ProposalBinding) !prov.Resource {
         if (binding) |value| if (value.operation) |operation| return operation;
@@ -2134,7 +2280,9 @@ const Run = struct {
         }
         // Identity is explicit. Names/aliases are discoverable candidates and
         // never constitute authority to merge two canonical IDs.
-        try self.put(path, t.EntityRecord{ .entity = value, .owner = self.service.context.principal, .revision = self.state.revision, .recorded_at = self.service.context.now_ms });
+        const record: t.EntityRecord = .{ .entity = value, .owner = self.service.context.principal, .revision = self.state.revision, .recorded_at = self.service.context.now_ms };
+        try self.put(path, record);
+        try self.indexCandidate(record, false);
         if (value.evidence.len > 0) try self.mention(.{ .id = try std.fmt.allocPrint(self.a, "entity/{s}", .{try hash(self.a, value.id)}), .entity_id = value.id, .evidence = value.evidence, .visibility = value.visibility });
     }
     fn putAssertion(self: *Run, value: t.StoredAssertion) !void {
@@ -2650,6 +2798,14 @@ const Run = struct {
         self.retention_maintenance = true;
         defer self.retention_maintenance = false;
         try self.pollResources();
+        var candidate_index = (try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{};
+        if (!candidate_index.complete) {
+            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "entity/", candidate_index.cursor, 16);
+            for (page.rows) |row| try self.indexCandidate(try parse(t.EntityRecord, self.a, row.json), false);
+            candidate_index.cursor = page.next;
+            candidate_index.complete = page.next == null;
+            try self.put("entity-candidate-index", candidate_index);
+        }
         if (self.state.next_expiry_at) |time| if (time <= self.service.context.now_ms) {
             try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
             self.state.next_expiry_at = null;
@@ -2785,6 +2941,7 @@ const Run = struct {
         } else if (std.mem.startsWith(u8, row.key, "entity/")) {
             const stored = try parse(t.EntityRecord, self.a, row.json);
             if (try self.read(bool, "forgotten-all") != null or !try self.entityRetained(stored)) {
+                try self.indexCandidate(stored, true);
                 try self.put(try key(self.a, "forgotten-entity", stored.entity.id), true);
                 try self.remove(try self.generationKey("entity", stored.entity.id));
                 try self.remove(row.key);
@@ -3581,7 +3738,7 @@ const Run = struct {
         if (request.environment) |value| if (claim.environment != null and !eql(u8, value, claim.environment.?)) return null;
         if (request.task) |value| if (claim.task != null and !eql(u8, value, claim.task.?)) return null;
         if (request.kind) |value| if (value != claim.kind) return null;
-        var score = lexical(request.query, claim.statement);
+        var score = try lexical.coverage(self.a, request.query, claim.statement);
         const compatible_embedding = if (vector != null) try self.vectorFor(self.state.config, claim) else null;
         if (vector) |query_vector| if (compatible_embedding) |embedding| {
             score += try cosine(query_vector, embedding);
@@ -3795,24 +3952,6 @@ fn sameGroup(left: t.Assertion, right: t.Assertion) bool {
 }
 fn optionalEqual(left: ?[]const u8, right: ?[]const u8) bool {
     return if (left) |value| if (right) |other| eql(u8, value, other) else false else right == null;
-}
-fn lexical(query: []const u8, text: []const u8) f64 {
-    if (query.len == 0) return 1;
-    var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n,.;:?!");
-    var score: f64 = 0;
-    var count: f64 = 0;
-    while (tokens.next()) |token| {
-        count += 1;
-        if (token.len <= text.len) {
-            for (0..text.len - token.len + 1) |i| {
-                if (std.ascii.eqlIgnoreCase(text[i..][0..token.len], token)) {
-                    score += 1;
-                    break;
-                }
-            }
-        }
-    }
-    return if (count > 0) score / count else 0;
 }
 fn cosine(left: []const f32, right: []const f32) !f64 {
     if (left.len == 0 or left.len != right.len) return error.MemoryEmbeddingMismatch;
