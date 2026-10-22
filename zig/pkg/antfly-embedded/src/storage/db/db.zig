@@ -42935,6 +42935,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .live_filter_doc_set_controlled = textLiveFilterDocSetControlledCallback,
             // An absent legacy summary is unknown, not a reason to scan the
             // primary population before searching selective postings.
             .all_docs_visible = allDocsVisibleFastCallback,
@@ -43420,6 +43421,23 @@ pub const DB = struct {
         return ttl_visible;
     }
 
+    /// The adaptive text path is identity-only; TTL tables retain their full
+    /// visibility fallback. Its bulk scan must obey the request deadline.
+    fn textLiveFilterDocSetControlledCallback(ctx: ?*anyopaque, alloc: Allocator, set: *const doc_set.ResolvedDocSet, generation: ?u64, control: db_query_search.QueryExecutionControl) anyerror!doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try control.check();
+        if (ttlDurationNs(self) != 0) return error.UnsupportedQueryRequest;
+        var result = if (try self.allDocsVisibleSummaryFast(generation))
+            try doc_set.cloneAlloc(alloc, set)
+        else if (set.* == .all)
+            try self.broadLiveDocSetCachedAllocControlled(alloc, generation, control)
+        else
+            try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+        errdefer result.deinit(alloc);
+        try control.check();
+        return result;
+    }
+
     fn ttlVisibleResolvedDocSetNoLockAlloc(
         self: *DB,
         alloc: Allocator,
@@ -43449,9 +43467,13 @@ pub const DB = struct {
     }
 
     fn broadLiveDocSetCachedAlloc(self: *DB, alloc: Allocator, generation: ?u64) !doc_set.ResolvedDocSet {
-        const all_set: doc_set.ResolvedDocSet = .all;
+        return self.broadLiveDocSetCachedAllocControlled(alloc, generation, .{});
+    }
+
+    fn broadLiveDocSetCachedAllocControlled(self: *DB, alloc: Allocator, generation: ?u64, control: db_query_search.QueryExecutionControl) !doc_set.ResolvedDocSet {
+        try control.check();
         const gen = generation orelse {
-            return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+            return (try doc_identity.visiblePrimaryDocSetIfCompleteFromStoreAllocControlled(alloc, self.core.store, generation, control)) orelse .all;
         };
         {
             lockAtomic(&self.core.identity_visibility.live_mutex);
@@ -43462,7 +43484,7 @@ pub const DB = struct {
                 }
             }
         }
-        var computed = try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+        var computed = (try doc_identity.visiblePrimaryDocSetIfCompleteFromStoreAllocControlled(alloc, self.core.store, generation, control)) orelse doc_set.ResolvedDocSet.all;
         errdefer computed.deinit(alloc);
         if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
             lockAtomic(&self.core.identity_visibility.live_mutex);

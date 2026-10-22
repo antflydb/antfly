@@ -1766,6 +1766,44 @@ pub const IndexSnapshot = struct {
         return self.docNumsForOrdinalMembershipAlloc(alloc, All{});
     }
 
+    /// Stream directly into compact membership without a corpus-sized u32
+    /// result array. Check request control even across deleted/sparse rows.
+    pub fn docNumBitmapForOrdinalMembershipAlloc(self: *const IndexSnapshot, alloc: Allocator, membership: anytype, control: query_mod.ExecutionControl) !roaring.RoaringBitmap {
+        var out = roaring.RoaringBitmap.init(alloc);
+        errdefer out.deinit();
+        var offset: u32 = 0;
+        var pending: [256]u32 = undefined;
+        var used: usize = 0;
+        for (self.segments, 0..) |_, segment_idx| {
+            try control.check();
+            var lease = try self.leaseSegment(segment_idx);
+            defer lease.deinit();
+            const seg = lease.entry;
+            var cursor: ?segment_mod.DocOrdinalCursor = null;
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            for (0..seg.reader.doc_count) |local| {
+                if (local % 256 == 0) try control.check();
+                const doc: u32 = @intCast(local);
+                if (seg.shared.deleted) |deleted| if (deleted.contains(doc)) continue;
+                if (cursor == null) cursor = try segment_mod.DocOrdinalCursor.init(&seg.reader);
+                const ordinal = (try cursor.?.get(doc)) orelse continue;
+                if (membership.contains(ordinal)) {
+                    pending[used] = offset + doc;
+                    used += 1;
+                    if (used == pending.len) {
+                        try out.addSortedAscending(&pending);
+                        used = 0;
+                    }
+                }
+            }
+            offset += seg.reader.doc_count;
+        }
+        try control.check();
+        try out.addSortedAscending(pending[0..used]);
+        return out;
+    }
+
     fn docNumsForOrdinalMembershipAlloc(self: *const IndexSnapshot, alloc: Allocator, membership: anytype) ![]u32 {
         var out = std.ArrayListUnmanaged(u32).empty;
         errdefer out.deinit(alloc);
@@ -5086,4 +5124,47 @@ test "ordinal bitmap projection bounds native reads for a broad live population"
     try std.testing.expectEqual(@as(u32, count - 1), actual[actual.len - 1]);
     try std.testing.expect(probes <= 256);
     std.debug.print("ORDINAL_PROJECTION docs={d} array_us={d} bitmap_us={d} array_probes={d} bitmap_probes={d}\n", .{ count, scalar_ns / 1000, elapsed_ns / 1000, scalar_probes, probes });
+}
+
+test "ordinal bitmap streaming projection cancels during traversal" {
+    const a = std.testing.allocator;
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    var ordinals: [2048]u32 = undefined;
+    for (&ordinals, 0..) |*ordinal, i| {
+        ordinal.* = @intCast(i + 1);
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "doc:{d}", .{i}), "{}");
+    }
+    try segment.addDocOrdinals(&ordinals);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    const snapshot_ = writer.acquireSnapshot();
+    defer snapshot_.release();
+    const Harness = struct {
+        remaining: usize = 4,
+        visited: usize = 0,
+        pub fn contains(self: *@This(), _: u32) bool {
+            self.visited += 1;
+            return true;
+        }
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) return error.Canceled;
+            self.remaining -= 1;
+        }
+    };
+    var harness: Harness = .{};
+    try std.testing.expectError(error.Canceled, snapshot_.docNumBitmapForOrdinalMembershipAlloc(a, &harness, .{
+        .cancellation = .{ .ptr = &harness, .check_fn = Harness.check },
+    }));
+    try std.testing.expect(harness.visited > 0 and harness.visited < ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.visited % 256);
+    try std.testing.expectError(error.Timeout, snapshot_.docNumBitmapForOrdinalMembershipAlloc(a, &harness, .{ .deadline_ns = 0 }));
+    var complete = try snapshot_.docNumBitmapForOrdinalMembershipAlloc(a, &harness, .{});
+    defer complete.deinit();
+    try std.testing.expectEqual(@as(usize, ordinals.len), complete.cardinality());
 }
