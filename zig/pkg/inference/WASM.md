@@ -495,7 +495,7 @@ Multimodal text+image semantic search in the browser.
 
 **JS API:** `loadClipModel()`, `clipEmbedText()`, `clipEmbedImage()`, `preprocessImage()`
 
-**Image preprocessing:** `lib/image/processing.zig` handles resize (bilinear, SIMD-optimized) + normalize → CHW f32 in WASM. JS does decode only (Canvas API → RGBA bytes).
+**Image preprocessing:** `zig/lib/image/src/processing.zig` handles resize (bilinear, SIMD-optimized) + normalize → CHW f32 in WASM. JS does decode only (Canvas API → RGBA bytes).
 
 **E2E test:** `web/test-clip-wasm.mjs` — load model, text embedding, image embedding, cosine similarity.
 
@@ -888,7 +888,7 @@ Architecture code (`bert.zig`, `clip.zig`, `whisper.zig`, `clap.zig`, `florence.
 | `src/backends/tensor.zig` | Tensor/DType types |
 | `lib/tokenizer/` | HuggingFace tokenizer (WordPiece/BPE/Unigram, pure Zig) |
 | `lib/audio/` | WAV decode, resample, log-mel spectrogram (Whisper + CLAP configs) |
-| `lib/image/processing.zig` | SIMD-optimized bilinear resize + normalize → CHW f32 |
+| `zig/lib/image/src/processing.zig` | SIMD-optimized bilinear resize + normalize → CHW f32 |
 
 ## WASM Exports
 

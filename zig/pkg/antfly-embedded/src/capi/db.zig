@@ -19,6 +19,7 @@ comptime {
 }
 const handles = @import("handles.zig");
 pub const testMaintenanceCaptureAdmission = @import("lite_connection.zig").testMaintenanceCaptureAdmission;
+pub const testPathReplacementAdmission = @import("lite_connection.zig").testPathReplacementAdmission;
 pub const std = handles.std;
 pub const builtin = handles.builtin;
 pub const local_write = handles.local_write;
@@ -3281,7 +3282,11 @@ pub fn antfly_restore_backup_json(
     defer io_impl.deinit();
 
     const restored = switch (resolved.storage_kind) {
-        .lite => restorePortableBackupToLiteFile(alloc, io_impl.io(), null, path, backup.bytes(), replace, null),
+        .lite => blk: {
+            const replacement = @import("lite_connection.zig").acquirePathReplacement(path) catch |err| break :blk err;
+            defer replacement.release();
+            break :blk restorePortableBackupToLiteFile(alloc, io_impl.io(), null, path, backup.bytes(), replace, null);
+        },
         .directory => restorePortableBackupToDirectory(alloc, io_impl.io(), path, backup.bytes(), replace),
     };
     restored catch |err| {
@@ -3313,7 +3318,11 @@ pub fn antfly_restore_backup_file_json(
     defer io_impl.deinit();
 
     const restored = switch (resolved.storage_kind) {
-        .lite => restorePortableBackupPathToLiteFile(alloc, io_impl.io(), destination, source, replace),
+        .lite => blk: {
+            const replacement = @import("lite_connection.zig").acquirePathReplacement(destination) catch |err| break :blk err;
+            defer replacement.release();
+            break :blk restorePortableBackupPathToLiteFile(alloc, io_impl.io(), destination, source, replace);
+        },
         .directory => restorePortableBackupPathToDirectory(alloc, io_impl.io(), destination, source, replace),
     };
     restored catch |err| {

@@ -4,14 +4,16 @@
 
 Antfly query execution has to remove documents that should not be returned:
 deleted documents, documents created after a read generation, expired TTL rows,
-and stale rows left behind in secondary indexes. The current tactical
-optimization can represent a small set of deleted or not-yet-visible ordinals
-as an exclude set, but building that set still scans identity state on a cold
-cache miss.
+and stale rows left behind in secondary indexes. The write path now maintains
+chunked ordinal visibility in primary storage. Current reads use compact deleted
+chunks and summary checks; generation-bound reads use visibility chunks carrying
+creation/deletion generations. These paths avoid scanning all identity state
+for the normal small-complement case.
 
-The long-term design should make visibility a first-class index maintained by
-the write path. Query-time filtering should read an already-materialized mask,
-not discover invisible documents by scanning the primary identity table.
+The implementation is in
+[`doc_identity.zig`](pkg/antfly-embedded/src/storage/db/doc_identity.zig).
+The design sections below describe the shared mask model; optional cache and
+telemetry extensions are not promises of a fully deployed metrics surface.
 
 This is the same shape used by production search systems:
 
@@ -47,30 +49,22 @@ Antfly's natural identity for this is the document ordinal.
 - Optimizing every rare visibility shape before the common current-read path is
   cheap and observable.
 
-## Current Problem
+## Current implementation and limits
 
-The include-set representation is correct but expensive for large tables. A
-single tombstone can force broad live filtering to materialize all visible
-documents.
+Visibility chunks cover 65,536 ordinals and are maintained atomically with
+identity state. Current reads first try summary/deleted-chunk fast paths;
+generation reads use the durable visibility records. Missing or invalid chunks
+can be reconstructed from the affected ordinal-state range for the current
+read. This read-time reconstruction does not imply a scheduled background repair
+or a persisted repaired chunk.
 
-The small exclude-set representation avoids returning a huge include set, but
-its cold-cache construction still scans every identity ordinal state row:
-
-```text
-identity ordinal states -> scan all rows -> collect non-visible ordinals
-```
-
-That makes the steady state good after the cache is warm, but the first query
-after identity changes can still pay O(total documents). A global
-single-generation cache also makes invalidation coarse: writes clear the whole
-cached answer even when they touch one ordinal.
-
-Production behavior should be:
-
-```text
-write path updates compact visibility chunks
-query path reads cached chunks and applies a mask
-```
+The non-visible set is bounded (65,536 entries by default); overflow returns
+an unavailable complement so callers can choose the general include/filter
+path. Incomplete identity coverage, invalid manifests, and older stores may
+require fallback or explicit repair rather than certification of a fast mask.
+Full identity/primary scans still exist for validation and general fallback;
+the implementation does not promise their removal from every read shape.
+TTL remains time-sensitive and requires its own checks alongside ordinal masks.
 
 ## Design Summary
 
@@ -196,8 +190,9 @@ On recovery:
 
 - Replay the WAL through the same identity mutation code.
 - Rebuild any dirty in-memory chunk cache from durable chunk records.
-- If a visibility chunk is missing or corrupt, fall back to identity-state
-  reconstruction for that chunk only and report a repair metric.
+- Missing or corrupt chunks can be reconstructed for a read from that ordinal
+  range. This is not a guarantee of persisted or background repair; identity
+  statistics can report invalid chunks separately.
 
 ## Query Path
 
@@ -286,15 +281,15 @@ Target complexities:
 - Delete write: O(1) chunk update plus normal WAL/LSM write cost.
 - First query after write: no O(total documents) scan.
 - Generation read: O(chunks touched plus derived generation mask construction).
-- Full fallback/repair: O(chunk size), not O(table size).
+- A missing chunk can be reconstructed within its ordinal range; general
+  include/validation fallback may still scan identity or primary state.
 
 The important boundary is that no normal query should scan all identity states
 just to learn that there is one tombstone.
 
 ## Operator UX
 
-Visibility should be observable. Add status and Prometheus metrics before
-depending on this path for production scale:
+Proposed telemetry extensions (not all exported today):
 
 - `antfly_visibility_chunks_total`
 - `antfly_visibility_dirty_chunks`
@@ -309,7 +304,7 @@ depending on this path for production scale:
 - `antfly_visibility_mask_bytes`
 - `antfly_visibility_overflow_total`
 
-Status should expose a compact summary:
+A future compact status summary could be:
 
 ```json
 {
@@ -328,35 +323,16 @@ Status should expose a compact summary:
 This makes the UX practical for operators: if queries get slower, they can see
 whether Antfly is hitting masks, rebuilding chunks, or falling back to scans.
 
-## Rollout Plan
+## Remaining work
 
-1. Keep the PR's complement optimization as a tactical bridge.
-2. Add visibility chunk records and write them beside identity state.
-3. Add a verifier that compares chunk masks with identity-state scans in tests
-   and optional debug builds.
-4. Add metrics for chunk cache hits, misses, build latency, and scan fallback.
-5. Teach dense current-read planning to consume the chunked mask.
-6. Teach match-all/sort/aggregation to consume the same mask.
-7. Extend sparse and full-text paths only where their doc-number mappings make
-   ordinal masks equivalent.
-8. Add background repair for missing or stale chunks.
-9. Retire full identity scans from the normal query path.
+Chunk records, atomic write maintenance, current deleted complements, and
+bounded chunk reconstruction are implemented. The chunk size and primary-store
+namespace are fixed in the current format; these are no longer rollout questions.
 
-## Open Questions
-
-- What exact ordinal chunk size gives the best cache and compression tradeoff?
-- How long do generation reads need to remain exact?
-- Should TTL be indexed as expiry-time chunks immediately, or remain a separate
-  positive live filter until vector top-k masking is deeper?
-- Should visibility chunks live in the primary DB namespace or in a dedicated
-  sidecar store with independent compaction policy?
-- Do dense and sparse indexes need per-segment masks to avoid converting ordinal
-  masks to vector/doc ids at query time?
-
-## Recommendation
-
-The durable long-term solution is a chunked, write-maintained visibility index.
-It is more work than a query-side cache, but it matches how production search
-systems scale: writes maintain compact live/deleted state, queries apply that
-state as a mask, and no query pays a full-table identity scan to discover a
-small number of invisible documents.
+Remaining improvements include broader per-index acceleration, cache tuning,
+and operator telemetry. The metrics/status shape above is a proposed extension,
+not an inventory of exported Prometheus series. Existing identity statistics
+include visibility chunk count, deleted ordinals, mask bytes, and invalid-chunk
+repair counts; they do not prove that background repair has completed. TTL
+expiry and general fallback must continue to fail or filter correctly when a
+compact mask cannot be certified.

@@ -576,9 +576,19 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
     expected_score = 2.0 if kind == "degree" else 0.5
     for row in result["scores"]:
         assert row["score"] == pytest.approx(expected_score, abs=1e-6)
-    runtime = stateful_api.get(f"/tables/{table}/indexes/graph_idx")["status"][
-        "graph_metric_runtime"
-    ]
+
+    def live_runtime(previous_owner=0):
+        value = stateful_api.get(f"/tables/{table}/indexes/graph_idx")["status"].get(
+            "graph_metric_runtime", {}
+        )
+        # Persisted scores can be queried before the asynchronously opened
+        # writer has published its runtime snapshot, especially after restart.
+        return (
+            value if value.get("owner_id_hash", 0) not in (0, previous_owner) else None
+        )
+
+    runtime = wait_until(live_runtime, timeout_s=30.0, interval_s=0.1)
+    assert runtime is not None, stateful_api.debug_logs()
     assert runtime["enabled"] is True
     assert runtime["role"] == "combined"
     assert runtime["owner_id_hash"] != 0
@@ -604,9 +614,12 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
         stateful_api.restart_server()
         persisted = wait_until(published, timeout_s=30.0, interval_s=0.1)
         assert persisted is not None, stateful_api.debug_logs()
-        reopened_runtime = stateful_api.get(f"/tables/{table}/indexes/graph_idx")[
-            "status"
-        ]["graph_metric_runtime"]
+        reopened_runtime = wait_until(
+            lambda: live_runtime(runtime["owner_id_hash"]),
+            timeout_s=30.0,
+            interval_s=0.1,
+        )
+        assert reopened_runtime is not None, stateful_api.debug_logs()
         assert reopened_runtime["owner_id_hash"] != runtime["owner_id_hash"]
         publication = persisted["status"]["last_event"]["sequence"]
         stateful_api.post(f"{action_path}:rebuild", {})

@@ -138,6 +138,16 @@ order should all validate against the same mapping and cursor rules. They may
 choose different candidate sources, but they should share the same comparator,
 doc-value access, `_id` tie-breaker, and coordinator merge logic.
 
+### Public HTTP Continuation
+
+The first ordered native-table HTTP query captures a retained cut and returns
+`remote_snapshot`. Continue with both that unchanged token and the last hit's
+complete `_sort` tuple as `search_after` (or the first hit's tuple as
+`search_before`). A token-free cursor is rejected; the HTTP path does not offer
+live-seek paging. On expiry or a catalog/incarnation conflict, discard the old
+cursor and start again. Minimum freshness in `read_requirements` is independent
+of retained snapshot identity. See the [request pair](../docs/guides/document-engine.mdx#exact-sort-and-cursor-pagination).
+
 ### Elasticsearch And Lucene Alignment
 
 Antfly should follow Elasticsearch's public model and Lucene's physical lessons
@@ -1247,7 +1257,10 @@ missing executor.
 
 ## API Contract
 
-The API should keep the current user-facing shape:
+For the first page, send the query and `order_by` without a cursor. Continue
+with the returned `remote_snapshot` and the last hit's complete `_sort` tuple.
+This continuation uses illustrative values; replace both with the actual first
+response values:
 
 ```json
 {
@@ -1256,11 +1269,14 @@ The API should keep the current user-facing shape:
     { "field": "created_at", "desc": true }
   ],
   "limit": 20,
+  "remote_snapshot": "<retained remote_snapshot from the first response>",
   "search_after": ["2026-01-01T00:00:00Z", "doc:123"]
 }
 ```
 
 Validation:
+
+- native-table HTTP continuation without `remote_snapshot`: rejected
 
 - unknown sort field: 422
 - analyzed text field without sortable keyword/doc-value field: 422
@@ -1269,17 +1285,18 @@ Validation:
 - semantic approximate exact sort: 422
 - count-only plus ordered page options: 422
 
-Response:
+Query response fragment (the retained token is unchanged):
 
 ```json
 {
+  "remote_snapshot": "<retained remote_snapshot from the first response>",
   "hits": {
     "total": { "value": 1234, "relation": "exact" },
     "hits": [
       {
-        "_id": "doc:123",
+        "_id": "doc:124",
         "_score": 1.0,
-        "_sort": ["2026-01-01T00:00:00Z", "doc:123"],
+        "_sort": ["2026-01-01T00:00:00Z", "doc:124"],
         "_source": { "title": "Antfly" }
       }
     ]
@@ -1287,7 +1304,10 @@ Response:
 }
 ```
 
-The `_sort` array should be present when `order_by` is present.
+The `_sort` array should be present when `order_by` is present. For another
+page, retain the same `remote_snapshot` and use this response's last `_sort`
+tuple. On expiry or a catalog/incarnation conflict, discard the token and
+cursor and restart from the first page.
 
 ## Documentation, OpenAPI, And SDK Contract
 

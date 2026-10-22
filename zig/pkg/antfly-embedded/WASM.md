@@ -34,18 +34,18 @@ Current implementation note:
 - this package targets
   [root.zig](src/engine/root.zig)
   as the canonical shared embedded module entrypoint
-- [embedded_root.zig](../antfly/src/embedded_root.zig)
+- [embedded_root.zig](src/embedded_root.zig)
   is a compatibility shim
 
 The shared embedded module sits on the normal storage DB engine path:
 
 - [db.zig](src/engine/db.zig)
-  wraps [mod.zig](../antfly/src/storage/db/mod.zig)
+  wraps [mod.zig](src/storage/db/mod.zig)
 - query execution comes from:
-  - [search_exec.zig](../antfly/src/storage/db/query/search_exec.zig)
-  - [graph_exec.zig](../antfly/src/storage/db/query/graph_exec.zig)
-  - [projection.zig](../antfly/src/storage/db/query/projection.zig)
-  - [result_shape.zig](../antfly/src/storage/db/query/result_shape.zig)
+  - [search_exec.zig](src/storage/db/query/search_exec.zig)
+  - [graph_exec.zig](src/storage/db/query/graph_exec.zig)
+  - [projection.zig](src/storage/db/query/projection.zig)
+  - [result_shape.zig](src/storage/db/query/result_shape.zig)
 
 ## Hosted Entry Points
 
@@ -111,16 +111,16 @@ There are two storage layers:
   - file/path-oriented
   - used by durable LSM internals
   - defined in
-    [storage_io.zig](../antfly/src/storage/lsm_backend/storage_io.zig)
+    [storage_io.zig](src/storage/lsm_backend/storage_io.zig)
 - `ObjectStorage`
   - blob/object-oriented
   - used by serverless/object-backed consumers
   - defined in
-    [object_storage.zig](../antfly/src/storage/object_storage.zig)
+    [object_storage.zig](src/storage/object_storage.zig)
 
 To make embedding simpler, one host can expose both through:
 
-- [host_environment.zig](../antfly/src/storage/host_environment.zig)
+- [host_environment.zig](src/storage/host_environment.zig)
 
 Recommended browser mapping:
 
@@ -128,25 +128,38 @@ Recommended browser mapping:
   - back with OPFS or another file-like store
   - implement `createDirPath`, `readFileAlloc`, `readFileRangeAlloc`,
     `writeFileAbsolute`, `renameAbsolute`, `deleteFileAbsolute`, `deleteTree`,
-    and `nowNs`
+    `fileSize` (`file_size` in the vtable), and `nowNs`
 - `ObjectStorage`
   - back with IndexedDB, OPFS blobs, or remote object APIs exposed by JS
   - implement `bucketExists`, `makeBucket`, `putObject`, `getObject`,
     `getObjectAttributes`, `statObject`, `deleteObject`, and `listObjects`
+
+For durable atomic publication, provide either a custom `begin_atomic_write`
+whose sink implements durable atomic finish, or all three fallback capabilities:
+`sync_contents_absolute`, `sync_parent_absolute`, and `rename_is_atomic = true`.
+The fallback writes a temporary sibling, syncs its contents, atomically renames
+it, then syncs the destination's parent directory. Implementing rename alone
+is insufficient: `beginAtomicWrite` returns `DurableAtomicWriteUnsupported`
+without these capabilities. A host must only declare atomic rename when its
+backing store guarantees it across failures.
+
+These durability capabilities and the required callbacks above are distinct
+from optional performance hooks such as range batching, immutable read sources,
+and cache advice. Optional hooks can be omitted without weakening durability.
 
 The host may use the same physical backing store for both. The split is
 logical, not necessarily operational.
 
 Available building blocks:
 
-- [storage_io.zig](../antfly/src/storage/lsm_backend/storage_io.zig)
+- [storage_io.zig](src/storage/lsm_backend/storage_io.zig)
   - `NativeStorage`
   - `MemoryStorage`
   - `HostStorage`
-- [object_storage.zig](../antfly/src/storage/object_storage.zig)
+- [object_storage.zig](src/storage/object_storage.zig)
   - shared object/blob facade
   - `HostObjectStorage`
-- [host_environment.zig](../antfly/src/storage/host_environment.zig)
+- [host_environment.zig](src/storage/host_environment.zig)
   - bundle exposing both host-facing contracts
 - [api.zig](src/engine/api.zig)
   - embedded function-call surface over `DB`

@@ -1,0 +1,697 @@
+{
+  "schema_version": 1,
+  "qualification": "Bounded cross-parent visual pipeline, adaptive projection admission and CLOCK scalar source proofs",
+  "source": {
+    "commit": "47cac5ef88dcc1a5c57a2ae37c94eb0ae340638b",
+    "baseline_commit": "a2840e65663630c1bb9e449a6f5c1b8e1add78ea",
+    "merged_main": "ddba6584b38b59c62e261ef63e0374dc1f711617",
+    "source_sha256": "beb6553c5903e3619dda51485a9acf320063bc7302a0796504d7c322646cfbe3",
+    "files": 702,
+    "directories": [
+      "zig/pkg/antfly-grep",
+      "zig/lib/decisions",
+      "zig/lib/source_evidence",
+      "zig/pkg/antfly-embedded/src/storage"
+    ],
+    "framing": "lexically sorted relative tracked .zig/.py paths NUL file bytes NUL"
+  },
+  "build": {
+    "zig_version": "0.17.0",
+    "optimize": "ReleaseFast",
+    "macos_target": "native aarch64-macos",
+    "linux_target": "aarch64-linux-gnu",
+    "windows_cross_target": "x86_64-windows",
+    "linux_resources": {
+      "cpus": 2,
+      "memory_bytes": 1073741824
+    }
+  },
+  "limits": {
+    "parent_lanes_max": 8,
+    "units_per_wave_max": 16,
+    "conservative_group_bytes_max": 8388608,
+    "scalar_proof_entries_max": 4096,
+    "scalar_proof_window_max": 64,
+    "warm_entries_preserved_after_one_cold_admission": 4095
+  },
+  "limitations": [
+    "Synthetic constant-score loopback fixtures on shared hardware with 20 ms artificial delay per HTTP request; no live-provider relevance, token billing or universal speed claim.",
+    "Linux is the authorized ARM64 Docker VM, not an independent native Linux host.",
+    "Concurrency can increase peak RSS. CPU and first-output medians are reported alongside elapsed time; fewer requests do not imply every metric improves.",
+    "Child wait4 RSS includes runtime/startup/file mappings, not only heap allocations. First stdout is emitted after ranking completes in ranked cases; the streaming case explicitly disables ranking.",
+    "Warm scores still require current authorization, revision and image-byte validation. Server-owned asset identities and complete cross-write predicate certificates remain separate contracts.",
+    "The source registry contains only ephemeral scalar facts. It does not retain bodies, ACL decisions or predicate answers, and is never persisted or restored across owners.",
+    "Raw reports/logs remain ignored local artifacts; their checksums are recorded but they are not published downloadable evidence.",
+    "One prior macOS full run entered conservative wide-directory watcher fallback; the same case failed on the old binary and passed isolated on the current binary. The final full native suite passed.",
+    "Windows is cross-compiled only; Windows runtime and real providers are not qualified."
+  ],
+  "hosts": [
+    {
+      "host": "macos",
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "binaries": {
+        "baseline": {
+          "sha256": "5e6698363639563dcecd0d964c422328ebe93adb279bcd2408273480f17a797e",
+          "bytes": 8154088
+        },
+        "candidate": {
+          "sha256": "80bcb343864ded72a878c12bf7d811a439abe056f45e7f21f5cd5b2332bb2139",
+          "bytes": 8187992
+        }
+      },
+      "records": [
+        {
+          "case": "eight-parents",
+          "parents": 8,
+          "units_per_parent": 1,
+          "requested_image_bytes": 0,
+          "page_size": 16,
+          "ranked": true,
+          "rounds": 5,
+          "artificial_delay_ms": 20,
+          "output_sha256": "190f29b836d186da5af709739a2548693af97d1f8bb46c65fdd19e9572a1526b",
+          "medians": [
+            {
+              "variant": "baseline",
+              "phase": "cold",
+              "elapsed_ns": 454380959,
+              "first_stdout_ns": 452916125,
+              "user_cpu_ns": 2785000,
+              "system_cpu_ns": 6928000,
+              "peak_rss_bytes": 4554752,
+              "provider_requests": 8,
+              "index_requests": 9,
+              "logical_provider_json_bytes": 7868,
+              "evaluated_units": 8,
+              "cpu_ns": 9912000
+            },
+            {
+              "variant": "baseline",
+              "phase": "warm",
+              "elapsed_ns": 233920708,
+              "first_stdout_ns": 232944041,
+              "user_cpu_ns": 2121000,
+              "system_cpu_ns": 3956000,
+              "peak_rss_bytes": 4276224,
+              "provider_requests": 0,
+              "index_requests": 9,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 8,
+              "cpu_ns": 6024000
+            },
+            {
+              "variant": "candidate",
+              "phase": "cold",
+              "elapsed_ns": 109737167,
+              "first_stdout_ns": 107747542,
+              "user_cpu_ns": 2033000,
+              "system_cpu_ns": 7602000,
+              "peak_rss_bytes": 5423104,
+              "provider_requests": 1,
+              "index_requests": 2,
+              "logical_provider_json_bytes": 5609,
+              "evaluated_units": 8,
+              "cpu_ns": 9567000
+            },
+            {
+              "variant": "candidate",
+              "phase": "warm",
+              "elapsed_ns": 67872334,
+              "first_stdout_ns": 65982417,
+              "user_cpu_ns": 1805000,
+              "system_cpu_ns": 4019000,
+              "peak_rss_bytes": 5160960,
+              "provider_requests": 0,
+              "index_requests": 2,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 8,
+              "cpu_ns": 5817000
+            }
+          ],
+          "local_raw_report": "output/grep-pipeline/macos-eight-parents.json",
+          "raw_report_sha256": "94b6a7c9da1e9cb6876763ddf83f1ca0f725b2703e20b5a9377ecab33c930d7c"
+        },
+        {
+          "case": "large-images",
+          "parents": 8,
+          "units_per_parent": 1,
+          "requested_image_bytes": 262144,
+          "page_size": 16,
+          "ranked": true,
+          "rounds": 5,
+          "artificial_delay_ms": 20,
+          "output_sha256": "be00ba31fa8947670f54836eaf3ef08fae6adda5cd636a642798e0f4932ae15b",
+          "medians": [
+            {
+              "variant": "baseline",
+              "phase": "cold",
+              "elapsed_ns": 480897375,
+              "first_stdout_ns": 478272166,
+              "user_cpu_ns": 15151000,
+              "system_cpu_ns": 9263000,
+              "peak_rss_bytes": 8159232,
+              "provider_requests": 8,
+              "index_requests": 9,
+              "logical_provider_json_bytes": 2803280,
+              "evaluated_units": 8,
+              "cpu_ns": 25257000
+            },
+            {
+              "variant": "baseline",
+              "phase": "warm",
+              "elapsed_ns": 252268791,
+              "first_stdout_ns": 250766750,
+              "user_cpu_ns": 10520000,
+              "system_cpu_ns": 5075000,
+              "peak_rss_bytes": 6815744,
+              "provider_requests": 0,
+              "index_requests": 9,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 8,
+              "cpu_ns": 15413000
+            },
+            {
+              "variant": "candidate",
+              "phase": "cold",
+              "elapsed_ns": 137041917,
+              "first_stdout_ns": 135209209,
+              "user_cpu_ns": 13221000,
+              "system_cpu_ns": 9486000,
+              "peak_rss_bytes": 17694720,
+              "provider_requests": 1,
+              "index_requests": 2,
+              "logical_provider_json_bytes": 2801021,
+              "evaluated_units": 8,
+              "cpu_ns": 22598000
+            },
+            {
+              "variant": "candidate",
+              "phase": "warm",
+              "elapsed_ns": 83600625,
+              "first_stdout_ns": 82442709,
+              "user_cpu_ns": 10185000,
+              "system_cpu_ns": 5306000,
+              "peak_rss_bytes": 12926976,
+              "provider_requests": 0,
+              "index_requests": 2,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 8,
+              "cpu_ns": 15988000
+            }
+          ],
+          "local_raw_report": "output/grep-pipeline/macos-large-images.json",
+          "raw_report_sha256": "956ad14741a0051ac5a99fbc10284c47fbd512ced07c379b68eacfe7cd34b235"
+        },
+        {
+          "case": "many-pages",
+          "parents": 20,
+          "units_per_parent": 8,
+          "requested_image_bytes": 0,
+          "page_size": 16,
+          "ranked": true,
+          "rounds": 3,
+          "artificial_delay_ms": 20,
+          "output_sha256": "96dc6a8bcd7ed763f31e88f6ab5fdff24517a6bc08f26da5cd409d7e8e808587",
+          "medians": [
+            {
+              "variant": "baseline",
+              "phase": "cold",
+              "elapsed_ns": 1056653042,
+              "first_stdout_ns": 1054042083,
+              "user_cpu_ns": 6800000,
+              "system_cpu_ns": 14462000,
+              "peak_rss_bytes": 5865472,
+              "provider_requests": 20,
+              "index_requests": 22,
+              "logical_provider_json_bytes": 113368,
+              "evaluated_units": 160,
+              "cpu_ns": 21262000
+            },
+            {
+              "variant": "baseline",
+              "phase": "warm",
+              "elapsed_ns": 565618042,
+              "first_stdout_ns": 564269083,
+              "user_cpu_ns": 4806000,
+              "system_cpu_ns": 6868000,
+              "peak_rss_bytes": 5341184,
+              "provider_requests": 0,
+              "index_requests": 22,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 160,
+              "cpu_ns": 11674000
+            },
+            {
+              "variant": "candidate",
+              "phase": "cold",
+              "elapsed_ns": 236436042,
+              "first_stdout_ns": 234070917,
+              "user_cpu_ns": 5303000,
+              "system_cpu_ns": 14899000,
+              "peak_rss_bytes": 8519680,
+              "provider_requests": 20,
+              "index_requests": 5,
+              "logical_provider_json_bytes": 113368,
+              "evaluated_units": 160,
+              "cpu_ns": 20248000
+            },
+            {
+              "variant": "candidate",
+              "phase": "warm",
+              "elapsed_ns": 145060000,
+              "first_stdout_ns": 143150500,
+              "user_cpu_ns": 3774000,
+              "system_cpu_ns": 5817000,
+              "peak_rss_bytes": 6406144,
+              "provider_requests": 0,
+              "index_requests": 5,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 160,
+              "cpu_ns": 9554000
+            }
+          ],
+          "local_raw_report": "output/grep-pipeline/macos-many-pages.json",
+          "raw_report_sha256": "4335b1c0fc3103741aedcf329c05ed837d01dbe3ea956efa8da0448c04736159"
+        },
+        {
+          "case": "streaming",
+          "parents": 20,
+          "units_per_parent": 1,
+          "requested_image_bytes": 0,
+          "page_size": 16,
+          "ranked": false,
+          "rounds": 3,
+          "artificial_delay_ms": 20,
+          "output_sha256": "61b6e696de12f2f303cfe728884bb2d4b1d89b6362fb4667ea0dcb1c91b26a85",
+          "medians": [
+            {
+              "variant": "baseline",
+              "phase": "cold",
+              "elapsed_ns": 1067016542,
+              "first_stdout_ns": 100372292,
+              "user_cpu_ns": 4950000,
+              "system_cpu_ns": 12139000,
+              "peak_rss_bytes": 4767744,
+              "provider_requests": 20,
+              "index_requests": 22,
+              "logical_provider_json_bytes": 19852,
+              "evaluated_units": 20,
+              "cpu_ns": 17097000
+            },
+            {
+              "variant": "baseline",
+              "phase": "warm",
+              "elapsed_ns": 555832125,
+              "first_stdout_ns": 67138833,
+              "user_cpu_ns": 3521000,
+              "system_cpu_ns": 6590000,
+              "peak_rss_bytes": 4489216,
+              "provider_requests": 0,
+              "index_requests": 22,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 20,
+              "cpu_ns": 10090000
+            },
+            {
+              "variant": "candidate",
+              "phase": "cold",
+              "elapsed_ns": 251010541,
+              "first_stdout_ns": 107468375,
+              "user_cpu_ns": 2923000,
+              "system_cpu_ns": 9264000,
+              "peak_rss_bytes": 5799936,
+              "provider_requests": 3,
+              "index_requests": 5,
+              "logical_provider_json_bytes": 14367,
+              "evaluated_units": 20,
+              "cpu_ns": 12187000
+            },
+            {
+              "variant": "candidate",
+              "phase": "warm",
+              "elapsed_ns": 151559792,
+              "first_stdout_ns": 73805667,
+              "user_cpu_ns": 2621000,
+              "system_cpu_ns": 5007000,
+              "peak_rss_bytes": 5455872,
+              "provider_requests": 0,
+              "index_requests": 5,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 20,
+              "cpu_ns": 7628000
+            }
+          ],
+          "local_raw_report": "output/grep-pipeline/macos-streaming.json",
+          "raw_report_sha256": "cfa71f21604f9f4e3dfaee321fa717d908dc811d12a02f2055b8029cd73abeb3"
+        }
+      ]
+    },
+    {
+      "host": "linux",
+      "platform": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+      "machine": "aarch64",
+      "binaries": {
+        "baseline": {
+          "sha256": "9121bf2cac62f6a52dccaf57f46b979718a9d911084e1265bd58994471966c89",
+          "bytes": 31468432
+        },
+        "candidate": {
+          "sha256": "58a27e32b35393e9e40c2f6c747905b5bf946bc5af12658b3e51bbf62d713326",
+          "bytes": 31589176
+        }
+      },
+      "records": [
+        {
+          "case": "eight-parents",
+          "parents": 8,
+          "units_per_parent": 1,
+          "requested_image_bytes": 0,
+          "page_size": 16,
+          "ranked": true,
+          "rounds": 5,
+          "artificial_delay_ms": 20,
+          "output_sha256": "190f29b836d186da5af709739a2548693af97d1f8bb46c65fdd19e9572a1526b",
+          "medians": [
+            {
+              "variant": "baseline",
+              "phase": "cold",
+              "elapsed_ns": 418426500,
+              "first_stdout_ns": 415673209,
+              "user_cpu_ns": 1354000,
+              "system_cpu_ns": 9478000,
+              "peak_rss_bytes": 8908800,
+              "provider_requests": 8,
+              "index_requests": 9,
+              "logical_provider_json_bytes": 7868,
+              "evaluated_units": 8,
+              "cpu_ns": 11053000
+            },
+            {
+              "variant": "baseline",
+              "phase": "warm",
+              "elapsed_ns": 224108333,
+              "first_stdout_ns": 222959167,
+              "user_cpu_ns": 1490000,
+              "system_cpu_ns": 5960000,
+              "peak_rss_bytes": 8908800,
+              "provider_requests": 0,
+              "index_requests": 9,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 8,
+              "cpu_ns": 6042000
+            },
+            {
+              "variant": "candidate",
+              "phase": "cold",
+              "elapsed_ns": 77762875,
+              "first_stdout_ns": 76892125,
+              "user_cpu_ns": 2077000,
+              "system_cpu_ns": 27008000,
+              "peak_rss_bytes": 8933376,
+              "provider_requests": 1,
+              "index_requests": 2,
+              "logical_provider_json_bytes": 5609,
+              "evaluated_units": 8,
+              "cpu_ns": 29085000
+            },
+            {
+              "variant": "candidate",
+              "phase": "warm",
+              "elapsed_ns": 52762584,
+              "first_stdout_ns": 52376667,
+              "user_cpu_ns": 0,
+              "system_cpu_ns": 5407000,
+              "peak_rss_bytes": 8941568,
+              "provider_requests": 0,
+              "index_requests": 2,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 8,
+              "cpu_ns": 5407000
+            }
+          ],
+          "local_raw_report": "output/grep-pipeline/linux-eight-parents.json",
+          "raw_report_sha256": "01428fc8159fa4f898d4bc49408bf41772a2931770924f5831f386e9433ad340"
+        },
+        {
+          "case": "large-images",
+          "parents": 8,
+          "units_per_parent": 1,
+          "requested_image_bytes": 262144,
+          "page_size": 16,
+          "ranked": true,
+          "rounds": 5,
+          "artificial_delay_ms": 20,
+          "output_sha256": "be00ba31fa8947670f54836eaf3ef08fae6adda5cd636a642798e0f4932ae15b",
+          "medians": [
+            {
+              "variant": "baseline",
+              "phase": "cold",
+              "elapsed_ns": 467182667,
+              "first_stdout_ns": 466218501,
+              "user_cpu_ns": 34688000,
+              "system_cpu_ns": 9182000,
+              "peak_rss_bytes": 8908800,
+              "provider_requests": 8,
+              "index_requests": 9,
+              "logical_provider_json_bytes": 2803280,
+              "evaluated_units": 8,
+              "cpu_ns": 43870000
+            },
+            {
+              "variant": "baseline",
+              "phase": "warm",
+              "elapsed_ns": 253851042,
+              "first_stdout_ns": 252766292,
+              "user_cpu_ns": 27155000,
+              "system_cpu_ns": 5138000,
+              "peak_rss_bytes": 8941568,
+              "provider_requests": 0,
+              "index_requests": 9,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 8,
+              "cpu_ns": 30459000
+            },
+            {
+              "variant": "candidate",
+              "phase": "cold",
+              "elapsed_ns": 104011875,
+              "first_stdout_ns": 103105916,
+              "user_cpu_ns": 25153000,
+              "system_cpu_ns": 21129000,
+              "peak_rss_bytes": 19677184,
+              "provider_requests": 1,
+              "index_requests": 2,
+              "logical_provider_json_bytes": 2801021,
+              "evaluated_units": 8,
+              "cpu_ns": 46282000
+            },
+            {
+              "variant": "candidate",
+              "phase": "warm",
+              "elapsed_ns": 66070542,
+              "first_stdout_ns": 65280875,
+              "user_cpu_ns": 16754000,
+              "system_cpu_ns": 7896000,
+              "peak_rss_bytes": 13836288,
+              "provider_requests": 0,
+              "index_requests": 2,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 8,
+              "cpu_ns": 23649000
+            }
+          ],
+          "local_raw_report": "output/grep-pipeline/linux-large-images.json",
+          "raw_report_sha256": "6b4365aab7c4ac4325f3c7619d3d25816608f54a85886fbdad2984474940ad83"
+        },
+        {
+          "case": "many-pages",
+          "parents": 20,
+          "units_per_parent": 8,
+          "requested_image_bytes": 0,
+          "page_size": 16,
+          "ranked": true,
+          "rounds": 3,
+          "artificial_delay_ms": 20,
+          "output_sha256": "96dc6a8bcd7ed763f31e88f6ab5fdff24517a6bc08f26da5cd409d7e8e808587",
+          "medians": [
+            {
+              "variant": "baseline",
+              "phase": "cold",
+              "elapsed_ns": 1012673792,
+              "first_stdout_ns": 1010778001,
+              "user_cpu_ns": 9439000,
+              "system_cpu_ns": 19495000,
+              "peak_rss_bytes": 8908800,
+              "provider_requests": 20,
+              "index_requests": 22,
+              "logical_provider_json_bytes": 113368,
+              "evaluated_units": 160,
+              "cpu_ns": 29176000
+            },
+            {
+              "variant": "baseline",
+              "phase": "warm",
+              "elapsed_ns": 542258834,
+              "first_stdout_ns": 540267667,
+              "user_cpu_ns": 7443000,
+              "system_cpu_ns": 7443000,
+              "peak_rss_bytes": 8847360,
+              "provider_requests": 0,
+              "index_requests": 22,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 160,
+              "cpu_ns": 14176000
+            },
+            {
+              "variant": "candidate",
+              "phase": "cold",
+              "elapsed_ns": 206358208,
+              "first_stdout_ns": 201872376,
+              "user_cpu_ns": 4348000,
+              "system_cpu_ns": 22829000,
+              "peak_rss_bytes": 12398592,
+              "provider_requests": 20,
+              "index_requests": 5,
+              "logical_provider_json_bytes": 113368,
+              "evaluated_units": 160,
+              "cpu_ns": 25975000
+            },
+            {
+              "variant": "candidate",
+              "phase": "warm",
+              "elapsed_ns": 128522583,
+              "first_stdout_ns": 127353875,
+              "user_cpu_ns": 4942000,
+              "system_cpu_ns": 8781000,
+              "peak_rss_bytes": 8908800,
+              "provider_requests": 0,
+              "index_requests": 5,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 160,
+              "cpu_ns": 10912000
+            }
+          ],
+          "local_raw_report": "output/grep-pipeline/linux-many-pages.json",
+          "raw_report_sha256": "98409ec7f2e8be0a8760944982a3a11ced28a61de7888ee0998f5e8743b5ae3e"
+        },
+        {
+          "case": "streaming",
+          "parents": 20,
+          "units_per_parent": 1,
+          "requested_image_bytes": 0,
+          "page_size": 16,
+          "ranked": false,
+          "rounds": 3,
+          "artificial_delay_ms": 20,
+          "output_sha256": "61b6e696de12f2f303cfe728884bb2d4b1d89b6362fb4667ea0dcb1c91b26a85",
+          "medians": [
+            {
+              "variant": "baseline",
+              "phase": "cold",
+              "elapsed_ns": 1011438834,
+              "first_stdout_ns": 73586875,
+              "user_cpu_ns": 5256000,
+              "system_cpu_ns": 16724000,
+              "peak_rss_bytes": 8916992,
+              "provider_requests": 20,
+              "index_requests": 22,
+              "logical_provider_json_bytes": 19852,
+              "evaluated_units": 20,
+              "cpu_ns": 24441000
+            },
+            {
+              "variant": "baseline",
+              "phase": "warm",
+              "elapsed_ns": 544313625,
+              "first_stdout_ns": 53374417,
+              "user_cpu_ns": 4005000,
+              "system_cpu_ns": 7900000,
+              "peak_rss_bytes": 8941568,
+              "provider_requests": 0,
+              "index_requests": 22,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 20,
+              "cpu_ns": 12016000
+            },
+            {
+              "variant": "candidate",
+              "phase": "cold",
+              "elapsed_ns": 225262083,
+              "first_stdout_ns": 76392500,
+              "user_cpu_ns": 4177000,
+              "system_cpu_ns": 24874000,
+              "peak_rss_bytes": 8908800,
+              "provider_requests": 3,
+              "index_requests": 5,
+              "logical_provider_json_bytes": 14367,
+              "evaluated_units": 20,
+              "cpu_ns": 27361000
+            },
+            {
+              "variant": "candidate",
+              "phase": "warm",
+              "elapsed_ns": 127506875,
+              "first_stdout_ns": 49255000,
+              "user_cpu_ns": 3479000,
+              "system_cpu_ns": 4639000,
+              "peak_rss_bytes": 8908800,
+              "provider_requests": 0,
+              "index_requests": 5,
+              "logical_provider_json_bytes": 0,
+              "evaluated_units": 20,
+              "cpu_ns": 8193000
+            }
+          ],
+          "local_raw_report": "output/grep-pipeline/linux-streaming.json",
+          "raw_report_sha256": "756de2c204e9a21e59288a633825be6bccff183dddbffd38d62809397a570b74"
+        }
+      ]
+    }
+  ],
+  "checks": {
+    "macos_cli": {
+      "total": 279,
+      "passed": 277,
+      "skipped": 2
+    },
+    "linux_cli": {
+      "total": 279,
+      "passed": 276,
+      "skipped": 3
+    },
+    "media_regressions": 19,
+    "native_indexed_server": {
+      "passed": 25,
+      "skipped": 7,
+      "note": "Existing frozen native server binary; only inference is fixture-controlled. Includes single/eight-parent current-read and revision/permission races."
+    },
+    "native_logical_db": {
+      "passed": 4,
+      "skipped": 0,
+      "leaked": 0
+    },
+    "registry_release_safe": 5,
+    "registry_linux": 5,
+    "native_package_units": "pass",
+    "linux_package_units": {
+      "total": 110,
+      "passed": 108,
+      "skipped": 2
+    },
+    "release_packaging": 4,
+    "boundary_checker_regressions": 35,
+    "apache_source_boundary": 2429,
+    "compatibility_manifest": "pass",
+    "toolchain_policy": "pass",
+    "ruff": "pass",
+    "windows_cross_compile": "pass"
+  },
+  "reproduction": [
+    "Build/freeze the baseline at a2840e6566 and this source commit with Zig 0.17.0 ReleaseFast before changing target.",
+    "python3 zig/pkg/antfly-grep/bench/visual_batches.py CURRENT --baseline BASELINE --fixture-library FIXTURE --parents 8 --units 1 --rounds 5 --delay-ms 20 --output output/parent-profile.json",
+    "Repeat with --image-bytes 262144, with --parents 20 --units 8 --rounds 3, and with --parents 20 --units 1 --rounds 3 --stream.",
+    "Run the same driver in the existing ARM64 VM with --cpus=2 --memory=1g.",
+    "cd zig && zig build logical-field-db-test source-proof-test -Dtest-filter=\"logical source certificates\" -Doptimize=ReleaseFast -j2"
+  ]
+}
