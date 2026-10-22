@@ -35,7 +35,7 @@ fine-tune and trainer timings in zig/pkg/inference/models/laya/LAYA.md.
 
 Time a trainer build with:
 
-  antfly-inference finetune train laya <output-dir>/td/prof.json
+  antfly inference finetune train laya <output-dir>/td/prof.json
 USAGE
 }
 

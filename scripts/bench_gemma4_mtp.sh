@@ -21,7 +21,7 @@ usage() {
 usage: scripts/bench_gemma4_mtp.sh <target-model> <assistant-q8> [assistant-q4]
 
 Environment:
-  BIN=zig/pkg/inference/zig-out/bin/antfly-inference
+  BIN=zig/pkg/inference/zig-out/bin/antfly-inference-dev
   OUT_DIR=/tmp/gemma4-mtp-bench-<timestamp>
   MODE=production|no_fallback|measurement|profile|profile_sync
   SPEC_KS="1 2 4"
@@ -72,7 +72,13 @@ fi
 TARGET_MODEL="$1"
 ASSISTANT_Q8="$2"
 ASSISTANT_Q4="${3:-}"
-BIN="${BIN:-zig/pkg/inference/zig-out/bin/antfly-inference}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/zig/pkg/inference/scripts/inference_cli.sh"
+BIN="${BIN:-$(resolve_antfly_inference_bin)}"
+INFERENCE_COMMAND=("$BIN")
+if [[ "$(basename "$BIN")" == "antfly" ]]; then
+  INFERENCE_COMMAND+=(inference)
+fi
 OUT_DIR="${OUT_DIR:-/tmp/gemma4-mtp-bench-$(date +%Y%m%d-%H%M%S)}"
 MODE="${MODE:-measurement}"
 SPEC_KS="${SPEC_KS:-1 2 4}"
@@ -301,21 +307,21 @@ run_case() {
   fi
 
   echo "running label=$label k=$spec_k case=$case_name mode=$prompt_mode"
-  if env "${env_args[@]}" timeout "$RUN_TIMEOUT" "$BIN" generate "$TARGET_MODEL" "$prompt" \
+  if env "${env_args[@]}" timeout "$RUN_TIMEOUT" "${INFERENCE_COMMAND[@]}" generate "$TARGET_MODEL" "$prompt" \
     --backend cuda \
-    "${draft_args[@]}" \
-    "${cache_args[@]}" \
+    ${draft_args[@]+"${draft_args[@]}"} \
+    ${cache_args[@]+"${cache_args[@]}"} \
     --max-tokens "$MAX_TOKENS" \
     --temperature 0 \
     --combined-budget-mb "$COMBINED_BUDGET_MB" \
     --backend-budget-mb "$BACKEND_BUDGET_MB" \
     --kv-budget-mb "$KV_BUDGET_MB" \
     --scratch-budget-mb "$SCRATCH_BUDGET_MB" \
-    "${prefill_args[@]}" \
+    ${prefill_args[@]+"${prefill_args[@]}"} \
     --print-timing \
     --print-token-count \
     --json-timing "$json_path" \
-    "${mode_args[@]}" >"$log_path" 2>&1; then
+    ${mode_args[@]+"${mode_args[@]}"} >"$log_path" 2>&1; then
     echo "ok" >"$status_path"
   else
     local status=$?

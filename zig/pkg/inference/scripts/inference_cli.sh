@@ -26,6 +26,10 @@ resolve_antfly_inference_bin() {
     printf '%s\n' "$ANTFLY_INFERENCE_PKG_DIR/zig-out/bin/antfly-inference-dev"
     return
   fi
+  if [[ -x "$ANTFLY_INFERENCE_ZIG_ROOT/zig-out/bin/antfly" ]]; then
+    printf '%s\n' "$ANTFLY_INFERENCE_ZIG_ROOT/zig-out/bin/antfly"
+    return
+  fi
   if [[ -x "$ANTFLY_INFERENCE_PKG_DIR/zig-out/bin/antfly" ]]; then
     printf '%s\n' "$ANTFLY_INFERENCE_PKG_DIR/zig-out/bin/antfly"
     return
