@@ -23053,3 +23053,61 @@ checks pass. A declaration audit finds entries for all 376 literal DB dispatches
 and exports for all 481 storage method-table fields. This audit supplements the
 runtime cases; full linked-owner, physical shutdown and cross-engine qualification
 remain open.
+
+### Cooperative candidate retirement turns
+
+Scheduled candidate draining now checkpoints between individual retirements.
+Previously `tryClose` detached and marked the entire registry, then ran every
+ready callback under one checkpoint. A large ready registry could therefore
+skip scheduler fairness and original-lifetime checks for its whole teardown.
+The controlled path now distinguishes completed, progressed and waiting states.
+Progress returns directly to the original checkpoint; only active guards or a
+competing callback use the original execution-wait boundary.
+
+Each turn detaches one node in constant time and retains that registry reference
+until retirement completes. The rest remain linked, allowing concurrent caller
+cancellation to detach its own node without a whole-list scan. The finisher and
+registry lock are released before the next checkpoint. Original rejection or
+deadline expiry after a retired prefix leaves the tail fenced and owned for the
+original mandatory cleanup path. Completed callbacks do not repeat. A concurrent
+linked cancellation remains counted as active until its callback joins, so
+physical teardown cannot pass it. Compatibility close still eagerly retires
+ready nodes for quiesced callers.
+
+Registration metadata now uses the owner's independent allocator. A detached
+registry reference can survive the caller's candidate destruction; allocating
+that node from the candidate allocator let a caller arena disappear before a
+resumable finisher read/unreferenced the node. Payload retirement still completes
+before caller destruction returns. Only stable metadata survives it, and the
+last node reference releases the owner. Independent metadata accounting and
+funding remain part of the broader resource-parent work.
+
+Native ABI 72 and storage-owner ABI 130 fence the changed controlled-drain
+semantics. Durable formats, reader floors and default activation are unchanged.
+This bounds registry work and callback count per checkpoint. Individual callback
+cleanup, including variable-size owned read metadata and backend lease release,
+still needs its resource/CPU and mandatory-completion audit before claiming a
+bound for all physical shutdown work. General admission fencing, driver cleanup
+ownership, other worker/cache/IO joins, routes, executable recovery funding and
+the remaining scheduler design remain open. Strong required providers remain
+disabled. Full Linux qualification remains waived; Linux uses the pinned
+Nix/glibc Zig toolchain.
+
+Pinned Debug qualification passes 14 focused lifetime/drain cases, 87 required DB
+cases, 15 backlog cases, 51 error/identity companions and five native ABI cases:
+172 executions with no failures, skips or leaks. The 65-node fixture checkpoints
+each retirement, rejects an original-control prefix and expires a finite deadline
+without invoking artificial wait pairs. The real scheduler fixture queues a peer
+after the first of eight candidates retires; it runs on the sole ordinary slot
+before the next retirement while protected health capacity remains available.
+A rejection after four retirements preserves four real replay-credit reservations
+until quiesced cleanup. A detached-node fixture destroys the candidate arena
+before the registry retries and releases its last metadata reference.
+
+All 5,502 native/schema inputs match the final prepared-retirement-turns-v4
+receipt. Source snapshots and hashes are retained in
+prepared-retirement-turns-verified.json in the cumulative receipts. Earlier runs
+are diagnostic/pre-final evidence, including the corrected test error-handler
+syntax. The 1,034-source embedded boundary, generated errors, control catalog,
+formatting and whitespace checks pass. Full linked-owner, callback cleanup,
+physical shutdown, object/crash and cross-engine qualification remain open.

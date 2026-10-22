@@ -38,7 +38,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Coverage outcome transitions join final-writer metadata programs.
 // Owned replay binding recipes and whole-operation refresh expand native state.
 // Owned assemblies retain checked memory state; native retries observe commits.
-pub const abi_version: u32 = 129;
+pub const abi_version: u32 = 130;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

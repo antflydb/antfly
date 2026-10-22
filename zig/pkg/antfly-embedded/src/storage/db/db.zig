@@ -149220,3 +149220,157 @@ test "db prepared transaction effects required assembly prepared lifetime checke
         try std.testing.expect(plan.backlog_admission.?.reservation == null);
     }
 }
+
+test "db prepared transaction effects required assembly prepared lifetime retirement yields between candidates and preserves a rejected quota tail" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    const Plan = @import("artifact_authored_acceptance.zig").OwnedPhysicalPlan;
+    const runnable = @import("../../common/runnable_scheduler.zig");
+    const now = @import("antfly_platform").time.monotonicNs;
+    for ([_]bool{ false, true }) |reject_prefix| {
+        var directory = try TestDirectory.init("prepared-retire-fair");
+        defer directory.cleanup();
+        var manager = resource_manager_mod.ResourceManager.init(.{});
+        defer manager.deinit(a);
+        var options = F.options;
+        options.resource_manager = &manager;
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try F.seed(&db, false, false);
+        const baseline = manager.sliceStats(.derived_backlog).used_bytes;
+        var plans: [8]Plan = undefined;
+        var initialized: usize = 0;
+        defer for (plans[0..initialized]) |*plan| plan.deinit();
+        for (&plans) |*plan| {
+            plan.* = try db.prepareTransactionAssembly(a, F.id, 19, null);
+            initialized += 1;
+            try std.testing.expect(plan.backlog_admission.?.reservation != null);
+        }
+        var scheduler = try runnable.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .read_isolation = false, .max_operations = 16, .max_wait_ms = 5000, .checkpoint_budget = 1 });
+        defer scheduler.close();
+        try scheduler.config.validateManagedCleanupCapacity();
+        var peer: runnable.Execution = .{};
+        defer peer.finish();
+        try peer.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = now, .allow_wait = true }, .query);
+        try peer.park(.resource_blocked);
+        var closing: runnable.Execution = .{};
+        defer closing.finish();
+        try closing.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .query);
+        var health: runnable.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = now, .allow_wait = false }, .control);
+        const Worker = struct {
+            execution: *runnable.Execution,
+            go: std.atomic.Value(bool) = .init(false),
+            abort: std.atomic.Value(bool) = .init(false),
+            done: std.atomic.Value(bool) = .init(false),
+            retired: std.atomic.Value(usize) = .init(0),
+            observed: usize = 0,
+            failure: ?anyerror = null,
+            fn run(self: *@This()) void {
+                defer self.done.store(true, .release);
+                while (!self.go.load(.acquire)) {
+                    if (self.abort.load(.acquire)) return;
+                    @import("antfly_platform").time.yieldNow();
+                }
+                self.execution.enter(.query) catch |cause| {
+                    self.failure = cause;
+                    return;
+                };
+                self.observed = self.retired.load(.acquire);
+                // Keep the capsule stable until the main thread joins us.
+                self.execution.park(.resource_blocked) catch |cause| {
+                    self.failure = cause;
+                };
+            }
+        };
+        const Hook = struct {
+            execution: *runnable.Execution,
+            scheduler: *runnable.Scheduler,
+            health: *runnable.Execution,
+            worker: *Worker,
+            plans: []Plan,
+            reject_prefix: bool,
+            checked: usize = 0,
+            checkpoints: usize = 0,
+            waits: usize = 0,
+            fn lifetime(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.execution.checkLifetime();
+            }
+            fn deadline(raw: *anyopaque) !?u64 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.execution.entry.?.options.deadline_ns;
+            }
+            fn checkpoint(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try lifetime(raw);
+                var retired: usize = 0;
+                for (self.plans) |*plan| retired += @intFromBool(plan.backlog_admission.?.reservation == null);
+                if (retired - self.checked > 1) return error.TestUnexpectedResult;
+                self.checked = retired;
+                self.checkpoints += 1;
+                self.worker.retired.store(retired, .release);
+                if (self.scheduler.state(&self.health.entry.?) != .running) return error.TestUnexpectedResult;
+                if (retired == 1) {
+                    self.worker.go.store(true, .release);
+                    // The peer only needs the scheduler mutex to enqueue.
+                    // Wait for that bounded handoff, then yield via the actual
+                    // checkpoint; there is no storage/resource wait here.
+                    while (self.scheduler.state(&self.worker.execution.entry.?) != .queued) {
+                        if (self.worker.done.load(.acquire)) return error.TestUnexpectedResult;
+                        try lifetime(raw);
+                        @import("antfly_platform").time.yieldNow();
+                    }
+                }
+                if (self.reject_prefix and retired == 4) return error.NotFound;
+                try self.execution.checkpoint();
+            }
+            fn unexpectedWait(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.waits += 1;
+                return error.TestUnexpectedResult;
+            }
+        };
+        var worker: Worker = .{ .execution = &peer };
+        var hook: Hook = .{ .execution = &closing, .scheduler = &scheduler, .health = &health, .worker = &worker, .plans = &plans, .reject_prefix = reject_prefix };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        var joined = false;
+        defer if (!joined) {
+            worker.abort.store(true, .release);
+            closing.finish();
+            thread.join();
+        };
+        var payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &hook, .vtable = &.{ .checkpoint = Hook.checkpoint, .check_lifetime = Hook.lifetime, .deadline_ns = Hook.deadline }, .execution_wait = .{ .ptr = &hook, .begin = Hook.unexpectedWait, .end = Hook.unexpectedWait } };
+        const result = db.drainPreparedAssembliesWithAdmission(.init(&payload));
+        if (reject_prefix) try std.testing.expectError(error.NotFound, result) else try result;
+        // An eager-drain regression must fail the observed-prefix assertion,
+        // rather than strand a peer whose start signal was never reached.
+        worker.abort.store(true, .release);
+        thread.join();
+        joined = true;
+        peer.finish();
+        try std.testing.expect(worker.failure == null);
+        try std.testing.expectEqual(@as(usize, 1), worker.observed);
+        try std.testing.expectEqual(@as(usize, 0), hook.waits);
+        try std.testing.expectEqual(@as(usize, if (reject_prefix) 5 else 8), hook.checkpoints);
+        var remaining: u64 = 0;
+        var retained: usize = 0;
+        for (&plans) |*plan| {
+            try std.testing.expectError(error.Canceled, plan.enterLifetime());
+            if (plan.backlog_admission.?.reservation != null) {
+                remaining += plan.backlog_admission.?.retained_bytes;
+                retained += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, if (reject_prefix) 4 else 0), retained);
+        try std.testing.expectEqual(baseline + remaining, manager.sliceStats(.derived_backlog).used_bytes);
+        try std.testing.expectEqual(!reject_prefix, db.local_execution.retained_preparation_owner.?.closed.load(.acquire));
+        try std.testing.expectEqual(runnable.State.running, scheduler.state(&closing.entry.?));
+        closing.finish();
+        health.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        db.close();
+        for (&plans) |*plan| try std.testing.expect(plan.backlog_admission.?.reservation == null);
+    }
+}

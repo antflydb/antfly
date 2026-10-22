@@ -57,53 +57,83 @@ pub const Owner = struct {
         _ = self.active.fetchAdd(1, .acq_rel);
         return .{ .owner = self };
     }
-    pub fn register(self: *Owner, alloc: std.mem.Allocator, ptr: *anyopaque, retire: *const fn (*anyopaque) void) !*Node {
-        const node = try alloc.create(Node);
-        errdefer alloc.destroy(node);
+    pub fn register(self: *Owner, ptr: *anyopaque, retire: *const fn (*anyopaque) void) !*Node {
+        // A detached registry reference can survive caller destruction and
+        // its output allocator. Only the payload borrows that allocator.
+        const node = try self.alloc.create(Node);
+        errdefer self.alloc.destroy(node);
         self.lock();
         defer self.mutex.unlock();
         if (self.closing.load(.acquire)) return error.Canceled;
-        node.* = .{ .alloc = alloc, .owner = self, .ptr = ptr, .retire_fn = retire, .next = self.first };
+        node.* = .{ .alloc = self.alloc, .owner = self, .ptr = ptr, .retire_fn = retire, .next = self.first };
         if (self.first) |first| first.previous = node;
         self.first = node;
         self.ref();
         return node;
     }
-    /// Fence new work and perform ready retirement under the caller's running
-    /// ownership. Never wait for active guards or another retirement callback.
-    /// Partial progress remains owned by `pending` across every retry/error.
-    pub fn tryClose(self: *Owner) bool {
+    const CloseProgress = enum { complete, progress, waiting };
+
+    /// Detach at most one registration in constant time. Keeping the rest of
+    /// `first` linked lets concurrent caller destruction remove its own node
+    /// without a registry-wide walk. `pending` retains the detached reference
+    /// if a competing retirement is still in progress.
+    fn closeOne(self: *Owner) CloseProgress {
         self.lock();
         self.closing.store(true, .release);
         if (self.closed.load(.acquire)) {
             self.mutex.unlock();
-            return true;
+            return .complete;
         }
         if (self.finishing.load(.acquire) or self.active.load(.acquire) != 0) {
             self.mutex.unlock();
-            return false;
+            return .waiting;
         }
         self.finishing.store(true, .release);
         if (self.pending == null) {
-            self.pending = self.first;
-            self.first = null;
-            var node = self.pending;
-            while (node) |entry| : (node = entry.next) entry.linked = false;
+            if (self.first) |entry| {
+                self.first = entry.next;
+                if (self.first) |first| first.previous = null;
+                entry.previous = null;
+                entry.next = null;
+                entry.linked = false;
+                self.pending = entry;
+            } else {
+                self.closed.store(true, .release);
+                self.finishing.store(false, .release);
+                self.mutex.unlock();
+                return .complete;
+            }
         }
         self.mutex.unlock();
         defer self.finishing.store(false, .release);
-        while (self.pending) |entry| {
-            const winner = entry.beginRetirement();
-            if (!winner and entry.state.load(.acquire) != .retired) return false;
-            // No new guards can enter after the fence; detached nodes still
-            // have their list reference until their callback completes.
-            std.debug.assert(entry.active.load(.acquire) == 0);
-            entry.finishRetirement(winner);
-            self.pending = entry.next;
-            entry.unref();
-        }
+        const entry = self.pending.?;
+        const winner = entry.beginRetirement();
+        if (!winner and entry.state.load(.acquire) != .retired) return .waiting;
+        // Closing fenced new guards before detaching; the registry reference
+        // keeps this node alive through its callback and concurrent release.
+        std.debug.assert(entry.active.load(.acquire) == 0);
+        entry.finishRetirement(winner);
+        self.pending = null;
+        entry.unref();
+        self.lock();
+        defer self.mutex.unlock();
+        // A linked caller cancellation may have detached another node while
+        // this callback ran. Its active reference is a real join obligation.
+        if (self.active.load(.acquire) != 0) return .waiting;
+        if (self.first != null) return .progress;
         self.closed.store(true, .release);
-        return true;
+        return .complete;
+    }
+
+    /// Quiesced compatibility caller: complete every ready retirement, but do
+    /// not wait for active guards or a competing callback. Scheduled callers
+    /// checkpoint between closeOne turns instead of using this eager loop.
+    pub fn tryClose(self: *Owner) bool {
+        while (true) switch (self.closeOne()) {
+            .complete => return true,
+            .progress => continue,
+            .waiting => return false,
+        };
     }
 
     fn readyToClose(self: *Owner) bool {
@@ -137,7 +167,11 @@ pub const Owner = struct {
         _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
         while (true) {
             try control.checkpoint();
-            if (self.tryClose()) return;
+            switch (self.closeOne()) {
+                .complete => return,
+                .progress => continue,
+                .waiting => {},
+            }
             try boundary.beginWait();
             var failure: ?anyerror = null;
             while (!self.readyToClose()) {
@@ -307,13 +341,13 @@ const Probe = struct {
 test "prepared lifetime closes idle registrations before caller destruction without holding its lock" {
     const owner = try Owner.create(std.testing.allocator);
     var probe: Probe = .{ .owner = owner };
-    const node = try owner.register(std.testing.allocator, &probe, Probe.retire);
+    const node = try owner.register(&probe, Probe.retire);
     owner.close();
     owner.close();
     try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
     try std.testing.expect(probe.unlocked);
     try std.testing.expectError(error.Canceled, node.enter());
-    try std.testing.expectError(error.Canceled, owner.register(std.testing.allocator, &probe, Probe.retire));
+    try std.testing.expectError(error.Canceled, owner.register(&probe, Probe.retire));
     owner.release(); // The node alone now owns the closed registry metadata.
     node.release();
 }
@@ -368,7 +402,7 @@ test "prepared lifetime racing close and caller retirement invokes cleanup exact
         const owner = try Owner.create(std.testing.allocator);
         defer owner.release();
         var probe: Probe = .{ .owner = owner };
-        const node = try owner.register(std.testing.allocator, &probe, Probe.retire);
+        const node = try owner.register(&probe, Probe.retire);
         const Close = struct {
             fn run(scope: *Owner) void {
                 scope.close();
@@ -388,7 +422,7 @@ test "prepared lifetime registration allocation failures and original rejections
             defer owner.release();
             defer owner.close();
             var probe: Probe = .{ .owner = owner };
-            const node = try owner.register(a, &probe, Probe.retire);
+            const node = try owner.register(&probe, Probe.retire);
             defer node.release();
             var access: Access = .{ .guard = try node.enter() };
             defer access.deinit();
@@ -449,7 +483,7 @@ test "prepared lifetime execution drain preserves begin end failures and retryab
         var access: Access = .{ .guard = try owner.enter() };
         defer access.deinit();
         var f: F = .{ .case = case, .access = &access };
-        const node = try owner.register(std.testing.allocator, &f, F.retire);
+        const node = try owner.register(&f, F.retire);
         defer node.release();
         var payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.begin, .end = F.end } };
         const result = owner.closeWithAdmission(.init(&payload));
@@ -477,7 +511,7 @@ test "prepared lifetime execution drain preserves begin end failures and retryab
     }
 }
 
-test "prepared lifetime execution drain retains a detached tail after competing retirement and wait failure" {
+test "prepared lifetime execution drain retains a competing linked cancellation after wait failure" {
     const F = struct {
         slow: ?*Node = null,
         fast_started: std.atomic.Value(bool) = .init(false),
@@ -514,8 +548,8 @@ test "prepared lifetime execution drain retains a detached tail after competing 
     defer owner.release();
     defer owner.close();
     var f: F = .{};
-    f.slow = try owner.register(std.testing.allocator, &f, F.slowRetire);
-    const fast = try owner.register(std.testing.allocator, &f, F.fast);
+    f.slow = try owner.register(&f, F.slowRetire);
+    const fast = try owner.register(&f, F.fast);
     defer fast.release();
     const thread = try std.Thread.spawn(.{}, F.run, .{&f});
     var joined = false;
@@ -525,7 +559,8 @@ test "prepared lifetime execution drain retains a detached tail after competing 
     }
     try std.testing.expect(!owner.tryClose());
     try std.testing.expectEqual(@as(usize, 1), f.fast_calls);
-    try std.testing.expect(owner.pending == f.slow);
+    try std.testing.expect(owner.pending == null and owner.first == null);
+    try std.testing.expectEqual(@as(usize, 1), owner.active.load(.acquire));
     var payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.fail, .end = F.end } };
     try std.testing.expectError(error.NotFound, owner.closeWithAdmission(.init(&payload)));
     try std.testing.expect(!owner.closed.load(.acquire));
@@ -543,7 +578,7 @@ test "prepared lifetime execution drain requires original finite wait metadata" 
     defer owner.release();
     defer owner.close();
     var probe: Probe = .{ .owner = owner };
-    const node = try owner.register(std.testing.allocator, &probe, Probe.retire);
+    const node = try owner.register(&probe, Probe.retire);
     defer node.release();
     const F = struct {
         fn check(_: *anyopaque) !void {}
@@ -556,4 +591,128 @@ test "prepared lifetime execution drain requires original finite wait metadata" 
     try std.testing.expect(owner.closing.load(.acquire) and !owner.closed.load(.acquire));
     owner.close();
     try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+}
+
+test "prepared lifetime execution drain checkpoints every ready retirement and resumes a rejected prefix" {
+    const Case = enum { success, original_rejection, deadline };
+    const F = struct {
+        case: Case,
+        owner: *Owner,
+        calls: usize = 0,
+        checkpoints: usize = 0,
+        last_checked: usize = 0,
+        waits: usize = 0,
+        now: u64 = 0,
+        bad_callback: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.case == .deadline and self.now >= 4) return error.DeadlineExceeded;
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoints += 1;
+            if (self.calls - self.last_checked > 1 or self.owner.finishing.load(.acquire)) return error.TestUnexpectedResult;
+            if (!self.owner.mutex.tryLock()) return error.TestUnexpectedResult;
+            self.owner.mutex.unlock();
+            self.last_checked = self.calls;
+            try check(raw);
+            if (self.case == .original_rejection and self.calls == 37) return error.NotFound;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return 4;
+        }
+        fn unexpectedWait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waits += 1;
+            return error.TestUnexpectedResult;
+        }
+        fn retire(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.case == .success and self.last_checked != self.calls) self.bad_callback = true;
+            self.calls += 1;
+            if (self.case == .deadline) self.now += 1;
+            if (!self.owner.mutex.tryLock()) self.bad_callback = true else self.owner.mutex.unlock();
+        }
+    };
+    for (std.enums.values(Case)) |case| {
+        const owner = try Owner.create(std.testing.allocator);
+        defer owner.release();
+        var f: F = .{ .case = case, .owner = owner };
+        var nodes: [65]*Node = undefined;
+        var initialized: usize = 0;
+        defer {
+            owner.close();
+            for (nodes[0..initialized]) |node| node.release();
+        }
+        for (&nodes) |*node| {
+            node.* = try owner.register(&f, F.retire);
+            initialized += 1;
+        }
+        var payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.checkpoint, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.unexpectedWait, .end = F.unexpectedWait } };
+        const result = owner.closeWithAdmission(.init(&payload));
+        const retired: usize = switch (case) {
+            .success => 65,
+            .original_rejection => 37,
+            .deadline => 4,
+        };
+        if (case == .success) try result else {
+            try std.testing.expectError(if (case == .deadline) error.DeadlineExceeded else error.NotFound, result);
+            try std.testing.expect(owner.closing.load(.acquire) and !owner.closed.load(.acquire));
+            // Only the retired prefix was detached. The remainder still owns
+            // its linked registry references and rejects new candidate access.
+            try std.testing.expect(owner.first != null and owner.first.?.linked and owner.pending == null);
+            for (nodes[0 .. nodes.len - retired]) |node| try std.testing.expectError(error.Canceled, node.enter());
+        }
+        try std.testing.expectEqual(retired, f.calls);
+        try std.testing.expectEqual(retired + @intFromBool(case != .success), f.checkpoints);
+        try std.testing.expectEqual(@as(usize, 0), f.waits);
+        try std.testing.expect(!f.bad_callback);
+        // Quiesced mandatory cleanup resumes the remaining list exactly once.
+        owner.close();
+        try std.testing.expectEqual(@as(usize, 65), f.calls);
+        try std.testing.expect(owner.first == null and owner.pending == null);
+    }
+}
+
+test "prepared lifetime detached metadata survives candidate allocator destruction before registry retry" {
+    const owner = try Owner.create(std.testing.allocator);
+    defer owner.release();
+    defer owner.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_live = true;
+    defer if (arena_live) arena.deinit();
+    const Payload = struct {
+        calls: *usize,
+        fn retire(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls.* += 1;
+        }
+    };
+    var calls: usize = 0;
+    const payload = try arena.allocator().create(Payload);
+    payload.* = .{ .calls = &calls };
+    const node = try owner.register(payload, Payload.retire);
+    var caller_live = true;
+    defer if (caller_live) node.release();
+    // Stage the valid race where the caller wins retirement of a detached
+    // node before the finisher invokes it. No guard or callback is active.
+    const winner = node.beginRetirement();
+    var retirement_finished = false;
+    defer if (!retirement_finished) node.finishRetirement(winner);
+    try std.testing.expect(winner);
+    try std.testing.expectEqual(Owner.CloseProgress.waiting, owner.closeOne());
+    try std.testing.expect(owner.pending == node and !node.linked);
+    node.finishRetirement(winner);
+    retirement_finished = true;
+    node.release();
+    caller_live = false;
+    try std.testing.expectEqual(@as(usize, 1), node.refs.load(.acquire));
+    try std.testing.expect(node.alloc.ptr == owner.alloc.ptr and node.alloc.vtable == owner.alloc.vtable);
+    // The caller can now discard all candidate storage. The registry must
+    // read/unref only its independently allocated metadata, never the payload.
+    arena.deinit();
+    arena_live = false;
+    owner.close();
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expect(owner.closed.load(.acquire) and owner.pending == null);
 }

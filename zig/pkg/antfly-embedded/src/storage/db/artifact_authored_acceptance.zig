@@ -250,7 +250,7 @@ pub const OwnedPhysicalPlan = struct {
     pub fn attachLifetime(self: *OwnedPhysicalPlan, owner: *lifetime.Owner) !void {
         const live = self.live orelse return error.PreparedEffectsRequired;
         if (live.node != null) return error.InvalidArgument;
-        live.node = try owner.register(live.alloc, live, Live.retire);
+        live.node = try owner.register(live, Live.retire);
     }
     pub fn enterLifetime(self: *const OwnedPhysicalPlan) !lifetime.Access {
         return .{ .guard = if (self.live) |live| if (live.node) |node| try node.enter() else null else null };
