@@ -2567,7 +2567,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else if (opts.assembly != null)
                 replay_bindings.symbolic
             else
-                S.ownerField(self, "core").*.reserveDerivedAppendSequence();
+                S.ownerField(self, "core").*.nextDerivedAppendSequence();
             if (group_plan) |plan| {
                 const overlay = &group_overlay;
                 const table = try group_mutations.tableIdentity(overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
@@ -3316,6 +3316,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (publication_control) |control| try control.checkpoint();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             if (prepared_physical) |*plan| try plan.validateDependencies(S.ownerField(self, "core").*, publication_control);
+            // All pure assembly, backlog admission, envelope preparation and
+            // original pre-decision checks precede this process-local claim.
+            // Keep the sequence already encoded in every metadata/replay byte;
+            // a competing reservation must reject, never relabel that batch.
+            if (!elide_semantic_noop_replay) try S.ownerField(self, "core").*.claimDerivedAppendSequence(sequence);
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
                 const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithAcceptedEffects(
                     resolution.txn_id,

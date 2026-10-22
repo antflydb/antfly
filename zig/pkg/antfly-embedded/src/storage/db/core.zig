@@ -746,6 +746,10 @@ pub const DBCore = struct {
         return self.store.reserveNextReplaySequence(1);
     }
 
+    pub fn claimDerivedAppendSequence(self: *DBCore, expected: u64) !void {
+        try self.store.claimReplaySequence(expected);
+    }
+
     pub fn replaySource(self: *DBCore) replay_source_mod.Source {
         return replay_source_mod.Source.fromPrimaryStore(self.store, null, self.index_manager.resource_manager);
     }

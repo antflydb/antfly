@@ -3347,6 +3347,18 @@ pub const DocStore = struct {
         }
     }
 
+    /// Claim the exact sequence used by a batch assembled under its owning
+    /// apply fence. A competing reservation invalidates the candidate rather
+    /// than silently publishing its metadata at another sequence. This is a
+    /// process-local reservation; only a successful writer advances durability.
+    /// Obtain the candidate through nextReplaySequence first. An unknown cache
+    /// fails closed so the final claim never initializes storage or performs I/O.
+    pub fn claimReplaySequence(self: *DocStore, expected: u64) !void {
+        if (expected == 0 or expected == std.math.maxInt(u64)) return error.ResourceLimitExceeded;
+        if (comptime @import("builtin").is_test) if (ReplayClaimTesting.before) |hook| hook(self, expected);
+        if (self.next_replay_sequence_cached.cmpxchgStrong(expected, expected + 1, .acq_rel, .acquire) != null) return error.PreparedGenerationChanged;
+    }
+
     pub fn appendReplayOpaque(self: *DocStore, alloc: Allocator, sequence: u64, payload: []const u8) !void {
         _ = alloc;
         var batch = try self.beginWriteBatch();
@@ -9287,4 +9299,73 @@ test "docstore prepared replay binding patches only registered native fields inc
     batch.backing[offset] ^= 1;
     try std.testing.expectError(error.PreparedEffectsMismatch, recipe.validate(&batch, 20001, null));
     try std.testing.expectEqual(@as(u64, 10001), batch.replay.?.sequence);
+}
+
+/// Deterministic interference at the claim linearization boundary. This seam
+/// and its storage are absent from production builds.
+pub const ReplayClaimTesting = if (@import("builtin").is_test) struct {
+    pub var before: ?*const fn (*DocStore, u64) void = null;
+} else struct {};
+
+test "docstore replay claim rejects stale candidates and exhaustion without advancing durability" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(std.testing.allocator, try backend.runtimeStore(std.testing.allocator, .{}));
+    defer store.close();
+    try std.testing.expectError(error.PreparedGenerationChanged, store.claimReplaySequence(1));
+    try std.testing.expectEqual(@as(u64, 1), store.nextReplaySequence(1));
+    try std.testing.expectError(error.ResourceLimitExceeded, store.claimReplaySequence(0));
+    try std.testing.expectError(error.ResourceLimitExceeded, store.claimReplaySequence(std.math.maxInt(u64)));
+    try std.testing.expectError(error.PreparedGenerationChanged, store.claimReplaySequence(2));
+    try std.testing.expectEqual(@as(u64, 1), store.nextReplaySequence(1));
+    try store.claimReplaySequence(1);
+    try std.testing.expectError(error.PreparedGenerationChanged, store.claimReplaySequence(1));
+    try std.testing.expectEqual(@as(u64, 2), store.nextReplaySequence(1));
+    try std.testing.expectEqual(@as(u64, 0), store.lastReplaySequence(0));
+    store.next_replay_sequence_cached.store(std.math.maxInt(u64) - 1, .release);
+    try store.claimReplaySequence(std.math.maxInt(u64) - 1);
+    try std.testing.expectError(error.ResourceLimitExceeded, store.claimReplaySequence(std.math.maxInt(u64)));
+    try std.testing.expectEqual(std.math.maxInt(u64), store.nextReplaySequence(1));
+    var reopened = try DocStore.openRuntime(std.testing.allocator, try backend.runtimeStore(std.testing.allocator, .{}));
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 1), reopened.nextReplaySequence(1));
+    try std.testing.expectEqual(@as(u64, 0), reopened.lastReplaySequence(0));
+}
+
+test "docstore replay claim has one winner for concurrent candidates" {
+    if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(std.testing.allocator, try backend.runtimeStore(std.testing.allocator, .{}));
+    defer store.close();
+    try std.testing.expectEqual(@as(u64, 1), store.nextReplaySequence(1));
+    const Worker = struct {
+        store: *DocStore,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.store.claimReplaySequence(1) catch |cause| {
+                self.failure = cause;
+            };
+        }
+    };
+    var workers: [8]Worker = undefined;
+    var threads: [8]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |thread| thread.join();
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .store = &store };
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        spawned += 1;
+    }
+    for (threads) |thread| thread.join();
+    spawned = 0;
+    var winners: usize = 0;
+    for (workers) |worker| if (worker.failure) |cause| {
+        try std.testing.expectEqual(error.PreparedGenerationChanged, cause);
+    } else {
+        winners += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), winners);
+    try std.testing.expectEqual(@as(u64, 2), store.nextReplaySequence(1));
+    try std.testing.expectEqual(@as(u64, 0), store.lastReplaySequence(0));
 }

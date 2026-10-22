@@ -141355,7 +141355,7 @@ test "issue1015 primary writes survive failed derived runtime and visibility sta
     try std.testing.expectEqualStrings(value, durable);
 }
 
-test "issue1015 degraded primary writes reject backlog exhaustion before commit" {
+test "issue1015 degraded primary writes reject backlog exhaustion before commit without a replay claim" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{ .soft_limit_bytes = 1024, .hard_limit_bytes = 4096 };
@@ -141376,8 +141376,10 @@ test "issue1015 degraded primary writes reject backlog exhaustion before commit"
     while (accepted < 200) : (accepted += 1) {
         var key_buffer: [32]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buffer, "primary-{d}", .{accepted});
+        const candidate_sequence = db.core.nextDerivedAppendSequence();
         db.batch(.{ .writes = &.{.{ .key = key, .value = "{\"search_text\":\"durable\"}" }}, .sync_level = .write }) catch |err| {
             try std.testing.expectEqual(error.ResourceBudgetExceeded, err);
+            try std.testing.expectEqual(candidate_sequence, db.core.nextDerivedAppendSequence());
             try std.testing.expect(accepted > 0);
             try std.testing.expect((try db.get(alloc, key)) == null);
             try std.testing.expect(manager.sliceStats(.derived_backlog).used_bytes <= 4096);
@@ -148274,4 +148276,125 @@ test "db prepared transaction effects required assembly replay binding refresh r
     // native mutation revision. Normal mutation ABA is covered separately.
     try db.refreshTransactionAssembly(&plan, null);
     try std.testing.expectEqual(db.core.nextDerivedAppendSequence(), plan.bytes.replay.?.sequence);
+}
+
+test "db prepared transaction effects required replay claim follows every original precommit checkpoint" {
+    var workspace = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.testing.expectEqual(@as(usize, 0), workspace.deinit()) catch @panic("replay claim workspace leaked");
+    const a = workspace.allocator();
+    const F = PreparedAssemblyFixture;
+    const Checks = struct {
+        db: *DB,
+        expected: u64,
+        calls: usize = 0,
+        last_before_claim: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.DeadlineExceeded,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.db.core.nextDerivedAppendSequence() == self.expected) self.last_before_claim = self.calls;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(self: *@This(), transaction: bool) !void {
+            const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = self, .check_fn = check } };
+            if (transaction) {
+                try self.db.resolveTransactionIntentsInternalWithControls(F.id, .committed, 19, .propose, .none, null, null, controls);
+            } else {
+                try self.db.batchWithAdmissionControls(.{ .writes = &.{.{ .key = "ordinary", .value = "{\"thread\":\"t\",\"ordinal\":3,\"text\":\"new\"}" }}, .timestamp_ns = 19, .sync_level = .propose }, controls, .none);
+            }
+        }
+    };
+    const Race = struct {
+        var owner: ?*docstore_mod.DocStore = null;
+        var reserved: ?u64 = null;
+        var calls: usize = 0;
+        var mismatch: bool = false;
+        fn before(store: *docstore_mod.DocStore, expected: u64) void {
+            if (store != owner) return;
+            reserved = store.reserveNextReplaySequence(1);
+            mismatch = mismatch or reserved.? != expected;
+            calls += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |transaction| {
+        var count: usize = 0;
+        {
+            var directory = try TestDirectory.init("replay-claim-baseline");
+            defer directory.cleanup();
+            var db = try DB.open(a, directory.path(), F.options);
+            defer db.close();
+            try F.seed(&db, false, true);
+            var candidate = try db.prepareTransactionAssembly(a, F.id, 19, null);
+            defer candidate.deinit();
+            const next = db.core.nextDerivedAppendSequence();
+            var checks: Checks = .{ .db = &db, .expected = next };
+            try checks.run(transaction);
+            try std.testing.expectEqual(next + 1, db.core.nextDerivedAppendSequence());
+            try std.testing.expectEqual(next, db.core.store.lastReplaySequence(0));
+            count = checks.last_before_claim;
+            try std.testing.expect(count != 0);
+        }
+        var directory = try TestDirectory.init("replay-claim-denials");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), F.options);
+        defer db.close();
+        try F.seed(&db, false, true);
+        var candidate = try db.prepareTransactionAssembly(a, F.id, 19, null);
+        defer candidate.deinit();
+        const next = db.core.nextDerivedAppendSequence();
+        const before = try F.snapshot(&db);
+        defer F.free(before);
+        for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..count + 1) |stop| {
+            var checks: Checks = .{ .db = &db, .expected = next, .stop = stop, .cause = cause };
+            try std.testing.expectError(cause, checks.run(transaction));
+            try std.testing.expectEqual(next, db.core.nextDerivedAppendSequence());
+        };
+        const after = try F.snapshot(&db);
+        defer F.free(after);
+        try std.testing.expectEqualDeep(before, after);
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            try candidate.validateDependencies(db.core, null);
+        }
+        {
+            const previous = docstore_mod.ReplayClaimTesting.before;
+            defer docstore_mod.ReplayClaimTesting.before = previous;
+            Race.owner = db.core.store;
+            defer Race.owner = null;
+            Race.reserved = null;
+            Race.calls = 0;
+            Race.mismatch = false;
+            docstore_mod.ReplayClaimTesting.before = Race.before;
+            var competing: Checks = .{ .db = &db, .expected = next };
+            const result = competing.run(transaction);
+            // The public path may rebuild a conflicted candidate twice. Keep
+            // interfering through its finite budget, then verify no publish.
+            try std.testing.expectEqual(@as(usize, 3), Race.calls);
+            try std.testing.expect(!Race.mismatch);
+            try std.testing.expectError(error.PreparedGenerationChanged, result);
+            try std.testing.expectEqual(@as(?u64, next + 2), Race.reserved);
+        }
+        try std.testing.expectEqual(next + 3, db.core.nextDerivedAppendSequence());
+        const conflicted = try F.snapshot(&db);
+        defer F.free(conflicted);
+        try std.testing.expectEqualDeep(before, conflicted);
+        // Only the competing process-local claims advanced the clock. Rebind
+        // the retained candidate without reassembling its unchanged effects.
+        try db.refreshTransactionAssembly(&candidate, null);
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            try candidate.validateDependencies(db.core, null);
+        }
+        var success: Checks = .{ .db = &db, .expected = next + 3 };
+        try success.run(transaction);
+        try std.testing.expectEqual(next + 4, db.core.nextDerivedAppendSequence());
+        try std.testing.expectEqual(next + 3, db.core.store.lastReplaySequence(0));
+        if (transaction) {
+            try db.resolveTransactionIntentsWithSyncLevel(F.id, .committed, 19, .propose);
+            try std.testing.expectEqual(next + 4, db.core.nextDerivedAppendSequence());
+        }
+    }
 }

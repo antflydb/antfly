@@ -22645,3 +22645,56 @@ receipts. Earlier failed runs retain the Zig API corrections and the corrected
 raw-store ABA test assumption; they provide no final qualification. Full linked
 owner-image, crash, object-engine and cross-engine performance qualification
 remain open.
+
+### Commit-boundary replay sequence claims
+
+The shared normal mutation path now assembles against the observed next replay
+sequence under apply and claims that exact value at the final precommit boundary.
+Pure assembly, backlog admission, publication-envelope preparation, preparation
+admission checks and retained dependency validation precede the claim. A rejected
+preparation therefore does not advance the process-local clock or invalidate a
+held candidate merely by consuming a sequence number.
+
+The storage owner conditionally advances the clock with a compare-and-exchange.
+A competing reservation rejects the candidate rather than publishing metadata
+and replay bytes at different sequences. The existing preparation retry wrapper
+can rebuild it; repeated conflicts stop after its three-attempt budget. Ordinary mutations and accepted
+transaction resolution share this boundary. Semantic no-op replay elision keeps
+its existing behavior; preparation-only assembly still reserves nothing.
+Only a successful atomic writer advances the durable replay cut. Writer admission
+or staging failure, or uncertain commit after the claim, can retain an unused
+process-local number;
+such reservations are never rolled back or handed to another live candidate.
+
+This integrates sequence ownership into the existing commit path. It does not
+yet consume an independently retained prepared assembly or authorize a PREPARE
+vote. Ready consumption, remaining counter/backend metadata, durable read-guard
+installation, live execution/route/DB ownership, executable recovery resources
+and derived-log quota, normal required-PREPARE drivers and broader scheduler
+qualification remain open. Strong required providers remain off and the full
+goal remains active. Durable formats, ABI layouts and default activation are
+unchanged. Full Linux qualification remains waived; Linux uses pinned Nix/glibc
+Zig. Cross-engine performance has not been qualified.
+
+Pinned Debug qualification passes four focused claim cases, 73 required-PREPARE
+DB cases, three transaction-publication cases, 51 runtime error/identity cases
+and five native ABI cases: 136 executions without failures, skips or leaks.
+The ordinary grouped-write and accepted-transaction paths preserve every tested
+original preparation rejection, leave persistent state and the replay clock
+unchanged, and retain a valid held assembly. Deterministic interference at the
+claim boundary exhausts the existing three-attempt retry budget without publishing
+any batch. The held candidate then refreshes, normal resolution succeeds, and a
+terminal transaction retry consumes no further number. The hook and its storage
+are compiled out of production. Primitive tests cover cold/stale claims,
+concurrent candidates, exhaustion and unchanged durable state across reopen.
+The existing degraded-worker backlog test also proves that quota rejection does
+not consume a claim. The leak-checked preparation sweep disables allocation
+stack traces without removing any rejection points.
+
+All 5,498 native/schema inputs are independently reverified against the final
+source. Formatting, generated errors, the control catalog, whitespace and the
+production source-boundary audit pass (966 sources from the DB entry). Evidence
+is retained in replay-claim-verified.json and replay-claim-v4.json/log in the
+cumulative receipts. Earlier diagnostic runs are retained and provide no final-
+source qualification. Full linked owner-image, object-engine, crash and cross-
+engine performance qualification remain open.
