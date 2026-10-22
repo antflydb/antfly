@@ -42,16 +42,28 @@ fn blocked(err: anyerror) bool {
         else => false,
     };
 }
-fn cleanup(backend: m.Backend, a: A, now: i64, state: m.types.State, executor: Executor) !bool {
+pub fn retentionDue(backend: m.Backend, a: A, now: i64, state: m.types.State) !bool {
     const candidate_index = try backend.get(backend.ptr, a, "entity-candidate-index");
     const index_complete = if (candidate_index) |row| (try std.json.parseFromSliceLeaky(struct { cursor: ?[]const u8 = null, complete: bool = false }, a, row.json, .{})).complete else false;
-    const semantic_row = if (state.config.semantic_discovery.enabled) try backend.get(backend.ptr, a, "entity-semantic-index") else null;
-    const semantic_index = if (semantic_row) |row| try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, row.json, .{}) else m.types.SemanticIndex{};
-    const semantic_ready = !state.config.semantic_discovery.enabled or (semantic_index.complete and semantic_index.generation == state.config.generation and (try backend.scan(backend.ptr, a, "entity-semantic-work/", null, 1)).rows.len == 0);
-    if (semantic_ready and index_complete and (state.next_resource_check_at == null or state.next_resource_check_at.? > now) and
-        (state.next_expiry_at == null or state.next_expiry_at.? > now) and
-        (try backend.get(backend.ptr, a, "cleanup")) == null and
-        (try backend.scan(backend.ptr, a, "dependency/work/", null, 1)).rows.len == 0) return false;
+    if (!index_complete or (state.next_resource_check_at != null and state.next_resource_check_at.? <= now) or
+        (state.next_expiry_at != null and state.next_expiry_at.? <= now) or
+        (try backend.get(backend.ptr, a, "cleanup")) != null or
+        (try backend.scan(backend.ptr, a, "dependency/work/", null, 1)).rows.len != 0) return true;
+    const due = try backend.scan(backend.ptr, a, "entity-semantic-due/", null, 1);
+    return due.rows.len != 0 and (try std.json.parseFromSliceLeaky(struct { id: []const u8, at: i64 }, a, due.rows[0].json, .{})).at <= now;
+}
+pub fn semanticDue(backend: m.Backend, a: A, state: m.types.State) !bool {
+    if (!state.config.semantic_discovery.enabled) return false;
+    const row = (try backend.get(backend.ptr, a, "entity-semantic-index")) orelse return true;
+    const index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, row.json, .{});
+    if (index.version != m.types.semantic_index_version or index.generation != state.config.generation or !index.backfill_complete) return true;
+    if ((try backend.scan(backend.ptr, a, "entity-semantic-work/", null, 1)).rows.len != 0) return true;
+    // Deferred source access is retried by the ordered timer lane, without
+    // spinning or committing a new maintenance receipt on every worker round.
+    return !index.complete and (try backend.scan(backend.ptr, a, "entity-semantic-blocked/", null, 1)).rows.len == 0;
+}
+fn cleanup(backend: m.Backend, a: A, now: i64, state: m.types.State, executor: Executor) !bool {
+    if (!try semanticDue(backend, a, state) and !try retentionDue(backend, a, now, state)) return false;
     executor.execute(executor.ptr, null) catch |err| {
         if (blocked(err)) return false;
         return err;

@@ -355,6 +355,9 @@ const Run = struct {
     resource_states: std.StringHashMapUnmanaged(ResourceRead) = .empty,
     inferred: bool = false,
     semantic_ready_after_commit: bool = false,
+    temporal_tracking: bool = false,
+    temporal_boundary: ?i64 = null,
+    temporal_denied: bool = false,
     inference_epoch: u64 = 0,
     capturing_resources: ?*ResourceSet = null,
     processing_failure: ?anyerror = null,
@@ -404,12 +407,34 @@ const Run = struct {
         try self.changes.append(self.a, .{ .key = path, .json = null });
     }
     fn read(self: *Run, comptime T: type, path: []const u8) !?T {
-        for (self.changes.items) |change| if (eql(u8, change.key, path)) return if (change.json) |json| try parse(T, self.a, json) else null;
-        if (self.backend_rows.getEntry(path)) |entry| return if (entry.value_ptr.*) |json| try parse(T, self.a, json) else null;
+        for (self.changes.items) |change| if (eql(u8, change.key, path)) return if (change.json) |json| try self.parseRead(T, json) else null;
+        if (self.backend_rows.getEntry(path)) |entry| return if (entry.value_ptr.*) |json| try self.parseRead(T, json) else null;
         const row = try self.service.backend.get(self.service.backend.ptr, self.a, path);
         const json = if (row) |value| value.json else null;
         try self.backend_rows.put(self.a, try self.a.dupe(u8, path), json);
-        return if (json) |value| try parse(T, self.a, value) else null;
+        return if (json) |value| try self.parseRead(T, value) else null;
+    }
+    fn trackTime(self: *Run, time: ?i64) void {
+        if (!self.temporal_tracking) return;
+        if (time) |at| if (at > self.service.context.now_ms and (self.temporal_boundary == null or at < self.temporal_boundary.?)) {
+            self.temporal_boundary = at;
+        };
+    }
+    fn parseRead(self: *Run, comptime T: type, json: []const u8) !T {
+        const value = try parse(T, self.a, json);
+        if (comptime T == t.StoredAssertion) {
+            self.trackTime(value.assertion.valid_from);
+            self.trackTime(value.assertion.valid_to);
+            self.trackTime(value.superseded_valid_at);
+        }
+        if (comptime T == t.StoredEvidence) self.trackTime(self.evidenceExpiry(value));
+        return value;
+    }
+    fn trackResource(self: *Run, snapshot: prov.Snapshot) void {
+        // An unavailable support branch may change the rendered view without
+        // a memory write. Revisit the projection on the ordinary poll cadence.
+        if (self.temporal_tracking and snapshot.state == .denied) self.temporal_denied = true;
+        if (snapshot.state == .denied or snapshot.state == .changed) self.trackTime(self.service.context.now_ms +| resource_check_interval_ms);
     }
     fn requireAdmin(self: *Run) !void {
         try self.service.context.requireGrant(.admin);
@@ -562,11 +587,13 @@ const Run = struct {
                 try self.validateResource(value.*);
                 value.epoch = self.inference_epoch;
             }
+            self.trackResource(value.snapshot);
             return value.snapshot;
         }
         const resolve = self.service.backend.resource orelse return error.MemoryCapabilityUnavailable;
         const value = try resolve(self.service.backend.ptr, self.a, reference);
         try self.cacheResource(reference, value);
+        self.trackResource(value);
         return value;
     }
     fn cacheResource(self: *Run, reference: prov.Resource, snapshot: prov.Snapshot) !void {
@@ -2035,14 +2062,41 @@ const Run = struct {
         const text = if (projection.kind == .names) try self.semanticNames(record.entity) else view.description;
         return eql(u8, projection.text, text);
     }
+    const SemanticTimer = struct { id: []const u8, at: i64 };
+    fn semanticTimerKey(self: *Run, timer: SemanticTimer) ![]const u8 {
+        const ordered = @as(u64, @bitCast(timer.at)) ^ (@as(u64, 1) << 63);
+        return std.fmt.allocPrint(self.a, "entity-semantic-due/{d:0>20}/{s}", .{ ordered, try hash(self.a, timer.id) });
+    }
+    fn scheduleSemanticTimer(self: *Run, id: []const u8, at: ?i64) !void {
+        const path = try key(self.a, "entity-semantic-timer", id);
+        if (try self.read(SemanticTimer, path)) |prior| try self.remove(try self.semanticTimerKey(prior));
+        if (at) |time| {
+            const timer: SemanticTimer = .{ .id = id, .at = time };
+            try self.put(path, timer);
+            try self.put(try self.semanticTimerKey(timer), timer);
+        } else try self.remove(path);
+    }
+    fn semanticTimers(self: *Run) !void {
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "entity-semantic-due/", null, 8);
+        for (page.rows) |row| {
+            const timer = try parse(SemanticTimer, self.a, row.json);
+            if (timer.at > self.service.context.now_ms) break;
+            try self.remove(row.key);
+            const path = try key(self.a, "entity-semantic-timer", timer.id);
+            if (try self.read(SemanticTimer, path)) |current| if (current.at == timer.at) {
+                try self.remove(path);
+                if (self.state.config.semantic_discovery.enabled) try self.semanticDirty(timer.id);
+            };
+        }
+    }
     fn semanticMaintenance(self: *Run) !void {
         if (!self.state.config.semantic_discovery.enabled) return;
         try self.requireAdmin();
         var index = (try self.read(t.SemanticIndex, "entity-semantic-index")) orelse t.SemanticIndex{};
-        if (index.generation != self.state.config.generation) index = .{ .generation = self.state.config.generation };
+        if (index.version != t.semantic_index_version or index.generation != self.state.config.generation) index = .{ .version = t.semantic_index_version, .generation = self.state.config.generation };
         const initial = !index.backfill_complete;
         index.complete = false;
-        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, if (initial) "entity/" else "entity-semantic-work/", if (initial) index.cursor else null, 8);
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, if (initial) "entity/" else "entity-semantic-work/", if (initial) index.cursor else index.work_cursor, 8);
         for (page.rows) |row| {
             const record = if (initial) try parse(t.EntityRecord, self.a, row.json) else blk: {
                 const work = try parse(struct { id: []const u8 }, self.a, row.json);
@@ -2051,6 +2105,10 @@ const Run = struct {
                     continue;
                 };
             };
+            self.temporal_tracking = true;
+            self.temporal_boundary = null;
+            self.temporal_denied = false;
+            defer self.temporal_tracking = false;
             if (try self.entityVisible(record)) {
                 const canonical_id = try self.canonical(record.entity.id);
                 if (canonical_id != null and eql(u8, canonical_id.?, record.entity.id)) {
@@ -2079,13 +2137,28 @@ const Run = struct {
                         }
                     }
                 }
-            }
+                try self.scheduleSemanticTimer(record.entity.id, self.temporal_boundary);
+            } else if (try self.entityRetained(record)) {
+                if (self.temporal_denied) {
+                    // Preserve readiness debt separately from runnable work.
+                    // The durable deadline retries denial at the poll cadence,
+                    // allowing both healthy jobs and retention work to advance.
+                    try self.put(try key(self.a, "entity-semantic-blocked", record.entity.id), .{ .id = record.entity.id });
+                    try self.scheduleSemanticTimer(record.entity.id, self.temporal_boundary orelse (self.service.context.now_ms +| resource_check_interval_ms));
+                    try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
+                    continue;
+                }
+                // A changed pinned source remains historical, rather than an
+                // eligible current projection. Revisit it if the pin is restored.
+                try self.scheduleSemanticTimer(record.entity.id, self.temporal_boundary);
+            } else try self.scheduleSemanticTimer(record.entity.id, null);
             try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
+            try self.remove(try key(self.a, "entity-semantic-blocked", record.entity.id));
         }
         if (initial) {
             index.cursor = page.next;
             index.backfill_complete = page.next == null;
-        }
+        } else index.work_cursor = page.next;
         self.semantic_ready_after_commit = index.backfill_complete;
         try self.put("entity-semantic-index", index);
     }
@@ -2098,23 +2171,26 @@ const Run = struct {
         const backend = self.service.backend;
         const control = (try backend.get(backend.ptr, self.a, "control")) orelse return error.MemorySpaceNotFound;
         if (!eql(u8, control.json, try self.encode(self.state))) return;
-        if ((try backend.scan(backend.ptr, self.a, "entity-semantic-work/", null, 1)).rows.len != 0) return;
+        if ((try backend.scan(backend.ptr, self.a, "entity-semantic-work/", null, 1)).rows.len != 0 or
+            (try backend.scan(backend.ptr, self.a, "entity-semantic-blocked/", null, 1)).rows.len != 0) return;
         const row = (try backend.get(backend.ptr, self.a, "entity-semantic-index")) orelse return;
         var index = try parse(t.SemanticIndex, self.a, row.json);
-        if (!index.backfill_complete or index.generation != self.state.config.generation) return;
+        if (index.version != t.semantic_index_version or !index.backfill_complete or index.generation != self.state.config.generation) return;
         index.complete = true;
         try self.service.context.requireGrant(.admin);
         try self.service.context.finish();
         if (self.inferred) try self.validateResources();
         try backend.commit(backend.ptr, self.a, control, &.{ .{ .key = "entity-semantic-index", .json = try self.encode(index) }, .{ .key = "control", .json = control.json } });
     }
-    fn semanticCandidates(self: *Run, input_seed: t.EntityRecord, request: t.EntityCandidateRequest) !SemanticMatches {
+    const CandidateRef = struct { id: []const u8, semantic: bool = false };
+    const CandidateContinuation = struct { pending: []const CandidateRef = &.{}, lexical: ?[]const u8 = null };
+    fn semanticCandidates(self: *Run, input_seed: t.EntityRecord, request: t.EntityCandidateRequest, pending: []const CandidateRef) !SemanticMatches {
         if (!self.state.config.semantic_discovery.enabled) return .{};
         var result: SemanticMatches = .{ .state = .not_ready };
         const selected = (try self.canonical(input_seed.entity.id)) orelse return result;
         const seed = (try self.read(t.EntityRecord, try key(self.a, "entity", selected))) orelse return result;
         const index = (try self.read(t.SemanticIndex, "entity-semantic-index")) orelse return result;
-        if (!index.complete or !index.backfill_complete or index.generation != self.state.config.generation) return result;
+        if (index.version != t.semantic_index_version or !index.complete or !index.backfill_complete or index.generation != self.state.config.generation) return result;
         if ((try self.service.backend.scan(self.service.backend.ptr, self.a, "entity-semantic-work/", null, 1)).rows.len != 0) return result;
         const view = try self.entityView(seed.entity.id, .{});
         var matches: std.StringHashMapUnmanaged(SemanticMatch) = .empty;
@@ -2129,12 +2205,21 @@ const Run = struct {
             result.self_scores[@backingInt(kind)] = self_score;
             // ANN runs once per projection on the first lexical page. Later
             // pages continue lexical postings without repeating semantic hits.
-            if (request.cursor == null) {
-                const neighbors = self.service.backend.neighbors.?(self.service.backend.ptr, self.a, .{ .index = try self.semanticIndexName(seed, kind), .vector = query, .limit = self.state.config.semantic_discovery.neighbors }) catch |err| switch (err) {
+            if (request.cursor == null or pending.len != 0) {
+                const neighbors = if (request.cursor != null) blk: {
+                    var carried: std.ArrayList(Neighbor) = .empty;
+                    for (pending) |ref| {
+                        if (!ref.semantic) continue;
+                        const record = (try self.read(t.EntityRecord, try key(self.a, "entity", ref.id))) orelse continue;
+                        const projection_row = (try self.read(t.EntityProjection, try self.semanticProjectionKey(record, kind))) orelse continue;
+                        try carried.append(self.a, .{ .key = try self.semanticProjectionKey(record, kind), .similarity = try cosine(query, projection_row.embedding) });
+                    }
+                    break :blk carried.items;
+                } else self.service.backend.neighbors.?(self.service.backend.ptr, self.a, .{ .index = try self.semanticIndexName(seed, kind), .vector = query, .limit = self.state.config.semantic_discovery.neighbors }) catch |err| switch (err) {
                     error.IndexNotFound, error.IndexRebuilding, error.Timeout, error.EnrichmentWaitTimeout => return result,
                     else => return err,
                 };
-                if (neighbors.len > self.state.config.semantic_discovery.neighbors) return error.MemoryCorruptState;
+                if (request.cursor == null and neighbors.len > self.state.config.semantic_discovery.neighbors) return error.MemoryCorruptState;
                 for (neighbors) |neighbor| {
                     if (!std.math.isFinite(neighbor.similarity)) continue;
                     const similarity = neighbor.similarity / self_score;
@@ -2169,8 +2254,37 @@ const Run = struct {
         try self.authorize(seed.owner, seed.entity.visibility);
         if (!try self.entityVisible(seed)) return error.MemoryNotFound;
         const canonical_seed = (try self.canonical(id)) orelse return error.MemoryEntitySuppressed;
-        const page = try self.candidatePage(seed, request);
-        const semantic = try self.semanticCandidates(seed, request);
+        const lexical_scope = try self.candidateScope(id, request);
+        const union_scope = try std.fmt.allocPrint(self.a, "{s}union/", .{lexical_scope});
+        var continuation: CandidateContinuation = .{};
+        if (request.cursor) |cursor_value| {
+            if (cursor_value.len > 262144) return error.InvalidMemoryCursor;
+            const position = (try self.decodeCursor(union_scope, cursor_value)).?;
+            const bytes = position[union_scope.len..];
+            if (bytes.len % 2 != 0) return error.InvalidMemoryCursor;
+            const json = try self.a.alloc(u8, bytes.len / 2);
+            _ = std.fmt.hexToBytes(json, bytes) catch return error.InvalidMemoryCursor;
+            continuation = parse(CandidateContinuation, self.a, json) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMemoryCursor,
+            };
+            if (continuation.pending.len > 192) return error.InvalidMemoryCursor;
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            for (continuation.pending) |ref| {
+                t.validateId(ref.id) catch return error.InvalidMemoryCursor;
+                if (seen.contains(ref.id)) return error.InvalidMemoryCursor;
+                try seen.put(self.a, ref.id, {});
+            }
+            if (continuation.lexical) |position_value| if (!std.mem.startsWith(u8, position_value, lexical_scope)) return error.InvalidMemoryCursor;
+        }
+        var lexical_request = request;
+        lexical_request.cursor = try self.encodeCursor(lexical_scope, continuation.lexical);
+        const page = if (continuation.pending.len != 0) blk: {
+            var rows: std.ArrayList(Row) = .empty;
+            for (continuation.pending) |ref| if (try self.service.backend.get(self.service.backend.ptr, self.a, try key(self.a, "entity", ref.id))) |row| try rows.append(self.a, row);
+            break :blk Page{ .rows = rows.items, .next = continuation.lexical };
+        } else try self.candidatePage(seed, lexical_request);
+        const semantic = try self.semanticCandidates(seed, request, continuation.pending);
         var candidate_rows: std.ArrayList(Row) = .empty;
         try candidate_rows.appendSlice(self.a, page.rows);
         for (semantic.items) |item| {
@@ -2248,7 +2362,20 @@ const Run = struct {
             }
         }.less);
         const count = @min(matches.items.len, request.limit);
-        return self.encode(t.EntityCandidatePage{ .seed = seed, .seed_view = seed_view, .kind = request.kind, .relationship_predicates = if (self.state.config.ontology_pack == .software_team_v1) &[_][]const u8{ "is_a", "part_of", "alternative_to" } else &[_][]const u8{}, .items = matches.items[0..count], .revision = self.state.revision, .config_generation = self.state.config.generation, .next_cursor = try self.encodeCursor(try self.candidateScope(id, request), page.next), .complete = views_complete and page.next == null and count == matches.items.len, .omitted = matches.items.len - count, .semantic_discovery = semantic.state, .retrieval = if (!((try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{}).complete) .bounded_primary_fallback else if (seed_terms.len > 128) .bounded_audience_fallback else .indexed_lexical });
+        const pending = try self.a.alloc(CandidateRef, matches.items.len - count);
+        for (matches.items[count..], pending) |item, *ref| ref.* = .{ .id = item.entity.entity.id, .semantic = item.semantic_discovered };
+        var next: ?[]const u8 = null;
+        if (pending.len != 0 or page.next != null) {
+            const json = try self.encode(CandidateContinuation{ .pending = pending, .lexical = page.next });
+            const encoded = try self.a.alloc(u8, json.len * 2);
+            const hex = "0123456789abcdef";
+            for (json, 0..) |byte, i| {
+                encoded[2 * i] = hex[byte >> 4];
+                encoded[2 * i + 1] = hex[byte & 15];
+            }
+            next = try self.encodeCursor(union_scope, try std.fmt.allocPrint(self.a, "{s}{s}", .{ union_scope, encoded }));
+        }
+        return self.encode(t.EntityCandidatePage{ .seed = seed, .seed_view = seed_view, .kind = request.kind, .relationship_predicates = if (self.state.config.ontology_pack == .software_team_v1) &[_][]const u8{ "is_a", "part_of", "alternative_to" } else &[_][]const u8{}, .items = matches.items[0..count], .revision = self.state.revision, .config_generation = self.state.config.generation, .next_cursor = next, .complete = views_complete and next == null, .omitted = 0, .semantic_discovery = semantic.state, .retrieval = if (!((try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{}).complete) .bounded_primary_fallback else if (seed_terms.len > 128) .bounded_audience_fallback else .indexed_lexical });
     }
     fn proposalOperation(self: *Run, proposal: curation.Proposal, binding: ?ProposalBinding) !prov.Resource {
         if (binding) |value| if (value.operation) |operation| return operation;
@@ -3034,8 +3161,9 @@ const Run = struct {
         // retirement. Foreground authorization still hides it immediately.
         self.retention_maintenance = true;
         defer self.retention_maintenance = false;
+        if (!try @import("scheduling.zig").retentionDue(self.service.backend, self.a, self.service.context.now_ms, self.state)) return self.semanticMaintenance();
         try self.pollResources();
-        try self.semanticMaintenance();
+        try self.semanticTimers();
         var candidate_index = (try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{};
         if (!candidate_index.complete) {
             const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "entity/", candidate_index.cursor, 16);
@@ -3219,6 +3347,18 @@ const Run = struct {
                     }
                 }
             }
+        } else if (std.mem.startsWith(u8, row.key, "entity-semantic-timer/")) {
+            const timer = try parse(SemanticTimer, self.a, row.json);
+            const record = try self.read(t.EntityRecord, try key(self.a, "entity", timer.id));
+            if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?)) try self.scheduleSemanticTimer(timer.id, null);
+        } else if (std.mem.startsWith(u8, row.key, "entity-semantic-due/")) {
+            const timer = try parse(SemanticTimer, self.a, row.json);
+            const current = try self.read(SemanticTimer, try key(self.a, "entity-semantic-timer", timer.id));
+            if (current == null or current.?.at != timer.at) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "entity-semantic-work/") or std.mem.startsWith(u8, row.key, "entity-semantic-blocked/")) {
+            const work = try parse(struct { id: []const u8 }, self.a, row.json);
+            const record = try self.read(t.EntityRecord, try key(self.a, "entity", work.id));
+            if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?)) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "vector/")) {
             const projection = try parse(VectorProjection, self.a, row.json);
             const record = try self.assertion(projection.assertion_id);

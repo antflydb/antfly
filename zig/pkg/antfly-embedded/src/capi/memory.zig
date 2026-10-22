@@ -248,6 +248,56 @@ test "capi native memory ANN projections use shared native indexes and routed ne
     try qualifyAnnScale(alloc, &native, service, projection_rows.rows);
 }
 
+test "capi native memory semantic deadlines survive reopen and refresh both validity boundaries" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("memory-semantic-timers");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    const Fixture = struct {
+        fn embed(_: *anyopaque, allocator: std.mem.Allocator, _: memory.types.Model, _: []const u8) ![]const f32 {
+            return allocator.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    for ([_]i64{ 1, 200, 400 }, 0..) |now, phase| {
+        var id: ?*anyopaque = null;
+        const status = if (phase == 0) api.antfly_lite_create(path, &id) else api.antfly_lite_open(path, &id);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, status);
+        defer api.antfly_db_close(id);
+        var guard = api.enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const root = guard.handle.parent_handle orelse guard.handle;
+        if (phase == 0) try @import("tables.zig").create(root, "memory_timers", "{}", true);
+        const db = try @import("tables.zig").get(root, "memory_timers");
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const context: memory.Context = .{ .principal = "owner", .admin = true, .now_ms = now, .table_id = db.core.identity_namespace.table_id, .space = "timers" };
+        var native: engine.Native(h.db_mod.DB) = .{ .db = db, .context = context };
+        var backend = native.backend();
+        backend.embed = Fixture.embed;
+        backend.embed_document = Fixture.embed;
+        const service: memory.Service = .{ .backend = backend, .context = context };
+        if (phase == 0) {
+            const config: memory.types.Config = .{ .models = .{ .embedder = .{ .provider = "fixture", .model = "timer", .revision = "v1", .dimensions = 2 } }, .semantic_discovery = .{ .enabled = true } };
+            _ = try service.execute(alloc, .create, "", try std.json.Stringify.valueAlloc(alloc, config, .{}), "create");
+            _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}],\"assertions\":[{\"id\":\"d\",\"subject\":\"graph\",\"predicate\":\"description\",\"value\":\"graph\",\"statement\":\"Timed graph description\",\"valid_from\":100,\"valid_to\":300,\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+        }
+        for (0..16) |i| {
+            _ = try service.execute(alloc, .advance, "", "{}", try std.fmt.allocPrint(alloc, "phase-{d}-{d}", .{ phase, i }));
+            const page = try std.json.parseFromSliceLeaky(memory.types.EntityCandidatePage, alloc, try service.execute(alloc, .entity_candidates, "graph", "{}", ""), .{});
+            if (page.semantic_discovery == .indexed) {
+                try std.testing.expectEqual(phase == 1, std.mem.indexOf(u8, page.seed_view.description, "Timed graph") != null);
+                break;
+            }
+        } else return error.TestUnexpectedResult;
+        const timers = try backend.scan(backend.ptr, alloc, "entity-semantic-due/", null, 8);
+        try std.testing.expectEqual(@as(usize, if (phase == 2) 0 else 1), timers.rows.len);
+    }
+}
+
 // This qualification isolates retrieval cost from model latency and import.
 // Projection fixtures use the exact native view contract and real vector indexes.
 fn qualifyAnnScale(allocator: std.mem.Allocator, native: *engine.Native(h.db_mod.DB), service: memory.Service, prototypes: []const memory.Row) !void {

@@ -346,7 +346,10 @@ managed roles. Nonpositive or nonfinite self scores fail readiness rather than
 silently changing the threshold's meaning. Similarity never authorizes a merge.
 
 The owner/leader's existing maintenance lane resumes an eight-entity generation
-backfill and then drains durable dirty-entity work. Inference runs through the
+backfill and then drains durable dirty-entity work. Retention, dependency cleanup,
+source polling and due-timer admission run in transactions separate from semantic
+inference. Retention debt takes priority; a provider failure or timeout cannot
+roll back a completed cleanup quantum. Inference runs through the
 same lease suspension/resumption and causal input fences as other memory model
 work. Publication fences the space control revision, live external dependencies
 and execution grant. Projection batches persist unready progress and wait for
@@ -360,6 +363,26 @@ entity neighborhoods; curation dirties the affected identity components rather
 than restarting a whole-space backfill. A configuration generation restarts the
 resumable backfill. Candidate reads do not generate stored projections.
 
+A retained entity whose source is temporarily unavailable keeps a durable blocked
+obligation and a retry deadline. Deferred jobs leave the runnable queue so they
+cannot pin healthy work or cause the worker to spin and append receipts between
+poll deadlines. A rotating cursor bounds each runnable quantum. Backfill readiness
+remains false until blocked obligations are materialized or authoritatively retired.
+Changed historical source pins do not block eligible current projections; a retry
+deadline lets them reappear if the original source pin is restored.
+
+Projection maintenance captures the earliest future validity boundary in its
+actual assertion/support closure, including `valid_from`, `valid_to`,
+supersession boundaries and evidence expiry. An ordered durable due index wakes
+only the affected entity; processing a deadline admits dirty work in a retention
+transaction, and a later inference quantum republishes the view. Redacted source
+branches receive a bounded retry deadline so access restoration also refreshes
+the projection. Timers survive restart, are replaced by point operations on
+refresh, and are scrubbed with forgotten entities. No primary-table sweep is
+needed to discover a time transition. An internal scheduler version makes older
+projection generations resume a bounded backfill to install deadline coverage;
+unchanged text reuses its existing embedding.
+
 Candidate pages report `semantic_discovery: indexed`, `not_ready`, or
 `not_indexed` alongside `retrieval`. Pending backfill/dirty work and a stale seed
 fail readiness; lexical results remain available. Each bounded neighbor is also
@@ -367,9 +390,17 @@ checked against the current entity, model, generation, exact view fingerprint an
 dependencies, so invalidation, source changes, forgetting and curation exclude
 stale projections before physical cleanup. The existing bounded cleanup lane
 removes obsolete projection payloads and their native vector entries. ANN runs
-on the first candidate page; subsequent cursors resume lexical postings without
-repeating semantic hits. One pass over N seeds performs at most 2N bounded
-neighbor calls; additional bounded point reads validate policy and provenance.
+on the first candidate page. A scoped, revision-bound continuation carries the
+bounded remainder of the lexical/ANN union, followed by the lexical frontier.
+Even two disjoint 64-neighbor windows remain fully pageable at a 64-item limit;
+page-size truncation never discards candidates. Continuations carry identities,
+not trusted scores: subsequent pages recompute similarity and all policy and
+provenance checks using current stored projections. The remainder is bounded to
+192 identities, cursor size and identity lengths are checked, and duplicates are
+rejected. Each continuation retains the existing principal and space-revision
+binding. One pass over N seeds performs at most 2N bounded neighbor calls,
+independent of the requested page size; additional bounded point reads validate
+policy and provenance without repeating ANN.
 
 The proposed 0.90 view threshold misses knowledge-graph/KG with the qualified
 EmbeddingGemma 2 model (normalized view similarities 0.851/0.865); the evaluated
