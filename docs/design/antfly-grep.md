@@ -349,6 +349,10 @@ a fixed 16-slot reorder buffer also bounds zero-byte result metadata. When that
 buffer approaches capacity, admission waits for the oldest outstanding parent.
 A slow parent therefore cannot grow a corpus-sized queue. Error paths cancel,
 join and release all borrowers without waiting for a missing sequence forever.
+A page-scope deferred drain must also join on its own failure; deferring that
+join to the outer scheduler destructor would let the manifest arena retire first.
+Failed drains discard remaining staged output while preserving already emitted
+records and completed accounting.
 Compatible model work coalesces across parents with unique wire IDs. A
 single-parent window retains intra-document provider parallelism.
 

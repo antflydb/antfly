@@ -4582,3 +4582,13 @@ opt-in benchmark skips), package units, 31 packaging tests, 35 boundary-checker
 regressions and Windows cross-compilation. The server integration uses the
 previously frozen native server. Raw trials remain in ignored local output;
 the compact report records binary hashes, CPU, RSS, first output and limitations.
+
+Main was subsequently merged through `eb5145c3b5` (#1259). After that merge and
+the additional failed-drain lifetime regression, the rebuilt final CLI passed
+283/285 cases on macOS and 282/285 in Linux (two/three platform skips), including
+25 media cases and Linux's wide-repository watcher under a 256-descriptor limit.
+The merged native DB suite passed four tests with zero leaks; all five registry
+cases and Windows cross-compilation passed. The report records these final
+validation hashes separately; its performance measurements remain pinned to the
+earlier measured binaries. Failed deferred drains join and discard remaining
+borrowers before retiring any manifest page, including failures inside cleanup.

@@ -920,5 +920,47 @@
     "For stragglers use --parents 24 --units 1 --page-size 32 --batch-size 1 --slow-first-ms 500 --rounds 5.",
     "For sustained images use --parents 8 --units 16 --image-bytes 262144 --rounds 3.",
     "Run the same profiles in the ARM64 VM with --cpus=2 --memory=1g."
-  ]
+  ],
+  "post_merge_validation": {
+    "source_commit": "e1f6f1c2b5a22ba3b6fdbb1b0f187f44aad1b46a",
+    "merged_main": "eb5145c3b509e47027f3b56d39a73c43e83db605",
+    "note": "Later main merges and failed deferred-drain cleanup were revalidated separately; workload measurements above remain pinned to their original source and binaries.",
+    "macos_cli": {
+      "total": 285,
+      "passed": 283,
+      "skipped": 2
+    },
+    "linux_cli": {
+      "total": 285,
+      "passed": 282,
+      "skipped": 3,
+      "wide_repository_low_descriptor_watch": "pass"
+    },
+    "media_cli": 25,
+    "native_logical_db": {
+      "passed": 4,
+      "skipped": 0,
+      "leaked": 0
+    },
+    "registry_release_safe": 5,
+    "packaging": 31,
+    "windows_cross_compile": "pass",
+    "binary_artifacts": {
+      "macos": {
+        "local_path": "output/grep-rolling/macos/final-antfly-grep",
+        "sha256": "76d49b626c3c60269f74c1fefc6f460c87085f76dd81a5a2e882d9374168ef04",
+        "bytes": 8189400
+      },
+      "linux": {
+        "local_path": "output/grep-rolling/linux/final-antfly-grep",
+        "sha256": "ac372a68cd5fbe69495a02c5aad77ee9a1305323730b14ec6ddc79cae2b1b1f2",
+        "bytes": 31631232
+      }
+    },
+    "native_indexed_server": {
+      "passed": 25,
+      "skipped": 7,
+      "note": "Final cleanup-fixed CLI; previously frozen native server."
+    }
+  }
 }
