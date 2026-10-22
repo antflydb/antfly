@@ -2581,7 +2581,13 @@ const Engine = struct {
                 if (found == null) {
                     // Aliases shadow input bindings in ORDER BY.
                     for (projection.items) |item| if (@import("expressions.zig").references(order.expression, item.alias orelse try engine.expressionName(item.expression))) return null;
-                    for (keys.items, 0..) |key, index| if (reduction_plan.repeatable(key) and @import("expressions.zig").same(key, order.expression)) {
+                    if (uniform) for (projection.items) |item| {
+                        if (aggregates(item.expression) and reduction_plan.repeatable(item.expression) and @import("expressions.zig").same(item.expression, order.expression)) {
+                            found = std.math.maxInt(usize);
+                            break;
+                        }
+                    };
+                    for (keys.items, 0..) |key, index| if (found == null and reduction_plan.repeatable(key) and @import("expressions.zig").same(key, order.expression)) {
                         found = index;
                         break;
                     };
@@ -2880,33 +2886,33 @@ const Engine = struct {
             try self.rows.append(retained, row);
         }
     };
-    fn residuePeriod(self: *Engine, value: anytype, period: *i64, work: *usize) anyerror!bool {
+    fn residuePeriod(self: *Engine, value: anytype, context: *StreamFold.Pipeline.Context, period: *i64, work: *usize) anyerror!bool {
         if (work.* == 0) return false;
         work.* -= 1;
         const T = @TypeOf(value);
         if (T == *const ast.Expr) {
             if (value.value == .binary and value.value.binary.op == .modulo) {
-                const divisor = (self.constant(value.value.binary.right, &.{})) orelse return false;
-                if (divisor != .integer or divisor.integer == 0 or @abs(@as(i128, divisor.integer)) > 64) return false;
-                const n: i64 = @intCast(@abs(divisor.integer));
+                const divisor = (try context.integer(value.value.binary.right)) orelse return false;
+                if (divisor.scale != 0 or divisor.offset == 0 or @abs(@as(i128, divisor.offset)) > 64) return false;
+                const n: i64 = @intCast(@abs(divisor.offset));
                 period.* = std.math.mul(i64, @divExact(period.*, @as(i64, @intCast(std.math.gcd(@as(u64, @intCast(period.*)), @as(u64, @intCast(n)))))), n) catch return false;
                 if (period.* > 64) return false;
             }
-            return self.residuePeriod(value.value, period, work);
+            return self.residuePeriod(value.value, context, period, work);
         }
         return switch (@typeInfo(T)) {
             .pointer => |p| blk: {
-                if (p.size == .slice and p.child != u8) for (value) |child| if (!try self.residuePeriod(child, period, work)) break :blk false;
+                if (p.size == .slice and p.child != u8) for (value) |child| if (!try self.residuePeriod(child, context, period, work)) break :blk false;
                 break :blk true;
             },
             .@"struct" => |info| blk: {
-                inline for (info.field_names) |name| if (!try self.residuePeriod(@field(value, name), period, work)) break :blk false;
+                inline for (info.field_names) |name| if (!try self.residuePeriod(@field(value, name), context, period, work)) break :blk false;
                 break :blk true;
             },
             .@"union" => switch (value) {
-                inline else => |payload| self.residuePeriod(payload, period, work),
+                inline else => |payload| self.residuePeriod(payload, context, period, work),
             },
-            .optional => if (value) |child| self.residuePeriod(child, period, work) else true,
+            .optional => if (value) |child| self.residuePeriod(child, context, period, work) else true,
             else => true,
         };
     }
@@ -4462,9 +4468,13 @@ const Engine = struct {
             var context = try Pipeline.Context.init(engine.a, .{ .start = 0, .step = 1, .length = 0 }, row, alias, engine.parameters, engine, Engine.chargeWork);
             context.setRanges(ranges);
             context.periodic = periodic;
-            const counts = try engine.a.alloc(u64, fold.middle.len - index - 1);
-            var end = index + 1;
-            for (fold.middle[index + 1 ..]) |clause| {
+            return fold.continueRangeProgram(engine, context, index, index + 1, fold.middle.len);
+        }
+        fn continueRangeProgram(fold: *@This(), engine: *Engine, incoming: Pipeline.Context, index: usize, start: usize, stop: usize) anyerror!?RangeProgram {
+            var context = incoming;
+            const counts = try engine.a.alloc(u64, stop - start);
+            var end = start;
+            for (fold.middle[start..stop]) |clause| {
                 if (context.domainLength() > std.math.maxInt(u64)) return null;
                 if (context.domainLength() != 0) switch (clause.operation) {
                     .project => |step| {
@@ -4479,11 +4489,11 @@ const Engine = struct {
                         var local = p;
                         local.skip = null;
                         local.limit = null;
-                        if (!try context.project(local, names)) return null;
-                        if (paginated) {
-                            const page = (try engine.provedPage(p)) orelse return null;
-                            try context.paginate(page.skip, if (page.limit) |n| n else null);
-                        }
+                        const page: ?Pipeline.Context.Page = if (paginated) blk: {
+                            const bounds = (try engine.provedPage(p)) orelse return null;
+                            break :blk .{ .skip = bounds.skip, .limit = if (bounds.limit) |n| n else null };
+                        } else null;
+                        if (!try context.project(local, names, page)) return null;
                     },
                     .subquery => |inner| {
                         if (!unitReturningCall(inner) or !pipelineIndependent(&context, inner)) break;
@@ -4537,10 +4547,10 @@ const Engine = struct {
                     const p = clause.operation.project.value;
                     if (p.skip != null or p.limit != null) if ((try engine.provedPage(p)) == null) return null;
                 }
-                counts[end - index - 1] = @intCast(context.domainLength());
+                counts[end - start] = @intCast(context.domainLength());
                 end += 1;
             }
-            return .{ .context = context, .end = end, .lengths = counts[0 .. end - index - 1] };
+            return .{ .context = context, .end = end, .lengths = counts[0 .. end - start] };
         }
         fn recordRangeProgram(fold: *@This(), engine: *Engine, index: usize, original: u128, program: RangeProgram) !void {
             if (!fold.record_rows) return;
@@ -4550,74 +4560,356 @@ const Engine = struct {
         /// Shared checked lineage for scalar reducers and key-ranked windows.
         fn orderedPipeline(fold: *@This(), engine: *Engine, row: Row, index: usize, alias: []const u8, ranges: []const @import("range.zig").Range) anyerror!bool {
             if (try fold.affinePipeline(engine, row, index, alias, ranges)) return true;
+            if (try fold.setCountPipeline(engine, row, index, alias, ranges)) return true;
             return fold.periodicPipeline(engine, row, index, alias, ranges);
         }
-        /// A bounded period partitions the source into ordered residue bags.
-        /// Every cohort and observer is checked before any group is published.
-        fn sameCohortKeys(left: []const v.Value, right: []const v.Value) bool {
-            if (left.len != right.len) return false;
-            for (left, right) |a, b| if (!v.Value.eql(a, b)) return false;
+        /// Cardinality observers consume symbolic support without demanding an
+        /// encounter-order enumeration of lattice differences. Row-local affine
+        /// stages preserve raw identity; a constant DISTINCT resets it to one.
+        fn setCountPipeline(fold: *@This(), engine: *Engine, row: Row, index: usize, alias: []const u8, ranges: []const @import("range.zig").Range) anyerror!bool {
+            if (!engine.read_only or !fold.axis_enabled or fold.axis_trace != null or fold.consumer != null or fold.continuation != null or fold.ordered_index != null or fold.active_calls != null or fold.calls.len == 0 or fold.projection.wildcard or fold.group_window != null or fold.closed_domain or !fold.unitPrefix(index)) return false;
+            for (fold.calls) |call_value| if (!std.ascii.eqlIgnoreCase(call_value.value.call.name, "count")) return false;
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            const scope = EvalScope.enter(engine, scratch.allocator());
+            defer scope.leave(engine);
+            var context = try Pipeline.Context.init(engine.a, .{ .start = 0, .step = 1, .length = 0 }, row, alias, engine.parameters, engine, Engine.chargeWork);
+            context.setRanges(ranges);
+            const original = context.domainLength();
+            if (original > std.math.maxInt(u64)) return false;
+            var support = false;
+            var distinct_stage = false;
+            const lengths = try engine.a.alloc(u64, fold.middle.len - index - 1);
+            for (fold.middle[index + 1 ..], index + 1..) |clause, stage| {
+                if (clause.operation == .project and clause.operation.project.value.distinct) {
+                    const p = clause.operation.project.value;
+                    if (p.order.len != 0 or p.skip != null or p.limit != null) return false;
+                    if (context.domainLength() != 0) {
+                        for (p.items) |item| if (aggregates(item.expression)) return false;
+                        const names = try engine.a.alloc([]const u8, p.items.len);
+                        for (p.items, names) |item, *name| name.* = item.alias orelse try engine.expressionName(item.expression);
+                        var local = p;
+                        local.distinct = false;
+                        local.predicate = null;
+                        if (!try context.project(local, names, null)) return false;
+                        if (p.predicate) |predicate| if (!try context.restrict(predicate)) return false;
+                        var varying = false;
+                        for (context.bindings) |entry| {
+                            if (entry.value == .integer) varying = varying or entry.value.integer.scale != 0 else if (!primitive(entry.value.scalar) or (entry.value.scalar == .number and !std.math.isFinite(entry.value.scalar.number))) return false;
+                        }
+                        if (context.domainLength() != 0 and !varying) {
+                            const point = try engine.a.alloc(@import("range.zig").Range, 1);
+                            point[0] = .{ .start = context.firstValue().?.integer, .step = 1, .length = 1 };
+                            context.setRanges(point);
+                        }
+                        support = varying;
+                    }
+                    distinct_stage = true;
+                } else {
+                    const program = (try fold.continueRangeProgram(engine, context, index, stage, stage + 1)) orelse return false;
+                    if (program.end != stage + 1) return false;
+                    context = program.context;
+                }
+                const length = if (support) (try @import("range.zig").distinctCardinalityWork(engine.a, context.ranges(), engine, Engine.chargeWork)) orelse return false else context.domainLength();
+                if (length > std.math.maxInt(u64)) return false;
+                lengths[stage - index - 1] = @intCast(length);
+            }
+            if (!distinct_stage) return false;
+            const length = if (support) (try @import("range.zig").distinctCardinalityWork(engine.a, context.ranges(), engine, Engine.chargeWork)) orelse return false else context.domainLength();
+            if (length == 0) {
+                try fold.recordRangeProgram(engine, index, original, .{ .context = context, .end = fold.middle.len, .lengths = lengths });
+                return true;
+            }
+            // The ordinary reduction proof checks final keys and every COUNT
+            // argument. Its leaves can be joined as support without ordering.
+            const proof = (try fold.proveRangeReduction(engine, &context)) orelse return false;
+            const packet = try engine.a.alloc(?RangeObserver, fold.calls.len);
+            @memset(packet, null);
+            for (proof.packets) |part| for (part, packet) |observer, *combined| if (observer) |known| {
+                combined.* = if (combined.*) |prior| try prior.concat(known, engine) else known;
+            };
+            const previous = fold.weight;
+            const prior_counts = fold.range_counts;
+            const prior_observers = fold.range_observers;
+            const prior_observation = fold.axis_observation;
+            const prior_copies = fold.axis_copies;
+            defer {
+                fold.weight = previous;
+                fold.range_counts = prior_counts;
+                fold.range_observers = prior_observers;
+                fold.axis_observation = prior_observation;
+                fold.axis_copies = prior_copies;
+            }
+            try fold.recordRangeProgram(engine, index, original, .{ .context = context, .end = fold.middle.len, .lengths = lengths });
+            fold.range_counts = proof.slots;
+            fold.range_observers = packet;
+            var observation = AxisObservation.init(fold, proof.slots, null, previous, @intCast(length), true, null);
+            defer observation.copies.deinit(engine.scratch_allocator);
+            fold.axis_observation = &observation;
+            fold.axis_copies = Count.one;
+            fold.weight = try previous.multiply(engine.a, Count.init(@intCast(length)));
+            try fold.expand(engine, try context.render(context.firstValue().?.integer), fold.middle.len);
+            try observation.finish(engine, fold);
             return true;
         }
+        const RangeCohort = struct {
+            context: Pipeline.Context,
+            ordinal: u128,
+            order_scope: ?Pipeline.Context = null,
+            proof: ?RangeReduction = null,
+        };
+        fn cohortValues(engine: *Engine, context: *const Pipeline.Context) ![]const v.Value {
+            const row = try context.render(context.firstValue().?.integer);
+            const values = try engine.a.alloc(v.Value, row.len);
+            for (row, values) |entry, *value| value.* = entry.value;
+            return values;
+        }
+        fn sameCohortKeys(engine: *Engine, left: []const v.Value, right: []const v.Value) !bool {
+            return engine.values.eql(.{ .list = left }, .{ .list = right });
+        }
+        /// Locate the next occurrence, not just the first matching value: bag
+        /// segments can repeat the same raw values at later source ordinals.
+        fn sourceOrdinal(engine: *Engine, ranges: []const @import("range.zig").Range, raw: i64, after: u128) !?u128 {
+            var base: u128 = 0;
+            for (ranges) |part| {
+                try engine.state();
+                if (part.length != 0 and base + part.length > after) {
+                    const offset = @as(i128, raw) - part.start;
+                    if (@rem(offset, part.step) == 0) {
+                        const position = @divTrunc(offset, part.step);
+                        if (position >= 0 and @as(u128, @intCast(position)) < part.length and base + @as(u128, @intCast(position)) >= after) return base + @as(u128, @intCast(position));
+                    }
+                }
+                base += part.length;
+            }
+            return null;
+        }
+        fn sortCohorts(cohorts: []RangeCohort) void {
+            std.mem.sort(RangeCohort, cohorts, {}, struct {
+                fn less(_: void, left: RangeCohort, right: RangeCohort) bool {
+                    return left.ordinal < right.ordinal;
+                }
+            }.less);
+        }
+        /// Discover periods in lexical stage scope. Only checked affine and
+        /// scalar bindings survive discovery; unknown outputs never acquire a
+        /// fabricated dependency or a guessed constant divisor.
+        fn pipelinePeriod(fold: *@This(), engine: *Engine, initial: Pipeline.Context, index: usize) !?i64 {
+            var context = initial;
+            var period: i64 = 1;
+            var work: usize = 1024;
+            for (fold.middle[index + 1 ..]) |clause| switch (clause.operation) {
+                .project => |step| {
+                    const p = step.value;
+                    if (!try engine.residuePeriod(p.items, &context, &period, &work)) return null;
+                    var output: std.ArrayList(Pipeline.Binding) = .empty;
+                    if (p.wildcard) try output.appendSlice(engine.a, context.bindings);
+                    for (p.items) |item| if (try context.expression(item.expression)) |known| {
+                        try output.append(engine.a, .{ .name = item.alias orelse try engine.expressionName(item.expression), .value = known });
+                    };
+                    var scope = if (p.distinct) context else try context.overlay(output.items);
+                    if (p.distinct) try scope.setBindings(output.items);
+                    if (!try engine.residuePeriod(p.predicate, &scope, &period, &work) or !try engine.residuePeriod(p.order, &scope, &period, &work)) return null;
+                    try context.setBindings(output.items);
+                },
+                .unwind => |u| {
+                    if (!try engine.residuePeriod(u.expression, &context, &period, &work)) return null;
+                    if (!axisPure(u.expression) or !pipelineIndependent(&context, u.expression) or context.domainLength() == 0) return null;
+                    const input = try context.render(context.firstValue().?.integer);
+                    const source = engine.unwindSource(u.expression, input) catch |err| {
+                        if (StreamingAggregate.consumerFailure(err)) return null;
+                        return err;
+                    };
+                    if (source) |values| {
+                        if (values.length() != 1 or !primitive(values.at(0))) return null;
+                        try context.bind(u.alias, values.at(0));
+                    } else return null;
+                },
+                .subquery => {}, // Actual cohort execution checks CALL scope and cardinality.
+                else => return null,
+            };
+            if (!try engine.residuePeriod(fold.projection, &context, &period, &work)) return null;
+            return if (period > 1) period else null;
+        }
+        /// A compact global barrier. Every reached expression has already been
+        /// checked on the complete cohort domain. Only a bounded output bag is
+        /// rendered; ordering and pagination apply once to that whole bag.
+        fn cohortWindow(fold: *@This(), engine: *Engine, cohorts: []const RangeCohort, p: ast.Projection, ranges: []const @import("range.zig").Range, ordered: bool) !?[]RangeCohort {
+            _ = fold;
+            var length: u128 = 0;
+            for (cohorts) |cohort| length += cohort.context.domainLength();
+            if (length > 128) return null;
+            const page = (try engine.provedPage(p)) orelse return null;
+            var points: std.ArrayList(RangeCohort) = .empty;
+            for (cohorts) |cohort| {
+                var after: u128 = 0;
+                for (cohort.context.ranges()) |part| {
+                    var position: u128 = 0;
+                    while (position < part.length) : (position += 1) {
+                        try engine.state();
+                        const raw = part.at(position).integer;
+                        const selected = try engine.a.alloc(@import("range.zig").Range, 1);
+                        selected[0] = .{ .start = raw, .step = 1, .length = 1 };
+                        var point = cohort;
+                        point.context.setRanges(selected);
+                        point.ordinal = if (ordered) cohort.ordinal else (try sourceOrdinal(engine, ranges, raw, after)) orelse return null;
+                        after = point.ordinal + 1;
+                        try points.append(engine.a, point);
+                    }
+                }
+            }
+            sortCohorts(points.items);
+            const Ranked = struct { cohort: RangeCohort, keys: []const v.Value, sequence: usize };
+            var ranked: std.ArrayList(Ranked) = .empty;
+            for (points.items, 0..) |point, sequence| {
+                const scope = point.order_scope orelse point.context;
+                var checked_scope = scope;
+                checked_scope.setRanges(point.context.ranges());
+                const keys = try engine.a.alloc(v.Value, p.order.len);
+                for (p.order, keys) |order, *key| {
+                    const known = (try checked_scope.expression(order.expression)) orelse return null;
+                    key.* = if (known == .scalar) known.scalar else .{ .integer = std.math.cast(i64, @as(i128, known.integer.scale) * point.context.firstValue().?.integer + known.integer.offset) orelse return null };
+                }
+                try ranked.append(engine.a, .{ .cohort = point, .keys = keys, .sequence = sequence });
+                var slot = ranked.items.len - 1;
+                while (slot != 0) : (slot -= 1) {
+                    const left = ranked.items[slot];
+                    const right = ranked.items[slot - 1];
+                    if (try engine.compareProjected(.{ .row = &.{}, .source = &.{}, .group = null, .keys = left.keys, .sequence = left.sequence }, .{ .row = &.{}, .source = &.{}, .group = null, .keys = right.keys, .sequence = right.sequence }, p.order) != .lt) break;
+                    std.mem.swap(Ranked, &ranked.items[slot], &ranked.items[slot - 1]);
+                }
+            }
+            const start = @min(page.skip, ranked.items.len);
+            const end = start + @min(page.limit orelse ranked.items.len, ranked.items.len - start);
+            const output = try engine.a.alloc(RangeCohort, end - start);
+            for (ranked.items[start..end], output, 0..) |item, *cohort, sequence| {
+                cohort.* = item.cohort;
+                cohort.ordinal = sequence;
+                cohort.order_scope = null;
+            }
+            return output;
+        }
+        /// Merging cohorts is a per-observer obligation. COUNT and extrema
+        /// commute; SUM additionally needs one sign across the whole group.
+        /// An ordinary AVG may only merge point contributions in original order.
+        fn mergeableCohorts(fold: *@This(), engine: *Engine, cohorts: []const RangeCohort) !bool {
+            for (cohorts, 0..) |left, i| {
+                if (left.proof == null) continue;
+                for (cohorts[i + 1 ..]) |right| {
+                    if (right.proof == null or !try sameCohortKeys(engine, left.proof.?.keys, right.proof.?.keys)) continue;
+                    if (left.context.domainLength() == 1 and right.context.domainLength() == 1) continue;
+                    for (fold.calls, 0..) |call_value, slot| {
+                        const specification = call_value.value.call;
+                        if (std.ascii.eqlIgnoreCase(specification.name, "count") or std.ascii.eqlIgnoreCase(specification.name, "min") or std.ascii.eqlIgnoreCase(specification.name, "max")) continue;
+                        var minimum: i64 = std.math.maxInt(i64);
+                        var maximum: i64 = std.math.minInt(i64);
+                        for ([_]RangeCohort{ left, right }) |cohort| for (cohort.proof.?.packets) |packet| {
+                            const extrema = packet[slot].?.extrema.?;
+                            minimum = @min(minimum, extrema.minimum);
+                            maximum = @max(maximum, extrema.maximum);
+                        };
+                        if (std.ascii.eqlIgnoreCase(specification.name, "avg") and minimum == maximum) continue;
+                        if (std.ascii.eqlIgnoreCase(specification.name, "sum") and (minimum >= 0 or maximum <= 0)) continue;
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+        /// Execute checked cohort stages in lockstep, including shared DISTINCT
+        /// membership and compact global windows, before publishing any reducers.
         fn periodicPipeline(fold: *@This(), engine: *Engine, row: Row, index: usize, alias: []const u8, ranges: []const @import("range.zig").Range) anyerror!bool {
-            if (!engine.read_only or !fold.axis_enabled or fold.axis_trace != null or fold.consumer != null or fold.continuation != null or fold.ordered_index != null or fold.active_calls != null or fold.calls.len == 0 or fold.projection.wildcard or fold.closed_domain or !fold.unitPrefix(index)) return false;
-            // A provisional aggregate rank needs an injective key certificate.
+            if (!engine.read_only or !fold.axis_enabled or fold.axis_trace != null or fold.consumer != null or fold.continuation != null or fold.ordered_index != null or fold.active_calls != null or fold.calls.len == 0 or fold.projection.wildcard or !fold.unitPrefix(index)) return false;
             if (fold.group_window) |window| if (window.uniform) return false;
             var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
             defer scratch.deinit();
             const scope = EvalScope.enter(engine, scratch.allocator());
             defer scope.leave(engine);
-            var period: i64 = 1;
-            var work: usize = 1024;
-            if (!try engine.residuePeriod(fold.middle[index + 1 ..], &period, &work) or !try engine.residuePeriod(fold.projection, &period, &work) or period == 1) return false;
-            const Cohort = struct { program: RangeProgram, proof: RangeReduction, ordinal: u128 };
-            var cohorts: std.ArrayList(Cohort) = .empty;
-            var original: u128 = 0;
-            for (ranges) |part| original +|= part.length;
-            if (original > std.math.maxInt(u64)) return false;
+            var initial = try Pipeline.Context.init(engine.a, .{ .start = 0, .step = 1, .length = 0 }, row, alias, engine.parameters, engine, Engine.chargeWork);
+            initial.setRanges(ranges);
+            const original = initial.domainLength();
+            if (original == 0 or original > std.math.maxInt(u64)) return false;
+            const period = (try fold.pipelinePeriod(engine, initial, index)) orelse return false;
+            var output: std.ArrayList(RangeCohort) = .empty;
             var desired = 1 - period;
             while (desired < period) : (desired += 1) {
                 var context = try Pipeline.Context.init(engine.a, .{ .start = 0, .step = 1, .length = 0 }, row, alias, engine.parameters, engine, Engine.chargeWork);
                 context.setRanges(ranges);
+                context.periodic = true;
                 if (!try context.residue(alias, period, desired)) return false;
                 if (context.domainLength() == 0) continue;
-                var program = (try fold.rangeProgram(engine, row, index, alias, context.ranges(), true)) orelse return false;
-                if (program.end != fold.middle.len) return false;
-                var ordinal: u128 = 0;
-                const first = (program.context.firstValue() orelse context.firstValue().?).integer;
-                for (ranges) |part| {
-                    if (part.length != 0) {
-                        const offset = @as(i128, first) - part.start;
-                        if (@rem(offset, part.step) == 0 and @divTrunc(offset, part.step) >= 0 and @as(u128, @intCast(@divTrunc(offset, part.step))) < part.length) {
-                            ordinal += @intCast(@divTrunc(offset, part.step));
-                            break;
+                try output.append(engine.a, .{ .context = context, .ordinal = (try sourceOrdinal(engine, ranges, context.firstValue().?.integer, 0)) orelse return false });
+            }
+            var cohorts = output.items;
+            const lengths = try engine.a.alloc(u64, fold.middle.len - index - 1);
+            var ordered = false;
+            for (fold.middle[index + 1 ..], index + 1..) |clause, stage| {
+                var local_middle = try engine.a.dupe(ast.Clause, fold.middle);
+                if (clause.operation == .project) {
+                    local_middle[stage].operation.project.value.order = &.{};
+                    local_middle[stage].operation.project.value.skip = null;
+                    local_middle[stage].operation.project.value.limit = null;
+                }
+                for (cohorts) |*cohort| {
+                    const before = cohort.context;
+                    const previous_middle = fold.middle;
+                    fold.middle = local_middle;
+                    const program = blk: {
+                        defer fold.middle = previous_middle;
+                        break :blk (try fold.continueRangeProgram(engine, cohort.context, index, stage, stage + 1)) orelse return false;
+                    };
+                    if (program.end != stage + 1) return false;
+                    cohort.context = program.context;
+                    if (cohort.context.domainLength() == 0) continue;
+                    if (!ordered) cohort.ordinal = (try sourceOrdinal(engine, ranges, cohort.context.firstValue().?.integer, 0)) orelse return false;
+                    if (clause.operation == .project and clause.operation.project.value.order.len != 0) {
+                        var key_scope = if (clause.operation.project.value.distinct) cohort.context else try before.overlay(cohort.context.bindings);
+                        key_scope.setRanges(cohort.context.ranges());
+                        for (clause.operation.project.value.order) |order| {
+                            const known = (try key_scope.expression(order.expression)) orelse return false;
+                            if (known == .scalar and known.scalar == .number and !std.math.isFinite(known.scalar.number)) return false;
+                        }
+                        cohort.order_scope = key_scope;
+                    }
+                }
+                sortCohorts(cohorts);
+                if (clause.operation == .project) {
+                    const p = clause.operation.project.value;
+                    if (p.distinct) {
+                        var membership: std.ArrayList([]const v.Value) = .empty;
+                        for (cohorts) |*cohort| {
+                            if (cohort.context.domainLength() == 0) continue;
+                            const key = try cohortValues(engine, &cohort.context);
+                            var duplicate = false;
+                            for (membership.items) |prior| if (try sameCohortKeys(engine, prior, key)) {
+                                duplicate = true;
+                                break;
+                            };
+                            if (duplicate) cohort.context.setRanges(&.{}) else try membership.append(engine.a, key);
                         }
                     }
-                    ordinal += part.length;
+                    if (p.order.len != 0 or p.skip != null or p.limit != null) {
+                        cohorts = (try fold.cohortWindow(engine, cohorts, p, ranges, ordered)) orelse return false;
+                        ordered = true;
+                    }
                 }
-                // Empty cohorts still contribute their pre-filter stage counts.
-                const proof: RangeReduction = if (program.context.domainLength() == 0) .{ .slots = &.{}, .packets = &.{}, .keys = &.{} } else (try fold.proveRangeReduction(engine, &program.context)) orelse return false;
-                if (program.context.domainLength() != 0) for (cohorts.items) |prior| {
-                    if (prior.program.context.domainLength() != 0 and sameCohortKeys(prior.proof.keys, proof.keys)) return false;
-                };
-                try cohorts.append(engine.a, .{ .program = program, .proof = proof, .ordinal = ordinal });
+                var length: u128 = 0;
+                for (cohorts) |cohort| length += cohort.context.domainLength();
+                if (length > std.math.maxInt(u64)) return false;
+                lengths[stage - index - 1] = @intCast(length);
             }
-            std.mem.sort(Cohort, cohorts.items, {}, struct {
-                fn less(_: void, left: Cohort, right: Cohort) bool {
-                    return left.ordinal < right.ordinal;
-                }
-            }.less);
-            // All groups are bounded by the period; retaining them also avoids
-            // a ranking shortcut suppressing an unproved aggregate error.
+            sortCohorts(cohorts);
+            for (cohorts) |*cohort| if (cohort.context.domainLength() != 0) {
+                cohort.proof = (try fold.proveRangeReduction(engine, &cohort.context)) orelse return false;
+            };
+            if (!try fold.mergeableCohorts(engine, cohorts)) return false;
             const prior_window = fold.group_window;
             fold.group_window = null;
             defer fold.group_window = prior_window;
-            for (cohorts.items) |cohort| {
-                // The first recorded stage is the original UNWIND, before
-                // restrictions/projections inside each cohort.
-                if (cohort.program.context.domainLength() == 0) try fold.recordRangeProgram(engine, index, 0, cohort.program) else try fold.publishRangeReduction(engine, index, 0, cohort.program, cohort.proof);
-            }
-            if (fold.record_rows) fold.stage_counts[index + 1] +|= @intCast((try fold.weight.multiply(engine.a, Count.init(@intCast(original)))).cap(std.math.maxInt(usize)));
+            for (cohorts) |cohort| if (cohort.proof) |proof| {
+                try fold.publishRangeReduction(engine, index, 0, .{ .context = cohort.context, .end = fold.middle.len, .lengths = &.{} }, proof);
+            };
+            try fold.recordRangeProgram(engine, index, original, .{ .context = initial, .end = fold.middle.len, .lengths = lengths });
             return true;
         }
         fn affinePipeline(fold: *@This(), engine: *Engine, row: Row, index: usize, alias: []const u8, ranges: []const @import("range.zig").Range) anyerror!bool {
@@ -4715,7 +5007,7 @@ const Engine = struct {
         /// This preserves each group's exact contribution sequence. The ordinary
         /// suffix packet proves all outer values before selecting any keys.
         fn repeatedWindow(fold: *@This(), engine: *Engine, row: Row, index: usize, outer: @FieldType(@FieldType(ast.Clause, "operation"), "unwind"), source: ListSource) anyerror!bool {
-            if (!engine.read_only or fold.closed_domain or fold.group_window == null or index != 0 or !fold.single_seed or !fold.weight.isOne() or fold.middle.len < 2 or fold.middle[1].operation != .unwind or source.values != .list or source.length() < 2 or source.length() > 128) return false;
+            if (!engine.read_only or fold.closed_domain or fold.group_window == null or index != 0 or !fold.single_seed or !fold.weight.isOne() or fold.middle.len < 2 or fold.middle[1].operation != .unwind or (source.values != .list and source.values != .range) or source.length() < 2 or source.length() > 128) return false;
             const inner = fold.middle[1].operation.unwind;
             if (std.mem.eql(u8, inner.alias, outer.alias) or !independentExpressions(inner.expression, outer.alias) or !engine.arithmeticDomainShape(inner.expression, 0)) return false;
             for (fold.projection.items) |item| if (!aggregates(item.expression) and !independentExpressions(item.expression, outer.alias)) return false;
@@ -6688,6 +6980,30 @@ const Engine = struct {
                     var work: usize = 1024;
                     const u = middle[0].operation.unwind;
                     if (!try self.orderedRangeSource(u.expression, row, false, &ranges, &null_source, 0, &work)) return if (!closed_domain and group_window != null and group_window.?.uniform) error.CypherGroupWindowDeclined else null;
+                    // Bounded arithmetic bags can be outer axes too. Reify
+                    // only this small source after its complete ordered proof;
+                    // aliases, reversal, and concatenation use the same path.
+                    if (!closed_domain and !null_source and middle.len > 1 and middle[1].operation == .unwind) {
+                        var length: u128 = 0;
+                        for (ranges.items) |part| length +|= part.length;
+                        if (length >= 2 and length <= 128) {
+                            const values = try self.a.alloc(v.Value, @intCast(length));
+                            var position: usize = 0;
+                            for (ranges.items) |part| {
+                                var ordinal: u128 = 0;
+                                while (ordinal < part.length) : (ordinal += 1) {
+                                    try self.state();
+                                    values[position] = part.at(ordinal);
+                                    position += 1;
+                                }
+                            }
+                            if (try fold.repeatedWindow(self, row, 0, u, .{ .values = .{ .list = values } })) {
+                                fold.had_match = true;
+                                if (fold.record_rows) fold.stage_counts[0] +|= 1;
+                                continue;
+                            }
+                        }
+                    }
                     if (!try fold.orderedPipeline(self, row, 0, u.alias, if (null_source) &.{} else ranges.items)) return if (!closed_domain and group_window != null and group_window.?.uniform) error.CypherGroupWindowDeclined else null;
                     fold.had_match = true;
                     if (fold.record_rows) fold.stage_counts[0] +|= 1;

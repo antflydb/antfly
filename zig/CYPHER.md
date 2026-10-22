@@ -2072,7 +2072,12 @@ work and segment count are bounded, with ordinary replay on a decline. Arithmeti
 WITH DISTINCT keeps affine tuples as stable novel support, subtracting prior
 ordered runs without materializing members. Overlapping progressions use checked
 lattice intersections and bounded segment subtraction; constant tuples retain
-the first encounter. This requires a certified unit producer invocation,
+the first encounter. Cardinality-only observers can retain symbolic union
+support through affine WITH projections and filters when stable subtraction
+would exceed its segment cap. They compute exact set cardinalities and retain
+COUNT DISTINCT argument support without enumerating lattice gaps. Ordered
+consumers still require an encounter-order proof. This requires a certified
+unit producer invocation,
 so repeated outer rows cannot bypass shared DISTINCT membership. Independent
 zero-or-one-row CALLs and singleton UNWINDs extend the program after their values,
 binding compatibility and child-local cardinality are checked. Failed probes
@@ -2083,24 +2088,36 @@ A certified complete scalar domain also carries WITH ordering and SKIP/LIMIT.
 Ordinal slicing and sorting disjoint monotone runs happen before downstream
 observers, without enumerating the omitted values. Pagination bounds and every
 reached pre-window expression must be checked before publication; unsupported
-scopes, interleaving lattices and fallible expressions retain ordinary execution.
-Invariant integer AVG arguments use the same zero-stride observer certificate.
+scopes and fallible expressions retain ordinary execution. For interleaving
+lattices, exact bag-rank searches locate a bounded page (at most 128 output
+rows), followed by a stable merge of just those retained values. Duplicate
+occurrences remain in source order. Invariant integer AVG arguments use the
+same zero-stride observer certificate.
 
 Small constant modulo periods (bounded at 64) partition an arithmetic producer
-into signed remainder cohorts. Each cohort retains its source encounter order;
-constant cohort keys feed existing exact aggregate observers. All cohort programs
-and packets are proved before publishing any groups. Cross-cohort key collisions
-and varying DISTINCT tuples decline, preserving shared DISTINCT membership and
-sequential floating recurrence. Cohorts are ordered by their first surviving source ordinal
-and record original logical stage counts. Planning is bounded independently of
-the source cardinality.
+into signed remainder cohorts. Divisors resolve through checked lexical stage
+bindings, including parameters and projected scalar aliases. Unknown outputs
+never become fabricated constants. Cohort stages advance in lockstep: DISTINCT
+shares membership across cohorts and selects the first surviving source ordinal.
+Global ORDER BY/SKIP/LIMIT barriers operate on a compact combined intermediate
+bag of at most 128 rows and apply once to that whole bag. Repeated raw values retain distinct source
+occurrences when reconstructing stable encounter order.
+
+All cohort programs and observer packets are checked before publishing groups.
+Colliding group keys require a per-observer merge certificate: COUNT and extrema
+commute, SUM also needs one sign across the colliding domains, and AVG requires
+ordered point contributions or an identical constant sample. Mixed-sign SUM
+and unproved floating recurrence keep ordinary replay. Shared DISTINCT, global
+windows, and filters retain each original logical stage cardinality. Proof work
+is bounded independently of source cardinality.
 
 Ranked group windows may ignore an aggregate rank only when the independent
-suffix packet proves identical contributions for every candidate key. A finite
-independent outer list can move inside an injective key axis while preserving
-each group's exact contribution sequence. The same suffix proof validates all
-outer values before pruning keys; no generic SUM/COUNT replacement changes AVG
-rounding. Key dependencies, unsupported shared stages and failed proofs keep
+suffix packet proves identical contributions for every candidate key. Both
+aggregate aliases and structurally equal aggregate ORDER BY expressions use
+this certificate. A finite independent outer list or range can move inside an
+adjacent injective key axis while preserving each group's exact contribution
+sequence. The complete suffix proof validates every outer value before pruning
+keys. Key dependencies, unsupported scope stages, and failed proofs keep
 ordinary execution.
 
 Total, invariant affine grouping keys can also collapse an unobserved producer
@@ -2113,6 +2130,9 @@ concatenations, can advance a group's mean without visiting its values. The
 proof bounds the complete prefix so integer values, half-integer means,
 subtractions and denominators are exactly representable in binary64. Existing
 state must match the certified prefix, including its weight representation.
+A zero-stride sequence separately certifies the repeated converted binary64
+sample, including rounded i64 endpoints. It preserves the exactly representable
+weight bound and only extends an existing mean equal to that sample.
 Independent zero-or-one-row CALLs preserve this arithmetic axis, including
 nested children, filtering, local windows and global empty-input reducers.
 Binding conflicts and failed children still run at their original boundary.

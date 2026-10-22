@@ -7099,6 +7099,90 @@ test "range pipeline certificates and tuple window proofs release failed allocat
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
 }
 
+test "cohort stages and symbolic cardinality stay bounded at a million rows" {
+    const a = std.testing.allocator;
+    for ([_]struct { text: []const u8, control: []const u8 }{
+        .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT x%10 AS g RETURN count(*),avg(g)", .control = "UNWIND range(1,9)+range(0,0) AS g RETURN count(*),avg(g)" },
+        .{ .text = "UNWIND range(1,1000000) AS x RETURN count(DISTINCT x%10)", .control = "UNWIND range(0,9) AS g RETURN count(*)" },
+        .{ .text = "UNWIND range(1,1000000) AS x RETURN (x%10)%2 AS g,count(*) ORDER BY g", .control = "UNWIND range(1,1000000) AS x RETURN x%2 AS g,count(*) ORDER BY g" },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT x%10 AS g ORDER BY g LIMIT 5 RETURN avg(g)", .control = "UNWIND range(0,4) AS g RETURN avg(g)" },
+        .{ .text = "UNWIND range(1,1000000,2)+range(2,1000000,2) AS x WITH x ORDER BY x LIMIT 5 RETURN avg(x)", .control = "UNWIND range(1,5) AS x RETURN avg(x)" },
+        .{ .text = "UNWIND range(7,8) AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5", .control = "UNWIND [7,8] AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 5" },
+        .{ .text = "UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY avg(x),i LIMIT 5", .control = "UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) AS a ORDER BY a,i LIMIT 5" },
+        .{ .text = "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y RETURN count(*)", .control = "UNWIND range(1,1000000,3)+range(1,1000000) AS x RETURN count(DISTINCT x)" },
+        .{ .text = "UNWIND range(1,1000000) AS x RETURN avg(9223372036854775807)", .control = "UNWIND [1] AS x RETURN avg(9223372036854775807)" },
+        .{ .text = "WITH 10 AS m UNWIND range(1,1000000) AS x RETURN x%m AS g,count(*) ORDER BY g", .control = "UNWIND range(1,1000000) AS x RETURN x%10 AS g,count(*) ORDER BY g" },
+        .{ .text = "UNWIND range(7,8) AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY avg(x),i LIMIT 5", .control = "UNWIND range(1,5) AS i UNWIND [0,1,0,0,1,0] AS x RETURN i,avg(x) ORDER BY i" },
+    }) |item| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, item.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var reference = try c.compile(a, item.control, .{}, &diagnostic);
+        defer reference.deinit();
+        var fixture: Fixture = .{};
+        var result = runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 }) catch |err| {
+            std.debug.print("\n{s}\n", .{item.text});
+            return err;
+        };
+        defer result.deinit();
+        var expected = try runtime.execute(a, fixture.backend(), graph, &reference, &.{}, .{});
+        defer expected.deinit();
+        try std.testing.expectEqualDeep(expected.rows, result.rows);
+    }
+}
+
+test "cohort global barriers retain shared membership stable order and failures" {
+    const a = std.testing.allocator;
+    for ([_]struct { source: []const u8, values: []const u8 }{
+        .{ .source = "range(-4,4)", .values = "[-4,-3,-2,-1,0,1,2,3,4]" },
+        .{ .source = "range(4,-4,-1)", .values = "[4,3,2,1,0,-1,-2,-3,-4]" },
+        .{ .source = "range(1,4)+range(1,4)", .values = "[1,2,3,4,1,2,3,4]" },
+        .{ .source = "range(1,9,3)+range(1,9)", .values = "[1,4,7,1,2,3,4,5,6,7,8,9]" },
+        .{ .source = "range(1,9,2)+range(2,10,2)", .values = "[1,3,5,7,9,2,4,6,8,10]" },
+        .{ .source = "range(1,0)", .values = "[]" },
+    }) |source| for ([_][]const u8{
+        "WITH DISTINCT x%3 AS g RETURN count(*),avg(g),collect(g)",
+        "RETURN count(DISTINCT x%3),avg(DISTINCT x%3)",
+        "WITH DISTINCT x%6 AS g WITH DISTINCT g%2 AS h RETURN count(*),avg(h),collect(h)",
+        "WITH x,x%6 AS g RETURN g%2 AS h,count(*),sum(x),min(x),max(x),avg(x)",
+        "WITH DISTINCT x%3 AS g ORDER BY g DESC SKIP 1 LIMIT 2 RETURN avg(g),collect(g)",
+        "WITH DISTINCT x%3 AS g ORDER BY 0 LIMIT 3 WITH g ORDER BY g DESC RETURN collect(g)",
+        "WITH x WHERE x>2 WITH x%3 AS g ORDER BY 0 LIMIT 3 RETURN collect(g)",
+        "WITH x WHERE x>2 WITH DISTINCT x%3 AS g ORDER BY g LIMIT 3 RETURN collect(g)",
+        "WITH x WHERE x>2 WITH x%3 AS g ORDER BY x LIMIT 3 RETURN collect(g)",
+        "WITH 3 AS m,x RETURN x%m AS g,count(*) ORDER BY g",
+        "WITH x AS y, 2 AS m WITH y,m+1 AS k RETURN y%k AS g,count(*)",
+        "WITH DISTINCT x AS y WITH y+1 AS z WHERE z>0 RETURN count(*),count(z),count(DISTINCT z)",
+        "WITH DISTINCT x AS y WITH 7 AS g RETURN count(*),count(DISTINCT g)",
+        "WITH DISTINCT x AS y WITH DISTINCT y-y AS z RETURN count(*),count(z)",
+        "WITH x ORDER BY x SKIP 1 LIMIT 5 RETURN count(*),avg(x),collect(x)",
+        "WITH x ORDER BY x DESC SKIP 1 LIMIT 5 RETURN count(*),avg(x),collect(x)",
+        "WITH DISTINCT x%3 AS g WHERE x>1 RETURN count(*)",
+        "WITH DISTINCT x%3 AS g ORDER BY g LIMIT -1 RETURN count(*)",
+        "WITH DISTINCT x%3 AS g ORDER BY g LIMIT $missing RETURN avg(g)",
+        "WITH DISTINCT x%3 AS g ORDER BY 1/0 LIMIT 2 RETURN count(*)",
+    }) |tail| {
+        const text = try std.fmt.allocPrint(a, "UNWIND {s} AS x {s}", .{ source.source, tail });
+        defer a.free(text);
+        const control = try std.fmt.allocPrint(a, "UNWIND {s} AS x {s}", .{ source.values, tail });
+        defer a.free(control);
+        try compareReductionPlans(text, control);
+    };
+    // Regrouping these alternating signs would overflow SUM and change AVG
+    // rounding. The cohort merger must retain the original contribution order.
+    try compareReductionPlans(
+        "UNWIND range(9223372036854775807,9223372036854775807)+range(-9223372036854775807,-9223372036854775807)+range(9223372036854775804,9223372036854775804)+range(-9223372036854775804,-9223372036854775804) AS x RETURN (x%3)%1 AS g,sum(x),avg(x),count(*)",
+        "UNWIND [9223372036854775807,-9223372036854775807,9223372036854775804,-9223372036854775804] AS x RETURN (x%3)%1 AS g,sum(x),avg(x),count(*)",
+    );
+    for ([_][]const u8{ "range(7,8)", "range(8,7,-1)", "range(7,7)", "range(7,6)" }) |outer| for ([_][]const u8{ "i", "avg(x),i", "count(*),i", "a DESC,i" }) |order| {
+        const text = try std.fmt.allocPrint(a, "UNWIND {s} AS z UNWIND range(5,1,-1) AS i UNWIND [z,1,z] AS x RETURN i,avg(x) AS a,count(*) ORDER BY {s} LIMIT 2", .{ outer, order });
+        defer a.free(text);
+        const control = try std.fmt.allocPrint(a, "UNWIND {s} AS z UNWIND [5,4,3,2,1] AS i UNWIND [z,1,z] AS x RETURN i,avg(x) AS a,count(*) ORDER BY {s} LIMIT 2", .{ outer, order });
+        defer a.free(control);
+        try compareReductionPlans(text, control);
+    };
+}
+
 test "bounded observer domains compose windows periodic keys and repeated ranks" {
     const a = std.testing.allocator;
     for ([_]struct { text: []const u8, expected: []const u8 }{
@@ -7259,6 +7343,11 @@ test "ordered lineage records logical DISTINCT CALL filter and singleton prefix 
     for ([_]struct { text: []const u8, counts: []const usize }{
         .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT x+1 AS y CALL {RETURN 7 AS z} RETURN avg(y)", .counts = &.{ 1000000, 1000000, 1000000 } },
         .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT 7 AS y RETURN count(*)", .counts = &.{ 1000000, 1 } },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT x%10 AS g ORDER BY g LIMIT 5 RETURN avg(g)", .counts = &.{ 1000000, 5 } },
+        .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT (x%10)%2 AS g WITH g ORDER BY g LIMIT 1 RETURN avg(g)", .counts = &.{ 1000000, 2, 1 } },
+        .{ .text = "UNWIND range(1,1000000,3)+range(1,1000000) AS x WITH DISTINCT x AS y RETURN count(*)", .counts = &.{ 1333334, 1000000 } },
+        .{ .text = "UNWIND range(1,1000000,2)+range(2,1000000,2) AS x WITH x ORDER BY x LIMIT 5 RETURN avg(x)", .counts = &.{ 1000000, 5 } },
+        .{ .text = "UNWIND range(7,8) AS z UNWIND range(1000000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY avg(x),i LIMIT 5", .counts = &.{ 2, 2000000, 6000000 } },
         .{ .text = "UNWIND range(1,1000000) AS x WITH x SKIP 999995 LIMIT 5 RETURN avg(x)", .counts = &.{ 1000000, 5 } },
         .{ .text = "UNWIND range(1,1000000)+range(1,1000000) AS x WITH DISTINCT x+1 AS y RETURN avg(y)", .counts = &.{ 2000000, 1000000 } },
         .{ .text = "UNWIND range(1,1000000) AS x WITH DISTINCT x%10 AS g RETURN g,count(*) ORDER BY g", .counts = &.{ 1000000, 10 } },
@@ -7271,7 +7360,10 @@ test "ordered lineage records logical DISTINCT CALL filter and singleton prefix 
         var compiled = try c.compile(a, item.text, .{}, &diagnostic);
         defer compiled.deinit();
         var fixture: Fixture = .{};
-        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 });
+        var result = runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000, .memory_bytes = 1 << 20 }) catch |err| {
+            std.debug.print("\n{s}\n", .{item.text});
+            return err;
+        };
         defer result.deinit();
         for (item.counts, 0..) |count, index| try std.testing.expectEqual(count, result.stages[index].output_rows);
     }
@@ -7293,6 +7385,11 @@ test "ordered lineage programs release allocations after proof and packet failur
         }
     };
     for ([_][]const u8{
+        "UNWIND range(1,20) AS x WITH DISTINCT (x%6)%2 AS g ORDER BY g LIMIT 1 RETURN avg(g)",
+        "UNWIND range(1,20) AS x RETURN count(DISTINCT x%3)",
+        "UNWIND range(1,20,3)+range(1,20) AS x WITH DISTINCT x AS y RETURN count(*),count(DISTINCT y+1)",
+        "UNWIND range(1,20,2)+range(2,20,2) AS x WITH x ORDER BY x SKIP 2 LIMIT 5 RETURN avg(x)",
+        "UNWIND range(7,8) AS z UNWIND range(20,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY avg(x),i LIMIT 2",
         "UNWIND range(1,20) AS x WITH x ORDER BY x DESC SKIP 2 LIMIT 5 RETURN avg(x)",
         "UNWIND range(1,20)+range(1,20) AS x WITH DISTINCT x+1 AS y RETURN avg(y)",
         "UNWIND range(1,20) AS x WITH DISTINCT x%3 AS g RETURN g,count(*) ORDER BY g LIMIT 2",

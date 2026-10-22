@@ -40,10 +40,19 @@ pub const Sequence = struct {
     pub fn meanAfter(self: @This(), count: u64, mean: f64) ?f64 {
         if (self.length == 0) return mean;
         const total = std.math.add(u128, count, self.length) catch return null;
+        // Keep the ordinary accumulator's weight updates exactly representable.
+        if (total > @as(u128, 1) << 52) return null;
+        // A repeated integer converts to the same binary64 sample every time.
+        // After the first sample the recurrence adds exactly zero, including
+        // rounded i64 endpoints. Do not relax nonconstant progression bounds.
+        if (self.step == 0) {
+            const sample: f64 = @floatFromInt(self.start);
+            if (count == 0 or mean == sample) return sample;
+            return null;
+        }
         // Integers, half-integer means, subtractions, and denominators in the
         // recurrence must all be exactly representable. The conservative
         // bounds cover the entire prefix, not just the final average.
-        if (total > @as(u128, 1) << 52) return null;
         const first = @as(i128, self.start) - @as(i128, count) * self.step;
         const last = first + @as(i128, @intCast(total - 1)) * self.step;
         const bound = @as(i128, 1) << 50;
@@ -71,4 +80,17 @@ test "arithmetic AVG certificates match every ordinary recurrence bit" {
     try std.testing.expect((Sequence{ .start = std.math.maxInt(i64), .step = -1, .length = 10 }).meanAfter(0, 0) == null);
     try std.testing.expect((Sequence{ .start = 1, .step = 1, .length = 100 }).meanAfter(10, 1.234) == null);
     try std.testing.expectEqual(@as(?f64, 100.5), (Sequence{ .start = 101, .step = 1, .length = 100 }).meanAfter(100, 50.5));
+}
+
+test "constant AVG converts wide samples once without changing recurrence bits" {
+    for ([_]i64{ std.math.minInt(i64), std.math.maxInt(i64), (@as(i64, 1) << 53) + 1, 0, -7 }) |sample| {
+        var mean: f64 = 0;
+        for (1..1001) |count| {
+            mean = @import("numbers.zig").nextAverage(mean, @floatFromInt(sample), count);
+            const sequence: Sequence = .{ .start = sample, .step = 0, .length = count };
+            try std.testing.expectEqual(@as(u64, @bitCast(mean)), @as(u64, @bitCast(sequence.meanAfter(0, 0).?)));
+        }
+    }
+    try std.testing.expect((Sequence{ .start = 7, .step = 0, .length = 10 }).meanAfter(5, 6.9) == null);
+    try std.testing.expect((Sequence{ .start = 7, .step = 0, .length = (@as(u128, 1) << 52) + 1 }).meanAfter(0, 0) == null);
 }

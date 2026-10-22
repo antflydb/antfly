@@ -156,6 +156,71 @@ pub const Context = struct {
         }
         self.parts = output.items;
     }
+    pub const Page = struct { skip: u128 = 0, limit: ?u128 = null };
+    /// Select the page's first value by exact bag rank, then merge only the
+    /// bounded retained rows. Duplicate values retain segment encounter order.
+    fn sortedPage(self: *Context, ascending: bool, page: Page) !bool {
+        const limit = page.limit orelse return false;
+        if (limit > 128) return false;
+        const length = self.domainLength();
+        if (page.skip >= length or limit == 0) {
+            self.setRanges(&.{});
+            return true;
+        }
+        var low: i128 = std.math.maxInt(i64);
+        var high: i128 = std.math.minInt(i64);
+        for (self.ranges()) |part| if (part.length != 0) {
+            const last = part.at(part.length - 1).integer;
+            low = @min(low, @min(part.start, last));
+            high = @max(high, @max(part.start, last));
+        };
+        const rank = if (ascending) page.skip + 1 else length - page.skip;
+        while (low < high) {
+            const middle = low + @divTrunc(high - low, 2);
+            var count: u128 = 0;
+            for (self.ranges()) |part| {
+                try self.charge(self.ptr, 1);
+                count += countBelow(part, middle);
+            }
+            if (count < rank) low = middle + 1 else high = middle;
+        }
+        const Cursor = struct { part: Range, position: u128 = 0 };
+        var cursors: std.ArrayList(Cursor) = .empty;
+        var preceding: u128 = 0;
+        for (self.ranges()) |incoming| {
+            if (incoming.length == 0) continue;
+            var part = incoming;
+            if (part.length > 1 and (part.step > 0) != ascending) {
+                part.start = part.at(part.length - 1).integer;
+                part.step = std.math.negate(part.step) catch return false;
+            }
+            const before = if (ascending) countBelow(part, low - 1) else part.length - countBelow(part, low);
+            preceding += before;
+            try cursors.append(self.a, .{ .part = part, .position = before });
+        }
+        var tie_skip = page.skip - preceding;
+        var output: std.ArrayList(Range) = .empty;
+        const keep = @min(limit, length - page.skip);
+        while (output.items.len < keep) {
+            var choice: ?usize = null;
+            for (cursors.items, 0..) |cursor, slot| {
+                try self.charge(self.ptr, 1);
+                if (cursor.position == cursor.part.length) continue;
+                const value = cursor.part.at(cursor.position).integer;
+                if (choice == null or (if (ascending) value < cursors.items[choice.?].part.at(cursors.items[choice.?].position).integer else value > cursors.items[choice.?].part.at(cursors.items[choice.?].position).integer)) choice = slot;
+            }
+            const slot = choice orelse return false;
+            const value = cursors.items[slot].part.at(cursors.items[slot].position).integer;
+            cursors.items[slot].position += 1;
+            if (tie_skip != 0) {
+                tie_skip -= 1;
+                continue;
+            }
+            try output.append(self.a, .{ .start = value, .step = 1, .length = 1 });
+        }
+        self.setRanges(output.items);
+        return true;
+    }
     /// Sort disjoint monotone runs without enumerating their values. General
     /// interleaving lattices retain ordinary replay rather than losing order.
     fn orderRanges(self: *Context, ascending: bool) !bool {
@@ -233,13 +298,27 @@ pub const Context = struct {
     fn known(value: v.Value) Known {
         return if (value == .integer) .{ .integer = Form.literal(value.integer) } else .{ .scalar = value };
     }
-    fn setBindings(self: *Context, bindings: []const Binding) !void {
+    pub fn setBindings(self: *Context, bindings: []const Binding) !void {
         self.bindings = bindings;
         self.positions = .empty;
         for (bindings, 0..) |entry, index| {
             const slot = try self.positions.getOrPut(self.a, entry.name);
             if (!slot.found_existing) slot.value_ptr.* = index;
         }
+    }
+    pub fn overlay(self: *const Context, bindings: []const Binding) !Context {
+        var result = self.*;
+        var entries: std.ArrayList(Binding) = .empty;
+        try entries.appendSlice(self.a, self.bindings);
+        try result.setBindings(entries.items);
+        for (bindings) |entry| {
+            if (result.positions.get(entry.name)) |slot| entries.items[slot] = entry else {
+                try entries.append(self.a, entry);
+                try result.setBindings(entries.items);
+            }
+        }
+        try result.setBindings(entries.items);
+        return result;
     }
     fn bounded(self: *Context, form: Form) ?Form {
         if (self.domainLength() == 0) return null;
@@ -320,7 +399,7 @@ pub const Context = struct {
     }
     /// WITH expressions share the old scope. WHERE overlays projected names on
     /// that old scope; its output drops unprojected input names afterwards.
-    pub fn project(self: *Context, projection: ast.Projection, names: []const []const u8) !bool {
+    pub fn project(self: *Context, projection: ast.Projection, names: []const []const u8, page: ?Page) !bool {
         if (projection.skip != null or projection.limit != null) return false;
         var output: std.ArrayList(Binding) = .empty;
         if (projection.wildcard) try output.appendSlice(self.a, self.bindings);
@@ -373,8 +452,12 @@ pub const Context = struct {
                     if (direction == null and key.integer.scale != 0) direction = (key.integer.scale > 0) != order.descending;
                 } else if (key.scalar == .number and !std.math.isFinite(key.scalar.number)) return false;
             }
-            if (direction) |ascending| if (!try self.orderRanges(ascending)) return false;
+            if (direction) |ascending| if (!try self.orderRanges(ascending)) {
+                if (page) |window_page| return self.sortedPage(ascending, window_page);
+                return false;
+            };
         }
+        if (page) |window_page| try self.paginate(window_page.skip, window_page.limit);
         return true;
     }
     fn slice(self: *Context, first: u128, end: u128) void {
