@@ -4500,8 +4500,8 @@ compares the prior PR binary with this implementation using eight distinct
 same-parent images, five alternating trials and 20 ms artificial delay per HTTP
 request. Cold requests drop from 17 to 3 (8 to 1 Decisions; 9 to 2 index queries),
 and warm requests from 9 to 2 with no inference. Median elapsed time was
-468 to 108 ms cold / 232 to 66 ms warm on macOS, and 414 to 71 ms cold /
-217 to 50 ms warm in the two-CPU, 1-GiB ARM64 Linux VM. These synthetic delays
+468 to 108 ms cold / 232 to 66 ms warm on macOS, and 389 to 78 ms cold /
+224 to 49 ms warm in the two-CPU, 1-GiB ARM64 Linux VM. These synthetic delays
 measure transport shape, not live-provider speed or model-token savings.
 Cross-parent scheduling is still serial. Reproduce with
 `bench/visual_batches.py --help`; raw trial reports remain in ignored `output/`.

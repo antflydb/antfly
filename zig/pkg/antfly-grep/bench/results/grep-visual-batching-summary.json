@@ -4,7 +4,7 @@
   "source": {
     "parent_commit": "0122816e4a24291f21ab34daabe612ca96153020",
     "baseline_commit": "270f575386d3e8576d3d7dce995b11c16b6284b7",
-    "merged_main": "ddba6584b38b59c62e261ef63e0374dc1f711617",
+    "merged_main": "cf7d55b7d0e8e48d8abda582612081e98ee1f625",
     "directories": [
       "zig/pkg/antfly-grep",
       "zig/lib/decisions",
@@ -13,7 +13,8 @@
     ],
     "source_sha256": "33f189a300ed776a879f86170dca0533ad7baa80cf236a8b62ee4b5277154231",
     "files": 701,
-    "framing": "sorted relative .zig/.py paths NUL file bytes NUL"
+    "framing": "relative .zig/.py paths sorted by pathlib.Path component order, path NUL file bytes NUL",
+    "commit": "bcc3fe883d57e21acf659f2cd27586aebe84114e"
   },
   "zig_version": "0.17.0",
   "scope": {
@@ -94,14 +95,16 @@
       "host": "linux",
       "platform": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
       "machine": "aarch64",
+      "linkage": "aarch64-linux-gnu, same linkage for both arms",
+      "build_source_commit": "d31e2fb27a8f281510790c905e5e57fce991a7d5",
       "binaries": {
         "baseline": {
           "sha256": "e02f26261c4256ffd020288fa3c2e69687faef3f998dc5bba7a3c88f0dc8406f",
           "bytes": 31429304
         },
         "candidate": {
-          "sha256": "66159e330291919659a18d97c0ad3269dc9e67480291973c2c6cda6c9d42af68",
-          "bytes": 32324688
+          "sha256": "9121bf2cac62f6a52dccaf57f46b979718a9d911084e1265bd58994471966c89",
+          "bytes": 31468432
         }
       },
       "output_sha256": "f4bb83d3cefbd2dddf4494e79eab6833d42cde2af1492837b585a67ba3c8c6f5",
@@ -109,7 +112,7 @@
         {
           "variant": "baseline",
           "phase": "cold",
-          "elapsed_ns": 414077876,
+          "elapsed_ns": 388594959,
           "provider_requests": 8,
           "index_requests": 9,
           "logical_provider_json_bytes": 7584,
@@ -118,7 +121,7 @@
         {
           "variant": "baseline",
           "phase": "warm",
-          "elapsed_ns": 216700667,
+          "elapsed_ns": 223992875,
           "provider_requests": 0,
           "index_requests": 9,
           "logical_provider_json_bytes": 0,
@@ -127,7 +130,7 @@
         {
           "variant": "candidate",
           "phase": "cold",
-          "elapsed_ns": 71191459,
+          "elapsed_ns": 77714208,
           "provider_requests": 1,
           "index_requests": 2,
           "logical_provider_json_bytes": 5533,
@@ -136,21 +139,21 @@
         {
           "variant": "candidate",
           "phase": "warm",
-          "elapsed_ns": 49946208,
+          "elapsed_ns": 49382584,
           "provider_requests": 0,
           "index_requests": 2,
           "logical_provider_json_bytes": 0,
           "evaluated_units": 8
         }
       ],
-      "local_raw_report": "output/grep-batching/linux-visual-final.json",
-      "raw_report_sha256": "f8be2c5dec67503a0cccd592fc88815090fc7bbb097f3809d9f37db4fa964f40"
+      "local_raw_report": "output/grep-batching/linux-visual-gnu.json",
+      "raw_report_sha256": "2e8cae25b3d614147f5d871a490067ee3a58fcf875f417d7465f788a7a9ee89b"
     }
   ],
   "checks": {
     "macos_cli": {
-      "total": 270,
-      "passed": 268,
+      "total": 271,
+      "passed": 269,
       "skipped": 2
     },
     "native_server_indexed_e2e": {
@@ -159,14 +162,47 @@
       "note": "existing native server binary; includes 3 added point-read/revision/permissions cases"
     },
     "release_packaging_tests": 4,
-    "apache_boundary_source_files": 2428,
+    "apache_boundary_source_files": 2429,
     "compatibility_manifest": "pass",
-    "toolchain_policy": "pass"
+    "toolchain_policy": "pass",
+    "linux_cli_musl": {
+      "total": 271,
+      "passed": 266,
+      "skipped": 5
+    },
+    "native_source_proof_release_safe": 4,
+    "linux_cli_glibc": {
+      "total": 271,
+      "passed": 268,
+      "skipped": 3
+    },
+    "apache_boundary_tests": 35,
+    "windows_x86_64_cross_compile": "pass",
+    "native_logical_db": {
+      "passed": 4,
+      "skipped": 0,
+      "leaked": 0,
+      "build_commit": "d31e2fb27a8f281510790c905e5e57fce991a7d5",
+      "cases": [
+        "transaction/batch invalidation, delete/recreate and nested bulk session fencing",
+        "logical primary/indexed pages, filters, counts and budgets",
+        "logical sort and raw keyword values",
+        "metadata proof hits across unrelated writes and stale retained-cut rejection"
+      ]
+    },
+    "native_source_proof_release_fast": 4,
+    "linux_source_proof": 4,
+    "cache_gc": "completed with GC_ACTIVE_MINUTES=360"
   },
   "reproduction": [
     "From worktree root, freeze baseline and candidate binaries before building the other target.",
     "python3 zig/pkg/antfly-grep/bench/visual_batches.py CANDIDATE --baseline BASELINE --fixture-library FIXTURE --rounds 5 --units 8 --delay-ms 20 --output output/visual-batching.json",
     "Run the same command inside the existing ARM64 Linux VM with --cpus=2 --memory=1g.",
     "cd zig && zig build logical-field-db-test source-proof-test -Dtest-filter=\"logical source certificates\" -Doptimize=ReleaseFast -j2"
-  ]
+  ],
+  "integration": {
+    "commit": "d31e2fb27a8f281510790c905e5e57fce991a7d5",
+    "merged_main": "ddba6584b38b59c62e261ef63e0374dc1f711617",
+    "note": "benchmark source fingerprint remains bound to the recorded build source commit; final CLI fixtures rerun after the subsequent main merge"
+  }
 }
