@@ -224,6 +224,7 @@ pub fn build(b: *std.Build) void {
                     library = self.root / target / f"lib/lib{name}.so"
                     self.assertEqual(library.read_bytes()[:4], b"\x7fELF")
 
+    @unittest.skipUnless(shutil.which("zig"), "Zig compiler required")
     def test_private_engine_final_links_are_target_and_image_scoped(self):
         self.copy_native_build_support()
         local = self.root / "pkg/antfly-embedded/src"
