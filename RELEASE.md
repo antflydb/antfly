@@ -55,6 +55,9 @@ The Homebrew C smoke test checks the installed library against
 `ANTFLY_ABI_VERSION` and the open-options layout in its installed header.
 `.github/workflows/embedded-release-publish.yml` automatically publishes embedded
 packages to npm, PyPI, and crates.io after a successful stable or RC build.
+The build-completion event validates source identity and dispatches the publisher
+on `main`; registry credentials are issued only to the dispatched run, since
+crates.io rejects `workflow_run` tokens.
 Nightlies retain artifacts without registry publication. Manual dispatch with
 the immutable tag and successful build run is the retry path. Rust crates are
 packaged from that source commit, stamped with the release version, verified,

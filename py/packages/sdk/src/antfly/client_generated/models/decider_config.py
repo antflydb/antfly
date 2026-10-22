@@ -48,9 +48,10 @@ class DeciderConfig:
         max_rows (int | Unset):  Default: 10000.
         max_input_tokens (int | Unset):  Default: 1000000.
         max_image_input_tokens (int | Unset): Provider/model upper bound on the input-token contribution of one image.
-            Required when sending images through hosted typed deciders, including image URLs. The runtime reserves this
-            allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt.
-            Omit for text-only, native, or generated deciders.
+            Required when sending images through typed hosted or generated deciders, including native generators and image
+            URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual
+            usage can add shared quota debt. Generated deciders apply the allowance to the selected generator's shared
+            quota. Omit for text-only deciders.
         rate_limit (RateLimitConfig | Unset): Outbound provider limits shared within one Antfly process by effective
             endpoint, operation, model, credential source, project and region/location.
             Conflicting policies for an active scope are rejected. These limits do
