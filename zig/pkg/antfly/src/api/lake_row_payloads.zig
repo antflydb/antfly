@@ -391,5 +391,5 @@ test "external lake clustered payloads retain exact decimal and raw JSON through
             try std.testing.expect((try cursor.next()) == null);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Run.run, .{&store});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{&store});
 }
