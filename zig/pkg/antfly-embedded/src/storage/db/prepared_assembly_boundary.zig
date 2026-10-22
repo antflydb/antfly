@@ -50,32 +50,7 @@ pub fn callDrain(self: *db.DB, original: control.Port, comptime invoke_owner: fn
     if (relay.errors.rejection) |cause| return cause;
 }
 
-const DrainRelay = struct {
-    errors: control.ErrorRelay = .{},
-    original_wait: ?@import("../../common/execution_wait.zig").Boundary = null,
-    fn bind(self: *DrainRelay, original: control.Port) !control.Port {
-        const borrowed = try self.errors.bind(original);
-        self.original_wait = self.errors.payload.execution_wait;
-        if (self.original_wait != null) self.errors.payload.execution_wait = .{ .ptr = self, .begin = begin, .end = end };
-        return borrowed;
-    }
-    fn reject(self: *DrainRelay, cause: anyerror) anyerror {
-        self.errors.rejection = self.errors.rejection orelse cause;
-        return error.Canceled;
-    }
-    fn begin(raw: *anyopaque) !void {
-        const self: *DrainRelay = @ptrCast(@alignCast(raw));
-        if (self.errors.rejection != null) return error.Canceled;
-        self.original_wait.?.beginWait() catch |cause| return self.reject(cause);
-    }
-    fn end(raw: *anyopaque) !void {
-        const self: *DrainRelay = @ptrCast(@alignCast(raw));
-        // Do not gate reentry on a prior rejection: the original caller still
-        // owns this balanced wait pair and must get its grant back or its own
-        // reentry failure before any retirement callback can run.
-        self.original_wait.?.endWait() catch |cause| return self.reject(cause);
-    }
-};
+const DrainRelay = control.ExecutionErrorRelay;
 
 comptime {
     const close_signature: @FieldType(engine.VTable, "drainCloseDependenciesWithAdmission") = &drainClose;

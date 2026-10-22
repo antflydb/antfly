@@ -134,3 +134,25 @@ export fn antfly_execution_fixture_recover_publisher(contract: *const runtime.na
     if (cursor.state.next_lsn != 123) return status.statusFromError(error.InvalidArgument);
     return .ok;
 }
+
+/// Construct the shipped server factory in an independent compilation. All
+/// borrowed native layouts are checked before the provider reads their fields.
+export fn antfly_execution_fixture_transaction_runtime(runtime_contract: *const runtime.native_abi.TypeContract, store_contract: *const runtime.native_abi.TypeContract, backend_contract: *const runtime.native_abi.TypeContract, allocator: *const memory.Allocator, store_raw: *anyopaque, backend_raw: *anyopaque, output: *anyopaque) callconv(.c) status.Status {
+    const Owned = local.storage_db_transaction_recovery_contract.OwnedRuntime;
+    const Store = local.storage_backend_erased.Store;
+    if (!runtime_contract.matches(runtime.native_abi.TypeContract.of(Owned)) or
+        !store_contract.matches(runtime.native_abi.TypeContract.of(Store)) or
+        !backend_contract.matches(runtime.native_abi.TypeContract.of(background.BackendRuntime)) or !allocator.valid()) return status.statusFromError(error.UnsupportedVersion);
+    if (@intFromPtr(store_raw) % @alignOf(Store) != 0 or @intFromPtr(backend_raw) % @alignOf(background.BackendRuntime) != 0 or @intFromPtr(output) % @alignOf(Owned) != 0) return status.statusFromError(error.InvalidArgument);
+    const store: *Store = @ptrCast(@alignCast(store_raw));
+    const backend: *background.BackendRuntime = @ptrCast(@alignCast(backend_raw));
+    const out: *Owned = @ptrCast(@alignCast(output));
+    const server = @import("storage/server_transaction_recovery.zig");
+    const Resolver = struct {
+        fn resolve(_: *anyopaque, _: local.storage_transactions.TxnId, _: []const u8, _: local.storage_transactions.TxnStatus, _: u64) !void {}
+    };
+    const config: server.Config = .{ .enabled = true, .lease_owned = true, .resolver_ctx = backend_raw, .resolve_participant_fn = Resolver.resolve };
+    const factory = server.borrowedConfig(&config).factory.?;
+    out.* = factory.create(factory.ptr, allocator.asStd(), store.*, backend, .{ .resolution_extra_hooks = .{}, .local_resolution_ctx = null, .resolve_local_fn = null }) catch |cause| return status.statusFromError(cause);
+    return .ok;
+}

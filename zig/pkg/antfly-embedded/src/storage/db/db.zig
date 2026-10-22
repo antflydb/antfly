@@ -6224,6 +6224,7 @@ pub const DB = struct {
         try self.portable_activation_recovery.stopWithAdmission(self.portableActivationRecoveryPort(), original);
         try self.local_execution.schema_reconcile.stopWithAdmission(self.backend_runtime, self.schema_reconcile_owner_id, original);
         try self.group_source_owner.stopWithAdmission(self.backend_runtime.io(), original);
+        if (self.transaction_runtime) |runtime| try runtime.stopWithAdmission(original);
         try self.local_execution.source_publication.stopWithAdmission(self.backend_runtime, original);
         try self.local_execution.online_merge_reader.closeWithAdmission(self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io, original);
     }

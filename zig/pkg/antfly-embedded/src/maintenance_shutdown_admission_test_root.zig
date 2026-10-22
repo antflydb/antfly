@@ -27,4 +27,5 @@ test {
     _ = @import("storage/db/portable_activation_recovery.zig");
     _ = @import("storage/db/group_source_owner.zig");
     _ = @import("common/cleanup_wait.zig");
+    _ = @import("storage/db/maintenance/transaction_recovery_driver.zig");
 }

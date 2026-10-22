@@ -864,3 +864,60 @@ test "execution services archive boundary durable quiescence retains its owner a
     try std.testing.expectError(error.BackgroundOwnerIdExhausted, lane.reopenOwner(owner));
     try std.testing.expectError(error.BackgroundOwnerClosing, lane.submit(.{ .owner_id = owner, .class = .maintenance, .ptr = &f, .run = F.run, .deinit = F.deinit }));
 }
+
+extern fn antfly_execution_fixture_transaction_runtime(*const runtime.native_abi.TypeContract, *const runtime.native_abi.TypeContract, *const runtime.native_abi.TypeContract, *const runtime.memory_abi.Allocator, *anyopaque, *anyopaque, *anyopaque) callconv(.c) runtime.error_abi.Status;
+
+test "execution services archive boundary shipped transaction factory retains its lease after original control rejection" {
+    const contract = local.storage_db_transaction_recovery_contract;
+    const admission = local.common_read_admission;
+    var allocator = std.testing.allocator;
+    const allocator_port = runtime.memory_abi.Allocator.fromStd(&allocator);
+    var backend = local.storage_mem_backend.Backend.init(allocator, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(allocator, .{ .name = "foreign-transaction-close" });
+    defer store.deinit();
+    var background_owner = try background.BackendRuntimeHandle.init(allocator, .{});
+    defer background_owner.deinit();
+    var owner: contract.OwnedRuntime = undefined;
+    const owned_contract = runtime.native_abi.TypeContract.of(contract.OwnedRuntime);
+    const store_contract = runtime.native_abi.TypeContract.of(@TypeOf(store));
+    const backend_contract = runtime.native_abi.TypeContract.of(background.BackendRuntime);
+    var old_contract = owned_contract;
+    old_contract.version -= 1;
+    const rejected = antfly_execution_fixture_transaction_runtime(&old_contract, &store_contract, &backend_contract, &allocator_port, &store, background_owner.ptr(), &owner);
+    try std.testing.expectEqual(error.UnsupportedVersion, runtime.error_abi.errorFromStatus(rejected));
+    const result = antfly_execution_fixture_transaction_runtime(&owned_contract, &store_contract, &backend_contract, &allocator_port, &store, background_owner.ptr(), &owner);
+    if (!result.isOk()) return runtime.error_abi.errorFromStatus(result);
+    defer owner.vtable.deinit(owner.ptr);
+    try owner.vtable.run_once(owner.ptr);
+    try std.testing.expect(owner.vtable.stats(owner.ptr).has_lease);
+    const Control = struct {
+        reject: bool = true,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.OriginalTransactionCloseRejectionOutsideNativeCatalog;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn wait(_: *anyopaque) !void {}
+    };
+    var control: Control = .{};
+    var payload: admission.Payload = .{
+        .ptr = &control,
+        .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline },
+        .execution_wait = .{ .ptr = &control, .begin = Control.wait, .end = Control.wait },
+    };
+    try std.testing.expectError(error.OriginalTransactionCloseRejectionOutsideNativeCatalog, owner.stopWithAdmission(.init(&payload)));
+    try std.testing.expect(owner.vtable.stats(owner.ptr).has_lease);
+    // Older providers cannot silently substitute a blocking legacy stop.
+    var missing_methods = owner.vtable.*;
+    missing_methods.stop_with_admission = null;
+    var missing = owner;
+    missing.vtable = &missing_methods;
+    try std.testing.expectError(error.ExecutionWaitUnsupported, missing.stopWithAdmission(.init(&payload)));
+    try std.testing.expect(owner.vtable.stats(owner.ptr).has_lease);
+    control.reject = false;
+    try owner.stopWithAdmission(.init(&payload));
+    try std.testing.expect(!owner.vtable.stats(owner.ptr).has_lease);
+}

@@ -510,3 +510,31 @@ pub const RejectionTrace = struct {
         };
     }
 };
+
+/// Synchronous cross-owner relay preserving original wait and reentry failures.
+pub const ExecutionErrorRelay = struct {
+    errors: ErrorRelay = .{},
+    original_wait: ?@import("execution_wait.zig").Boundary = null,
+    pub fn bind(self: *ExecutionErrorRelay, original: Port) !Port {
+        const borrowed = try self.errors.bind(original);
+        self.original_wait = self.errors.payload.execution_wait;
+        if (self.original_wait != null) self.errors.payload.execution_wait = .{ .ptr = self, .begin = begin, .end = end };
+        return borrowed;
+    }
+    fn reject(self: *ExecutionErrorRelay, cause: anyerror) anyerror {
+        self.errors.rejection = self.errors.rejection orelse cause;
+        return error.Canceled;
+    }
+    fn begin(raw: *anyopaque) !void {
+        const self: *ExecutionErrorRelay = @ptrCast(@alignCast(raw));
+        if (self.errors.rejection != null) return error.Canceled;
+        self.original_wait.?.beginWait() catch |cause| return self.reject(cause);
+    }
+    fn end(raw: *anyopaque) !void {
+        const self: *ExecutionErrorRelay = @ptrCast(@alignCast(raw));
+        // Do not gate reentry on a prior rejection: the original caller still
+        // owns this balanced wait pair and must get its grant back or its own
+        // reentry failure before any retirement callback can run.
+        self.original_wait.?.endWait() catch |cause| return self.reject(cause);
+    }
+};

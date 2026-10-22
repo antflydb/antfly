@@ -2333,7 +2333,9 @@ test "SQL shared worker native control floor admits a cold full lane under exhau
     while (probe.entered.load(.acquire) != tasks.len) std.Thread.yield() catch {};
     const stats = runtime.ptr().runtimeMemoryStats().?;
     const mapping = try std.Io.Threaded.workerStackMappingSize((std.Io.Threaded.InitOptions{}).stack_size);
-    try std.testing.expectEqual(mapping * tasks.len, stats.control_stacks.used);
+    // Dedicated recovery workers use the same prepaid control stack account.
+    const recovery_workers = @import("antfly_runtime_fs").threaded_io_limits.backend_runtime_recovery;
+    try std.testing.expectEqual(mapping * (tasks.len + recovery_workers), stats.control_stacks.used);
     try std.testing.expect(stats.control_heap.used > 0);
     // Preserve the existing aggregate metric meanings across the partition.
     try std.testing.expect(stats.heap.used >= stats.control_heap.used);

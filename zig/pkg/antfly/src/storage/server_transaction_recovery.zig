@@ -1175,6 +1175,9 @@ const OwnedServerRuntime = struct {
     fn stop(ptr: *anyopaque) bool {
         return owner(ptr).runtime.stop();
     }
+    fn stopWithAdmission(ptr: *anyopaque, original: @import("antfly_local_sources").common_read_admission.Port) anyerror!void {
+        return try owner(ptr).runtime.stopWithAdmission(original);
+    }
     fn pause(ptr: *anyopaque) bool {
         return owner(ptr).runtime.pause();
     }
@@ -1200,6 +1203,7 @@ const OwnedServerRuntime = struct {
         .deinit = deinit,
         .start = start,
         .stop = stop,
+        .stop_with_admission = stopWithAdmission,
         .pause = pause,
         .resume_after_pause = resumeAfterPause,
         .ensure_running = ensureRunning,

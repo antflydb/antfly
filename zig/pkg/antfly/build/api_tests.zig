@@ -4188,7 +4188,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, bounded_sql_worker_tests).step);
 
     const shared_sql_worker_root = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api/shared_sql_workers_test_root.zig"),
+        .root_source_file = b.path("pkg/antfly/src/shared_sql_workers_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
