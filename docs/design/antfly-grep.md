@@ -413,35 +413,74 @@ constrained Linux VM; it does not establish zero-cost execution. The later
 measures the rolling scheduler, shared admission and borrowed envelopes, including
 the sustained-image warm-latency/memory tradeoff.
 
-Warm scores still require fresh authorized asset validation. Avoiding those image
-bytes requires a generic server-owned source/asset identity contract: an identity
-must bind the exact stored bytes at the authorized read cut, survive only valid
-immutable revisions, and be distinct from caller-supplied revision or digest
-metadata. A trusted identity may select a previously verified score; absent or
-changed identity must materialize and validate bytes. No caller-written manifest,
-TTL, cached permission result or segment ID establishes that guarantee. The CLI
-retains full validation until that server contract exists.
+Warm scores require a fresh authorized query. The conditional source projection
+contract now permits a server to confirm previously validated image identities
+without transferring the image again. Manifest digests and caller revision fields
+are never identity authority. Missing or changed identities materialize and validate
+bytes; an unavailable score also materializes bytes before provider dispatch.
 
+### Conditional source projection and future storage authorities
 
-### Future generic conditional source projection
+The existing query API accepts an optional, general source delivery extension:
 
-Skipping warm image bytes requires a general query-source contract, rather than
-a grep endpoint or a caller-maintained companion digest. A future conditional
-projection should request explicit logical source paths and return opaque,
-versioned value identities computed or certified by the server. Identities must
-bind exact stored values at the same authorized read cut as returned metadata.
-The server may omit a value only when a supplied previous identity matches that
-current value; a caller-supplied expected identity is a condition, never proof.
-Missing fields must differ from stored nulls, and missing/old authorities require
-value reads or ordinary full projection. Current filters and authorization apply
-before every omission decision, including retained snapshots and distributed or
-external-table reads. No cached authorization grant survives into a later query.
+```json
+{
+  "query": {"bool": {"filter": {"ids": ["source-1"]}}},
+  "fields": ["grep.revision", "grep.permissions", "payloads.image"],
+  "source_projection": {
+    "fields": [{
+      "field": "payloads.image",
+      "if_match": [{"id": "source-1", "identity": "sv1-<64 lowercase hex characters>"}]
+    }]
+  }
+}
+```
 
-The client would retain only bounded, verified image descriptors (decoded digest,
-MIME, dimensions, length and source identity) beside scores, scoped by endpoint,
-table, parent, field and credential context. Changed identities or missing scores
-materialize and validate payloads again. Capability negotiation must preserve
-full-byte fallback against older servers. Digest persistence belongs with the
-existing storage-owned projection authorities and publication fences, not in an
-ingester-owned schema field. This contract and its client reuse path are future
-work; the current implementation continues to fetch and validate warm bytes.
+Each hit's `_source_projection` maps exact logical paths to `{state, identity}`.
+`value` retains the selected value; `unchanged` omits only that value; `missing`
+has no identity. Stored null is a value, distinct from an absent path. Only an
+exact expected identity for the same record ID can cause omission. Conditions
+never authorize a read, bypass query filters, resurrect absent documents, or
+change source-dependent ranking, evaluation, highlighting or aggregation.
+Conditional delivery runs at the final coordinator boundary; worker retrieval
+retains complete ordinary projections. Column-backed sources use the same final
+boundary. Requests allow 64 non-overlapping exact paths and 4,096 conditions
+in total. Duplicate IDs and overlapping paths are rejected. Conditions are
+indexed once per response; per-hit lookup is independent of the condition count.
+
+`sv1` is a versioned server-computed identity over the typed JSON value delivered
+by that authorized read cut. Hashing streams into SHA-256 without allocating an
+encoded copy. The reference implementation reads current selected values before
+hashing and omission. It reduces response bytes and client decoding, but **does
+not eliminate server storage reads or hashing**. Persisting an authenticated,
+canonical-value digest in storage-owned projection authorities is a further
+optimization; raw directory digests, caller metadata, segment IDs and cached
+permission grants cannot substitute for that proof. A future authority adapter
+must preserve versioned identity semantics and publication fences, or use a new
+identity version with safe full-value fallback. Old/missing authorities retain
+the current full-value reference path.
+
+The CLI retains bounded verified descriptors (digest, MIME, dimensions, length
+and server identity), never image payloads, in the existing atomic artifact
+cache. Keys include endpoint, table, parent, field and credential context, plus
+a build digest of the image validators. The cache uses 256 buckets and four
+1 KiB slots per bucket; records can be evicted at any time. Current permissions
+and expected revision are rechecked before any descriptor is accepted. Lower
+current image-byte/pixel limits still apply. Changed questions, expired/evicted
+scores and concurrent descriptor eviction force ordinary materialization.
+Descriptors never enter provider requests: an explicit materialization guard
+runs before coalescing and dispatch. Conditional fallback retains ordinary
+source/request budgets and avoids charging the same logical image twice.
+Disabling caches also disables conditional identity work. Older servers that
+ignore the extension return full values; those rejecting it receive one ordinary
+projection retry, charged to the same request budget. No permission result is
+cached by this mechanism.
+
+Manifest pages have independent worker leases. Completed lanes can refill across
+page boundaries while output stays in discovery order. At most eight active
+jobs, sixteen staged results, the coordinator page and one prefetched page are
+retained; there is no corpus-sized page or reorder inventory. Explicit finite
+evaluation budgets retain serial admission. Every launch, cancellation, decode,
+output and drain failure joins borrowers before releasing their pages. The shared
+64 MiB conservative image admission pool remains in place; warm reuse removes
+transfer and validation work instead of raising that pool's limit.

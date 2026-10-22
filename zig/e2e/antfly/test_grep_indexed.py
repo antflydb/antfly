@@ -2622,3 +2622,61 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_conditional_source_projection_binds_current_values_and_query_selection(
+    stateful_api, num_shards
+):
+    table = f"conditional_source_{time.time_ns()}"
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    item = {
+        "body": {"image": "large-image-" * 4096, "null": None},
+        "revision": "caller-revision",
+    }
+    stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
+    url = stateful_api.url + f"/tables/{table}/query"
+    fields = [{"field": f"body.{name}"} for name in ("image", "null", "absent")]
+    request = {
+        "query": {"match_all": {}},
+        "fields": ["body"],
+        "source_projection": {"fields": fields},
+        "limit": 10,
+    }
+
+    def query(body):
+        response = requests.post(url, json=body, timeout=60)
+        assert response.status_code == 200, response.text
+        result = response.json()["responses"][0]
+        assert result["status"] == 200, result
+        return result["hits"]["hits"]
+
+    cold = query(request)[0]
+    states = cold["_source_projection"]
+    assert cold["_source"]["body"]["image"] == item["body"]["image"]
+    assert states["body.image"]["state"] == "value"
+    assert states["body.null"]["state"] == "value"
+    assert states["body.absent"] == {"state": "missing"}
+    token = states["body.image"]["identity"]
+    assert token.startswith("sv1-") and len(token) == 68
+    fields[0]["if_match"] = [{"id": "a", "identity": token}]
+    warm = query(request)[0]
+    assert "image" not in warm["_source"]["body"]
+    assert warm["_source"]["body"]["null"] is None
+    assert warm["_source_projection"]["body.image"] == {
+        "state": "unchanged",
+        "identity": token,
+    }
+    # Expected identities cannot cause an excluded document to become a hit.
+    assert query({**request, "query": {"bool": {"filter": {"ids": ["other"]}}}}) == []
+    # Caller revision metadata is not authority for the image identity.
+    item["body"]["image"] = "changed-payload"
+    stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
+    changed = query(request)[0]
+    assert changed["_source"]["body"]["image"] == "changed-payload"
+    assert changed["_source_projection"]["body.image"]["state"] == "value"
+    assert changed["_source_projection"]["body.image"]["identity"] != token
+    # Conditions are scoped to the exact record ID, even for identical values.
+    token = changed["_source_projection"]["body.image"]["identity"]
+    fields[0]["if_match"] = [{"id": "other", "identity": token}]
+    assert query(request)[0]["_source"]["body"]["image"] == "changed-payload"

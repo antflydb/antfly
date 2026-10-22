@@ -19,6 +19,10 @@ const httpx = @import("httpx");
 const document = @import("document.zig");
 const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
+const descriptors = @import("image_descriptor.zig");
+const SourceCondition = struct { id: []const u8, identity: []const u8 };
+const SourceField = struct { field: []const u8, if_match: []const SourceCondition = &.{} };
+const SourceProjection = struct { fields: []const SourceField };
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
 pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
 pub const ValueVerification = struct {
@@ -120,7 +124,20 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     defer fetcher.finish();
     const Search = @typeInfo(@TypeOf(search)).pointer.child;
     const Lane = Search.IndexedLane;
-    const Job = struct { lane: *Lane, resolver: AssetResolver(@TypeOf(search)) = undefined, sequence: usize = 0, page: ?*Page = null };
+    const Job = struct {
+        lane: *Lane,
+        resolver: AssetResolver(@TypeOf(search)) = undefined,
+        sequence: usize = 0,
+        page: ?*Page = null,
+        // Document strings and projection shapes borrow this manifest.
+        manifest: ?*Page = null,
+        fn release(self: *@This(), a: A) void {
+            if (self.page) |page| page.deinit(a);
+            if (self.manifest) |page| page.deinit(a);
+            self.page = null;
+            self.manifest = null;
+        }
+    };
     // Finite evaluation budgets and early-selection modes retain discovery order.
     const parallel = search.options.media == .images and (!budgeted_decisions or !search.options.max_requests_explicit) and
         search.options.max_regions == std.math.maxInt(usize) and search.options.max_source_bytes == std.math.maxInt(usize) and
@@ -165,10 +182,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 self.failed = true;
                 self.root.limits.cancel.store(true, .release);
             }
-            defer if (job.page) |page| {
-                page.deinit(self.root.a);
-                job.page = null;
-            };
+            defer job.release(self.root.a);
             for (&self.completed) |*slot| if (slot.* == null) {
                 slot.* = .{ .sequence = job.sequence, .result = try job.lane.take(self.root) };
                 try self.emit();
@@ -214,9 +228,16 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 self.pool.waitForCompletion();
             }
         }
+        fn pendingRequestBound(self: *@This()) usize {
+            var pending_work: usize = 0;
+            for (self.jobs[0..self.initialized]) |job| if (job.lane.handle != null) {
+                pending_work +|= job.lane.doc.evidence.len *| 8 *| (self.root.options.retries +| 1);
+            };
+            return pending_work;
+        }
         fn discard(self: *@This()) void {
-            // Page-scope cleanup must join borrowers here, before manifest
-            // arenas retire; the outer scheduler destructor is too late.
+            // Join all borrowers before releasing their independently owned
+            // manifest and asset pages, including partially launched jobs.
             for (self.jobs[0..self.initialized]) |*job| {
                 if (job.lane.handle != null) {
                     if (job.lane.take(self.root)) |value| {
@@ -224,10 +245,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                         result.deinit(self.root);
                     } else |_| {}
                 }
-                if (job.page) |page| {
-                    page.deinit(self.root.a);
-                    job.page = null;
-                }
+                job.release(self.root.a);
             }
             for (&self.completed) |*slot| if (slot.*) |*entry| {
                 entry.result.deinit(self.root);
@@ -262,7 +280,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                         } else |_| {}
                     }
                 } else job.lane.finish(self.root) catch {};
-                if (job.page) |page| page.deinit(self.root.a);
+                job.release(self.root.a);
                 job.lane.deinit(self.root);
             }
             for (&self.completed) |*slot| if (slot.*) |*entry| entry.result.deinit(self.root);
@@ -317,16 +335,15 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             state.deinit();
             state = fresh;
         }
-        if (overlap and has_next and count.* + hits.array.items.len < search.options.max_index_documents and prefetchHeadroom(search, table, hits.array.items)) {
+        if (overlap and has_next and count.* + hits.array.items.len < search.options.max_index_documents and prefetchHeadroom(search, table, hits.array.items, scheduler.pendingRequestBound())) {
             fetcher.submit(.{ .cursor = cursor, .snapshot = snapshot, .page_size = page_size });
             pending = true;
         }
         var materialized: ?Materialized = null;
         var window_end: usize = 0;
         defer if (materialized) |group| group.page.deinit(search.a);
-        // Drain every borrowed page before its arena is released, including
-        // cancellation, projection failures and output-budget errors.
-        defer scheduler.finish() catch {};
+        // Active jobs retain their own pages, so discovery can advance while
+        // an earlier ordered result is pending. The scheduler bounds leases.
         for (hits.array.items, 0..) |hit, hit_index| {
             if (search.stopped()) return;
             if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
@@ -382,7 +399,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             if (search.options.media == .images) {
                 const units = document.field(value, "evidence");
                 if (units) |raw| doc.evidence = try @import("antfly_source_evidence").parseUnits(a, raw);
-                doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
+                doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .materialize_many = AssetResolver(@TypeOf(search)).materializeMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
             }
             if (lane_count > 1) {
                 const slot = try scheduler.vacant(lane_count);
@@ -395,8 +412,10 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                     job.page = group.page;
                 }
                 job.sequence = scheduler.sequence;
+                loaded.retain();
+                job.manifest = loaded;
                 job.resolver.search = &job.lane.search;
-                doc.evidence_loader = .{ .ctx = &job.resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
+                doc.evidence_loader = .{ .ctx = &job.resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .materialize_many = AssetResolver(@TypeOf(search)).materializeMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
                 // Wave memory admission bounds active parents; the shared
                 // provider semaphore bounds nested batches across all lanes.
                 job.lane.search.decider.allow_parallel = true;
@@ -408,17 +427,20 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 scheduler.sequence += 1;
             } else search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
         }
-        try scheduler.finish();
-        if (!has_next) return;
+        if (!has_next) {
+            try scheduler.finish();
+            return;
+        }
     }
+    try scheduler.finish();
 }
 /// Speculation must not steal the last request from the current image page.
-/// Bound complete field/provider split trees and every retry, not just batches
-/// expected to succeed. Text stages have no comparable finite structural bound.
-fn prefetchHeadroom(search: anytype, table: Table, hits: []const std.json.Value) bool {
+/// Bound complete field/provider split trees and every retry for both the new
+/// page and older leased manifests, not just batches expected to succeed. Text stages have no comparable finite structural bound.
+fn prefetchHeadroom(search: anytype, table: Table, hits: []const std.json.Value, pending_work: usize) bool {
     if (search.options.max_requests == std.math.maxInt(usize)) return true;
     if (search.options.max_requests_explicit or search.options.media != .images) return false;
-    var foreground: usize = 0;
+    var foreground: usize = pending_work;
     for (hits) |hit| {
         const source = document.field(hit, "_source") orelse return false;
         const value = document.at(source, table.document_field) orelse return false;
@@ -496,7 +518,30 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
     try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{table.document_field}));
     try fields.appendSlice(a, shape.items);
     const encoded = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = ids.items } } }, .{});
-    var fetch: Fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false };
+    var projected: std.ArrayList(SourceField) = .empty;
+    for (shape.items) |field| {
+        var conditions: std.ArrayList(SourceCondition) = .empty;
+        for (hits[0..covered_hits]) |hit| {
+            const id = try document.string(hit, "_id");
+            const admitted = for (ids.items) |selected| {
+                if (std.mem.eql(u8, selected, id)) break true;
+            } else false;
+            if (!admitted) continue;
+            const source = document.field(hit, "_source") orelse continue;
+            const value = document.at(source, table.document_field) orelse continue;
+            const raw = document.field(value, "evidence") orelse continue;
+            for (raw.array.items) |entry| {
+                const unit = @import("antfly_source_evidence").Unit.parse(a, entry) catch continue;
+                if (!std.mem.eql(u8, field, unit.asset.field)) continue;
+                if (descriptors.load(a, search.io, search.options, .{ .endpoint = config.endpoint, .token = search.options.table_token orelse "", .table = table.name, .id = id }, unit)) |record| {
+                    try conditions.append(a, .{ .id = id, .identity = record.identity });
+                }
+                break;
+            }
+        }
+        try projected.append(a, .{ .field = field, .if_match = conditions.items });
+    }
+    var fetch: Fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false, .source_projection = if (descriptors.enabled(search.options)) .{ .fields = projected.items } else null };
     defer search.summary.index_requests += fetch.summary.index_requests;
     const page = fetch.load(.{ .cursor = null, .snapshot = null, .page_size = ids.items.len }) catch |err| switch (err) {
         error.ResponseTooLarge, error.IndexPageMemoryExceeded, error.IndexProjectionTooLarge => return null,
@@ -536,6 +581,7 @@ const Fetch = struct {
     text_query: ?std.json.Value = null,
     fields: []const []const u8,
     ordered: bool = true,
+    source_projection: ?SourceProjection = null,
     http: *httpx.Client,
     summary: struct { index_requests: usize = 0 } = .{},
     cancel: std.atomic.Value(bool) = .init(false),
@@ -629,7 +675,8 @@ const Fetch = struct {
             defer if (!retained) page.deinit(self.a);
             const a = page.arena.allocator();
             const memory = &page.memory;
-            const body = try std.json.Stringify.valueAlloc(a, .{ .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            const conditional = self.source_projection != null and !self.limits.source_projection_unsupported.load(.acquire);
+            const body = try std.json.Stringify.valueAlloc(a, .{ .source_projection = if (conditional) self.source_projection else null, .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
             const auth = if (self.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
             const headers: ?[]const [2][]const u8 = if (auth) |value| &.{ .{ "Authorization", value }, .{ "Content-Type", "application/json" } } else &.{.{ "Content-Type", "application/json" }};
             var attempt: usize = 0;
@@ -650,6 +697,12 @@ const Fetch = struct {
                 var transferred = false;
                 defer if (!transferred) response.deinit();
                 const status = response.status.code;
+                if (status == 400 and conditional) {
+                    // Older servers may reject an unknown extension. Retry the
+                    // ordinary projection once; conditions never alter filters.
+                    self.limits.source_projection_unsupported.store(true, .release);
+                    continue :resize;
+                }
                 if (status == 413 and !self.ordered) return error.IndexProjectionTooLarge;
                 if (status == 413 and page_size.* > 1) {
                     page_size.* = @max(1, page_size.* / 2);
@@ -687,6 +740,10 @@ const Fetch = struct {
                 const envelope = document.field(decoded.value, "responses") orelse return error.InvalidIndexResponse;
                 if (envelope != .array or envelope.array.items.len != 1) return error.InvalidIndexResponse;
                 const result_status = document.integer(document.field(envelope.array.items[0], "status")) orelse return error.InvalidIndexResponse;
+                if (result_status == 400 and conditional) {
+                    self.limits.source_projection_unsupported.store(true, .release);
+                    continue :resize;
+                }
                 if (result_status == 413 and !self.ordered) return error.IndexProjectionTooLarge;
                 if (result_status == 413 and page_size.* > 1) {
                     page_size.* = @max(1, page_size.* / 2);
@@ -859,7 +916,19 @@ fn AssetResolver(comptime SearchType: type) type {
         filter: ?std.json.Value,
         materialized: ?Materialized = null,
         wave_page: ?*?*Page = null,
-        point_pages: [16]?*Page = @splat(null),
+        point_pages: [32]?*Page = @splat(null),
+        force_full: bool = false,
+        fn descriptorContext(self: *@This()) descriptors.Context {
+            return .{ .endpoint = self.config.endpoint, .token = self.search.options.table_token orelse "", .table = self.table.name, .id = self.id };
+        }
+        fn materializeMany(raw: *anyopaque, a: A, units: []const media.Unit, output: []media.Loaded) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const previous = self.force_full;
+            self.force_full = true;
+            defer self.force_full = previous;
+            self.materialized = null;
+            try loadMany(raw, a, units, output);
+        }
         fn releaseWave(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             for (&self.point_pages) |*slot| if (slot.*) |page| {
@@ -888,6 +957,12 @@ fn AssetResolver(comptime SearchType: type) type {
             std.debug.assert(units.len == output.len and units.len <= 16);
             if (self.search.stopped()) return error.Canceled;
             loadGroup(self, a, units, output) catch |err| {
+                // A racing cache eviction is an ordinary full-value fallback.
+                // Do not retire sibling pages during a recursively split load.
+                if (err == error.ImageMaterializationRequired and !self.force_full) {
+                    try materializeMany(raw, a, units, output);
+                    return;
+                }
                 const distinct_fields = for (units[1..]) |unit| {
                     if (!std.mem.eql(u8, unit.asset.field, units[0].asset.field)) break true;
                 } else false;
@@ -924,14 +999,28 @@ fn AssetResolver(comptime SearchType: type) type {
             }
             if (fields.items.len == 2) return;
             const ids = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = .{self.id} } } }, .{});
-            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false };
+            var projected: std.ArrayList(SourceField) = .empty;
+            for (fields.items[2..]) |field| {
+                var conditions: []const SourceCondition = &.{};
+                if (!self.force_full) for (units) |unit| {
+                    if (!std.mem.eql(u8, unit.asset.field, field)) continue;
+                    if (descriptors.load(a, self.search.io, self.search.options, self.descriptorContext(), unit)) |record| {
+                        const condition = try a.create(SourceCondition);
+                        condition.* = .{ .id = self.id, .identity = record.identity };
+                        conditions = @as(*[1]SourceCondition, @ptrCast(condition));
+                    }
+                    break;
+                };
+                try projected.append(a, .{ .field = field, .if_match = conditions });
+            }
+            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false, .source_projection = if (descriptors.enabled(self.search.options)) .{ .fields = projected.items } else null };
             defer self.search.summary.index_requests += fetch.summary.index_requests;
             // Point reads deliberately omit ordering/cursors. They reauthorize
             // current rows without creating a durable pagination snapshot.
             const borrowed = if (self.materialized) |group| blk: {
                 for (fields.items[2..]) |field| {
-                    const present = for (group.fields) |projected| {
-                        if (std.mem.eql(u8, field, projected)) break true;
+                    const present = for (group.fields) |projected_field| {
+                        if (std.mem.eql(u8, field, projected_field)) break true;
                     } else false;
                     if (!present) break :blk false;
                 }
@@ -977,6 +1066,18 @@ fn AssetResolver(comptime SearchType: type) type {
                     item.* = .{ .image = image };
                     continue;
                 }
+                const projection = document.field(hit, "_source_projection");
+                const state = if (projection) |map| document.field(map, unit.asset.field) else null;
+                const state_name = if (state) |entry| (document.string(entry, "state") catch return error.InvalidEvidenceIdentity) else "";
+                const identity = if (state) |entry| (document.string(entry, "identity") catch "") else "";
+                if (std.mem.eql(u8, state_name, "unchanged")) {
+                    if (self.force_full or !descriptors.validIdentity(identity) or document.at(source, unit.asset.field) != null) return error.InvalidEvidenceIdentity;
+                    const record = descriptors.load(a, self.search.io, self.search.options, self.descriptorContext(), unit) orelse return error.ImageMaterializationRequired;
+                    if (!std.mem.eql(u8, identity, record.identity)) return error.InvalidEvidenceIdentity;
+                    item.* = .{ .image = record.image() };
+                    continue;
+                }
+                if (projection == null) (self.search.shared_limits orelse &self.search.limits).source_projection_unsupported.store(true, .release);
                 const payload = document.at(source, unit.asset.field) orelse continue;
                 if (payload != .string) {
                     item.* = .{ .failed = error.InvalidEvidenceAsset };
@@ -986,6 +1087,8 @@ fn AssetResolver(comptime SearchType: type) type {
                     item.* = .{ .failed = err };
                     continue;
                 };
+                if (std.mem.eql(u8, state_name, "value") and descriptors.validIdentity(identity))
+                    descriptors.store(a, self.search.io, self.search.options, self.descriptorContext(), unit, image, identity);
                 // Both grouped and split point responses are pinned through
                 // the wave; no second base64 URL allocation is needed.
                 item.* = .{ .image = image };

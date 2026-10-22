@@ -11862,6 +11862,7 @@ export interface components {
              * @example 0.5
              */
             search_effort?: number;
+            source_projection?: components["schemas"]["SourceProjection"];
             /**
              * @description List of fields to include in the results. If not specified, all fields are returned.
              *     Use to reduce response size and improve performance. This field is required when
@@ -12883,6 +12884,37 @@ export interface components {
              */
             published_generation: number;
         };
+        /**
+         * @description Conditional delivery of selected logical source fields on authorized hits.
+         *     Every field must also be selected by `fields` (or the default all-fields
+         *     projection). Conditions only suppress unchanged source values; they never
+         *     authorize a read, skip filters, or establish the existence of a record.
+         *     The response reports value, unchanged, or missing separately for each path.
+         *     Older servers may omit this extension; callers must retain full-value fallback.
+         */
+        SourceProjection: {
+            fields: components["schemas"]["SourceProjectionField"][];
+        };
+        SourceProjectionField: {
+            /** @description Exact logical object path; overlapping paths and wildcards are not supported. */
+            field: string;
+            /** @description Optional per-record expected identities. Duplicate record IDs are invalid. */
+            if_match?: components["schemas"]["SourceValueCondition"][];
+        };
+        SourceValueCondition: {
+            id: string;
+            /** @description Opaque versioned identity previously returned by this server for these exact logical bytes. */
+            identity: string;
+        };
+        SourceValueIdentity: {
+            /**
+             * @description Stored null is a value. Missing has no identity; unchanged omits the value from _source.
+             * @enum {string}
+             */
+            state: "value" | "unchanged" | "missing";
+            /** @description Opaque versioned value identity, present for value and unchanged states. */
+            identity?: string;
+        };
         /** @description A single query result hit */
         QueryHit: {
             /** @description Source table provenance for composed query hits; equal IDs from union inputs remain distinct. */
@@ -12912,6 +12944,10 @@ export interface components {
             };
             /** @description Optional score provenance for ranking features applied to this hit. */
             _score_details?: components["schemas"]["QueryScoreDetails"];
+            /** @description Conditional source states keyed by exact logical field path; returned only when source_projection was requested. */
+            _source_projection?: {
+                [key: string]: components["schemas"]["SourceValueIdentity"];
+            };
             _source?: {
                 [key: string]: unknown;
             };

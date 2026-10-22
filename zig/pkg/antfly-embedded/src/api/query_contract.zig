@@ -40,6 +40,7 @@ const public_limits = @import("antfly_public_limits");
 const graph_wire_envelope = @import("graph_wire_envelope.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const source_projection = @import("source_projection.zig");
 const query_openapi = @import("antfly_query_openapi");
 const reranking_mod = @import("antfly_reranking");
 const vector_codec = @import("antfly_vector").codec;
@@ -52,6 +53,60 @@ const public_query_max_tree_nodes: usize = 16 * 1024;
 pub const QueryResponse = @import("query_response.zig").QueryResponse;
 
 pub const testing = if (builtin.is_test) struct {
+    pub fn expectConditionalSourceProjection() !void {
+        const a = std.testing.allocator;
+        var owned = try parseQueryRequest(a, null, "docs", "{\"fields\":[\"body\"],\"source_projection\":{\"fields\":[{\"field\":\"body.image\"}]}}");
+        defer owned.deinit(a);
+        try std.testing.expect(owned.req.source_projection_json.len > 0);
+        try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs", "{\"fields\":[\"title\"],\"source_projection\":{\"fields\":[{\"field\":\"body.image\"}]}}"));
+        // Worker retrieval must not omit bytes before coordinator-owned ranking,
+        // filtering, highlighting and final authorization have finished.
+        const worker = try @import("query_execution_contract.zig").encodeQueryRequest(a, owned.req);
+        defer a.free(worker);
+        try std.testing.expect(std.mem.indexOf(u8, worker, "source_projection") == null);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        const source = "{\"body\":{\"image\":\"payload\",\"null\":null}}";
+        const cold = try toOpenApiHit(temp, owned.req, .{ .id = @constCast("a"), .stored_data = @constCast(source) });
+        try std.testing.expect(cold._source_projection != null);
+        const cold_map = cold._source_projection.?.map;
+        try std.testing.expect(cold_map.get("body.image") != null);
+        try std.testing.expect(cold_map.get("body.image").?.identity != null);
+        const token = cold_map.get("body.image").?.identity.?;
+        const projection_request = try std.fmt.allocPrint(temp, "{{\"fields\":[{{\"field\":\"body.image\",\"if_match\":[{{\"id\":\"a\",\"identity\":\"{s}\"}}]}},{{\"field\":\"body.null\"}},{{\"field\":\"body.absent\"}}]}}", .{token});
+        var req = owned.req;
+        req.source_projection_json = projection_request;
+        const warm = try toOpenApiHit(temp, req, .{ .id = @constCast("a"), .stored_data = @constCast(source) });
+        const encoded = try std.json.Stringify.valueAlloc(temp, warm, .{ .emit_null_optional_fields = false });
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "payload") == null);
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "unchanged") != null);
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "missing") != null);
+        try std.testing.expect(warm._source != null);
+        try std.testing.expect(warm._source.?.map.get("body") != null);
+        try std.testing.expect(warm._source.?.map.get("body").?.object.get("null") != null);
+        try std.testing.expect(warm._source.?.map.get("body").?.object.get("null").? == .null);
+        const different_id = try toOpenApiHit(temp, req, .{ .id = @constCast("b"), .stored_data = @constCast(source) });
+        try std.testing.expectEqualStrings("payload", different_id._source.?.map.get("body").?.object.get("image").?.string);
+        const rows = @import("../storage/rowsource/types.zig");
+        const refs = [_]rows.RowRef{.{ .relational_key = "a" }};
+        const columns = [_]rows.ColumnVector{
+            .{ .name = "body", .values = .{ .json = &.{"{\"image\":\"payload\",\"null\":null}"} } },
+            .{ .name = "unselected", .values = .{ .json = &.{"not-json"} } },
+        };
+        const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+        defer page.release();
+        var column_hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "a"), .column_source = page.row(0) };
+        defer column_hit.deinit(a);
+        var column_hits = [_]db_mod.types.SearchHit{column_hit};
+        var response = try encodeQueryResponses(a, "docs", req, .{}, .{ .alloc = a, .hits = &column_hits, .total_hits = 1 });
+        defer response.deinit(a);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, "payload") == null);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, "unchanged") != null);
+        const unchanged_page = try column_hit.column_source.?.valueForProjection(&arena, .{ .fields = req.fields, .include_all_fields = req.include_all_fields });
+        try std.testing.expectEqualStrings("payload", unchanged_page.object.get("body").?.object.get("image").?.string);
+    }
+
     pub fn bodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !bool {
         return queryBodyHasInternalShardFields(alloc, body);
     }
@@ -2344,6 +2399,9 @@ fn applyCommonSearchRequestOptions(
             .through = if (requirements.after_write) |receipt| .{ .table_id = receipt.table_id, .object_generation = receipt.object_generation, .wal_lsn = receipt.wal_lsn } else null,
         };
     };
+    if (comptime @hasField(@TypeOf(request), "source_projection")) if (request.source_projection) |projection_request| {
+        req.source_projection_json = try std.json.Stringify.valueAlloc(alloc, projection_request, .{ .emit_null_optional_fields = false });
+    };
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
     if (request.remote_snapshot) |snapshot| {
@@ -2511,8 +2569,14 @@ fn applySearchRequestFields(
         try cloneFields(alloc, items)
     else
         &.{};
+    errdefer freeClonedFields(alloc, fields);
     req.fields = fields;
     req.include_all_fields = include_all_fields;
+    if (req.source_projection_json.len != 0) {
+        var parsed_projection = try std.json.parseFromSlice(source_projection.Request, alloc, req.source_projection_json, .{});
+        defer parsed_projection.deinit();
+        try source_projection.validate(alloc, parsed_projection.value, fields, include_all_fields);
+    }
     req.include_stored = include_all_fields or fields.len > 0 or req.reranker != null or req.hasHitEvaluation();
     req.defer_stored_projection = req.hasHitEvaluation() or canDeferStoredProjection(fields) or
         !req.hierarchy_match_include_all_fields or
@@ -3649,6 +3713,7 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"_primary_text_index_name\"",
         "\"_embedding_limits\"",
         "\"execution\"",
+        "\"source_projection\"",
         "\"value_search_execution\"",
         "\"lake_read\"",
         "\"lake_visibility\"",
@@ -3950,6 +4015,7 @@ fn ColumnWireResult(comptime T: type) type {
         base: T,
         hits: []db_mod.types.SearchHit,
         req: db_mod.types.SearchRequest,
+        projection: ?source_projection.Prepared,
         scratch: *std.heap.ArenaAllocator,
         alloc: std.mem.Allocator,
         failure: *?anyerror,
@@ -3978,7 +4044,7 @@ fn ColumnWireResult(comptime T: type) type {
                         };
                         const hit = self.hits[hit_index];
                         _ = hit_arena.reset(.retain_capacity);
-                        const api_hit = if (hydrator != null) toOpenApiHit(hit_arena.allocator(), self.req, hit) catch |err| {
+                        var api_hit = if (hydrator != null) toOpenApiHitPrepared(hit_arena.allocator(), self.req, hit, self.projection) catch |err| {
                             self.failure.* = err;
                             return error.WriteFailed;
                         } else base_hit;
@@ -3986,10 +4052,29 @@ fn ColumnWireResult(comptime T: type) type {
                             self.failure.* = err;
                             return error.WriteFailed;
                         };
+                        if (self.projection != null) if (hit.column_source) |source| {
+                            // Reuse the column view directly. Encoding/parsing a
+                            // full JSON row here would duplicate large image strings.
+                            const source_value = source.valueForProjection(&hit_arena, .{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields }) catch |err| {
+                                self.failure.* = err;
+                                return error.WriteFailed;
+                            };
+                            var value = projectPublicSourceView(hit_arena.allocator(), source_value, .{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields }) catch |err| {
+                                self.failure.* = err;
+                                return error.WriteFailed;
+                            };
+                            applySourceProjection(true, hit_arena.allocator(), self.projection.?, hit.id, &value, &api_hit) catch |err| {
+                                self.failure.* = err;
+                                return error.WriteFailed;
+                            };
+                            api_hit._source = .{ .map = value.object };
+                        };
                         try w.beginObject();
                         inline for (@typeInfo(@TypeOf(api_hit)).@"struct".field_names) |field| {
                             if (comptime std.mem.eql(u8, field, "_source")) {
-                                if (hit.column_source) |source| {
+                                if (self.projection != null) {
+                                    try writeWireField(w, field, api_hit._source);
+                                } else if (hit.column_source) |source| {
                                     if (self.req.include_stored) {
                                         try w.objectField(field);
                                         const options: db_mod.types.LookupOptions = .{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields };
@@ -4040,7 +4125,7 @@ fn writeWireField(w: *std.json.Stringify, comptime name: []const u8, value: anyt
     try w.objectField(name);
     try w.write(value);
 }
-fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req: db_mod.types.SearchRequest, base: anytype, hits: []db_mod.types.SearchHit, delivery: ?@import("query_response.zig").Delivery, delivered: *?usize) ![]u8 {
+fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req: db_mod.types.SearchRequest, base: anytype, hits: []db_mod.types.SearchHit, delivery: ?@import("query_response.zig").Delivery, delivered: *?usize, projection: ?source_projection.Prepared) ![]u8 {
     var failure: ?anyerror = null;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
@@ -4068,7 +4153,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
                 }
             };
         }
-        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan };
+        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan };
         std.json.Stringify.value(.{ .responses = &.{wrapped} }, options, &plan.writer) catch |err| return failure orelse (plan.failure orelse err);
         plan.writer.flush() catch |err| return plan.failure orelse err;
         // Every prepared fragment now belongs to residency or the spool.
@@ -4096,7 +4181,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
         delivered.* = plan.length;
         return empty;
     }
-    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure };
+    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .alloc = alloc, .failure = &failure };
     return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, options) catch |err| return failure orelse err;
 }
 
@@ -4125,9 +4210,10 @@ pub fn encodeQueryResponsesWithDelivery(
     const arena = arena_impl.allocator();
 
     const emitted_hits = if (req.count_only) result.hits[0..0] else result.hits;
+    const projection = try prepareSourceProjection(arena, req);
     const hits = try arena.alloc(metadata_openapi.QueryHit, emitted_hits.len);
     for (emitted_hits, 0..) |hit, i| {
-        hits[i] = try toOpenApiHit(arena, req, hit);
+        hits[i] = try toOpenApiHitPrepared(arena, req, hit, projection);
     }
 
     const graph_dialect = if (req.graph_queries.len > 0)
@@ -4167,7 +4253,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
-            break :blk if (graph_results != null or hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) encodeColumnWire(alloc, graph_results, req, query_results[0], emitted_hits, delivery, &delivered) catch |err| return graph_wire_failure orelse err else try std.json.Stringify.valueAlloc(
+            break :blk if (graph_results != null or hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) encodeColumnWire(alloc, graph_results, req, query_results[0], emitted_hits, delivery, &delivered, projection) catch |err| return graph_wire_failure orelse err else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.QueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -4199,7 +4285,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
-            break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.StatefulQueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -4218,10 +4304,18 @@ pub fn encodeQueryResponsesWithDelivery(
     };
 }
 
+fn prepareSourceProjection(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) !?source_projection.Prepared {
+    if (req.source_projection_json.len == 0 or req.document_authority_mode != .none) return null;
+    const request = try std.json.parseFromSliceLeaky(source_projection.Request, alloc, req.source_projection_json, .{});
+    return try source_projection.Prepared.init(alloc, request);
+}
 fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !metadata_openapi.QueryHit {
+    return toOpenApiHitPrepared(alloc, req, hit, try prepareSourceProjection(alloc, req));
+}
+fn toOpenApiHitPrepared(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?source_projection.Prepared) !metadata_openapi.QueryHit {
     try validateOpenApiHitSortTuple(req, hit);
 
-    return .{
+    var api_hit: metadata_openapi.QueryHit = .{
         ._computed = if (hit.computed_json) |data| try takeOpenApiObjectMap(alloc, try ant_json.parseFromSliceLeaky(std.json.Value, alloc, data, .{})) else null,
         ._id = hit.id,
         ._score = if (hit.score) |score| finiteScoreOrZero(score) else 0,
@@ -4258,6 +4352,23 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         .hierarchy = try searchHitHierarchyOpenApiValue(alloc, req, hit),
         ._highlights = try highlightsJsonValue(alloc, hit.highlights),
     };
+    if (projection != null and hit.column_source == null) {
+        if (api_hit._source) |source| {
+            var value = std.json.Value{ .object = source.map };
+            if (hit.source_value != null)
+                try applySourceProjection(true, alloc, projection.?, hit.id, &value, &api_hit)
+            else
+                try applySourceProjection(false, alloc, projection.?, hit.id, &value, &api_hit);
+            api_hit._source = .{ .map = value.object };
+        }
+    }
+    return api_hit;
+}
+fn applySourceProjection(comptime borrowed: bool, alloc: std.mem.Allocator, projection: source_projection.Prepared, id: []const u8, value: *std.json.Value, hit: *metadata_openapi.QueryHit) !void {
+    const identities = try source_projection.apply(borrowed, alloc, projection, id, value);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, identities, .{ .emit_null_optional_fields = false });
+    defer alloc.free(encoded);
+    hit._source_projection = try std.json.parseFromSliceLeaky(@typeInfo(@FieldType(metadata_openapi.QueryHit, "_source_projection")).optional.child, alloc, encoded, .{ .allocate = .alloc_always });
 }
 
 /// Move an owned dynamic JSON object into the generated OpenAPI object-map
@@ -11158,6 +11269,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     if (req.index_name) |index_name| alloc.free(index_name);
     if (req.primary_text_index_name) |index_name| alloc.free(index_name);
     if (req.remote_snapshot) |snapshot| alloc.free(snapshot);
+    if (req.source_projection_json.len > 0) alloc.free(req.source_projection_json);
     if (req.evaluation_json.len > 0) alloc.free(req.evaluation_json);
     if (req.aggregations_json.len > 0) alloc.free(req.aggregations_json);
     if (req.filter_prefix.len > 0) alloc.free(req.filter_prefix);
@@ -19274,7 +19386,7 @@ fn typedLakeSourceScenario(a: std.mem.Allocator) !void {
     }
 }
 
-test "external lake typed source preserves ownership highlights exact values and public projection" {
+test "api query contract external lake typed source preserves ownership highlights exact values and public projection" {
     try typedLakeSourceScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, typedLakeSourceScenario, .{});
 }
@@ -19339,12 +19451,12 @@ fn columnLakeSourceScenario(a: std.mem.Allocator) !void {
     defer spilled.deinit(a);
     try std.testing.expectEqual(spilled.delivered_bytes.?, counter.bytes);
 }
-test "external lake column sources share pages and encode with typed source parity under allocation failures" {
+test "api query contract external lake column sources share pages and encode with typed source parity under allocation failures" {
     try columnLakeSourceScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, columnLakeSourceScenario, .{});
 }
 
-test "external lake column response delivery preserves cancellation and malformed source errors" {
+test "api query contract external lake column response delivery preserves cancellation and malformed source errors" {
     const a = std.testing.allocator;
     const rows = @import("../storage/rowsource/types.zig");
     const refs = [_]rows.RowRef{.{ .relational_key = "doc" }};

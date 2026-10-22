@@ -281,9 +281,30 @@ pub const Row = struct {
     /// Temporary borrowed source for highlighting and complex projections.
     /// Containers and parsed JSON belong to arena; scalar bytes belong to the page.
     pub fn value(self: Row, arena: *std.heap.ArenaAllocator) !std.json.Value {
+        return self.valueForProjection(arena, .{ .fields = @as([]const []const u8, &.{}), .include_all_fields = true });
+    }
+    /// Conservative root selection for a subsequent full projection. This is
+    /// not a final field mask: nested exclusions still belong to the projector.
+    /// Do not decode unrelated JSON columns merely to select one logical path.
+    pub fn valueForProjection(self: Row, arena: *std.heap.ArenaAllocator, options: anytype) !std.json.Value {
         const a = arena.allocator();
         var object: std.json.ObjectMap = .empty;
-        for (self.page.columns) |column| try object.put(a, column.name, try self.cell(a, column));
+        const includes = for (options.fields) |field| {
+            if (field.len == 0 or field[0] != '-') break true;
+        } else false;
+        if (options.fields.len == 0 and !options.include_all_fields) return .{ .object = object };
+        for (self.page.columns) |column| {
+            if (excluded(options.fields, column.name)) continue;
+            if (includes) {
+                const selected = for (options.fields) |field| {
+                    if (field.len > 0 and field[0] == '-') continue;
+                    const root = field[0 .. std.mem.indexOfScalar(u8, field, '.') orelse field.len];
+                    if (std.mem.eql(u8, root, "*") or std.mem.eql(u8, root, column.name)) break true;
+                } else false;
+                if (!selected) continue;
+            }
+            try object.put(a, column.name, try self.cell(a, column));
+        }
         return .{ .object = object };
     }
     fn cell(self: Row, a: A, column: rows.ColumnVector) !std.json.Value {
@@ -310,7 +331,7 @@ pub const Row = struct {
             if (std.mem.indexOfScalar(u8, field, '.') != null) break false;
         } else true;
         if (!simple) {
-            const source = try self.value(scratch);
+            const source = try self.valueForProjection(scratch, options);
             var view = try projection.projectLookupView(sa, source, options);
             stripInternal(&view);
             return w.write(view);
@@ -344,7 +365,7 @@ pub const Row = struct {
             if (std.mem.indexOfScalar(u8, field, '.') != null) break false;
         } else true;
         if (!simple) {
-            const source = try self.value(scratch);
+            const source = try self.valueForProjection(scratch, options);
             var view = try projection.projectLookupView(sa, source, options);
             stripInternal(&view);
             var it = view.object.iterator();

@@ -50,6 +50,11 @@ def main():
         action="store_true",
         help="disable ranking to measure first streaming output",
     )
+    parser.add_argument(
+        "--source-projection",
+        action="store_true",
+        help="enable conditional source identities on the fixture server",
+    )
     parser.add_argument("--delay-ms", type=float, default=20)
     parser.add_argument("--slow-first-ms", type=float, default=0)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -145,9 +150,14 @@ def main():
                     Path(config).write_text(json.dumps(settings))
                     case.server.delay = args.delay_ms / 1000
                     case.server.slow_first_ms = args.slow_first_ms
+                    case.server.source_projection_mode = (
+                        "enabled" if args.source_projection else None
+                    )
                     for phase in ("cold", "warm"):
                         case.server.requests.clear()
                         case.server.index_requests.clear()
+                        case.server.projected_asset_bytes = 0
+                        case.server.index_response_bytes = 0
                         start = time.monotonic_ns()
                         process_report = case.root / "child-usage.json"
                         command = [
@@ -213,6 +223,8 @@ def main():
                                 "harness_elapsed_ns": harness_elapsed,
                                 "provider_requests": len(requests),
                                 "index_requests": len(case.server.index_requests),
+                                "index_response_bytes": case.server.index_response_bytes,
+                                "projected_asset_bytes": case.server.projected_asset_bytes,
                                 "logical_provider_json_bytes": sum(
                                     len(
                                         json.dumps(
@@ -251,6 +263,8 @@ def main():
                             "peak_rss_bytes",
                             "provider_requests",
                             "index_requests",
+                            "index_response_bytes",
+                            "projected_asset_bytes",
                             "logical_provider_json_bytes",
                             "evaluated_units",
                         )
@@ -271,6 +285,7 @@ def main():
         "per_request_delay_ms": args.delay_ms,
         "slow_first_ms": args.slow_first_ms,
         "batch_size": args.batch_size,
+        "conditional_source_projection": args.source_projection,
         "binaries": {
             name: {
                 "path": str(path),

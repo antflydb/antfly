@@ -9902,6 +9902,9 @@ components:
             When omitted, Antfly uses the balanced default effort (`0.5`) unless
             lower-level vector search overrides are provided internally.
           example: 0.5
+        source_projection:
+          $ref: "#/components/schemas/SourceProjection"
+          x-go-type-skip-optional-pointer: false
         fields:
           x-go-type-skip-optional-pointer: false
           type: array
@@ -11173,6 +11176,62 @@ components:
           type: integer
           format: int64
           description: Published graph metric score generation used for this hit.
+    SourceProjection:
+      type: object
+      additionalProperties: false
+      required: [fields]
+      description: |
+        Conditional delivery of selected logical source fields on authorized hits.
+        Every field must also be selected by `fields` (or the default all-fields
+        projection). Conditions only suppress unchanged source values; they never
+        authorize a read, skip filters, or establish the existence of a record.
+        The response reports value, unchanged, or missing separately for each path.
+        Older servers may omit this extension; callers must retain full-value fallback.
+      properties:
+        fields:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/SourceProjectionField"
+    SourceProjectionField:
+      type: object
+      additionalProperties: false
+      required: [field]
+      properties:
+        field:
+          type: string
+          maxLength: 1024
+          description: Exact logical object path; overlapping paths and wildcards are not supported.
+        if_match:
+          type: array
+          maxItems: 4096
+          description: Optional per-record expected identities. Duplicate record IDs are invalid.
+          items:
+            $ref: "#/components/schemas/SourceValueCondition"
+    SourceValueCondition:
+      type: object
+      additionalProperties: false
+      required: [id, identity]
+      properties:
+        id:
+          type: string
+          maxLength: 4096
+        identity:
+          type: string
+          pattern: '^sv1-[0-9a-f]{64}$'
+          description: Opaque versioned identity previously returned by this server for these exact logical bytes.
+    SourceValueIdentity:
+      type: object
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [value, unchanged, missing]
+          description: Stored null is a value. Missing has no identity; unchanged omits the value from _source.
+        identity:
+          type: string
+          description: Opaque versioned value identity, present for value and unchanged states.
     QueryHit:
       type: object
       description: A single query result hit
@@ -11220,6 +11279,11 @@ components:
           $ref: "#/components/schemas/QueryScoreDetails"
           description: Optional score provenance for ranking features applied to this hit.
           x-go-name: scoreDetails
+        _source_projection:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/SourceValueIdentity"
+          description: Conditional source states keyed by exact logical field path; returned only when source_projection was requested.
         _source:
           type: object
           additionalProperties: true # map[string]any for field values

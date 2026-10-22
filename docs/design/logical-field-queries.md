@@ -872,3 +872,17 @@ registers fetched proofs under one lock, with epoch validity rechecked after I/O
 Owner/nonce/epoch/publication rules are unchanged. This cache stores scalar source
 facts; it does not establish complete cross-write predicate membership or bypass
 current authorization, selected-range digests or original-byte work budgets.
+
+
+### Conditional source delivery
+
+`QueryRequest.source_projection` conditions the delivery of exact selected
+logical source fields, independently of predicate representation selection.
+It does not introduce physical companion fields into the query DSL. Conditions
+are per record ID and logical path; `_source_projection` distinguishes returned,
+unchanged and missing values. Stored null remains a value. Authorization and
+source-dependent operators run before final delivery, including distributed and
+column-backed execution. See [the grep design](antfly-grep.md#conditional-source-projection-and-future-storage-authorities)
+for the wire contract, bounded verified-image reuse, old-server fallback and
+remaining storage-authority optimization. The initial reference path hashes
+current projected values and cannot claim source-free server execution.

@@ -700,6 +700,8 @@ pub const Client = struct {
         if (self.batch_store) |store| store.store(a, self.io, self.options, scores.len, digestKey(key_hex), bytes);
     }
     fn request(self: *Client, inputs: []const Input, probabilities: []f64) anyerror!void {
+        // Never let a descriptor poison a coalesced batch of materialized peers.
+        for (inputs) |input| if (input.image) |image| if (image.data_url.len == 0) return error.ImageMaterializationRequired;
         if (self.coalescer) |coalescer| {
             if (inputs.len > 0 and inputs.len < self.options.decisionBatchSize() and self.options.decision_batch_wait_ms > 0 and
                 // The shared request counter reserves one slot per actual
@@ -786,6 +788,9 @@ pub const Client = struct {
         if (failure) |err| return err;
     }
     fn requestOnce(self: *Client, inputs: []const Input, probabilities: []f64) !void {
+        // A descriptor proves prior validation of current bytes, not a model
+        // score. Expiry, eviction and query changes must materialize before HTTP.
+        for (inputs) |input| if (input.image) |image| if (image.data_url.len == 0) return error.ImageMaterializationRequired;
         // Bound serialization/response scratch by provider concurrency too.
         // Release only after those buffers are freed, including split/retry
         // errors; waiting file workers retain borrowed source, not JSON copies.

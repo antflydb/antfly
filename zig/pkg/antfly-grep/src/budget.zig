@@ -31,6 +31,7 @@ pub const Limits = struct {
     requests: std.atomic.Value(usize) = .init(0),
     regions: std.atomic.Value(usize) = .init(0),
     source_bytes: std.atomic.Value(usize) = .init(0),
+    source_projection_unsupported: std.atomic.Value(bool) = .init(false),
     cancel: std.atomic.Value(bool) = .init(false),
     pub fn acquireEvidence(self: *Limits, io: std.Io, bytes: usize) !void {
         if (bytes > evidence_memory_limit) return error.EvidenceMemoryExceeded;

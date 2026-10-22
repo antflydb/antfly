@@ -1930,6 +1930,9 @@ pub const SearchRequest = struct {
     /// Immutable local projection borrowed until synchronous search completion.
     /// Never serialized or populated by a public request.
     document_projection_plan: ?@import("document_query.zig").BorrowedSpanProjection = null,
+    /// Coordinator-owned conditional delivery; never forwarded to workers.
+    /// Owned canonical JSON on public ingress, borrowed for synchronous reads.
+    source_projection_json: []const u8 = "",
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -2110,6 +2113,8 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    // Conditional delivery runs after child authorization and retrieval.
+    "source_projection_json",
     "value_search_work",
     "value_search_scope",
     "document_authority_mode",

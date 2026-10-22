@@ -4561,7 +4561,12 @@ The default 1,000-request cap applies to all index and provider attempts across
 lanes. Default-budget image searches can overlap a manifest page only when
 conservative current-page retry/split headroom remains; explicit finite budgets
 and text-stage searches keep serial metadata admission. Server-owned conditional
-source identities remain [future API work](../../../docs/design/antfly-grep.md#future-generic-conditional-source-projection); warm images still receive full byte validation.
+source identities use the generic [conditional projection contract](../../../docs/design/antfly-grep.md#conditional-source-projection-and-future-storage-authorities).
+Warm descriptor and decision hits can omit image transfers after a current
+permission/revision check. Changed values or unavailable scores materialize and
+validate full bytes. Older servers retain full-value fallback. The current
+server reference path still reads and hashes selected values; source-free
+storage authority lookup remains future work.
 
 The [rolling-evidence qualification](bench/results/grep-rolling-evidence-summary.json)
 compares this implementation with the preceding cross-parent binary. In a
