@@ -11933,6 +11933,7 @@ const TextLiveVisibilityProducer = struct {
     live_filter: @typeInfo(@FieldType(StructuredFilterResolverExecutor, "live_filter_doc_set")).optional.child,
     generation: ?u64,
     control: @FieldType(search_mod.SearchRequest, "control"),
+    materialize_after: u64,
     examined: std.atomic.Value(u64) = .init(0),
     building: std.atomic.Value(bool) = .init(false),
     complete: std.atomic.Value(?*roaring.RoaringBitmap) = .init(null),
@@ -11994,17 +11995,25 @@ const TextLiveVisibilityProducer = struct {
         try self.control.check();
         if (self.complete.load(.acquire)) |bitmap| return self.fromComplete(bitmap, alloc, offset, count, candidates);
         const incoming: u64 = if (candidates) |bitmap| bitmap.cardinality() else count;
+        if (incoming == 0) return roaring.RoaringBitmap.init(alloc);
         const before = self.examined.fetchAdd(incoming, .monotonic);
         // Bound selective probes before a broad query pays for one population
         // projection. Never wait for another builder: concurrent lanes keep
         // refining their candidates until immutable membership is published.
-        const threshold = @max(1024, self.snapshot.liveDocCount() / 128);
-        if (before + incoming >= threshold and self.building.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+        if (before + incoming >= self.materialize_after and self.building.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
             if (try self.buildComplete()) |bitmap| self.complete.store(bitmap, .release);
         }
         if (self.complete.load(.acquire)) |bitmap| return self.fromComplete(bitmap, alloc, offset, count, candidates);
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
+        // The producer receives one segment's base and local candidates.
+        // Resolve and lease that segment once, not once per posting hit.
+        const resolved = self.snapshot.resolveDocId(offset) orelse return error.InvalidQueryRequest;
+        var segment = try self.snapshot.leaseSegment(resolved.seg_idx);
+        defer segment.deinit();
+        if (resolved.local_id != 0 or segment.entry.reader.doc_count != count) return error.InvalidQueryRequest;
+        segment.entry.noteAccess();
+        var ordinal_cursor = try segment_mod.DocOrdinalCursor.init(&segment.entry.reader);
         var iterator = if (candidates) |bitmap| bitmap.iterator() else null;
         var position: u32 = 0;
         var docs: [64]u32 = undefined;
@@ -12016,8 +12025,7 @@ const TextLiveVisibilityProducer = struct {
             if (local) |doc| {
                 if (doc >= count) return error.InvalidQueryRequest;
                 position = doc +| 1;
-                const global = std.math.add(u32, offset, doc) catch return error.InvalidQueryRequest;
-                if (try self.snapshot.docOrdinal(global)) |ordinal| {
+                if (try ordinal_cursor.get(doc)) |ordinal| {
                     docs[used] = doc;
                     ordinals[used] = ordinal;
                     used += 1;
@@ -12138,6 +12146,7 @@ pub fn searchTextQuery(
                     .live_filter = executor.live_filter_doc_set.?,
                     .generation = effective_req.identity_read_generation,
                     .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+                    .materialize_after = @max(1024, snapshot.liveDocCount() / 128),
                 };
                 apply_broad_live_all_docs = false;
             }
@@ -35092,6 +35101,25 @@ test "text live visibility refines posting candidates and skips an all-visible f
         try std.testing.expectEqual(@as(usize, 1), harness.broad_calls);
         if (mode != .keys) try std.testing.expect(harness.seen <= 1024);
     }
+    // Candidate lookup must amortize sidecar validation and source reads too,
+    // rather than resolving the global segment/header again for every hit.
+    harness.broad = .bitmap;
+    harness.broad_calls = 0;
+    const pinned = writer.acquireSnapshot();
+    defer pinned.release();
+    var producer = TextLiveVisibilityProducer{ .alloc = a, .snapshot = pinned, .ctx = &harness, .live_filter = Harness.filter, .generation = 9, .control = .{}, .materialize_after = 1024 };
+    defer producer.deinit();
+    var candidates = roaring.RoaringBitmap.init(a);
+    defer candidates.deinit();
+    try candidates.addRange(0, 512);
+    const cache = &pinned.segments[0].reader.native.?.metadata_cache.?;
+    const before = cache.cache.clock;
+    var selected = try TextLiveVisibilityProducer.produce(&producer, a, 0, 5000, &candidates);
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 511), selected.cardinality());
+    try std.testing.expect(!selected.contains(111));
+    try std.testing.expect(cache.cache.clock - before <= 32);
+    try std.testing.expectEqual(@as(usize, 0), harness.broad_calls);
     harness.broad = .forbidden;
     harness.fail = true;
     try std.testing.expectError(error.TestVisibilityFailure, searchTextQuery(a, req, query, executor));
