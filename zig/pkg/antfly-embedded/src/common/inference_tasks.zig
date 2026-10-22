@@ -122,7 +122,7 @@ pub const Executor = struct {
         return generator.chat(a, .{ .messages = messages, .body_json = body, .operation = operation, .stream = if (sink.start != null) .{ .context = &borrowed, .start = Forwarder.start, .write = Forwarder.write, .close = Forwarder.close } else null });
     }
 
-    pub fn decide(self: Executor, a: std.mem.Allocator, name: []const u8, input: []const u8, questions: Json) !Json {
+    pub fn decide(self: Executor, a: std.mem.Allocator, name: []const u8, input: decisions.Input, questions: Json) !Json {
         var runtime = decision_runtime.Runtime{
             .registry = self.view.providers,
             .http = self.http,
@@ -133,8 +133,49 @@ pub const Executor = struct {
             .antfly_url = self.inference_api_url,
             .antfly_api_key = self.inference_api_key,
         };
+        defer runtime.deinit();
         const results = try runtime.provider().evaluateBatch(a, &.{.{ .decider = name, .input = input, .questions = if (questions == .array) try decisions.publicQuestions(a, questions) else questions }});
         return results[0];
+    }
+
+    pub fn decideRequest(self: Executor, a: std.mem.Allocator, name: []const u8, request: Json) !Json {
+        const batch = try @import("../functions/decision_batch.zig").parse(a, request);
+        const source_questions = request.object.get("questions") orelse return error.InvalidDecisionSpecification;
+        if (!batch.batched) return self.decide(a, name, batch.items[0].input, source_questions);
+        const questions = if (source_questions == .array) try decisions.publicQuestions(a, source_questions) else source_questions;
+        const requests = try a.alloc(decisions.Request, batch.items.len);
+        for (batch.items, requests) |item, *target| target.* = .{ .decider = name, .input = item.input, .questions = questions };
+        var runtime = decision_runtime.Runtime{
+            .registry = self.view.providers,
+            .http = self.http,
+            .io = self.http.io,
+            .context = self.context,
+            .secret_store = self.secret_store,
+            .antfly_provider = self.antfly_provider,
+            .antfly_url = self.inference_api_url,
+            .antfly_api_key = self.inference_api_key,
+        };
+        defer runtime.deinit();
+        const result = try runtime.evaluatePartial(a, requests);
+        var data: Json = .{ .array = std.array_list.Managed(Json).init(a) };
+        for (batch.items, result.values, result.failures, 0..) |item, value, failure, index| {
+            var row = decisions.jsonObject();
+            try decisions.put(a, &row, "input_index", .{ .integer = @intCast(index) });
+            if (item.id) |id| try decisions.put(a, &row, "id", .{ .string = id });
+            try decisions.put(a, &row, "answers", if (value) |valid| valid.object.get("answers").? else .{ .array = std.array_list.Managed(Json).init(a) });
+            if (value) |valid| try decisions.put(a, &row, "model", valid.object.get("model").?);
+            if (failure) |err| try decisions.put(a, &row, "error", .{ .string = @errorName(err) });
+            try data.array.append(row);
+        }
+        const cfg = try self.view.providers.getDeciderConfig(name);
+        var envelope = decisions.jsonObject();
+        try decisions.put(a, &envelope, "model", .{ .string = if (cfg.generator) |generator| generator.model else cfg.modelName() });
+        try decisions.put(a, &envelope, "data", data);
+        var usage = decisions.jsonObject();
+        try decisions.put(a, &usage, "input_tokens", .{ .integer = std.math.cast(i64, runtime.input_tokens) orelse return error.InvalidDecisionOutput });
+        try decisions.put(a, &usage, "output_tokens", .{ .integer = std.math.cast(i64, runtime.output_tokens) orelse return error.InvalidDecisionOutput });
+        try decisions.put(a, &envelope, "usage", usage);
+        return envelope;
     }
 
     pub fn embed(self: Executor, a: std.mem.Allocator, name: []const u8, texts: []const []const u8, dimensions: ?u32) ![]const []const f32 {

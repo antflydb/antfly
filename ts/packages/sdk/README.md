@@ -5,12 +5,15 @@ A TypeScript SDK for interacting with the Antfly API, suitable for both frontend
 ## Installation
 
 ```bash
-npm install @antfly/sdk
-# or
-yarn add @antfly/sdk
-# or
-pnpm add @antfly/sdk
+# For this development API, build from the pinned source using:
+# https://antfly.io/docs/reference/sdks#installation
+npm install /tmp/antfly-sdk-0.2.0.tgz
 ```
+
+The source examples target revision `ddba6584b38b59c62e261ef63e0374dc1f711617`.
+The inspected npm `0.0.14` package lacks `readAfterWrite`, `read_requirements`,
+and media chunking (checked 2026-10-22). Use the pinned source build above for
+these unreleased APIs; an unversioned registry install does not provide them.
 
 ## Quick Start
 

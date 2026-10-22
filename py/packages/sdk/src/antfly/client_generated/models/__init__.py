@@ -264,6 +264,14 @@ from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
 from .decision_choice import DecisionChoice
 from .decision_choice_probability import DecisionChoiceProbability
+from .decision_evidence_image import DecisionEvidenceImage
+from .decision_evidence_image_detail import DecisionEvidenceImageDetail
+from .decision_evidence_image_type import DecisionEvidenceImageType
+from .decision_evidence_message import DecisionEvidenceMessage
+from .decision_evidence_message_role import DecisionEvidenceMessageRole
+from .decision_evidence_message_type import DecisionEvidenceMessageType
+from .decision_evidence_text import DecisionEvidenceText
+from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
@@ -982,6 +990,15 @@ from .inference_model_info import InferenceModelInfo
 from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
 from .inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
+from .inference_model_instance import InferenceModelInstance
+from .inference_model_instance_list import InferenceModelInstanceList
+from .inference_model_instance_list_object import InferenceModelInstanceListObject
+from .inference_model_instance_load_request import InferenceModelInstanceLoadRequest
+from .inference_model_instance_residency_mode import InferenceModelInstanceResidencyMode
+from .inference_model_instance_state import InferenceModelInstanceState
+from .inference_model_instance_unload_blocked_reason import InferenceModelInstanceUnloadBlockedReason
+from .inference_model_instance_unload_response import InferenceModelInstanceUnloadResponse
+from .inference_model_instance_unload_response_outcome import InferenceModelInstanceUnloadResponseOutcome
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
@@ -2484,6 +2501,14 @@ __all__ = (
     "DecisionBatchItem",
     "DecisionChoice",
     "DecisionChoiceProbability",
+    "DecisionEvidenceImage",
+    "DecisionEvidenceImageDetail",
+    "DecisionEvidenceImageType",
+    "DecisionEvidenceMessage",
+    "DecisionEvidenceMessageRole",
+    "DecisionEvidenceMessageType",
+    "DecisionEvidenceText",
+    "DecisionEvidenceTextType",
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
@@ -3192,6 +3217,15 @@ __all__ = (
     "InferenceModelInfoChunkingLimits",
     "InferenceModelInfoInferenceCapabilities",
     "InferenceModelInfoQualifiedLimits",
+    "InferenceModelInstance",
+    "InferenceModelInstanceList",
+    "InferenceModelInstanceListObject",
+    "InferenceModelInstanceLoadRequest",
+    "InferenceModelInstanceResidencyMode",
+    "InferenceModelInstanceState",
+    "InferenceModelInstanceUnloadBlockedReason",
+    "InferenceModelInstanceUnloadResponse",
+    "InferenceModelInstanceUnloadResponseOutcome",
     "InferenceModelKind",
     "InferenceModelQuantization",
     "InferenceModelRef",

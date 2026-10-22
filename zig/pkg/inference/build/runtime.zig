@@ -19,6 +19,7 @@ pub const OnnxModules = onnx_build.Modules;
 const jit_identity = @import("jit_identity.zig");
 
 pub const BackendOptions = struct {
+    allow_downloads: bool = true,
     enable_metal: bool = false,
     enable_cuda: bool = false,
     cuda_artifacts: []const u8 = "fatbin",
@@ -198,6 +199,7 @@ pub fn create(config: Config) Graph {
     };
     const scraping_mod = shared.scraping orelse blk: {
         const mod = createSharedModule(config, "lib/scraping/src/mod.zig");
+        mod.addImport("antfly_source_reference", createSharedModule(config, "lib/scraping/src/source_reference.zig"));
         mod.addImport("objectstore", objectstore_mod);
         mod.addImport("httpx", httpx_mod);
         break :blk mod;
@@ -449,6 +451,7 @@ pub fn create(config: Config) Graph {
     });
     inference_internal_mod.addImport("antfly_decisions", decisions_mod);
     inference_internal_mod.addImport("antfly_structured", structured_mod);
+    inference_internal_mod.addImport("antfly_extracting", extracting_mod);
     inference_internal_mod.addImport("build_info", shared.build_info_mod);
     identities.addImports(inference_internal_mod);
     inference_internal_mod.addImport("build_options", build_options_mod);
@@ -633,6 +636,7 @@ fn addExplicitBuildOptions(b: *std.Build, backend: BackendOptions) *std.Build.St
 }
 
 fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) void {
+    options.addOption(bool, "allow_downloads", backend.allow_downloads);
     options.addOption(bool, "enable_metal", backend.enable_metal);
     options.addOption(bool, "enable_cuda", backend.enable_cuda);
     options.addOption([]const u8, "cuda_artifacts", backend.cuda_artifacts);

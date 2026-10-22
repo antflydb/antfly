@@ -55,6 +55,12 @@ export interface AnswerResultsProps {
   followUpCount?: number; // → steps.followup.count
 
   // Callbacks
+  /** Receives a controller before the request starts, including the header wait. */
+  onController?: (controller: AbortController) => void;
+  /** Called after request settings change and invalidate active or completed results.
+   * Incidental rerenders and explicit controller aborts do not trigger this event.
+   */
+  onRequestContextChange?: () => void;
   onStreamStart?: () => void;
   onStreamEnd?: () => void;
   onError?: (error: string) => void;
@@ -114,6 +120,8 @@ export default function AnswerResults({
   renderFollowUpQuestions,
   renderHits,
   renderEvalResult,
+  onController,
+  onRequestContextChange,
   onStreamStart,
   onStreamEnd,
   onError: onErrorCallback,
@@ -147,6 +155,47 @@ export default function AnswerResults({
   const currentQuery = searchBoxWidget?.value as string | undefined;
   const submittedAt = searchBoxWidget?.submittedAt;
 
+  // Request ownership follows the values sent to the server, not React object
+  // identity. This keeps incidental rerenders alive while preventing a stream
+  // from an old table, endpoint, or model from updating the new context.
+  const requestContext = JSON.stringify([
+    url,
+    headers,
+    resolveTable(table || searchBoxWidget?.table, defaultTable),
+    generator,
+    agentKnowledge,
+    filterQuery,
+    exclusionQuery,
+    fields,
+    semanticIndexes,
+    evalConfig,
+    systemPrompt,
+    generationContext,
+    limit,
+    followUpCount,
+    showClassification,
+    showReasoning,
+    showFollowUpQuestions,
+    showConfidence,
+  ]);
+  const previousRequestContextRef = useRef(requestContext);
+  useEffect(() => {
+    if (previousRequestContextRef.current === requestContext) return;
+    previousRequestContextRef.current = requestContext;
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setClassification(null);
+    setHits([]);
+    setReasoning("");
+    setAnswer("");
+    setConfidence(null);
+    setFollowUpQuestions([]);
+    setEvalResult(null);
+    setIsStreaming(false);
+    setError(null);
+    onRequestContextChange?.();
+  }, [requestContext, onRequestContextChange]);
+
   // Trigger Answer Agent request when QueryBox is submitted (based on timestamp, not just query value)
   useEffect(() => {
     // Only trigger if we have a query and a submission timestamp
@@ -170,6 +219,10 @@ export default function AnswerResults({
       abortControllerRef.current.abort();
     }
 
+    const requestController = new AbortController();
+    abortControllerRef.current = requestController;
+    requestController.signal.addEventListener("abort", () => setIsStreaming(false), { once: true });
+    onController?.(requestController);
     previousSubmissionRef.current = submittedAt;
 
     // Resolve table: prop > QueryBox widget > default
@@ -228,75 +281,91 @@ export default function AnswerResults({
       }
 
       try {
-        const controller = await streamAnswer(url, retrievalRequest, headers || {}, {
-          onClassification: (data) => {
-            setClassification(data);
-            onClassificationCallback?.(data);
+        await streamAnswer(
+          url,
+          retrievalRequest,
+          headers || {},
+          {
+            onClassification: (data) => {
+              if (requestController.signal.aborted) return;
+              setClassification(data);
+              onClassificationCallback?.(data);
+            },
+            onReasoning: (chunk) => {
+              if (requestController.signal.aborted) return;
+              setReasoning((prev) => prev + chunk);
+            },
+            onHit: (hit) => {
+              if (requestController.signal.aborted) return;
+              setHits((prev) => [...prev, hit]);
+              onHitCallback?.(hit);
+            },
+            onGeneration: (chunk) => {
+              if (requestController.signal.aborted) return;
+              setAnswer((prev) => prev + chunk);
+              onGenerationChunkCallback?.(chunk);
+            },
+            onConfidence: (data) => {
+              if (requestController.signal.aborted) return;
+              setConfidence(data);
+              onConfidenceCallback?.(data);
+            },
+            onFollowup: (question) => {
+              if (requestController.signal.aborted) return;
+              setFollowUpQuestions((prev) => [...prev, question]);
+              onFollowupCallback?.(question);
+            },
+            onEvalResult: (data) => {
+              if (requestController.signal.aborted) return;
+              setEvalResult(data);
+            },
+            onComplete: () => {
+              if (requestController.signal.aborted) return;
+              setIsStreaming(false);
+              if (onStreamEnd) {
+                onStreamEnd();
+              }
+            },
+            onError: (err) => {
+              if (requestController.signal.aborted) return;
+              const message = err instanceof Error ? err.message : String(err);
+              setError(message);
+              setIsStreaming(false);
+              if (onErrorCallback) {
+                onErrorCallback(message);
+              }
+            },
+            onRetrievalAgentResult: (result) => {
+              if (requestController.signal.aborted) return;
+              // A terminal SSE result may omit fields already delivered as
+              // deltas. Only replace values the terminal payload contains.
+              if (result.classification !== undefined) {
+                setClassification(result.classification ?? null);
+              }
+              if (result.generation !== undefined) setAnswer(result.generation);
+              if (result.followup_questions !== undefined) {
+                setFollowUpQuestions(result.followup_questions);
+              }
+              if (result.hits !== undefined) setHits(result.hits);
+              if (
+                result.generation_confidence !== undefined &&
+                result.context_relevance !== undefined
+              ) {
+                setConfidence({
+                  generation_confidence: result.generation_confidence,
+                  context_relevance: result.context_relevance,
+                });
+              }
+              // Handle eval result from non-streaming response
+              if (result.eval_result) {
+                setEvalResult(result.eval_result);
+              }
+            },
           },
-          onReasoning: (chunk) => {
-            setReasoning((prev) => prev + chunk);
-          },
-          onHit: (hit) => {
-            setHits((prev) => [...prev, hit]);
-            onHitCallback?.(hit);
-          },
-          onGeneration: (chunk) => {
-            setAnswer((prev) => prev + chunk);
-            onGenerationChunkCallback?.(chunk);
-          },
-          onConfidence: (data) => {
-            setConfidence(data);
-            onConfidenceCallback?.(data);
-          },
-          onFollowup: (question) => {
-            setFollowUpQuestions((prev) => [...prev, question]);
-            onFollowupCallback?.(question);
-          },
-          onEvalResult: (data) => {
-            setEvalResult(data);
-          },
-          onComplete: () => {
-            setIsStreaming(false);
-            if (onStreamEnd) {
-              onStreamEnd();
-            }
-          },
-          onError: (err) => {
-            const message = err instanceof Error ? err.message : String(err);
-            setError(message);
-            setIsStreaming(false);
-            if (onErrorCallback) {
-              onErrorCallback(message);
-            }
-          },
-          onRetrievalAgentResult: (result) => {
-            // Non-streaming response
-            setClassification(result.classification || null);
-            setAnswer(result.generation || "");
-            setFollowUpQuestions(result.followup_questions || []);
-            setHits(result.hits || []);
-            if (
-              result.generation_confidence !== undefined &&
-              result.context_relevance !== undefined
-            ) {
-              setConfidence({
-                generation_confidence: result.generation_confidence,
-                context_relevance: result.context_relevance,
-              });
-            }
-            // Handle eval result from non-streaming response
-            if (result.eval_result) {
-              setEvalResult(result.eval_result);
-            }
-            setIsStreaming(false);
-            if (onStreamEnd) {
-              onStreamEnd();
-            }
-          },
-        });
-
-        abortControllerRef.current = controller;
+          { signal: requestController.signal }
+        );
       } catch (err) {
+        if (requestController.signal.aborted) return;
         const message = err instanceof Error ? err.message : "Unknown error";
         setError(message);
         setIsStreaming(false);
@@ -308,12 +377,8 @@ export default function AnswerResults({
 
     startStream();
 
-    // Cleanup on unmount or when submission changes
-    return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-    };
+    // Cancel on the next submission or unmount. An incidental render may
+    // recreate callback/array props and must not abort the active submission.
   }, [
     submittedAt,
     currentQuery,
@@ -336,6 +401,7 @@ export default function AnswerResults({
     showReasoning,
     showFollowUpQuestions,
     showConfidence,
+    onController,
     onStreamStart,
     onStreamEnd,
     onErrorCallback,

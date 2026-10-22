@@ -110,6 +110,82 @@ pub fn nowNs() u64 {
     return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
 }
 
+/// One observation per HTTP attempt, before its concurrency permit is released.
+pub const UsageObserver = struct {
+    ptr: *anyopaque,
+    record_fn: *const fn (*anyopaque, u64, u64) void,
+    pub fn record(self: UsageObserver, input: u64, output: u64) void {
+        self.record_fn(self.ptr, input, output);
+    }
+};
+pub const ReportedUsage = struct { input_tokens: u64, output_tokens: u64 };
+/// Parse only accounting fields, so invalid output/choices cannot hide usage.
+pub fn responseUsage(body: []const u8) ?ReportedUsage {
+    const Wire = struct {
+        usage: ?struct { input_tokens: ?u64 = null, output_tokens: ?u64 = null, prompt_tokens: ?u64 = null, completion_tokens: ?u64 = null } = null,
+        usageMetadata: ?struct { promptTokenCount: u64 = 0, candidatesTokenCount: u64 = 0, thoughtsTokenCount: u64 = 0 } = null,
+    };
+    var buffer: [4096]u8 = undefined;
+    var storage = std.heap.BufferFirstAllocator.init(&buffer, std.heap.smp_allocator);
+    const parsed = std.json.parseFromSlice(Wire, storage.allocator(), body, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    if (parsed.value.usage) |usage| return .{
+        .input_tokens = usage.input_tokens orelse usage.prompt_tokens orelse return null,
+        .output_tokens = usage.output_tokens orelse usage.completion_tokens orelse return null,
+    };
+    if (parsed.value.usageMetadata) |usage| return .{ .input_tokens = usage.promptTokenCount, .output_tokens = usage.candidatesTokenCount +| usage.thoughtsTokenCount };
+    return null;
+}
+
+/// Request-owned token accounting. Explicit input estimates support non-text
+/// inputs; excess provider usage becomes shared debt even for a fresh caller.
+/// Failed attempts retain their reservations, and successful calls never refund.
+pub const TokenReservation = struct {
+    limiter: *Limiter,
+    input_tokens: u64,
+    include_body_bytes: bool = false,
+    body_bytes_discount: usize = 0,
+    output_tokens: u64 = 0,
+    charged: u64 = 0,
+    /// Retain observed usage even if a caller cannot parse or validate the full
+    /// response within its arena budget. Reconciliation may run more than once.
+    reported_usage: ?ReportedUsage = null,
+    usage_observer: ?UsageObserver = null,
+
+    pub fn observer(self: *@This()) httpx.AttemptObserver {
+        return .{ .ptr = self, .before = before, .after = after, .output_tokens = self.output_tokens };
+    }
+    fn before(ptr: *anyopaque, context: httpx.AttemptObserver.Context) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const cost = self.input_tokens +| self.output_tokens +| (if (self.include_body_bytes) context.body_bytes -| self.body_bytes_discount else 0);
+        try self.limiter.beforeCost(context, cost);
+        self.charged = cost;
+        self.reported_usage = null;
+    }
+    fn after(ptr: *anyopaque, response: ?*const httpx.Response) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        // Reconcile before releasing concurrency so a following request cannot
+        // observe a replenished slot without the completed request's token debt.
+        if (response) |res| if (res.body) |body| {
+            if (responseUsage(body)) |usage| {
+                self.reconcile(usage.input_tokens, usage.output_tokens);
+                if (self.usage_observer) |usage_sink| usage_sink.record(usage.input_tokens, usage.output_tokens);
+            }
+        };
+        Limiter.after(self.limiter, response);
+    }
+    pub fn reconcile(self: *@This(), input_tokens: u64, output_tokens: u64) void {
+        self.reported_usage = .{ .input_tokens = input_tokens, .output_tokens = output_tokens };
+        const actual = input_tokens +| output_tokens;
+        if (actual <= self.charged) return;
+        sync.lockYielding(&self.limiter.mutex);
+        defer self.limiter.mutex.unlock();
+        self.limiter.refill(nowNs());
+        if (self.limiter.policy.tokens_per_minute != 0) self.limiter.tokens -= @floatFromInt(actual - self.charged);
+        self.charged = actual;
+    }
+};
+
 pub const Limiter = struct {
     mutex: std.atomic.Mutex = .unlocked,
     policy: Policy,
@@ -133,6 +209,10 @@ pub const Limiter = struct {
         // Conservative text accounting: serialized UTF-8 bytes plus the output
         // cap. No refund on failure; retries consume independent reservations.
         const cost = @as(u64, @intCast(context.body_bytes)) +| context.output_tokens;
+        return self.beforeCost(context, cost);
+    }
+
+    fn beforeCost(self: *Limiter, context: httpx.AttemptObserver.Context, cost: u64) !void {
         if (self.policy.tokens_per_minute != 0 and cost > self.policy.tokens_per_minute)
             return error.ProviderTokenBudgetExceeded;
         while (true) {
@@ -170,13 +250,18 @@ pub const Limiter = struct {
         if (self.policy.max_concurrency != 0 and self.in_flight >= self.policy.max_concurrency)
             return std.time.ns_per_ms;
         if (self.policy.requests_per_minute != 0 and self.requests < 1)
-            return @max(1, @as(u64, @intFromFloat(@ceil((1 - self.requests) * minute / @as(f64, @floatFromInt(self.policy.requests_per_minute))))));
+            return boundedWait((1 - self.requests) * minute / @as(f64, @floatFromInt(self.policy.requests_per_minute)));
         if (self.policy.tokens_per_minute != 0 and self.tokens < @as(f64, @floatFromInt(cost)))
-            return @max(1, @as(u64, @intFromFloat(@ceil((@as(f64, @floatFromInt(cost)) - self.tokens) * minute / @as(f64, @floatFromInt(self.policy.tokens_per_minute))))));
+            return boundedWait((@as(f64, @floatFromInt(cost)) - self.tokens) * minute / @as(f64, @floatFromInt(self.policy.tokens_per_minute)));
         if (self.policy.requests_per_minute != 0) self.requests -= 1;
         if (self.policy.tokens_per_minute != 0) self.tokens -= @floatFromInt(cost);
         self.in_flight += 1;
         return 0;
+    }
+
+    fn boundedWait(value: f64) u64 {
+        if (value >= @as(f64, @floatFromInt(std.math.maxInt(u64)))) return std.math.maxInt(u64);
+        return @max(1, @as(u64, @intFromFloat(@ceil(value))));
     }
 
     fn after(ptr: *anyopaque, response: ?*const httpx.Response) void {
@@ -581,4 +666,99 @@ test "provider quotas observe every retry and retain the permit through streamed
     try std.testing.expectEqual(state.starts, state.finishes);
     try std.testing.expectEqual(@as(usize, 0), state.active);
     try std.testing.expectEqual(@as(usize, 8), state.writes);
+}
+
+test "decision functions quota reservations reconcile actual usage before releasing concurrency" {
+    var limiter = Limiter.init(.{ .tokens_per_minute = 1000, .max_concurrency = 1 });
+    var reservation: TokenReservation = .{ .limiter = &limiter, .input_tokens = 400 };
+    const observer = reservation.observer();
+    const Cancel = struct {
+        fn no(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    try observer.before(observer.ptr, .{ .io = std.testing.io, .deadline_ms = null, .cancellation_ptr = &limiter, .is_cancelled = Cancel.no, .body_bytes = 1, .output_tokens = 0 });
+    try std.testing.expectEqual(@as(u64, 400), reservation.charged);
+    reservation.reconcile(3, 1);
+    try std.testing.expectEqual(@as(u64, 3), reservation.reported_usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u64, 400), reservation.charged);
+    var response = httpx.Response.init(std.testing.allocator, 200);
+    defer response.deinit();
+    response.body = "{\"usage\":{\"input_tokens\":10000,\"output_tokens\":5},\"answers\":\"invalid\"}";
+    observer.after(observer.ptr, &response);
+    try std.testing.expectEqual(@as(u32, 0), limiter.in_flight);
+    try std.testing.expect(limiter.tokens < -8000);
+    try std.testing.expect(limiter.tryReserve(limiter.last_ns, 400) > 0);
+    const debt = limiter.tokens;
+    reservation.reconcile(10000, 5);
+    try std.testing.expectEqual(debt, limiter.tokens);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), Limiter.boundedWait(1e100));
+}
+
+test "decision functions generation media quotas reserve framing and reconcile hosted usage" {
+    const Cancel = struct {
+        fn no(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    for ([_][]const u8{
+        "{\"usage\":{\"prompt_tokens\":2000,\"completion_tokens\":20}}",
+        "{\"usageMetadata\":{\"promptTokenCount\":2000,\"candidatesTokenCount\":15,\"thoughtsTokenCount\":5}}",
+    }) |body| {
+        var limiter = Limiter.init(.{ .tokens_per_minute = 10000, .max_concurrency = 1 });
+        var reservation = TokenReservation{ .limiter = &limiter, .input_tokens = 1000, .include_body_bytes = true, .body_bytes_discount = 80, .output_tokens = 20 };
+        const observer = reservation.observer();
+        try observer.before(observer.ptr, .{ .io = std.testing.io, .deadline_ms = null, .cancellation_ptr = &limiter, .is_cancelled = Cancel.no, .body_bytes = 100, .output_tokens = 0 });
+        try std.testing.expectEqual(@as(u64, 1040), reservation.charged);
+        var response = httpx.Response.init(std.testing.allocator, 200);
+        defer response.deinit();
+        response.body = body;
+        observer.after(observer.ptr, &response);
+        try std.testing.expectEqual(@as(u64, 2020), reservation.charged);
+        try std.testing.expectEqual(@as(u64, 2000), reservation.reported_usage.?.input_tokens);
+        try std.testing.expectEqual(@as(u32, 0), limiter.in_flight);
+    }
+}
+
+test "decision functions generated usage observes retries before releasing permits without stale counts" {
+    const Sink = struct {
+        limiter: *Limiter,
+        calls: usize = 0,
+        input: u64 = 0,
+        output: u64 = 0,
+        held: bool = true,
+        fn record(ptr: *anyopaque, input: u64, output: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.held = self.held and self.limiter.in_flight == 1;
+            self.calls += 1;
+            self.input += input;
+            self.output += output;
+        }
+        fn cancelled(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var limiter = Limiter.init(.{ .max_concurrency = 1 });
+    var sink = Sink{ .limiter = &limiter };
+    var reservation = TokenReservation{ .limiter = &limiter, .input_tokens = 0, .usage_observer = .{ .ptr = &sink, .record_fn = Sink.record } };
+    const observer = reservation.observer();
+    const context: httpx.AttemptObserver.Context = .{ .io = std.testing.io, .deadline_ms = null, .cancellation_ptr = &sink, .is_cancelled = Sink.cancelled, .body_bytes = 1, .output_tokens = 0 };
+    for ([_]?[]const u8{
+        "{\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3},\"choices\":\"invalid\"}",
+        null,
+        "{\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":2,\"thoughtsTokenCount\":1}}",
+    }) |body| {
+        try observer.before(observer.ptr, context);
+        try std.testing.expect(reservation.reported_usage == null);
+        var response = httpx.Response.init(std.testing.allocator, 503);
+        defer response.deinit();
+        response.body = body;
+        observer.after(observer.ptr, &response);
+        try std.testing.expectEqual(@as(u32, 0), limiter.in_flight);
+        if (body == null) try std.testing.expect(reservation.reported_usage == null);
+    }
+    try std.testing.expect(sink.held);
+    try std.testing.expectEqual(@as(usize, 2), sink.calls);
+    try std.testing.expectEqual(@as(u64, 19), sink.input);
+    try std.testing.expectEqual(@as(u64, 6), sink.output);
 }

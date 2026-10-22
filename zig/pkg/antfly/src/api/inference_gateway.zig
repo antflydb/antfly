@@ -273,7 +273,7 @@ fn sessionResponseId(value: Json) !?[]const u8 {
 
 pub fn view(server: anytype) !gateway.View {
     const config = server.cfg.node_config orelse return .{ .providers = &empty_registry };
-    return .{ .providers = &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
+    return .{ .providers = &config.registry, .connections = &config.connections, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
 }
 
 pub fn disabledResponse(ctx: *httpx.Context) !httpx.Response {
@@ -586,10 +586,9 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             });
         },
         .decide => {
-            try only(request, &.{ "model", "input", "questions" });
-            const input = try string(request.object.get("input") orelse return error.InvalidInferenceRequest);
-            const questions = request.object.get("questions") orelse return error.InvalidInferenceRequest;
-            const result = try executor.decide(a, name, input, questions);
+            try only(request, &.{ "model", "input", "inputs", "questions", "context_version", "contexts" });
+            const result = try executor.decideRequest(a, name, request);
+            observation.usageJson(result);
             return ctx.json(result);
         },
         .embed => {
@@ -887,6 +886,9 @@ fn executeVendorConnection(server: anytype, ctx: *httpx.Context, task: gateway.T
         if (cfg.region) |value| try provider.object.put(a, "region", .{ .string = value });
         if (request.object.get("dimensions")) |value| try provider.object.put(a, "dimensions", value);
     }
+    if (task == .decide) {
+        if (cfg.max_image_input_tokens) |bound| try provider.object.put(a, "max_image_input_tokens", .{ .integer = std.math.cast(i64, bound) orelse return error.InvalidConfig });
+    }
     if (task == .rerank) try provider.object.put(a, "field", .{ .string = "text" });
     var entries: Json = .{ .object = .empty };
     const name = "connection-target";
@@ -950,11 +952,18 @@ fn inlineTaskAttachments(a: std.mem.Allocator, task: gateway.Task, request: Json
                         }
                         return;
                     };
-                    if (object.get("image_url")) |image| if (image == .object) {
-                        const url = image.object.getPtr("url") orelse return error.InvalidInferenceRequest;
-                        if (try self.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(self.a, attachment) };
-                    };
-                    inline for (.{ "messages", "content", "input", "documents", "prompts" }) |field| if (object.getPtr(field)) |child| try self.media(child);
+                    if (object.get("image_url")) |image| {
+                        if (image == .object) {
+                            const url = image.object.getPtr("url") orelse return error.InvalidInferenceRequest;
+                            if (try self.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(self.a, attachment) };
+                        } else if (object.get("type")) |kind| {
+                            if (kind == .string and std.mem.eql(u8, kind.string, "input_image")) {
+                                const url = object.getPtr("image_url").?;
+                                if (try self.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(self.a, attachment) };
+                            }
+                        }
+                    }
+                    inline for (.{ "messages", "content", "input", "inputs", "documents", "prompts" }) |field| if (object.getPtr(field)) |child| try self.media(child);
                 },
                 else => {},
             }
@@ -964,7 +973,7 @@ fn inlineTaskAttachments(a: std.mem.Allocator, task: gateway.Task, request: Json
     @memset(seen, false);
     var state = State{ .a = a, .attachments = attachments, .seen = seen, .chat = task == .generate };
     switch (task) {
-        .generate, .embed, .rerank => try state.media(&adapted),
+        .generate, .embed, .rerank, .decide => try state.media(&adapted),
         .read => {
             const images = request.object.get("images") orelse return error.InvalidInferenceRequest;
             if (images != .array) return error.InvalidInferenceRequest;
@@ -1330,7 +1339,7 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
                 }
                 try item.object.put(a, "availability", connection.object.get("status") orelse .{ .string = "unknown" });
                 try item.object.put(a, "freshness", listed.object.get("freshness") orelse .{ .string = "cached" });
-                try item.object.put(a, "gateway_capabilities", try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, named.capabilities(.{ .connection = .{ .task = .generate, .connection = id, .model = backend } }), .{}), .{}));
+                try item.object.put(a, "gateway_capabilities", try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, connectionCatalogCapabilities(named, group.key_ptr.*, id, backend), .{}), .{}));
                 try putCatalogItem(a, &seen, &data, item);
                 var catalog_group = root.object.get(group.key_ptr.*) orelse Json{ .object = .empty };
                 if (catalog_group != .object) continue;
@@ -1345,6 +1354,12 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
     try root.object.put(a, "object", .{ .string = "list" });
     try root.object.put(a, "data", data);
     return ctx.json(root);
+}
+
+fn connectionCatalogCapabilities(named: gateway.View, category: []const u8, connection: []const u8, model: []const u8) gateway.Capabilities {
+    // Opaque groups retain declarations without claiming a task. Known groups
+    // must use the same task-specific adapter contract as invocation.
+    return named.capabilities(.{ .connection = .{ .task = gateway.taskForCategory(category) orelse .generate, .connection = connection, .model = model } });
 }
 
 fn putCatalogItem(a: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(usize), data: *Json, item: Json) !void {
@@ -1706,6 +1721,21 @@ test "httpx inference gateway framed typed adapters inline only media references
     try std.testing.expectEqualStrings("attachment:0", adapted_embed.object.get("input").?.array.items[0].object.get("text").?.string);
     const parts = try tasks.embeddingParts(a, adapted_embed.object.get("input").?);
     try std.testing.expectEqualStrings("image", parts[1].binary.data);
+    const decide = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"model":"deciders/visual","input":[{"role":"user","content":[{"type":"input_text","text":"attachment:0"},{"type":"input_image","image_url":"attachment:0"}]}]}
+    , .{});
+    const adapted_decide = try inlineTaskAttachments(a, .decide, decide, attachments);
+    const decision_parts = adapted_decide.object.get("input").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("attachment:0", decision_parts[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,aW1hZ2U=", decision_parts[1].object.get("image_url").?.string);
+    const batch_decide = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"model":"deciders/visual","inputs":[{"id":"text","input":"attachment:0"},{"id":"image","input":[{"role":"user","content":[{"type":"input_image","image_url":"attachment:0"}]}]}]}
+    , .{});
+    const adapted_batch = try inlineTaskAttachments(a, .decide, batch_decide, attachments);
+    const batch_inputs = adapted_batch.object.get("inputs").?.array.items;
+    try std.testing.expectEqualStrings("attachment:0", batch_inputs[0].object.get("input").?.string);
+    const image_part = batch_inputs[1].object.get("input").?.array.items[0].object.get("content").?.array.items[0];
+    try std.testing.expectEqualStrings("data:image/png;base64,aW1hZ2U=", image_part.object.get("image_url").?.string);
     const audio = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"transcribers/speech\",\"audio\":\"attachment:0\"}", .{});
     const adapted_audio = try inlineTaskAttachments(a, .transcribe, audio, &.{.{ .mime_type = "audio/flac", .data = "audio" }});
     try std.testing.expect(!adapted_audio.object.contains("audio"));
@@ -1714,4 +1744,19 @@ test "httpx inference gateway framed typed adapters inline only media references
     try std.testing.expectError(error.InvalidInferenceRequest, inlineTaskAttachments(a, .read, invalid, attachments));
     const unused = try std.json.parseFromSliceLeaky(Json, a, "{\"images\":[{\"url\":\"https://example.com/image\"}]}", .{});
     try std.testing.expectError(error.InvalidInferenceRequest, inlineTaskAttachments(a, .read, unused, attachments));
+}
+
+test "httpx inference gateway physical decision catalogs apply connection image budgets by task" {
+    const a = std.testing.allocator;
+    var config = try sources.common_config.Config.parseFromSlice(a,
+        \\{"connections":{"vendor":{"kind":"inference","capabilities":["models.decide","models.generate"],"inference":{"provider":"openai"}}},"inference_capabilities":{"connections/vendor/models/vision":{"images":"supported"}}}
+    );
+    defer config.deinit();
+    const Server = struct { cfg: struct { node_config: ?*sources.common_config.Config } };
+    var server = Server{ .cfg = .{ .node_config = &config } };
+    const named = try view(&server);
+    try std.testing.expectEqual(gateway.Support.unsupported, connectionCatalogCapabilities(named, "deciders", "vendor", "vision").images);
+    try std.testing.expectEqual(gateway.Support.supported, connectionCatalogCapabilities(named, "generators", "vendor", "vision").images);
+    config.connections.getPtr("vendor").?.inference.?.max_image_input_tokens = 8192;
+    try std.testing.expectEqual(gateway.Support.supported, connectionCatalogCapabilities(named, "deciders", "vendor", "vision").images);
 }

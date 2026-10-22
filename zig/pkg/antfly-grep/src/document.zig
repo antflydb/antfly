@@ -31,6 +31,8 @@ pub const Provenance = struct {
 pub const Document = struct {
     path: []const u8,
     content: []const u8,
+    evidence: []const @import("antfly_source_evidence").Unit = &.{},
+    evidence_loader: ?@import("antfly_source_evidence").Loader = null,
     cache_scope: ?[32]u8 = null,
     provenance: Provenance,
     modified_at: ?i64 = null,
@@ -43,15 +45,17 @@ pub const Document = struct {
         return parseSelected(value, table, id, snapshot, now, true);
     }
     fn parseSelected(value: std.json.Value, table: []const u8, id: []const u8, snapshot: ?[]const u8, now: i64, listing: bool) !Document {
-        if (integer(field(value, "version")) != 1) return error.UnsupportedDocumentVersion;
+        const version = integer(field(value, "version")) orelse return error.UnsupportedDocumentVersion;
+        if (version != 1 and version != 2) return error.UnsupportedDocumentVersion;
+        if (version == 1 and field(value, "evidence") != null) return error.UnsupportedDocumentVersion;
         const path = try string(value, "path");
         if (path.len == 0 or path.len > 16384 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidDocumentPath;
         const content = if (listing) "" else try string(value, "content");
         if (!std.unicode.utf8ValidateSlice(content)) return error.InvalidDocumentEncoding;
         const uri = try string(value, "uri");
-        if (uri.len > 16384) return error.InvalidSourceUri;
+        if (uri.len > 16384 or !std.unicode.utf8ValidateSlice(uri) or std.mem.indexOfScalar(u8, uri, 0) != null) return error.InvalidSourceUri;
         const parsed = std.Uri.parse(uri) catch return error.InvalidSourceUri;
-        if (parsed.scheme.len == 0 or parsed.user != null or parsed.password != null) return error.InvalidSourceUri;
+        if (parsed.scheme.len == 0 or std.ascii.eqlIgnoreCase(parsed.scheme, "data") or parsed.user != null or parsed.password != null) return error.InvalidSourceUri;
         const revision = try string(value, "revision");
         if (revision.len == 0 or revision.len > 4096) return error.InvalidDocumentRevision;
         const indexed_at = integer(field(value, "indexed_at")) orelse return error.InvalidIndexedTimestamp;

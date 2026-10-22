@@ -449,3 +449,87 @@ it("shows deployment enablement instead of an executable playground when public 
   expect(screen.queryByLabelText("Model")).toBeNull();
   expect(client.inference.invoke).not.toHaveBeenCalled();
 });
+
+it("runs multimodal decision evidence for an image-capable decider", async () => {
+  const id = "deciders/visual";
+  client.inference.models.mockResolvedValue({
+    data: [{ id, task: "decide", gateway_capabilities: { images: "supported" } }],
+  });
+  client.inference.invoke.mockResolvedValue(
+    new Response("{}", { headers: { "content-type": "application/json" } })
+  );
+  render(
+    <MemoryRouter>
+      <InferenceGatewayPage />
+    </MemoryRouter>
+  );
+  await waitFor(() => expect(document.querySelector(`option[value="${id}"]`)).not.toBeNull());
+  fireEvent.change(screen.getByLabelText("Model"), { target: { value: id } });
+  fireEvent.click(screen.getByRole("button", { name: "Use image example" }));
+  const body = JSON.parse((screen.getByLabelText("JSON request") as HTMLTextAreaElement).value);
+  expect(body.input[0].content[1]).toEqual({
+    type: "input_image",
+    image_url: expect.stringMatching(/^data:image\/png;base64,/),
+    detail: "auto",
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Run" }));
+  await waitFor(() =>
+    expect(client.inference.invoke).toHaveBeenCalledWith(
+      "decisions",
+      { ...body, model: id },
+      expect.any(AbortSignal)
+    )
+  );
+});
+
+it.each([
+  "generate",
+  undefined,
+])("does not offer decision images for a model with task %s", async (task) => {
+  const id = "connections/vendor/models/vision";
+  client.inference.models.mockResolvedValue({
+    data: [{ id, task, gateway_capabilities: { images: "supported" } }],
+  });
+  render(
+    <MemoryRouter>
+      <InferenceGatewayPage />
+    </MemoryRouter>
+  );
+  await waitFor(() => expect(document.querySelector(`option[value="${id}"]`)).not.toBeNull());
+  fireEvent.change(screen.getByLabelText("Model"), { target: { value: id } });
+  fireEvent.change(screen.getByLabelText("Operation"), { target: { value: "decisions" } });
+  expect(screen.queryByRole("button", { name: "Use image example" })).toBeNull();
+});
+
+it.each([
+  "supported",
+  "unsupported",
+])("runs an ordered decision batch with image support %s", async (images) => {
+  const id = "deciders/batch";
+  client.inference.models.mockResolvedValue({
+    data: [{ id, task: "decide", gateway_capabilities: { images } }],
+  });
+  client.inference.invoke.mockResolvedValue(
+    new Response("{}", { headers: { "content-type": "application/json" } })
+  );
+  render(
+    <MemoryRouter>
+      <InferenceGatewayPage />
+    </MemoryRouter>
+  );
+  await waitFor(() => expect(document.querySelector(`option[value="${id}"]`)).not.toBeNull());
+  fireEvent.change(screen.getByLabelText("Model"), { target: { value: id } });
+  fireEvent.click(screen.getByRole("button", { name: "Use batch example" }));
+  const request = JSON.parse((screen.getByLabelText("JSON request") as HTMLTextAreaElement).value);
+  expect(request.input).toBeUndefined();
+  expect(request.inputs.map((item: { id: string }) => item.id)).toEqual(["first", "second"]);
+  expect(Array.isArray(request.inputs[0].input)).toBe(images === "supported");
+  fireEvent.click(screen.getByRole("button", { name: "Run" }));
+  await waitFor(() =>
+    expect(client.inference.invoke).toHaveBeenCalledWith(
+      "decisions",
+      { model: id, ...request },
+      expect.any(AbortSignal)
+    )
+  );
+});

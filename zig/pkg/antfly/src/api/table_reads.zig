@@ -8613,7 +8613,7 @@ fn validateDecisionRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchReq
     }
 
     const Validate = struct {
-        fn call(ptr: *anyopaque, name: []const u8, questions: std.json.Value) !void {
+        fn call(ptr: *anyopaque, name: []const u8, questions: std.json.Value, _: []const u8) !void {
             const cfgs: *const @import("antfly_local_sources").common_provider_registry.Registry = @ptrCast(@alignCast(ptr));
             const cfg = try cfgs.getDeciderConfig(name);
             try @import("antfly_local_sources").functions_decisions.validateQuestions(questions, @import("antfly_local_sources").functions_decisions.capabilities(cfg.provider));
