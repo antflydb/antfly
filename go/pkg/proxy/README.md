@@ -14,7 +14,7 @@ storage coordination. Key types: `Gateway` (wires a `Router`, `Authenticator`,
 `Authorizer`, and `BackendForwarder`), `Catalog`/`StaticCatalog`/
 `ChainedCatalog` (resolve a tenant+resource to a `NamespaceRoute`), and
 `ParseRoutesJSON` for loading static route configuration. Licensed under the
-Elastic License 2.0 (ELv2) — see the file headers in `antfly/*.go`.
+Apache License 2.0 (Apache-2.0) — see the file headers in `antfly/*.go`.
 
 ## `inference` — model-aware inference routing proxy
 

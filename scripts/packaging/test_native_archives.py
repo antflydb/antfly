@@ -25,19 +25,19 @@ from verify_native_archives import verify
 
 
 class NativeArchivesTests(unittest.TestCase):
-    def test_target_and_worker_are_verified(self):
+    def test_target_and_library_only_layout_are_verified(self):
         platform = {
             "archive_os": "Linux",
             "archive_arch": "arm64",
             "archive_suffix": "_gnu",
         }
-        for machine, worker, error in (
-            (183, True, None),
-            (62, True, "wrong native target"),
-            (183, False, "antfly-inference-worker"),
+        for machine, extra_cli, error in (
+            (183, False, None),
+            (62, False, "wrong native target"),
+            (183, True, "CLI executable in library archive"),
         ):
             with (
-                self.subTest(machine=machine, worker=worker),
+                self.subTest(machine=machine, extra_cli=extra_cli),
                 tempfile.TemporaryDirectory() as directory,
             ):
                 root = Path(directory)
@@ -45,15 +45,14 @@ class NativeArchivesTests(unittest.TestCase):
                 header[:6] = b"\x7fELF\x02\x01"
                 header[18:20] = machine.to_bytes(2, "little")
                 names = [
-                    "antfly-lite",
-                    "antfly-inference",
                     "lib/libantfly.so",
                     "include/antfly.h",
+                    "lib/pkgconfig/libantfly.pc",
                     "README.md",
                     "LICENSE",
                     "THIRD_PARTY_NOTICES.md",
                 ]
-                if worker:
+                if extra_cli:
                     names.append("antfly-inference-worker")
                 with tarfile.open(
                     root / "antfly-embedded_test_Linux_arm64_gnu.tar.gz", "w:gz"

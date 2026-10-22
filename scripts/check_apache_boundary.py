@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reject ELv2 source dependencies in the Apache embedded engine owners."""
+"""Keep the embedded engine independent of server implementations."""
 
 from __future__ import annotations
 
@@ -42,7 +42,6 @@ SERVER_SOURCE_ROOT = "zig/pkg/antfly/src/"
 ENTRYPOINTS = (
     "public_capi_root.zig",
     "enrichment_compute_root.zig",
-    "lite_main.zig",
     "embedded_root.zig",
     "runtime_memory_abi.zig",
     "runtime_failure_abi.zig",
@@ -518,6 +517,11 @@ def check_sources(root: Path = ROOT) -> tuple[set[str], list[str]]:
         if not path.is_file():
             errors.append(f"missing source: {name} (imported by {parent})")
             continue
+        if name.startswith(SERVER_SOURCE_ROOT):
+            errors.append(
+                f"server dependency in embedded product: {name} (imported by {parent})"
+            )
+            continue
         if name.startswith("zig/pkg/antfly-server-api/"):
             errors.append(
                 f"embedded product imports server-only API: {name} (imported by {parent})"
@@ -548,7 +552,10 @@ def check_sources(root: Path = ROOT) -> tuple[set[str], list[str]]:
                 continue
             asset_name = asset.relative_to(root).as_posix()
             error = check_embedded_asset(
-                asset_name, group_for(asset_name, "all") == "apache", root
+                asset_name,
+                group_for(asset_name, "all") == "apache"
+                and not asset_name.startswith("zig/pkg/antfly/"),
+                root,
             )
             if error:
                 errors.append(f"{error} (embedded by {name})")
@@ -577,8 +584,8 @@ def main() -> int:
     errors.extend(check_asset_records())
     for name in sorted(server_only_sources()):
         path = SERVER_SOURCE_ROOT + name
-        if group_for(path, "all") != "elv2":
-            errors.append(f"server owner must remain ELv2: {path}")
+        if group_for(path, "all") != "apache":
+            errors.append(f"server owner must use Apache-2.0: {path}")
     apache_header = read_header("apache")
     for name in sorted(APACHE_FILES):
         path = ROOT / name
@@ -595,7 +602,7 @@ def main() -> int:
     if errors:
         return 1
     print(
-        f"Apache product boundary verified: {len(seen)} source files; server entry points remain ELv2"
+        f"Apache product boundary verified: {len(seen)} source files; server entry points are Apache-2.0"
     )
     return 0
 

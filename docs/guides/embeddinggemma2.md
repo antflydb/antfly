@@ -115,10 +115,10 @@ The linked provider exposes `embedDenseGroupsDirectWithControl` and uses the sam
 validation, media policy, model pinning and admission. CLI examples:
 
 ```sh
-antfly-inference embed models/embedders/embeddinggemma2 --backend metal \
+antfly inference embed models/embedders/embeddinggemma2 --backend metal \
   --group --title 'Account recovery' --dimensions 256 \
   --text 'Reset a forgotten password.' --image reset.png
-antfly-inference embed models/embedders/embeddinggemma2 --backend native \
+antfly inference embed models/embedders/embeddinggemma2 --backend native \
   --task-type RETRIEVAL_QUERY --text 'How do I regain access?'
 antfly-inference decisions models --request decision.json --backend metal
 antfly-inference decisions models --request multi-choice.json --backend native

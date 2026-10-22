@@ -22,15 +22,15 @@ resolve_antfly_inference_bin() {
     printf '%s\n' "$ANTFLY_BIN"
     return
   fi
-  if [[ -x "$ANTFLY_INFERENCE_PKG_DIR/zig-out/bin/antfly-inference" ]]; then
-    printf '%s\n' "$ANTFLY_INFERENCE_PKG_DIR/zig-out/bin/antfly-inference"
+  if [[ -x "$ANTFLY_INFERENCE_PKG_DIR/zig-out/bin/antfly-inference-dev" ]]; then
+    printf '%s\n' "$ANTFLY_INFERENCE_PKG_DIR/zig-out/bin/antfly-inference-dev"
     return
   fi
   if [[ -x "$ANTFLY_INFERENCE_PKG_DIR/zig-out/bin/antfly" ]]; then
     printf '%s\n' "$ANTFLY_INFERENCE_PKG_DIR/zig-out/bin/antfly"
     return
   fi
-  printf '%s\n' "$ANTFLY_INFERENCE_PKG_DIR/zig-out/bin/antfly-inference"
+  printf '%s\n' "$ANTFLY_INFERENCE_PKG_DIR/zig-out/bin/antfly-inference-dev"
 }
 
 run_antfly_inference() {

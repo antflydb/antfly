@@ -27,46 +27,45 @@ That gives you the [Antfarm dashboard](ts/apps/antfarm) at `http://localhost:808
 
 See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full walkthrough.
 
-### Lite, inference, or a database server
+### One CLI, an embeddable library
 
-| Product | How it runs | License |
-|---------|-------------|---------|
-| [Antfly Lite](docs/guides/lite.mdx) | An embedded `.aflite` database through `libantfly`, Zig, Go, Python, Rust, TypeScript, or browser WASM; local file commands through `antfly-lite lite` | [Apache 2.0](LICENSES/Apache-2.0.txt) |
-| [Antfly inference](zig/pkg/inference) | In-process inference, browser WASM (wasm32/wasm64), or the independent `antfly-inference` executable and inference APIs | [Apache 2.0](LICENSES/Apache-2.0.txt) |
-| Antfly database server | `antfly standalone`, distributed clusters, or serverless deployment; database HTTP APIs and the dashboard | [ELv2](LICENSES/Elastic-2.0.txt) |
+All first-party Antfly code is [Apache-2.0](LICENSES/Apache-2.0.txt). The `antfly`
+CLI runs the server, manages local database files, and runs inference:
 
-Separate Apache Embedded archives apply to **v0.3.0+** (including prereleases).
-The [v0.3.0-rc.2 release](https://github.com/antflydb/antfly/releases/tag/v0.3.0-rc.2)
-has verified Embedded binary and source assets; v0.2.4 does not. Use only assets
-listed for the selected release, or build from source below.
+```sh
+antfly standalone
+antfly lite init app.aflite
+antfly lite query app.aflite --file query.json
+antfly inference pull <model>
+antfly inference chat <model>
+antfly inference run
+```
 
-The Apache `antfly-embedded` release archive bundles `antfly-lite`,
-`antfly-inference`, `libantfly`, its C header, and the private inference worker,
-with runtime files and license notices. Python/npm embedded packages use the same
-library without installing public commands. Go/Rust consumers
-link the library from the archive or a local build using its relocatable
-`lib/pkgconfig/libantfly.pc` metadata.
+[Antfly Lite](docs/guides/lite.mdx) embeds the same database and inference engine
+through `libantfly`, Zig, Go, Python, Rust, TypeScript, or browser WASM. Language
+packages retain the `antfly-embedded` / `@antfly/embedded` names to distinguish
+in-process bindings from the HTTP SDKs. They do not install CLI commands.
 
-Zig applications can fetch the independent Apache
-`antfly-embedded-source_<version>.tar.gz` release package. It exports the
-embedded and inference modules and native/WASM artifacts without a server
-checkout; see the [Zig package guide](zig/pkg/antfly-embedded/README.md).
+The `antfly-embedded` native archive contains `libantfly`, `include/antfly.h`,
+relocatable `lib/pkgconfig/libantfly.pc` metadata, runtime assets, and notices.
+It contains no executable. Go, Rust, and C consumers can link this library;
+Python and npm platform packages bundle it. Install the CLI separately to use
+`antfly lite` or `antfly inference`.
 
-Build the Apache Lite CLI and native library from source:
+Build both surfaces, or just the library, from source:
 
-```bash
+```sh
 cd zig
-zig build lite -j1
-./zig-out/bin/antfly-lite lite init app.aflite
+zig build release                         # antfly + libantfly
+./zig-out/bin/antfly lite init app.aflite
+zig build --build-file embedded.build.zig libantfly  # library without server sources
 ```
 
-The Lite build installs its CLI, `libantfly`, and the C header. To serve that file over HTTP, use the full database server executable:
-
-```bash
-antfly standalone --storage-engine lite --storage-path app.aflite
-```
-
-The standalone server uses the same Apache engine under ELv2. See [LICENSING.md](LICENSING.md) for the source boundaries and third-party licenses.
+Zig applications can also fetch the independent
+`antfly-embedded-source_<version>.tar.gz` package; see the
+[Zig package guide](zig/pkg/antfly-embedded/README.md). Select only assets listed
+for the release you install: earlier archives retain their recorded layouts.
+See [LICENSING.md](LICENSING.md) for third-party notices and source ownership.
 
 ## Features
 
@@ -146,7 +145,7 @@ SELECT * FROM docs WHERE content @@@ 'fix my computer';
 
 ### Inference Runtime
 
-Antfly inference handles the ML side: embeddings, chunking, reranking, classification, NER, OCR, transcription, generation, and more. The Apache runtime can run in-process or independently as [`antfly-inference`](zig/pkg/inference). The full database server also exposes `antfly inference` commands and includes inference in standalone mode.
+Antfly inference handles the ML side: embeddings, chunking, reranking, classification, NER, OCR, transcription, generation, and more. The runtime runs in-process through `libantfly`, through `antfly inference` commands, or as an inference service with `antfly inference run`. Standalone database mode includes inference.
 
 ## Libraries & Tools
 
@@ -186,6 +185,8 @@ Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-The shared embedded engine, Antfly Lite CLI, native `libantfly`, [Zig embedding package](zig/pkg/antfly-embedded), embedded bindings, SDKs, and inference runtime and executable are [Apache 2.0](LICENSES/Apache-2.0.txt).
-
-The standalone database server, database HTTP serving, distributed control, and serverless orchestration are [Elastic License 2.0 (ELv2)](LICENSES/Elastic-2.0.txt). Third-party components retain their original licenses. See [LICENSING.md](LICENSING.md) for the exact scope and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for upstream notices.
+All first-party Antfly code, including the database server, distributed and serverless
+runtime, embedded engine, inference, CLI, SDKs, and bindings, is
+[Apache-2.0](LICENSES/Apache-2.0.txt). Third-party components retain their original
+licenses. See [LICENSING.md](LICENSING.md) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

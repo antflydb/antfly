@@ -304,11 +304,11 @@ pub fn main(init: std.process.Init) !void {
     const args = args_buf[0..args_len];
 
     if (args.len < 2) {
-        printUsage("antfly-inference");
+        printUsage("antfly-inference-dev");
         return;
     }
 
-    return try runFromArgs(init, allocator, "antfly-inference", args[1..]);
+    return try runFromArgs(init, allocator, "antfly-inference-dev", args[1..]);
 }
 
 pub fn runFromArgs(

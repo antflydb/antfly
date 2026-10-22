@@ -29,10 +29,9 @@
     "tools",
     "specs",
     "bench",
-    "compat"
-  ],
-  "Elastic-2.0": [
+    "compat",
     "zig/pkg/antfly",
     "zig/e2e/antfly"
-  ]
+  ],
+  "Elastic-2.0": []
 }

@@ -12,6 +12,11 @@ Antfly has separate packages for SDKs and CLI installation:
 The CLI packages do not build Antfly from source. They repack the native Zig
 runtime archives produced by the main release workflow.
 
+`antfly` is the only public CLI executable. It exposes `lite` file commands,
+`inference` model commands and serving, and database server commands.
+`libantfly` is the embedding library; the embedded language packages install
+no CLI commands. All first-party products use Apache-2.0.
+
 The native Zig runtime archives are also the distribution vehicle for Antfly
 Lite's C ABI. Each archive contains:
 

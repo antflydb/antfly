@@ -90,7 +90,7 @@ resident Qwen embedding route. Use an absolute model root:
 
 ```bash
 ANTFLY_INFERENCE_REQUIRED_BACKEND=metal TERMITE_EMBED_RESIDENT_FAIL_CLOSED=1 \
-  antfly-inference run --models-dir /absolute/path/to/models \
+  antfly inference run --models-dir /absolute/path/to/models \
   --preload-model embedder:metal:MODEL_ID
 ```
 
@@ -269,7 +269,7 @@ instead of silently falling back to CPU. Use an absolute models path so preload
 and request-time discovery resolve to the same cache key:
 
 ```bash
-ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda antfly-inference run \
+ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda antfly inference run \
   --models-dir /absolute/path/to/models \
   --preload-model embedder:cuda:MODEL_ID
 ```
