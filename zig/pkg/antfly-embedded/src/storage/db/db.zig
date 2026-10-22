@@ -9125,6 +9125,7 @@ pub const DB = struct {
         restart_text_merge: bool,
         restart_sparse_compaction: bool,
         catalog_barrier_held: bool = false,
+        catalog_read_held: bool = false,
         active: bool = true,
 
         fn acquireCatalogBarrierUntil(self: *@This(), deadline_ns: u64) bool {
@@ -9154,7 +9155,24 @@ pub const DB = struct {
             self.catalog_barrier_held = true;
         }
 
+        /// Retained reads pin immutable backend generations; they do not
+        /// replace catalog pointers. Share admission with existing searches
+        /// and background merges instead of draining those owners.
+        fn acquireCatalogReadWithCancellation(self: *@This(), io: std.Io, cancellation: types.CancellationToken) !void {
+            while (!self.db.core.index_manager.tryAcquireCatalogRead()) {
+                try cancellation.check();
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            errdefer self.db.core.index_manager.releaseCatalogRead();
+            try cancellation.check();
+            self.catalog_read_held = true;
+        }
+
         fn releaseCatalogBarrier(self: *@This()) void {
+            if (self.catalog_read_held) {
+                self.db.core.index_manager.releaseCatalogRead();
+                self.catalog_read_held = false;
+            }
             if (!self.catalog_barrier_held) return;
             self.db.endIndexCatalogBarrier();
             self.catalog_barrier_held = false;
@@ -20672,11 +20690,11 @@ pub const DB = struct {
                     .snapshot_mutation = capture.borrowMutation(),
                     .operation = "native query cut",
                     .index_name = "*",
-                    .restart_text_merge = self.quiesceTextMergeForStructuralMutation(),
-                    .restart_sparse_compaction = self.quiesceSparseCompactionForStructuralMutation(),
+                    .restart_text_merge = false,
+                    .restart_sparse_compaction = false,
                 };
-                profile.next("catalog_reader_drain");
-                try structural.?.acquireCatalogBarrierWithCancellation(io, cancellation);
+                profile.next("catalog_pin");
+                try structural.?.acquireCatalogReadWithCancellation(io, cancellation);
             } else {
                 structural = self.beginDrainedIndexStructuralMutationWithLease("native snapshot", "*", capture.borrowMutation());
                 if (!structural.?.acquireCatalogBarrierUntil(std.math.maxInt(u64))) unreachable;
@@ -72056,8 +72074,8 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
         fn check(raw: *const anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
             // Let maintenance and capture admission finish, then cancel at
-            // exactly the catalog-reader drain which crashed the CI server.
-            self.canceled = self.canceled or self.db.indexCatalogBarrierActive();
+            // the shared catalog pin, without waiting for existing readers.
+            self.canceled = self.canceled or self.db.publishedDenseSearchCount() > 1;
             if (self.canceled) return self.failure;
         }
     };
@@ -72112,7 +72130,11 @@ test "db query capture seals outside mutation fences and retains the selected ge
         const cut = @import("native_query_cut.zig");
         const empty_id: [64]u8 = @splat('c');
         var empty_request: cut.Request = .{ .id = &empty_id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+        // A foreground reader/maintenance owner can retain catalog admission
+        // throughout capture. No exclusive reader drain is needed for pins.
+        try std.testing.expect(db.beginPublishedDenseSearch());
         try db.captureQueryCut(empty_request, .none);
+        db.endPublishedDenseSearch();
         empty_request.create = false;
         {
             var empty = try db.openQueryCut(empty_request, .none);
