@@ -6058,6 +6058,10 @@ test "capi SQL maintenance capture queues after bounded foreground contention" {
     try public.testMaintenanceCaptureAdmission();
 }
 
+test "capi SQL file replacement joins the canonical connection queue" {
+    try public.testPathReplacementAdmission();
+}
+
 test "capi SQL detached renewal releases the mutex and rejects changed tenure" {
     if (builtin.os.tag == .freestanding) return error.SkipZigTest;
     const Runtime = std.meta.Child(std.meta.Child(@FieldType(db_mod.DB, "enrichment_runtime")));

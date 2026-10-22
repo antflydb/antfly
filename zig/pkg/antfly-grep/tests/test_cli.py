@@ -7610,11 +7610,70 @@ class CliTests(unittest.TestCase):
 
         if sys.platform not in ("darwin", "linux"):
             self.skipTest("native namespace events require macOS or Linux")
-        if resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 40000:
+        if (
+            sys.platform == "darwin"
+            and resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 40000
+        ):
             self.skipTest("requires descriptor headroom for a wide repository")
         for i in range(4200):
             self.write(f"src/d{i:05}/file.txt", "STOP old\n")
-        with self.workspace("--workspace-watch", "src") as (ready, request):
+        if sys.platform == "linux":
+            # These three queues share the kernel's per-UID watch allowance
+            # with other processes. Verify that allowance before requiring the
+            # optimization; exact fallback is covered separately below.
+            import ctypes
+            import errno
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.inotify_add_watch.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint32,
+            ]
+            queues = []
+            try:
+                for _ in range(3):
+                    fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+                    if fd < 0:
+                        error = ctypes.get_errno()
+                        if error in (errno.EMFILE, errno.ENFILE, errno.ENOSPC):
+                            self.skipTest(
+                                f"insufficient inotify queue capacity: {os.strerror(error)}"
+                            )
+                        raise OSError(error, os.strerror(error))
+                    queues.append(fd)
+                directories = list((self.root / "src").iterdir())
+                directories.extend((self.root / "src", self.root, *self.root.parents))
+                for fd, paths in (
+                    (queues[0], directories),
+                    (queues[1], directories),
+                    (
+                        queues[2],
+                        [self.root / f"src/d{i:05}/file.txt" for i in range(4096)],
+                    ),
+                ):
+                    for path in paths:
+                        if (
+                            libc.inotify_add_watch(fd, os.fsencode(path), 0x00000004)
+                            >= 0
+                        ):
+                            continue
+                        error = ctypes.get_errno()
+                        if error in (errno.EMFILE, errno.ENFILE, errno.ENOSPC):
+                            self.skipTest(
+                                f"insufficient per-UID inotify watch capacity: {os.strerror(error)}"
+                            )
+                        raise OSError(error, os.strerror(error), path)
+            finally:
+                for fd in queues:
+                    os.close(fd)
+        # Linux subscriptions do not need one FD per directory. Exercise a
+        # low descriptor limit independently of the kernel's watch allowance.
+        with self.workspace(
+            "--workspace-watch",
+            "src",
+            descriptor_limit=256 if sys.platform == "linux" else None,
+        ) as (ready, request):
             self.assertFalse(ready["watch_fallback"], ready)
             stable = request("refresh")[0]
             self.assertTrue(stable["discovery_reused"], stable)

@@ -29,7 +29,11 @@ from conftest import (
 )
 from test_iceberg_sql import _export_table
 
-pytestmark = [pytest.mark.iceberg_integration, pytest.mark.fresh_antfly_process]
+pytestmark = [
+    pytest.mark.iceberg_integration,
+    pytest.mark.fresh_antfly_process,
+    pytest.mark.e2e_resource("antfly_process"),
+]
 
 
 def test_hackernews_streaming_snapshots_roots_deletions_and_restart(

@@ -21,6 +21,10 @@ from uuid import uuid4
 import pytest
 
 
+# Server ownership is dynamic/direct, outside static fixture inference.
+pytestmark = pytest.mark.e2e_resource("antfly_process")
+
+
 def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
     api = stateful_api
     suffix = uuid4().hex[:8]
