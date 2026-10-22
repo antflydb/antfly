@@ -40,7 +40,14 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument(
-        "--backend", choices=("typesafe", "decision"), default="typesafe"
+        "--transport",
+        choices=("single", "antfly-batch", "shared-v1"),
+        default="shared-v1",
+    )
+    parser.add_argument(
+        "--baseline-transport",
+        choices=("single", "antfly-batch", "shared-v1"),
+        default="antfly-batch",
     )
     parser.add_argument(
         "--cache",
@@ -80,18 +87,19 @@ def main():
                     {
                         "bytes": len(raw),
                         "client_port": self.client_address[1],
-                        "state_bytes": len(body.get("state", "").encode())
-                        + sum(len(x.encode()) for x in body.get("contexts", [])),
+                        "state_bytes": sum(
+                            len(x.encode()) for x in body.get("contexts", [])
+                        ),
                         "questions": len(body["questions"])
                         * len(body.get("inputs", [None])),
                     }
                 )
-            if args.backend == "typesafe":
+            if "input" in body:
                 response = {
-                    "answers": {
-                        name: {"type": "noul", "noul": 0.9}
-                        for name in body["questions"]
-                    }
+                    "answers": [
+                        {"name": q["name"], "type": "predicate", "probability": 0.9}
+                        for q in body["questions"]
+                    ]
                 }
             else:
                 response = {
@@ -132,7 +140,7 @@ def main():
         f"let value_{i:04} = process_request({i});\n" for i in range(args.lines)
     )
     report = {
-        "evaluation": f"synthetic_{args.backend}_transport_fixture",
+        "evaluation": "synthetic_decisions_transport_fixture",
         "limitations": "Constant scores; no model quality, provider tokens, or actual cost measured.",
         "platform": platform.platform(),
         "cache": args.cache,
@@ -154,6 +162,9 @@ def main():
             expected = None
             for name, binary in binaries.items():
                 report["binaries"][name] = {
+                    "transport": args.transport
+                    if name == "antfly-grep"
+                    else args.baseline_transport,
                     "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                     "runs": [],
                 }
@@ -169,10 +180,15 @@ def main():
                             "--ask",
                             "find request processing",
                             "--backend",
-                            "typesafe" if args.backend == "typesafe" else "http",
+                            "http",
+                            *(
+                                ["--decision-transport=single"]
+                                if report["binaries"][name]["transport"] == "single"
+                                else []
+                            ),
                             *(
                                 ["--decision-context=shared-v1"]
-                                if args.backend == "decision" and name == "antfly-grep"
+                                if report["binaries"][name]["transport"] == "shared-v1"
                                 else []
                             ),
                             "--model",

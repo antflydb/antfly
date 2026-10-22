@@ -18,7 +18,9 @@ const Allocator = std.mem.Allocator;
 
 pub const default_max_requests: usize = 1000;
 pub const Options = struct {
-    typesafe_api_key: ?[]const u8 = null,
+    openai_api_key: ?[]const u8 = null,
+    antfly_api_key: ?[]const u8 = null,
+    explicit_token: ?[]const u8 = null,
     workspace_watch: bool = false,
     workspace_parallel_open: bool = false,
     workspace_memory_limit: usize = 256 * 1024 * 1024,
@@ -149,6 +151,7 @@ pub const Options = struct {
     retries: usize = 3,
     retry_base_ms: u64 = 100,
     max_requests: usize = default_max_requests,
+    max_requests_explicit: bool = false,
     max_source_bytes: usize = std.math.maxInt(usize),
     max_output_bytes: usize = std.math.maxInt(usize),
     exclude: std.ArrayList([]const u8) = .empty,
@@ -174,9 +177,13 @@ pub const Options = struct {
     max_count: usize = std.math.maxInt(usize),
     max_file_bytes: usize = std.math.maxInt(usize),
     ask: ?[]const u8 = null,
-    endpoint: []const u8 = "http://127.0.0.1:8090/decisions",
+    media: enum { text, images } = .text,
+    max_image_bytes: usize = 512 * 1024,
+    max_image_pixels: u64 = 16 * 1024 * 1024,
+    endpoint: []const u8 = "http://127.0.0.1:8080/ai/v1/decisions",
     model: ?[]const u8 = null,
-    backend: enum { http, local, typesafe } = .http,
+    backend: enum { http, local } = .http,
+    decision_transport: enum { single, antfly_batch } = .antfly_batch,
     decision_context: enum { legacy, shared_v1 } = .legacy,
     models_dir: ?[]const u8 = null,
     library_path: ?[]const u8 = null,
@@ -220,9 +227,41 @@ pub const Options = struct {
     }
     /// Shared by process startup and each workspace request, after parsing.
     pub fn finalizeProvider(self: *Options, a: Allocator) !void {
-        if (self.backend == .typesafe and std.mem.eql(u8, self.endpoint, "http://127.0.0.1:8090/decisions")) self.endpoint = "https://api.typesafe.ai/v1/systemone";
-        if (self.backend == .typesafe and self.token == null and (std.mem.eql(u8, self.provider_name, "typesafe") or std.mem.eql(u8, self.provider_name, "antfly"))) self.token = self.typesafe_api_key;
-        if (self.ask != null and self.backend != .typesafe and !std.mem.endsWith(u8, self.endpoint, "/decisions")) self.endpoint = try std.fmt.allocPrint(a, "{s}/decisions", .{std.mem.trimEnd(u8, self.endpoint, "/")});
+        if (self.ask == null) return;
+        if (@import("providers.zig").removed(self.provider_name)) return error.JevRequiresAntflyGateway;
+        if (self.backend != .local) {
+            try @import("providers.zig").validateCustom(self.endpoint);
+            if (!std.mem.endsWith(u8, self.endpoint, "/decisions")) self.endpoint = try std.fmt.allocPrint(a, "{s}/decisions", .{std.mem.trimEnd(u8, self.endpoint, "/")});
+        }
+        if (self.explicit_token) |token| self.token = token;
+        if (self.token == null and std.mem.eql(u8, self.provider_name, "openai") and std.mem.eql(u8, self.endpoint, "https://api.openai.com/v1/decisions")) self.token = self.openai_api_key;
+        if (self.token == null and std.mem.eql(u8, self.provider_name, "antfly")) self.token = self.antfly_api_key;
+        if (self.token) |token| {
+            if (token.len == 0 or token.len > 8192) return error.InvalidCredential;
+            for (token) |ch| if (std.ascii.isWhitespace(ch) or ch < 32 or ch == 127) return error.InvalidCredential;
+        }
+        if (self.backend != .local and self.decision_transport == .single and self.decision_context == .shared_v1) return error.SharedContextRequiresAntflyBatch;
+    }
+    pub fn decisionBatchSize(self: *const Options) usize {
+        return if (self.backend == .local or self.decision_transport == .antfly_batch) self.batch_size else 1;
+    }
+    pub fn selectProvider(self: *Options, name: []const u8) !void {
+        const profiles = @import("providers.zig");
+        if (profiles.removed(name)) return error.JevRequiresAntflyGateway;
+        const provider = profiles.get(name) orelse return error.UnsupportedProvider;
+        self.provider_name = name;
+        self.endpoint = provider.endpoint;
+        self.model = provider.model;
+        self.token = null;
+        self.backend = if (provider.protocol == .local) .local else .http;
+        self.decision_transport = if (provider.protocol == .decisions) .single else .antfly_batch;
+        self.decision_context = .legacy;
+    }
+    pub fn setEndpoint(self: *Options, endpoint: []const u8) void {
+        // Stored credentials are endpoint-bound. Overrides require a newly
+        // supplied token (or an explicitly selected provider's environment key).
+        if (!std.mem.eql(u8, self.endpoint, endpoint)) self.token = null;
+        self.endpoint = endpoint;
     }
     pub fn providerJobs(self: *const Options) usize {
         return @max(1, if (self.decision_concurrency == 0) self.jobs else self.decision_concurrency);
@@ -239,6 +278,7 @@ pub const Options = struct {
         var positional: std.ArrayList([]const u8) = .empty;
         defer positional.deinit(a);
         var decision_mode = false;
+        var provider_overrides = struct { model: bool = false, endpoint: bool = false, transport: bool = false, context: bool = false }{};
         for (args) |arg| {
             if (std.mem.eql(u8, arg, "--")) break;
             if (std.mem.eql(u8, arg, "--ask") or std.mem.startsWith(u8, arg, "--ask=")) {
@@ -600,17 +640,45 @@ pub const Options = struct {
                     if (self.retries > 10) return error.InvalidNumber;
                 } else if (std.mem.eql(u8, name, "--engine")) {
                     self.engine = std.meta.stringToEnum(@TypeOf(self.engine), value) orelse return error.InvalidEngine;
-                } else if (std.mem.eql(u8, name, "--decision-context")) self.decision_context = if (std.mem.eql(u8, value, "shared-v1")) .shared_v1 else if (std.mem.eql(u8, value, "legacy")) .legacy else return error.InvalidDecisionContext else if (std.mem.eql(u8, name, "--backend")) self.backend = if (std.mem.eql(u8, value, "local")) .local else if (std.mem.eql(u8, value, "typesafe")) .typesafe else if (std.mem.eql(u8, value, "http") or std.mem.eql(u8, value, "antfly")) .http else return error.UnsupportedBackend else if (std.mem.eql(u8, name, "--models-dir")) self.models_dir = value else if (std.mem.eql(u8, name, "--library")) self.library_path = value else if (std.mem.eql(u8, name, "--replace")) self.replacement = value else if (std.mem.eql(u8, name, "--threads") or std.mem.eql(u8, name, "--concurrency")) {
+                } else if (std.mem.eql(u8, name, "--media")) {
+                    self.media = std.meta.stringToEnum(@TypeOf(self.media), value) orelse return error.UnsupportedSearchMedia;
+                } else if (std.mem.eql(u8, name, "--max-image-bytes")) {
+                    self.max_image_bytes = try size(value);
+                } else if (std.mem.eql(u8, name, "--max-image-pixels")) {
+                    self.max_image_pixels = try number(value);
+                } else if (std.mem.eql(u8, name, "--provider")) {
+                    const model = self.model;
+                    const endpoint = self.endpoint;
+                    const transport = self.decision_transport;
+                    const context = self.decision_context;
+                    try self.selectProvider(value);
+                    // Explicit command options override profile defaults,
+                    // independently of where --provider occurs in argv.
+                    if (provider_overrides.model) self.model = model;
+                    if (provider_overrides.endpoint) self.setEndpoint(endpoint);
+                    if (provider_overrides.transport) self.decision_transport = transport;
+                    if (provider_overrides.context) self.decision_context = context;
+                } else if (std.mem.eql(u8, name, "--decision-transport")) {
+                    provider_overrides.transport = true;
+                    self.decision_transport = if (std.mem.eql(u8, value, "single")) .single else if (std.mem.eql(u8, value, "antfly-batch")) .antfly_batch else return error.InvalidDecisionTransport;
+                } else if (std.mem.eql(u8, name, "--decision-context")) {
+                    provider_overrides.context = true;
+                    self.decision_context = if (std.mem.eql(u8, value, "shared-v1")) .shared_v1 else if (std.mem.eql(u8, value, "legacy")) .legacy else return error.InvalidDecisionContext;
+                } else if (std.mem.eql(u8, name, "--backend")) self.backend = if (std.mem.eql(u8, value, "local")) .local else if (std.mem.eql(u8, value, "http") or std.mem.eql(u8, value, "antfly")) .http else return error.UnsupportedBackend else if (std.mem.eql(u8, name, "--models-dir")) self.models_dir = value else if (std.mem.eql(u8, name, "--library")) self.library_path = value else if (std.mem.eql(u8, name, "--replace")) self.replacement = value else if (std.mem.eql(u8, name, "--threads") or std.mem.eql(u8, name, "--concurrency")) {
                     self.jobs = try number(value);
                     self.jobs_auto = false;
                 } else if (std.mem.eql(u8, name, "--max-filesize")) {
                     self.max_file_bytes = try size(value);
                     self.skip_oversize = true;
                 } else if (std.mem.eql(u8, name, "--table-config")) self.table_config = value else if (std.mem.eql(u8, name, "--table")) try self.tables.append(a, value) else if (std.mem.eql(u8, name, "--table-filter")) self.table_filter = value else if (std.mem.eql(u8, name, "--max-index-documents")) self.max_index_documents = try number(value) else if (std.mem.eql(u8, name, "--max-spill-bytes")) self.max_spill_bytes = unlimited(try size(value)) else if (std.mem.eql(u8, name, "--max-pending-output")) self.max_pending_output = try number(value) else if (std.mem.eql(u8, name, "--cache-ttl")) self.cache_ttl_seconds = try number(value) else if (std.mem.eql(u8, name, "--max-columns")) self.max_columns = unlimited(try number(value)) else if (std.mem.eql(u8, name, "--max-depth")) self.max_depth = try number(value) else if (std.mem.eql(u8, name, "--max-requests")) {
+                    self.max_requests_explicit = true;
                     self.max_requests = if (std.mem.eql(u8, value, "unlimited")) std.math.maxInt(usize) else try number(value);
                 } else if (std.mem.eql(u8, name, "--max-source-bytes")) {
                     if (self.jev_mode) self.source_excerpt_bytes = unlimited(try size(value)) else self.max_source_bytes = unlimited(try size(value));
-                } else if (std.mem.eql(u8, name, "--model-revision")) self.model_revision = value else if (std.mem.eql(u8, name, "--max-output-bytes")) self.max_output_bytes = unlimited(try size(value)) else if (std.mem.eql(u8, name, "--cache-dir")) self.cache_dir = value else if (std.mem.eql(u8, name, "--base-url")) self.endpoint = value else if (std.mem.eql(u8, name, "--query")) try self.queries.append(a, value) else if (std.mem.eql(u8, name, "--exclude")) try self.exclude.append(a, value) else if (std.mem.eql(u8, name, "--only")) try self.only.append(a, value) else if (std.mem.eql(u8, name, "--not")) try self.not.append(a, value) else if (std.mem.eql(u8, name, "--file")) try self.pattern_files.append(a, value) else if (std.mem.eql(u8, name, "--ignore-file")) try self.ignore_files.append(a, value) else if (std.mem.eql(u8, name, "--type")) try self.types.append(a, value) else if (std.mem.eql(u8, name, "--type-not")) try self.types_not.append(a, value) else if (std.mem.eql(u8, name, "--type-add")) try self.type_add.append(a, value) else if (std.mem.eql(u8, name, "--iglob")) {
+                } else if (std.mem.eql(u8, name, "--model-revision")) self.model_revision = value else if (std.mem.eql(u8, name, "--max-output-bytes")) self.max_output_bytes = unlimited(try size(value)) else if (std.mem.eql(u8, name, "--cache-dir")) self.cache_dir = value else if (std.mem.eql(u8, name, "--base-url")) {
+                    provider_overrides.endpoint = true;
+                    self.setEndpoint(value);
+                } else if (std.mem.eql(u8, name, "--query")) try self.queries.append(a, value) else if (std.mem.eql(u8, name, "--exclude")) try self.exclude.append(a, value) else if (std.mem.eql(u8, name, "--only")) try self.only.append(a, value) else if (std.mem.eql(u8, name, "--not")) try self.not.append(a, value) else if (std.mem.eql(u8, name, "--file")) try self.pattern_files.append(a, value) else if (std.mem.eql(u8, name, "--ignore-file")) try self.ignore_files.append(a, value) else if (std.mem.eql(u8, name, "--type")) try self.types.append(a, value) else if (std.mem.eql(u8, name, "--type-not")) try self.types_not.append(a, value) else if (std.mem.eql(u8, name, "--type-add")) try self.type_add.append(a, value) else if (std.mem.eql(u8, name, "--iglob")) {
                     try self.iglobs.append(a, value);
                     try self.glob_order.append(a, .{ .pattern = value, .insensitive = true });
                 } else if (std.mem.eql(u8, name, "--color")) self.color = if (std.mem.eql(u8, value, "ansi")) .always else std.meta.stringToEnum(@TypeOf(self.color), value) orelse return error.InvalidColor else if (std.mem.eql(u8, name, "--sort") or std.mem.eql(u8, name, "--sortr")) {
@@ -623,7 +691,13 @@ pub const Options = struct {
                 } else if (std.mem.eql(u8, name, "--ask")) {
                     if (self.ask != null or value.len == 0) return error.InvalidQuestion;
                     self.ask = value;
-                } else if (std.mem.eql(u8, name, "--endpoint")) self.endpoint = value else if (std.mem.eql(u8, name, "--model")) self.model = value else if (std.mem.eql(u8, name, "--threshold")) self.threshold = std.fmt.parseFloat(f64, value) catch return error.InvalidNumber else if (std.mem.eql(u8, name, "--chunk-lines")) self.chunk_lines = try number(value) else if (std.mem.eql(u8, name, "--context-lines")) self.context_lines = try number(value) else if (std.mem.eql(u8, name, "--decision-concurrency")) self.decision_concurrency = try number(value) else if (std.mem.eql(u8, name, "--decision-batch-wait-ms")) self.decision_batch_wait_ms = try number(value) else if (std.mem.eql(u8, name, "--batch-size")) self.batch_size = try number(value) else if (std.mem.eql(u8, name, "--max-regions")) {
+                } else if (std.mem.eql(u8, name, "--endpoint")) {
+                    provider_overrides.endpoint = true;
+                    self.setEndpoint(value);
+                } else if (std.mem.eql(u8, name, "--model")) {
+                    provider_overrides.model = true;
+                    self.model = value;
+                } else if (std.mem.eql(u8, name, "--threshold")) self.threshold = std.fmt.parseFloat(f64, value) catch return error.InvalidNumber else if (std.mem.eql(u8, name, "--chunk-lines")) self.chunk_lines = try number(value) else if (std.mem.eql(u8, name, "--context-lines")) self.context_lines = try number(value) else if (std.mem.eql(u8, name, "--decision-concurrency")) self.decision_concurrency = try number(value) else if (std.mem.eql(u8, name, "--decision-batch-wait-ms")) self.decision_batch_wait_ms = try number(value) else if (std.mem.eql(u8, name, "--batch-size")) self.batch_size = try number(value) else if (std.mem.eql(u8, name, "--max-regions")) {
                     if (self.jev_mode) self.max_regions_per_file = try number(value) else self.max_regions = try number(value);
                 } else if (std.mem.eql(u8, name, "--max-file-size")) self.max_file_bytes = try number(value) else if (std.mem.eql(u8, name, "--timeout-ms")) self.timeout_ms = try number(value) else if (std.mem.eql(u8, name, "--max-count")) self.max_count = try number(value) else if (std.mem.eql(u8, name, "--before-context")) self.before = try number(value) else if (std.mem.eql(u8, name, "--after-context")) self.after = try number(value) else if (std.mem.eql(u8, name, "--context")) {
                     self.before = try number(value);
@@ -752,8 +826,12 @@ pub const Options = struct {
         }
         try self.paths.appendSlice(a, positional.items);
         if (self.help or self.version or self.generate != null or self.pcre2_version) return;
-        if (self.backend == .typesafe and self.model == null) self.model = "jev-latest";
         if (self.ask != null and self.model == null) return error.DecisionModelRequired;
+        if (self.media != .text) {
+            if (self.ask == null) return error.MediaRequiresDecision;
+            if (self.backend == .local or self.pre != null or self.patterns.items.len > 0 or self.pattern_files.items.len > 0 or self.triage or self.workspace_watch) return error.ConflictingMediaOptions;
+            if (self.max_image_bytes == 0 or self.max_image_bytes > 768 * 1024 or self.max_image_pixels == 0) return error.InvalidImageLimit;
+        }
         if (!std.math.isFinite(self.threshold) or self.threshold < 0 or self.threshold > 1 or self.chunk_lines == 0 or self.batch_size == 0 or self.batch_size > 128 or self.decision_batch_wait_ms > 1000 or self.timeout_ms == 0 or (self.max_file_bytes == 0 and !self.skip_oversize)) return error.InvalidNumber;
         if (self.cached_only and (self.ask == null or self.no_cache or self.cache_ttl_seconds == 0 or self.table_config != null or self.pre != null or self.hostname_bin != null)) return error.ConflictingCachedOnlyFlags;
         if (self.files and (self.patterns.items.len > 0 or self.ask != null)) return error.ConflictingFlags;
@@ -833,16 +911,17 @@ test "preprocessor and compression flags override in command order" {
     try std.testing.expect(third.pre == null);
 }
 
-test "provider finalization shares base URL and typesafe defaults" {
+test "provider finalization scopes credentials and selects single transport" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var options: Options = .{ .ask = "question", .endpoint = "http://localhost:8090/" };
+    var options: Options = .{ .ask = "question", .openai_api_key = "openai-key", .antfly_api_key = "antfly-key" };
+    try options.selectProvider("openai");
+    try options.finalizeProvider(arena.allocator());
+    try std.testing.expectEqualStrings("openai-key", options.token.?);
+    try std.testing.expectEqual(@as(usize, 1), options.decisionBatchSize());
+    options.setEndpoint("http://localhost:8090/");
     try options.finalizeProvider(arena.allocator());
     try std.testing.expectEqualStrings("http://localhost:8090/decisions", options.endpoint);
-    try options.finalizeProvider(arena.allocator());
-    try std.testing.expectEqualStrings("http://localhost:8090/decisions", options.endpoint);
-    options = .{ .backend = .typesafe, .typesafe_api_key = "environment-token" };
-    try options.finalizeProvider(arena.allocator());
-    try std.testing.expectEqualStrings("https://api.typesafe.ai/v1/systemone", options.endpoint);
-    try std.testing.expectEqualStrings("environment-token", options.token.?);
+    try std.testing.expect(options.token == null);
+    try std.testing.expectError(error.JevRequiresAntflyGateway, options.selectProvider("typesafe"));
 }

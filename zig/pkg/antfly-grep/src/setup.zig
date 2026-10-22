@@ -17,7 +17,7 @@
 const std = @import("std");
 const Options = @import("options.zig").Options;
 const providers = @import("providers.zig");
-pub const Config = struct { provider: []const u8 = "antfly", endpoint: []const u8 = "http://127.0.0.1:8090/decisions", model: ?[]const u8 = null, token: ?[]const u8 = null, models_dir: ?[]const u8 = null, library: ?[]const u8 = null, decision_concurrency: ?usize = null, batch_size: ?usize = null, decision_batch_wait_ms: ?u64 = null, decision_context: ?@FieldType(Options, "decision_context") = null };
+pub const Config = struct { provider: []const u8 = "antfly", endpoint: []const u8 = "http://127.0.0.1:8080/ai/v1/decisions", model: ?[]const u8 = null, token: ?[]const u8 = null, models_dir: ?[]const u8 = null, library: ?[]const u8 = null, decision_concurrency: ?usize = null, batch_size: ?usize = null, decision_batch_wait_ms: ?u64 = null, decision_transport: ?@FieldType(Options, "decision_transport") = null, decision_context: ?@FieldType(Options, "decision_context") = null };
 pub fn configPath(a: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]const u8 {
     if (env.get("ANTFLY_GREP_CREDENTIALS_PATH")) |path| return try a.dupe(u8, path);
     if (env.get("XDG_CONFIG_HOME")) |path| return try std.fs.path.join(a, &.{ path, "antfly-grep", "credentials.json" });
@@ -42,12 +42,17 @@ pub fn load(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Ma
     if (c.batch_size) |value| o.batch_size = value;
     if (c.decision_batch_wait_ms) |value| o.decision_batch_wait_ms = value;
     if (c.decision_context) |value| o.decision_context = value;
-    const provider = providers.get(c.provider) orelse return error.UnsupportedProvider;
+    const provider = providers.get(c.provider) orelse {
+        // Stale decision configuration must not break ordinary regex searches.
+        if (!providers.removed(c.provider)) return error.UnsupportedProvider;
+        o.provider_name = c.provider;
+        return;
+    };
     o.provider_name = c.provider;
+    o.decision_transport = c.decision_transport orelse (if (provider.protocol == .decisions) .single else .antfly_batch);
     o.backend = switch (provider.protocol) {
         .local => .local,
-        .typesafe => .typesafe,
-        .antfly => .http,
+        .decisions, .antfly => .http,
     };
 }
 pub fn auth(parent_a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
@@ -55,12 +60,12 @@ pub fn auth(parent_a: std.mem.Allocator, io: std.Io, env: *const std.process.Env
         try std.Io.File.stdout().writeStreamingAll(io,
             \\Usage: antfly-grep auth [OPTIONS]
             \\
-            \\Configure a decision provider. Without --stdin, prompts use the terminal.
-            \\  --provider NAME    antfly, typesafe, vercel, openrouter, opencode, local, custom
+            \\Configure a nonsecret decision profile. Keys come from the environment.
+            \\  --provider NAME    antfly, openai, local, custom
             \\  --endpoint URL     Explicit decision endpoint
             \\  --base-url URL     Provider base URL
             \\  --model NAME       Decision model
-            \\  --stdin            Read API token from standard input
+            \\  --stdin            Removed: use OPENAI_API_KEY / ANTFLY_API_KEY / ANTFLY_GREP_TOKEN
             \\  --models-dir PATH  Local model directory
             \\  --library PATH     Local inference library
             \\  --decision-concurrency N   Save provider lane limit (0 follows threads)
@@ -109,46 +114,37 @@ pub fn auth(parent_a: std.mem.Allocator, io: std.Io, env: *const std.process.Env
             const n = std.fmt.parseInt(u64, value, 10) catch return error.InvalidNumber;
             if (n > 1000) return error.InvalidNumber;
             c.decision_batch_wait_ms = n;
+        } else if (std.mem.eql(u8, flag, "--decision-transport")) {
+            c.decision_transport = if (std.mem.eql(u8, value, "single")) .single else if (std.mem.eql(u8, value, "antfly-batch")) .antfly_batch else return error.InvalidDecisionTransport;
         } else if (std.mem.eql(u8, flag, "--decision-context")) {
             c.decision_context = std.meta.stringToEnum(@FieldType(Options, "decision_context"), if (std.mem.eql(u8, value, "shared-v1")) "shared_v1" else value) orelse return error.InvalidDecisionContext;
         } else return error.UnknownFlag;
     }
     const interactive = !stdin and (try std.Io.File.stdin().isTty(io));
     if (interactive and !explicit_provider) {
-        const selected = try @import("terminal.zig").prompt(a, io, "Provider [antfly/typesafe/vercel/openrouter/opencode/local/custom] (antfly): ", false);
+        const selected = try @import("terminal.zig").prompt(a, io, "Provider [antfly/openai/local/custom] (antfly): ", false);
         if (selected.len > 0) c.provider = selected;
     }
-    const provider = providers.get(c.provider) orelse return error.UnsupportedProvider;
+    const provider = providers.get(c.provider) orelse return if (providers.removed(c.provider)) error.JevRequiresAntflyGateway else error.UnsupportedProvider;
     if (!explicit_endpoint) c.endpoint = provider.endpoint;
     if (c.model == null) c.model = provider.model;
     if (std.mem.eql(u8, c.provider, "custom") and !explicit_endpoint) {
         if (!interactive) return error.ProviderEndpointRequired;
-        c.endpoint = try @import("terminal.zig").prompt(a, io, "TypeSafe-compatible base URL: ", false);
+        c.endpoint = try @import("terminal.zig").prompt(a, io, "Decisions base URL: ", false);
         base_url = true;
     }
-    if (std.mem.eql(u8, c.provider, "custom")) try providers.validateCustom(c.endpoint);
-    if (provider.protocol == .typesafe and base_url and !std.mem.endsWith(u8, c.endpoint, "/systemone")) c.endpoint = try std.fmt.allocPrint(a, "{s}/systemone", .{std.mem.trimEnd(u8, c.endpoint, "/")});
+    if (provider.protocol != .local and base_url and !std.mem.endsWith(u8, c.endpoint, "/decisions")) c.endpoint = try std.fmt.allocPrint(a, "{s}/decisions", .{std.mem.trimEnd(u8, c.endpoint, "/")});
+    if (provider.protocol != .local) try providers.validateCustom(c.endpoint);
     if (c.model == null and interactive) {
         c.model = try @import("terminal.zig").prompt(a, io, "Decision model: ", false);
         if (c.model.?.len == 0) return error.DecisionModelRequired;
     }
     if (c.model == null) return error.DecisionModelRequired;
-    if (stdin) {
-        var buffer: [4096]u8 = undefined;
-        var reader = std.Io.File.stdin().readerStreaming(io, &buffer);
-        const bytes = try reader.interface.allocRemaining(a, .limited(65536));
-        c.token = std.mem.trim(u8, bytes, " \t\r\n");
-        if (c.token.?.len == 0) return error.EmptyCredential;
-    } else if (!std.mem.eql(u8, c.provider, "local")) {
-        if (!interactive) return error.AuthRequiresStdin;
-        const label = try std.fmt.allocPrint(a, "{s} API token (hidden): ", .{provider.label});
-        c.token = try @import("terminal.zig").prompt(a, io, label, true);
-        if (c.token.?.len == 0) return error.EmptyCredential;
-    }
-    if (c.token) |token| {
-        if (token.len > 8192) return error.CredentialTooLong;
-        for (token) |ch| if (std.ascii.isWhitespace(ch) or ch < 32 or ch == 127) return error.InvalidCredential;
-    }
+    const transport: @FieldType(Options, "decision_transport") = c.decision_transport orelse (if (provider.protocol == .decisions) .single else .antfly_batch);
+    if (provider.protocol != .local and transport == .single and c.decision_context == .shared_v1) return error.SharedContextRequiresAntflyBatch;
+    // Profiles contain no new persisted secrets. Existing credentials are read
+    // for migration, but environment keys are resolved only at request time.
+    if (stdin) return error.UseEnvironmentCredential;
     const path = try configPath(a, env) orelse return error.MissingConfigDirectory;
     if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
     const data = try std.json.Stringify.valueAlloc(a, c, .{ .emit_null_optional_fields = false });
@@ -178,7 +174,7 @@ const skill =
     \\have different scopes. Omitted excerpts and exit 2 mean incomplete evidence.
     \\Use `--broad`, a lower threshold, or exact search to investigate missing evidence.
     \\Run `antfly-grep files PATH` before remote searches to inspect eligible paths.
-    \\Configure explicitly with `auth --provider antfly --base-url URL --model MODEL --stdin`
+    \\Configure explicitly with `auth --provider antfly --base-url URL --model MODEL`
     \\or use `--backend local --models-dir PATH --library PATH --model MODEL`.
     \\Never print or save credentials in repository files. Run `doctor` to verify setup.
     \\

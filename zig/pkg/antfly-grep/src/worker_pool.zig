@@ -90,6 +90,24 @@ pub const Pool = struct {
             self.changed.broadcast(self.io);
         }
     }
+    /// Coordinator sleeps until any outstanding lease completes. Joining a
+    /// particular lease here would leave other lanes idle behind a straggler.
+    pub fn waitForCompletion(self: *Pool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (true) {
+            for (self.slots) |slot| if (slot.leased and slot.done) return;
+            self.changed.waitUncancelable(self.io, &self.mutex);
+        }
+    }
+    pub fn completed(self: *Pool, handle: Handle) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return switch (handle) {
+            .pooled => |slot| slot.done,
+            .native => unreachable,
+        };
+    }
     pub fn deinit(self: *Pool) void {
         self.mutex.lockUncancelable(self.io);
         for (self.slots) |slot| std.debug.assert(!slot.leased);

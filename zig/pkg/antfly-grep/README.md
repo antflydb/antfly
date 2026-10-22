@@ -254,26 +254,59 @@ pipes terminate work. JSON emits per-file `begin`, `match`/`context`, `end`, and
 final `summary` records, with ripgrep-shaped `data` and Antfly extensions for
 probabilities and completion/request statistics. Invalid UTF-8 uses base64.
 
-Configure an Antfly decision endpoint or the TypeSafe provider explicitly:
+Decision search uses the OpenAI Decisions named-question contract, without a
+provider SDK or private Jev wire adapter:
 
 ```sh
-printf '%s' "$ANTFLY_GREP_TOKEN" | antfly-grep auth --provider antfly \
-  --endpoint http://127.0.0.1:8090/decisions --model MODEL --stdin
-printf '%s' "$TYPESAFE_API_KEY" | antfly-grep auth --provider typesafe --stdin
+export OPENAI_API_KEY=...  # inherited only by the canonical OpenAI destination
+antfly-grep ask 'Where are retries bounded?' --provider openai ./src
+# Antfly gateway routes to a configured decider (including provider: jev).
+export ANTFLY_API_KEY=...
+antfly-grep auth --provider antfly --base-url http://localhost:8080/ai/v1 \
+  --model deciders/triage
 antfly-grep doctor
 antfly-grep skill --agent codex
 ```
 
-Running `antfly-grep auth` in a terminal prompts for a provider, any required
-endpoint/model, and a hidden token. Presets include Antfly, TypeSafe, Vercel AI
-Gateway, OpenRouter, OpenCode Zen, local inference, and custom TypeSafe gateways.
-Custom gateways require HTTPS or loopback HTTP. Configuration is written atomically
-with owner-only permissions on POSIX. Terminal echo is restored after entry and
-on POSIX SIGINT/SIGTERM. Shell completions include value choices, file types,
-option arity, paths, and setup commands.
-`doctor` uses a synthetic request. Agent installation supports Codex, Claude,
-and OpenCode; `--global` chooses the home directory. Model inference can also
-use the monorepo native library described above. No model is downloaded implicitly.
+`--provider openai` defaults to `https://api.openai.com/v1/decisions` and
+`gpt-6-luna`; pass `--model` to choose a supported Decisions model explicitly.
+`ANTFLY_GREP_PROVIDER`, `ANTFLY_GREP_ENDPOINT`, and `ANTFLY_GREP_MODEL` configure
+nonsecret defaults. Explicit endpoint, model, and transport options override
+provider defaults regardless of argument order. A custom Decisions service uses `--provider custom --endpoint
+URL --model MODEL`; its key comes from `ANTFLY_GREP_TOKEN`. That explicitly
+supplied key is bound to the selected destination. OpenAI environment keys are
+never sent to custom endpoints; Antfly keys apply only to the Antfly profile.
+Changing a saved endpoint or provider clears its saved token. Redirects are
+not followed. HTTPS or loopback HTTP is required.
+
+The baseline sends one `input` with multiple questions. Requests share a persistent
+HTTP client and use bounded provider concurrency; `--decision-concurrency` controls
+lanes independently of file workers. `--batch-size` affects Antfly batches only.
+Antfly and local profiles retain the native batch capability. A custom service may
+explicitly opt into `--decision-transport antfly-batch`; `--decision-context
+shared-v1` additionally interns repeated contexts. Neither extension is probed by
+sending unsupported requests. Single-input mode rejects shared-v1. Successful
+cache hits require no provider request; request budgets count actual attempts,
+including retries and splits. Refusal, abstention, similarity/generated answers,
+and malformed/missing responses remain incomplete evidence (exit 2), never cached
+negative results. Typed predicates may omit Antfly's `decision_method` metadata.
+
+Antfly's public gateway requires `public_inference.enabled: true`; authenticated
+execution requires `inference:write`. Use its canonical `deciders/NAME` model ID.
+An unauthenticated local gateway needs only its URL and configured model. Direct
+TypeSafe/Vercel/OpenRouter/OpenCode presets were removed: configure Jev on the
+Antfly gateway and select its decider instead. No chat/Structured Outputs fallback
+manufactures probability scores. See [the gateway contract](../../../docs/reference/inference-gateway.md).
+
+`auth` saves nonsecret provider configuration atomically with owner-only permissions
+on POSIX. Keys come from the environment; `--stdin` returns
+`UseEnvironmentCredential` instead of persisting a new token. Old credential
+profiles can be read during migration; remove their `token` after exporting an
+appropriate environment key. `doctor` uses a synthetic request. Agent installation
+supports Codex, Claude, and OpenCode; `--global` chooses the home directory.
+Shell completions include provider/transport choices, file types, option arity,
+paths, and setup commands. Local inference needs the explicit model/library setup
+above. No model is downloaded implicitly.
 
 Table-backed searches use the same matcher, decision pipeline and renderers as
 local files. Configure an endpoint and tables using
@@ -840,8 +873,8 @@ Fixture request bytes are recorded
 separately from provider token usage; fixture results do not establish model
 quality or actual provider cost.
 
-`bench/decision_transport.py` compares a saved baseline with the current binary
-using synthetic source and a local constant-score Typesafe fixture. The recorded
+The historical TypeSafe transport qualification used synthetic source and a
+local constant-score fixture. The recorded
 512-line case sends the same 513 questions in 65 requests and produces identical
 output, while request-body bytes fall from 10,719,928 to 1,609,144 (85% less).
 See the archived `followup-typesafe-transport.json` report in the [historical results archive](bench/results/README.md). The labeled repository
@@ -4270,3 +4303,292 @@ grants and maintained per-segment source-binding certificates. Current budgets
 remain per shard request, and writes invalidate whole-generation proofs. The
 [execution design](../../../docs/design/logical-field-queries.md) records ownership,
 fallback behavior, and the required fences for those remaining changes.
+
+### Postings runs and retained result pages
+
+The [postings/page qualification](bench/results/grep-postings-pages-summary.json)
+compares matched ReleaseFast, stripped server builds with the same compiler.
+It supersedes the preceding server qualification for these changes; the
+standalone CLI and its dependency sources are unchanged. Raw trials and logs
+remain local ignored artifacts. These measurements use a warm filesystem on
+one shared Apple Silicon host and its ARM64 Linux VM.
+
+Default postings runs retain the 8 MiB trigger on small managed build slices.
+Larger slices can use up to 64 MiB, based on advisory live headroom; ordinary
+resource admission still governs allocations. Pressure spills the largest fields
+first and retains tiny companions. The private run's lazy read cache increases
+from 64 to 512 KiB, with four-way lookup. The sixteen-cursor component regression
+performs 2,048 logical reads with 32 physical reads. This work bound is separate
+from end-to-end ingestion performance. Runs remain temporary disk scratch,
+unlinked while open on POSIX; query membership facts remain memory-only.
+
+Complete immutable memberships remain borrowed through constant-score pages,
+ranked include/exclude gates, and native sorted pagination. Captured deletion
+masks are subtracted word by word; sparse iteration seeks over unrelated mask
+ranges, and dense deletion skips check cancellation. Misses and unsupported
+Boolean shapes retain owned execution. Consumers still allocate requested
+output and capture deletion state. This removes avoidable bitmap copies, not
+the cost of parsing, authorization, read-cut validation, and presentation.
+
+Source windows use their already-leased segment reader for identity lookup.
+Separate opt-in diagnostic runs attribute key lookup, provider work, revision
+lookup, directory reads/planning, selected ranges, reconstruction, and fallback.
+For reproduction, pass frozen server binaries to the benchmark driver:
+
+```sh
+python3 zig/pkg/antfly-grep/bench/logical_sources.py \
+  --baseline /path/to/reference/antfly --candidate /path/to/candidate/antfly \
+  --grep /path/to/antfly-grep --suite all --rounds 2 \
+  --output output/grep-postings-paired
+python3 zig/pkg/antfly-grep/bench/logical_sources.py \
+  --baseline /path/to/reference/antfly --candidate /path/to/candidate/antfly \
+  --grep /path/to/antfly-grep --suite hints --source-phases --rounds 1 \
+  --output output/grep-postings-phase-diagnostic
+```
+
+Use a separate directory for each run; the driver refuses to overwrite evidence.
+Run the `pages` diagnostic suite separately to inspect membership ownership.
+Ordinary benchmark requests enable the public query profile, including the
+top-level lookup/ownership counters. Extra physical-source phase clocks and log
+capture are opt-in; those diagnostic timings are not pooled with ordinary
+latency trials. The
+retained-page fixture covers early, middle, and final dense/sparse pages over
+16,384 documents and requires zero source re-verification on measured pages.
+
+Maintained source-binding certificates across writes and coordinator-owned
+verification grants remain unimplemented. Existing whole-generation proofs and
+per-shard request budgets remain authoritative. The
+[execution design](../../../docs/design/logical-field-queries.md) records the
+publication, mutation, repair, restart, capacity, and lifetime fences needed for
+those changes.
+
+Qualification passes 21 integration/upgrade cases on each platform (seven opt-in
+skips), 215 selected search/storage tests in both Debug and ReleaseFast (one
+skip), 89 logical-query and 144 query-contract cases in Debug, and 46 introducer
+cases in both modes. Allocation-failure and ownership checks report no leaks.
+The separate Linux ingestion check passes with two CPUs, 1 GiB RAM and swap
+disabled. Paired Linux retrieval uses two CPUs/1 GiB; paired ingestion uses equal
+8 GiB envelopes with swap disabled.
+
+Two alternating primary rounds produce these HTTP medians in milliseconds:
+
+| Workload | macOS reference → candidate | Linux reference → candidate |
+|---|---:|---:|
+| Tiny values | 11.74 → 12.49 | 12.73 → 13.63 |
+| Selected 4 KiB values | 14.71 → 19.68 | 24.13 → 23.86 |
+| Dominant selected values | 8.94 → 10.36 | 10.41 → 14.59 |
+| Unselected escaped arrays | 11.47 → 11.24 | 14.70 → 12.05 |
+| Nested source | 11.78 → 12.64 | 15.90 → 15.24 |
+| One concurrent client | 8.35 → 8.23 | 15.34 → 15.25 |
+| Four concurrent clients | 18.13 → 16.30 | 69.91 → 67.85 |
+| Fresh distinct predicates | 82.12 → 69.00 | 85.45 → 78.85 |
+| Repetitive ingestion | 259.29 → 184.80 | 1093.69 → 728.92 |
+| Source-like ingestion | 213.83 → 197.79 | 1561.50 → 846.28 |
+| Distinct-word ingestion | 2522.38 → 2118.94 | 7344.83 → 3470.95 |
+
+Linux distinct-word ingestion reduces process read characters from 205.9 to
+128.4 MB and process write bytes from 96.6 to 75.3 MB (about 38% and 22%). Its
+process CPU median falls from 3.71 to 2.95 seconds. These are process I/O
+counters on a warm filesystem, not cold-device bandwidth measurements.
+Ingestion improves in these trials; retrieval remains mixed, including slower
+selected-value cases. No general latency or RSS improvement is established.
+
+The primary cached-page trials were also mixed and showed some larger macOS
+slowdowns. A post-hoc four-round page repeat, kept separate from those primary
+trials, produced the following HTTP medians. It did not reproduce the large
+late-page slowdown, and it does not establish a consistent page-latency win.
+
+| Cached page | macOS reference → candidate | Linux reference → candidate |
+|---|---:|---:|
+| Dense, first | 153.86 → 169.17 | 216.30 → 218.55 |
+| Dense, middle | 162.54 → 162.55 | 225.58 → 219.74 |
+| Dense, final | 154.98 → 152.31 | 218.20 → 222.35 |
+| Sparse, first | 23.51 → 27.37 | 20.20 → 19.31 |
+| Sparse, middle | 24.15 → 22.86 | 20.33 → 20.41 |
+| Sparse, final | 24.63 → 25.82 | 19.14 → 20.24 |
+
+On each platform, the candidate page diagnostics record 90 successful segment
+borrows across 18 page requests, zero membership copies, and zero source
+re-verification. This establishes the ownership/work bound independently of
+latency. Dense-deletion regressions check a million-document domain, wordwise
+skipping, cancellation, sparse seeks and upper-bound clipping.
+
+Fresh-predicate diagnostics identify revision lookup (median component times
+27.3–27.5 ms) and selected-range reads (15.8–18.1 ms) as the main source costs in
+that fixture. Identity lookup is only 30–51 μs; directory reads take 6.3–6.7 ms.
+These component medians are diagnostic observations, not additive attribution
+of every workload. Batched revision/source validation and maintained binding
+certificates are better next targets than enlarging an identity cache.
+
+
+### Decisions transport qualification
+
+`bench/decision_transport.py` now compares the public single-input Decisions
+contract, native Antfly batches, and versioned shared contexts. It uses local
+constant-score fixtures, alternating trial order, binary/source hashes, and
+output equivalence; it never contacts a model. Use `--transport single` or
+`--transport shared-v1`, with `--baseline-transport antfly-batch`. To isolate
+transport from code changes, pass the same binary as candidate and baseline.
+`--cache` measures warmed decision caches; `--keep-alive` enables persistent
+fixture connections. Write raw JSON under ignored `output/`, not this directory.
+Protocol compatibility, fewer bytes or requests, and cache hits do not establish
+model quality, provider token charges, or a universal latency advantage.
+
+
+The [Decisions client qualification](bench/results/grep-decisions-client-summary.json)
+records artifact hashes, conformance checks, and three alternating trials per
+transport on macOS and the ARM64 Linux VM. In the 512-line constant-score fixture,
+all modes preserve 513 evaluations and identical output. Shared contexts reduce
+request bodies from 10,548,999 to 1,412,265 bytes (86.6%) with 65 requests;
+common single-input Decisions needs 513 requests. Warmed caches require zero
+provider requests in both protocols. These are protocol byte/request measurements,
+not provider token costs or a claim that complete searches are free.
+
+
+## Visual decision search
+
+Use the same Decisions endpoint and credentials with explicit image mode:
+
+```sh
+antfly-grep --provider antfly --model VISION_DECIDER \
+  --media images --ask 'Does this show a failed checkout?' --json ./screenshots
+antfly-grep --provider antfly --model VISION_DECIDER \
+  --media images --ask 'Which slide shows declining revenue?' --table-config tables.json
+```
+
+Local PNG/JPEG/WebP/GIF files are whole-image units. Indexed
+[document v2](schema/document-v2.json) adds page/slide/image manifests and
+revision-bound inline image fields on the same parent row. The configured
+`document_field` selects v1 or v2 sources; text mode remains the default. DocsAF
+`ToEvidenceRecord` can construct v2 source records with explicit ACL metadata.
+PDF/slide rendering and Cloud Drive synchronization belong to ingestion.
+
+Visual mode sends one ordered text/image evidence message per unit, with multiple
+questions sharing that image. JSON evidence records identify the unit, page/slide,
+source revision, image digest and recipe; they contain no invented line numbers
+or bounding boxes. Counts refer to matching visual units. The provider must
+support image Decisions; native text-only models, lexical prefilters, triage,
+stdin and workspace media are rejected. Antfly multimodal batches and shared text
+contexts preserve images; explicit single-input transport remains available for
+custom services.
+
+Default image limits are 512 KiB and 16,777,216 pixels. Adjust
+`--max-image-bytes SIZE` (maximum 768 KiB) / `--max-image-pixels N`; the 1 MiB
+serialized Decisions evidence cap still applies. Images are inspected without
+raster decoding. Budget errors retain completed partial results and exit 2.
+Cached scores avoid repeat inference; indexed media is freshly authorized and
+validated before every cache lookup. Grep never fetches arbitrary provider URLs.
+See the [design](../../../docs/design/antfly-grep.md#multimodal-source-evidence-and-cloud-boundary-2026-10-21)
+and [Cloud delivery issue](https://github.com/antflydb/colony/issues/790) for the
+private asset, ACL and connector lifecycle requirements. Cloud connector work is
+not included in this CLI implementation; fixture tests do not establish visual
+model quality.
+
+
+Visual evaluations use waves capped at 16 units and 8 MiB conservative evidence.
+Indexed waves fetch distinct same-parent image fields together with one fresh
+authorized ID query; these point reads create no pagination snapshots. The
+manifest scan keeps its retained snapshot and ascending-ID order. Identical asset
+references share validated bytes within a wave, and successful siblings survive
+refusal, malformed item answers and oversized-batch partition failures. Warm
+scores still require current asset authorization, revision and digest validation.
+Local `--max-filesize` filtering and hard `--max-file-size` limits apply before
+inference. Quiet mode respects file selection, including `--files-without-match`.
+
+The [visual batching qualification](bench/results/grep-visual-batching-summary.json)
+compares the prior PR binary with this implementation using eight distinct
+same-parent images, five alternating trials and 20 ms artificial delay per HTTP
+request. Cold requests drop from 17 to 3 (8 to 1 Decisions; 9 to 2 index queries),
+and warm requests from 9 to 2 with no inference. Median elapsed time was
+468 to 108 ms cold / 232 to 66 ms warm on macOS, and 389 to 78 ms cold /
+224 to 49 ms warm in the two-CPU, 1-GiB ARM64 Linux VM. These synthetic delays
+measure transport shape, not live-provider speed or model-token savings.
+That historical qualification uses one parent. The follow-up below adds
+cross-parent scheduling. Reproduce with `bench/visual_batches.py --help`; raw trial reports remain in ignored `output/`.
+
+
+Cross-parent visual search now groups up to eight equal-shape parent projections,
+coalesces Decisions across bounded worker lanes, and retains ordered output and
+per-parent authorization/revision/digest checks. Asset-size rejection falls back
+to individual parents; oversized per-parent field groups split adaptively. A
+borrowed asset page covers one evaluation wave, then later waves authorize again.
+Explicit finite budgets and early-selection modes retain serial admission; the
+default request safety cap remains shared across every HTTP attempt. Active
+parents can increase RSS: concurrency is a latency/throughput tradeoff, not a
+claim that every workload uses less memory.
+
+`bench/visual_batches.py --parents 8 --units 1` measures separate documents;
+`--parents 20 --units 8` crosses pages and windows, and `--image-bytes 262144`
+adds valid PNG payloads to exercise larger transfers. Five alternating paired
+trials record exact output equivalence, HTTP counts, child CPU/wall time, first
+stdout and peak RSS. Use pinned baseline/current binaries and write raw reports
+to ignored `output/`. Live model tokens, prices and relevance remain unmeasured.
+
+The [cross-parent qualification](bench/results/grep-cross-parent-summary.json)
+records the final binaries and all four workload shapes. For eight separate
+documents, total requests fall from 17 to 3 cold and 9 to 2 warm:
+
+| Host | Cold median, baseline → current | Warm median, baseline → current |
+|---|---:|---:|
+| macOS ARM64 | 454 → 110 ms | 234 → 68 ms |
+| Linux ARM64 VM, 2 CPUs / 1 GiB | 418 → 78 ms | 224 → 53 ms |
+
+These are loopback fixtures with 20 ms artificial delay per HTTP request. With
+256 KiB images, peak RSS rises from 7.8 to 16.9 MiB on macOS and 8.5 to 18.8 MiB
+in the Linux VM. Cold tiny-input CPU time also rises from 11 to 29 ms in that VM.
+Unranked first-output latency is similar or slightly worse despite lower total
+time; results still arrive before later provider work finishes. The report
+includes CPU, RSS and first-output figures rather than implying universal cost
+or latency improvements. Live provider cost and relevance remain unmeasured.
+
+The scalar source-proof cache now admits one cold entry with CLOCK eviction
+instead of clearing all 4,096 entries, retaining 4,095 existing facts. Proof
+lookup and registration take one lock per bounded window of up to 64 rows.
+Epoch, owner and publication checks still fence reuse; a cached fact never
+authorizes an asset or substitutes for a complete predicate certificate.
+
+
+Cross-parent workers now refill as each lane completes, with a fixed 16-slot
+ordered completion buffer and the existing global pending-output quota. Shared
+asset responses retire after their last wave borrower. Ordinary parsed strings
+borrow their retained response, removing a second base64-string allocation;
+response bytes count toward the page memory limit. Image-wave scratch has a
+shared 64 MiB conservative admission budget, separate from cumulative source
+bytes and provider concurrency. This is an admission estimate, not an RSS cap.
+
+Fallback asset reads use the invocation's request counter and cancellation token.
+The default 1,000-request cap applies to all index and provider attempts across
+lanes. Default-budget image searches can overlap a manifest page only when
+conservative current-page retry/split headroom remains; explicit finite budgets
+and text-stage searches keep serial metadata admission. Server-owned conditional
+source identities remain [future API work](../../../docs/design/antfly-grep.md#future-generic-conditional-source-projection); warm images still receive full byte validation.
+
+The [rolling-evidence qualification](bench/results/grep-rolling-evidence-summary.json)
+compares this implementation with the preceding cross-parent binary. In a
+128-image workload (eight parents, sixteen 256 KiB images each), both use 17
+index requests. Cold peak RSS falls from 154.4 to 58.6 MiB on macOS and 150.9 to
+92.8 MiB in the two-CPU/1-GiB Linux VM. Warm peak RSS falls from 98.7 to 24.3 MiB
+and 122.9 to 41.1 MiB respectively. Cold elapsed medians are 420→436 ms on macOS
+and 489→432 ms in the VM; warm medians rise from 181→210 ms and 202→235 ms.
+Memory admission therefore trades some warm latency for a smaller working set.
+The slow-parent fixture improves cold elapsed time by about 6% on both hosts;
+ordinary workloads and CPU/first-output metrics do not improve uniformly.
+These fixtures impose 20 ms HTTP delays and synthetic constant scores; they
+establish no live-provider token savings or universal performance guarantee.
+
+Final validation passed 282/284 CLI cases on macOS and 281/284 in the Linux VM
+(two/three platform skips), 24 media regressions, 25 real-server cases (seven
+opt-in benchmark skips), package units, 31 packaging tests, 35 boundary-checker
+regressions and Windows cross-compilation. The server integration uses the
+previously frozen native server. Raw trials remain in ignored local output;
+the compact report records binary hashes, CPU, RSS, first output and limitations.
+
+Main was subsequently merged through `eb5145c3b5` (#1259). After that merge and
+the additional failed-drain lifetime regression, the rebuilt final CLI passed
+283/285 cases on macOS and 282/285 in Linux (two/three platform skips), including
+25 media cases and Linux's wide-repository watcher under a 256-descriptor limit.
+The merged native DB suite passed four tests with zero leaks; all five registry
+cases and Windows cross-compilation passed. The report records these final
+validation hashes separately; its performance measurements remain pinned to the
+earlier measured binaries. Failed deferred drains join and discard remaining
+borrowers before retiring any manifest page, including failures inside cleanup.

@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antfly.io/schemas/grep-document-v2.json",
+  "title": "Antfly grep source document v2 with revision-bound visual evidence",
+  "type": "object",
+  "required": [
+    "grep"
+  ],
+  "properties": {
+    "grep": {
+      "type": "object",
+      "required": [
+        "version",
+        "uri",
+        "path",
+        "content",
+        "revision",
+        "indexed_at",
+        "permissions"
+      ],
+      "properties": {
+        "version": {
+          "const": 2
+        },
+        "uri": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 16384,
+          "description": "Canonical provider identity/link, never a data URL or credential-bearing materialization URL."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "content": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "indexed_at": {
+          "type": "integer",
+          "description": "UTC Unix seconds at which this exact revision was indexed."
+        },
+        "modified_at": {
+          "type": "integer"
+        },
+        "permissions": {
+          "type": "object",
+          "required": [
+            "public",
+            "readers"
+          ],
+          "properties": {
+            "public": {
+              "type": "boolean"
+            },
+            "readers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "regions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "start_line",
+              "end_line"
+            ],
+            "properties": {
+              "start_line": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "end_line": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "label": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "created_at": {
+          "type": "integer"
+        },
+        "accessed_at": {
+          "type": "integer"
+        },
+        "evidence": {
+          "type": "array",
+          "maxItems": 4096,
+          "description": "Unique unit IDs per parent revision; manifests only. Image bytes live in same-parent logical fields.",
+          "items": {
+            "$ref": "#/$defs/unit"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "mime_type",
+        "sha256",
+        "recipe",
+        "byte_length"
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "maxLength": 1024,
+          "pattern": "^[A-Za-z0-9-][A-Za-z0-9_-]*(\\.[A-Za-z0-9-][A-Za-z0-9_-]*)*$",
+          "description": "Ordinary logical field on this parent row containing an inline data URL. Not a URL or cross-document reference."
+        },
+        "mime_type": {
+          "enum": [
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif"
+          ]
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "recipe": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "asset"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "kind": {
+          "enum": [
+            "image",
+            "page",
+            "slide"
+          ]
+        },
+        "location": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "page": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            "slide": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            }
+          }
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 131072
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "asset": {
+          "$ref": "#/$defs/asset"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "image"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "location": {
+                "maxProperties": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "page"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "location"
+            ],
+            "properties": {
+              "location": {
+                "required": [
+                  "page"
+                ],
+                "not": {
+                  "required": [
+                    "slide"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "slide"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "location"
+            ],
+            "properties": {
+              "location": {
+                "required": [
+                  "slide"
+                ],
+                "not": {
+                  "required": [
+                    "page"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "description": "Example contract root is grep; table document_field may choose another root. Text limits are UTF-8 byte limits in the native implementation, not JSON Schema character counts. IDs must be unique; all fields, bytes and permissions must describe one atomic source revision."
+}

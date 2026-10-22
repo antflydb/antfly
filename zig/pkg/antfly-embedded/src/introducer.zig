@@ -917,15 +917,38 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
 /// Spill at physical-field boundaries as well as row boundaries. A document
 /// may have many analyzed companions, each larger than the entire run target.
 /// Waiting for its last field defeats the working-set bound on small nodes.
+/// Explicit non-default targets remain deterministic for tests and callers.
+/// Adaptive growth uses advisory slice/node headroom; every allocation still
+/// passes normal admission. Small nodes retain the proven 8-MiB run policy.
+fn postingsRunTarget(options: BuildTextOptions, pending: u64) u64 {
+    const base = options.postings_run_target_bytes;
+    if (base != 8 * 1024 * 1024) return base;
+    const manager = options.resource_manager orelse return base;
+    if (manager.memoryHardLimitForSlice(.full_text_build_working_set) <= 128 * 1024 * 1024) return base;
+    const available = manager.availableAdmissionBytes(.full_text_build_working_set);
+    return @max(base, @min(64 * 1024 * 1024, (pending +| available) / 4));
+}
+
 fn spillPendingFields(alloc: Allocator, builders: *FieldPostingsBuilders, options: BuildTextOptions, count: u32, spool: *?*PostingRun) !void {
     if (options.postings_run_io == null or builders.pending_bytes < options.postings_run_target_bytes) return;
-    for (builders.pending.items) |name| {
-        const builder = builders.getPtr(name).?;
+    const target = postingsRunTarget(options, builders.pending_bytes);
+    if (builders.pending_bytes < target) return;
+    // Spill largest fields first. Tiny companion fields retain their builders
+    // instead of creating a run every time a large field crosses its target.
+    std.sort.pdq([]const u8, builders.pending.items, builders, struct {
+        fn less(context: *FieldPostingsBuilders, left: []const u8, right: []const u8) bool {
+            return context.getPtr(left).?.estimatedMemoryBytes() > context.getPtr(right).?.estimatedMemoryBytes();
+        }
+    }.less);
+    var spilled: usize = 0;
+    while (spilled < builders.pending.items.len and builders.pending_bytes >= target / 2) : (spilled += 1) {
+        const builder = builders.getPtr(builders.pending.items[spilled]).?;
         if (options.profile) |p| p.postings_spill_checks +|= 1;
         try builder.spill(alloc, options, count, spool);
         builder.queued = false;
     }
-    builders.pending.clearRetainingCapacity();
+    std.mem.copyForwards([]const u8, builders.pending.items, builders.pending.items[spilled..]);
+    builders.pending.items.len -= spilled;
 }
 
 fn writeTextSegmentWithScratch(
@@ -4892,4 +4915,47 @@ test "bounded postings prepared segment owners unwind partial allocation failure
     };
     try Scenario.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
+test "postings merge caches sixteen interleaved dictionary and posting cursors" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    const spool = try PostingRun.create(a, std.testing.io, directory);
+    defer spool.deinit();
+    var payload: [32 * 1024]u8 = undefined;
+    for (0..16) |lane| {
+        @memset(&payload, @intCast(lane));
+        const start = spool.len();
+        try spool.appendSlice(&payload);
+        try spool.seal(start);
+    }
+    const view = try spool.view();
+    var byte: [1]u8 = undefined;
+    for (0..64) |step| for (0..16) |lane| {
+        for ([_]usize{ 0, 16 * 1024 }) |section| {
+            try view.readInto(lane * payload.len + section + step, &byte);
+            try std.testing.expectEqual(@as(u8, @intCast(lane)), byte[0]);
+        }
+    };
+    try std.testing.expect(spool.read_calls <= 32);
+    try std.testing.expect(spool.read_buffer.len <= 512 * 1024);
+    std.debug.print("interleaved merge logical_reads=2048 physical_reads={d} cache_bytes={d}\n", .{ spool.read_calls, spool.read_buffer.len });
+}
+
+test "postings spill policy retains small-node bounds and adapts to live headroom" {
+    const MiB = 1024 * 1024;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)] = .{ .hard_limit_bytes = 128 * MiB };
+    var small = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    try std.testing.expectEqual(@as(u64, 8 * MiB), postingsRunTarget(.{ .resource_manager = &small }, 8 * MiB));
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)] = .{ .hard_limit_bytes = 512 * MiB };
+    var large = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    try std.testing.expectEqual(@as(u64, 64 * MiB), postingsRunTarget(.{ .resource_manager = &large }, 8 * MiB));
+    var held = try large.reserve(.full_text_build_working_set, 480 * MiB);
+    defer held.release();
+    try std.testing.expectEqual(@as(u64, 10 * MiB), postingsRunTarget(.{ .resource_manager = &large }, 8 * MiB));
+    try std.testing.expectEqual(@as(u64, 1024), postingsRunTarget(.{ .resource_manager = &large, .postings_run_target_bytes = 1024 }, 8 * MiB));
 }

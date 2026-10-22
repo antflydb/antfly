@@ -15,6 +15,12 @@
 
 const std = @import("std");
 pub const Limits = struct {
+    pub const evidence_memory_limit: usize = 64 * 1024 * 1024;
+    /// Shared conservative image-wave working-set admission. Separate from
+    /// cumulative source bytes and provider concurrency; retained output has
+    /// its own quota and must never hold a wave lease while awaiting ordering.
+    evidence_bytes: std.atomic.Value(usize) = .init(0),
+    peak_evidence_bytes: std.atomic.Value(usize) = .init(0),
     spill_bytes: std.atomic.Value(usize) = .init(0),
     pending_output: std.atomic.Value(usize) = .init(0),
     mutex: std.Io.Mutex = .init,
@@ -26,6 +32,29 @@ pub const Limits = struct {
     regions: std.atomic.Value(usize) = .init(0),
     source_bytes: std.atomic.Value(usize) = .init(0),
     cancel: std.atomic.Value(bool) = .init(false),
+    pub fn acquireEvidence(self: *Limits, io: std.Io, bytes: usize) !void {
+        if (bytes > evidence_memory_limit) return error.EvidenceMemoryExceeded;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        while (true) {
+            if (self.cancel.load(.acquire)) return error.Canceled;
+            if (reserve(&self.evidence_bytes, bytes, evidence_memory_limit)) {
+                _ = self.peak_evidence_bytes.fetchMax(self.evidence_bytes.load(.monotonic), .monotonic);
+                return;
+            }
+            self.changed.waitTimeout(io, &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => {},
+                else => return err,
+            };
+        }
+    }
+    pub fn releaseEvidence(self: *Limits, io: std.Io, bytes: usize) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const prior = self.evidence_bytes.fetchSub(bytes, .monotonic);
+        std.debug.assert(prior >= bytes);
+        self.changed.broadcast(io);
+    }
     pub fn acquire(self: *Limits, io: std.Io, max: usize) !void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -74,3 +103,34 @@ pub const Limits = struct {
         }
     }
 };
+
+test "image wave admission is shared and cancellation releases waiters" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var limits: Limits = .{};
+    const io = std.testing.io;
+    try limits.acquireEvidence(io, Limits.evidence_memory_limit);
+    const Waiter = struct {
+        limits: *Limits,
+        entered: std.atomic.Value(bool) = .init(false),
+        canceled: bool = false,
+        fn run(self: *@This()) void {
+            self.entered.store(true, .release);
+            self.limits.acquireEvidence(std.testing.io, 1) catch |err| {
+                self.canceled = err == error.Canceled;
+                return;
+            };
+            self.limits.releaseEvidence(std.testing.io, 1);
+        }
+    };
+    var waiter: Waiter = .{ .limits = &limits };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    while (!waiter.entered.load(.acquire)) std.Thread.yield() catch {};
+    limits.cancel.store(true, .release);
+    thread.join();
+    try std.testing.expect(waiter.canceled);
+    limits.releaseEvidence(io, Limits.evidence_memory_limit);
+    try std.testing.expectEqual(@as(usize, 0), limits.evidence_bytes.load(.monotonic));
+    try std.testing.expectEqual(Limits.evidence_memory_limit, limits.peak_evidence_bytes.load(.monotonic));
+    limits.cancel.store(false, .release);
+    try std.testing.expectError(error.EvidenceMemoryExceeded, limits.acquireEvidence(io, Limits.evidence_memory_limit + 1));
+}

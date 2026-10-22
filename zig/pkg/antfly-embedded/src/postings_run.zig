@@ -64,6 +64,12 @@ pub const Run = if (@import("builtin").os.tag == .freestanding) struct {
 } else NativeRun;
 
 const NativeRun = struct {
+    // A merge has up to sixteen interleaved cursors, each visiting dictionary
+    // and postings pages. Four global slots thrash even on warm file caches.
+    // Four ways keep lookup work constant; the lazy payload stays at 512 KiB.
+    const read_sets = 8;
+    const read_ways = 4;
+    const read_page_bytes = 16 * 1024;
     const Extent = struct { logical: usize, physical: usize, length: usize };
     allocator: Allocator,
     io: std.Io,
@@ -82,8 +88,8 @@ const NativeRun = struct {
     live_bytes: usize = 0,
     dead_extents: usize = 0,
     read_buffer: []u8 = &.{},
-    read_pages: [4]struct { offset: usize = 0, length: usize = 0 } = @splat(.{}),
-    next_read_page: usize = 0,
+    read_pages: [read_sets * read_ways]struct { offset: usize = 0, length: usize = 0 } = @splat(.{}),
+    next_read_page: [read_sets]u2 = @splat(0),
     read_calls: usize = 0,
     write_calls: usize = 0,
 
@@ -267,21 +273,24 @@ const NativeRun = struct {
             if (try self.file.readPositionalAll(self.io, bytes, physical) != bytes.len) return error.EndOfStream;
             return;
         }
-        if (self.read_buffer.len == 0) self.read_buffer = try self.allocator.alloc(u8, 64 * 1024);
+        if (self.read_buffer.len == 0) self.read_buffer = try self.allocator.alloc(u8, read_sets * read_ways * read_page_bytes);
         var copied: usize = 0;
         while (copied < bytes.len) {
             const position = physical + copied;
-            const page_offset = position / (16 * 1024) * (16 * 1024);
+            const page_offset = position / read_page_bytes * read_page_bytes;
+            const page_number = page_offset / read_page_bytes;
+            const set = (page_number ^ (page_number >> 3) ^ (page_number >> 6) ^ (page_number >> 9)) % read_sets;
+            const first = set * read_ways;
             const in_page = position - page_offset;
             const take = @min(bytes.len - copied, 16 * 1024 - in_page);
             var slot: ?usize = null;
-            for (self.read_pages, 0..) |page, i| if (page.offset == page_offset and page.length >= in_page + take) {
+            for (self.read_pages[first..][0..read_ways], first..) |page, i| if (page.offset == page_offset and page.length >= in_page + take) {
                 slot = i;
                 break;
             };
             const index = slot orelse blk: {
-                const i = self.next_read_page;
-                self.next_read_page = (i + 1) % self.read_pages.len;
+                const i = first + self.next_read_page[set];
+                self.next_read_page[set] +%= 1;
                 const length = @min(16 * 1024, self.persisted - page_offset);
                 self.read_calls += 1;
                 if (try self.file.readPositionalAll(self.io, self.read_buffer[i * 16 * 1024 ..][0..length], page_offset) != length) return error.EndOfStream;
