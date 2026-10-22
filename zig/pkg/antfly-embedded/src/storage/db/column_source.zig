@@ -53,6 +53,74 @@ pub const Page = struct {
         for (selection) |index| if (index >= batch.rowCount()) return error.InvalidSqlBackendResponse;
         return gather(a, batch.columns, selection);
     }
+    pub const Position = struct { page: *const Page, row: usize };
+    /// Assemble a bounded scatter from independently owned pages. Preserve
+    /// native scalar types; page-local dictionaries normalize into compact slots.
+    pub fn gatherPositions(a: A, positions: []const Position) !*Page {
+        if (positions.len == 0 or positions.len > 4096) return error.InvalidSqlBackendResponse;
+        const self = try a.create(Page);
+        self.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = positions.len };
+        errdefer self.release();
+        const pa = self.arena.allocator();
+        const first = positions[0].page;
+        const columns = try pa.alloc(rows.ColumnVector, first.columns.len);
+        for (positions) |position| if (position.row >= position.page.len or position.page.columns.len != columns.len or position.page.selection != null) return error.InvalidSqlBackendResponse;
+        for (first.columns, columns, 0..) |original, *out, ci| {
+            const nulls = try pa.alloc(u8, positions.len);
+            out.* = .{ .name = try pa.dupe(u8, original.name), .values = undefined, .nulls = .{ .bytes = nulls } };
+            for (positions, nulls) |position, *flag| {
+                const column = position.page.columns[ci];
+                if (!std.mem.eql(u8, original.name, column.name)) return error.InvalidSqlBackendResponse;
+                flag.* = @intFromBool(column.nulls.isNull(position.row));
+            }
+            out.values = switch (original.values) {
+                .i64, .dictionary_i64 => blk: {
+                    const values = try pa.alloc(i64, positions.len);
+                    for (positions, values, nulls) |position, *value, flag| value.* = if (flag != 0) 0 else try position.page.columns[ci].integerAt(position.row);
+                    break :blk .{ .i64 = values };
+                },
+                .f64, .dictionary_f64 => blk: {
+                    const values = try pa.alloc(f64, positions.len);
+                    for (positions, values, nulls) |position, *value, flag| value.* = if (flag != 0) 0 else switch (position.page.columns[ci].values) {
+                        .f64 => |v| v[position.row],
+                        .dictionary_f64 => |v| v.at(position.row),
+                        else => return error.RowSourceColumnKindMismatch,
+                    };
+                    break :blk .{ .f64 = values };
+                },
+                .bytes, .dictionary_bytes => blk: {
+                    const values = try pa.alloc([]const u8, positions.len);
+                    for (positions, values, nulls) |position, *value, flag| value.* = if (flag != 0) "" else try pa.dupe(u8, try position.page.columns[ci].bytesAt(position.row));
+                    break :blk .{ .bytes = values };
+                },
+                .decimal128 => |decimal| blk: {
+                    var result = decimal;
+                    const values = try pa.alloc(i128, positions.len);
+                    for (positions, values, nulls) |position, *value, flag| {
+                        const source = position.page.columns[ci].values;
+                        if (source != .decimal128 or source.decimal128.scale != decimal.scale) return error.RowSourceColumnKindMismatch;
+                        value.* = if (flag != 0) 0 else source.decimal128.values[position.row];
+                    }
+                    result.values = values;
+                    break :blk .{ .decimal128 = result };
+                },
+                inline .bool, .json, .vector_f32 => |_, tag| blk: {
+                    const T = @typeInfo(@FieldType(rows.ColumnValues, @tagName(tag))).pointer.child;
+                    const values = try pa.alloc(T, positions.len);
+                    for (positions, values, nulls) |position, *value, flag| {
+                        const source = position.page.columns[ci].values;
+                        if (std.meta.activeTag(source) != tag) return error.RowSourceColumnKindMismatch;
+                        const raw = @field(source, @tagName(tag))[position.row];
+                        value.* = if (comptime tag == .bool) flag == 0 and raw else if (flag != 0) &.{} else try pa.dupe(@typeInfo(T).pointer.child, raw);
+                    }
+                    break :blk @unionInit(rows.ColumnValues, @tagName(tag), values);
+                },
+                .encoded => return error.UnsupportedSqlExecution,
+            };
+        }
+        self.columns = columns;
+        return self;
+    }
     /// Prefer retained payloads for dense selections; sparse selections gather
     /// compact slots so a few hits cannot pin a large decoded page/dictionary.
     pub fn retainOrCopy(a: A, batch: rows.ColumnBatch, selection: []const usize, capability: anytype) !*Page {

@@ -403,6 +403,7 @@ pub const ServingSource = struct {
         file: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?[]const u8,
         digest: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]const u8,
         tie_rank: *const fn (*anyopaque, std.mem.Allocator, @import("../../storage/rowsource/types.zig").RowRef) anyerror!u64,
+        tie_ranks: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, []u64) anyerror!void = null,
         translate_many: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, bool) anyerror![]const @import("../../storage/rowsource/types.zig").RowRef = null,
         translate_many_bounded: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, bool, *TranslationAllowance) anyerror![]const @import("../../storage/rowsource/types.zig").RowRef = null,
         bind_index: ?*const fn (*anyopaque, []const u8) anyerror!RowResolver = null,

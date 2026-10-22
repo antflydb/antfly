@@ -1895,7 +1895,7 @@ const FastTopK = struct {
         if (self.pending_count == 0) return;
         var candidates = roaring.RoaringBitmap.init(self.alloc);
         defer candidates.deinit();
-        for (self.pending[0..self.pending_count]) |hit| try candidates.add(hit.doc_id - self.segment_offset);
+        if (self.producers.present()) for (self.pending[0..self.pending_count]) |hit| try candidates.add(hit.doc_id - self.segment_offset);
         // Complete global membership is immutable for the request. Borrow it
         // directly instead of copying a full segment bitmap for every batch.
         const include_global = complete(self.producers.include);
@@ -1904,14 +1904,33 @@ const FastTopK = struct {
         defer if (include) |*bitmap| bitmap.deinit();
         var exclude = if (exclude_global == null) if (self.producers.exclude) |producer| try producer.produce(producer.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null else null;
         defer if (exclude) |*bitmap| bitmap.deinit();
+        var admitted: usize = 0;
         for (self.pending[0..self.pending_count]) |hit| {
             const local_id = hit.doc_id - self.segment_offset;
             if (include_global) |bitmap| if (!bitmap.contains(hit.doc_id)) continue;
             if (exclude_global) |bitmap| if (bitmap.contains(hit.doc_id)) continue;
             if (include) |*bitmap| if (!bitmap.contains(local_id)) continue;
             if (exclude) |*bitmap| if (bitmap.contains(local_id)) continue;
-            try self.collectAdmitted(hit);
+            self.pending[admitted] = hit;
+            admitted += 1;
         }
+        // Scores rejected by the current heap/floor/cursor need no map reads.
+        // Deferring a cutoff until the next bounded tile is conservative.
+        var competitive: [64]scorer_mod.ScoredHit = undefined;
+        var positions: [64]usize = undefined;
+        var count: usize = 0;
+        for (self.pending[0..admitted], 0..) |hit, i| {
+            if (self.k == 0) continue;
+            if (self.minimum_competitive_score) |floor| if (hit.score < floor) continue;
+            if (self.hits.items.len >= self.k and hit.score < self.hits.items[0].score) continue;
+            if (self.after) |cursor| if (hit.score > cursor.score) continue;
+            competitive[count] = hit;
+            positions[count] = i;
+            count += 1;
+        }
+        try scorer_mod.prepareHits(self.alloc, competitive[0..count], self.tie_rank);
+        for (competitive[0..count], positions[0..count]) |hit, i| self.pending[i] = hit;
+        for (self.pending[0..admitted]) |hit| try self.collectAdmitted(hit);
         self.pending_count = 0;
     }
 
@@ -1922,7 +1941,7 @@ const FastTopK = struct {
     pub fn collect(self: *FastTopK, doc_id: u32, score: f32) !void {
         if (!self.allows(doc_id)) return;
         const hit = scorer_mod.ScoredHit{ .doc_id = doc_id, .score = score };
-        if (self.producers.present()) {
+        if (self.producers.present() or (if (self.tie_rank) |rank| rank.resolve_many != null else false)) {
             self.pending[self.pending_count] = hit;
             self.pending_count += 1;
             if (self.pending_count == self.pending.len) try self.flushPending();
@@ -1932,6 +1951,8 @@ const FastTopK = struct {
     }
     fn collectAdmitted(self: *FastTopK, hit: scorer_mod.ScoredHit) !void {
         self.total_count += 1;
+        if (self.k == 0) return;
+        if (self.minimum_competitive_score) |floor| if (hit.score < floor) return;
         var candidate = hit;
         if (self.after) |cursor| {
             if (self.after_hit == null) self.after_hit = try scorer_mod.prepareHit(self.alloc, .{ .doc_id = cursor.doc_id, .score = cursor.score }, self.tie_rank);
@@ -1939,7 +1960,6 @@ const FastTopK = struct {
             if (cursor.score == hit.score) candidate = try scorer_mod.prepareHit(self.alloc, hit, self.tie_rank);
             if (!scorer_mod.betterWithRank(self.after_hit.?, candidate, self.tie_rank)) return;
         }
-        if (self.minimum_competitive_score) |floor| if (hit.score < floor) return;
         try scorer_mod.offerTopKWithRank(self.alloc, &self.hits, self.k, candidate, self.tie_rank);
     }
 
@@ -5959,7 +5979,7 @@ fn buildResult(
     if (request.tie_rank) |order| {
         const sorted = try alloc.dupe(scorer_mod.ScoredHit, scored);
         defer alloc.free(sorted);
-        for (sorted) |*hit| hit.* = try scorer_mod.prepareHit(alloc, hit.*, order);
+        try scorer_mod.prepareHits(alloc, sorted, order);
         scorer_mod.sortScoredHitsWithRank(sorted, order);
         var start: usize = 0;
         if (request.search_after) |cursor| {
@@ -10926,4 +10946,36 @@ test "external lake global frontier patterns stream mixed scores and cursor page
         try std.testing.expectEqual(@as(u32, 640), constant.total_hits);
         try std.testing.expectEqual(@as(usize, 7), constant.hits.len);
     }
+}
+
+test "producer top k batches competitive relocation ranks through heap and cursor" {
+    const Context = struct {
+        batches: usize = 0,
+        scalar_calls: usize = 0,
+        fn rank(_: *const anyopaque, doc: u32) u64 {
+            return doc;
+        }
+        fn resolve(raw: *const anyopaque, _: Allocator, doc: u32) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.scalar_calls += 1;
+            return 200 - @as(u64, doc);
+        }
+        fn many(raw: *const anyopaque, _: Allocator, docs: []const u32, ranks: []u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.batches += 1;
+            try std.testing.expect(docs.len <= 64);
+            for (docs, ranks) |doc, *value| value.* = 200 - @as(u64, doc);
+        }
+    };
+    var context: Context = .{};
+    var collector: FastTopK = .{ .alloc = std.testing.allocator, .k = 3, .tie_rank = .{ .ptr = &context, .rank = Context.rank, .resolve = Context.resolve, .resolve_many = Context.many }, .after = .{ .doc_id = 127, .score = 1 } };
+    defer collector.deinit();
+    for (0..128) |doc| try collector.collect(@intCast(doc), 1);
+    const hits = try collector.finish();
+    defer std.testing.allocator.free(hits);
+    try std.testing.expectEqual(@as(u32, 126), hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 124), hits[2].doc_id);
+    try std.testing.expectEqual(@as(usize, 2), context.batches);
+    try std.testing.expectEqual(@as(usize, 1), context.scalar_calls);
+    try std.testing.expectEqual(@as(u32, 128), collector.total_count);
 }

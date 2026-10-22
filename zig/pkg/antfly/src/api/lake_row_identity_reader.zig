@@ -185,6 +185,54 @@ const Binding = struct {
         };
         return value.canonicalRank(scratch.allocator(), value.root.current, current) catch |err| return owner.failed(err);
     }
+    fn tieRanks(raw: *anyopaque, a: A, refs: []const RowRef, ranks: []u64) !void {
+        const self = from(raw);
+        self.tieRanksInner(a, refs, ranks) catch |err| return self.owner.failed(err);
+    }
+    fn tieRanksInner(self: *Binding, a: A, refs: []const RowRef, ranks: []u64) !void {
+        if (refs.len != ranks.len or refs.len > 256) return error.InvalidLogicalRowIdentity;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var lane: ReadLane = undefined;
+        lane.init(self.owner, sa, null);
+        defer lane.deinit();
+        var reader_ = self.reader(&lane);
+        const current = reader_.root.current;
+        if (current.by_order == null) {
+            for (refs, ranks) |ref, *rank| rank.* = try self.tieRankInner(a, ref);
+            return;
+        }
+        const coordinates = try sa.alloc(identity.logical.Coordinate, refs.len);
+        if (self.translation) |translation| {
+            for (refs, coordinates) |ref, *coordinate| {
+                if (!sameCut(self.space, ref)) return error.ExternalLakeSnapshotMismatch;
+                coordinate.* = .{ .file = try self.slot(sa, &reader_, self.space, ref.external.file_id, true), .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal };
+            }
+            const mapped = try reader_.translateDenseMany(sa, translation, coordinates, true);
+            if (translation.ranked) {
+                for (mapped, ranks) |value, *rank| {
+                    if (value.rank >= current.rows) return error.InvalidLogicalRowIdentity;
+                    rank.* = value.rank;
+                }
+                return;
+            }
+            for (mapped, coordinates) |value, *coordinate| coordinate.* = value.coordinate;
+        } else {
+            const mapped = try reader_.translateMany(sa, refs, true);
+            for (mapped, coordinates) |value, *coordinate| coordinate.* = value.coordinate;
+        }
+        var keys: [256][44]u8 = undefined;
+        var pointers: [256][]const u8 = undefined;
+        var names: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+        for (coordinates, keys[0..refs.len], pointers[0..refs.len]) |coordinate, *key, *pointer| {
+            const name = try names.getOrPut(sa, coordinate.file);
+            if (!name.found_existing) name.value_ptr.* = try reader_.file(sa, current, coordinate.file);
+            key.* = identity.orderKey(name.value_ptr.*, coordinate.group, coordinate.row);
+            pointer.* = key;
+        }
+        try @import("../serverless/graph_segment/page_tree.zig").ranksOf(sa, lane.cache.store(), current.by_order orelse return error.InvalidLogicalRowIdentity, pointers[0..refs.len], ranks);
+    }
     fn file(raw: *anyopaque, a: A, digest_: []const u8) !?[]const u8 {
         const self = from(raw);
         const resolver = try self.nav(a);
@@ -209,7 +257,7 @@ const Binding = struct {
         }
         var space: [32]u8 = undefined;
         hash.final(&space);
-        return .{ .ptr = self, .source = self.space.source, .snapshot = self.space.snapshot, .current_source = self.owner.reader.root.current.source, .current_snapshot = self.owner.reader.root.current.snapshot, .rows = self.owner.reader.root.current.rows, .relocated = self.relocated, .coordinate_space = space, .from_index = fromIndex, .to_index = toIndex, .file = file, .digest = digest, .tie_rank = tieRank, .translate_many = translateMany, .translate_many_bounded = translateManyBounded, .close = close };
+        return .{ .ptr = self, .source = self.space.source, .snapshot = self.space.snapshot, .current_source = self.owner.reader.root.current.source, .current_snapshot = self.owner.reader.root.current.snapshot, .rows = self.owner.reader.root.current.rows, .relocated = self.relocated, .coordinate_space = space, .from_index = fromIndex, .to_index = toIndex, .file = file, .digest = digest, .tie_rank = tieRank, .tie_ranks = tieRanks, .translate_many = translateMany, .translate_many_bounded = translateManyBounded, .close = close };
     }
 };
 fn sameCut(space: identity.Space, ref: RowRef) bool {
@@ -290,6 +338,10 @@ const Owner = struct {
     fn translateManyBounded(raw: *anyopaque, a: A, refs: []const RowRef, forward: bool, allowance: *Source.TranslationAllowance) ![]const RowRef {
         const self: *Owner = @ptrCast(@alignCast(raw));
         return Binding.translateManyBounded(&self.default_binding, a, refs, forward, allowance);
+    }
+    fn tieRanks(raw: *anyopaque, a: A, refs: []const RowRef, ranks: []u64) !void {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        try Binding.tieRanks(&self.default_binding, a, refs, ranks);
     }
     fn bindIndex(raw: *anyopaque, name: []const u8) !Source.RowResolver {
         const self: *Owner = @ptrCast(@alignCast(raw));
@@ -534,6 +586,7 @@ pub fn install(table_id: u64, source: *Source, store: *Store, publication: local
     resolver.file = Owner.file;
     resolver.digest = Owner.digest;
     resolver.tie_rank = Owner.tieRank;
+    resolver.tie_ranks = Owner.tieRanks;
     resolver.translate_many = Owner.translateMany;
     resolver.translate_many_bounded = Owner.translateManyBounded;
     resolver.bind_index = Owner.bindIndex;

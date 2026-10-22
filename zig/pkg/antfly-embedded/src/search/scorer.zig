@@ -32,6 +32,7 @@ pub const TieRank = struct {
     /// Relocated sources resolve bounded competitive hits through authenticated
     /// navigation. Resolution happens before heap/sort comparisons and can fail.
     resolve: ?*const fn (*const anyopaque, Allocator, u32) anyerror!u64 = null,
+    resolve_many: ?*const fn (*const anyopaque, Allocator, []const u32, []u64) anyerror!void = null,
     pub fn value(self: @This(), doc: u32) u64 {
         return self.rank(self.ptr, doc);
     }
@@ -53,6 +54,34 @@ pub fn prepareHit(a: Allocator, hit: ScoredHit, rank: ?TieRank) !ScoredHit {
         if (prepared.resolved_tie == std.math.maxInt(u64)) return error.InvalidSearchTieRank;
     };
     return prepared;
+}
+/// Resolve only the missing ranks, with bounded stack storage independent of
+/// candidate count. Callbacks must complete a whole tile or propagate failure.
+pub fn prepareHits(a: Allocator, hits: []ScoredHit, rank: ?TieRank) !void {
+    const order = rank orelse return;
+    const batch = order.resolve_many orelse {
+        for (hits) |*hit| hit.* = try prepareHit(a, hit.*, order);
+        return;
+    };
+    var begin: usize = 0;
+    while (begin < hits.len) {
+        const end = @min(hits.len, begin + 64);
+        var docs: [64]u32 = undefined;
+        var positions: [64]usize = undefined;
+        var ranks: [64]u64 = undefined;
+        var count: usize = 0;
+        for (hits[begin..end], begin..) |hit, i| if (hit.resolved_tie == std.math.maxInt(u64)) {
+            docs[count] = hit.doc_id;
+            positions[count] = i;
+            count += 1;
+        };
+        if (count != 0) try batch(order.ptr, a, docs[0..count], ranks[0..count]);
+        for (positions[0..count], ranks[0..count]) |i, value| {
+            if (value == std.math.maxInt(u64)) return error.InvalidSearchTieRank;
+            hits[i].resolved_tie = value;
+        }
+        begin = end;
+    }
 }
 pub fn sortScoredHitsWithRank(hits: []ScoredHit, rank: ?TieRank) void {
     std.mem.sort(ScoredHit, hits, rank, struct {

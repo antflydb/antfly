@@ -3675,8 +3675,8 @@ reuse their immutable index artifacts. External Parquet/Iceberg rewrites cannot
 be inferred from file names, row counts or offsets. Stable-key reuse is now
 implemented with delete-aware key verification and per-index typed input
 fingerprints. Unchanged files retain copy-on-write identity state. Unchanged
-indexes retain their exact original artifacts; changed indexes rebuild in the
-same atomic publication. A stable key alone never establishes unchanged postings.
+indexes retain their exact original artifacts; changed logical fragments update
+native state in the same atomic publication. A stable key alone never establishes unchanged postings.
 Absent a complete proof, native index construction continues normally.
 
 A future durable rewrite map must bind both immutable inventories, source and
@@ -3687,10 +3687,14 @@ keys, missing rows or changed indexed values force rebuild/update. Query readers
 must apply the same mapping to text, scalar predicates, deletes, covering values
 and public identity; a text-only mapping would be incorrect. The current
 stable-key implementation applies these boundaries to scoped resolver views,
-persistent coordinate maps with shared canonical ordering, budgeted batched
-predicate translation, parallel map readers and covering delivery.
-Trusted-producer mapping adapters and reuse across changed logical ID sets remain
-staged in the linked identity design.
+persistent coordinate maps with shared canonical ordering, batched competitive
+tie ranks, budgeted predicate translation, native dense-ID constraints, parallel
+map readers and covering delivery. Logical radix fragments now reuse native
+per-file mutations across append/removal after relocation; their census,
+coordinate maps and native roots share the publication, certificate and GC
+closure. Changed fragments use bounded physical gathers and shared projected
+replay. Identity verification and fragment census hashing can still scale with
+row count. Trusted-producer mapping adapters remain staged in the linked design.
 
 [Lance fragment reuse](https://lance.org/format/index/system/frag_reuse/) defers
 physical index remapping using verified compaction transitions.

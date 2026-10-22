@@ -459,11 +459,64 @@ const Execution = struct {
     fn vectorRequest(self: *Execution, req: types.SearchRequest) types.SearchRequest {
         var result = req;
         if (self.overlay != null or self.vector_include != null or self.vector_exclude != null or self.vector_include_provider != null or self.vector_exclude_provider != null) {
-            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_constraints = selectSparseConstraints, .constraint_revision = sparseConstraintRevision, .select_range = selectSparseRange };
+            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_dense = selectDenseConstraints, .select_constraints = selectSparseConstraints, .constraint_revision = sparseConstraintRevision, .select_range = selectSparseRange };
             result.filter_query_json = "";
             result.exclusion_query_json = "";
         }
         return result;
+    }
+    fn selectDenseConstraints(raw: *anyopaque, a: A) !?types.DenseIdSelection {
+        const self: *Execution = @ptrCast(@alignCast(raw));
+        if (self.overlay != null or self.active_recent) return null;
+        const runtime = self.unit_runtime orelse return null;
+        const entry = runtime.dense_entry orelse return null;
+        var workspace: local.sql_memory_budget = .{ .backing = a, .limit = 4 * 1024 * 1024 };
+        var scratch = std.heap.ArenaAllocator.init(workspace.allocator());
+        defer scratch.deinit();
+        var allowance: local.serverless_query_lake_serving.ServingSource.TranslationAllowance = .{};
+        return self.denseConstraintsInner(a, scratch.allocator(), entry, &allowance) catch |err| {
+            if (err == error.QueryCandidateBudgetExceeded or (err == error.OutOfMemory and workspace.isLocallyExhausted())) return null;
+            return err;
+        };
+    }
+    fn denseConstraintsInner(self: *Execution, out: A, a: A, entry: *local.storage_db_catalog_index_manager.IndexManager.DenseIndex, allowance: *local.serverless_query_lake_serving.ServingSource.TranslationAllowance) !?types.DenseIdSelection {
+        const need_include = self.vector_include_provider != null or self.includeSet() != null;
+        const need_exclude = self.vector_exclude_provider != null or self.excludeSet() != null;
+        const include = if (need_include) try self.denseIds(a, entry, if (self.vector_include_provider) |*provider| provider else null, self.includeSet(), allowance) else null;
+        const exclude = if (need_exclude) try self.denseIds(a, entry, if (self.vector_exclude_provider) |*provider| provider else null, self.excludeSet(), allowance) else null;
+        if (include == null and exclude == null) return null;
+        const retained = if (include) |ids| try out.dupe(u64, ids) else null;
+        errdefer if (retained) |ids| out.free(ids);
+        return .{ .include = retained, .exclude = if (exclude) |ids| try out.dupe(u64, ids) else &.{}, .residual = (need_include and include == null) or (need_exclude and exclude == null) };
+    }
+    fn denseIds(self: *Execution, a: A, entry: *local.storage_db_catalog_index_manager.IndexManager.DenseIndex, provider: ?*@import("lake_index_text_predicate.zig").PhysicalResolver.Membership, selected: ?*const @import("lake_index_physical_set.zig").Set, allowance: *local.serverless_query_lake_serving.ServingSource.TranslationAllowance) !?[]const u64 {
+        var converted = if (self.relocated()) try self.relocatedSelection(a, provider, selected, allowance) else null;
+        defer if (converted) |*set| set.deinit();
+        const selection = if (self.relocated()) (if (converted) |*set| set else return null) else selected orelse return null;
+        const count = selection.boundedCardinality(4096) orelse return null;
+        var ids: std.ArrayList(u64) = .empty;
+        try ids.ensureTotalCapacity(a, count);
+        var files = selection.files.iterator();
+        while (files.next()) |file| {
+            try self.context.ensureActive();
+            const digest = if (self.index_resolver) |resolver| try resolver.digest(resolver.ptr, a, file.key_ptr.*) else if (self.navigation) |resolver| try resolver.digest(a, file.key_ptr.*) else self.private_digests.get(file.key_ptr.*) orelse return error.ExternalLakeSnapshotMismatch;
+            var blocks = file.value_ptr.iterator();
+            while (blocks.next()) |block| {
+                var rows = block.value_ptr.iterator();
+                while (rows.next()) |low| {
+                    const row = (@as(u64, block.key_ptr.high) << 32) | low;
+                    var buffer: [96]u8 = undefined;
+                    const key = try std.fmt.bufPrint(&buffer, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, block.key_ptr.group, row });
+                    const id = @import("lake_index_native_dense.zig").vectorId(key);
+                    const metadata = (try entry.index.getMetadata(id)) orelse continue;
+                    defer entry.index.alloc.free(metadata);
+                    if (!std.mem.eql(u8, metadata, key)) return error.NativeLakeVectorIdentityCollision;
+                    ids.appendAssumeCapacity(id);
+                }
+            }
+        }
+        std.mem.sort(u64, ids.items, {}, std.sort.asc(u64));
+        return ids.items;
     }
     fn includeSet(self: *Execution) ?*const @import("lake_index_physical_set.zig").Set {
         if (self.vector_include) |*set| return set;
@@ -687,7 +740,6 @@ const Execution = struct {
     }
     fn deinit(self: *Execution) void {
         self.ordinal_live_rows.deinit(self.result_allocator);
-        for (self.relocated_ties.items) |tie| tie.live.deinit(self.result_allocator);
         if (self.vector_include_provider) |*provider| provider.deinit();
         if (self.vector_exclude_provider) |*provider| provider.deinit();
         self.highlight_locations.deinit(self.arena);
@@ -1419,25 +1471,44 @@ const Execution = struct {
         execution: *Execution,
         identities: @import("lake_index_text_predicate.zig").Identities,
         resolver: local.serverless_query_lake_serving.ServingSource.RowResolver,
-        live: @import("lake_index_text_predicate.zig").LiveRowsCache,
-        mutex: std.atomic.Mutex = .unlocked,
         fn fallback(_: *const anyopaque, doc: u32) u64 {
             return doc;
         }
         fn resolve(raw: *const anyopaque, a: A, doc: u32) !u64 {
-            const self: *RelocatedTie = @ptrCast(@alignCast(@constCast(raw)));
-            while (!self.mutex.tryLock()) {
-                try self.execution.context.ensureActive();
-                if (self.execution.context.io) |io| try io.sleep(.zero, .awake) else @import("antfly_platform").time.yieldBriefly();
-            }
-            defer self.mutex.unlock();
-            const archive_docs = self.identities.offsets[self.identities.offsets.len - 1];
-            if (doc >= archive_docs) return std.math.add(u64, self.resolver.rows, doc - archive_docs) catch return error.InvalidSearchTieRank;
+            var result: [1]u64 = undefined;
+            try resolveMany(raw, a, &.{doc}, &result);
+            return result[0];
+        }
+        fn resolveMany(raw: *const anyopaque, a: A, docs: []const u32, ranks: []u64) !void {
+            const self: *const RelocatedTie = @ptrCast(@alignCast(raw));
+            if (docs.len != ranks.len or docs.len > 256) return error.InvalidSearchTieRank;
+            try self.execution.context.ensureActive();
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
+            const sa = scratch.allocator();
+            // Mutable navigation belongs to this tile/scoring lane. Shared
+            // authenticated decoded pages remain in the publication cache.
+            var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
+            defer live.deinit(a);
             const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.execution.server.lake_read_cache, .scope = self.execution.store.identity, .context = self.execution.context };
-            const ref = try self.identities.physicalRow(scratch.allocator(), &self.live, self.execution.store.artifactStore(), cached, doc, self.resolver.source, self.resolver.snapshot);
-            return self.resolver.tie_rank(self.resolver.ptr, scratch.allocator(), ref);
+            const archive_docs = self.identities.offsets[self.identities.offsets.len - 1];
+            var refs: [256]local.storage_rowsource_types.RowRef = undefined;
+            var positions: [256]usize = undefined;
+            var values: [256]u64 = undefined;
+            var count: usize = 0;
+            for (docs, 0..) |doc, i| {
+                if (doc >= archive_docs) {
+                    ranks[i] = std.math.add(u64, self.resolver.rows, doc - archive_docs) catch return error.InvalidSearchTieRank;
+                    continue;
+                }
+                refs[count] = try self.identities.physicalRow(sa, &live, self.execution.store.artifactStore(), cached, doc, self.resolver.source, self.resolver.snapshot);
+                positions[count] = i;
+                count += 1;
+            }
+            if (self.resolver.tie_ranks) |batch| {
+                try batch(self.resolver.ptr, sa, refs[0..count], values[0..count]);
+            } else for (refs[0..count], values[0..count]) |ref, *value| value.* = try self.resolver.tie_rank(self.resolver.ptr, sa, ref);
+            for (positions[0..count], values[0..count]) |i, value| ranks[i] = value;
         }
     };
     fn acquireForRanking(raw: ?*anyopaque, name: ?[]const u8) !?search.PinnedTextSource {
@@ -1448,10 +1519,10 @@ const Execution = struct {
             const identities: *const @import("lake_index_text_predicate.zig").Identities = @ptrCast(@alignCast(raw_identities));
             if (if (self.relocated()) self.index_resolver else null) |resolver| {
                 const tie = try self.arena.create(RelocatedTie);
-                tie.* = .{ .execution = self, .identities = identities.*, .resolver = resolver, .live = .{ .backing = self.result_allocator } };
+                tie.* = .{ .execution = self, .identities = identities.*, .resolver = resolver };
                 tie.identities.row_resolver = null;
                 try self.relocated_ties.append(self.arena, tie);
-                pin.logical_tie_rank = .{ .ptr = tie, .rank = RelocatedTie.fallback, .resolve = RelocatedTie.resolve };
+                pin.logical_tie_rank = .{ .ptr = tie, .rank = RelocatedTie.fallback, .resolve = RelocatedTie.resolve, .resolve_many = RelocatedTie.resolveMany };
             } else pin.logical_tie_rank = identities.tie_rank;
         }
         if (self.typed_delivery) {

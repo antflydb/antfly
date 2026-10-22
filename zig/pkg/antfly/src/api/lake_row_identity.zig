@@ -124,7 +124,12 @@ pub const Root = struct {
     indexes: ?Space = null,
     certificate: ?logical.Digest = null,
     reused: []const ReusedIndex = &.{},
+    native_space: ?Space = null,
     pub fn jsonStringify(self: Root, writer: anytype) !void {
+        if (self.native_space) |space| {
+            try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate, .reused = self.reused, .native_space = space });
+            return;
+        }
         // Keep the original certificate payload for maps predating typed hashes.
         if (self.values_format == 1) {
             try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate });
@@ -139,6 +144,10 @@ pub const Root = struct {
         try self.current.validate();
         if ((self.reused.len != 0 and self.values_format != 2) or self.reused.len > local.metadata_lake_index_catalog.max_directory_artifacts) return error.InvalidLogicalRowIdentity;
         if (self.indexes) |index| try self.validateIndexSpace(index);
+        if (self.native_space) |space| {
+            if (self.values_format != 2) return error.InvalidLogicalRowIdentity;
+            try self.validateIndexSpace(space);
+        }
         for (self.reused, 0..) |entry, i| {
             if (entry.name.len == 0) return error.InvalidLogicalRowIdentity;
             for (self.reused[0..i]) |prior| if (std.mem.eql(u8, prior.name, entry.name)) return error.InvalidLogicalRowIdentity;
@@ -158,14 +167,14 @@ pub const Root = struct {
         if (space.rows != self.current.rows or !std.mem.eql(u8, space.source, self.current.source)) return error.InvalidLogicalRowIdentity;
     }
     pub fn hasRelocation(self: Root) bool {
-        return self.indexes != null or self.reused.len != 0;
+        return self.indexes != null or self.reused.len != 0 or self.native_space != null;
     }
     pub fn reseal(self: *Root, a: A) !void {
         self.certificate = if (self.hasRelocation()) try self.seal(a) else null;
     }
     pub fn spaceForIndex(self: Root, name: []const u8) Space {
         for (self.reused) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.space;
-        return self.indexes orelse self.current;
+        return self.indexes orelse self.native_space orelse self.current;
     }
     fn seal(self: Root, a: A) !logical.Digest {
         var copy = self;
@@ -180,7 +189,7 @@ pub const Root = struct {
         return result;
     }
     pub fn indexSpace(self: Root) Space {
-        return self.indexes orelse (if (self.reused.len != 0) self.reused[0].space else self.current);
+        return self.indexes orelse (if (self.reused.len != 0) self.reused[0].space else self.native_space orelse self.current);
     }
 };
 
@@ -221,9 +230,13 @@ pub const Spaces = struct {
                 if (self.root.indexes) |space| return space;
                 continue;
             }
-            if (position - 2 < self.root.reused.len) {
-                self.translation = self.root.reused[position - 2].translation;
-                return self.root.reused[position - 2].space;
+            if (position == 2) {
+                if (self.root.native_space) |space| return space;
+                continue;
+            }
+            if (position - 3 < self.root.reused.len) {
+                self.translation = self.root.reused[position - 3].translation;
+                return self.root.reused[position - 3].space;
             }
             return null;
         }

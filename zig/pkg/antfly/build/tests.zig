@@ -6409,6 +6409,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_storage_work_contract_tests = addCuratedTestRunArtifact(b, storage_work_contract_tests, storage_work_contract_tests.filters);
     b.step("storage-work-contract-test", "Run storage boundary and bounded-work regressions").dependOn(&run_storage_work_contract_tests.step);
 
+    const dense_selection_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"one percent native filter routes through integrated dense search exactly"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("native-dense-selection-test", "Verify exact lake dense-ID callback intersection and empty selections")
+        .dependOn(&addFilteredTestRunArtifact(b, dense_selection_tests).step);
+
     const release_scale_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &release_scale_test_filters,

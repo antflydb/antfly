@@ -201,58 +201,69 @@ failures and cancellation propagate.
 
 Reader leases, GC traversal, cloud publication certificates, startup navigation
 warming and recovery include all current and original navigation/map roots and
-compact translations. Protocol 68 fences readers that cannot interpret rank-free
-coordinate maps. Historical rank-bearing map certificates retain their original
-serialization and remain readable. Reconciliation probes bounded unique navigation roots. A deeper
+compact translations. Protocol 69 additionally fences readers that cannot interpret
+logical native fragment spaces; protocol 68 introduced rank-free coordinate maps.
+Historical rank-bearing map certificates retain their original serialization and
+remain readable. Reconciliation probes bounded unique navigation roots. A deeper
 reader failure records a generation- and publication-token-bound repair hint;
 the coordinator rebuilds that publication without reuse. Stale hints cannot
 invalidate a later publication. Hints are process-local and are rediscovered by a
 failed reader after restart.
 
 Existing physical public IDs remain unchanged; the logical ID codec is internal
-and does not introduce a public stable-ID promise. Added or removed logical IDs
-still require complete index rebase after relocation. Identity maps themselves
-remain incremental, but reusing native index postings across a changed logical ID
-set needs explicit membership/delta support in each consumer. Worst-case map
-publication and proof comparisons still scale with row count; unchanged
-authenticated subtrees skip verification reads. Cross-file rewrite savings must
-be measured against this verification/publication cost.
+and does not introduce a public stable-ID promise. Worst-case identity verification,
+fragment census hashing and proof comparisons still scale with row count; unchanged
+authenticated subtrees skip verification reads. Cross-file rewrite savings must be
+measured against this verification/publication cost.
 
 ## Native delta reuse across membership changes
 
-The remaining expensive case is a changed logical ID set after relocation.
-Coordinate translation alone cannot make a native checkpoint reusable here:
-postings, term/document frequencies, vector membership, ordered covering tuples
-and algebraic contributions all describe the old live set.
+Native publication now persists a logical fragment space independently of physical
+Parquet files. A radix census starts with sixteen 4-bit prefixes and splits a leaf
+above 8,192 live IDs, retaining unaffected boundaries and empty leaves. The census
+is capped at 16,384 fragments under publication admission. Each fragment version
+binds the verified ID and captured input-value fingerprints, excluding physical
+coordinates. Native removal/addition and contribution paths replace only affected
+fragments, updating postings, collection statistics, dense/sparse membership,
+covering tuples and algebraic retractions in the same atomic publication.
 
-Prefer index-local logical fragments backed by the existing native per-file
-mutation and contribution machinery. A fragment census assigns stable logical
-IDs to bounded fragments independently of physical Parquet files. Unchanged
-fragment inputs retain native state. New/changed/deleted inputs rebuild the
-affected fragment, using native removal/addition paths so text collection
-statistics and algebraic retractions stay exact. Publication seals a complete
-new index address space and its map to current physical rows. This avoids
-query-time unions of an unbounded number of overlays and avoids inventing a
-second statistics implementation for tombstoned base postings.
+Coordinates within a fragment are collision-free ordered ordinals, never truncated
+ID hashes. A changed fragment is replaced completely before its ordinals can be
+reused. Per-index equivalence proofs still retain exact artifact roots for indexes
+whose captured inputs are unchanged. Retained indexes can therefore refer to older
+fragment spaces; each index binds its own authenticated resolver and coordinate map.
 
-Fragment ownership must be explicit and durable. Never hash an ID into a finite
-row ordinal without collision verification, retain a removed address as live,
-or equate source offsets with logical membership. Split oversized fragments
-under publication admission; retain stable unaffected fragment boundaries.
-Fragment-local reordering is safe only when that fragment's complete native
-contribution is replaced in the same commit. Per-index recipes and shared
-aggregate cohorts still control which fragment inputs can reuse state.
+Construction gathers changed fragments through bounded 256-row physical selections
+and the existing projected replay shared by native builders. Each consumer owns a
+parallel physical reader. A typed scatter restores logical order across physical
+file/page boundaries before exposing each tile; wide integers, decimals and NULLs
+retain their native representations. Expanded payloads above an 8 MiB target
+retry with fewer selected rows before copying, down to one row subject to the
+existing decoder and native construction limits. It does not scan the archive for every fragment. The exact
+verified census supplies COUNT metadata without interpreting internal fragment
+identifiers as source object paths. Invalid/missing identity evidence or exhausted
+optional construction admission selects ordinary complete physical rebuilding.
 
-Construction needs a bounded projected spool that routes current source rows to
-those logical fragments once, shared across native builders, rather than a
-physical-source scan for each fragment. Publication admission must account for
-this spool, coordinate maps and native mutations together. If it declines,
-ordinary complete rebuilding remains available. Delta census, maps, contribution
-roots and native checkpoints enter the same reader protocol, publication
-certificate, lease and GC closure. Independent Parquet and Iceberg writers must
-exercise append, removal, input updates, mixed relocation and restart against a
-fresh-build oracle before this path can replace rebasing. This fragment path is
-not implemented by the coordinate-map changes above.
+A new fragment space, its navigation, native mutations, contribution roots and
+coordinate maps enter the same publication certificate, reader lease, GC and restart
+closure. Rank-free maps update the union of changed IDs on both the old/new native
+and physical sides; additions take priority over deleted addresses during swaps.
+They retain unchanged COW pages rather than re-sorting all rows after membership
+changes. Canonical tie ranks come from current physical membership. Competitive
+text hits resolve ranks in batches of 64; each operation owns its cache and shares
+map/tree paths without holding a mutex across remote I/O.
+
+Selective dense constraints also cross the native owner boundary as complete
+include/exclude vector-ID sets (at most 4,096 IDs in a 4 MiB planning workspace).
+The planner verifies native metadata against each physical key before accepting a
+hashed vector ID. Partial plans retain the exact residual predicate; declined
+translations never reinterpret current coordinates as historical native addresses.
+Broad selections keep bounded candidate membership evaluation.
+
+Real Parquet and Iceberg E2Es exercise append, removal, per-index input changes,
+mixed original spaces, forward/backward pages and restart against fresh-build
+oracles. These are correctness qualifications, not archive-scale throughput or
+live-cloud retention measurements.
 
 ## Staged extensions
 
@@ -260,17 +271,6 @@ not implemented by the coordinate-map changes above.
   The inheritance rules are modeled and tested, but the current reader does not
   claim automatic v3 lineage reuse.
 - Accept independently authenticated, snapshot-bound writer mapping proofs.
-- Extend per-index reuse across added/deleted logical IDs with explicit native
-  membership and delta state; never retain stale aggregates or deleted postings.
-  This remains unimplemented. The logical-fragment path above persists an
-  index-local address space and publication-bound live membership/version census
-  alongside native immutable mutation/contribution state. Stable addresses
-  cannot be inferred from the current source's file offsets. New, changed and
-  removed inputs must update text DF and collection statistics, ordered/covering
-  tuples, dense/sparse membership and algebraic reductions under one commit.
-  Reader protocol, resolver views, GC, cloud closure proofs and restart must
-  adopt the same membership epoch before enabling reuse; the current whole-index
-  rebase remains the execution path.
 - Enable stable logical public IDs only with complete lookup, overlay, cursor,
   filtering and compatibility coverage.
 

@@ -287,6 +287,12 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                     try declarations.append(out, .{ .name = name, .binding = slot_binding, .artifact = artifact });
                 }
                 continue;
+            } else if (metadata_count and native_provider.fragment_rows != null) {
+                // The authenticated logical census already applied source
+                // deletes and verified every key; no physical footer is owed.
+                var count: u64 = 0;
+                for (source.inventory.files) |file| count = try std.math.add(u64, count, file.row_count);
+                try group.addGlobalCount(count);
             } else if (metadata_count) {
                 var stream = try local.serverless_query_lake_stream.Stream.init(a, source, columns, &.{}, provider.context, provider.limits);
                 defer stream.deinit();
@@ -518,7 +524,7 @@ const LeafResolver = struct {
                 defer self.provider.only_file = null;
                 const file = self.source.inventory.files[leaf.index];
                 if (self.metadata_count) {
-                    if (self.source.inventory.format == .iceberg) {
+                    if (self.source.inventory.format == .iceberg or self.provider.fragment_rows != null) {
                         try partial.addGlobalCount(file.row_count);
                     } else {
                         // Footer discovery qualifies the immutable file version;

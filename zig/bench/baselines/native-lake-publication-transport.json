@@ -164,7 +164,7 @@
   "qualification_outstanding": [
     "Controlled identical-fixture base/head HN one-file and 1024-file latency and post-GC footprint",
     "Live object-provider publication throughput and durable retention qualification",
-    "External rewrite reuse with trusted row lineage or stable keys plus indexed-value change detection",
+    "Trusted writer row-lineage adapter and archive-scale stable-key reuse measurements",
     "Pin-aware unified dirty execution-page pager and fully resumable shared operator scheduling"
   ],
   "remote_query": {
@@ -183,5 +183,25 @@
     "ownership": "retained until result deinit or stream close",
     "host_cache_reclaim_before_denial": true,
     "automatic_dirty_page_pager": false
+  },
+  "logical_native_fragments": {
+    "reader_protocol": 69,
+    "initial_radix_bits": 4,
+    "target_maximum_rows": 8192,
+    "maximum_fragments": 16384,
+    "physical_gather_rows": 256,
+    "identity": "verified logical ID plus captured indexed-value fingerprints",
+    "mutation": "replace affected native per-file contributions; retain unaffected radix leaves",
+    "coordinate_maps": "COW union of changed native and physical IDs; additions win address swaps",
+    "tie_rank_batch_rows": 64,
+    "dense_selection_maximum_ids": 4096,
+    "dense_selection_workspace_bytes": 4194304,
+    "remaining_cost": "full identity verification and fragment census hashing can scale with row count",
+    "performance_claim": "structural bounds and correctness tests; archive throughput not measured",
+    "physical_gather_target_payload_bytes": 8388608,
+    "physical_gather_wide_test_rows": 65,
+    "physical_gather_wide_test_field_bytes": 131072,
+    "physical_gather_wide_test_maximum_rows_per_tile": 32,
+    "oversized_gather": "shrink before copying; single rows retain decoder/native construction limits"
   }
 }

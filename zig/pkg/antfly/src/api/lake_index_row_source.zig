@@ -31,6 +31,10 @@ pub const Provider = struct {
     identity_spill_bytes: u64 = 1024 * 1024 * 1024,
     identity_working_set_bytes: usize = 64 * 1024 * 1024,
     skip_indexes: []const []const u8 = &.{},
+    fragment_rows: ?struct {
+        ptr: *anyopaque,
+        open: *const fn (*anyopaque, A, bindings.Binding, ?usize, Cancellation, ?*const stores.IoPhase) anyerror!rows.Source,
+    } = null,
 
     /// Total work belongs to a configuration, across private file checkpoints.
     resume_work: ?*ResumeWork = null,
@@ -179,6 +183,11 @@ pub const Provider = struct {
             var projected = binding;
             projected.column_bindings = names.items;
             if (try replay.openFor(a, projected, self.only_file, cancellation, self.replay_consumer)) |source| return source;
+        }
+        if (self.fragment_rows) |fragments| {
+            var projected = binding;
+            projected.column_bindings = names.items;
+            return fragments.open(fragments.ptr, a, projected, self.only_file, cancellation, self.io_phase);
         }
         if (self.source.scanner.iceberg_delete_plan) |plan| for (plan.files) |file| for (file.equality_columns) |column| {
             const present = for (names.items) |name| {

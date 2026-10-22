@@ -269,6 +269,42 @@ pub fn rankOf(alloc: Allocator, store: Store, root: Ref, key: []const u8) !u64 {
     }
 }
 
+/// Ordered multi-seek: read each reached ancestor/leaf once for the tile,
+/// preserving duplicates and caller order without walking intervening leaves.
+pub fn ranksOf(alloc: Allocator, store: Store, root: Ref, keys: []const []const u8, result: []u64) !void {
+    if (keys.len != result.len or keys.len > 256) return error.InvalidGraphPage;
+    var positions: [256]usize = undefined;
+    for (positions[0..keys.len], 0..) |*position, i| position.* = i;
+    std.mem.sort(usize, positions[0..keys.len], keys, struct {
+        fn compare(values: []const []const u8, left: usize, right: usize) bool {
+            return less(values[left], values[right]);
+        }
+    }.compare);
+    try rankTile(alloc, store, root, keys, positions[0..keys.len], result, 0);
+}
+fn rankTile(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8, positions: []const usize, result: []u64, base: u64) anyerror!void {
+    if (positions.len == 0) return;
+    var page = try readPage(alloc, store, ref);
+    defer page.deinit(alloc);
+    var next: usize = 0;
+    var rank = base;
+    for (page.entries, 0..) |entry, i| {
+        const first = next;
+        while (next < positions.len and (i + 1 == page.entries.len or less(keys[positions[next]], page.entries[i + 1].key))) : (next += 1) {}
+        if (ref.height == 0) {
+            for (positions[first..next]) |position| {
+                if (!std.mem.eql(u8, keys[position], entry.key)) return error.InvalidGraphPage;
+                result[position] = rank;
+            }
+            rank = try std.math.add(u64, rank, 1);
+        } else {
+            try rankTile(alloc, store, entry.child.?, keys, positions[first..next], result, rank);
+            rank = try std.math.add(u64, rank, entry.child.?.records);
+        }
+    }
+    if (next != positions.len) return error.InvalidGraphPage;
+}
+
 /// An independently owned authenticated page. Callers may retain its immutable
 /// bytes/entry views in a bounded decode cache, under the full ref and domain.
 pub fn readPage(alloc: Allocator, store: Store, ref: Ref) !Page {
@@ -2917,4 +2953,36 @@ test "external lake changed tree traversal skips COW ranges and reports rebalanc
     try std.testing.checkAllAllocationFailures(a, Failure.run, .{ backing.store(), root, removed });
     backing.canceled = true;
     try std.testing.expectError(error.Canceled, visitDifferences(a, backing.store(), root, root, &visitor));
+}
+
+test "external lake batched ranks share paths preserve duplicates and reject absent keys" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    var names: [2000][8]u8 = undefined;
+    var mutations: [2000]Mutation = undefined;
+    const value: [128]u8 = @splat(42);
+    for (&names, &mutations, 0..) |*name, *mutation, i| {
+        std.mem.writeInt(u64, name, i, .big);
+        mutation.* = .{ .key = name, .value = &value };
+    }
+    const root = (try apply(a, backing.store(), null, &mutations)).?;
+    const keys = [_][]const u8{ &names[1023], &names[3], &names[1024], &names[3], &names[1999] };
+    var result: [keys.len]u64 = undefined;
+    backing.reads = 0;
+    try ranksOf(a, backing.store(), root, &keys, &result);
+    try std.testing.expectEqualSlices(u64, &.{ 1023, 3, 1024, 3, 1999 }, &result);
+    const batched_reads = backing.reads;
+    backing.reads = 0;
+    for (keys) |key| _ = try rankOf(a, backing.store(), root, key);
+    try std.testing.expect(batched_reads < backing.reads);
+    try std.testing.expectError(error.InvalidGraphPage, ranksOf(a, backing.store(), root, &.{"absent"}, result[0..1]));
+    const Failure = struct {
+        fn run(alloc: Allocator, store: Store, ref: Ref, input: []const []const u8) !void {
+            var ranks: [5]u64 = undefined;
+            try ranksOf(alloc, store, ref, input, &ranks);
+            try std.testing.expectEqualSlices(u64, &.{ 1023, 3, 1024, 3, 1999 }, &ranks);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ backing.store(), root, &keys });
 }

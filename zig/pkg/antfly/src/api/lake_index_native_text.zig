@@ -2030,9 +2030,9 @@ const Compactor = struct {
         const segments = self.segments;
         try cancellation.check();
         if (segments.items.len == max_segments or source.len() > 32 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
-        var upload = store.*;
-        upload.allocator = out;
-        const ref = @import("lake_index_seekable_text.zig").publishSourceWithOpeningCollector(a, out, &upload, source, cancellation, self.opening) catch |err| return buildFailure(err, "segment_packs", self.file_ordinal, segments.items.len);
+        // Pack workers allocate concurrently. Keep their synchronized transport
+        // allocator; the seekable publisher copies final refs into out serially.
+        const ref = @import("lake_index_seekable_text.zig").publishSourceWithOpeningCollector(a, out, store, source, cancellation, self.opening) catch |err| return buildFailure(err, "segment_packs", self.file_ordinal, segments.items.len);
         var reader = try local.segment.SegmentReader.initSource(a, source);
         defer reader.deinit();
         try self.admissions.append(out, try reader.admission(out));
@@ -2918,4 +2918,68 @@ test "external lake publication encoding lookahead spill and direct contribution
             try std.testing.expectEqualSlices(?statistics.Ref, expected_summaries, summaries.items);
         }
     }
+}
+
+test "external lake canonical multi-pack publication keeps worker allocations outside result arena" {
+    const Probe = struct {
+        var active: *@This() = undefined;
+        backend: stores.ArtifactStore,
+        result_arena: *anyopaque,
+        current: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        fn put(_: *anyopaque, a: A, scope: stores.UploadScope, bytes: []const u8, token: Cancellation) !stores.ArtifactMetadata {
+            const self = active;
+            if (bytes.len > 512 * 1024 and a.ptr == self.result_arena) return error.UnsafeConcurrentResultArena;
+            const count = self.current.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.current.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(count, .acq_rel);
+            try std.testing.io.sleep(.fromMilliseconds(3), .awake);
+            var backend = self.backend;
+            backend.allocator = a;
+            return backend.putScoped(scope, bytes, token);
+        }
+    };
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("canonical-pack-allocator");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(74), 1, std.testing.io);
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    var probe: Probe = .{ .backend = store, .result_arena = output.allocator().ptr };
+    Probe.active = &probe;
+    var vtable = store.vtable.*;
+    vtable.put_scoped = Probe.put;
+    store.vtable = &vtable;
+    var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = 3 };
+    var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 1024 };
+    try execution.enter(std.testing.io);
+    defer execution.pause();
+    var phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
+    store.io_phase = phase.capability();
+    var budget = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 64 * 1024 * 1024 });
+    var locked: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = budget.allocator() };
+    store.allocator = locked.allocator();
+    var writer = local.segment.SegmentWriter.init(a);
+    defer writer.deinit();
+    const payload = try a.alloc(u8, 3 * 1024 * 1024);
+    defer a.free(payload);
+    var random = std.Random.DefaultPrng.init(71);
+    random.random().bytes(payload);
+    try writer.addStoredDoc("row", payload);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    try std.testing.expect(bytes.len > 2 * 1024 * 1024);
+    var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+    var summaries: std.ArrayList(?statistics.Ref) = .empty;
+    var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+    var compactor: Compactor = .{ .a = locked.allocator(), .out = output.allocator(), .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .io = std.testing.io };
+    defer compactor.deinit();
+    try compactor.publishSource(.{ .contiguous = bytes }, null);
+    try std.testing.expect(probe.peak.load(.acquire) > 1);
+    try std.testing.expectEqual(@as(usize, 1), segments.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
 }

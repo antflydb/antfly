@@ -13718,8 +13718,26 @@ fn searchDenseInternal(
         constraint_req.exclusion_query_json = "";
     }
     var native_constraints = try deriveNativeDenseConstraintsAlloc(alloc, constraint_req, executor, req.index_name orelse entry.config.name, true);
-    profile.constraint_ns = platform_time.monotonicNs() - constraint_start;
     defer native_constraints.deinit(alloc);
+    var dense_residual = true;
+    if (!chunk_backed and !multi_source_members) if (req.native_key_predicate) |predicate| if (predicate.select_dense) |select| {
+        if (try select(predicate.ptr, alloc)) |selection| {
+            defer selection.deinit(alloc);
+            if (selection.include) |ids| {
+                const merged = if (native_constraints.positive_filter)
+                    try intersectVectorIdsAlloc(alloc, native_constraints.filter_ids, ids)
+                else
+                    try alloc.dupe(u64, ids);
+                if (native_constraints.filter_ids_owned) alloc.free(native_constraints.filter_ids);
+                native_constraints.filter_ids = merged;
+                native_constraints.filter_ids_owned = true;
+                native_constraints.positive_filter = true;
+            }
+            if (selection.exclude.len != 0) try mergeNativeExcludeIds(alloc, &native_constraints, try alloc.dupe(u64, selection.exclude), req.exclude_ids);
+            dense_residual = selection.residual;
+        }
+    };
+    profile.constraint_ns = platform_time.monotonicNs() - constraint_start;
     const unresolved_stored_filters =
         (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
@@ -13837,7 +13855,7 @@ fn searchDenseInternal(
             .epsilon = resolved_epsilon,
             .rerank_factor = resolveRerankFactor(effort),
             .filter_prefix = req.filter_prefix,
-            .key_predicate = if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows } else null,
+            .key_predicate = if (dense_residual) if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows } else null else null,
             .distance_over = req.distance_over,
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
@@ -15332,6 +15350,17 @@ test "one percent native filter routes through integrated dense search exactly" 
 
     const Harness = struct {
         entry: *index_manager_mod.IndexManager.DenseIndex,
+        include_ids: []const u64 = &.{},
+        exclude_ids: []const u64 = &.{},
+        fn selectDense(raw: *anyopaque, a: Allocator) !?types.DenseIdSelection {
+            const state: *@This() = @ptrCast(@alignCast(raw));
+            const include = try a.dupe(u64, state.include_ids);
+            errdefer a.free(include);
+            return .{ .include = include, .exclude = try a.dupe(u64, state.exclude_ids), .residual = false };
+        }
+        fn unexpectedAllows(_: *anyopaque, _: []const u8) !bool {
+            return error.UnexpectedResidualPredicate;
+        }
 
         fn self(ctx: ?*anyopaque) *@This() {
             return @ptrCast(@alignCast(ctx.?));
@@ -15393,6 +15422,33 @@ test "one percent native filter routes through integrated dense search exactly" 
     try std.testing.expectEqual(@as(u64, candidate_count), profiled.profile.hbc_exact_vectors_scored);
     try std.testing.expectEqual(result_count, profiled.result.hits.len);
     try std.testing.expectEqualStrings("exact", profiled.result.sort_profile.?.exactness);
+    // Exercise the named owner callback: intersect explicit IDs, subtract exact
+    // exclusions, then prove an empty positive selection cannot become all rows.
+    harness.include_ids = filter_ids;
+    harness.exclude_ids = filter_ids[filter_ids.len - 3 .. filter_ids.len - 2];
+    var predicate: types.NativeKeyPredicate = .{ .ptr = &harness, .allows = Harness.unexpectedAllows, .select_dense = Harness.selectDense };
+    var native = try searchDenseProfiled(alloc, .{
+        .index_name = "dense",
+        .limit = result_count,
+        .include_stored = false,
+        .profile = true,
+        .filter_ids = filter_ids[0 .. filter_ids.len - 2],
+        .native_key_predicate = predicate.receiver(),
+    }, .{ .vector = &query, .k = result_count }, executor);
+    defer native.result.deinit();
+    try std.testing.expectEqualStrings("exact_native_filter", native.profile.search_route);
+    try std.testing.expectEqual(@as(u64, candidate_count - 3), native.profile.hbc_exact_vectors_scored);
+    try std.testing.expectEqual(result_count, native.result.hits.len);
+    harness.include_ids = &.{};
+    var empty = try searchDenseProfiled(alloc, .{
+        .index_name = "dense",
+        .limit = result_count,
+        .include_stored = false,
+        .profile = true,
+        .native_key_predicate = predicate.receiver(),
+    }, .{ .vector = &query, .k = result_count }, executor);
+    defer empty.result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.result.hits.len);
 }
 
 fn countActiveDenseVectorIdsAlloc(

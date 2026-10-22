@@ -82,6 +82,8 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
         )
         if step == 2:
             order.reverse()
+        # Separate the top sparse scores despite per-block 8-bit quantization
+        # changing scales across physical and logical fragment layouts.
         docs = [
             {
                 "id": base + i,
@@ -92,10 +94,12 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                 ),
                 "label": f"updated-{i}" if step == 5 else f"row-{i}",
                 "dense_native": json.dumps([1, i / count]),
-                "sparse_native": json.dumps({"1": i + 1}),
+                "sparse_native": json.dumps({"1": (i + 1) ** 2}),
             }
             for i in order
         ]
+        if step == 7:
+            docs = [doc for doc in docs if doc["id"] != base + 17]
         if step == 4:
             docs = [
                 {
@@ -103,7 +107,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     "body": "needle same text",
                     "label": f"row-{count}",
                     "dense_native": json.dumps([1, 1]),
-                    "sparse_native": json.dumps({"1": count + 1}),
+                    "sparse_native": json.dumps({"1": (count + 1) ** 2}),
                 }
             ]
         if iceberg is not None:
@@ -257,7 +261,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                 indexes = call("GET", f"/tables/{name}/indexes")
                 assert all(
                     i["status"]["readiness"]["state"] != "failed" for i in indexes
-                ), indexes
+                ), json.dumps(indexes) + server.debug_logs()
                 revision = next(
                     i["status"].get("published_revision")
                     for i in indexes
@@ -300,7 +304,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
         assert first, "Logical identity state was not published"
         original = next(root for root in first if root.get("indexes") is None)
 
-        for step in (1, 2, 5, 3, 6, 4):
+        for step in (1, 2, 5, 3, 6, 4, 7):
             write(step)
             revision = ready("logical", revision)
             candidates = states()
@@ -317,11 +321,12 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                 assert text_space["snapshot"] == original["current"]["snapshot"], current
             elif step == 5:
                 assert "text" in reused, current
-                assert "all_text" not in reused, current
+                assert reused["all_text"]["by_id"] != original["native_space"]["by_id"], current
                 assert current["artifacts"] != original["artifacts"], current
                 assert reused["text"]["snapshot"] == original["current"]["snapshot"]
             elif step == 3:
-                assert "text" not in reused and "all_text" not in reused, current
+                assert reused["text"]["by_id"] != original["native_space"]["by_id"], current
+                assert reused["all_text"]["by_id"] != original["native_space"]["by_id"], current
                 assert "dense_native" in reused and "sparse_native" in reused, current
             elif step == 6:
                 assert "text" in reused and "dense_native" in reused, current
@@ -329,7 +334,13 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     reused["text"]["snapshot"] != reused["dense_native"]["snapshot"]
                 ), current
             else:
-                assert not reused and current.get("indexes") is None, current
+                assert current.get("native_space") is not None, current
+                assert current["native_space"]["rows"] == count + (1 if step == 4 else -1)
+                assert (
+                    current["native_space"]["file_count"]
+                    == original["native_space"]["file_count"]
+                )
+                assert {"text", "dense_native", "sparse_native"} <= reused.keys()
                 assert current["artifacts"] != original["artifacts"], current
             oracle = f"oracle{step}"
             attach(oracle, False)
@@ -389,12 +400,14 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                         for h in response["hits"]["hits"]
                     ]
 
-                assert normalize(actual) == normalize(expected), (actual, expected)
+                assert normalize(actual) == normalize(expected), (
+                    step, request, actual, expected
+                )
                 # Sparse posting blocks quantize weights to 8 bits. Rebuilding
                 # a different physical layout can choose different scales;
                 # identity, values and membership must still agree exactly.
                 score_error = (
-                    2 * (count + 1) / 255 + 1e-4
+                    2 * (count + 1) ** 2 / 255 + 1e-4
                     if request.get("indexes") == ["sparse_native"]
                     else 0
                 )
@@ -448,7 +461,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     "POST", "/sql", {"statement": statement.format(table=oracle)}
                 )["rows"]
                 assert actual == expected
-            if step in (2, 6):
+            if step in (2, 6, 7):
                 before = call("POST", "/tables/logical/query", text)
                 server.restart()
                 ready("logical")

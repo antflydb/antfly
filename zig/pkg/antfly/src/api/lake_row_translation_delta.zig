@@ -25,6 +25,11 @@ const A = std.mem.Allocator;
 const Context = local.serverless_query_lake_read_context.Context;
 
 pub fn build(a: A, pages: *Pages, original: identity.Space, current: identity.Space, previous: ?identity.Space, prior: ?identity.Translation, context: Context, spill_bytes: u64) !?identity.Translation {
+    return buildWithOriginal(a, pages, original, current, previous, null, prior, context, spill_bytes);
+}
+/// Logical fragment replacement can change both sides of the coordinate map.
+/// Visit the union of changed logical IDs and update only their live addresses.
+pub fn buildWithOriginal(a: A, pages: *Pages, original: identity.Space, current: identity.Space, previous: ?identity.Space, previous_original: ?identity.Space, prior: ?identity.Translation, context: Context, spill_bytes: u64) !?identity.Translation {
     if (spill_bytes == 0 or original.rows == 0 or original.rows != current.rows or original.file_slots == null or current.file_slots == null or current.by_order == null) return null;
     const io = context.io orelse return error.InvalidLogicalRowIdentity;
     const scheduler = local.sql_parallel_scheduler.global();
@@ -50,12 +55,16 @@ pub fn build(a: A, pages: *Pages, original: identity.Space, current: identity.Sp
     var workspace: local.sql_memory_budget = .{ .backing = a, .limit = retained };
     var manager: local.sql_spill.Manager = .{ .alloc = workspace.allocator(), .io = io, .context = &check_context, .checkpoint = Check.call, .max_bytes = spill_bytes };
     defer manager.deinit();
-    return buildInner(workspace.allocator(), &admitted, &manager, original, current, previous, prior, context) catch |err| {
+    return buildInnerExtended(workspace.allocator(), &admitted, &manager, original, current, previous, previous_original, prior, context) catch |err| {
         if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and workspace.isLocallyExhausted())) return null;
         return err;
     };
 }
 fn buildInner(a: A, pages: *Pages, manager: *local.sql_spill.Manager, original: identity.Space, current: identity.Space, previous: ?identity.Space, prior: ?identity.Translation, context: Context) !identity.Translation {
+    return buildInnerExtended(a, pages, manager, original, current, previous, null, prior, context);
+}
+fn buildInnerExtended(a: A, pages: *Pages, manager: *local.sql_spill.Manager, original: identity.Space, current: identity.Space, previous: ?identity.Space, previous_original: ?identity.Space, prior: ?identity.Translation, context: Context) !identity.Translation {
+    if (prior != null and !prior.?.ranked and previous != null and previous_original != null) return changedOriginal(a, pages, manager, original, current, previous.?, previous_original.?, prior.?, context);
     if (prior != null and !prior.?.ranked and previous != null and previous.?.rows == current.rows) {
         var forward = Mutations.init(a, manager, pages.store());
         forward.private_pages.phase = pages.artifacts.io_phase;
@@ -126,6 +135,70 @@ fn buildInner(a: A, pages: *Pages, manager: *local.sql_spill.Manager, original: 
     defer inverse.scratch.deinit();
     const r = (try tree.buildSortedWithOptions(a, pages.store(), &inverse, .{ .target_bytes = tree.bulk_target_page_bytes })) orelse return error.InvalidLogicalRowIdentity;
     return .{ .forward = f, .reverse = r, .ranked = false };
+}
+fn changedOriginal(a: A, pages: *Pages, manager: *local.sql_spill.Manager, original: identity.Space, current: identity.Space, previous: identity.Space, old_original: identity.Space, prior: identity.Translation, context: Context) !identity.Translation {
+    if (previous.rows != old_original.rows or prior.forward.records != previous.rows or prior.reverse.records != previous.rows) return error.InvalidLogicalRowIdentity;
+    var changes = local.sql_spill.Sort.init(a, manager, &.{.{}}, 512 * 1024);
+    defer changes.deinit();
+    changes.shared_runs = true;
+    changes.encoded_bytes = true;
+    const Visitor = struct {
+        sort: *local.sql_spill.Sort,
+        context: Context,
+        pub fn change(self: *@This(), left: ?tree.Cursor.Record, right: ?tree.Cursor.Record) !void {
+            try self.context.ensureActive();
+            if (left) |row| if (row.key.len != 32 or row.value.len != 56) return error.InvalidLogicalRowIdentity;
+            if (right) |row| if (row.key.len != 32 or row.value.len != 56) return error.InvalidLogicalRowIdentity;
+            if (left != null and right != null and std.mem.eql(u8, left.?.value[0..16], right.?.value[0..16])) return;
+            const row = right orelse left.?;
+            try self.sort.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = row.key })}, .values = &.{}, .ordinal = self.sort.total });
+        }
+    };
+    var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store(), .max_bytes = 2 * 1024 * 1024 };
+    defer cache.deinit();
+    var visitor: Visitor = .{ .sort = &changes, .context = context };
+    tree.visitDifferences(a, cache.store(), previous.by_id, current.by_id, &visitor) catch |err| return identity.derivedReadFailure(err);
+    tree.visitDifferences(a, cache.store(), old_original.by_id, original.by_id, &visitor) catch |err| return identity.derivedReadFailure(err);
+    var forward = Mutations.init(a, manager, pages.store());
+    forward.private_pages.phase = pages.artifacts.io_phase;
+    forward.addition_first = true;
+    forward.forest.policy = .addition_first;
+    defer forward.deinit();
+    var reverse = Mutations.init(a, manager, pages.store());
+    reverse.private_pages.phase = pages.artifacts.io_phase;
+    reverse.addition_first = true;
+    reverse.forest.policy = .addition_first;
+    defer reverse.deinit();
+    var reader: identity.Reader = .{ .root = undefined, .pages = pages, .cache = &cache };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var last: ?[32]u8 = null;
+    while (true) {
+        try context.ensureActive();
+        _ = scratch.reset(.retain_capacity);
+        const sa = scratch.allocator();
+        const row = (try changes.next(sa)) orelse break;
+        if (row.keys.len != 1 or row.keys[0].value != .string or row.keys[0].value.string.len != 32) return error.InvalidLogicalRowIdentity;
+        const id = row.keys[0].value.string[0..32].*;
+        if (last) |old| if (std.mem.eql(u8, &old, &id)) continue;
+        last = id;
+        const old_index = try reader.byId(sa, old_original, id);
+        const old_source = try reader.byId(sa, previous, id);
+        const new_index = try reader.byId(sa, original, id);
+        const new_source = try reader.byId(sa, current, id);
+        if ((old_index == null) != (old_source == null) or (new_index == null) != (new_source == null)) return error.InvalidLogicalRowIdentity;
+        if (old_index) |old| {
+            try forward.addRecord(&old.coordinate.encode(), null);
+            try reverse.addRecord(&old_source.?.coordinate.encode(), null);
+        }
+        if (new_index) |next| {
+            try forward.addRecord(&next.coordinate.encode(), &new_source.?.coordinate.encode());
+            try reverse.addRecord(&new_source.?.coordinate.encode(), &next.coordinate.encode());
+        }
+    }
+    const result: identity.Translation = .{ .forward = (try forward.finish(prior.forward)) orelse return error.InvalidLogicalRowIdentity, .reverse = (try reverse.finish(prior.reverse)) orelse return error.InvalidLogicalRowIdentity, .ranked = false };
+    if (result.forward.records != current.rows or result.reverse.records != current.rows) return error.InvalidLogicalRowIdentity;
+    return result;
 }
 const Sorted = struct {
     sort: *local.sql_spill.Sort,
@@ -209,6 +282,9 @@ test "external lake persistent translations retain unchanged maps and update swa
             const result = try buildInner(alloc, map_pages, &spill, old, next, previous, prior, .{ .io = std.testing.io });
             try std.testing.expectEqual(next.rows, result.forward.records);
             try std.testing.expectEqual(next.rows, result.reverse.records);
+            const extended = try buildInnerExtended(alloc, map_pages, &spill, old, next, previous, old, prior, .{ .io = std.testing.io });
+            try std.testing.expectEqual(next.rows, extended.forward.records);
+            try std.testing.expectEqual(next.rows, extended.reverse.records);
         }
     };
     try std.testing.checkAllAllocationFailures(a, Failure.run, .{ &pages, original.current, third, current.current, initial });

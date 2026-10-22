@@ -429,6 +429,41 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
         error.NullLogicalRowKey, error.DuplicateLogicalRowKey, error.LogicalRowIdentityAdmissionDeclined => null,
         else => return err,
     };
+    var fragments: ?*@import("lake_row_fragments.zig").Build = null;
+    defer if (fragments) |value| value.deinit();
+    if (!identity_unchanged) if (row_identity) |identity| {
+        // Legacy sidecars/enrichment dependencies retain the physical builder.
+        const configs = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{});
+        const reusable_inputs = for (configs.object.values()) |config| {
+            if (!@import("lake_row_input_recipes.zig").configurationReusable(config)) break false;
+            const kind = if (config == .object) config.object.get("type") else null;
+            if (kind == null or kind.? != .string or !(std.mem.eql(u8, kind.?.string, "full_text") or std.mem.eql(u8, kind.?.string, "embeddings") or std.mem.eql(u8, kind.?.string, "algebraic"))) break false;
+        } else true;
+        if (reusable_inputs) fragments = try @import("lake_row_fragments.zig").prepare(a, &scoped, table, source, &provider, identity, previous_identity);
+    };
+    var fragment_replay: ?replay_api.Replay = null;
+    defer if (fragment_replay) |*value| value.deinit();
+    const native_provider = if (fragments) |value| &value.provider else &provider;
+    if (fragments) |value| {
+        const projection = try replay_api.columnsForBuild(a, na, table, native_provider, base_source);
+        fragment_replay = replay_api.Replay.init(a, native_provider, projection);
+        native_provider.replay = &fragment_replay.?;
+        // The retained native state owns logical contributions, so only a
+        // predecessor carrying the same durable logical census is eligible.
+        if (previous_identity != null and previous_identity.?.native_space != null and current.value.published != null and std.mem.eql(u8, &previous_identity.?.values_recipe, &value.root.values_recipe)) {
+            published_candidates = current.value.published.?.declarations;
+            contribution_index.deinit();
+            const previous = current.value.published.?;
+            const root = if (previous.contribution_index) |bytes| try std.json.parseFromSliceLeaky(@import("../serverless/graph_segment/page_tree.zig").Ref, na, bytes, .{}) else null;
+            try contribution_index.init(a, scoped, root, cancellation);
+            contribution_index.counted = true;
+            contribution_index.prior_roots = previous.contribution_roots;
+            for (previous.contribution_roots) |key| try contribution_index.includeRoot(key);
+            const prior = previous_identity.?.native_space.?;
+            contribution_index.predecessor = .{ .source = prior.source, .schema = source.inventory.schema_fingerprint, .snapshot = prior.snapshot, .count = @intCast(prior.liveFiles()) };
+        }
+    }
+    const native_candidates = if (fragments != null) published_candidates else candidates;
     var relocated = identity_unchanged;
     var retained_declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = &.{};
     if (row_identity) |*identity| if (previous_identity) |previous| {
@@ -498,18 +533,19 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     var manifest = if (relocated) rebuild.ReconciledManifest{ .artifacts = try a.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, 0) } else try rebuild.reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(a, &scoped, provider.provider(), base_source, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = legacy_json }, reusable, cancellation, .{ .published_generation = attempt.generation, .edge_generation = attempt.generation, .computed_at_ms = started }, .{}, scope);
     defer manifest.deinit(a);
     const builders = @import("lake_index_publication_builders.zig");
-    const built = if (relocated) builders.Result{} else (try builders.build(.{ .a = a, .out = na, .table = table, .store = &scoped, .provider = &provider, .base = base_source, .reusable = reusable, .candidates = candidates, .contributions = previous_contributions, .index = &contribution_index, .token = cancellation })) orelse serial: {
-        const native = @import("lake_index_native_aggregates.zig").buildIndexed(a, na, table, source, &scoped, &provider, cancellation, reusable, previous_contributions, &contribution_index) catch |err| return constructionFailure(err, "aggregate_build", attempt.generation);
+    native_provider.skip_indexes = provider.skip_indexes;
+    const built = if (relocated) builders.Result{} else (try builders.build(.{ .a = a, .out = na, .table = table, .store = &scoped, .provider = native_provider, .base = base_source, .reusable = reusable, .candidates = native_candidates, .contributions = previous_contributions, .index = &contribution_index, .token = cancellation })) orelse serial: {
+        const native = @import("lake_index_native_aggregates.zig").buildIndexed(a, na, table, native_provider.source, &scoped, native_provider, cancellation, reusable, previous_contributions, &contribution_index) catch |err| return constructionFailure(err, "aggregate_build", attempt.generation);
         // Aggregate construction already completes the entire set before this
         // boundary. Publishing every growing prefix writes quadratic directory
         // bytes and metadata commits without saving any earlier build work.
-        provider.checkpointBatch(native.declarations) catch |err| return constructionFailure(err, "aggregate_checkpoint", attempt.generation);
-        const ordered = @import("lake_index_native_rows.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "ordered_build", attempt.generation);
-        for (ordered) |declaration| provider.checkpoint(declaration) catch |err| return constructionFailure(err, "ordered_checkpoint", attempt.generation);
-        const text = @import("lake_index_native_text.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "text_build", attempt.generation);
-        for (text) |declaration| provider.checkpoint(declaration) catch |err| return constructionFailure(err, "text_checkpoint", attempt.generation);
-        const sparse = @import("lake_index_native_sparse.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "sparse_build", attempt.generation);
-        const dense = @import("lake_index_native_dense.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "dense_build", attempt.generation);
+        native_provider.checkpointBatch(native.declarations) catch |err| return constructionFailure(err, "aggregate_checkpoint", attempt.generation);
+        const ordered = @import("lake_index_native_rows.zig").buildIncremental(a, na, table, native_provider.source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "ordered_build", attempt.generation);
+        for (ordered) |declaration| native_provider.checkpoint(declaration) catch |err| return constructionFailure(err, "ordered_checkpoint", attempt.generation);
+        const text = @import("lake_index_native_text.zig").buildIncremental(a, na, table, native_provider.source, base_source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "text_build", attempt.generation);
+        for (text) |declaration| native_provider.checkpoint(declaration) catch |err| return constructionFailure(err, "text_checkpoint", attempt.generation);
+        const sparse = @import("lake_index_native_sparse.zig").buildIncremental(a, na, table, native_provider.source, base_source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "sparse_build", attempt.generation);
+        const dense = @import("lake_index_native_dense.zig").buildIncremental(a, na, table, native_provider.source, base_source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "dense_build", attempt.generation);
         break :serial builders.Result{ .native = native, .ordered = ordered, .text = text, .sparse = sparse, .dense = dense };
     };
     if (built.contribution_root) |root| {
@@ -534,6 +570,30 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
         @memcpy(result[manifest.artifacts.len + native_declarations.len + ordered.len + text.len + sparse.len ..][0..dense.len], dense);
         @memcpy(result[result.len - retained_declarations.len ..], retained_declarations);
         break :assembled result;
+    };
+    if (fragments) |value| if (row_identity) |*identity| {
+        identity.native_space = value.space;
+        identity.indexes = null;
+        const bindings = try na.alloc(row_identity_api.ReusedIndex, declarations.len);
+        var reads: u64 = 0;
+        var writes: u64 = 0;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &scoped, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .cancellation = cancellation, .streaming = true };
+        pages.admitPublication();
+        var prior_translation: ?row_identity_api.Translation = null;
+        if (previous_identity) |previous| if (previous.native_space) |space| {
+            for (previous.reused) |entry| if (entry.translation != null and entry.space.by_id != null and space.by_id != null and entry.space.by_id.?.eql(space.by_id.?)) {
+                prior_translation = entry.translation;
+                break;
+            };
+        };
+        const translation = try @import("lake_row_translation_delta.zig").buildWithOriginal(a, &pages, value.space, identity.current, if (prior_translation != null) previous_identity.?.current else null, if (prior_translation != null) previous_identity.?.native_space else null, prior_translation, context, identity_spill_bytes);
+        for (bindings, declarations) |*binding_, declaration| {
+            const retained = for (identity.reused) |entry| {
+                if (std.mem.eql(u8, entry.name, declaration.name)) break entry;
+            } else null;
+            binding_.* = retained orelse .{ .name = declaration.name, .space = value.space, .translation = translation };
+        }
+        identity.reused = bindings;
     };
     navigation.ref = try costing.finish();
     progress.saved.source_navigation = navigation.ref;
@@ -831,9 +891,14 @@ test "external lake native publication builds scoped text artifacts and fences e
     appended.deinit(a);
     var next_source = try serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
     defer next_source.deinit();
-    const next_pending_bytes = try begin(a, std.testing.io, published, &next_source, store_identity, .{}, 102, 20);
+    // This regression exercises physical append reuse. The copied rows have
+    // duplicate logical keys, so use the explicit physical baseline above;
+    // losing key evidence after logical construction correctly requires rebase.
+    var physical_published = published;
+    physical_published.lake_index_catalog_json = declined_bytes;
+    const next_pending_bytes = try begin(a, std.testing.io, physical_published, &next_source, store_identity, .{}, 102, 20);
     defer a.free(next_pending_bytes);
-    var next_pending = published;
+    var next_pending = physical_published;
     next_pending.lake_index_catalog_json = next_pending_bytes;
     const Denied = struct {
         var base: local.storage_object_storage.ObjectStorage = undefined;
@@ -849,7 +914,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     denied.get_object = Denied.get;
     next_source.scanner.object_reader.client.vtable = &denied;
     time.now = 103;
-    const next_bytes = try build(a, &artifact_store, next_pending, &next_source, store_identity, .{ .io = std.testing.io }, .none, clock);
+    const next_bytes = try buildWithReuse(a, &artifact_store, next_pending, &next_source, store_identity, .{ .io = std.testing.io }, .none, clock, null, null, null, .{ .identity_spill_bytes = 0 });
     defer a.free(next_bytes);
     var next = try catalog.parse(a, next_bytes);
     defer next.deinit();
@@ -983,7 +1048,13 @@ test "external lake logical identity publishes native indexes once across reorde
         if (step == 0) {
             original_directory = try a.dupe(u8, publication.directory.?.artifact_id);
             original_snapshot = try a.dupe(u8, source.inventory.snapshot_id);
-            original_location = .{ .external = .{ .source_id = try saved.allocator().dupe(u8, source.inventory.source_id), .snapshot_id = try saved.allocator().dupe(u8, source.inventory.snapshot_id), .file_id = try saved.allocator().dupe(u8, source.inventory.files[0].file_id), .row_group_ordinal = 0, .row_ordinal = 0 } };
+            var reads: u64 = 4 * 1024 * 1024;
+            var writes: u64 = 0;
+            var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = root.domain, .artifacts = &artifact_store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            var resolver: @import("lake_row_identity.zig").Reader = .{ .root = root, .pages = &pages };
+            const logical = (try resolver.toIndex(arena.allocator(), source.inventory.files[0].file_id, 0, 0)).?;
+            original_location = try resolver.reference(saved.allocator(), root.spaceForIndex("body_text"), logical);
+            try std.testing.expect(root.native_space != null);
             try std.testing.expect(root.indexes == null);
         } else if (step < 3) {
             try std.testing.expectEqualStrings(original_directory.?, publication.directory.?.artifact_id);
