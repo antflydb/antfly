@@ -36,6 +36,10 @@ pub fn drain(self: *db.DB, original: control.Port) engine.Outcome(void) {
     return .{ .value = self.drainPreparedAssembliesWithAdmission(original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
 }
 
+pub fn drainClose(self: *db.DB, original: control.Port) engine.Outcome(void) {
+    return .{ .value = self.drainCloseDependenciesWithAdmission(original) catch |cause| return .{ .failure = .init(@errorName(cause)) } };
+}
+
 /// Runs in the caller's compilation so arbitrary original control failures
 /// never need a status-catalog entry. The borrowed relay cannot escape invoke.
 /// Reentry is mandatory after successful begin, even after lifetime rejection.
@@ -74,6 +78,8 @@ const DrainRelay = struct {
 };
 
 comptime {
+    const close_signature: @FieldType(engine.VTable, "drainCloseDependenciesWithAdmission") = &drainClose;
+    _ = close_signature;
     const drain_signature: @FieldType(engine.VTable, "drainPreparedAssembliesWithAdmission") = &drain;
     _ = drain_signature;
     const signature: @FieldType(engine.VTable, "prepareTransactionAssemblyWithPolicyLease") = &invoke;

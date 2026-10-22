@@ -3670,6 +3670,64 @@ pub fn storageOwnerOpen(
     return .ok;
 }
 
+/// The registry still owns the handle and has fenced general admission.
+/// Retirement failures leave the physical DB/context alive for a later
+/// authorized cleanup turn; no borrowed control is stored in the DB.
+pub fn storageOwnerDrainClose(owner: ?*anyopaque, request: *const kernel_owner_abi.CloseDrainRequest) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.reserved != 0 or request.deadline_ns == 0) return .invalid_argument;
+    const rt = @import("antfly_runtime_abi");
+    const runnable_raw = request.execution_runnable orelse return .invalid_argument;
+    const clock_raw = request.clock_io orelse return .invalid_argument;
+    if (@intFromPtr(runnable_raw) % @alignOf(rt.runnable_abi.Borrowed) != 0 or @intFromPtr(clock_raw) % @alignOf(rt.native_abi.IoBorrow) != 0) return .invalid_argument;
+    const borrow = rt.runnable_abi.Borrowed.read(@ptrCast(@alignCast(runnable_raw))) catch |cause| return storageOwnerStatusFromError(cause);
+    const clock: *const rt.native_abi.IoBorrow = @ptrCast(@alignCast(clock_raw));
+    var receiver = clock.receive() catch |cause| return storageOwnerStatusFromError(cause);
+    const class = borrow.currentClass() catch |cause| return storageOwnerStatusFromError(cause);
+    if (class != .control or borrow.cpu_slots != 1) return .invalid_argument;
+    const Control = struct {
+        execution: rt.runnable_abi.Borrowed,
+        clock: *rt.io_abi.Receiver,
+        deadline: u64,
+        class: rt.runnable_abi.Class,
+        fn checked(status: rt.error_abi.Status) !void {
+            if (!status.isOk()) return rt.error_abi.errorFromStatus(status);
+        }
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.checkLifetime();
+            const now: u64 = @intCast(@max(0, std.Io.Clock.awake.now(self.clock.io()).nanoseconds));
+            if (now >= self.deadline) return error.DeadlineExceeded;
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try lifetime(raw);
+            try checked(self.execution.checkpoint(self.execution.context));
+            try lifetime(raw);
+        }
+        fn deadlineNs(raw: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.deadline;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(self.execution.park(self.execution.context, @backingInt(rt.runnable_abi.Wait.resource)));
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(self.execution.enter(self.execution.context, @backingInt(self.class)));
+            try lifetime(raw);
+        }
+    };
+    var controls: Control = .{ .execution = borrow, .clock = &receiver, .deadline = request.deadline_ns, .class = class };
+    const read = @import("antfly_local_sources").common_read_admission;
+    var payload: read.Payload = .{ .ptr = &controls, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadlineNs }, .execution_wait = .{ .ptr = &controls, .begin = Control.begin, .end = Control.end } };
+    Control.checkpoint(&controls) catch |cause| return storageOwnerStatusFromError(cause);
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    handle.db.drainCloseDependenciesWithAdmission(.init(&payload)) catch |cause| return storageOwnerStatusFromError(cause);
+    return .ok;
+}
+
 pub fn storageOwnerClose(owner: ?*anyopaque) callconv(.c) void {
     closeHandleId(owner);
 }
@@ -6908,3 +6966,57 @@ pub fn releaseServerContext(context_ptr: *anyopaque) void {
 pub const test_support = if (@import("builtin").is_test) struct {
     pub const transactionRecoveryConfig = StorageOwnerTransactionRecovery.serverConfig;
 } else struct {};
+
+test "controlled owner batch admission C entry close preflight rejects invalid controls before resource access" {
+    var request: kernel_owner_abi.CloseDrainRequest = .{ .deadline_ns = 1, .execution_runnable = null, .clock_io = null };
+    request.version += 1;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, storageOwnerDrainClose(null, &request));
+    request.version = kernel_owner_abi.abi_version;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, storageOwnerDrainClose(null, &request));
+    request.execution_runnable = @ptrFromInt(1);
+    request.clock_io = @ptrFromInt(1);
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, storageOwnerDrainClose(null, &request));
+}
+
+test "controlled owner close preflight C entry drains a real DB with the original cleanup capsule" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const rt = @import("antfly_runtime_abi");
+    var state: @import("../api/runnable_owner_execution.zig").State = .{
+        .owner_alloc = a,
+        .owner = try native.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }),
+        .native_now_ns = @import("antfly_platform").time.monotonicNs,
+    };
+    defer state.owner.tryDeinit() catch @panic("cleanup owner retained");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/close-db", .{directory.sub_path});
+    defer a.free(path);
+    var db = try db_mod.DB.open(a, path, .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    const handle = a.create(Handle) catch |cause| {
+        db.close();
+        return cause;
+    };
+    handle.* = .{ .alloc = a, .db = db };
+    const id = handleRegistry().register(handle) catch |cause| {
+        closeHandle(handle);
+        return cause;
+    };
+    defer closeHandleId(id);
+    const owner = state.port();
+    const clock = rt.native_abi.IoBorrow.init(&io);
+    const now: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds));
+    const deadline = now +| 250 * std.time.ns_per_ms;
+    var capsule: ?*anyopaque = null;
+    const started = owner.start(owner.context, &.{ .io = &clock, .class = @backingInt(rt.runnable_abi.Class.control), .slots = 1, .cleanup = 1, .allow_wait = 0, .has_deadline = 1, .deadline_ns = deadline, .out_handle = &capsule });
+    try std.testing.expect(started.isOk() and capsule != null);
+    defer owner.finish(capsule.?);
+    const borrow = try rt.runnable_abi.Borrowed.fromOwner(owner, capsule.?, 1, .control);
+    const request: kernel_owner_abi.CloseDrainRequest = .{ .deadline_ns = deadline, .execution_runnable = &borrow, .clock_io = &clock };
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerDrainClose(id, &request));
+    try std.testing.expect(!handle.db.isClosed());
+    try std.testing.expect(handle.db.native_query_warming.joined.isSet());
+    try std.testing.expect(handle.db.local_execution.retained_preparation_owner.?.closed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().cleanup_operations);
+}

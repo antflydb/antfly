@@ -745,3 +745,65 @@ test "execution services archive boundary controlled publisher recovery preserve
     try std.testing.expectEqualStrings("ExecutionWaitUnsupported", std.mem.span(failure.?));
     try std.testing.expectEqual(@as(usize, 0), peer.calls);
 }
+
+test "execution services archive boundary readiness cancellation retains a remote registration after original reentry rejection" {
+    var fixture: Fixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var client = try services.Client.open(&fixture.offer);
+    defer client.close() catch @panic("scope close");
+    var io = try client.ioView(.general);
+    const Scheduler = background.MaintenanceScheduler;
+    const scheduler = try Scheduler.createRemote(std.testing.allocator, io.io(), try client.maintenancePort());
+    defer scheduler.destroy();
+    const Probe = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        fn step(self: *@This()) ?u64 {
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            return null;
+        }
+    };
+    const Control = struct {
+        probe: *Probe,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            self.probe.release.store(true, .release);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            return error.Canceled;
+        }
+    };
+    var probe: Probe = .{};
+    var handle = try scheduler.register(&probe, Probe.step);
+    var live = true;
+    defer if (live) {
+        probe.release.store(true, .release);
+        handle.cancel(io.io());
+    };
+    try yieldUntil(&probe.entered);
+    handle.requestStop();
+    try std.testing.expect(!try handle.readyToFinish());
+    var control: Control = .{ .probe = &probe };
+    const admission = local.common_read_admission;
+    var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    try std.testing.expectError(error.Canceled, handle.cancelWithAdmission(io.io(), .init(&payload)));
+    try std.testing.expectEqual(@as(usize, 1), control.begins);
+    try std.testing.expectEqual(@as(usize, 1), control.ends);
+    try std.testing.expect(try handle.readyToFinish());
+    try std.testing.expectEqual(@as(usize, 1), scheduler.snapshot().owned_registrations);
+    try std.testing.expectEqual(@as(usize, 1), (try client.maintenanceStats()).?.owned_registrations);
+    handle.cancel(io.io());
+    live = false;
+    try std.testing.expectEqual(@as(usize, 0), (try client.maintenanceStats()).?.owned_registrations);
+}

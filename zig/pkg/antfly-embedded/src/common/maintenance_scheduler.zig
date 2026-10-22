@@ -59,6 +59,7 @@ pub const Scheduler = struct {
         context: *anyopaque,
         finish_fn: *const fn (*anyopaque, bool) void,
         stop_fn: *const fn (*anyopaque) void,
+        ready_fn: ?*const fn (*anyopaque, *bool) callconv(.c) errors.Status = null,
     };
     pub const RemotePort = struct {
         context: *anyopaque,
@@ -162,6 +163,60 @@ pub const Scheduler = struct {
             self.task.canceled.store(true, .release);
             scheduler.changed.set(scheduler.io);
         }
+        /// Cancellation must fence redispatch before using this readiness
+        /// result to join. A true result means user callback work (including
+        /// its runnable capsule retirement) has returned, not just stop intent.
+        pub fn readyToFinish(self: *const Handle) !bool {
+            if (self.remote) |port| {
+                const get = port.ready_fn orelse return error.ExecutionWaitUnsupported;
+                var ready = false;
+                const status = get(port.context, &ready);
+                if (!status.isOk()) return errors.errorFromStatus(status);
+                return ready;
+            }
+            const scheduler = self.task.scheduler;
+            scheduler.mutex.lockUncancelable(scheduler.io);
+            defer scheduler.mutex.unlock(scheduler.io);
+            return self.task.future == null or self.task.done.load(.acquire);
+        }
+
+        /// Exclusive handle borrow. Failure retains the registration, context
+        /// and scheduler lease for mandatory retry. Only genuine callback wait
+        /// lends CPU; ready Future/registration metadata retires after reentry.
+        pub fn cancelWithAdmission(self: *Handle, io: Io, original: @import("read_admission.zig").Port) !void {
+            self.requestStop();
+            var trace: @import("read_admission.zig").RejectionTrace = .{};
+            const control = trace.bind(original).?;
+            const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+            _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+            while (true) {
+                try control.checkpoint();
+                if (try self.readyToFinish()) {
+                    self.cancel(io);
+                    return;
+                }
+                try boundary.beginWait();
+                var failure: ?anyerror = null;
+                while (true) {
+                    control.checkLifetime() catch |cause| {
+                        failure = trace.failure orelse cause;
+                        break;
+                    };
+                    const ready = self.readyToFinish() catch |cause| {
+                        failure = cause;
+                        break;
+                    };
+                    if (ready) break;
+                    @import("antfly_platform").time.yieldNow();
+                }
+                boundary.endWait() catch |cause| {
+                    if (failure) |first| return first;
+                    return trace.failure orelse cause;
+                };
+                if (failure) |cause| return cause;
+            }
+        }
+
         pub fn await(self: *Handle, _: Io) void {
             self.finish(false);
         }
@@ -771,5 +826,107 @@ test "maintenance scheduler registration allocation rollback restores capacity" 
         scheduler.closeAdmission();
         try std.testing.expectError(error.BackendRuntimeShuttingDown, scheduler.register(&probe, Probe.step));
         try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().owned_registrations);
+    }
+}
+
+test "maintenance scheduler execution-aware cancellation lends the sole ordinary slot and retains failed joins" {
+    const admission = @import("read_admission.zig");
+    const native_scheduler = @import("runnable_scheduler.zig");
+    const now = @import("antfly_platform").time.monotonicNs;
+    const Case = enum { success, begin_failure, end_failure };
+    for (std.enums.values(Case)) |case| {
+        const io = std.testing.io;
+        var cpu = try native_scheduler.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_wait_ms = 5000 });
+        defer cpu.close();
+        var producer: native_scheduler.Execution = .{};
+        defer producer.finish();
+        try producer.start(&cpu, .{ .io = io, .native_now_ns = now, .allow_wait = true }, .background);
+        try producer.park(.resource_blocked);
+        var closer: native_scheduler.Execution = .{};
+        defer closer.finish();
+        try closer.start(&cpu, .{ .io = io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .query);
+        var health: native_scheduler.Execution = .{};
+        defer health.finish();
+        try health.start(&cpu, .{ .io = io, .native_now_ns = now }, .control);
+        const scheduler = try Scheduler.create(std.testing.allocator, io, 4);
+        defer scheduler.destroy();
+        const F = struct {
+            io: Io,
+            producer: *native_scheduler.Execution,
+            entered: Io.Event = .unset,
+            ran: bool = false,
+            fn step(self: *@This()) ?u64 {
+                defer self.producer.finish();
+                self.entered.set(self.io);
+                self.producer.enter(.background) catch return null;
+                self.ran = true;
+                return null;
+            }
+        };
+        const Control = struct {
+            execution: *native_scheduler.Execution,
+            case: Case,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn lifetime(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.execution.checkLifetime();
+            }
+            fn checkpoint(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try lifetime(raw);
+                const entry = &self.execution.entry.?;
+                if (entry.scheduler.?.state(entry) != .running) return error.InvalidRunnableTransition;
+            }
+            fn deadline(raw: *anyopaque) !?u64 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.execution.entry.?.options.deadline_ns;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                try self.execution.park(.resource_blocked);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                if (self.case == .end_failure) return error.Canceled;
+                try self.execution.enter(.query);
+            }
+        };
+        var f: F = .{ .io = io, .producer = &producer };
+        var handle = try scheduler.register(&f, F.step);
+        var live = true;
+        defer if (live) {
+            closer.finish();
+            handle.cancel(io);
+        };
+        try f.entered.wait(io);
+        var control: Control = .{ .execution = &closer, .case = case };
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const result = handle.cancelWithAdmission(io, .init(&payload));
+        if (case == .success) {
+            try result;
+            live = false;
+        } else {
+            try std.testing.expectError(if (case == .begin_failure) error.NotFound else error.Canceled, result);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.snapshot().owned_registrations);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.snapshot().registrations);
+            closer.finish();
+            handle.cancel(io);
+            live = false;
+        }
+        try std.testing.expectEqual(@as(usize, 1), control.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .begin_failure) 0 else 1), control.ends);
+        if (case == .success) {
+            try std.testing.expect(f.ran);
+            try std.testing.expectEqual(native_scheduler.State.running, cpu.state(&closer.entry.?));
+        }
+        try std.testing.expectEqual(native_scheduler.State.running, cpu.state(&health.entry.?));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().owned_registrations);
+        closer.finish();
+        health.finish();
+        try std.testing.expectEqual(@as(usize, 0), cpu.stats().operations);
     }
 }

@@ -3447,6 +3447,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-native-begin-source-check", "Analyze controlled native BEGIN and completion owner acquisition")
         .dependOn(&native_begin_source_check.step);
 
+    const owner_close_preflight_tests = b.addTest(.{
+        .name = "owner-close-preflight-tests",
+        .root_module = owner_preflight_context_root,
+        .filters = &.{"controlled owner close preflight C entry"},
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-owner-close-preflight-test", "Exercise controlled close preflight with a real DB and original cleanup capsule")
+        .dependOn(&b.addRunArtifact(owner_close_preflight_tests).step);
+
     const owner_control_funding_check = b.addTest(.{
         .name = "owner-control-funding-check",
         .root_module = owner_preflight_context_root,

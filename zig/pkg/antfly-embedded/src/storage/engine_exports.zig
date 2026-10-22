@@ -262,6 +262,7 @@ fn activateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
 }
 
 const prepareTransactionAssemblyWithPolicyLease = @import("db/prepared_assembly_boundary.zig").invoke;
+const drainCloseDependenciesWithAdmission = @import("db/prepared_assembly_boundary.zig").drainClose;
 const drainPreparedAssembliesWithAdmission = @import("db/prepared_assembly_boundary.zig").drain;
 const refreshTransactionAssembly = @import("db/prepared_assembly_boundary.zig").refresh;
 

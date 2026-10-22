@@ -383,6 +383,10 @@ pub const Owner = struct {
         return result;
     }
 
+    pub fn drainClose(self: *Owner, request: abi.CloseDrainRequest) !void {
+        try statusToError(abi.antfly_storage_owner_drain_close(self.handle, &request));
+    }
+
     pub fn deinit(self: *Owner) void {
         abi.antfly_storage_owner_close(self.handle);
         self.* = undefined;

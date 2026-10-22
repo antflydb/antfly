@@ -6190,6 +6190,21 @@ pub const DB = struct {
         if (self.local_execution.retained_preparation_owner) |owner| try owner.closeWithAdmission(original);
     }
 
+    /// Serving-owner close preflight. General request admission must already
+    /// be fenced by the registry owner. Failure keeps DB/context resources
+    /// alive for the original cleanup path; physical teardown follows success.
+    /// Other worker/cache/IO join phases still belong to the shutdown owner.
+    pub fn drainCloseDependenciesWithAdmission(self: *DB, original: @import("../../common/read_admission.zig").Port) !void {
+        if (comptime storage_engine.enabled) return @import("prepared_assembly_boundary.zig").callDrain(self, original, struct {
+            fn invoke(database: *DB, borrowed: @import("../../common/read_admission.zig").Port) anyerror!void {
+                return storage_engine.call("drainCloseDependenciesWithAdmission", .{ database, borrowed });
+            }
+        }.invoke);
+        if (self.closed) return;
+        try self.drainPreparedAssembliesWithAdmission(original);
+        try self.native_query_warming.stopWithAdmission(self.backend_runtime, original);
+    }
+
     fn stopRetainedPreparations(self: *DB) void {
         self.async_context.background_closing.store(true, .release);
         if (self.local_execution.retained_preparation_owner) |owner| {

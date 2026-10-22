@@ -66,6 +66,7 @@ const Methods = struct {
     ensure_maintenance: *const fn (*anyopaque) anyerror!Scheduler.Stats,
     stop_maintenance: *const fn (*anyopaque) anyerror!void,
     stop_registration: *const fn (*anyopaque, *anyopaque) anyerror!void,
+    registration_ready: *const fn (*anyopaque, *anyopaque) anyerror!bool,
     owner: *const fn (*anyopaque) anyerror!u64,
     jobs: *const fn (*anyopaque) anyerror!background.DurableJobLane,
     arm_probe: *const fn (*anyopaque, u64, background.OwnerMaintenanceProbe) anyerror!void,
@@ -237,6 +238,11 @@ const ClientState = struct {
         const self: *ClientState = @ptrCast(@alignCast(raw));
         self.offer.call("release", .{ self.scope, self.handle, cancel }) catch @panic("execution services registration release contract");
     }
+    fn readyRegistration(raw: *anyopaque, out: *bool) callconv(.c) runtime_abi.error_abi.Status {
+        const self: *ClientState = @ptrCast(@alignCast(raw));
+        out.* = self.offer.call("registration_ready", .{ self.scope, self.handle }) catch |cause| return runtime_abi.error_abi.statusFromError(cause);
+        return .ok;
+    }
     fn stopRegistration(raw: *anyopaque) void {
         const self: *ClientState = @ptrCast(@alignCast(raw));
         self.offer.call("stop_registration", .{ self.scope, self.handle }) catch @panic("execution services registration stop contract");
@@ -277,7 +283,7 @@ pub const Lease = struct {
     pub fn intoMaintenanceHandle(self: *Lease) Scheduler.RemoteHandle {
         const state = self.resource.?.client_state;
         self.resource = null;
-        return .{ .context = state, .finish_fn = ClientState.finishRegistration, .stop_fn = ClientState.stopRegistration };
+        return .{ .context = state, .finish_fn = ClientState.finishRegistration, .stop_fn = ClientState.stopRegistration, .ready_fn = ClientState.readyRegistration };
     }
     pub fn capacity(self: *const Lease) usize {
         return self.resource.?.capacity;
@@ -649,6 +655,23 @@ const Scope = struct {
         };
         return error.InvalidArgument;
     }
+    fn registrationReady(raw: *anyopaque, handle: *anyopaque) !bool {
+        const self = cast(raw);
+        try self.begin(true);
+        defer self.end();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var it = self.resource_head;
+        while (it) |token| : (it = token.next) if (@as(*anyopaque, token) == handle) {
+            if (token.maintenance_spec == null) return error.InvalidArgument;
+            return switch (token.inner) {
+                .maintenance_pending => false,
+                .maintenance => |*registration| registration.readyToFinish(),
+                else => error.InvalidArgument,
+            };
+        };
+        return error.InvalidArgument;
+    }
     fn maintenanceStats(raw: *anyopaque) !?Scheduler.Stats {
         const self = cast(raw);
         try self.begin(true);
@@ -836,6 +859,7 @@ const producer_methods: Methods = .{
     .ensure_maintenance = Scope.ensureMaintenance,
     .stop_maintenance = Scope.stopMaintenance,
     .stop_registration = Scope.stopRegistration,
+    .registration_ready = Scope.registrationReady,
     .owner = Scope.allocateOwner,
     .jobs = Scope.jobs,
     .arm_probe = Scope.armProbe,

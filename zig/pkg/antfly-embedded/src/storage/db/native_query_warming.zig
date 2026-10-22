@@ -115,27 +115,95 @@ pub const Owner = struct {
         self.port = port;
         self.registration = scheduler.registerClass(.maintenance, self, step) catch null;
     }
+    fn completeStop(self: *Owner, io: ?std.Io) void {
+        self.lock();
+        defer self.mutex.unlock();
+        self.registration = null;
+        self.stop_started = false;
+        if (io) |lane| self.joined.set(lane) else @atomicStore(std.Io.Event, &self.joined, .is_set, .release);
+    }
+    fn stopAvailable(self: *Owner) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.joined.isSet() or !self.stop_started;
+    }
+    /// Quiesced compatibility join. A controlled attempt may abandon its
+    /// finisher after an original-control failure, so followers recheck the
+    /// claim rather than waiting forever for that attempt to publish joined.
     pub fn stop(self: *Owner, backend: *runtime.BackendRuntime) void {
         const io = backend.io();
-        self.lock();
-        if (self.stop_started) {
+        while (true) {
+            self.lock();
+            self.stopping.store(true, .release);
+            if (self.joined.isSet()) {
+                self.mutex.unlock();
+                return;
+            }
+            if (self.stop_started) {
+                self.mutex.unlock();
+                @import("antfly_platform").time.yieldNow();
+                continue;
+            }
+            self.stop_started = true;
+            var registration = self.registration;
             self.mutex.unlock();
-            // A detached registration still borrows its DB until physical join.
-            if (io) |lane| self.joined.waitUncancelable(lane) else std.debug.assert(self.joined.isSet());
+            if (registration) |*handle| handle.cancel(io orelse @panic("native warming registration outlived runtime I/O"));
+            self.completeStop(io);
             return;
         }
-        self.stop_started = true;
+    }
+    /// Keep the same registration/context after every failed begin, lifetime
+    /// or reentry check. No callback can restart once stopping is fenced.
+    pub fn stopWithAdmission(self: *Owner, backend: *runtime.BackendRuntime, original: @import("../../common/read_admission.zig").Port) !void {
         self.stopping.store(true, .release);
-        var registration = self.registration;
-        self.registration = null;
-        if (registration == null) {
-            if (io) |lane| self.joined.set(lane) else @atomicStore(std.Io.Event, &self.joined, .is_set, .release);
+        var trace: @import("../../common/read_admission.zig").RejectionTrace = .{};
+        const control = trace.bind(original).?;
+        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        while (true) {
+            try control.checkpoint();
+            self.lock();
+            if (self.joined.isSet()) {
+                self.mutex.unlock();
+                return;
+            }
+            if (!self.stop_started) {
+                self.stop_started = true;
+                var registration = self.registration;
+                self.mutex.unlock();
+                if (registration) |*handle| {
+                    const io = backend.io() orelse {
+                        self.lock();
+                        self.stop_started = false;
+                        self.mutex.unlock();
+                        return error.BackendRuntimeUnavailable;
+                    };
+                    handle.cancelWithAdmission(io, control) catch |cause| {
+                        self.lock();
+                        self.stop_started = false;
+                        self.mutex.unlock();
+                        return trace.failure orelse cause;
+                    };
+                }
+                self.completeStop(backend.io());
+                return;
+            }
             self.mutex.unlock();
-            return;
+            try boundary.beginWait();
+            var failure: ?anyerror = null;
+            while (!self.stopAvailable()) {
+                control.checkLifetime() catch |cause| {
+                    failure = trace.failure orelse cause;
+                    break;
+                };
+                @import("antfly_platform").time.yieldNow();
+            }
+            boundary.endWait() catch |cause| {
+                if (failure) |first| return first;
+                return trace.failure orelse cause;
+            };
+            if (failure) |cause| return cause;
         }
-        self.mutex.unlock();
-        registration.?.cancel(io orelse @panic("native warming registration outlived runtime I/O"));
-        self.joined.set(io.?);
     }
     fn cancelled(raw: *const anyopaque) bool {
         const self: *const Owner = @ptrCast(@alignCast(raw));
@@ -375,4 +443,74 @@ test "external lake native warming canceled persistence preserves last complete 
         entries += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), entries);
+}
+
+test "maintenance runtime native warming controlled stop retains failed physical joins for retry" {
+    const admission = @import("../../common/read_admission.zig");
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    for (std.enums.values(Case)) |case| {
+        const io = std.testing.io;
+        var backend = try runtime.BackendRuntimeHandle.init(std.testing.allocator, .{});
+        defer backend.deinit();
+        var owner: Owner = .{};
+        defer owner.stop(backend.ptr());
+        const F = struct {
+            io: std.Io,
+            entered: std.Io.Event = .unset,
+            release: std.Io.Event = .unset,
+            fn turn(raw: *anyopaque, _: *const Pass) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.entered.set(self.io);
+                self.release.waitUncancelable(self.io);
+                return true;
+            }
+        };
+        const Control = struct {
+            f: *F,
+            case: Case,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case != .lifetime_in_wait) self.f.release.set(self.f.io);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                self.f.release.set(self.f.io);
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        var f: F = .{ .io = io };
+        defer f.release.set(io);
+        owner.startInner(.{ .ptr = &f, .runtime = backend.ptr(), .turn = F.turn }, true);
+        try std.testing.expect(owner.registration != null);
+        try f.entered.wait(io);
+        var control: Control = .{ .f = &f, .case = case };
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const result = owner.stopWithAdmission(backend.ptr(), .init(&payload));
+        if (case == .success) try result else {
+            try std.testing.expectError(switch (case) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .lifetime_in_wait => error.DeadlineExceeded,
+                else => unreachable,
+            }, result);
+            try std.testing.expect(owner.registration != null and !owner.stop_started and !owner.joined.isSet());
+            f.release.set(io);
+            owner.stop(backend.ptr());
+        }
+        try std.testing.expectEqual(@as(usize, 1), control.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .begin_failure) 0 else 1), control.ends);
+        try std.testing.expect(owner.registration == null and owner.joined.isSet());
+    }
 }

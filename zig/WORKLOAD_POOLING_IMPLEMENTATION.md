@@ -23165,3 +23165,40 @@ cumulative receipts. The 1,034-source embedded boundary, generated errors,
 control catalog, formatting and whitespace checks pass. Full linked-owner,
 allocator/backend callback cost/funding, mandatory-completion, physical shutdown,
 object/crash and cross-engine qualification remain open.
+
+### Supervised close preflight and maintenance readiness
+
+Serving owner retirement now carries its existing protected cleanup capsule,
+original clock and finite deadline through the storage-owner C entry into DB
+close preflight. With general admission fenced by the retired registry entry,
+preflight drains retained candidates and stops native query warming before
+physical destruction. A rejected checkpoint, wait or reentry leaves the retired
+entry and physical owner alive for a later authorized cleanup attempt. No
+borrowed control is stored in the DB and preflight does not renew its deadline.
+
+Maintenance cancellation fences redispatch, checks callback completion and lends
+the caller's execution slot only while waiting. Local and shared-service handles
+report readiness after the callback has returned; runnable callbacks also finish
+their execution capsule before readiness. Joining and registration destruction
+require successful reentry. Missing remote readiness support fails closed.
+Native warming retains its registration after interrupted cancellation and
+releases the finisher claim so a later controlled or quiesced stop can retry.
+
+Native ABI 74 and storage-owner ABI 132 fence the new readiness and close-drain
+contracts. Durable formats and default activation are unchanged. This connects
+candidate retirement and warming cancellation to the serving close path; other
+physical worker, cache and IO joins, individual callback cost/funding, metadata
+parent charges, routes, executable recovery funding and complete mandatory
+completion remain open. Strong required providers remain disabled. Full Linux
+qualification remains waived; Linux uses the pinned Nix/glibc Zig toolchain.
+
+Pinned Debug validation passes all 89 build steps, including the real-DB C-entry
+close preflight, serving registry retry, maintenance cancellation and shared
+service readiness targets. Error/identity companions and five native ABI cases
+pass. All 5,502 native/schema inputs match the final run. Source snapshots and
+hashes are retained in controlled-close-jobs-verified.json in the cumulative
+receipts. Embedded boundary, generated errors, control catalog, formatting and
+whitespace checks pass. The registry retry fixture stubs physical close; the
+separate real-DB fixture exercises preflight and leaves final destruction to its
+quiesced owner. Full linked-owner and cross-engine shutdown qualification remain
+open.

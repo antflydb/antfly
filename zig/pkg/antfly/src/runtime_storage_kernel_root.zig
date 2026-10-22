@@ -161,6 +161,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerLocalTransition, "antfly_storage_owner_local_transition");
     exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
     exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
+    exportInternal(&storage_kernel_exports.storageOwnerDrainClose, "antfly_storage_owner_drain_close");
     exportInternal(&storage_kernel_exports.storageHotStandbySeedActivateJson, "antfly_storage_hot_standby_seed_activate_json");
     exportInternal(&storage_kernel_exports.storageHotStandbySeedValidateJson, "antfly_storage_hot_standby_seed_validate_json");
     exportInternal(&storage_kernel_exports.storageHotStandbySeedPruneJson, "antfly_storage_hot_standby_seed_prune_json");

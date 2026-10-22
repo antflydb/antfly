@@ -2941,11 +2941,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         // permission to reopen, move, or delete the same physical root.
         self.mutex.unlock();
         var cleanup_handle: ?*anyopaque = null;
+        var close_deadline_ns: u64 = 0;
         const close_owner = if (self.close_execution_owner) |lease| lease.owner else null;
         if (close_owner) |owner| {
             const close_io = self.apply_control_io orelse std.Options.debug_io;
             const borrowed_io = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&close_io);
             const now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, close_io).nanoseconds));
+            close_deadline_ns = now +| 250 * std.time.ns_per_ms;
             const status = owner.start(owner.context, &.{
                 .io = &borrowed_io,
                 .class = @backingInt(@import("antfly_runtime_abi").runnable_abi.Class.control),
@@ -2953,11 +2955,11 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .cleanup = 1,
                 .allow_wait = 0,
                 .has_deadline = 1,
-                .deadline_ns = now +| 250 * std.time.ns_per_ms,
+                .deadline_ns = close_deadline_ns,
                 .retained_bytes = @sizeOf(client.Owner),
                 .out_handle = &cleanup_handle,
             });
-            if (!status.isOk()) {
+            if (!status.isOk() or cleanup_handle == null) {
                 lock(&self.mutex);
                 entry.closing = false;
                 return false;
@@ -2968,6 +2970,21 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.mutex.unlock();
             owner.finish(handle);
             lock(&self.mutex);
+        };
+        if (close_owner) |owner| if (cleanup_handle) |handle| {
+            const rt = @import("antfly_runtime_abi");
+            const borrow = rt.runnable_abi.Borrowed.fromOwner(owner, handle, 1, .control) catch {
+                lock(&self.mutex);
+                entry.closing = false;
+                return false;
+            };
+            const close_io = self.apply_control_io orelse std.Options.debug_io;
+            const clock = rt.native_abi.IoBorrow.init(&close_io);
+            entry.owner.drainClose(.{ .deadline_ns = close_deadline_ns, .execution_runnable = &borrow, .clock_io = &clock }) catch {
+                lock(&self.mutex);
+                entry.closing = false;
+                return false;
+            };
         };
         if (@import("builtin").is_test) if (self.test_apply_control_hooks) |hooks| {
             if (hooks.before_close) |before_close| before_close(hooks.ptr);
@@ -9242,4 +9259,44 @@ test "controlled native ACK source analyzes typed cohort acknowledgement" {
 test "controlled native ACK source rejects silently discarded mutation fields" {
     var source: ProvisionedKernelOwnerSource = undefined;
     try std.testing.expectError(error.InvalidBatchRequest, ProvisionedKernelOwnerSource.batchGroupLocalWithPreDecisionContext(&source, std.testing.allocator, 7, "docs", .{ .writes = &.{.{ .key = "drop", .value = "{}" }}, .transaction = .{ .acknowledge_many = .{ .txn_id = @splat(1), .participants = &.{"member"} } } }, .{}));
+}
+
+test "controlled owner lease retirement retains a physical owner when close preflight rejects" {
+    const root = @import("root");
+    if (comptime !@hasDecl(root, "drain_status")) return;
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const alloc = std.testing.allocator;
+    var close_owner: @import("runnable_owner_execution.zig").State = .{
+        .owner_alloc = alloc,
+        .owner = try native.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }),
+        .native_now_ns = platform_time.monotonicNs,
+    };
+    defer close_owner.owner.tryDeinit() catch @panic("close owner retained");
+    var source = ProvisionedKernelOwnerSource.init(alloc, "unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    source.owns_context = false;
+    _ = try source.withCloseExecutionOwner(close_owner.port());
+    defer source.deinit();
+    source.apply_control_io = std.testing.io;
+    const entry = try alloc.create(ProvisionedKernelOwnerSource.Entry);
+    entry.* = .{ .group_id = 1, .table_name = try alloc.dupe(u8, "docs"), .generation = 1, .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .schema_json = try alloc.dupe(u8, "{}"), .indexes_json = try alloc.dupe(u8, "{}"), .restore_bootstrap_json = try alloc.dupe(u8, ""), .initial_child_bootstrap_json = try alloc.dupe(u8, ""), .owner = .{ .handle = null }, .retired = true };
+    try source.entries.append(alloc, entry);
+    root.drain_calls = 0;
+    root.drain_status = .deadline_exceeded;
+    defer root.drain_status = .ok;
+    ProvisionedKernelOwnerSource.lock(&source.mutex);
+    const refused = source.destroyEntryAtIndexLocked(0);
+    source.mutex.unlock();
+    try std.testing.expect(!refused);
+    try std.testing.expectEqual(@as(usize, 1), root.drain_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+    try std.testing.expect(entry.retired and !entry.closing);
+    try std.testing.expectEqual(@as(usize, 0), close_owner.owner.scheduler.stats().operations);
+    root.drain_status = .ok;
+    ProvisionedKernelOwnerSource.lock(&source.mutex);
+    const closed = source.destroyEntryAtIndexLocked(0);
+    source.mutex.unlock();
+    try std.testing.expect(closed);
+    try std.testing.expectEqual(@as(usize, 2), root.drain_calls);
+    try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), close_owner.owner.scheduler.stats().operations);
 }

@@ -38,7 +38,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Coverage outcome transitions join final-writer metadata programs.
 // Owned replay binding recipes and whole-operation refresh expand native state.
 // Owned assemblies retain checked memory state; native retries observe commits.
-pub const abi_version: u32 = 131;
+pub const abi_version: u32 = 132;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -2230,6 +2230,18 @@ pub extern fn antfly_storage_owner_open(
     request: *const OpenRequest,
     out_owner: *?*anyopaque,
 ) callconv(.c) Status;
+
+/// Synchronous close preflight uses the registry's existing cleanup capsule
+/// and its original clock/deadline. The physical owner remains registered on
+/// failure. This header is never reconstructed from public input.
+pub const CloseDrainRequest = extern struct {
+    version: u32 = abi_version,
+    reserved: u32 = 0,
+    deadline_ns: u64,
+    execution_runnable: ?*const anyopaque,
+    clock_io: ?*const anyopaque,
+};
+pub extern fn antfly_storage_owner_drain_close(owner: ?*anyopaque, request: *const CloseDrainRequest) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_close(owner: ?*anyopaque) callconv(.c) void;
 
