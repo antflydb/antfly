@@ -237,8 +237,7 @@ zig build antfly-test
 - `antfly-unit-test`
 - `vopr-test`
 - `antfly-integration-test`
-- `antfly-recall-test`
-- the default recall harness over `testdata/vectorsets`
+- `antfly-recall-conformance` (fetches the recall vectorsets; see below)
 - `antfly-chaos-test`
 
 Run only the inference package tests:
@@ -318,15 +317,39 @@ zig build antfly-chaos-test
 Run recall checks:
 
 ```sh
-zig build antfly-storage-vectorindex-recall-test
-zig build recall-harness && ./zig-out/bin/recall_harness
+zig build antfly-recall-conformance
 ```
+
+`antfly-recall-conformance` fetches the recall vectorsets, then runs the
+storage-backed HBC recall tests, the RaBitQ quantizer parity test, and the
+per-metric recall harness against them. The datasets are not committed; they are
+pinned by SHA-256 in `testdata/vectorsets.manifest.json` and cached under
+`antfly-vectorsets/` in the conformance fixture directory (see below), so every
+worktree shares one copy. Missing datasets fail this target instead of skipping.
+`antfly-recall-test` remains as a deprecated alias.
+
+For ad hoc runs of the individual pieces, point them at the fetched datasets:
+
+```sh
+python3 tools/fetch_vectorsets.py --manifest testdata/vectorsets.manifest.json \
+  --dest ~/.cache/antfly/conformance-fixtures/antfly-vectorsets
+ANTFLY_VECTORSETS_DIR=~/.cache/antfly/conformance-fixtures/antfly-vectorsets \
+  zig build antfly-storage-vectorindex-recall-test
+zig build recall-harness && ./zig-out/bin/recall_harness \
+  --dataset-dir ~/.cache/antfly/conformance-fixtures/antfly-vectorsets
+```
+
+To update a dataset, publish the new file at a pinned URL and update its name,
+size, and SHA-256 in the manifest; `tools/test_fetch_vectorsets.py` checks the
+manifest shape.
 
 ## Conformance And Soak
 
 Conformance targets fetch missing external fixtures, reuse cached corpora, and run
 the suite. Setup failures fail the target. These suites remain opt-in; ordinary
-library tests do not download external corpora.
+library tests do not download external corpora. CI runs
+`antfly-recall-conformance` in every full run and `conformance-test` nightly,
+both with fixtures cached on the runner volume.
 
 ```sh
 zig build conformance-test
@@ -338,7 +361,8 @@ zig build lib-audio-conformance
 Library suite names follow `lib-<library>-conformance`, alongside
 `lib-<library>-test` and `lib-<library>-bench`.
 
-Fixtures are cached under `/tmp` by default. Use
+Fixtures are cached under `$XDG_CACHE_HOME/antfly/conformance-fixtures`
+(`~/.cache/antfly/conformance-fixtures` by default), shared by every worktree. Use
 `-Dconformance-fixtures=/absolute/path` to choose another cache directory.
 For offline runs, disable fixture fetching explicitly (missing fixtures fail):
 

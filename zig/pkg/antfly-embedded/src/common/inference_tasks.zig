@@ -122,7 +122,7 @@ pub const Executor = struct {
         return generator.chat(a, .{ .messages = messages, .body_json = body, .operation = operation, .stream = if (sink.start != null) .{ .context = &borrowed, .start = Forwarder.start, .write = Forwarder.write, .close = Forwarder.close } else null });
     }
 
-    pub fn decide(self: Executor, a: std.mem.Allocator, name: []const u8, input: []const u8, questions: Json) !Json {
+    pub fn decide(self: Executor, a: std.mem.Allocator, name: []const u8, input: decisions.Input, questions: Json) !Json {
         var runtime = decision_runtime.Runtime{
             .registry = self.view.providers,
             .http = self.http,

@@ -19,7 +19,8 @@ const std = @import("std");
 const api = @import("openai_api");
 const d = @import("decisions.zig");
 
-pub fn requestBody(a: std.mem.Allocator, model: []const u8, input: []const u8, questions: d.Json) ![]const u8 {
+pub fn requestBody(a: std.mem.Allocator, model: []const u8, input: d.Input, questions: d.Json) ![]const u8 {
+    try input.validate();
     try d.validateQuestions(questions, d.capabilities(.openai));
     const wire = try a.alloc(api.QuestionParam, questions.object.count());
     for (questions.object.keys(), questions.object.values(), wire) |name, question, *out| {
@@ -48,7 +49,7 @@ pub fn requestBody(a: std.mem.Allocator, model: []const u8, input: []const u8, q
             },
         };
     }
-    return std.json.Stringify.valueAlloc(a, api.DecisionRequest{ .model = model, .input = .{ .string = input }, .questions = wire }, .{});
+    return std.json.Stringify.valueAlloc(a, api.DecisionRequest{ .model = model, .input = input.jsonValue(a), .questions = wire }, .{});
 }
 
 fn checkName(actual: ?[]const u8, expected: []const u8) !void {
@@ -131,7 +132,7 @@ test "decision functions OpenAI generated wire types preserve instructions and o
     defer arena.deinit();
     const a = arena.allocator();
     const questions = try std.json.parseFromSliceLeaky(d.Json, a, test_questions, .{});
-    const body = try requestBody(a, "gpt-6-luna", "command: ls; cwd: /tmp; request: list files", questions);
+    const body = try requestBody(a, "gpt-6-luna", .{ .text = "command: ls; cwd: /tmp; request: list files" }, questions);
     const parsed = try std.json.parseFromSliceLeaky(api.DecisionRequest, a, body, .{});
     try std.testing.expectEqualStrings("gpt-6-luna", parsed.model);
     try std.testing.expectEqualStrings("command: ls; cwd: /tmp; request: list files", parsed.input.string);
