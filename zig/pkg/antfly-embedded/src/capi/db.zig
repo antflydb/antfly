@@ -9333,7 +9333,9 @@ test "capi resolver invalid inline declarations reject before replay activity or
     try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
     const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
     defer a.free(path);
-    const handle = try openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .hosted }, true);
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    const handle = try openLiteHandleAllocWithRuntime(a, path, .{ .no_sync = true, .profile = .hosted }, true, std.testing.io, runtime.ptr());
     const id = try publishHandle(handle);
     defer antfly_db_close(id);
     const database = handle.database();
