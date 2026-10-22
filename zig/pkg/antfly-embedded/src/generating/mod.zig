@@ -523,7 +523,9 @@ const BackendState = struct {
             try self.limits.acquire(self.quotaIdentity(model), policy);
         defer if (temporary) |*handle| handle.release();
         const quota = temporary orelse self.quota.?;
-        const observer = quota.limiter().observer(try generationOutputBudget(self.cfg, 1));
+        const media = try generationMediaReservation(self.cfg, messages);
+        var reservation = provider_limits.TokenReservation{ .limiter = quota.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(self.cfg, 1) };
+        const observer = if (media.tokens > 0) reservation.observer() else quota.limiter().observer(try generationOutputBudget(self.cfg, 1));
         switch (self.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.attempt_observer = observer,
             .embedded_antfly, .apple => {},
@@ -1265,18 +1267,38 @@ pub fn validateGenerationOutputTokenBudget(cfg: GeneratorConfig, count: usize) !
         return error.ProviderTokenBudgetExceeded;
 }
 
+const MediaReservation = struct { tokens: u64 = 0, inline_bytes: usize = 0 };
+fn generationMediaReservation(cfg: GeneratorConfig, messages: []const ChatMessage) !MediaReservation {
+    var result: MediaReservation = .{};
+    for (messages) |message| if (message.content) |content| {
+        if (content == .parts) for (content.parts) |part| {
+            if (part == .text) continue;
+            const bound = cfg.image_input_token_bound orelse {
+                if ((try provider_limits.Policy.fromConfig(cfg.rate_limit)).tokens_per_minute != 0) return error.UnsupportedMediaTokenBudget;
+                continue;
+            };
+            result.tokens = std.math.add(u64, result.tokens, bound) catch return error.ProviderTokenBudgetExceeded;
+            switch (part) {
+                .text => unreachable,
+                .media => |media| {
+                    if (!std.mem.startsWith(u8, media.mime_type, "image/")) return error.UnsupportedMediaTokenBudget;
+                    if (media.url == null) result.inline_bytes += media.data.len;
+                },
+                .image_url => |image| if (std.mem.startsWith(u8, image.url, "data:")) {
+                    const start = std.mem.indexOf(u8, image.url, ";base64,") orelse return error.UnsupportedMediaTokenBudget;
+                    result.inline_bytes += image.url.len - start - 8;
+                },
+            }
+        };
+    };
+    return result;
+}
+
 pub fn validateGenerationMessagesTokenBudget(cfg: GeneratorConfig, messages: []const ChatMessage) !void {
     try validateGenerationOutputTokenBudget(cfg, 1);
     const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
     if (policy.tokens_per_minute == 0) return;
-    for (messages) |message| {
-        if (message.content) |content| switch (content) {
-            .text => {},
-            .parts => |parts| for (parts) |part| {
-                if (part != .text) return error.UnsupportedMediaTokenBudget;
-            },
-        };
-    }
+    _ = try generationMediaReservation(cfg, messages);
 }
 
 test "generating backend batch preserves cancellation alongside quota policy" {

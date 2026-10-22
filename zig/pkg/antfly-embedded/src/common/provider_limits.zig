@@ -116,6 +116,8 @@ pub fn nowNs() u64 {
 pub const TokenReservation = struct {
     limiter: *Limiter,
     input_tokens: u64,
+    include_body_bytes: bool = false,
+    body_bytes_discount: usize = 0,
     output_tokens: u64 = 0,
     charged: u64 = 0,
     /// Retain observed usage even if a caller cannot parse or validate the full
@@ -127,7 +129,7 @@ pub const TokenReservation = struct {
     }
     fn before(ptr: *anyopaque, context: httpx.AttemptObserver.Context) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const cost = self.input_tokens +| self.output_tokens;
+        const cost = self.input_tokens +| self.output_tokens +| (if (self.include_body_bytes) context.body_bytes -| self.body_bytes_discount else 0);
         try self.limiter.beforeCost(context, cost);
         self.charged = cost;
     }
@@ -136,12 +138,17 @@ pub const TokenReservation = struct {
         // Reconcile before releasing concurrency so a following request cannot
         // observe a replenished slot without the completed request's token debt.
         if (response) |res| if (res.body) |body| {
-            const Usage = struct { usage: struct { input_tokens: u64, output_tokens: u64 } };
+            const Usage = struct {
+                usage: ?struct { input_tokens: ?u64 = null, output_tokens: ?u64 = null, prompt_tokens: ?u64 = null, completion_tokens: ?u64 = null } = null,
+                usageMetadata: ?struct { promptTokenCount: u64 = 0, candidatesTokenCount: u64 = 0, thoughtsTokenCount: u64 = 0 } = null,
+            };
             var buffer: [4096]u8 = undefined;
             var storage = std.heap.BufferFirstAllocator.init(&buffer, std.heap.smp_allocator);
             if (std.json.parseFromSlice(Usage, storage.allocator(), body, .{ .ignore_unknown_fields = true })) |parsed| {
                 defer parsed.deinit();
-                self.reconcile(parsed.value.usage.input_tokens, parsed.value.usage.output_tokens);
+                if (parsed.value.usage) |usage| {
+                    if (usage.input_tokens orelse usage.prompt_tokens) |input| if (usage.output_tokens orelse usage.completion_tokens) |output| self.reconcile(input, output);
+                } else if (parsed.value.usageMetadata) |usage| self.reconcile(usage.promptTokenCount, usage.candidatesTokenCount +| usage.thoughtsTokenCount);
             } else |_| {}
         };
         Limiter.after(self.limiter, response);
@@ -665,4 +672,29 @@ test "decision functions quota reservations reconcile actual usage before releas
     reservation.reconcile(10000, 5);
     try std.testing.expectEqual(debt, limiter.tokens);
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), Limiter.boundedWait(1e100));
+}
+
+test "decision functions generation media quotas reserve framing and reconcile hosted usage" {
+    const Cancel = struct {
+        fn no(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    for ([_][]const u8{
+        "{\"usage\":{\"prompt_tokens\":2000,\"completion_tokens\":20}}",
+        "{\"usageMetadata\":{\"promptTokenCount\":2000,\"candidatesTokenCount\":15,\"thoughtsTokenCount\":5}}",
+    }) |body| {
+        var limiter = Limiter.init(.{ .tokens_per_minute = 10000, .max_concurrency = 1 });
+        var reservation = TokenReservation{ .limiter = &limiter, .input_tokens = 1000, .include_body_bytes = true, .body_bytes_discount = 80, .output_tokens = 20 };
+        const observer = reservation.observer();
+        try observer.before(observer.ptr, .{ .io = std.testing.io, .deadline_ms = null, .cancellation_ptr = &limiter, .is_cancelled = Cancel.no, .body_bytes = 100, .output_tokens = 0 });
+        try std.testing.expectEqual(@as(u64, 1040), reservation.charged);
+        var response = httpx.Response.init(std.testing.allocator, 200);
+        defer response.deinit();
+        response.body = body;
+        observer.after(observer.ptr, &response);
+        try std.testing.expectEqual(@as(u64, 2020), reservation.charged);
+        try std.testing.expectEqual(@as(u64, 2000), reservation.reported_usage.?.input_tokens);
+        try std.testing.expectEqual(@as(u32, 0), limiter.in_flight);
+    }
 }

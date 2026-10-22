@@ -27,6 +27,24 @@ const httpx = @import("httpx");
 const Json = std.json.Value;
 const Allocator = std.mem.Allocator;
 
+/// Validate adapter-specific media constraints before any batch is dispatched.
+pub fn validateEvidence(cfg: generating.GeneratorConfig, input: @import("../functions/decision_input.zig").Input) !void {
+    try input.validate();
+    if (input == .text) return;
+    for (input.messages) |message| {
+        const content = message.object.get("content").?;
+        if (content != .array) continue;
+        for (content.array.items) |part| {
+            if (!std.mem.eql(u8, part.object.get("type").?.string, "input_image")) continue;
+            const url = part.object.get("image_url").?.string;
+            if (cfg.provider != .openai) {
+                if (!std.mem.startsWith(u8, url, "data:")) return error.UnsupportedInferenceFeature;
+                if (part.object.get("detail")) |detail| if (!std.mem.eql(u8, detail.string, "auto")) return error.UnsupportedInferenceFeature;
+            }
+        }
+    }
+}
+
 pub const Runtime = struct {
     http: *httpx.Client,
     options: generating.BackendFactory.Options = .{},
@@ -70,12 +88,17 @@ pub const Runtime = struct {
             if (lease.descriptor_revision) |revision| cfg.capability_revision = try a.dupe(u8, revision.slice());
         }
         const caps = native orelse return error.UnsupportedConstrainedOutput;
-        return .{ .grammar = caps.generation_grammar_v1, .token_logprobs = caps.generation_token_logprobs_v1, .model_revision = if (caps.model_revision) |revision| try std.fmt.allocPrint(a, "{x}", .{&revision}) else null };
+        return .{ .images = caps.input_modalities.image, .grammar = caps.generation_grammar_v1, .token_logprobs = caps.generation_token_logprobs_v1, .model_revision = if (caps.model_revision) |revision| try std.fmt.allocPrint(a, "{x}", .{&revision}) else null };
     }
 
     pub fn execute(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig, mode: constrained.Output, schema: Json, instructions: []const u8, batch: constrained.Batch, inputs: []const []const u8) !constrained.Result {
         var backend = Backend{ .runtime = self, .cfg = cfg };
         return constrained.execute(a, .{ .ptr = &backend, .invoke = Backend.invoke, .checkpoint = Backend.checkpoint, .validate_item = Backend.validateItem }, mode, schema, instructions, batch, inputs);
+    }
+
+    pub fn executeEvidence(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig, mode: constrained.Output, schema: Json, instructions: []const u8, batch: constrained.Batch, inputs: []const Json) !constrained.Result {
+        var backend = Backend{ .runtime = self, .cfg = cfg };
+        return constrained.executeEvidence(a, .{ .ptr = &backend, .invoke = Backend.invoke, .checkpoint = Backend.checkpoint, .validate_item = Backend.validateItem }, mode, schema, instructions, batch, inputs);
     }
 
     const Backend = struct {
@@ -113,9 +136,9 @@ pub const Runtime = struct {
                     .schema = wire_schema,
                 } }, .{});
             }
-            const body = try std.json.Stringify.valueAlloc(a, .{ .instructions = request.instructions, .items = request.items, .validation_error = request.validation_error }, .{ .emit_null_optional_fields = false });
             const schema_text = try std.json.Stringify.valueAlloc(a, request.schema, .{});
             const system = try std.fmt.allocPrint(a, "Return one structured result per input item. Preserve the item IDs exactly. The JSON schema is: {s}", .{schema_text});
+            const messages = try constrained.evidenceMessages(a, request, system, cfg.provider == .openai);
             var result = generating.executeChainWithOptions(a, self.runtime.http, &.{.{ .generator = cfg }}, .{
                 .antfly_provider = self.runtime.options.antfly_provider,
                 .secret_store = self.runtime.options.secret_store,
@@ -125,7 +148,7 @@ pub const Runtime = struct {
                 .execution = self.runtime.options.execution,
                 .request_context = self.runtime.options.request_context,
                 .limits = self.runtime.options.limits,
-            }, &.{ .{ .role = .system, .content = .{ .text = system } }, .{ .role = .user, .content = .{ .text = body } } }) catch |err| switch (err) {
+            }, messages) catch |err| switch (err) {
                 error.InvalidStructuredOutput, error.InvalidGeneratedToolArguments => return .{ .value = try std.json.parseFromSliceLeaky(Json, a, "{\"items\":[]}", .{}) },
                 else => return err,
             };

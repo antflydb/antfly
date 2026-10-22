@@ -204,7 +204,7 @@ components:
           x-go-type-skip-optional-pointer: false
           type: integer
           minimum: 0
-          description: Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native and generated models require text.
+          description: Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native trained and embedding deciders require text. Generated deciders accept image evidence when the selected generator supports images and constrained output.
     DecideLongDocument:
       type: object
       additionalProperties: false
@@ -307,7 +307,7 @@ components:
       properties:
         decision_method: { type: string, enum: [generated] }
         generator: { $ref: '../shared/generating.yaml#/components/schemas/GeneratorConfig' }
-        input: { type: string, minLength: 1, maxLength: 1048576 }
+        input: { $ref: '#/components/schemas/DecisionEvidence' }
         inputs:
           type: array
           minItems: 1
@@ -323,7 +323,7 @@ components:
         probabilities: { $ref: '../shared/generating.yaml#/components/schemas/ConstrainedProbabilities' }
         batch: { $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGenerationBatch' }
     DecisionEvidence:
-      description: Text or ordered user messages containing text and images. Named OpenAI and Jev deciders accept messages. Native trained, embedding, and generated deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
+      description: Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
       oneOf:
         - type: string
           minLength: 1

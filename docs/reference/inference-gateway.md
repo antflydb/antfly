@@ -179,19 +179,24 @@ charged its configured allowance. Limits are 1 MiB of evidence per item and
 Shared text contexts use `context_version: 1`, `contexts: ["..."]`, and optional
 `context_index` on each item. Text inputs become context, newline, and input;
 message inputs receive a leading user message containing that context. Images
-and their ordering are retained. Named native and generated deciders accept text
-batches and reject image/message evidence before inference dispatch. Native
-runtime batch inputs remain text-only. Jev batches require inline PNG/JPEG images;
+and their ordering are retained. Native trained and embedding deciders accept text
+batches. Generated deciders preserve message and image evidence through constrained
+generation, batching, and selective repair when the selected model supports both
+images and the requested output mode. Native generated requests accept the same
+evidence through `decision_method: "generated"`. Native trained runtime batches
+remain text-only. Jev batches require inline PNG/JPEG images;
 HTTP(S) image URLs in the example above require an OpenAI decider.
 
 Existing string inputs continue to work. Message order and content order are
 preserved. Inputs allow only user messages, `input_text`, and `input_image`;
 audio, files, tools, and other roles fail validation. Limits are 128 messages,
-128 images, and 1 MiB of serialized evidence per call. Text-only native,
-embedding-similarity, and generated deciders reject message inputs explicitly.
-`gateway_capabilities.images` reports support on named hosted deciders with a
-configured image-token bound. Text-only message arrays remain available without
-that bound or when images are explicitly disabled.
+128 images, and 1 MiB of serialized evidence per call. Native trained and
+embedding-similarity deciders reject message inputs explicitly.
+`gateway_capabilities.images` reports support on named hosted deciders and
+qualified hosted generators with a configured image-token bound. Native generated
+deciders report unknown unless explicitly declared; execution checks the selected
+native model's actual image and grammar capabilities. Text-only message arrays
+remain available without that bound or when images are explicitly disabled.
 Explicit `inference_capabilities` declarations intersect this adapter support;
 `images: unsupported` or `unknown` rejects images in HTTP, SQL, and expressions.
 
@@ -205,8 +210,16 @@ decision budgets. Antfarm offers the decision image example only for models
 identified as image-capable deciders. Antfly runtime connections forward their
 requests intact; the remote gateway owns its adapter and image budgets.
 
-Configure `max_image_input_tokens` on each hosted decider used with images. Set
-it to the selected provider/model's upper bound on one image's input-token
+Configure `max_image_input_tokens` on each named typed or generated decider used
+with images, including native generators. Generated OpenAI decisions retain image
+URLs and detail; native, Gemini, and Vertex generators accept inline images with
+`detail: "auto"`. Generated batches obey `batch.max_input_bytes` (64 KiB by
+default, configurable up to 4 MiB) including encoded media, and retain successful
+siblings during repair without resending their evidence. Configure the generator's
+`rate_limit` for generated calls; each attempt reserves its image allowances and
+serialized non-image bytes against that shared quota.
+
+Set the bound to the selected provider/model's upper bound on one image's input-token
 contribution, including its largest supported resolution/detail. For example,
 use `max_image_input_tokens: 8192` only when that bound fits the selected model.
 Image calls without a configured bound fail before provider I/O. The runtime

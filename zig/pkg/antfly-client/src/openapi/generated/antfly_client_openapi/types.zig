@@ -9123,7 +9123,7 @@ pub const DeciderConfig = struct {
     api_key: ?[]const u8 = null,
     max_rows: ?i64 = null,
     max_input_tokens: ?i64 = null,
-    /// Provider/model upper bound on the input-token contribution of one image. Required when sending images through hosted typed deciders, including image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Omit for text-only, native, or generated deciders.
+    /// Provider/model upper bound on the input-token contribution of one image. Required when sending images through typed hosted or generated deciders, including native generators and image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Generated deciders apply the allowance to the selected generator's shared quota. Omit for text-only deciders.
     max_image_input_tokens: ?i64 = null,
     rate_limit: ?RateLimitConfig = null,
     batch_size: ?i64 = null,
@@ -9321,7 +9321,7 @@ pub const DecisionChoiceProbability = struct {
     probability: f64,
 };
 
-/// Text or ordered user messages containing text and images. Named OpenAI and Jev deciders accept messages. Native trained, embedding, and generated deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
+/// Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
 pub const DecisionEvidence = std.json.Value;
 
 pub const DecisionEvidenceImage = struct {
@@ -9401,7 +9401,7 @@ pub const DecisionEvidenceText = struct {
 pub const DecisionInput = struct {
     id: ?[]const u8 = null,
     input: DecisionEvidence,
-    /// Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native and generated models require text.
+    /// Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native trained and embedding deciders require text. Generated deciders accept image evidence when the selected generator supports images and constrained output.
     context_index: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -17588,7 +17588,7 @@ pub const GeneratedDecideQuestion = union(enum) {
 pub const GeneratedDecideRequest = struct {
     decision_method: []const u8,
     generator: GeneratorConfig,
-    input: ?[]const u8 = null,
+    input: ?DecisionEvidence = null,
     inputs: ?[]const DecisionInput = null,
     questions: []const GeneratedDecideQuestion,
     instructions: ?[]const u8 = null,

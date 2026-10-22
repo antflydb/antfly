@@ -19,14 +19,16 @@ class DecisionInput:
     """
     Attributes:
         input_ (list[DecisionEvidenceMessage] | str): Text or ordered user messages containing text and images. Named
-            OpenAI and Jev deciders accept messages. Native trained, embedding, and generated deciders require text. At most
-            128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto;
-            OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are
-            unsupported.
+            OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model
+            that supports both images and constrained output; native, Gemini, and Vertex generators require inline images
+            and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of
+            serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public
+            HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
         id (str | Unset):
         context_index (int | Unset): Index into request contexts. Requires context_version 1. Text expands to context,
             newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and
-            16 MiB aggregate evidence limits apply after expansion. Native and generated models require text.
+            16 MiB aggregate evidence limits apply after expansion. Native trained and embedding deciders require text.
+            Generated deciders accept image evidence when the selected generator supports images and constrained output.
     """
 
     input_: list[DecisionEvidenceMessage] | str

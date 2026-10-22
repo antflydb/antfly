@@ -5237,7 +5237,7 @@ export interface paths {
         put?: never;
         /**
          * Answer named decision questions
-         * @description Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items. Hosted typed deciders accept text and images per batch item; native and generated deciders require text. OpenAI and Jev adapters support images; native deciders require text. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
+         * @description Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items. Hosted typed deciders and qualified constrained generators accept text and images per batch item. Generated native models must support both images and constrained output. Native trained and embedding deciders require text. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
          */
         post: operations["decide"];
         delete?: never;
@@ -15822,7 +15822,7 @@ export interface components {
             max_input_tokens?: number;
             /**
              * Format: int64
-             * @description Provider/model upper bound on the input-token contribution of one image. Required when sending images through hosted typed deciders, including image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Omit for text-only, native, or generated deciders.
+             * @description Provider/model upper bound on the input-token contribution of one image. Required when sending images through typed hosted or generated deciders, including native generators and image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Generated deciders apply the allowance to the selected generator's shared quota. Omit for text-only deciders.
              */
             max_image_input_tokens?: number;
             rate_limit?: components["schemas"]["RateLimitConfig"];
@@ -23196,12 +23196,12 @@ export interface components {
             role: "user";
             content: string | (components["schemas"]["DecisionEvidenceText"] | components["schemas"]["DecisionEvidenceImage"])[];
         };
-        /** @description Text or ordered user messages containing text and images. Named OpenAI and Jev deciders accept messages. Native trained, embedding, and generated deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported. */
+        /** @description Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported. */
         DecisionEvidence: string | components["schemas"]["DecisionEvidenceMessage"][];
         DecisionInput: {
             id?: string;
             input: components["schemas"]["DecisionEvidence"];
-            /** @description Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native and generated models require text. */
+            /** @description Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native trained and embedding deciders require text. Generated deciders accept image evidence when the selected generator supports images and constrained output. */
             context_index?: number;
         };
         /** @description Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text. */
@@ -23323,7 +23323,7 @@ export interface components {
             /** @enum {string} */
             decision_method: "generated";
             generator: components["schemas"]["GeneratorConfig"];
-            input?: string;
+            input?: components["schemas"]["DecisionEvidence"];
             inputs?: components["schemas"]["DecisionInput"][];
             questions: components["schemas"]["GeneratedDecideQuestion"][];
             instructions?: string;

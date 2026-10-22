@@ -1379,3 +1379,30 @@ func TestInferenceDecidePreservesMultimodalBatchAndItemErrors(t *testing.T) {
 	assert.Equal(t, "resolved", response.Data[0].Model)
 	assert.Equal(t, 12, response.Usage.InputTokens)
 }
+
+func TestGeneratedDecisionsPreserveMultimodalEvidence(t *testing.T) {
+	const evidence = `[{"role":"user","content":[{"type":"input_text","text":"Inspect"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]`
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprint(batch), func(t *testing.T) {
+			payload := `"input":` + evidence
+			if batch {
+				payload = `"inputs":[{"id":"text","input":"source"},{"id":"image","input":` + evidence + `}]`
+			}
+			wire := `{"decision_method":"generated","generator":{"provider":"antfly","model":"vision"},"probabilities":"verdict_only",` + payload + `,"questions":[{"name":"answer","type":"predicate","instructions":"Present?"}]}`
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				assert.JSONEq(t, wire, string(body))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"model":"vision","answers":[],"usage":{"input_tokens":2,"output_tokens":0}}`)
+			}))
+			defer server.Close()
+			client, err := NewInferenceClient(server.URL, nil)
+			require.NoError(t, err)
+			var request oapi.GeneratedDecideRequest
+			require.NoError(t, json.Unmarshal([]byte(wire), &request))
+			_, err = client.DecideGenerated(context.Background(), request)
+			require.NoError(t, err)
+		})
+	}
+}

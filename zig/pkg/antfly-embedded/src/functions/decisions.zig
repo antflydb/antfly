@@ -102,7 +102,7 @@ pub const DeciderConfig = struct {
             }
         }
         if (self.max_image_input_tokens) |bound| {
-            if (bound == 0 or self.provider == .antfly or self.decision_method != .typed) return error.InvalidDeciderConfig;
+            if (bound == 0 or (self.decision_method != .generated and (self.provider == .antfly or self.decision_method != .typed))) return error.InvalidDeciderConfig;
         }
         if (self.max_rows == 0 or self.max_input_tokens == 0 or self.batch_size == 0 or self.batch_size > 256) return error.InvalidDeciderConfig;
         if (self.decision_method != .generated and self.provider != .jev and std.mem.trim(u8, self.model, " \r\n\t").len == 0) return error.InvalidDeciderConfig;
@@ -117,8 +117,9 @@ pub const DeciderConfig = struct {
         caps.generated = self.decision_method == .generated;
         if (caps.generated) {
             caps.max_levels = 64;
-            caps.images = false;
-            caps.messages = false;
+            const generator = self.generator orelse return caps;
+            caps.images = generator.provider == .antfly or constrained.hostedCapabilities(generator).images;
+            caps.messages = true;
         }
         if (self.decision_method == .embedding_similarity) {
             caps.embedding_similarity = true;

@@ -16,6 +16,7 @@
 //! Shared constrained-output contract. Callers own the request arena and
 //! provider execution; this layer owns item identity, validation and repair.
 const std = @import("std");
+pub const chatRequestJsonWithOptionsAlloc = @import("antfly_generating").chatRequestJsonWithOptionsAlloc;
 pub const localGenerationStatusError = @import("antfly_generating").localGenerationStatusError;
 const schema_validator = @import("antfly_jsonschema");
 pub const extraction = @import("generated_extractor.zig");
@@ -42,6 +43,7 @@ pub const Capabilities = struct {
     tool_call: bool = false,
     json_schema: bool = false,
     grammar: bool = false,
+    images: bool = false,
     token_logprobs: bool = false,
     tool_call_token_logprobs: bool = false,
     model_revision: ?[]const u8 = null,
@@ -63,7 +65,7 @@ pub const Capabilities = struct {
     }
 };
 
-pub const Item = struct { id: usize, input: []const u8 };
+pub const Item = struct { id: usize, input: Json };
 pub const Invocation = struct {
     mode: Output,
     schema: Json,
@@ -71,6 +73,57 @@ pub const Invocation = struct {
     items: []const Item,
     validation_error: ?[]const u8 = null,
 };
+
+/// Render typed user evidence as real provider content, keeping item identity
+/// stable during selective repair. Media never appears in the metadata JSON.
+pub fn evidenceMessages(a: Allocator, invocation: Invocation, system: []const u8, openai_images: bool) ![]const @import("antfly_generating").ChatMessage {
+    const generation = @import("antfly_generating");
+    const metadata = try a.dupe(Item, invocation.items);
+    var messages: std.ArrayList(generation.ChatMessage) = .empty;
+    for (metadata) |*item| if (item.input != .string) {
+        item.input = .{ .string = "See the following evidence messages labeled with this item ID." };
+    };
+    const body = try std.json.Stringify.valueAlloc(a, .{ .instructions = invocation.instructions, .items = metadata, .validation_error = invocation.validation_error }, .{ .emit_null_optional_fields = false });
+    try messages.append(a, .{ .role = .system, .content = .{ .text = system } });
+    try messages.append(a, .{ .role = .user, .content = .{ .text = body } });
+    for (invocation.items) |item| if (item.input != .string) {
+        const evidence = item.input;
+        if (evidence != .array) return error.UnsupportedInferenceFeature;
+        try messages.append(a, .{ .role = .user, .content = .{ .text = try std.fmt.allocPrint(a, "Evidence for item ID {d}:", .{item.id}) } });
+        for (evidence.array.items) |message| {
+            const content = message.object.get("content").?;
+            if (content == .string) {
+                try messages.append(a, .{ .role = .user, .content = .{ .text = content.string } });
+            } else {
+                const parts = try a.alloc(generation.ContentPart, content.array.items.len);
+                for (parts, content.array.items) |*part, value| {
+                    if (std.mem.eql(u8, value.object.get("type").?.string, "input_text")) {
+                        part.* = .{ .text = value.object.get("text").?.string };
+                    } else {
+                        const url = value.object.get("image_url").?.string;
+                        const detail = if (value.object.get("detail")) |d| d.string else "auto";
+                        if (!openai_images and !std.mem.eql(u8, detail, "auto")) return error.UnsupportedInferenceFeature;
+                        if (std.mem.startsWith(u8, url, "data:")) {
+                            if (openai_images) {
+                                part.* = .{ .image_url = .{ .url = url, .detail = detail } };
+                            } else {
+                                const separator = std.mem.indexOf(u8, url, ";base64,") orelse return error.UnsupportedInferenceFeature;
+                                part.* = .{ .media = .{ .mime_type = url[5..separator], .data = url[separator + 8 ..] } };
+                            }
+                        } else {
+                            // Native/Google transports have no shared public-URL fetch contract.
+                            if (!openai_images) return error.UnsupportedInferenceFeature;
+                            part.* = .{ .image_url = .{ .url = url, .detail = detail } };
+                        }
+                    }
+                }
+                try messages.append(a, .{ .role = .user, .content = .{ .parts = parts } });
+            }
+        }
+    };
+    return messages.toOwnedSlice(a);
+}
+
 pub const TokenEvidence = struct {
     ptr: *const anyopaque,
     get_distribution: *const fn (*const anyopaque, Allocator, usize, []const []const u8, []const Json) anyerror![]f64,
@@ -200,8 +253,29 @@ pub fn batchSchema(a: Allocator, value_schema: Json, items: []const Item) !Json 
 /// Operational failures belong only to unanswered items; consumers apply their
 /// ordinary failure policy. Cancellation and allocation failures abort work.
 pub fn execute(a: Allocator, executor: Executor, mode: Output, value_schema: Json, instructions: []const u8, batch: Batch, inputs: []const []const u8) !Result {
+    const evidence = try a.alloc(Json, inputs.len);
+    defer a.free(evidence);
+    for (inputs, evidence) |input, *value| value.* = .{ .string = input };
+    return executeEvidence(a, executor, mode, value_schema, instructions, batch, evidence);
+}
+
+/// Preserve typed evidence through partitioning and selective repair. Providers
+/// render non-string evidence as native content parts, never as JSON text.
+pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_schema: Json, instructions: []const u8, batch: Batch, inputs: []const Json) !Result {
     try batch.validate();
     try validateSchema(value_schema);
+    const sizes = try a.alloc(usize, inputs.len);
+    defer a.free(sizes);
+    for (inputs, sizes) |input, *size| {
+        if (input == .string) {
+            size.* = input.string.len;
+        } else {
+            var buffer: [1024]u8 = undefined;
+            var counter = std.Io.Writer.Discarding.init(&buffer);
+            try std.json.Stringify.value(input, .{}, &counter.writer);
+            size.* = std.math.cast(usize, counter.fullCount()) orelse return error.ConstrainedInputTooLarge;
+        }
+    }
     if (mode == .auto or value_schema != .object) return error.InvalidConstrainedGenerationConfig;
     var validator = try schema_validator.CompiledSchema.init(a, value_schema);
     defer validator.deinit();
@@ -215,7 +289,7 @@ pub fn execute(a: Allocator, executor: Executor, mode: Output, value_schema: Jso
     @memset(result.token_evidence, null);
     var begin: usize = 0;
     while (begin < inputs.len) {
-        if (inputs[begin].len > batch.max_input_bytes) {
+        if (sizes[begin] > batch.max_input_bytes) {
             result.failures[begin] = error.ConstrainedInputTooLarge;
             result.execution.rejected_items += 1;
             begin += 1;
@@ -225,9 +299,9 @@ pub fn execute(a: Allocator, executor: Executor, mode: Output, value_schema: Jso
         var bytes: usize = 0;
         while (begin + pending.items.len < inputs.len and pending.items.len < batch.max_items_per_call) {
             const id = begin + pending.items.len;
-            if (inputs[id].len > batch.max_input_bytes) break;
-            if (inputs[id].len > batch.max_input_bytes - bytes) break;
-            bytes += inputs[id].len;
+            if (sizes[id] > batch.max_input_bytes) break;
+            if (sizes[id] > batch.max_input_bytes - bytes) break;
+            bytes += sizes[id];
             try pending.append(a, .{ .id = id, .input = inputs[id] });
         }
         const end = begin + pending.items.len;
@@ -436,13 +510,13 @@ pub fn hostedCapabilities(cfg: anytype) Capabilities {
     const name = if (std.mem.lastIndexOfScalar(u8, cfg.model, '/')) |slash| cfg.model[slash + 1 ..] else cfg.model;
     switch (cfg.provider) {
         .openai => {
-            if (std.mem.eql(u8, name, "gpt-4o-2024-05-13")) return .{ .tool_call = true, .token_logprobs = true };
+            if (std.mem.eql(u8, name, "gpt-4o-2024-05-13")) return .{ .tool_call = true, .images = true, .token_logprobs = true };
             for ([_][]const u8{ "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1", "o3", "o3-mini", "o4-mini" }) |model| {
-                if (std.mem.eql(u8, name, model) or datedSnapshot(name, model)) return .{ .tool_call = true, .json_schema = true, .token_logprobs = std.mem.startsWith(u8, model, "gpt-4") };
+                if (std.mem.eql(u8, name, model) or datedSnapshot(name, model)) return .{ .tool_call = true, .images = !std.mem.eql(u8, model, "o3-mini"), .json_schema = true, .token_logprobs = std.mem.startsWith(u8, model, "gpt-4") };
             }
         },
         .gemini, .vertex => {
-            for ([_][]const u8{ "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-pro-preview", "gemini-3-flash-preview" }) |model| if (std.mem.eql(u8, name, model)) return .{ .tool_call = true };
+            for ([_][]const u8{ "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-pro-preview", "gemini-3-flash-preview" }) |model| if (std.mem.eql(u8, name, model)) return .{ .tool_call = true, .images = true };
         },
         else => {},
     }
@@ -699,4 +773,27 @@ test "constrained admission bounds nested const and enum literals" {
         try raw.append(a, '}');
         try std.testing.expectError(error.InvalidConstrainedSchema, validateSchema(try parseReply(a, raw.items)));
     }
+}
+
+test "constrained evidence renderer preserves provider images without duplicating them in metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input = try std.json.parseFromSliceLeaky(Json, a,
+        \\[{"role":"user","content":[{"type":"input_text","text":"Inspect"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo=","detail":"high"}]}]
+    , .{});
+    const invocation = Invocation{ .mode = .json_schema, .schema = object(), .instructions = "Check", .items = &.{.{ .id = 7, .input = input }}, .validation_error = "Repair" };
+    const messages = try evidenceMessages(a, invocation, "System", true);
+    try std.testing.expectEqual(@as(usize, 4), messages.len);
+    try std.testing.expectEqualStrings("Evidence for item ID 7:", messages[2].content.?.text);
+    const parts = messages[3].content.?.parts;
+    try std.testing.expectEqualStrings("Inspect", parts[0].text);
+    try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgo=", parts[1].image_url.url);
+    try std.testing.expectEqualStrings("high", parts[1].image_url.detail.?);
+    try std.testing.expect(std.mem.indexOf(u8, messages[1].content.?.text, "iVBORw0KGgo=") == null);
+    try std.testing.expectError(error.UnsupportedInferenceFeature, evidenceMessages(a, invocation, "System", false));
+    _ = input.array.items[0].object.getPtr("content").?.array.items[1].object.swapRemove("detail");
+    const native = try evidenceMessages(a, invocation, "System", false);
+    try std.testing.expectEqualStrings("image/png", native[3].content.?.parts[1].media.mime_type);
+    try std.testing.expectEqualStrings("iVBORw0KGgo=", native[3].content.?.parts[1].media.data);
 }

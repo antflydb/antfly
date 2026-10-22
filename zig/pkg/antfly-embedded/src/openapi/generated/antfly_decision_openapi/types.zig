@@ -603,7 +603,7 @@ pub const DecisionChoiceProbability = struct {
     probability: f64,
 };
 
-/// Text or ordered user messages containing text and images. Named OpenAI and Jev deciders accept messages. Native trained, embedding, and generated deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
+/// Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
 pub const DecisionEvidence = std.json.Value;
 
 pub const DecisionEvidenceImage = struct {
@@ -683,7 +683,7 @@ pub const DecisionEvidenceText = struct {
 pub const DecisionInput = struct {
     id: ?[]const u8 = null,
     input: DecisionEvidence,
-    /// Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native and generated models require text.
+    /// Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native trained and embedding deciders require text. Generated deciders accept image evidence when the selected generator supports images and constrained output.
     context_index: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -1215,7 +1215,7 @@ pub const GeneratedDecideQuestion = union(enum) {
 pub const GeneratedDecideRequest = struct {
     decision_method: []const u8,
     generator: antfly_generating_openapi.GeneratorConfig,
-    input: ?[]const u8 = null,
+    input: ?DecisionEvidence = null,
     inputs: ?[]const DecisionInput = null,
     questions: []const GeneratedDecideQuestion,
     instructions: ?[]const u8 = null,
