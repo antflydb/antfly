@@ -74,6 +74,12 @@ pub const Store = struct {
         ptr: *anyopaque,
         read: *const fn (*anyopaque, Allocator, Ref) anyerror!Page,
     } = null,
+    /// Independently admitted query reads. Providers authenticate every page,
+    /// join all workers, and transfer no page ownership on failure.
+    read_many: ?struct {
+        ptr: *anyopaque,
+        read: *const fn (*anyopaque, Allocator, []const Ref, []Page) anyerror!void,
+    } = null,
     put: *const fn (*anyopaque, Ref, []const u8) anyerror!void,
     /// Persist the entire bounded batch before returning. On failure no root
     /// escapes the private sorted builder; scoped orphans remain collectible.
@@ -108,7 +114,7 @@ pub const Cache = struct {
     }
 
     pub fn store(self: *Cache) Store {
-        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .decoded_page = self.underlying.decoded_page, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .check = check, .reduce = self.underlying.reduce };
+        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .decoded_page = self.underlying.decoded_page, .read_many = self.underlying.read_many, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .check = check, .reduce = self.underlying.reduce };
     }
 
     fn check(ptr: *anyopaque) !void {
@@ -271,38 +277,125 @@ pub fn rankOf(alloc: Allocator, store: Store, root: Ref, key: []const u8) !u64 {
 
 /// Ordered multi-seek: read each reached ancestor/leaf once for the tile,
 /// preserving duplicates and caller order without walking intervening leaves.
-pub fn ranksOf(alloc: Allocator, store: Store, root: Ref, keys: []const []const u8, result: []u64) !void {
-    if (keys.len != result.len or keys.len > 256) return error.InvalidGraphPage;
-    var positions: [256]usize = undefined;
-    for (positions[0..keys.len], 0..) |*position, i| position.* = i;
-    std.mem.sort(usize, positions[0..keys.len], keys, struct {
-        fn compare(values: []const []const u8, left: usize, right: usize) bool {
-            return less(values[left], values[right]);
+pub const max_read_batch = 8;
+pub const max_lookup_batch = 512;
+pub const BatchEntry = struct {
+    key: []const u8,
+    value: []const u8,
+    rank: u64,
+    pub fn deinit(self: BatchEntry, a: Allocator) void {
+        a.free(self.key);
+        a.free(self.value);
+    }
+};
+/// Exact point reads share each routing page and fetch independent children in
+/// bounded waves. Results own their bytes and preserve duplicate/input order.
+pub fn lookupMany(a: Allocator, store: Store, root: ?Ref, keys: []const []const u8) ![]?BatchEntry {
+    return lookupBatch(a, store, root, keys, false);
+}
+/// Lower-bound reads use the same wave traversal. A missing leaf successor may
+/// cross a subtree boundary; only those gaps need an ordinary cursor fallback.
+pub fn seekMany(a: Allocator, store: Store, root: ?Ref, keys: []const []const u8) ![]?BatchEntry {
+    return lookupBatch(a, store, root, keys, true);
+}
+fn lookupBatch(a: Allocator, store: Store, root: ?Ref, keys: []const []const u8, lower: bool) ![]?BatchEntry {
+    if (keys.len > max_lookup_batch) return error.InvalidGraphPage;
+    const result = try a.alloc(?BatchEntry, keys.len);
+    @memset(result, null);
+    errdefer {
+        for (result) |entry| if (entry) |value| value.deinit(a);
+        a.free(result);
+    }
+    if (root) |ref| if (keys.len != 0) {
+        var positions: [max_lookup_batch]usize = undefined;
+        sortedPositions(keys, positions[0..keys.len]);
+        var page = try readPage(a, store, ref);
+        defer page.deinit(a);
+        try batchPage(a, store, page, keys, positions[0..keys.len], result, 0, lower, true);
+        if (lower) for (result, keys) |*entry, key| if (entry.* == null) {
+            var cursor = try Cursor.init(a, store, ref, key, null);
+            defer cursor.deinit();
+            if (try cursor.next()) |record| entry.* = try ownBatchEntry(a, record.key, record.value, try rankOf(a, store, ref, record.key), true);
+        };
+    };
+    return result;
+}
+fn sortedPositions(keys: []const []const u8, positions: []usize) void {
+    for (positions, 0..) |*position, i| position.* = i;
+    std.mem.sort(usize, positions, keys, struct {
+        fn compare(values: []const []const u8, l: usize, r: usize) bool {
+            return less(values[l], values[r]);
         }
     }.compare);
-    try rankTile(alloc, store, root, keys, positions[0..keys.len], result, 0);
 }
-fn rankTile(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8, positions: []const usize, result: []u64, base: u64) anyerror!void {
-    if (positions.len == 0) return;
-    var page = try readPage(alloc, store, ref);
-    defer page.deinit(alloc);
+fn ownBatchEntry(a: Allocator, key: []const u8, value: []const u8, rank: u64, copy: bool) !BatchEntry {
+    if (!copy) return .{ .key = "", .value = "", .rank = rank };
+    const owned = try a.dupe(u8, key);
+    errdefer a.free(owned);
+    return .{ .key = owned, .value = try a.dupe(u8, value), .rank = rank };
+}
+fn readPageWave(a: Allocator, store: Store, refs: []const Ref, pages: []Page) !void {
+    if (store.read_many) |batch| return batch.read(batch.ptr, a, refs, pages);
+    var initialized: usize = 0;
+    errdefer for (pages[0..initialized]) |*page| page.deinit(a);
+    for (refs, pages) |ref, *page| {
+        page.* = try readPage(a, store, ref);
+        initialized += 1;
+    }
+}
+fn batchPage(a: Allocator, store: Store, page: Page, keys: []const []const u8, positions: []const usize, result: []?BatchEntry, base: u64, lower: bool, copy: bool) anyerror!void {
+    try store.check(store.ptr);
+    if (page.ref.height == 0) {
+        var at: usize = 0;
+        for (positions) |position| {
+            while (at < page.entries.len and less(page.entries[at].key, keys[position])) at += 1;
+            if (at == page.entries.len or (!lower and !std.mem.eql(u8, page.entries[at].key, keys[position]))) continue;
+            const entry = page.entries[at];
+            result[position] = try ownBatchEntry(a, entry.key, entry.value, try std.math.add(u64, base, at), copy);
+        }
+        return;
+    }
+    const BatchChild = struct { entry: usize, begin: usize, end: usize, rank: u64 };
+    var children: [max_read_batch]BatchChild = undefined;
+    var refs: [max_read_batch]Ref = undefined;
     var next: usize = 0;
     var rank = base;
-    for (page.entries, 0..) |entry, i| {
-        const first = next;
-        while (next < positions.len and (i + 1 == page.entries.len or less(keys[positions[next]], page.entries[i + 1].key))) : (next += 1) {}
-        if (ref.height == 0) {
-            for (positions[first..next]) |position| {
-                if (!std.mem.eql(u8, keys[position], entry.key)) return error.InvalidGraphPage;
-                result[position] = rank;
+    var index: usize = 0;
+    while (index < page.entries.len) {
+        var count: usize = 0;
+        while (index < page.entries.len and count < children.len) : (index += 1) {
+            const first = next;
+            while (next < positions.len and (index + 1 == page.entries.len or less(keys[positions[next]], page.entries[index + 1].key))) next += 1;
+            const child = page.entries[index].child.?;
+            if (first != next) {
+                children[count] = .{ .entry = index, .begin = first, .end = next, .rank = rank };
+                refs[count] = child;
+                count += 1;
             }
-            rank = try std.math.add(u64, rank, 1);
-        } else {
-            try rankTile(alloc, store, entry.child.?, keys, positions[first..next], result, rank);
-            rank = try std.math.add(u64, rank, entry.child.?.records);
+            rank = try std.math.add(u64, rank, child.records);
+        }
+        if (count == 0) continue;
+        var pages: [max_read_batch]Page = undefined;
+        try readPageWave(a, store, refs[0..count], pages[0..count]);
+        defer for (pages[0..count]) |*owned| owned.deinit(a);
+        for (children[0..count], pages[0..count], refs[0..count]) |child, decoded, ref| {
+            if (!decoded.ref.eql(ref) or !std.mem.eql(u8, decoded.entries[0].key, page.entries[child.entry].key)) return error.InvalidGraphPage;
+            if (child.entry + 1 < page.entries.len and !less(decoded.entries[decoded.entries.len - 1].key, page.entries[child.entry + 1].key)) return error.InvalidGraphPage;
+            try batchPage(a, store, decoded, keys, positions[child.begin..child.end], result, child.rank, lower, copy);
         }
     }
     if (next != positions.len) return error.InvalidGraphPage;
+}
+pub fn ranksOf(a: Allocator, store: Store, root: Ref, keys: []const []const u8, ranks: []u64) !void {
+    if (keys.len != ranks.len or keys.len > 256) return error.InvalidGraphPage;
+    var positions: [256]usize = undefined;
+    var results: [256]?BatchEntry = @splat(null);
+    sortedPositions(keys, positions[0..keys.len]);
+    if (keys.len == 0) return;
+    var page = try readPage(a, store, root);
+    defer page.deinit(a);
+    try batchPage(a, store, page, keys, positions[0..keys.len], results[0..keys.len], 0, false, false);
+    for (results[0..keys.len], ranks) |entry, *rank| rank.* = (entry orelse return error.InvalidGraphPage).rank;
 }
 
 /// An independently owned authenticated page. Callers may retain its immutable
@@ -3095,4 +3188,50 @@ test "external lake range zipper prunes shared pages after boundary insertions s
     var visitor: Visitor = .{};
     try visitDifferences(a, backing.store(), original, repacked, &visitor);
     try std.testing.expectEqual(@as(usize, 0), visitor.count);
+}
+
+test "serverless graph batched seeks preserve duplicates gaps boundaries ranks and allocation ownership" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    var builder: SortedBuilder = .{ .alloc = a, .store = backing.store(), .target_bytes = 1024 };
+    defer builder.deinit();
+    for (0..1024) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, 2 * i + 2, .big);
+        try builder.add(&key, &key);
+    }
+    const root = (try builder.finish()).?;
+    const keys = [_][8]u8{ @splat(0), std.mem.toBytes(std.mem.nativeToBig(u64, 1025)), std.mem.toBytes(std.mem.nativeToBig(u64, 2048)), std.mem.toBytes(std.mem.nativeToBig(u64, 1024)), std.mem.toBytes(std.mem.nativeToBig(u64, 1024)), @splat(255) };
+    var pointers: [keys.len][]const u8 = undefined;
+    for (&keys, &pointers) |*key, *pointer| pointer.* = key;
+    for ([_]bool{ false, true }) |lower| {
+        const values = try lookupBatch(a, backing.store(), root, &pointers, lower);
+        defer {
+            for (values) |entry| if (entry) |value| value.deinit(a);
+            a.free(values);
+        }
+        for (values, pointers) |entry, key| {
+            var expected = try Cursor.init(a, backing.store(), root, key, null);
+            defer expected.deinit();
+            const record = try expected.next();
+            if (record != null and (lower or std.mem.eql(u8, record.?.key, key))) {
+                try std.testing.expectEqualSlices(u8, record.?.key, entry.?.key);
+                try std.testing.expectEqualSlices(u8, record.?.value, entry.?.value);
+                try std.testing.expectEqual(try rankOf(a, backing.store(), root, record.?.key), entry.?.rank);
+            } else try std.testing.expect(entry == null);
+        }
+    }
+    const Case = struct {
+        fn run(allocator: Allocator, store: Store, ref: Ref, input: []const []const u8) !void {
+            const values = try seekMany(allocator, store, ref, input);
+            defer {
+                for (values) |entry| if (entry) |value| value.deinit(allocator);
+                allocator.free(values);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{ backing.store(), root, &pointers });
+    backing.canceled = true;
+    try std.testing.expectError(error.Canceled, lookupMany(a, backing.store(), root, &pointers));
 }

@@ -51,7 +51,7 @@ pub const PageStore = struct {
     }
 
     pub fn store(self: *PageStore) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .ptr = self, .get = get, .put = put, .put_many = if (self.io != null) putMany else null, .check = check };
+        return .{ .domain = self.domain, .attempt = self.attempt, .ptr = self, .get = get, .read_many = if (self.io != null and self.read_phase == null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null) putMany else null, .check = check };
     }
 
     pub fn namespaceDomain(namespace: []const u8) [32]u8 {
@@ -146,6 +146,30 @@ pub const PageStore = struct {
         return self.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, id, 0, ref.bytes, self.cancellation);
     }
 
+    fn readMany(raw: *anyopaque, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.Page) !void {
+        const self: *PageStore = @ptrCast(@alignCast(raw));
+        if (refs_.len != output.len or refs_.len > tree.max_read_batch or self.read_phase != null) return error.InvalidGraphPage;
+        var bytes: u64 = 0;
+        for (refs_) |ref| {
+            try ref.validate();
+            bytes += ref.bytes;
+        }
+        try artifacts.chargeReadBudget(self.remaining_read_bytes, bytes);
+        // A wave reserves its total read budget before workers start. Each
+        // worker owns counters; a cached reader callback only borrows metadata.
+        var copies: [tree.max_read_batch]PageStore = undefined;
+        var budgets: [tree.max_read_batch]u64 = undefined;
+        var stores_: [tree.max_read_batch]tree.Store = undefined;
+        for (refs_, 0..) |ref, i| {
+            budgets[i] = ref.bytes;
+            copies[i] = self.*;
+            copies[i].io = null;
+            copies[i].remaining_read_bytes = &budgets[i];
+            stores_[i] = copies[i].store();
+        }
+        try readBatch(self.io.?, a, stores_[0..refs_.len], refs_, output);
+    }
+
     fn put(ptr: *anyopaque, ref: tree.Ref, bytes: []const u8) !void {
         const self: *PageStore = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, &ref.attempt, &self.attempt)) return error.GraphPageAttemptMismatch;
@@ -197,6 +221,52 @@ pub const PageStore = struct {
         }
     }
 };
+
+/// Query-owned authenticated reads. Allocator forwarding is locked only while
+/// workers run; all tasks join before output or an error escapes the caller.
+/// Each store capability must have independent counters or synchronized owners.
+pub fn readBatch(io: std.Io, a: std.mem.Allocator, sources: []const tree.Store, refs_: []const tree.Ref, output: []tree.Page) !void {
+    const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
+    if (sources.len != refs_.len or refs_.len != output.len or refs_.len > tree.max_read_batch) return error.InvalidGraphPage;
+    const Job = struct {
+        source: tree.Store,
+        a: std.mem.Allocator,
+        ref: tree.Ref,
+        result: ?tree.Page = null,
+        fn run(self: *@This()) anyerror!void {
+            self.result = try tree.readPage(self.a, self.source, self.ref);
+        }
+    };
+    var allocations: scheduler.LockedAllocator = .{ .backing = a };
+    var jobs: [tree.max_read_batch]Job = undefined;
+    for (sources, refs_, jobs[0..refs_.len]) |source, ref, *job| job.* = .{ .source = source, .a = allocations.allocator(), .ref = ref };
+    defer for (jobs[0..refs_.len]) |*job| if (job.result) |*page| page.deinit(a);
+    var tasks: [tree.max_read_batch]?scheduler.Task(anyerror!void) = @splat(null);
+    defer for (&tasks) |*task| if (task.*) |*held| {
+        held.cancel(io) catch {};
+    };
+    var failure: ?anyerror = null;
+    for (jobs[0..refs_.len], 0..) |*job, i| {
+        if (failure != null) break;
+        try job.ref.validate();
+        if (refs_.len > 1) tasks[i] = scheduler.global().submitIo(io, @as(usize, job.ref.bytes) * 2 + 32 * 1024, Job.run, .{job});
+        if (tasks[i] == null) job.run() catch |err| {
+            failure = err;
+        };
+    }
+    for (&tasks) |*task| if (task.*) |*held| {
+        held.await(io) catch |err| {
+            if (failure == null) failure = err;
+        };
+        task.* = null;
+    };
+    if (failure) |err| return err;
+    for (sources) |source| try source.check(source.ptr);
+    for (jobs[0..refs_.len], output) |*job, *page| {
+        page.* = job.result.?;
+        job.result = null;
+    }
+}
 
 /// Operation-private immutable runs. Each run has a fixed, small hash directory;
 /// its attempt token identifies the owner without an archive-sized page map.
@@ -1121,4 +1191,71 @@ test "serverless private graph pages keep large run probes independent of run le
     }
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
     try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "serverless graph query page waves overlap reads and drain failures cancellations and leases" {
+    const a = std.testing.allocator;
+    var backing: tree.testing.MemoryStore = .{ .alloc = a };
+    defer backing.deinit();
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = backing.store(), .target_bytes = 1024 };
+    defer builder.deinit();
+    for (0..512) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        try builder.add(&key, &key);
+    }
+    const root = (try builder.finish()).?;
+    var page = try tree.readPage(a, backing.store(), root);
+    defer page.deinit(a);
+    try std.testing.expect(page.entries.len >= 2);
+    const Measured = struct {
+        base: *tree.testing.MemoryStore,
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        canceled: std.atomic.Value(bool) = .init(false),
+        fail: bool = false,
+        cancel_on_read: bool = false,
+        mutex: std.atomic.Mutex = .unlocked,
+        fn get(raw: *anyopaque, allocator: std.mem.Allocator, ref: tree.Ref) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            _ = self.peak.fetchMax(active, .acq_rel);
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            try std.testing.io.sleep(.fromMilliseconds(3), .awake);
+            if (self.fail) return error.InjectedPageReadFailure;
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            const store = self.base.store();
+            const bytes = try store.get(store.ptr, allocator, ref);
+            if (self.cancel_on_read) self.canceled.store(true, .release);
+            return bytes;
+        }
+        fn check(raw: *anyopaque) !void {
+            if (@as(*@This(), @ptrCast(@alignCast(raw))).canceled.load(.acquire)) return error.Canceled;
+        }
+    };
+    var measured: Measured = .{ .base = &backing };
+    var store = backing.store();
+    store.ptr = &measured;
+    store.get = Measured.get;
+    store.check = Measured.check;
+    var refs_: [tree.max_read_batch]tree.Ref = undefined;
+    var sources: [tree.max_read_batch]tree.Store = undefined;
+    const count = @min(refs_.len, page.entries.len);
+    for (page.entries[0..count], refs_[0..count], sources[0..count]) |entry, *ref, *source| {
+        ref.* = entry.child.?;
+        source.* = store;
+    }
+    var output: [tree.max_read_batch]tree.Page = undefined;
+    try readBatch(std.testing.io, a, sources[0..count], refs_[0..count], output[0..count]);
+    for (output[0..count]) |*owned| owned.deinit(a);
+    try std.testing.expect(measured.peak.load(.acquire) > 1 and measured.peak.load(.acquire) <= count);
+    try std.testing.expectEqual(@as(usize, 0), measured.active.load(.acquire));
+    measured.fail = true;
+    try std.testing.expectError(error.InjectedPageReadFailure, readBatch(std.testing.io, a, sources[0..count], refs_[0..count], output[0..count]));
+    try std.testing.expectEqual(@as(usize, 0), measured.active.load(.acquire));
+    measured.fail = false;
+    measured.cancel_on_read = true;
+    try std.testing.expectError(error.Canceled, readBatch(std.testing.io, a, sources[0..count], refs_[0..count], output[0..count]));
+    try std.testing.expectEqual(@as(usize, 0), measured.active.load(.acquire));
 }

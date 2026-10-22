@@ -722,9 +722,10 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
         // Sort the bounded gather by block identity: one lease, decode and
         // read-budget charge per block, while preserving ranked output order.
         const index_refs = try owner.mapToIndex(scratch.allocator(), refs_);
-        for (index_refs, pending, 0..) |ref, *item, position| {
+        const entries = try owner.reader.entriesAtPhysical(scratch.allocator(), index_refs);
+        for (entries, pending, 0..) |found, *item, position| {
             try owner.read_context.ensureActive();
-            const entry = (try owner.reader.entryAtPhysical(scratch.allocator(), ref)) orelse return null;
+            const entry = found orelse return null;
             if (entry.cover == null) return null;
             item.* = .{ .entry = entry, .position = position };
         }
@@ -737,26 +738,68 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
         defer row_arena.deinit();
         var begin: usize = 0;
         while (begin < pending.len) {
-            const reference = pending[begin].entry.cover.?;
-            var end = begin + 1;
-            while (end < pending.len and std.mem.eql(u8, pending[end].entry.cover.?.block.artifact_id, reference.block.artifact_id)) : (end += 1) {
-                const same = pending[end].entry.cover.?.block;
-                if (same.byte_len != reference.block.byte_len or !std.mem.eql(u8, same.checksum, reference.block.checksum)) return error.InvalidNativeLakeRowIndex;
+            const Block = @import("lake_index_decoded_metadata.zig").Owned(local.sql_spill.ColumnarBlock);
+            const Job = struct {
+                cached: @import("lake_index_aggregate_artifact.zig").CachedRead,
+                store: @import("../serverless/artifacts/store.zig").ArtifactStore,
+                ref: @import("lake_index_aggregate_artifact.zig").ChunkRef,
+                token: @import("antfly_cancellation").CancellationToken,
+                block: ?Block = null,
+                fn run(self: *@This()) anyerror!void {
+                    self.block = try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(self.cached, self.store, self.ref, self.token);
+                }
+            };
+            var jobs: [4]Job = undefined;
+            var groups: [4]struct { begin: usize, end: usize } = undefined;
+            var count: usize = 0;
+            while (count < jobs.len and begin < pending.len) {
+                const reference = pending[begin].entry.cover.?;
+                var end = begin + 1;
+                while (end < pending.len and std.mem.eql(u8, pending[end].entry.cover.?.block.artifact_id, reference.block.artifact_id)) : (end += 1) {
+                    const same = pending[end].entry.cover.?.block;
+                    if (same.byte_len != reference.block.byte_len or !std.mem.eql(u8, same.checksum, reference.block.checksum)) return error.InvalidNativeLakeRowIndex;
+                }
+                try @import("../serverless/artifacts/store.zig").chargeReadBudget(&owner.reader.remaining_reads, reference.block.byte_len);
+                jobs[count] = .{ .cached = .{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context }, .store = owner.artifacts, .ref = reference.block, .token = owner.reader.pages.cancellation };
+                groups[count] = .{ .begin = begin, .end = end };
+                count += 1;
+                begin = end;
             }
-            const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context };
-            try @import("../serverless/artifacts/store.zig").chargeReadBudget(&owner.reader.remaining_reads, reference.block.byte_len);
-            const block = try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(cached, owner.artifacts, reference.block, owner.reader.pages.cancellation);
-            defer block.release();
-            for (pending[begin..end]) |item| {
-                try owner.read_context.ensureActive();
-                _ = row_arena.reset(.retain_capacity);
-                const row = item.entry.cover.?.row;
-                if (block.value.keys.len != 1 or row >= block.value.count()) return error.InvalidNativeLakeRowIndex;
-                const key = try block.value.keyCell(row, 0);
-                if (key.sql_null or key.value != .string or !std.mem.eql(u8, key.value.string, item.entry.key)) return error.InvalidNativeLakeRowIndex;
-                result[item.position] = try coveringSource(out, row_arena.allocator(), table, root, block.value.*, row, refs_[item.position], fields);
+            defer for (jobs[0..count]) |job| if (job.block) |block| block.release();
+            const scheduler = local.sql_parallel_scheduler;
+            var tasks: [4]?scheduler.Task(anyerror!void) = @splat(null);
+            defer if (pinned.read_context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
+                held.cancel(io) catch {};
+            };
+            var failure: ?anyerror = null;
+            for (jobs[0..count], 0..) |*job, i| {
+                if (failure != null) break;
+                if (pinned.read_context.io) |io| {
+                    if (count > 1) tasks[i] = scheduler.global().submitIo(io, 64 * 1024 * 1024, Job.run, .{job});
+                }
+                if (tasks[i] == null) job.run() catch |err| {
+                    failure = err;
+                };
             }
-            begin = end;
+            if (pinned.read_context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
+                held.await(io) catch |err| {
+                    if (failure == null) failure = err;
+                };
+                task.* = null;
+            };
+            if (failure) |err| return err;
+            for (jobs[0..count], groups[0..count]) |job, group| {
+                const block = job.block.?;
+                for (pending[group.begin..group.end]) |item| {
+                    try owner.read_context.ensureActive();
+                    _ = row_arena.reset(.retain_capacity);
+                    const row = item.entry.cover.?.row;
+                    if (block.value.keys.len != 1 or row >= block.value.count()) return error.InvalidNativeLakeRowIndex;
+                    const key = try block.value.keyCell(row, 0);
+                    if (key.sql_null or key.value != .string or !std.mem.eql(u8, key.value.string, item.entry.key)) return error.InvalidNativeLakeRowIndex;
+                    result[item.position] = try coveringSource(out, row_arena.allocator(), table, root, block.value.*, row, refs_[item.position], fields);
+                }
+            }
         }
         transferred = true;
         return result;

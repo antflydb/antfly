@@ -60,6 +60,31 @@ pub fn unique(a: A, recipes: []const Recipe) ![]Recipe {
     }
     return result.toOwnedSlice(a);
 }
+/// Stable row-value domain, independent of declaration names/configurations.
+/// A genuinely new input projection or schema still requires fresh evidence.
+pub fn valuesRecipe(a: A, schema_json: []const u8, columns: []const []const u8) ![32]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, ca, schema_json, .{});
+    if (schema == .object) _ = schema.object.swapRemove("relational_indexes");
+    const encoded = try std.json.Stringify.valueAlloc(ca, .{ .format = "native-lake-value-projection-v1", .schema = schema, .columns = columns }, .{});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(encoded, &digest, .{});
+    return digest;
+}
+pub fn sameCohorts(a: A, left: []const Recipe, right: []const Recipe) !bool {
+    var remaining: std.AutoHashMapUnmanaged([32]u8, bool) = .empty;
+    defer remaining.deinit(a);
+    for (left) |recipe| try remaining.put(a, recipe.digest, false);
+    for (right) |recipe| {
+        const entry = remaining.getPtr(recipe.digest) orelse return false;
+        entry.* = true;
+    }
+    var seen = remaining.valueIterator();
+    while (seen.next()) |value| if (!value.*) return false;
+    return true;
+}
 pub fn configurationReusable(config: std.json.Value) bool {
     if (config != .object) return false;
     if (@import("lake_enrichment_units.zig").configured(config, "embedder") != null) return false;

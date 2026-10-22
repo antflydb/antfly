@@ -81,7 +81,7 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     var incarnation: identity.logical.Digest = undefined;
     hash.final(&incarnation);
     const namespace: identity.logical.Namespace = .{ .incarnation = incarnation, .adapter = .stable_key, .recipe = tuple.fingerprint };
-    const recipe = local.metadata_lake_index_catalog.desiredFingerprint(table);
+    const definition = local.metadata_lake_index_catalog.desiredFingerprint(table);
     var metadata = std.heap.ArenaAllocator.init(a);
     defer metadata.deinit();
     const input_recipes = try @import("lake_row_input_recipes.zig").plan(a, metadata.allocator(), table, provider, base);
@@ -105,6 +105,7 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     }
     // Identity and index input evidence need no unrelated payload columns.
     const columns = column_storage[0..column_count];
+    const recipe = try @import("lake_row_input_recipes.zig").valuesRecipe(a, table.schema_json, columns);
     const inventory = provider.source.inventory;
     const files = try a.alloc([]const u8, inventory.files.len);
     defer a.free(files);
@@ -120,10 +121,10 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     const prior: ?identity.Root = compatible: {
         const old = previous orelse break :compatible null;
         const delta = provider.native_delta orelse break :compatible null;
-        if (old.current.input_recipes.len != input_recipes.len or old.current.file_slots == null or old.values_format != fingerprints.format or delta.prior_snapshot == null or delta.count() != inventory.files.len or delta.prior_count != old.current.liveFiles() or
+        if (old.definition == null or old.current.file_slots == null or old.values_format != fingerprints.format or delta.prior_snapshot == null or delta.count() != inventory.files.len or delta.prior_count != old.current.liveFiles() or
             !std.mem.eql(u8, &old.domain, &scope.domain) or !std.mem.eql(u8, &old.namespace, &namespace.digest()) or
             !std.mem.eql(u8, &old.values_recipe, &recipe) or !std.mem.eql(u8, old.current.source, inventory.source_id) or !std.mem.eql(u8, delta.prior_snapshot.?, old.current.snapshot)) break :compatible null;
-        for (old.current.input_recipes, input_recipes) |left, right| if (!std.mem.eql(u8, &left.digest, &right.digest)) break :compatible null;
+        if (!try @import("lake_row_input_recipes.zig").sameCohorts(a, old.current.input_recipes, input_recipes)) break :compatible null;
         break :compatible old;
     };
     const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, files, prior, if (prior != null) provider.native_delta else null, input_recipes, inventory.source_id, inventory.snapshot_id);
@@ -170,14 +171,23 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
         const next = source.next(a) catch |err| return phase.failed(err);
         try phase.finish();
         const batch = next orelse break;
-        if (capture_out.*) |capture| capture.add(batch, &by_file, store) catch |err| {
+        var bound = try tuple.bindExternalBatch(a, batch);
+        defer bound.deinit();
+        const ids = try a.alloc([32]u8, batch.rowCount());
+        defer a.free(ids);
+        for (ids, 0..) |*id, row| {
+            try token.check();
+            key.clearRetainingCapacity();
+            if (try bound.append(a, &key, row)) return error.NullLogicalRowKey;
+            id.* = try identity.logical.keyId(namespace, key.items);
+        }
+        if (capture_out.*) |capture| capture.add(batch, ids, store) catch |err| {
             if (!capture.optionalFailure(err)) return err;
             capture.deinit();
             capture_out.* = null;
             manager.max_bytes = provider.identity_spill_bytes;
         };
-        var bound = try tuple.bindExternalBatch(a, batch);
-        defer bound.deinit();
+
         const input_plans = try a.alloc(fingerprints.Plan, builder.cohorts.len + 1);
         var bound_inputs: usize = 0;
         defer {
@@ -206,16 +216,15 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
             try token.check();
             try provider.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
-            key.clearRetainingCapacity();
-            if (try bound.append(a, &key, row)) return error.NullLogicalRowKey;
             const ref = batch.rowRef(row);
             if (ref != .external) return error.InvalidLogicalRowIdentity;
             const slot = by_file.get(ref.external.file_id) orelse return error.InvalidLogicalRowIdentity;
-            try builder.addWithInputs(.{ .id = try identity.logical.keyId(namespace, key.items), .values = input_tiles[0][row % tile_rows] }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, row_inputs);
+            try builder.addWithInputs(.{ .id = ids[row], .values = input_tiles[0][row % tile_rows] }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, row_inputs);
         }
     }
     var root = try builder.finish(namespace.digest(), recipe, cut);
     root.values_format = fingerprints.format;
+    root.definition = definition;
     root.current.navigation = navigation;
     const encoded = try std.json.Stringify.valueAlloc(a, root, .{});
     defer a.free(encoded);

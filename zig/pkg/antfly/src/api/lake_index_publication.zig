@@ -293,7 +293,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
         };
         if (previous_identity) |identity| {
             const previous = current.value.published.?;
-            if (!std.mem.eql(u8, &identity.domain, &scope.domain) or !std.mem.eql(u8, &identity.cut, &previous.signature.source) or !std.mem.eql(u8, &identity.values_recipe, &previous.signature.desired) or !std.mem.eql(u8, &identity.artifacts, &try row_identity_api.declarationDigest(a, previous.declarations))) return error.InvalidLogicalRowIdentity;
+            if (!std.mem.eql(u8, &identity.domain, &scope.domain) or !std.mem.eql(u8, &identity.cut, &previous.signature.source) or !std.mem.eql(u8, &identity.definitionFingerprint(), &previous.signature.desired) or !std.mem.eql(u8, &identity.artifacts, &try row_identity_api.declarationDigest(a, previous.declarations))) return error.InvalidLogicalRowIdentity;
         }
     };
     // Physical per-file builders cannot treat a relocated source file as the
@@ -516,7 +516,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
                 }
                 provider.skip_indexes = names;
                 retained_declarations = retained;
-                relocated = retained.len == published.declarations.len;
+                relocated = retained.len == published.declarations.len and try completeNativeReuse(a, table.indexes_json, identity.current.input_recipes, retained);
             } else if (previous.reused.len == 0) {
                 const configurations = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{});
                 const captured_inputs = for (configurations.object.values()) |config| {
@@ -654,6 +654,21 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     var final_state = try catalog.parse(a, latest.lake_index_catalog_json);
     defer final_state.deinit();
     return catalog.encode(a, try final_state.value.publish(publication, completed));
+}
+
+/// Directory reuse covers the current desired declaration plan, not just the
+/// predecessor's surviving subset. Added/removed/renamed declarations assemble
+/// a fresh directory while unchanged artifacts remain individually reusable.
+fn completeNativeReuse(a: A, configs_json: []const u8, desired: []const @import("lake_row_input_recipes.zig").Recipe, retained: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact) !bool {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const configs = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), configs_json, .{});
+    if (!@import("lake_row_input_recipes.zig").nativeFragmentsEligible(configs) or desired.len != retained.len) return false;
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(a);
+    for (retained) |declaration| try names.put(a, declaration.name, {});
+    for (desired) |recipe| if (!names.contains(recipe.name)) return false;
+    return names.count() == desired.len;
 }
 
 /// Relocation cannot keep a root whose serving/build format has advanced.
@@ -1115,5 +1130,114 @@ test "external lake logical identity publishes native indexes once across reorde
             const aggregate_name = try @import("lake_index_names.zig").materialization(arena.allocator(), "stats", "rows");
             try std.testing.expectEqualStrings(if (step == 3) original_snapshot.? else root.current.snapshot, root.spaceForIndex(aggregate_name).snapshot);
         }
+    }
+}
+
+test "external lake definition refresh retains evidence and publishes added renamed removed indexes" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-definition-refresh");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{.{ .column_id = "id", .field_id = 1, .values = &.{ 1, 2, 3 } }}, &.{.{ .column_id = "body", .field_id = 2, .converted_type = 0, .values = &.{ "first value", "second value", "last" } }});
+    defer a.free(data);
+    var uploaded = try client.putObject("antfly", "part.parquet", data, .{});
+    uploaded.deinit(a);
+    const schema = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"id":{{"type":"integer"}},"body":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+    , .{directory.path()});
+    defer a.free(schema);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer binding.deinit(a);
+    const artifacts_path = try std.fs.path.join(a, &.{ directory.path(), "indexes" });
+    defer a.free(artifacts_path);
+    var artifacts_fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, artifacts_path);
+    defer artifacts_fs.deinit();
+    var store = artifacts_fs.artifactStore();
+    const configs = [_][]const u8{
+        \\{"text":{"type":"full_text","field":"body","store_source":false},"stats":{"type":"algebraic","materializations":[{"name":"rows","op":"count"}]}}
+        ,
+        \\{"text":{"type":"full_text","field":"body","store_source":false},"extra":{"type":"full_text","field":"body","store_source":false},"stats":{"type":"algebraic","materializations":[{"name":"rows","op":"count"}]}}
+        ,
+        \\{"text":{"type":"full_text","field":"body","store_source":false},"renamed":{"type":"full_text","field":"body","store_source":false},"stats":{"type":"algebraic","materializations":[{"name":"rows","op":"count"}]}}
+        ,
+        \\{"text":{"type":"full_text","field":"body","store_source":false},"stats":{"type":"algebraic","materializations":[{"name":"rows","op":"count"}]}}
+    };
+    const Fixed = struct {
+        now: u64 = 100,
+        fn read(raw: *const anyopaque) !u64 {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).now;
+        }
+    };
+    var time: Fixed = .{};
+    var bytes_: []u8 = &.{};
+    defer a.free(bytes_);
+    var table: records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = schema, .indexes_json = configs[0] };
+    var roots = std.heap.ArenaAllocator.init(a);
+    defer roots.deinit();
+    var prior: ?@import("lake_row_identity.zig").Root = null;
+    var original_text: ?[]u8 = null;
+    defer if (original_text) |id| a.free(id);
+    for (configs, 0..) |config, step| {
+        table.indexes_json = config;
+        time.now += 100;
+        var source = try serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+        defer source.deinit();
+        if (prior) |old| {
+            store.upload_scope = .{ .domain = old.domain, .attempt = @splat(7) };
+            var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
+            const navigation = @import("lake_source_navigation.zig");
+            const old_nav = try navigation.load(roots.allocator(), store, old.current.navigation.?, .none, null);
+            var next_nav = try navigation.build(a, roots.allocator(), &store, &provider, old_nav, .none);
+            defer next_nav.deinit();
+            provider.native_delta = next_nav.delta;
+            const Denied = struct {
+                fn get(_: *anyopaque, _: A, _: []const u8, _: []const u8, _: local.storage_object_storage.GetOptions) !local.storage_object_storage.GetResult {
+                    return error.UnexpectedDefinitionOnlyParquetRead;
+                }
+            };
+            var vtable = source.scanner.object_reader.client.vtable.*;
+            const original = source.scanner.object_reader.client.vtable;
+            vtable.get_object = Denied.get;
+            source.scanner.object_reader.client.vtable = &vtable;
+            defer source.scanner.object_reader.client.vtable = original;
+            var captured: ?*@import("lake_row_payloads.zig").Capture = null;
+            defer if (captured) |capture| capture.deinit();
+            const base = try binding.binding.toManifestBaseSource(source.inventory.snapshot_id, "inventory");
+            const rebound = (try @import("lake_row_identity_build.zig").build(a, roots.allocator(), table, &store, &provider, old.cut, base, next_nav.ref, old, .none, &captured)).?;
+            try std.testing.expect(captured == null);
+            try std.testing.expectEqual(old.current.by_id, rebound.current.by_id);
+            try std.testing.expectEqual(old.current.input_versions, rebound.current.input_versions);
+            try std.testing.expectEqualSlices(u8, &old.values_recipe, &rebound.values_recipe);
+            try std.testing.expectEqualSlices(u8, &catalog.desiredFingerprint(table), &rebound.definition.?);
+        }
+        const pending = try begin(a, std.testing.io, table, &source, @splat(4), .{}, time.now - 1, 100000);
+        defer a.free(pending);
+        var attempt = table;
+        attempt.lake_index_catalog_json = pending;
+        const complete = try build(a, &store, attempt, &source, @splat(4), .{ .io = std.testing.io }, .none, .{ .ptr = &time, .now_ms = Fixed.read });
+        a.free(bytes_);
+        bytes_ = complete;
+        table.lake_index_catalog_json = complete;
+        var state = try catalog.parse(a, complete);
+        defer state.deinit();
+        try @import("lake_index_directory.zig").hydrate(state.arena.allocator(), store, &state.value.published.?, .none, null);
+        const published = state.value.published.?;
+        try std.testing.expectEqual(@as(usize, if (step == 1 or step == 2) 3 else 2), published.declarations.len);
+        var found_extra = false;
+        var found_renamed = false;
+        for (published.declarations) |declaration| {
+            if (std.mem.eql(u8, declaration.name, "text")) {
+                if (original_text) |id| try std.testing.expectEqualStrings(id, declaration.artifact.artifact_id) else original_text = try a.dupe(u8, declaration.artifact.artifact_id);
+            }
+            found_extra = found_extra or std.mem.eql(u8, declaration.name, "extra");
+            found_renamed = found_renamed or std.mem.eql(u8, declaration.name, "renamed");
+        }
+        try std.testing.expectEqual(step == 1, found_extra);
+        try std.testing.expectEqual(step == 2, found_renamed);
+        prior = try @import("lake_row_identity.zig").load(roots.allocator(), store, published.row_identity.?, .none, null);
+        try @import("lake_row_identity_reader.zig").validate(roots.allocator(), prior.?, published, prior.?.domain, &source);
     }
 }

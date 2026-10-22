@@ -450,7 +450,18 @@ const ReadLane = struct {
         self.pages = .{ .domain = owner_.reader.root.domain, .artifacts = &owner_.artifacts, .cancellation = owner_.pages.cancellation, .remaining_read_bytes = &self.unused_reads, .remaining_write_bytes = &self.unused_writes, .read_cache = .{ .ptr = self, .read = readPage } };
         var storage = self.pages.store();
         storage.decoded_page = .{ .ptr = self, .read = decodedPage };
+        if (allowance == null and owner_.cached.context.io != null) storage.read_many = .{ .ptr = self, .read = readMany };
         self.cache = .{ .alloc = a, .underlying = storage, .max_bytes = 256 * 1024 };
+    }
+    fn readMany(raw: *anyopaque, a: A, refs: []const @import("../serverless/graph_segment/page_tree.zig").Ref, output: []@import("../serverless/graph_segment/page_tree.zig").Page) !void {
+        const self: *ReadLane = @ptrCast(@alignCast(raw));
+        if (self.allowance != null) return error.InvalidLogicalRowIdentity;
+        var source = self.pages.store();
+        source.decoded_page = .{ .ptr = self, .read = decodedPage };
+        var stores_: [@import("../serverless/graph_segment/page_tree.zig").max_read_batch]@import("../serverless/graph_segment/page_tree.zig").Store = undefined;
+        if (refs.len > stores_.len) return error.InvalidLogicalRowIdentity;
+        @memset(stores_[0..refs.len], source);
+        try @import("../serverless/graph_segment/page_store.zig").readBatch(self.owner.cached.context.io.?, a, stores_[0..refs.len], refs, output);
     }
     fn deinit(self: *ReadLane) void {
         self.cache.deinit();
@@ -532,7 +543,7 @@ const ReadLane = struct {
 
 pub fn validate(a: A, root: identity.Root, publication: local.metadata_lake_index_catalog.Publication, domain: identity.logical.Digest, source: *Source) !void {
     try root.validate(a);
-    if (!std.mem.eql(u8, &root.domain, &domain) or !std.mem.eql(u8, &root.cut, &publication.signature.source) or !std.mem.eql(u8, &root.values_recipe, &publication.signature.desired) or !std.mem.eql(u8, &root.artifacts, &try identity.declarationDigest(a, publication.declarations)) or !std.mem.eql(u8, root.current.source, source.inventory.source_id) or !std.mem.eql(u8, root.current.snapshot, source.inventory.snapshot_id) or root.current.liveFiles() != source.fileCount()) return error.InvalidLogicalRowIdentity;
+    if (!std.mem.eql(u8, &root.domain, &domain) or !std.mem.eql(u8, &root.cut, &publication.signature.source) or !std.mem.eql(u8, &root.definitionFingerprint(), &publication.signature.desired) or !std.mem.eql(u8, &root.artifacts, &try identity.declarationDigest(a, publication.declarations)) or !std.mem.eql(u8, root.current.source, source.inventory.source_id) or !std.mem.eql(u8, root.current.snapshot, source.inventory.snapshot_id) or root.current.liveFiles() != source.fileCount()) return error.InvalidLogicalRowIdentity;
     for (publication.declarations) |declaration| {
         const index = root.spaceForIndex(declaration.name);
         if (!std.mem.eql(u8, declaration.binding.source_id, index.source) or !std.mem.eql(u8, declaration.binding.snapshot_id, index.snapshot)) return error.InvalidLogicalRowIdentity;

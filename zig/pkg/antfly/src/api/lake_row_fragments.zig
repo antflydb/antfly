@@ -560,6 +560,8 @@ const Spool = struct {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const pa = arena.allocator();
+            const sizing = try @import("lake_row_payloads.zig").Sizer.bind(pa, batch);
+            defer sizing.deinit();
             const vectors = try @import("lake_row_payloads.zig").vectors(pa, batch, columns, self.specs, bound);
             bound = true;
             var begin: usize = 0;
@@ -587,7 +589,7 @@ const Spool = struct {
                 var captured: usize = 0;
                 while (captured < count) {
                     var take = @min(spill.JoinPayloads.page_rows, count - captured);
-                    while (take > 1 and try Gather.selectedBytes(batch, selected[captured..][0..take]) > 8 * 1024 * 1024) take = @max(1, take / 2);
+                    while (take > 1 and try sizing.selected(selected[captured..][0..take]) > 8 * 1024 * 1024) take = @max(1, take / 2);
                     var adapter: @import("lake_index_build_replay.zig").Replay.CaptureBatch = .{ .vectors = vectors };
                     const Reader = @import("lake_index_build_replay.zig").Replay.CaptureBatch;
                     const borrowed: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &adapter, .read = Reader.cell, .read_physical = Reader.physical, .read_identity = Reader.identity, .count = batch.rowCount(), .width = columns.len } };
@@ -599,7 +601,7 @@ const Spool = struct {
                         var value: [24]u8 = @splat(0);
                         std.mem.writeInt(u64, value[0..8], offset, .big);
                         std.mem.writeInt(u64, value[8..16], row, .big);
-                        std.mem.writeInt(u64, value[16..24], try Gather.selectedBytes(batch, &.{physical}), .big);
+                        std.mem.writeInt(u64, value[16..24], try sizing.selected(&.{physical}), .big);
                         const key = coordinate.encode();
                         try edits.addRecord(&key, &value);
                     }
@@ -611,7 +613,7 @@ const Spool = struct {
         self.route_root = try edits.finish(null);
         self.routes.phase = null;
     }
-    /// Only compact coordinate/offset records are sorted after verification.
+    /// Merge the verified ID stream with captured offsets; sort only final routes.
     /// Typed Parquet payloads stay in the original private capture pages.
     fn adopt(self: *Spool, capture: *@import("lake_row_payloads.zig").Capture, store: *stores.ArtifactStore) !void {
         if (!capture.complete or capture.rows != self.owner.root.current.rows) return error.InvalidLogicalRowIdentity;
@@ -623,40 +625,30 @@ const Spool = struct {
         self.captured = capture;
         for (self.owner.slots, 0..) |slot, ordinal| try self.positions.put(a, slot, ordinal);
         self.route_store = try @import("../serverless/graph_segment/page_store.zig").PrivatePages.beginRun(&self.routes);
-        var mappings = @import("lake_index_page_mutations.zig").Mutations.init(a, &self.manager, self.route_store);
-        defer mappings.deinit();
-        mappings.private_pages.phase = store.io_phase;
         var reads: u64 = 0;
         var writes: u64 = 0;
         var pages = self.owner.pageStore(&reads, &writes);
         pages.artifacts = store;
         pages.read_phase = store.io_phase;
-        var physical = try tree.Cursor.init(a, pages.store(), self.owner.root.current.by_id, "", null);
-        defer physical.deinit();
+        // Both streams are keyed by verified logical ID. No physical census,
+        // physical-to-logical sort, or source payload reread is needed.
         var logical = try tree.Cursor.init(a, pages.store(), self.owner.space.by_id, "", null);
         defer logical.deinit();
-        while (try physical.next()) |row| {
-            const native = (try logical.next()) orelse return error.InvalidLogicalRowIdentity;
-            if (row.key.len != 32 or row.value.len != 56 or native.value.len != 56 or !std.mem.eql(u8, row.key, native.key)) return error.InvalidLogicalRowIdentity;
-            const coordinate = try identity.logical.Coordinate.decode(native.value[0..16]);
-            const file = self.positions.get(coordinate.file) orelse return error.InvalidLogicalRowIdentity;
-            if (self.needed[file]) try mappings.addRecord(row.value[0..16], native.value[0..16]);
-        }
-        if ((try logical.next()) != null) return error.InvalidLogicalRowIdentity;
-        const mapping = try mappings.finish(null);
-        var by_physical = try tree.Cursor.init(a, self.route_store, mapping, "", null);
-        defer by_physical.deinit();
         var payload = try tree.Cursor.init(a, capture.route_store, capture.route_root, "", null);
         defer payload.deinit();
-        var current = try payload.next();
         var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &self.manager, self.route_store);
         defer edits.deinit();
         edits.private_pages.phase = store.io_phase;
-        while (try by_physical.next()) |row| {
-            while (current != null and std.mem.lessThan(u8, current.?.key, row.key)) current = try payload.next();
-            if (current == null or !std.mem.eql(u8, row.key, current.?.key) or current.?.value.len != 24) return error.InvalidLogicalRowIdentity;
-            try edits.addRecord(row.value, current.?.value);
+        var count: u64 = 0;
+        while (try logical.next()) |row| {
+            const captured = (try payload.next()) orelse return error.InvalidLogicalRowIdentity;
+            if (row.key.len != 32 or row.value.len != 56 or captured.value.len != 24 or !std.mem.eql(u8, row.key, captured.key)) return error.InvalidLogicalRowIdentity;
+            const coordinate = try identity.logical.Coordinate.decode(row.value[0..16]);
+            const file = self.positions.get(coordinate.file) orelse return error.InvalidLogicalRowIdentity;
+            if (self.needed[file]) try edits.addRecord(row.value[0..16], captured.value);
+            count += 1;
         }
+        if (count != capture.rows or (try payload.next()) != null) return error.InvalidLogicalRowIdentity;
         self.route_root = try edits.finish(null);
         self.routes.phase = null;
     }
@@ -1356,13 +1348,20 @@ fn broadSpoolScenario(fused: bool, selective: bool) !void {
     defer if (captured) |value| value.deinit();
     if (fused) {
         captured = (try @import("lake_row_payloads.zig").Capture.start(a, &provider, &store, &.{ "id", "body", "price" })).?;
-        var by_file: std.StringHashMapUnmanaged(u32) = .empty;
-        defer by_file.deinit(a);
-        try by_file.put(a, physical.inventory.files[0].file_id, 0);
         const opening = provider.provider();
         const source = try opening.open_with_cancellation_fn.?(opening.ptr, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .index_config_hash = "test", .column_bindings = &.{ "id", "body", "price" } }, .none);
         defer source.deinit(a);
-        while (try source.next(a)) |batch| try captured.?.add(batch, &by_file, &store);
+        while (try source.next(a)) |batch| {
+            const keys = try a.alloc([32]u8, batch.rowCount());
+            defer a.free(keys);
+            for (keys, 0..) |*id, row| {
+                const ordinal: usize = @intCast(256 - batch.rowRef(row).external.row_ordinal);
+                id.* = @splat(3);
+                id[0] = if (selective) @intCast((ordinal % 16) << 4) else 0;
+                std.mem.writeInt(u64, id[24..32], ordinal, .big);
+            }
+            try captured.?.add(batch, keys, &store);
+        }
         try captured.?.finish(root.current.rows);
     }
     try prepareCapturedSpool(native, &provider, &store, captured);

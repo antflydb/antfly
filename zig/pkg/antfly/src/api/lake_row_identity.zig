@@ -192,6 +192,8 @@ pub const Root = struct {
     domain: logical.Digest,
     namespace: logical.Digest,
     values_recipe: logical.Digest,
+    /// Definition signature is independent of the row-value projection recipe.
+    definition: ?logical.Digest = null,
     values_format: u16 = 1,
     /// Fresh provider-qualified source cut and exact reused index closure.
     cut: logical.Digest,
@@ -207,6 +209,10 @@ pub const Root = struct {
     index_bindings: []const IndexBinding = &.{},
     pub fn jsonStringify(self: Root, writer: anytype) !void {
         if (self.version == 2) {
+            if (self.definition) |definition| {
+                try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .definition = definition, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate, .coordinate_spaces = CompactSpaces{ .entries = self.reused }, .index_bindings = CompactBindings{ .entries = self.reused }, .native_space = self.native_space });
+                return;
+            }
             try writer.write(.{ .version = self.version, .domain = self.domain, .namespace = self.namespace, .values_recipe = self.values_recipe, .values_format = self.values_format, .cut = self.cut, .artifacts = self.artifacts, .current = self.current, .indexes = self.indexes, .certificate = self.certificate, .coordinate_spaces = CompactSpaces{ .entries = self.reused }, .index_bindings = CompactBindings{ .entries = self.reused }, .native_space = self.native_space });
             return;
         }
@@ -225,6 +231,7 @@ pub const Root = struct {
     }
     pub fn validate(self: Root, a: A) !void {
         if ((self.values_format != 1 and self.values_format != 2) or (self.version != 1 and self.version != metadata_version) or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.namespace, 0) or std.mem.allEqual(u8, &self.values_recipe, 0) or std.mem.allEqual(u8, &self.cut, 0)) return error.InvalidLogicalRowIdentity;
+        if (self.definition) |definition| if (self.version != 2 or std.mem.allEqual(u8, &definition, 0)) return error.InvalidLogicalRowIdentity;
         try self.current.validate();
         if ((self.reused.len != 0 and self.values_format != 2) or self.reused.len > local.metadata_lake_index_catalog.max_directory_artifacts) return error.InvalidLogicalRowIdentity;
         if (self.indexes) |index| try self.validateIndexSpace(index);
@@ -249,6 +256,9 @@ pub const Root = struct {
     fn validateIndexSpace(self: Root, space: Space) !void {
         try space.validate();
         if (space.rows != self.current.rows or !std.mem.eql(u8, space.source, self.current.source)) return error.InvalidLogicalRowIdentity;
+    }
+    pub fn definitionFingerprint(self: Root) logical.Digest {
+        return self.definition orelse self.values_recipe;
     }
     pub fn hasRelocation(self: Root) bool {
         return self.indexes != null or self.reused.len != 0 or self.native_space != null;
@@ -543,7 +553,7 @@ pub fn proveReuse(a: A, pages: *pages_api.PageStore, previous: Root, next: *Root
     try previous.validate(a);
     if (std.mem.allEqual(u8, &previous.artifacts, 0)) return error.InvalidLogicalRowIdentity;
     try next.validate(a);
-    if (previous.values_format != next.values_format or !std.mem.eql(u8, &previous.domain, &next.domain) or !std.mem.eql(u8, &previous.namespace, &next.namespace) or !std.mem.eql(u8, &previous.values_recipe, &next.values_recipe) or previous.current.rows != next.current.rows or !std.mem.eql(u8, previous.current.source, next.current.source)) return false;
+    if (previous.values_format != next.values_format or !std.mem.eql(u8, &previous.definitionFingerprint(), &next.definitionFingerprint()) or !std.mem.eql(u8, &previous.domain, &next.domain) or !std.mem.eql(u8, &previous.namespace, &next.namespace) or !std.mem.eql(u8, &previous.values_recipe, &next.values_recipe) or previous.current.rows != next.current.rows or !std.mem.eql(u8, previous.current.source, next.current.source)) return false;
     var old = tree.Cursor.init(a, pages.store(), previous.current.by_id, "", null) catch |err| return derivedReadFailure(err);
     defer old.deinit();
     var current = tree.Cursor.init(a, pages.store(), next.current.by_id, "", null) catch |err| return derivedReadFailure(err);
@@ -759,31 +769,24 @@ pub const Reader = struct {
         return result;
     }
     fn lookupMany(self: *Reader, a: A, root: ?tree.Ref, keys: []const []const u8, width: usize) ![][]const u8 {
-        const positions = try a.alloc(usize, keys.len);
-        for (positions, 0..) |*position, i| position.* = i;
-        std.mem.sort(usize, positions, keys, struct {
-            fn less(values: []const []const u8, left: usize, right: usize) bool {
-                return std.mem.order(u8, values[left], values[right]) == .lt;
-            }
-        }.less);
         const result = try a.alloc([]const u8, keys.len);
-        if (keys.len == 0) return result;
-        var cursor = tree.Cursor.init(a, self.storage(), root, keys[positions[0]], null) catch |err| return derivedReadFailure(err);
-        defer cursor.deinit();
-        var previous: ?usize = null;
-        for (positions) |position| {
-            if (previous) |prior| if (std.mem.eql(u8, keys[position], keys[prior])) {
-                result[position] = result[prior];
-                continue;
-            };
-            cursor.seekForward(keys[position]) catch |err| return derivedReadFailure(err);
-            const record = (cursor.next() catch |err| return derivedReadFailure(err)) orelse return error.InvalidLogicalRowIdentity;
-            if (!std.mem.eql(u8, record.key, keys[position]) or record.value.len != width) return error.InvalidLogicalRowIdentity;
-            result[position] = try a.dupe(u8, record.value);
-            previous = position;
+        errdefer a.free(result);
+        const found = tree.lookupMany(a, self.storage(), root, keys) catch |err| return derivedReadFailure(err);
+        defer {
+            for (found) |entry| if (entry) |value| value.deinit(a);
+            a.free(found);
+        }
+        var initialized: usize = 0;
+        errdefer for (result[0..initialized]) |value| a.free(value);
+        for (found, result) |entry, *value| {
+            const record = entry orelse return error.InvalidLogicalRowIdentity;
+            if (record.value.len != width) return error.InvalidLogicalRowIdentity;
+            value.* = try a.dupe(u8, record.value);
+            initialized += 1;
         }
         return result;
     }
+
     pub fn publicReference(self: *Reader, a: A, id: []const u8) !?local.storage_rowsource_types.RowRef {
         const parsed = try logical.parsePublic(id);
         if (!std.mem.eql(u8, &parsed.namespace, &self.root.namespace)) return error.ExternalLakeSnapshotMismatch;

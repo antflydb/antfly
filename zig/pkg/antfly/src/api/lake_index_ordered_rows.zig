@@ -888,7 +888,10 @@ pub const Reader = struct {
         if (!std.mem.eql(u8, &root.fingerprint, &fingerprint)) return error.ExternalLakeIndexUnavailable;
         self.* = .{ .root = root, .pages = undefined, .cached = cached };
         self.pages = .{ .domain = root.domain, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.remaining_reads, .remaining_write_bytes = &self.remaining_writes };
-        if (cached != null) self.pages.read_cache = .{ .ptr = self, .read = readPage };
+        if (cached) |shared| {
+            self.pages.read_cache = .{ .ptr = self, .read = readPage };
+            self.pages.io = shared.context.io;
+        }
         self.cursor = try tree.Cursor.init(a, self.pages.store(), root.page, lower, upper);
     }
     /// Enclosed immutable subtrees carry exact counts without leaf reads.
@@ -1099,6 +1102,54 @@ pub const Reader = struct {
         if (!std.mem.eql(u8, record.key, key)) return error.InvalidNativeLakeRowIndex;
         _ = try self.decode(a, record);
         return .{ .key = key, .ref = ref, .cover = try coverReference(a, self.root.domain, record.value) };
+    }
+    /// Batch reverse/forward seeks over one immutable publication. Routing
+    /// pages are shared and independent page reads use the query I/O scheduler.
+    pub fn entriesAtPhysical(self: *Reader, a: A, refs: []const rows.RowRef) ![]?Entry {
+        if (refs.len > tree.max_lookup_batch) return error.InvalidNativeLakeRowIndex;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const coordinates = try sa.alloc([16]u8, refs.len);
+        const keys = try sa.alloc([]const u8, refs.len);
+        for (refs, coordinates, keys) |ref, *physical, *key| {
+            if (ref != .external) return error.InvalidNativeLakeRowIndex;
+            const row = ref.external;
+            if (!std.mem.eql(u8, row.source_id, self.root.source) or !std.mem.eql(u8, row.snapshot_id, self.root.snapshot) or row.identity_version != self.identityVersion()) return error.ExternalLakeSnapshotMismatch;
+            physical.* = coordinate(try self.fileSlot(sa, row.file_id), row);
+            key.* = physical;
+        }
+        const result = try a.alloc(?Entry, refs.len);
+        @memset(result, null);
+        errdefer {
+            for (result) |entry| if (entry) |value| {
+                a.free(value.key);
+                if (value.cover) |cover| {
+                    a.free(cover.block.artifact_id);
+                    a.free(cover.block.checksum);
+                }
+            };
+            a.free(result);
+        }
+        if (self.root.reverse == null) return result;
+        const reverse = try tree.seekMany(sa, self.pages.store(), self.root.reverse, keys);
+        var selected: std.ArrayList(usize) = .empty;
+        var forward_keys: std.ArrayList([]const u8) = .empty;
+        for (reverse, coordinates, 0..) |entry, physical, i| if (entry) |record| {
+            if (!std.mem.startsWith(u8, record.key, &physical)) continue;
+            if (record.key.len < 32 or !std.mem.endsWith(u8, record.key, &physical)) return error.InvalidNativeLakeRowIndex;
+            try selected.append(sa, i);
+            try forward_keys.append(sa, record.key[16..]);
+        };
+        const forward = try tree.lookupMany(sa, self.pages.store(), self.root.page, forward_keys.items);
+        for (forward, selected.items) |entry, i| {
+            const record = entry orelse return error.InvalidNativeLakeRowIndex;
+            _ = try self.decode(sa, .{ .key = record.key, .value = record.value });
+            const key = try a.dupe(u8, record.key);
+            errdefer a.free(key);
+            result[i] = .{ .key = key, .ref = refs[i], .cover = try coverReference(a, self.root.domain, record.value) };
+        }
+        return result;
     }
     pub fn nextEntries(self: *Reader, a: A, max_rows: usize) ![]const Entry {
         if (max_rows == 0 or max_rows > 65536) return error.InvalidNativeLakeRowIndex;
@@ -1676,6 +1727,13 @@ test "external lake ordered reuse streams beyond a page budget with bounded cove
     var missing = entries[0].ref;
     missing.external.row_ordinal = count + 1;
     try std.testing.expect(try reader.entryAtPhysical(ca, missing) == null);
+    // Exercise the real PageStore wave adapter over independent filesystem reads.
+    reader.pages.io = std.testing.io;
+    const gathered = try reader.entriesAtPhysical(ca, &.{ entries[count - 1].ref, entries[0].ref, missing, entries[0].ref });
+    try std.testing.expectEqualStrings(entries[count - 1].key, gathered[0].?.key);
+    try std.testing.expectEqualStrings(entries[0].cover.?.block.artifact_id, gathered[1].?.cover.?.block.artifact_id);
+    try std.testing.expect(gathered[2] == null);
+    try std.testing.expectEqualStrings(gathered[1].?.key, gathered[3].?.key);
     var foreign = entries[0].ref;
     foreign.external.snapshot_id = "foreign";
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, reader.entryAtPhysical(ca, foreign));

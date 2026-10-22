@@ -14,7 +14,7 @@
 // limitations.
 
 //! Private typed payload capture during stable-key verification. Payloads have
-//! physical coordinates until the complete verified logical maps exist.
+//! IDs until complete key/value verification authorizes their adoption.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const rows = local.storage_rowsource_types;
@@ -48,10 +48,53 @@ pub fn vectors(a: A, batch: rows.ColumnBatch, columns: []const []const u8, specs
     }
     return result;
 }
+/// Validate a producer batch once and size each typed row in one column pass.
+/// Selections thereafter inspect only their own bounded positions.
+pub const Sizer = struct {
+    a: A,
+    base: usize = 0,
+    sizes: []usize,
+    pub fn bind(a: A, batch: rows.ColumnBatch) !Sizer {
+        try batch.validate();
+        const sizes = try a.alloc(usize, batch.rowCount());
+        errdefer a.free(sizes);
+        @memset(sizes, 0);
+        var base: usize = 0;
+        for (batch.columns) |column| {
+            base +|= column.name.len +| @sizeOf(rows.ColumnVector);
+            for (sizes, 0..) |*size, row| {
+                size.* +|= 1 + @sizeOf(rows.RowRef);
+                if (column.nulls.isNull(row)) continue;
+                size.* +|= switch (column.values) {
+                    .bytes, .json => |v| v[row].len +| @sizeOf([]const u8),
+                    .dictionary_bytes => |v| v.at(row).len +| @sizeOf([]const u8),
+                    .decimal128 => @sizeOf(i128),
+                    .i64, .f64, .dictionary_i64, .dictionary_f64 => 8,
+                    .bool => 1,
+                    .vector_f32 => |v| v[row].len *| @sizeOf(f32) +| @sizeOf([]const f32),
+                    .encoded => return error.UnsupportedExternalLakeIndex,
+                };
+            }
+        }
+        return .{ .a = a, .base = base, .sizes = sizes };
+    }
+    pub fn deinit(self: Sizer) void {
+        self.a.free(self.sizes);
+    }
+    pub fn selected(self: Sizer, selection: []const usize) !usize {
+        var bytes = self.base;
+        for (selection) |row| {
+            if (row >= self.sizes.len) return error.InvalidSqlBackendResponse;
+            bytes +|= self.sizes[row];
+        }
+        return bytes;
+    }
+};
 pub fn selectedBytes(batch: rows.ColumnBatch, selection: []const usize) !usize {
+    // One-shot callers size a page; repeated row/tile callers retain a Sizer.
+    var bytes: usize = 0;
     try batch.validate();
     for (selection) |row| if (row >= batch.rowCount()) return error.InvalidSqlBackendResponse;
-    var bytes: usize = 0;
     for (batch.columns) |column| {
         bytes +|= column.name.len +| @sizeOf(rows.ColumnVector);
         for (selection) |row| {
@@ -143,12 +186,15 @@ pub const Capture = struct {
     pub fn optionalFailure(self: *Capture, err: anyerror) bool {
         return err == error.SqlProgramLimitExceeded or err == error.UnsupportedExternalLakeIndex or (err == error.OutOfMemory and self.budget.isLocallyExhausted());
     }
-    pub fn add(self: *Capture, batch: rows.ColumnBatch, slots: *const std.StringHashMapUnmanaged(u32), store: *stores.ArtifactStore) !void {
+    pub fn add(self: *Capture, batch: rows.ColumnBatch, ids: []const [32]u8, store: *stores.ArtifactStore) !void {
         try check(self);
         const a = self.budget.allocator();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const ca = arena.allocator();
+        if (ids.len != batch.rowCount()) return error.InvalidLogicalRowIdentity;
+        const sizing = try Sizer.bind(ca, batch);
+        defer sizing.deinit();
         const bound_vectors = try vectors(ca, batch, self.columns, self.specs, self.bound);
         self.bound = true;
         var adapter: @import("lake_index_build_replay.zig").Replay.CaptureBatch = .{ .vectors = bound_vectors };
@@ -159,21 +205,17 @@ pub const Capture = struct {
             var selection: [spill.JoinPayloads.page_rows]usize = undefined;
             var take = @min(selection.len, batch.rowCount() - begin);
             for (&selection, begin..) |*row, i| row.* = i;
-            while (take > 1 and try selectedBytes(batch, selection[0..take]) > 8 * 1024 * 1024) take = @max(1, take / 2);
+            while (take > 1 and try sizing.selected(selection[0..take]) > 8 * 1024 * 1024) take = @max(1, take / 2);
             var phase = try store.beginIo(1);
             defer phase.abort();
             const offset = self.payloads.appendBatch(try borrowed.select(ca, selection[0..take])) catch |err| return phase.failed(err);
             try phase.finish();
             for (selection[0..take], 0..) |row, ordinal| {
-                const ref = batch.rowRef(row);
-                if (ref != .external) return error.InvalidLogicalRowIdentity;
-                const coordinate: @import("lake_row_identity.zig").logical.Coordinate = .{ .file = slots.get(ref.external.file_id) orelse return error.InvalidLogicalRowIdentity, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal };
                 var value: [24]u8 = undefined;
                 std.mem.writeInt(u64, value[0..8], offset, .big);
                 std.mem.writeInt(u64, value[8..16], ordinal, .big);
-                std.mem.writeInt(u64, value[16..24], try selectedBytes(batch, &.{row}), .big);
-                const key = coordinate.encode();
-                try self.edits.?.addRecord(&key, &value);
+                std.mem.writeInt(u64, value[16..24], try sizing.selected(&.{row}), .big);
+                try self.edits.?.addRecord(&ids[row], &value);
                 self.rows += 1;
             }
             begin += take;
@@ -188,3 +230,19 @@ pub const Capture = struct {
         self.complete = true;
     }
 };
+
+test "external lake payload sizing validates dictionary once and retains linear row costs" {
+    const a = std.testing.allocator;
+    var indices: [4096]u32 = @splat(0);
+    const batch: rows.ColumnBatch = .{ .snapshot = .{ .table_id = "s", .snapshot_id = "cut" }, .external_span = .{ .first = .{ .source_id = "s", .snapshot_id = "cut", .file_id = "part", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = indices.len }, .columns = &.{.{ .name = "body", .values = .{ .dictionary_bytes = .{ .values = &.{"value"}, .indices = &indices } } }} };
+    const sizing = try Sizer.bind(a, batch);
+    defer sizing.deinit();
+    for ([_][]const usize{ &.{0}, &.{ 4095, 7, 7, 1024 }, &.{} }) |selection| try std.testing.expectEqual(try selectedBytes(batch, selection), try sizing.selected(selection));
+    try std.testing.expectError(error.InvalidSqlBackendResponse, sizing.selected(&.{4096}));
+    // The retained costs no longer borrow producer validity or dictionary IDs.
+    // A whole-batch revalidation here would observe this unrelated bad index.
+    indices[4095] = 99;
+    const first = try sizing.selected(&.{0});
+    for (0..4096) |row| try std.testing.expectEqual(first, try sizing.selected(&.{row}));
+    try std.testing.expectError(error.RowSourceDictionaryIndexOutOfBounds, Sizer.bind(a, batch));
+}

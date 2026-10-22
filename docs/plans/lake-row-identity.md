@@ -126,6 +126,15 @@ once per 64-row tile. Changing one declaration still requires its own matching
 configuration proof, without invalidating unrelated declaration evidence.
 Legacy per-declaration evidence remains readable and is rebuilt on migration.
 
+The authenticated root separately binds the publication's `definition` signature
+and its `values_recipe` (schema plus projected input paths). Reader protocol 72
+fences this contract; older roots retain their historical definition binding.
+Changing declaration names, adding another index on an existing cohort, or
+changing a configuration without changing inputs retains the existing row maps
+and cohort evidence. A new input projection still needs source verification.
+Complete directory reuse requires the current desired declaration set, including
+new names; retaining every predecessor declaration alone is insufficient.
+
 Identity state uses bounded native spill sorts and immutable copy-on-write trees.
 Stable file slots and per-file membership let an authenticated file delta retain
 unchanged rows without sorting or rebuilding the entire identity map. A separate
@@ -143,11 +152,15 @@ propagate. These limits are separate from SQL query limits.
 
 Full verification of at least 128 rows can also capture the projected typed
 payloads in private compressed spill pages during that same source pass. Once
-keys, duplicates and root admission are verified, construction sorts only compact
-physical-to-logical coordinate and payload-offset records. Broad native rebuilds
+keys, duplicates and root admission are verified, construction merges the captured
+logical-ID/offset stream directly with the native ID census and sorts only final
+fragment coordinate/offset routes. It does not build a physical-to-logical
+intermediate tree or reread the physical ID census. Broad native rebuilds
 reuse those pages instead of reading and decoding Parquet again. Decimal payloads
 keep exact 128-bit coefficients and scale; compatible precisions widen to their
-maximum. Mixed types/scales decline the optional spool. Partial file verification
+maximum. Mixed types/scales decline the optional spool. Each producer batch is
+validated and sized once; bounded selections reuse immutable row costs instead
+of revalidating every dictionary for every captured row. Partial file verification
 continues to use selective gathers or a separate broad spool, since its capture
 would not cover unchanged files. The optional capture has a separate 64 MiB
 retained admission, uses at most half the configured spill quota during verification,
@@ -330,7 +343,17 @@ and physical sides; additions take priority over deleted addresses during swaps.
 They retain unchanged COW pages rather than re-sorting all rows after membership
 changes. Canonical tie ranks come from current physical membership. Competitive
 text hits resolve ranks in batches of 64; each operation owns its cache and shares
-map/tree paths without holding a mutex across remote I/O.
+map/tree paths without holding a mutex across remote I/O. Exact multi-seeks,
+lower-bound covering seeks, and batched ranks partition requests by authenticated
+child fences. Independent children load in waves of at most eight through shared
+query I/O admission. Each wave joins on success, failure, or cancellation; budget
+owners synchronize shared charges or reserve the whole wave before spawning.
+Decoded row-map leases remain shareable across concurrent readers. Covering
+hydration also batches reverse/forward lookups and reads up to four distinct
+payload blocks concurrently, while preserving ranked result order and performing
+all block/key checks before exposing a row. Required inline fallbacks remain
+available when scheduling admission is full. No publication CPU/I/O capability
+is inherited by these independent query workers.
 
 Selective dense constraints also cross the native owner boundary as complete
 include/exclude vector-ID sets (at most 4,096 IDs in a 4 MiB planning workspace).
@@ -383,14 +406,17 @@ paging, vectors, aggregates, covering fields, highlights and public IDs against 
 rebuild oracle. Check restart, old-reader leases, publication failure, mapping
 composition, reader-safe GC and bounded memory/spill with allocation failures.
 
-Qualification on the final implementation with main `10899c8e9b`: both real
-Parquet/Iceberg E2Es passed in 350.10 seconds, including append/removal and three
-restarts per format. Twelve targeted lake tests passed without leaks, including
-aggregate root retirement, census compatibility, key-namespace migration,
-wide Parquet gathers and sparse numerical stability. The shared ranking/filter
-suite passed 43 tests (one benchmark skipped), and the native dense callback
-regression passed. Archive-scale throughput and live-cloud retention remain
-unmeasured.
+Qualification with main `ddba6584b3`: all three real Parquet/Iceberg and mixed
+precision decimal E2Es passed in 345.91 seconds, including append/removal,
+filtered text/vector/sparse queries, forward/backward paging, highlights and
+three restarts per rewrite format. Sixteen focused lake tests and all 84 graph
+page tests passed without leaks. Definition-refresh regressions block Parquet
+reads during evidence rebinding and check index addition, rename, removal and
+unchanged artifact retention. Batch-read regressions cover actual filesystem
+page waves, duplicate/missing candidates, lower-bound gaps, ranks, cancellation,
+joined read failures and exhaustive allocation-failure cleanup. Catalog,
+error/source-catalog, Apache boundary, license and formatting checks passed.
+Archive-scale throughput and live-cloud retention remain unmeasured.
 
 ## Prior art
 
