@@ -65,6 +65,7 @@ const Methods = struct {
     maintenance_stats: *const fn (*anyopaque) anyerror!?Scheduler.Stats,
     ensure_maintenance: *const fn (*anyopaque) anyerror!Scheduler.Stats,
     stop_maintenance: *const fn (*anyopaque) anyerror!void,
+    cancel_registration: *const fn (*anyopaque, *anyopaque) anyerror!void,
     stop_registration: *const fn (*anyopaque, *anyopaque) anyerror!void,
     registration_ready: *const fn (*anyopaque, *anyopaque) anyerror!bool,
     owner: *const fn (*anyopaque) anyerror!u64,
@@ -86,10 +87,11 @@ const methods_contract = blk: {
 };
 
 pub const Offer = extern struct {
+    // V4 separates active cancellation requests from graceful registration stop.
     // V3 adds the finite-step recovery Job class and reserves its workers in
     // the aggregate lane budget. Older producers cannot provide this contract.
     // V2 introduced whole-graph Raft outbound admission.
-    pub const abi_version = 3;
+    pub const abi_version = 4;
     version: u32 = abi_version,
     struct_size: u32 = @sizeOf(Offer),
     context: ?*anyopaque,
@@ -243,6 +245,11 @@ const ClientState = struct {
         out.* = self.offer.call("registration_ready", .{ self.scope, self.handle }) catch |cause| return runtime_abi.error_abi.statusFromError(cause);
         return .ok;
     }
+    fn cancelRegistration(raw: *anyopaque) callconv(.c) runtime_abi.error_abi.Status {
+        const self: *ClientState = @ptrCast(@alignCast(raw));
+        self.offer.call("cancel_registration", .{ self.scope, self.handle }) catch |cause| return runtime_abi.error_abi.statusFromError(cause);
+        return .ok;
+    }
     fn stopRegistration(raw: *anyopaque) void {
         const self: *ClientState = @ptrCast(@alignCast(raw));
         self.offer.call("stop_registration", .{ self.scope, self.handle }) catch @panic("execution services registration stop contract");
@@ -283,7 +290,7 @@ pub const Lease = struct {
     pub fn intoMaintenanceHandle(self: *Lease) Scheduler.RemoteHandle {
         const state = self.resource.?.client_state;
         self.resource = null;
-        return .{ .context = state, .finish_fn = ClientState.finishRegistration, .stop_fn = ClientState.stopRegistration, .ready_fn = ClientState.readyRegistration };
+        return .{ .context = state, .finish_fn = ClientState.finishRegistration, .stop_fn = ClientState.stopRegistration, .cancel_fn = ClientState.cancelRegistration, .ready_fn = ClientState.readyRegistration };
     }
     pub fn capacity(self: *const Lease) usize {
         return self.resource.?.capacity;
@@ -655,6 +662,22 @@ const Scope = struct {
         };
         return error.InvalidArgument;
     }
+    fn cancelRegistration(raw: *anyopaque, handle: *anyopaque) !void {
+        const self = cast(raw);
+        try self.begin(true);
+        defer self.end();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var it = self.resource_head;
+        while (it) |token| : (it = token.next) if (@as(*anyopaque, token) == handle) {
+            if (token.maintenance_spec == null) return error.InvalidArgument;
+            token.stop_requested.store(true, .release);
+            token.cancel_requested = true;
+            if (std.meta.activeTag(token.inner) == .maintenance) try token.inner.maintenance.requestCancel();
+            return;
+        };
+        return error.InvalidArgument;
+    }
     fn registrationReady(raw: *anyopaque, handle: *anyopaque) !bool {
         const self = cast(raw);
         try self.begin(true);
@@ -666,7 +689,10 @@ const Scope = struct {
             if (token.maintenance_spec == null) return error.InvalidArgument;
             return switch (token.inner) {
                 .maintenance_pending => false,
-                .maintenance => |*registration| registration.readyToFinish(),
+                .maintenance => |*registration| blk: {
+                    if (token.cancel_requested) try registration.requestCancel();
+                    break :blk registration.readyToFinish();
+                },
                 else => error.InvalidArgument,
             };
         };
@@ -813,6 +839,7 @@ const Token = struct {
     client_state: ClientState = undefined,
     maintenance_spec: ?Maintenance = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
+    cancel_requested: bool = false,
     scope: *Scope,
     allocator: Allocator,
     io: std.Io,
@@ -875,6 +902,7 @@ const producer_methods: Methods = .{
     .ensure_maintenance = Scope.ensureMaintenance,
     .stop_maintenance = Scope.stopMaintenance,
     .stop_registration = Scope.stopRegistration,
+    .cancel_registration = Scope.cancelRegistration,
     .registration_ready = Scope.registrationReady,
     .owner = Scope.allocateOwner,
     .jobs = Scope.jobs,

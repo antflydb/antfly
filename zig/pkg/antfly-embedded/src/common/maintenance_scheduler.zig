@@ -59,6 +59,7 @@ pub const Scheduler = struct {
         context: *anyopaque,
         finish_fn: *const fn (*anyopaque, bool) void,
         stop_fn: *const fn (*anyopaque) void,
+        cancel_fn: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
         ready_fn: ?*const fn (*anyopaque, *bool) callconv(.c) errors.Status = null,
     };
     pub const RemotePort = struct {
@@ -139,6 +140,7 @@ pub const Scheduler = struct {
         runnable_step: ?*const fn (*anyopaque, runnable.Borrowed) anyerror!?u64 = null,
         runnable_pass: ?RunnablePass = null,
         canceled: std.atomic.Value(bool) = .init(false),
+        cancel_active: bool = false,
         class: Class,
         future: ?Io.Future(void) = null,
         done: std.atomic.Value(bool) = .init(false),
@@ -163,6 +165,29 @@ pub const Scheduler = struct {
             self.task.canceled.store(true, .release);
             scheduler.changed.set(scheduler.io);
         }
+        /// Active I/O cancellation is explicit: ordinary stop drains admitted
+        /// durable callbacks without changing their cancellation policy.
+        pub fn requestCancel(self: *Handle) !void {
+            self.requestStop();
+            if (self.remote) |port| {
+                const request = port.cancel_fn orelse return error.ExecutionWaitUnsupported;
+                const status = request(port.context);
+                if (!status.isOk()) return errors.errorFromStatus(status);
+                return;
+            }
+            const scheduler = self.task.scheduler;
+            scheduler.mutex.lockUncancelable(scheduler.io);
+            defer scheduler.mutex.unlock(scheduler.io);
+            self.task.cancel_active = true;
+            try self.requestActiveCancelLocked();
+        }
+        fn requestActiveCancelLocked(self: *const Handle) !void {
+            if (self.task.future) |*future| {
+                if (!self.task.done.load(.acquire) and !future.requestCancel(self.task.scheduler.io))
+                    return error.ExecutionWaitUnsupported;
+            }
+        }
+
         /// Cancellation must fence redispatch before using this readiness
         /// result to join. A true result means user callback work (including
         /// its runnable capsule retirement) has returned, not just stop intent.
@@ -177,6 +202,9 @@ pub const Scheduler = struct {
             const scheduler = self.task.scheduler;
             scheduler.mutex.lockUncancelable(scheduler.io);
             defer scheduler.mutex.unlock(scheduler.io);
+            // Cancellation may require repeated syscall signals. The handle
+            // remains owned throughout; readiness never performs a physical join.
+            if (self.task.cancel_active) try self.requestActiveCancelLocked();
             return self.task.future == null or self.task.done.load(.acquire);
         }
 
@@ -193,6 +221,11 @@ pub const Scheduler = struct {
             };
             try @import("cleanup_wait.zig").until(io, original, self, Ready.get, null);
             self.cancel(io);
+        }
+
+        pub fn cancelActiveWithAdmission(self: *Handle, io: Io, original: @import("read_admission.zig").Port) !void {
+            try self.requestCancel();
+            try self.cancelWithAdmission(io, original);
         }
 
         pub fn await(self: *Handle, _: Io) void {
@@ -907,4 +940,38 @@ test "maintenance scheduler execution-aware cancellation lends the sole ordinary
         health.finish();
         try std.testing.expectEqual(@as(usize, 0), cpu.stats().operations);
     }
+}
+
+test "maintenance scheduler active cancellation fails closed when executor cannot request without joining" {
+    const io = std.testing.io;
+    const Unsupported = struct {
+        fn request(_: ?*anyopaque, _: *Io.AnyFuture) bool {
+            return false;
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.requestCancel = Unsupported.request;
+    const lane: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    const scheduler = try Scheduler.create(std.testing.allocator, lane, 1);
+    defer scheduler.destroy();
+    const F = struct {
+        io: Io,
+        entered: Io.Event = .unset,
+        release: Io.Event = .unset,
+        fn run(self: *@This()) ?u64 {
+            self.entered.set(self.io);
+            self.release.waitUncancelable(self.io);
+            return null;
+        }
+    };
+    var f: F = .{ .io = lane };
+    var handle = try scheduler.register(&f, F.run);
+    defer {
+        f.release.set(lane);
+        handle.cancel(lane);
+    }
+    try f.entered.wait(lane);
+    try std.testing.expectError(error.ExecutionWaitUnsupported, handle.requestCancel());
+    try std.testing.expectError(error.ExecutionWaitUnsupported, handle.readyToFinish());
+    try std.testing.expectEqual(@as(usize, 1), scheduler.snapshot().owned_registrations);
 }

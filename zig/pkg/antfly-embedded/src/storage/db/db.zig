@@ -6251,6 +6251,7 @@ pub const DB = struct {
         try self.executor.requestShutdown();
         if (self.text_merge_runtime) |runtime| try runtime.closeProducerAdmissionWithAdmission(original);
         try self.executor.quiesceWithAdmission(original);
+        if (self.text_merge_runtime) |runtime| try runtime.stopWithAdmission(original);
         try self.local_execution.source_publication.stopWithAdmission(self.backend_runtime, original);
         try self.local_execution.online_merge_reader.closeWithAdmission(self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io, original);
     }

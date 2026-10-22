@@ -32,7 +32,11 @@ class OverlayTests(unittest.TestCase):
             output = root / "output"
             with self.assertRaises(RuntimeError):
                 patcher.prepare(
-                    root / "lib", source, root / "lib/std/Thread.zig", output
+                    root / "lib",
+                    source,
+                    root / "lib/std/Thread.zig",
+                    root / "lib/std/Io.zig",
+                    output,
                 )
             self.assertFalse(output.exists())
             self.assertEqual(source.read_text(), "unrecognized toolchain source\n")
@@ -50,10 +54,34 @@ class OverlayTests(unittest.TestCase):
                 mock.patch.object(patcher, "patch_threaded", return_value="patched"),
                 self.assertRaises(RuntimeError),
             ):
-                patcher.prepare(root / "lib", source, thread, output)
+                patcher.prepare(
+                    root / "lib", source, thread, root / "lib/std/Io.zig", output
+                )
             self.assertFalse(output.exists())
             self.assertEqual(thread.read_text(), "unknown thread source")
             self.assertEqual(source.read_text(), "original threaded")
+
+    def test_unknown_io_source_fails_before_copying_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "lib/std/Io/Threaded.zig"
+            source.parent.mkdir(parents=True)
+            source.write_text("original threaded")
+            thread = root / "lib/std/Thread.zig"
+            thread.write_text("original thread")
+            io = root / "lib/std/Io.zig"
+            io.write_text("unknown io source")
+            output = root / "output"
+            with (
+                mock.patch.object(patcher, "patch_threaded", return_value="patched"),
+                mock.patch.object(
+                    patcher, "patch_thread", return_value="patched thread"
+                ),
+                self.assertRaises(RuntimeError),
+            ):
+                patcher.prepare(root / "lib", source, thread, io, output)
+            self.assertFalse(output.exists())
+            self.assertEqual(io.read_text(), "unknown io source")
 
     def test_no_symlink_privileges_copy_resources_without_mutating_toolchain(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -62,6 +90,7 @@ class OverlayTests(unittest.TestCase):
             source.parent.mkdir(parents=True)
             source.write_text("original")
             (root / "lib/std/Thread.zig").write_text("original thread")
+            (root / "lib/std/Io.zig").write_text("original io")
             resource = root / "lib/libc/fixture.h"
             resource.parent.mkdir()
             resource.write_text("immutable resource")
@@ -71,10 +100,15 @@ class OverlayTests(unittest.TestCase):
                 mock.patch.object(
                     patcher, "patch_thread", return_value="patched thread"
                 ),
+                mock.patch.object(patcher, "patch_io", return_value="patched io"),
                 mock.patch.object(Path, "symlink_to", side_effect=PermissionError),
             ):
                 patcher.prepare(
-                    root / "lib", source, root / "lib/std/Thread.zig", output
+                    root / "lib",
+                    source,
+                    root / "lib/std/Thread.zig",
+                    root / "lib/std/Io.zig",
+                    output,
                 )
             self.assertEqual(source.read_text(), "original")
             self.assertEqual((output / "std/Io/Threaded.zig").read_text(), "patched")
@@ -82,6 +116,8 @@ class OverlayTests(unittest.TestCase):
                 (root / "lib/std/Thread.zig").read_text(), "original thread"
             )
             self.assertEqual((output / "std/Thread.zig").read_text(), "patched thread")
+            self.assertEqual((output / "std/Io.zig").read_text(), "patched io")
+            self.assertEqual((root / "lib/std/Io.zig").read_text(), "original io")
             (output / "libc/fixture.h").write_text("changed copy")
             self.assertEqual(resource.read_text(), "immutable resource")
             metadata = json.loads(

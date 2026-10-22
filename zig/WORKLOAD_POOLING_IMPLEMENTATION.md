@@ -23386,3 +23386,47 @@ receipts. Native ABI cases, error/identity companions, boundary (1,036 sources),
 control catalog, generated errors, formatting, license and whitespace checks
 pass. These focused results leave the remaining shutdown, callback funding and
 full linked-owner/cross-engine behavior unqualified.
+
+
+### Controlled executor and merge shutdown
+
+Owner close preflight now fences derived executor admission, closes text-merge
+producer admission, drains admitted structural and visibility/persistence
+borrows, and joins scheduled derived callbacks before joining the merge worker.
+Worker arrays, idle catch-up sessions and producer reservation maps stay owned
+until physical teardown. Idle final catch-up and final persistence callbacks
+still execute in the existing physical close path and require further controlled
+funding; this increment does not qualify those callbacks.
+
+The pinned Zig overlay separates a nonblocking cancellation request from Future
+joining. Cancellation intent survives queued task startup; repeated requests
+resignal blocked syscalls without installing a stack awaiter or consuming the
+future. The executor bridge forwards this operation across compilation units.
+An executor lacking this capability reports unsupported instead of pretending
+that a blocked callback has stopped. The installed toolchain remains immutable.
+
+Active cancellation is an explicit maintenance-handle operation. Ordinary stop
+continues to drain admitted callbacks. Text-merge final close opts into active
+cancellation to wake descriptor admission, then waits under the original finite
+execution authority. Begin, lifetime and reentry failures retain the registration
+for retry. Pause, restart and physical stop share the final join ownership fence.
+Native ABI 83, storage-owner ABI 141 and execution-service offer version 4 fence
+the expanded contracts.
+
+The broader design remains incomplete: idle derived finalization, sparse compaction and
+graph-metric stages, backend/cache/IO destruction, transaction cursor/pause audits,
+callback cost and parent metadata funding, route coverage, executable recovery
+funding and complete mandatory completion still need qualification. Strong
+required providers remain disabled. Full GNU/Linux qualification is waived;
+Linux continues to require the pinned Nix/glibc Zig toolchain.
+
+The final pinned Darwin Debug run passes all 90 build steps across the I/O ABI,
+execution-service archive, derived visibility, maintenance shutdown, shared SQL
+worker and real C-entry owner-close targets. It reports 66 passing tests plus
+cached passing suites (50 derived, 56 maintenance and 20 execution-service cases).
+The four Python overlay safety tests and separate 43 error ABI, one released
+status ABI and seven failure-identity tests pass. All 5,506 native/schema inputs
+match the final receipt, with no source changes during validation. The C-entry
+fixture starts an actual merge registration and proves it is joined while the
+DB and retained provider context remain owned. Receipts are preserved under
+`controlled-merge-cancel-final` in the cumulative qualification directory.

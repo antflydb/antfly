@@ -22,6 +22,7 @@ pub fn prepare(b: *std.Build) std.Build.LazyPath {
     run.addDirectoryArg(std.Build.LazyPath.zig_lib);
     run.addFileArg(std.Build.LazyPath.zig_lib.path(b, "std/Io/Threaded.zig"));
     run.addFileArg(std.Build.LazyPath.zig_lib.path(b, "std/Thread.zig"));
+    run.addFileArg(std.Build.LazyPath.zig_lib.path(b, "std/Io.zig"));
     return run.addOutputDirectoryArg("joinable-zig-lib");
 }
 

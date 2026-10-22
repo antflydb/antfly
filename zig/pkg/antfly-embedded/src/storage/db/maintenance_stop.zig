@@ -30,6 +30,7 @@ pub const Borrowed = struct {
     changed: *std.Io.Event,
     generation: *std.atomic.Value(u64),
     waiters: *std.atomic.Value(u32),
+    cancel_active: bool = false,
 
     fn lock(self: Borrowed) void {
         while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
@@ -109,7 +110,8 @@ pub const Borrowed = struct {
                 errdefer self.abandon(io);
                 if (registration) |*handle| {
                     const lane = io orelse return error.BackendRuntimeUnavailable;
-                    handle.cancelWithAdmission(lane, control) catch |cause| return trace.failure orelse cause;
+                    const result = if (self.cancel_active) handle.cancelActiveWithAdmission(lane, control) else handle.cancelWithAdmission(lane, control);
+                    result catch |cause| return trace.failure orelse cause;
                 }
                 self.complete(io);
                 return;

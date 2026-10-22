@@ -235,3 +235,49 @@ test "executor archive boundary composes inference checkpoints in both error dom
         try std.testing.expectEqual(@as(usize, 2), combined.calls);
     }
 }
+
+test "executor archive boundary requests cancellation without joining retained callback" {
+    var borrow: bridge.Borrow = undefined;
+    runtime_io_abi_test_borrow(&borrow);
+    defer runtime_io_abi_test_destroy(&borrow);
+    var receiver = try borrow.receive();
+    const io = receiver.io();
+    const F = struct {
+        io: std.Io,
+        canceled: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fn run(self: *@This()) std.Io.Cancelable!void {
+            self.io.sleep(.fromSeconds(3600), .awake) catch |cause| {
+                self.canceled.set(self.io);
+                self.release.waitUncancelable(self.io);
+                return cause;
+            };
+        }
+    };
+    // Request immediately after submission to exercise the queued/start race,
+    // then retain the callback after cancellation to prove request != join.
+    for (0..64) |_| {
+        var f: F = .{ .io = io };
+        var future = try io.concurrent(F.run, .{&f});
+        defer {
+            f.release.set(io);
+            _ = future.cancel(io) catch {};
+        }
+        try std.testing.expect(future.requestCancel(io));
+        try f.canceled.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        try std.testing.expect(future.any_future != null);
+        try std.testing.expect(future.requestCancel(io));
+        f.release.set(io);
+        try std.testing.expectError(error.Canceled, future.await(io));
+        try std.testing.expect(future.requestCancel(io));
+    }
+    // A cancellation for a completed registration must not poison the next
+    // task running on the same physical executor.
+    const Healthy = struct {
+        fn run(lane: std.Io) !void {
+            try lane.sleep(.fromMilliseconds(1), .awake);
+        }
+    };
+    var healthy = try io.concurrent(Healthy.run, .{io});
+    try healthy.await(io);
+}

@@ -172,6 +172,98 @@ fn retainWorker(t: *Threaded, thread: OwnedWorker) void {
 
 fn worker(t: *Threaded) void {""",
     )
+    # Keep cancellation intent independent of the awaiter pointer. Requesting
+    # cancellation must neither install a stack awaiter nor consume the future.
+    source = replace_once(
+        source,
+        "    awaiter: *std.atomic.Value(u32),\n",
+        "    awaiter: *std.atomic.Value(u32),\n    cancel_requested: std.atomic.Value(bool) = .init(false),\n",
+    )
+    source = replace_once(
+        source,
+        "            .cancel = cancel,\n",
+        "            .cancel = cancel,\n            .requestCancel = requestCancel,\n",
+    )
+    source = replace_once(
+        source,
+        "            }, .release);\n            assert(old_status.thread == .null);",
+        "            }, .seq_cst);\n            assert(old_status.thread == .null);",
+    )
+    source = replace_once(
+        source,
+        "        future.func(future.contextPointer(), future.resultPointer());",
+        """        // Paired sequentially consistent observations prevent the queued/start
+        // race from missing both the published thread and cancellation intent.
+        if (future.cancel_requested.load(.seq_cst))
+            _ = thread.cancelAwaitable(.fromFuture(future));
+        future.func(future.contextPointer(), future.resultPointer());""",
+    )
+    source = replace_once(
+        source,
+        "                .blocked_canceling => unreachable, // `awaitable` has not been canceled before now\n                .blocked_alertable_canceling => unreachable, // `awaitable` has not been canceled before now",
+        "                .blocked_canceling, .blocked_alertable_canceling => return true, // repeat nonblocking cancellation signal",
+    )
+    source = replace_once(
+        source,
+        "fn cancel(\n",
+        """// Exclusive Future borrow, just like await/cancel. May be polled repeatedly
+// while a separate execution authority controls the join deadline. Never
+// stores an awaiter, consumes results, allocates a helper, or waits for exit.
+fn requestCancel(userdata: ?*anyopaque, any_future: *Io.AnyFuture) bool {
+    if (builtin.single_threaded) unreachable;
+    const t: *Threaded = @ptrCast(@alignCast(userdata));
+    const future: *Future = @ptrCast(@alignCast(any_future));
+    future.cancel_requested.store(true, .seq_cst);
+    const status = future.status.load(.seq_cst);
+    if (status.tag == .done) return true;
+    assert(status.tag == .pending);
+    if (status.thread.unpack()) |thread| {
+        if (thread.cancelAwaitable(.fromFuture(future)))
+            _ = thread.signalCanceledSyscall(t, .fromFuture(future));
+    }
+    return true;
+}
+
+fn cancel(
+""",
+    )
+    return source
+
+
+def patch_io(source: str) -> str:
+    source = replace_once(
+        source,
+        "    /// Equivalent to `await` but initiates cancel request.\n",
+        """    /// Request cancellation without waiting or consuming the Future. False
+    /// means this executor cannot separate cancellation from joining.
+    requestCancel: *const fn (?*anyopaque, *AnyFuture) bool = unsupportedRequestCancel,
+
+    /// Equivalent to `await` but initiates cancel request.
+""",
+    )
+    source = replace_once(
+        source,
+        "pub const AnyFuture = opaque {};",
+        """fn unsupportedRequestCancel(_: ?*anyopaque, _: *AnyFuture) bool {
+    return false;
+}
+
+pub const AnyFuture = opaque {};""",
+    )
+    source = replace_once(
+        source,
+        "        /// Idempotent. Not threadsafe.\n        pub fn cancel(f:",
+        """        /// Nonblocking, idempotent, exclusive Future borrow. Polling repeats
+        /// syscall signals when necessary. Retains ownership for await/cancel.
+        /// False means unsupported; it does not pretend cancellation happened.
+        pub fn requestCancel(f: *@This(), io: Io) bool {
+            const any_future = f.any_future orelse return true;
+            return io.vtable.requestCancel(io.userdata, any_future);
+        }
+
+        /// Idempotent. Not threadsafe.
+        pub fn cancel(f:""",
+    )
     return source
 
 
@@ -253,12 +345,18 @@ def patch_thread(source: str) -> str:
 
 
 def prepare(
-    lib_dir: Path, threaded_source: Path, thread_source: Path, output: Path
+    lib_dir: Path,
+    threaded_source: Path,
+    thread_source: Path,
+    io_source: Path,
+    output: Path,
 ) -> None:
     source = threaded_source.read_text()
     patched = patch_threaded(source)
     thread = thread_source.read_text()
     patched_thread = patch_thread(thread)
+    io = io_source.read_text()
+    patched_io = patch_io(io)
     output.mkdir(parents=True, exist_ok=True)
     # Copy std so relative imports cannot resolve through a symlink back to the
     # unpatched installation. Other compiler/libc resources remain read-only.
@@ -280,11 +378,14 @@ def prepare(
                 shutil.copy2(path, destination)
     (output / "std/Io/Threaded.zig").write_text(patched)
     (output / "std/Thread.zig").write_text(patched_thread)
+    (output / "std/Io.zig").write_text(patched_io)
     (output / "antfly-joinable-threaded.json").write_text(
         json.dumps(
             {
                 "original_sha256": hashlib.sha256(source.encode()).hexdigest(),
                 "patched_sha256": hashlib.sha256(patched.encode()).hexdigest(),
+                "original_io_sha256": hashlib.sha256(io.encode()).hexdigest(),
+                "patched_io_sha256": hashlib.sha256(patched_io.encode()).hexdigest(),
                 "original_thread_sha256": hashlib.sha256(thread.encode()).hexdigest(),
                 "patched_thread_sha256": hashlib.sha256(
                     patched_thread.encode()

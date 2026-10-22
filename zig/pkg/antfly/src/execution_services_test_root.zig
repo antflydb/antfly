@@ -59,6 +59,8 @@ test "execution services archive boundary rejects incompatible offers before nat
     try std.testing.expectError(error.UnsupportedVersion, services.Client.open(&bad));
     bad.version = 2;
     try std.testing.expectError(error.UnsupportedVersion, services.Client.open(&bad));
+    bad.version = 3;
+    try std.testing.expectError(error.UnsupportedVersion, services.Client.open(&bad));
     bad = f.offer;
     bad.struct_size -= 1;
     try std.testing.expectError(error.UnsupportedVersion, services.Client.open(&bad));
@@ -920,4 +922,75 @@ test "execution services archive boundary shipped transaction factory retains it
     control.reject = false;
     try owner.stopWithAdmission(.init(&payload));
     try std.testing.expect(!owner.vtable.stats(owner.ptr).has_lease);
+}
+
+test "execution services archive boundary active cancellation preserves original reentry and graceful drain" {
+    for ([_]bool{ false, true }) |active| {
+        var fixture: Fixture = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        var client = try services.Client.open(&fixture.offer);
+        defer client.close() catch @panic("scope close");
+        var receiver = try client.ioView(.general);
+        const io = receiver.io();
+        const scheduler = try background.MaintenanceScheduler.createRemote(std.testing.allocator, io, try client.maintenancePort());
+        defer scheduler.destroy();
+        const Probe = struct {
+            io: std.Io,
+            entered: std.Io.Event = .unset,
+            release: std.Io.Event = .unset,
+            canceled: std.atomic.Value(bool) = .init(false),
+            fn step(self: *@This()) ?u64 {
+                self.entered.set(self.io);
+                self.release.wait(self.io) catch {
+                    self.canceled.store(true, .release);
+                    self.release.waitUncancelable(self.io);
+                };
+                return null;
+            }
+        };
+        const Control = struct {
+            probe: *Probe,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(_: *anyopaque) !void {}
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                self.probe.release.set(self.probe.io);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                return error.Canceled;
+            }
+        };
+        var probe: Probe = .{ .io = io };
+        var handle = try scheduler.register(&probe, Probe.step);
+        defer {
+            probe.release.set(io);
+            handle.cancel(io);
+        }
+        try probe.entered.wait(io);
+        handle.requestStop();
+        try std.testing.expect(!try handle.readyToFinish());
+        try std.testing.expect(!probe.canceled.load(.acquire));
+        if (active) {
+            try handle.requestCancel();
+            try yieldUntil(&probe.canceled);
+            try std.testing.expect(!try handle.readyToFinish());
+        }
+        var control: Control = .{ .probe = &probe };
+        const admission = local.common_read_admission;
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const result = if (active) handle.cancelActiveWithAdmission(io, .init(&payload)) else handle.cancelWithAdmission(io, .init(&payload));
+        try std.testing.expectError(error.Canceled, result);
+        try std.testing.expectEqual(active, probe.canceled.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), control.begins);
+        try std.testing.expectEqual(@as(usize, 1), control.ends);
+        try std.testing.expectEqual(@as(usize, 1), (try client.maintenanceStats()).?.owned_registrations);
+    }
 }

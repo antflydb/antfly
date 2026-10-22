@@ -7041,6 +7041,8 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         const resolution_context = handle.db.resolution_append_context.?;
         try handle.db.initOptionalTextMergeRuntime(.{ .enabled = true });
         const text_merge = handle.db.text_merge_runtime.?;
+        try text_merge.start();
+        try std.testing.expect(text_merge.future != null);
         try enrichment.start();
         try std.testing.expect(enrichment.future != null);
         try resolution.start();
@@ -7058,6 +7060,7 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerDrainClose(id, &request));
         try std.testing.expect(!handle.db.isClosed());
         try std.testing.expect(text_merge.producer_closing.load(.acquire));
+        try std.testing.expect(text_merge.joined.isSet() and text_merge.future == null);
         try std.testing.expectError(error.TextMergeRuntimeShutdown, text_merge.acquireProducerPermit("late", 1, 1));
         try std.testing.expectError(error.Canceled, text_merge.start());
         try std.testing.expectError(error.WorkerStopping, handle.db.executor.addWorker("late", .{ .name = "late", .kind = .full_text }, 0));
