@@ -53,6 +53,11 @@ const EntityCurationProvenance = struct {
 };
 
 const ProposalBinding = struct { owner: []const u8, actor: []const u8 = "", verdict_actor: []const u8 = "", config_generation: u64, entities: []const struct { id: []const u8, revision: u64 }, evidence: []const t.EvidenceRef, verdict_revision: ?u64 = null, model: ?t.Model = null };
+const EpisodeCatalog = struct { thread_id: []const u8, members: u64 = 0 };
+const EpisodeListPosition = struct {
+    after: ?[]const u8 = null,
+    pending: ?[]const u8 = null,
+};
 
 pub const Row = struct { key: []const u8, json: []const u8, version: u64 = 0, digest: ?[32]u8 = null };
 pub const Change = struct { key: []const u8, json: ?[]const u8 };
@@ -915,7 +920,7 @@ const Run = struct {
                 // use a fresh evidence ID, preserving historical provenance.
                 if (!eql(u8, try self.encode(old.evidence), try self.encode(source))) return error.MemoryEvidenceConflict;
             } else try self.put(path, t.StoredEvidence{ .evidence = source, .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision });
-            try self.indexEpisode(source);
+            try self.indexEpisode((try self.evidence(source.id)).?);
             const expires = self.evidenceExpiry((try self.evidence(source.id)).?);
             if (expires) |time| if (self.state.next_expiry_at == null or time < self.state.next_expiry_at.?) {
                 self.state.next_expiry_at = time;
@@ -1416,15 +1421,82 @@ const Run = struct {
             if (ref.span) |span| if (span.start >= span.end or span.end > source.evidence.text.len or !std.unicode.utf8ValidateSlice(source.evidence.text[span.start..span.end])) return error.InvalidMemorySpan;
         }
     }
-    fn indexEpisode(self: *Run, source: t.Evidence) !void {
+    fn episodeAudience(self: *Run, visibility: t.Visibility, owner: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "episode-access/{s}/", .{try hash(self.a, .{ visibility, if (visibility == .team) "" else owner })});
+    }
+    fn episodeTurnKey(self: *Run, source: t.Evidence) ![]const u8 {
+        // Sign-bit rotation makes lexicographic order agree with signed ordinals.
+        const ordered = @as(u64, @bitCast(source.ordinal.?)) ^ (@as(u64, 1) << 63);
+        return std.fmt.allocPrint(self.a, "episode-turn/{s}/{d:0>20}/{s}", .{ try hash(self.a, source.thread_id.?), ordered, try hash(self.a, source.id) });
+    }
+    fn indexEpisode(self: *Run, record: t.StoredEvidence) !void {
+        const source = record.evidence;
         const thread = source.thread_id orelse return;
-        const ordinal = source.ordinal orelse return;
+        if (source.ordinal == null) return;
         try t.validateId(thread);
         if (source.turn_id) |turn| try t.validateId(turn);
-        try self.put(try key(self.a, "episode", thread), .{ .thread_id = thread });
-        // Sign-bit rotation makes lexicographic order agree with signed ordinals.
-        const ordered = @as(u64, @bitCast(ordinal)) ^ (@as(u64, 1) << 63);
-        try self.put(try std.fmt.allocPrint(self.a, "episode-turn/{s}/{d:0>20}/{s}", .{ try hash(self.a, thread), ordered, try hash(self.a, source.id) }), .{ .id = source.id });
+        const turn = try self.episodeTurnKey(source);
+        const catalog = try key(self.a, "episode", thread);
+        // The global lane serves administrators; ordinary reads merge only
+        // the team lane and their own private lane. Counts keep catalog
+        // membership exact without scanning a thread during retirement.
+        for ([_][]const u8{ "", try self.episodeAudience(source.visibility, record.owner) }) |root| {
+            const turn_path = try std.fmt.allocPrint(self.a, "{s}{s}", .{ root, turn });
+            if (try self.read(std.json.Value, turn_path) != null) continue;
+            const catalog_path = try std.fmt.allocPrint(self.a, "{s}{s}", .{ root, catalog });
+            var entry = (try self.read(EpisodeCatalog, catalog_path)) orelse EpisodeCatalog{ .thread_id = thread };
+            if (entry.members == std.math.maxInt(u64)) return error.MemoryCorruptState;
+            entry.members += 1;
+            try self.put(catalog_path, entry);
+            try self.put(turn_path, .{ .id = source.id });
+        }
+    }
+    fn retireEpisode(self: *Run, record: t.StoredEvidence) !void {
+        const source = record.evidence;
+        const thread = source.thread_id orelse return;
+        if (source.ordinal == null) return;
+        const turn = try self.episodeTurnKey(source);
+        const catalog = try key(self.a, "episode", thread);
+        for ([_][]const u8{ "", try self.episodeAudience(source.visibility, record.owner) }) |root| {
+            const turn_path = try std.fmt.allocPrint(self.a, "{s}{s}", .{ root, turn });
+            if (try self.read(std.json.Value, turn_path) == null) continue;
+            try self.remove(turn_path);
+            const catalog_path = try std.fmt.allocPrint(self.a, "{s}{s}", .{ root, catalog });
+            var entry = (try self.read(EpisodeCatalog, catalog_path)) orelse continue;
+            if (entry.members <= 1) try self.remove(catalog_path) else {
+                entry.members -= 1;
+                try self.put(catalog_path, entry);
+            }
+        }
+    }
+    fn scanEpisodeRows(self: *Run, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
+        if (self.service.context.admin) return self.service.backend.scan(self.service.backend.ptr, self.a, prefix, after, limit);
+        var rows: std.ArrayList(Row) = .empty;
+        var more = false;
+        for ([_][]const u8{ try self.episodeAudience(.team, ""), try self.episodeAudience(.private, self.service.context.principal) }) |root| {
+            try self.service.context.check();
+            const physical_prefix = try std.fmt.allocPrint(self.a, "{s}{s}", .{ root, prefix });
+            const cursor = if (after) |position| try std.fmt.allocPrint(self.a, "{s}{s}", .{ root, position }) else null;
+            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, physical_prefix, cursor, limit);
+            more = more or page.next != null;
+            for (page.rows) |row| try rows.append(self.a, .{ .key = row.key[root.len..], .json = row.json, .version = row.version, .digest = row.digest });
+        }
+        std.mem.sort(Row, rows.items, {}, struct {
+            fn less(_: void, lhs: Row, rhs: Row) bool {
+                return std.mem.lessThan(u8, lhs.key, rhs.key);
+            }
+        }.less);
+        // Catalog entries may occur in both lanes; one shared virtual key
+        // also lets turn pages preserve ordinal order across audiences.
+        var count: usize = 0;
+        for (rows.items) |row| {
+            if (count > 0 and eql(u8, rows.items[count - 1].key, row.key)) continue;
+            rows.items[count] = row;
+            count += 1;
+        }
+        const selected = @min(count, limit);
+        more = more or count > selected;
+        return .{ .rows = rows.items[0..selected], .next = if (more and selected > 0) rows.items[selected - 1].key else null };
     }
     fn mention(self: *Run, value: t.EntityMention) !void {
         try t.validateId(value.id);
@@ -1481,10 +1553,11 @@ const Run = struct {
         if (request.limit == 0 or request.limit > 64) return error.InvalidMemoryRequest;
         self.historical_resource_reads = request.known_at != null;
         const prefix = try std.fmt.allocPrint(self.a, "episode-turn/{s}/", .{try hash(self.a, id)});
-        const page = try self.scanOverlay(prefix, try self.decodeCursor(prefix, request.cursor), request.limit);
+        const page = try self.scanEpisodeRows(prefix, try self.decodeCursor(prefix, request.cursor), 64);
         var turns: std.ArrayList(t.EpisodeTurn) = .empty;
-        var complete = page.next == null;
-        for (page.rows) |row| {
+        var complete = true;
+        var next = page.next;
+        for (page.rows, 0..) |row, index| {
             const binding = try parse(struct { id: []const u8 }, self.a, row.json);
             const source = (try self.evidence(binding.id)) orelse continue;
             self.authorize(source.owner, source.evidence.visibility) catch continue;
@@ -1493,32 +1566,68 @@ const Run = struct {
             const entities = try self.evidenceEntities(source, request.known_at);
             complete = complete and entities.complete;
             try turns.append(self.a, .{ .evidence = source, .entities = entities.ids });
+            if (turns.items.len == request.limit) {
+                next = if (index + 1 < page.rows.len or page.next != null) row.key else null;
+                break;
+            }
         }
-        // An empty filtered page may still have a continuation; it must not
-        // reveal the existence of a private episode to a point lookup.
-        if (turns.items.len == 0 and request.cursor == null and page.next == null) return error.MemoryNotFound;
-        return .{ .thread_id = id, .turns = turns.items, .next_cursor = try self.encodeCursor(prefix, page.next), .complete = complete, .revision = self.state.revision };
+        // Foreign private turns never participate in these scans, including
+        // their cursor/absence decisions. Empty progress pages are possible
+        // only within the caller's own authorized audience (e.g. expired turns).
+        if (turns.items.len == 0 and request.cursor == null and next == null) return error.MemoryNotFound;
+        return .{ .thread_id = id, .turns = turns.items, .next_cursor = try self.encodeCursor(prefix, next), .complete = complete and next == null, .revision = self.state.revision };
+    }
+    fn episodeListPosition(self: *Run, cursor: ?[]const u8) !EpisodeListPosition {
+        const path = (try self.decodeCursor("episode-list/", cursor)) orelse return .{};
+        const encoded = path["episode-list/".len..];
+        if (encoded.len > 8192) return error.InvalidMemoryCursor;
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        const bytes = try self.a.alloc(u8, decoder.calcSizeForSlice(encoded) catch return error.InvalidMemoryCursor);
+        decoder.decode(bytes, encoded) catch return error.InvalidMemoryCursor;
+        const position = parse(EpisodeListPosition, self.a, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidMemoryCursor,
+        };
+        if (position.after) |after| if (!std.mem.startsWith(u8, after, "episode/")) return error.InvalidMemoryCursor;
+        return position;
+    }
+    fn episodeListCursor(self: *Run, position: EpisodeListPosition) !?[]const u8 {
+        const bytes = try self.encode(position);
+        const encoder = std.base64.url_safe_no_pad.Encoder;
+        const encoded = try self.a.alloc(u8, encoder.calcSize(bytes.len));
+        _ = encoder.encode(encoded, bytes);
+        return self.encodeCursor("episode-list/", try std.fmt.allocPrint(self.a, "episode-list/{s}", .{encoded}));
     }
     fn episodes(self: *Run, request: t.EpisodeRequest) ![]const u8 {
         if (request.limit == 0 or request.limit > 64) return error.InvalidMemoryRequest;
-        const page = try self.scanOverlay("episode/", try self.decodeCursor("episode/", request.cursor), request.limit);
+        var position = try self.episodeListPosition(request.cursor);
         var items: std.ArrayList(t.Episode) = .empty;
-        var complete = page.next == null;
-        for (page.rows) |row| {
-            const binding = try parse(struct { thread_id: []const u8 }, self.a, row.json);
-            const item = self.episode(binding.thread_id, .{ .limit = 1, .known_at = request.known_at }) catch |err| switch (err) {
-                error.MemoryNotFound => continue,
+        for (0..request.limit) |_| {
+            try self.service.context.check();
+            // The revision-fenced catalog is immutable across continuation.
+            // Resolve its next authorized entry again rather than storing an
+            // unproven thread name inside the externally carried cursor.
+            const page = try self.scanEpisodeRows("episode/", position.after, 1);
+            if (page.rows.len == 0) return self.encode(t.EpisodePage{ .items = items.items, .next_cursor = null, .complete = true, .revision = self.state.revision });
+            const thread = (try parse(EpisodeCatalog, self.a, page.rows[0].json)).thread_id;
+            const item = self.episode(thread, .{ .limit = 1, .known_at = request.known_at, .cursor = position.pending }) catch |err| switch (err) {
+                error.MemoryNotFound => {
+                    position = .{ .after = try key(self.a, "episode", thread) };
+                    continue;
+                },
                 else => return err,
             };
-            // A catalog entry carries no text. Do not return it unless this
-            // bounded page actually proves an authorized retained member.
-            if (item.turns.len == 0) {
-                complete = false;
-                continue;
+            if (item.turns.len == 0 and item.next_cursor != null) {
+                // Never advance the outer catalog past an unfinished member
+                // scan. The scoped cursor owns both levels of continuation.
+                position.pending = item.next_cursor;
+                return self.encode(t.EpisodePage{ .items = items.items, .next_cursor = try self.episodeListCursor(position), .complete = false, .revision = self.state.revision });
             }
-            try items.append(self.a, item);
+            if (item.turns.len > 0) try items.append(self.a, item);
+            position = .{ .after = try key(self.a, "episode", thread) };
         }
-        return self.encode(t.EpisodePage{ .items = items.items, .next_cursor = try self.encodeCursor("episode/", page.next), .complete = complete, .revision = self.state.revision });
+        const remaining = try self.scanEpisodeRows("episode/", position.after, 1);
+        return self.encode(t.EpisodePage{ .items = items.items, .next_cursor = if (remaining.rows.len > 0) try self.episodeListCursor(position) else null, .complete = remaining.rows.len == 0, .revision = self.state.revision });
     }
     fn relatedAssertions(self: *Run, id: []const u8, limit: usize) !struct { items: []const t.StoredAssertion, scanned: usize, complete: bool } {
         var records: std.StringHashMapUnmanaged(t.StoredAssertion) = .empty;
@@ -1555,6 +1664,9 @@ const Run = struct {
         return .{ .items = result, .scanned = scanned, .complete = complete };
     }
     fn entityView(self: *Run, id: []const u8, request: t.EntityViewRequest) !t.EntityView {
+        return self.entityViewFiltered(id, request, .{ .known_at = request.known_at, .valid_at = request.valid_at });
+    }
+    fn entityViewFiltered(self: *Run, id: []const u8, request: t.EntityViewRequest, filters: t.Recall) !t.EntityView {
         if (request.limit == 0 or request.limit > 32) return error.InvalidMemoryRequest;
         self.historical_resource_reads = request.known_at != null;
         const requested = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
@@ -1572,7 +1684,7 @@ const Run = struct {
         try text.appendSlice(self.a, record.entity.name);
         var complete = related.complete;
         for (related.items) |original| {
-            const hit = (try self.recallHit(original, .{ .known_at = request.known_at, .valid_at = request.valid_at }, null, false)) orelse continue;
+            const hit = (try self.recallHit(original, filters, null, false)) orelse continue;
             if (dependencies.items.len > request.limit or text.items.len + hit.memory.assertion.statement.len + 2 > 8192) {
                 complete = false;
                 continue;
@@ -1821,6 +1933,10 @@ const Run = struct {
         var binding = (try self.read(ProposalBinding, try key(self.a, "proposal-input", id))) orelse return error.MemoryNotFound;
         if (!try self.proposalInputsRetained(binding)) return error.MemoryForgotten;
         if (binding.config_generation != self.state.config.generation) return error.MemoryConfigurationChanged;
+        // Retention permits historical audit reads; applying a judgment also
+        // requires every original context source to remain current. Space
+        // revision fences do not cover edits in ordinary source tables.
+        try self.reviewEvidence(binding.evidence);
         const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
         const proposal = for (stored.state.proposals) |proposal| {
             if (eql(u8, proposal.id, id)) break proposal;
@@ -2436,13 +2552,7 @@ const Run = struct {
     fn retireEvidence(self: *Run, source: t.StoredEvidence) !void {
         try self.remove(try key(self.a, "evidence", source.evidence.id));
         try self.put(try key(self.a, "forgotten-evidence", source.evidence.id), true);
-        if (source.evidence.thread_id) |thread| if (source.evidence.ordinal) |ordinal| {
-            const prefix = try std.fmt.allocPrint(self.a, "episode-turn/{s}/", .{try hash(self.a, thread)});
-            const ordered = @as(u64, @bitCast(ordinal)) ^ (@as(u64, 1) << 63);
-            try self.remove(try std.fmt.allocPrint(self.a, "{s}{d:0>20}/{s}", .{ prefix, ordered, try hash(self.a, source.evidence.id) }));
-            const remaining = try self.scanOverlay(prefix, null, 1);
-            if (remaining.rows.len == 0) try self.remove(try key(self.a, "episode", thread));
-        };
+        try self.retireEpisode(source);
         if (source.evidence.resource) |reference| {
             try self.remove(try std.fmt.allocPrint(self.a, "resource-evidence/{s}/{s}", .{ try hash(self.a, reference.identity()), try hash(self.a, source.evidence.id) }));
             try self.remove(try key(self.a, "resource-watch", source.evidence.id));
@@ -3367,7 +3477,7 @@ const Run = struct {
                     try hits.append(self.a, hit);
                 },
                 .entity => if (entities.items.len < 8) {
-                    const view = try self.entityView(graph.nodes.items[i].id, .{ .limit = 4, .known_at = request.known_at, .valid_at = request.valid_at });
+                    const view = try self.entityViewFiltered(graph.nodes.items[i].id, .{ .limit = 4, .known_at = request.known_at, .valid_at = request.valid_at }, request);
                     graph.complete = graph.complete and view.complete;
                     try entities.append(self.a, view);
                 } else {

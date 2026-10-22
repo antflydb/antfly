@@ -10164,7 +10164,11 @@ test "capi native memory migration views episodes graph and external reviews sur
     const temporary = arena.allocator();
     _ = try nativeMemoryTestCall(id, temporary, "alice", .create, memory.types.Config{ .ontology_pack = .software_team_v1 }, "create", "");
     const observation: memory.types.ObservationRequest = .{
-        .evidence = &.{.{ .id = "turn", .source_id = "history", .source_version = "1", .text = "Antfly storage uses WAL", .thread_id = "thread", .turn_id = "turn-1", .ordinal = 1 }},
+        .evidence = &.{
+            .{ .id = "turn", .source_id = "history", .source_version = "1", .text = "Antfly storage uses WAL", .thread_id = "thread", .turn_id = "turn-1", .ordinal = 1, .visibility = .team },
+            .{ .id = "prefix", .source_id = "history", .source_version = "1", .text = "OWNER_ONLY_PREFIX", .thread_id = "thread", .ordinal = 0 },
+            .{ .id = "private", .source_id = "history", .source_version = "1", .text = "OWNER_ONLY_THREAD", .thread_id = "private-thread", .ordinal = 0 },
+        },
         .entities = &.{ .{ .id = "a", .name = "Antfly", .evidence = &.{.{ .id = "turn" }} }, .{ .id = "b", .name = "storage", .evidence = &.{.{ .id = "turn" }} } },
         .assertions = &.{.{ .id = "relation", .subject = "b", .predicate = "part_of", .value = "a", .statement = "Storage is part of Antfly", .evidence = &.{.{ .id = "turn" }} }},
     };
@@ -10183,6 +10187,22 @@ test "capi native memory migration views episodes graph and external reviews sur
         try std.testing.expectEqual(@as(usize, 1), graph.episodes.len);
         const review = try nativeMemoryTestCall(id, temporary, "alice", .entity_proposal, .{}, "", proposed.proposal_id.?);
         try std.testing.expect(std.mem.indexOf(u8, review, "\"state\":\"rejected\"") != null);
+        {
+            // The local C ABI caller is trusted as administrator. Exercise
+            // ordinary reader policy on the same persisted native table too.
+            const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+            defer guard.leave();
+            const database = try @import("tables.zig").get(guard.handle.parent_handle orelse guard.handle, "memory_personal");
+            const context: memory.Context = .{ .principal = "bob", .table_id = database.core.identity_namespace.table_id, .space = "personal", .now_ms = 1 };
+            var adapter: @import("../memory/engine.zig").Native(@import("../storage/db/db.zig").DB) = .{ .db = database, .context = context };
+            const reader: memory.Service = .{ .backend = adapter.backend(), .context = context };
+            try std.testing.expectError(error.MemoryNotFound, reader.execute(temporary, .episode, "private-thread", "{\"limit\":1}", ""));
+            const public_json = try reader.execute(temporary, .episodes, "", "{}", "");
+            const public = try std.json.parseFromSliceLeaky(memory.types.EpisodePage, temporary, public_json, .{});
+            try std.testing.expectEqual(@as(usize, 1), public.items.len);
+            try std.testing.expectEqualStrings("turn", public.items[0].turns[0].evidence.evidence.id);
+            try std.testing.expect(std.mem.indexOf(u8, public_json, "OWNER_ONLY") == null);
+        }
         if (attempt == 0) {
             antfly_db_close(id);
             id = null;

@@ -3971,3 +3971,190 @@ test "memory graph recall does not spend assertion work on disabled episode expa
         try std.testing.expect(!std.mem.startsWith(u8, row.*, "dependency/mention-"));
     }
 }
+
+test "memory graph descriptions share recall filters rather than widening accepted claims" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try externalReviewSetup(&store);
+    const claims = [_]m.types.Assertion{
+        .{ .id = "allowed", .subject = "a", .predicate = "allowed", .value = "yes", .statement = "Accepted settled fact", .scope = "wanted", .kind = .decision, .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "provisional", .subject = "a", .predicate = "allowed", .value = "maybe", .statement = "EXCLUDED_PROVISIONAL", .scope = "wanted", .kind = .decision, .stability = .provisional, .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "predicate", .subject = "a", .predicate = "other", .value = "no", .statement = "EXCLUDED_PREDICATE", .scope = "wanted", .kind = .decision, .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "scope", .subject = "a", .predicate = "allowed", .value = "no", .statement = "EXCLUDED_SCOPE", .scope = "elsewhere", .kind = .decision, .evidence = &.{.{ .id = "e" }} },
+        .{ .id = "kind", .subject = "a", .predicate = "allowed", .value = "no", .statement = "EXCLUDED_KIND", .scope = "wanted", .evidence = &.{.{ .id = "e" }} },
+    };
+    _ = try store.service("alice", true, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "claims");
+    const result = try store.service("alice", false, 4).execute(a, .recall, "", "{\"predicate\":\"allowed\",\"scope\":\"wanted\",\"kind\":\"decision\",\"include_provisional\":false,\"graph\":{\"entity_seeds\":[\"a\"],\"include_episodes\":false},\"token_budget\":8192}", "");
+    try std.testing.expect(std.mem.indexOf(u8, result, "Accepted settled fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "EXCLUDED_") == null);
+    const parsed = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, result, .{});
+    try std.testing.expectEqual(@as(usize, 1), parsed.entities.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed.entities[0].dependencies.len);
+    // The standalone derived view still exposes all ordinarily eligible facts.
+    const full = try store.service("alice", false, 4).execute(a, .entity_view, "a", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, full, "EXCLUDED_PROVISIONAL") != null);
+}
+
+test "memory external entity verdicts revalidate original proposal context without deleting changed history" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try externalReviewSetup(&store);
+    const evidence: m.types.Evidence = .{ .id = "review-context", .resource_selector = .{ .table = "business", .id = "approval" } };
+    _ = try store.service("alice", true, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence} }, .{}), "context");
+    const proposal: m.types.EntityProposalRequest = .{ .action = .merge, .from = "a", .to = "b", .expected_revision = 4, .evidence = &.{.{ .id = "review-context" }} };
+    const raw = try store.service("alice", true, 4).execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, proposal, .{}), "proposal");
+    const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, raw, .{});
+    store.resource_state = .changed;
+    for ([_]?bool{ true, false, null }) |accept| {
+        const verdict: m.types.EntityVerdict = .{ .expected_revision = 5, .accept = accept };
+        try std.testing.expectError(error.MemoryForgotten, store.service("alice", true, 5).execute(a, .review_entity, receipt.proposal_id.?, try std.json.Stringify.valueAlloc(a, verdict, .{}), "verdict"));
+    }
+    const identity = try store.service("alice", true, 5).execute(a, .resolve_entity, "a", "{}", "");
+    const entity = try std.json.parseFromSliceLeaky(std.json.Value, a, identity, .{});
+    try std.testing.expectEqualStrings("a", entity.object.get("canonical_id").?.string);
+    _ = try store.service("alice", true, 40000).execute(a, .advance, "", "{}", "cleanup");
+    const history = try store.service("alice", true, 40001).execute(a, .entity_proposal, receipt.proposal_id.?, "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, history, "review-context") != null);
+    // A current source allows the same still-open proposal to be judged.
+    store.resource_state = .current;
+    const verdict: m.types.EntityVerdict = .{ .expected_revision = 6, .accept = true };
+    _ = try store.service("alice", true, 40002).execute(a, .review_entity, receipt.proposal_id.?, try std.json.Stringify.valueAlloc(a, verdict, .{}), "verdict");
+}
+
+test "memory foreign private episodes have the same point and catalog absence as missing episodes" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    _ = try store.service("alice", true, 1).execute(a, .create, "", "{}", "create");
+    var sources: [130]m.types.Evidence = undefined;
+    for (&sources, 0..) |*value, i| value.* = .{ .id = try std.fmt.allocPrint(a, "private-{d}", .{i}), .source_id = "history", .source_version = "1", .text = "PRIVATE_EPISODE", .thread_id = "private-thread", .ordinal = @intCast(i) };
+    _ = try store.service("alice", false, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = sources }, .{}), "observe");
+    const before = store.scans;
+    for ([_][]const u8{ "private-thread", "missing-thread" }) |id| try std.testing.expectError(error.MemoryNotFound, store.service("bob", false, 3).execute(a, .episode, id, "{\"limit\":1}", ""));
+    try std.testing.expect(store.scans - before <= 4); // No scan of Alice's 130 private turns.
+    const raw = try store.service("bob", false, 3).execute(a, .episodes, "", "{}", "");
+    const result = try std.json.parseFromSliceLeaky(m.types.EpisodePage, a, raw, .{});
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+    try std.testing.expect(result.complete);
+    try std.testing.expect(result.next_cursor == null);
+}
+
+test "memory audience episode indexes merge ordered turns deduplicate catalogs and retire exact membership" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    _ = try store.service("alice", true, 1).execute(a, .create, "", "{}", "create");
+    const alice_sources = [_]m.types.Evidence{
+        .{ .id = "private", .source_id = "alice-history", .source_version = "1", .text = "ALICE_ONLY", .thread_id = "mixed-thread", .ordinal = -1 },
+        .{ .id = "team", .source_id = "alice-history", .source_version = "1", .text = "TEAM_TURN", .thread_id = "mixed-thread", .ordinal = 1, .visibility = .team },
+    };
+    const body = try std.json.Stringify.valueAlloc(a, .{ .evidence = alice_sources }, .{});
+    _ = try store.service("alice", false, 2).execute(a, .observe, "", body, "alice");
+    const bob_source: m.types.Evidence = .{ .id = "bob", .source_id = "bob-history", .source_version = "1", .text = "BOB_ONLY", .thread_id = "mixed-thread", .ordinal = 2 };
+    _ = try store.service("bob", false, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{bob_source} }, .{}), "bob");
+    _ = try store.service("alice", false, 4).execute(a, .observe, "", body, "repeat");
+    const list = try store.service("bob", false, 5).execute(a, .episodes, "", "{}", "");
+    const catalog = try std.json.parseFromSliceLeaky(m.types.EpisodePage, a, list, .{});
+    try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+    try std.testing.expectEqualStrings("team", catalog.items[0].turns[0].evidence.evidence.id);
+    try std.testing.expect(std.mem.indexOf(u8, list, "ALICE_ONLY") == null);
+    const first = try store.service("bob", false, 5).execute(a, .episode, "mixed-thread", "{\"limit\":1}", "");
+    const page = try std.json.parseFromSliceLeaky(m.types.Episode, a, first, .{});
+    const resume_body = try std.json.Stringify.valueAlloc(a, m.types.EpisodeRequest{ .limit = 1, .cursor = page.next_cursor }, .{});
+    const next = try store.service("bob", false, 5).execute(a, .episode, "mixed-thread", resume_body, "");
+    const second = try std.json.parseFromSliceLeaky(m.types.Episode, a, next, .{});
+    try std.testing.expectEqualStrings("bob", second.turns[0].evidence.evidence.id);
+    try std.testing.expect(second.complete);
+    try std.testing.expectError(error.InvalidMemoryCursor, store.service("eve", false, 5).execute(a, .episode, "mixed-thread", resume_body, ""));
+    const admin = try store.service("alice", true, 5).execute(a, .episode, "mixed-thread", "{}", "");
+    const all = try std.json.parseFromSliceLeaky(m.types.Episode, a, admin, .{});
+    try std.testing.expectEqual(@as(usize, 3), all.turns.len);
+    const counts = try Store.scan(&store, a, "episode/", null, 64);
+    try std.testing.expectEqual(@as(u64, 3), (try std.json.parseFromSliceLeaky(struct { thread_id: []const u8, members: u64 }, a, counts.rows[0].json, .{})).members);
+    _ = try store.service("alice", true, 6).execute(a, .forget, "", "{\"evidence_ids\":[\"private\",\"bob\"]}", "forget-private");
+    try std.testing.expectError(error.MemoryCursorStale, store.service("bob", false, 7).execute(a, .episode, "mixed-thread", resume_body, ""));
+    for (0..20) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "retire-private-{d}", .{i}), @intCast(8 + i));
+    const remaining = try Store.scan(&store, a, "episode/", null, 64);
+    try std.testing.expectEqual(@as(u64, 1), (try std.json.parseFromSliceLeaky(struct { thread_id: []const u8, members: u64 }, a, remaining.rows[0].json, .{})).members);
+    _ = try store.service("alice", true, 30).execute(a, .forget, "", "{\"evidence_ids\":[\"team\"]}", "forget-team");
+    for (0..20) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "retire-team-{d}", .{i}), @intCast(31 + i));
+    for ([_][]const u8{ "episode/", "episode-turn/", "episode-access/" }) |prefix| try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, prefix, null, 64)).rows.len);
+}
+
+test "memory episode catalog resumes bounded expired prefixes without losing accessible later members" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    _ = try store.service("alice", true, 1).execute(a, .create, "", "{}", "create");
+    var sources: [130]m.types.Evidence = undefined;
+    for (&sources, 0..) |*value, i| value.* = .{ .id = try std.fmt.allocPrint(a, "turn-{d}", .{i}), .source_id = "history", .source_version = "1", .text = if (i < 128) "EXPIRED_TEXT" else "SURVIVING_TEXT", .thread_id = "UNPROVEN_THREAD_NAME", .ordinal = @intCast(i), .expires_at = if (i < 128) 10 else null };
+    _ = try store.service("alice", false, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = sources }, .{}), "observe");
+    var cursor: ?[]const u8 = null;
+    for (0..3) |i| {
+        const before = store.scans;
+        const raw = try store.service("alice", false, 20).execute(a, .episodes, "", try std.json.Stringify.valueAlloc(a, m.types.EpisodeRequest{ .limit = 1, .cursor = cursor }, .{}), "");
+        try std.testing.expect(store.scans - before <= 8);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "EXPIRED_TEXT") == null);
+        const page = try std.json.parseFromSliceLeaky(m.types.EpisodePage, a, raw, .{});
+        if (i < 2) {
+            try std.testing.expectEqual(@as(usize, 0), page.items.len);
+            try std.testing.expect(!page.complete and page.next_cursor != null);
+            try std.testing.expect(!std.mem.eql(u8, cursor orelse "", page.next_cursor.?));
+            cursor = page.next_cursor;
+            // Cursor encoding is not encryption. Even after decoding it,
+            // an empty progress page must not disclose the unproven name.
+            var pieces = std.mem.splitScalar(u8, cursor.?, ':');
+            _ = pieces.next();
+            _ = pieces.next();
+            const encoded = pieces.next().?["episode-list/".len..];
+            const decoder = std.base64.url_safe_no_pad.Decoder;
+            const decoded = try a.alloc(u8, try decoder.calcSizeForSlice(encoded));
+            try decoder.decode(decoded, encoded);
+            try std.testing.expect(std.mem.indexOf(u8, decoded, "UNPROVEN_THREAD_NAME") == null);
+            const foreign = try std.json.Stringify.valueAlloc(a, m.types.EpisodeRequest{ .cursor = cursor }, .{});
+            try std.testing.expectError(error.InvalidMemoryCursor, store.service("bob", false, 20).execute(a, .episodes, "", foreign, ""));
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), page.items.len);
+            try std.testing.expectEqualStrings("turn-128", page.items[0].turns[0].evidence.evidence.id);
+            try std.testing.expect(page.complete and page.next_cursor == null);
+            const next = try store.service("alice", false, 20).execute(a, .episode, "UNPROVEN_THREAD_NAME", try std.json.Stringify.valueAlloc(a, m.types.EpisodeRequest{ .cursor = page.items[0].next_cursor }, .{}), "");
+            const turns = try std.json.parseFromSliceLeaky(m.types.Episode, a, next, .{});
+            try std.testing.expectEqualStrings("turn-129", turns.turns[0].evidence.evidence.id);
+        }
+    }
+}
+
+test "memory episode catalog pagination merges audience lanes without duplicate or missing threads" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    _ = try store.service("alice", true, 1).execute(a, .create, "", "{}", "create");
+    var alice: [40]m.types.Evidence = undefined;
+    var bob: [20]m.types.Evidence = undefined;
+    for (&alice, 0..) |*value, i| value.* = .{ .id = try std.fmt.allocPrint(a, "alice-{d}", .{i}), .source_id = "alice", .source_version = "1", .text = if (i < 20) "TEAM" else "ALICE_PRIVATE", .thread_id = try std.fmt.allocPrint(a, "thread-{d}", .{i}), .ordinal = 0, .visibility = if (i < 20) .team else .private };
+    for (&bob, 0..) |*value, i| value.* = .{ .id = try std.fmt.allocPrint(a, "bob-{d}", .{i}), .source_id = "bob", .source_version = "1", .text = "BOB_PRIVATE", .thread_id = try std.fmt.allocPrint(a, "thread-{d}", .{i + 10}), .ordinal = 1 };
+    _ = try store.service("alice", false, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = alice }, .{}), "alice");
+    _ = try store.service("bob", false, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = bob }, .{}), "bob");
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var cursor: ?[]const u8 = null;
+    for (0..11) |i| {
+        const raw = try store.service("bob", false, 4).execute(a, .episodes, "", try std.json.Stringify.valueAlloc(a, m.types.EpisodeRequest{ .limit = 3, .cursor = cursor }, .{}), "");
+        try std.testing.expect(std.mem.indexOf(u8, raw, "ALICE_PRIVATE") == null);
+        const page = try std.json.parseFromSliceLeaky(m.types.EpisodePage, a, raw, .{});
+        for (page.items) |episode| {
+            try std.testing.expect(!seen.contains(episode.thread_id));
+            try seen.put(a, episode.thread_id, {});
+        }
+        cursor = page.next_cursor;
+        if (cursor == null) {
+            try std.testing.expect(page.complete);
+            try std.testing.expect(i < 10);
+            break;
+        }
+    }
+    try std.testing.expect(cursor == null);
+    try std.testing.expectEqual(@as(usize, 30), seen.count());
+    for (0..30) |i| try std.testing.expect(seen.contains(try std.fmt.allocPrint(a, "thread-{d}", .{i})));
+}

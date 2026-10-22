@@ -219,6 +219,9 @@ it is not an independently revision-pinned historical resource. Dependencies
 can be followed through the ordinary native `explain` contract. Clients wanting
 a model-written description submit a grounded summary assertion or enable the
 existing optional managed summary stage. No generator is required to read views.
+Descriptions returned by graph recall use the full recall eligibility policy,
+including predicate, scope, kind, lifecycle and provisional filters. Their
+dependencies identify only assertions admitted under that same policy.
 
 ### Episodes and repeated mentions
 
@@ -234,9 +237,17 @@ as managed assertions do; external mentions use the ordinary evidence gate.
 An episode read filters each source and mention before returning text or entity
 IDs. Losing any conjunctive mention input removes that mention; independent
 surviving turns remain readable. Reads perform no whole-thread rebuild and do
-not invoke a model. One episode page examines at most 64 turns and 64 mention
-bindings per turn and reports incomplete member scans. Episode catalogs return
-only entries with a proven accessible member in the bounded preview. Foreground
+not invoke a model. Audience indexes separate team turns from each owner's
+private turns, with a global lane for administrators. Ordinary reads merge at
+most 64 index candidates from each of their two lanes, evaluate at most 64 ordered
+turns and 64 mention bindings per turn, and report incomplete member scans.
+Foreign private membership never affects absence, ordering or cursors. Admission
+and retirement maintain exact catalog membership counts atomically; repeated
+admission of the same evidence does not increment them. Episode catalogs return
+only entries with a proven accessible member. When expiry or source changes
+exhaust a bounded preview before one is found, the list cursor retains both the
+catalog position and unfinished member scan, so later members remain reachable.
+Foreground
 forgetting/expiry fences all views immediately; maintenance removes retired
 payload and orphaned indexes, retaining ID tombstones. Temporary resource denial
 is not authority for background global deletion.
@@ -265,6 +276,9 @@ an expected space revision, declared actor, evidence and optional qualified
 model metadata. The authenticated principal remains the authoritative initiator;
 a supplied actor is declared agent attribution. Accept applies the same native
 curation and belief rebuild atomically; config/input changes fence stale review.
+Verdict admission revalidates both the proposal's original evidence and any new
+judge evidence against current source resources. Retained changed captures may
+remain available for audit, but cannot authorize a new identity judgment.
 Terminal queue entries cannot be reopened by changing an idempotency token.
 
 Typed relationship candidates use `propose_relationship`,
