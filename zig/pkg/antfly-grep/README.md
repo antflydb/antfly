@@ -4562,3 +4562,23 @@ lanes. Default-budget image searches can overlap a manifest page only when
 conservative current-page retry/split headroom remains; explicit finite budgets
 and text-stage searches keep serial metadata admission. Server-owned conditional
 source identities remain [future API work](../../../docs/design/antfly-grep.md#future-generic-conditional-source-projection); warm images still receive full byte validation.
+
+The [rolling-evidence qualification](bench/results/grep-rolling-evidence-summary.json)
+compares this implementation with the preceding cross-parent binary. In a
+128-image workload (eight parents, sixteen 256 KiB images each), both use 17
+index requests. Cold peak RSS falls from 154.4 to 58.6 MiB on macOS and 150.9 to
+92.8 MiB in the two-CPU/1-GiB Linux VM. Warm peak RSS falls from 98.7 to 24.3 MiB
+and 122.9 to 41.1 MiB respectively. Cold elapsed medians are 420→436 ms on macOS
+and 489→432 ms in the VM; warm medians rise from 181→210 ms and 202→235 ms.
+Memory admission therefore trades some warm latency for a smaller working set.
+The slow-parent fixture improves cold elapsed time by about 6% on both hosts;
+ordinary workloads and CPU/first-output metrics do not improve uniformly.
+These fixtures impose 20 ms HTTP delays and synthetic constant scores; they
+establish no live-provider token savings or universal performance guarantee.
+
+Final validation passed 282/284 CLI cases on macOS and 281/284 in the Linux VM
+(two/three platform skips), 24 media regressions, 25 real-server cases (seven
+opt-in benchmark skips), package units, 31 packaging tests, 35 boundary-checker
+regressions and Windows cross-compilation. The server integration uses the
+previously frozen native server. Raw trials remain in ignored local output;
+the compact report records binary hashes, CPU, RSS, first output and limitations.

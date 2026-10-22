@@ -404,7 +404,10 @@ First stdout in the ranked fixture follows ranking completion; it is not a
 claim of streaming an early unranked hit. Live providers and real Cloud ACLs
 remain separate qualification. The [cross-parent qualification](../../zig/pkg/antfly-grep/bench/results/grep-cross-parent-summary.json)
 records wall time, CPU, memory and first-output tradeoffs on macOS and the
-constrained Linux VM; it does not establish zero-cost execution.
+constrained Linux VM; it does not establish zero-cost execution. The later
+[rolling-evidence qualification](../../zig/pkg/antfly-grep/bench/results/grep-rolling-evidence-summary.json)
+measures the rolling scheduler, shared admission and borrowed envelopes, including
+the sustained-image warm-latency/memory tradeoff.
 
 Warm scores still require fresh authorized asset validation. Avoiding those image
 bytes requires a generic server-owned source/asset identity contract: an identity
