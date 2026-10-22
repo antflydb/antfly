@@ -243,6 +243,11 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     });
     embedded_support_wasm_mod.addImport("antfly_data_uri", wasm_data_uri_mod);
+    embedded_support_wasm_mod.addImport("antfly_source_reference", b.createModule(.{
+        .root_source_file = b.path("lib/scraping/src/source_reference.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    }));
     const inference_work_mod = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/host/work.zig"),
         .target = wasm_target,

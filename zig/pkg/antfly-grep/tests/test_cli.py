@@ -8204,7 +8204,39 @@ class CliTests(unittest.TestCase):
             self.assertTrue(any(r["type"] == "workspace_delta" for r in rows), rows)
             self.assertFalse(any(r["type"] == "match" for r in rows), rows)
 
-    def test_workspace_cached_outcomes_expire_and_no_cache_bypasses(self):
+    def test_workspace_live_cached_outcomes_and_no_cache_bypasses(self):
+        self.write("src/a.txt", "STOP HIGH\n")
+        self.write("src/b.txt", "irrelevant\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--max-result-files=1",
+            # A cache-hit contract must not depend on requests finishing in
+            # the same wall-clock second on a loaded CI worker.
+            "--cache-ttl=3600",
+            "--threads=1",
+        ]
+        with self.workspace("src") as (ready, request):
+
+            def run(extra=()):
+                rows = request(
+                    "search", revision=ready["revision"], args=[*args, *extra]
+                )
+                return next(row for row in rows if row["type"] == "summary")
+
+            self.assertGreater(run()["requests"], 0)
+            warm = run()
+            self.assertEqual(warm["stats"]["query_cache_hits"], 1, warm)
+            self.assertEqual(warm["requests"], 0, warm)
+            for _ in range(2):
+                bypass = run(["--no-cache"])
+                self.assertGreater(bypass["requests"], 0, bypass)
+                self.assertEqual(bypass["stats"]["query_cache_hits"], 0, bypass)
+                self.assertEqual(
+                    bypass["stats"]["file_evaluation_cache_hits"], 0, bypass
+                )
+
+    def test_workspace_cached_outcomes_expire(self):
         self.write("src/a.txt", "STOP HIGH\n")
         self.write("src/b.txt", "irrelevant\n")
         args = [
@@ -8223,17 +8255,14 @@ class CliTests(unittest.TestCase):
                 return rows, next(row for row in rows if row["type"] == "summary")
 
             run()
-            self.assertEqual(run()[1]["stats"]["query_cache_hits"], 1)
+            # Expiration is a minimum-age assertion. Unlike a warm-hit
+            # assertion, extra scheduler delay cannot invalidate it.
             time.sleep(1.1)
             rows, summary = run(["--cached-only"])
             self.assertEqual(rows[-1]["exit_code"], 2)
             self.assertEqual(summary["requests"], 0)
             self.assertEqual(summary["stats"]["query_cache_hits"], 0)
             self.assertGreater(run()[1]["requests"], 0)
-            self.assertGreater(run(["--no-cache"])[1]["requests"], 0)
-            self.assertEqual(
-                run(["--no-cache"])[1]["stats"]["file_evaluation_cache_hits"], 0
-            )
 
     def test_workspace_conditional_results_are_scoped_and_replayed_ids_are_fresh(self):
         path = self.write("src/a.txt", "STOP HIGH\n")

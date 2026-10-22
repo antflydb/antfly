@@ -653,6 +653,12 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    const source_reference_mod = b.createModule(.{
+        .root_source_file = b.path("lib/scraping/src/source_reference.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scraping_mod.addImport("antfly_source_reference", source_reference_mod);
     scraping_mod.addImport("objectstore", objectstore_mod);
     scraping_mod.addImport("httpx", httpx_mod);
     const reranking_mod = b.createModule(.{
@@ -1246,6 +1252,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .middleware_openapi = middleware_openapi_mod,
         .scraping_openapi = scraping_openapi_mod,
         .scraping = scraping_mod,
+        .source_reference = source_reference_mod,
         .s3_openapi = s3_openapi_mod,
         .inference_config_openapi = inference_config_openapi_mod,
         .chunking_api_openapi = chunking_api_openapi_mod,
