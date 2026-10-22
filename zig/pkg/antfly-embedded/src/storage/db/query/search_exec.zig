@@ -11966,7 +11966,11 @@ const TextLiveVisibilityProducer = struct {
         const all: doc_set.ResolvedDocSet = .all;
         var live = try controlled(self.ctx, self.alloc, &all, self.generation, self.control);
         defer live.deinit(self.alloc);
-        if (live == .doc_keys) return null;
+        // Legacy bulk `.all` can mean inconclusive primary coverage, including
+        // rows created after the read generation. Only the all-visible proof
+        // at request setup may skip candidate checks; an unknown bulk result
+        // must not widen already-refined membership during adaptation.
+        if (live == .all or live == .doc_keys) return null;
         const Membership = struct {
             set: *const doc_set.ResolvedDocSet,
             pub fn contains(self_: @This(), ordinal: u32) bool {
@@ -35223,8 +35227,17 @@ test "text live visibility refines posting candidates and skips an all-visible f
         defer broad.deinit();
         try std.testing.expectEqual(@as(u64, 9996), broad.total_hits);
         try std.testing.expectEqual(@as(usize, 1), harness.broad_calls);
-        if (mode != .keys) try std.testing.expect(harness.seen <= 1024);
+        if (mode == .bitmap) try std.testing.expect(harness.seen <= 1024);
     }
+    // The legacy bulk callback's `.all` is inconclusive, not an all-visible
+    // proof. Force adaptation on a query that actually matches ordinal 112:
+    // publishing unfiltered membership here would incorrectly count 10,000.
+    harness.broad = .all;
+    harness.broad_calls = 0;
+    var inconclusive = try searchTextQuery(a, count_req, .match_all, executor);
+    defer inconclusive.deinit();
+    try std.testing.expectEqual(@as(u64, 9999), inconclusive.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), harness.broad_calls);
     // Providers without a controlled bulk API remain correct and cancellable
     // through bounded candidate batches rather than an opaque population scan.
     var bounded_executor = executor;

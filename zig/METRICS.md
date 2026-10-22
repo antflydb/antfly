@@ -190,7 +190,9 @@ posting candidates. Broad matches adapt to one immutable request bitmap;
 indexed inclusion is composed into the same producer so it retains the
 candidate execution path. Bulk identity scans and ordinal projection check
 request cancellation/deadlines at most every 256 rows. Providers without a
-controlled bulk visibility callback stay on bounded candidate batches.
+controlled bulk visibility callback stay on bounded candidate batches. An
+inconclusive legacy bulk result also retains candidate checks; it cannot
+replace the all-visible proof with unfiltered membership.
 
 ## Dense Stack Benchmark Profiles
 
