@@ -836,7 +836,7 @@ pub const Client = struct {
 
         const auth = if (self.options.token) |token| try std.fmt.allocPrint(self.a, "Bearer {s}", .{token}) else null;
         defer if (auth) |h| self.a.free(h);
-        const headers: []const [2][]const u8 = if (auth) |h| &.{.{ "Authorization", h }} else &.{};
+        const headers: []const [2][]const u8 = if (auth) |h| &.{ .{ "Authorization", h }, .{ "Content-Type", "application/json" } } else &.{.{ "Content-Type", "application/json" }};
         if (self.limits) |limits| {
             if (limits.cancel.load(.monotonic)) return error.Canceled;
             if (!@import("budget.zig").Limits.reserve(&limits.requests, 1, self.options.max_requests)) return error.RequestBudgetExceeded;
@@ -855,7 +855,7 @@ pub const Client = struct {
         }
         self.recordRequest(body.len, inputs.len);
         var response = try (self.shared_http orelse &self.http).post(self.options.endpoint, .{
-            .json = body,
+            .borrowed_body = body,
             .headers = headers,
             .timeout_ms = self.options.timeout_ms,
             .max_response_size = 4 * 1024 * 1024,

@@ -4546,3 +4546,19 @@ instead of clearing all 4,096 entries, retaining 4,095 existing facts. Proof
 lookup and registration take one lock per bounded window of up to 64 rows.
 Epoch, owner and publication checks still fence reuse; a cached fact never
 authorizes an asset or substitutes for a complete predicate certificate.
+
+
+Cross-parent workers now refill as each lane completes, with a fixed 16-slot
+ordered completion buffer and the existing global pending-output quota. Shared
+asset responses retire after their last wave borrower. Ordinary parsed strings
+borrow their retained response, removing a second base64-string allocation;
+response bytes count toward the page memory limit. Image-wave scratch has a
+shared 64 MiB conservative admission budget, separate from cumulative source
+bytes and provider concurrency. This is an admission estimate, not an RSS cap.
+
+Fallback asset reads use the invocation's request counter and cancellation token.
+The default 1,000-request cap applies to all index and provider attempts across
+lanes. Default-budget image searches can overlap a manifest page only when
+conservative current-page retry/split headroom remains; explicit finite budgets
+and text-stage searches keep serial metadata admission. Server-owned conditional
+source identities remain [future API work](../../../docs/design/antfly-grep.md#future-generic-conditional-source-projection); warm images still receive full byte validation.

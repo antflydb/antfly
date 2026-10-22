@@ -1659,11 +1659,31 @@ pub const Search = struct {
                 };
             };
         }
+        pub const Result = struct {
+            output: std.Io.Writer.Allocating,
+            reserved: usize,
+            failure: ?anyerror,
+            pub fn emit(self: *Result, root: *Search) !void {
+                try root.write(self.output.written());
+                if (!root.options.ranked and !root.options.block_buffered) try root.flushOutput();
+                if (self.failure) |err| return err;
+            }
+            pub fn deinit(self: *Result, root: *Search) void {
+                _ = root.limits.pending_output.fetchSub(self.reserved, .monotonic);
+                self.output.deinit();
+            }
+        };
         pub fn finish(self: *IndexedLane, root: *Search) !void {
-            if (self.handle) |handle| handle.join() else return;
+            if (self.handle == null) return;
+            var result = try self.take(root);
+            defer result.deinit(root);
+            try result.emit(root);
+        }
+        pub fn take(self: *IndexedLane, root: *Search) !Result {
+            self.handle.?.join();
             self.handle = null;
             const child = &self.search;
-            defer {
+            errdefer {
                 _ = root.limits.pending_output.fetchSub(child.reserved_output, .monotonic);
                 child.reserved_output = 0;
                 self.output.clearRetainingCapacity();
@@ -1684,9 +1704,10 @@ pub const Search = struct {
             try root.tasks.ensureUnusedCapacity(root.a, child.tasks.items.len);
             for (child.tasks.items) |task| root.tasks.appendAssumeCapacity(task);
             child.tasks.clearRetainingCapacity();
-            try root.write(self.output.written());
-            if (!root.options.ranked and !root.options.block_buffered) try root.flushOutput();
-            if (self.failure) |err| return err;
+            const result: Result = .{ .output = self.output, .reserved = child.reserved_output, .failure = self.failure };
+            self.output = .init(root.a);
+            child.reserved_output = 0;
+            return result;
         }
         pub fn deinit(self: *IndexedLane, root: *Search) void {
             std.debug.assert(self.handle == null);
@@ -1919,6 +1940,7 @@ pub const Search = struct {
             const cap = if (self.options.quiet or self.options.files_with_matches or self.options.files_without_match) @as(usize, 1) else @min(selection_limit - selected, @min(@as(usize, 16), self.options.decisionBatchSize() *| self.options.providerJobs()));
             var end = offset;
             var estimated: usize = 0;
+            var working_set: usize = 0;
             var failure: ?anyerror = null;
             const limits = self.shared_limits orelse &self.limits;
             while (end < doc.evidence.len and end - offset < cap) {
@@ -1930,12 +1952,20 @@ pub const Search = struct {
                     break;
                 }
                 estimated +|= bytes;
+                // Borrowed response strings and synchronous HTTP envelopes
+                // avoid retaining a second full body per input. Account URL
+                // retention, transient decode and bounded provider scratch
+                // independently from the transport-wave limit.
+                working_set +|= unit.asset.byte_length *| 4 +| unit.text.len *| 8 +| doc.path.len *| 8 +| 65536;
                 end += 1;
             }
             if (end == offset) return failure orelse error.InvalidEvidenceUnits;
             const units = doc.evidence[offset..end];
             offset = end;
             self.summary.regions_considered += units.len;
+            try limits.acquireEvidence(self.io, working_set);
+            defer limits.releaseEvidence(self.io, working_set);
+            defer loader.releaseWave();
             var scratch = std.heap.ArenaAllocator.init(self.a);
             defer scratch.deinit();
             const a = scratch.allocator();

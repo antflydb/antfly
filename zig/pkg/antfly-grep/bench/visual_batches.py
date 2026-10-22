@@ -51,6 +51,8 @@ def main():
         help="disable ranking to measure first streaming output",
     )
     parser.add_argument("--delay-ms", type=float, default=20)
+    parser.add_argument("--slow-first-ms", type=float, default=0)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if (
@@ -60,6 +62,8 @@ def main():
         or not 1 <= args.page_size <= 1000
         or not 0 <= args.image_bytes <= 500000
         or args.delay_ms < 0
+        or args.slow_first_ms < 0
+        or not 1 <= args.batch_size <= 128
     ):
         parser.error(
             "positive rounds, 1..16 units, 1..64 parents, 1..1000 page size, nonnegative delay required"
@@ -140,6 +144,7 @@ def main():
                     settings["page_size"] = args.page_size
                     Path(config).write_text(json.dumps(settings))
                     case.server.delay = args.delay_ms / 1000
+                    case.server.slow_first_ms = args.slow_first_ms
                     for phase in ("cold", "warm"):
                         case.server.requests.clear()
                         case.server.index_requests.clear()
@@ -151,7 +156,7 @@ def main():
                             "--json",
                             "--table-config",
                             config,
-                            "--batch-size=8",
+                            f"--batch-size={args.batch_size}",
                             "--decision-concurrency=8",
                             "--decision-batch-wait-ms=20",
                         ]
@@ -264,6 +269,8 @@ def main():
         "ranked": not args.stream,
         "rounds": args.rounds,
         "per_request_delay_ms": args.delay_ms,
+        "slow_first_ms": args.slow_first_ms,
+        "batch_size": args.batch_size,
         "binaries": {
             name: {
                 "path": str(path),

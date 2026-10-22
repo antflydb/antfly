@@ -149,6 +149,11 @@ pub const Loader = struct {
     ctx: *anyopaque,
     load: *const fn (*anyopaque, A, Unit) anyerror!Image,
     load_many: ?*const fn (*anyopaque, A, []const Unit, []Loaded) anyerror!void = null,
+    /// Retire borrowed wave backing only after its last score/output user.
+    release_wave: ?*const fn (*anyopaque) void = null,
+    pub fn releaseWave(self: Loader) void {
+        if (self.release_wave) |release| release(self.ctx);
+    }
     pub fn batch(self: Loader, a: A, units: []const Unit, output: []Loaded) !void {
         std.debug.assert(units.len == output.len);
         if (self.load_many) |many| return many(self.ctx, a, units, output);

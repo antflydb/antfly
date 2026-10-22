@@ -343,6 +343,12 @@ Each lane owns mutable matcher and decision state and shares the invocation's
 atomic budgets, cancellation, HTTP pools, score store and synchronized ranking or
 spill owner. Lane output is charged to the common pending-output budget and
 published in discovery order; ranked results retain their existing stable order.
+Completed lanes immediately accept later parents on the same manifest page.
+Completion records own their output and its existing global quota reservation;
+a fixed 16-slot reorder buffer also bounds zero-byte result metadata. When that
+buffer approaches capacity, admission waits for the oldest outstanding parent.
+A slow parent therefore cannot grow a corpus-sized queue. Error paths cancel,
+join and release all borrowers without waiting for a missing sequence forever.
 Compatible model work coalesces across parents with unique wire IDs. A
 single-parent window retains intra-document provider parallelism.
 
@@ -357,6 +363,12 @@ Missing/denied/changed parents do not authorize their image bytes or score reuse
 The asset page is immutable and pinned until all lanes finish; validated URL
 views can borrow that page without a second base64-string copy. The grant covers
 one wave only: later waves fetch and authorize current parent state again.
+Reference counts retire shared asset responses after their last wave borrower,
+not after the longest parent finishes. Parsed ordinary strings borrow the retained
+HTTP body; escaped strings remain arena-owned. The response bytes and parser
+allocations share the configured page memory bound. Split point responses also
+remain pinned through their wave instead of copying their base64 payloads.
+Response JSON rejects duplicate keys and nesting beyond 256 levels.
 
 Response-size/HTTP-413/memory rejection of a parent group falls back to bounded
 individual parent reads. Oversized same-parent projections split the image-field
@@ -368,11 +380,21 @@ silently shrink its limit and omit requested parents.
 
 Explicit finite request budgets, finite source/evaluation budgets and early file
 selection retain ordered serial admission. The default 1,000-attempt safety cap
-continues to apply to actual HTTP requests across all lanes; parallelism does not
-turn it into an unlimited allowance. Groups respect per-document selection limits
+continues to apply to actual HTTP requests across all lanes, including fallback
+asset projections and their cancellation callbacks. Parallelism does not turn it
+into an unlimited allowance. Default-budget image searches may prefetch one
+manifest page only when a conservative bound for the current page's complete
+provider/field split trees and retries leaves request headroom. Explicit finite
+budgets and text stages retain serial metadata admission. Groups respect per-document selection limits
 and the remaining indexed-document quota. Active lanes, borrowed pages and output
 are bounded independently of corpus size. This is a latency/throughput tradeoff:
 more active parents may raise RSS even while reducing requests and CPU.
+Image waves additionally share a 64 MiB conservative working-set admission pool,
+independent of cumulative source-byte and provider-concurrency limits. A wave's
+weight includes decoded, encoded and serialization scratch; waiting is cancelable
+and every failure releases its lease. This bounds admitted estimated work, not
+all process RSS: HTTP bodies, manifest pages, output and allocator overhead retain
+their separate bounds.
 
 The benchmark driver includes multi-page/multi-parent cases and large encoded
 images. Its Unix child wrapper records child wall/CPU time, first stdout byte and
@@ -392,3 +414,27 @@ metadata. A trusted identity may select a previously verified score; absent or
 changed identity must materialize and validate bytes. No caller-written manifest,
 TTL, cached permission result or segment ID establishes that guarantee. The CLI
 retains full validation until that server contract exists.
+
+
+### Future generic conditional source projection
+
+Skipping warm image bytes requires a general query-source contract, rather than
+a grep endpoint or a caller-maintained companion digest. A future conditional
+projection should request explicit logical source paths and return opaque,
+versioned value identities computed or certified by the server. Identities must
+bind exact stored values at the same authorized read cut as returned metadata.
+The server may omit a value only when a supplied previous identity matches that
+current value; a caller-supplied expected identity is a condition, never proof.
+Missing fields must differ from stored nulls, and missing/old authorities require
+value reads or ordinary full projection. Current filters and authorization apply
+before every omission decision, including retained snapshots and distributed or
+external-table reads. No cached authorization grant survives into a later query.
+
+The client would retain only bounded, verified image descriptors (decoded digest,
+MIME, dimensions, length and source identity) beside scores, scoped by endpoint,
+table, parent, field and credential context. Changed identities or missing scores
+materialize and validate payloads again. Capability negotiation must preserve
+full-byte fallback against older servers. Digest persistence belongs with the
+existing storage-owned projection authorities and publication fences, not in an
+ingester-owned schema field. This contract and its client reuse path are future
+work; the current implementation continues to fetch and validate warm bytes.

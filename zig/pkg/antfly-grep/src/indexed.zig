@@ -114,12 +114,13 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     // Finite decision budgets preserve foreground order: speculative page
     // requests must not consume the budget reserved by the user for evidence.
     const budgeted_decisions = search.options.ask != null and (search.options.max_requests != std.math.maxInt(usize));
-    const overlap = config.prefetch and !budgeted_decisions and !search.options.quiet and search.options.max_count == std.math.maxInt(usize);
+    const overlap = config.prefetch and (!budgeted_decisions or (search.options.media == .images and !search.options.max_requests_explicit)) and
+        !search.options.quiet and search.options.max_count == std.math.maxInt(usize);
     if (overlap) fetcher.thread = try std.Thread.spawn(.{}, Fetch.worker, .{&fetcher});
     defer fetcher.finish();
     const Search = @typeInfo(@TypeOf(search)).pointer.child;
     const Lane = Search.IndexedLane;
-    const Job = struct { lane: *Lane, resolver: AssetResolver(@TypeOf(search)) = undefined };
+    const Job = struct { lane: *Lane, resolver: AssetResolver(@TypeOf(search)) = undefined, sequence: usize = 0, page: ?*Page = null };
     // Finite evaluation budgets and early-selection modes retain discovery order.
     const parallel = search.options.media == .images and (!budgeted_decisions or !search.options.max_requests_explicit) and
         search.options.max_regions == std.math.maxInt(usize) and search.options.max_source_bytes == std.math.maxInt(usize) and
@@ -127,12 +128,123 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     const lane_count = if (parallel) @min(@as(usize, 8), search.options.providerJobs()) else 1;
     var pool: @import("worker_pool.zig").Pool = .{ .io = search.io };
     defer pool.deinit();
-    var jobs: [8]Job = undefined;
-    var initialized: usize = 0;
-    defer for (jobs[0..initialized]) |*job| {
-        job.lane.finish(search) catch {};
-        job.lane.deinit(search);
+    const Scheduler = struct {
+        root: *Search,
+        pool: *@import("worker_pool.zig").Pool,
+        jobs: [8]Job = undefined,
+        initialized: usize = 0,
+        sequence: usize = 0,
+        next: usize = 0,
+        failed: bool = false,
+        // Bound metadata as well as charged output bytes when the oldest
+        // document is slow. No corpus-sized reorder queue can accumulate.
+        completed: [16]?struct { sequence: usize, result: Lane.Result } = @splat(null),
+        fn emit(self: *@This()) !void {
+            errdefer {
+                self.failed = true;
+                self.root.limits.cancel.store(true, .release);
+            }
+            while (true) {
+                var found = false;
+                for (&self.completed) |*slot| if (slot.*) |*entry| {
+                    if (entry.sequence != self.next) continue;
+                    defer {
+                        entry.result.deinit(self.root);
+                        slot.* = null;
+                    }
+                    self.next += 1;
+                    try entry.result.emit(self.root);
+                    found = true;
+                    break;
+                };
+                if (!found) return;
+            }
+        }
+        fn harvest(self: *@This(), job: *Job) !void {
+            errdefer {
+                self.failed = true;
+                self.root.limits.cancel.store(true, .release);
+            }
+            defer if (job.page) |page| {
+                page.deinit(self.root.a);
+                job.page = null;
+            };
+            for (&self.completed) |*slot| if (slot.* == null) {
+                slot.* = .{ .sequence = job.sequence, .result = try job.lane.take(self.root) };
+                try self.emit();
+                return;
+            };
+            unreachable;
+        }
+        fn vacant(self: *@This(), max: usize) !usize {
+            while (true) {
+                try self.emit();
+                const room = for (self.completed) |slot| {
+                    if (slot == null) break true;
+                } else false;
+                // Leave room for the next completed head even when later
+                // results have filled the reorder buffer.
+                const free_count = blk: {
+                    var n: usize = 0;
+                    for (self.completed) |slot| {
+                        n += @intFromBool(slot == null);
+                    }
+                    break :blk n;
+                };
+                if (free_count <= max) {
+                    var oldest: ?*Job = null;
+                    for (self.jobs[0..self.initialized]) |*job| if (job.lane.handle != null and (oldest == null or job.sequence < oldest.?.sequence)) {
+                        oldest = job;
+                    };
+                    if (oldest) |job| {
+                        try self.harvest(job);
+                        continue;
+                    }
+                }
+                if (room) for (self.jobs[0..self.initialized]) |*job| {
+                    if (job.lane.handle) |handle| if (self.pool.completed(handle)) try self.harvest(job);
+                };
+                for (self.jobs[0..self.initialized], 0..) |job, i| if (job.lane.handle == null) return i;
+                if (self.initialized < max) {
+                    const slot = self.initialized;
+                    self.jobs[slot] = .{ .lane = try Lane.init(self.root) };
+                    self.initialized += 1;
+                    return slot;
+                }
+                self.pool.waitForCompletion();
+            }
+        }
+        fn finish(self: *@This()) !void {
+            if (self.failed) return error.Canceled;
+            // Drain by sequence on every normal and error path.
+            while (self.next < self.sequence) {
+                try self.emit();
+                if (self.next == self.sequence) break;
+                for (self.jobs[0..self.initialized]) |*job| if (job.lane.handle != null and job.sequence == self.next) {
+                    try self.harvest(job);
+                    break;
+                };
+            }
+        }
+        fn deinit(self: *@This()) void {
+            self.finish() catch {};
+            for (self.jobs[0..self.initialized]) |*job| {
+                if (self.failed) {
+                    if (job.lane.handle != null) {
+                        if (job.lane.take(self.root)) |value| {
+                            var discarded = value;
+                            discarded.deinit(self.root);
+                        } else |_| {}
+                    }
+                } else job.lane.finish(self.root) catch {};
+                if (job.page) |page| page.deinit(self.root.a);
+                job.lane.deinit(self.root);
+            }
+            for (&self.completed) |*slot| if (slot.*) |*entry| entry.result.deinit(self.root);
+        }
     };
+    var scheduler: Scheduler = .{ .root = search, .pool = &pool };
+    defer scheduler.deinit();
     var page_size = config.page_size;
     var pending = false;
     while (!search.stopped()) {
@@ -165,7 +277,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             next_cursor = sort.array.items;
         }
         const has_next = hits.array.items.len == page_size;
-        if (loaded.memory.peak < config.max_page_memory / 4) page_size = @min(config.page_size, page_size * 2);
+        if (loaded.memory.peak + (if (loaded.response) |response| (if (response.body) |body_bytes| body_bytes.len else @as(usize, 0)) else @as(usize, 0)) < config.max_page_memory / 4) page_size = @min(config.page_size, page_size * 2);
         if (has_next) {
             // Copy only continuation state. Recycle every previous page before
             // receiving the next; no document corpus accumulates in memory.
@@ -180,35 +292,26 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             state.deinit();
             state = fresh;
         }
-        if (overlap and has_next and count.* + hits.array.items.len < search.options.max_index_documents) {
+        if (overlap and has_next and count.* + hits.array.items.len < search.options.max_index_documents and prefetchHeadroom(search, table, hits.array.items)) {
             fetcher.submit(.{ .cursor = cursor, .snapshot = snapshot, .page_size = page_size });
             pending = true;
         }
-        var submitted: usize = 0;
         var materialized: ?Materialized = null;
         var window_end: usize = 0;
-        var window_width: usize = 1;
         defer if (materialized) |group| group.page.deinit(search.a);
         // Drain every borrowed page before its arena is released, including
         // cancellation, projection failures and output-budget errors.
-        defer for (jobs[0..initialized]) |*job| {
-            job.lane.finish(search) catch {};
-        };
+        defer scheduler.finish() catch {};
         for (hits.array.items, 0..) |hit, hit_index| {
             if (search.stopped()) return;
             if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
             if (lane_count > 1 and hit_index == window_end) {
-                for (0..@min(submitted, lane_count)) |i| {
-                    const index = if (submitted < lane_count) i else (submitted + i) % lane_count;
-                    try jobs[index].lane.finish(search);
-                }
-                submitted = 0;
+                _ = try scheduler.vacant(lane_count);
                 if (materialized) |group| group.page.deinit(search.a);
                 materialized = null;
                 window_end = @min(hits.array.items.len, hit_index + @min(lane_count, search.options.max_index_documents - count.*));
                 materialized = try prefetchAssets(search, http, config, table, url, user_filter, a, hits.array.items[hit_index..window_end], &discovery);
                 if (materialized) |group| window_end = hit_index + group.covered_hits;
-                window_width = window_end - hit_index;
             }
             if (search.stopped()) return;
             if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
@@ -254,37 +357,54 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             if (search.options.media == .images) {
                 const units = document.field(value, "evidence");
                 if (units) |raw| doc.evidence = try @import("antfly_source_evidence").parseUnits(a, raw);
-                doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany };
+                doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
             }
             if (lane_count > 1) {
-                const slot = submitted % lane_count;
-                if (slot == initialized) {
-                    jobs[slot].lane = try Lane.init(search);
-                    initialized += 1;
-                }
-                const job = &jobs[slot];
-                try job.lane.finish(search);
+                const slot = try scheduler.vacant(lane_count);
+                const job = &scheduler.jobs[slot];
                 job.resolver = resolver;
                 job.resolver.materialized = materialized;
+                job.resolver.wave_page = &job.page;
+                if (materialized) |group| {
+                    group.page.retain();
+                    job.page = group.page;
+                }
+                job.sequence = scheduler.sequence;
                 job.resolver.search = &job.lane.search;
-                doc.evidence_loader = .{ .ctx = &job.resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany };
-                job.lane.search.decider.allow_parallel = window_width == 1;
+                doc.evidence_loader = .{ .ctx = &job.resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
+                // Wave memory admission bounds active parents; the shared
+                // provider semaphore bounds nested batches across all lanes.
+                job.lane.search.decider.allow_parallel = true;
                 job.lane.search.next_ordinal = search.next_ordinal;
                 search.next_ordinal += 1;
                 job.lane.doc = doc;
                 job.lane.failure = null;
                 job.lane.handle = try pool.launch(Lane.run, job.lane);
-                submitted += 1;
+                scheduler.sequence += 1;
             } else search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
         }
-        // Stable draining order is also the discovery order after ring wrap.
-        if (initialized > 0) for (0..@min(submitted, lane_count)) |i| {
-            const index = if (submitted < lane_count) i else (submitted + i) % lane_count;
-            try jobs[index].lane.finish(search);
-        };
+        try scheduler.finish();
         if (!has_next) return;
     }
 }
+/// Speculation must not steal the last request from the current image page.
+/// Bound complete field/provider split trees and every retry, not just batches
+/// expected to succeed. Text stages have no comparable finite structural bound.
+fn prefetchHeadroom(search: anytype, table: Table, hits: []const std.json.Value) bool {
+    if (search.options.max_requests == std.math.maxInt(usize)) return true;
+    if (search.options.max_requests_explicit or search.options.media != .images) return false;
+    var foreground: usize = 0;
+    for (hits) |hit| {
+        const source = document.field(hit, "_source") orelse return false;
+        const value = document.at(source, table.document_field) orelse return false;
+        const units = document.field(value, "evidence") orelse return false;
+        if (units != .array) return false;
+        foreground +|= units.array.items.len *| 8 *| (search.options.retries +| 1);
+    }
+    const remaining = search.options.max_requests -| search.limits.requests.load(.monotonic);
+    return foreground +| (search.options.retries +| 1) < remaining;
+}
+
 const Materialized = struct { page: *Page, fields: []const []const u8, covered_hits: usize };
 
 /// Group only equal projection shapes. Unioning unrelated per-parent fields
@@ -309,6 +429,7 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
         if (raw.array.items.len == 0) continue;
         var fields: std.ArrayList([]const u8) = .empty;
         var bytes: usize = 65536;
+        var wave_bytes: usize = 0;
         var wave: usize = 0;
         const width = @min(raw.array.items.len, @min(@as(usize, 16), @min(search.options.decisionBatchSize() *| search.options.providerJobs(), @min(search.options.max_count, search.options.max_regions_per_file))));
         for (raw.array.items[0..width]) |entry| {
@@ -317,8 +438,11 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
             const unit = media.Unit.parse(a, entry) catch return null;
             if (unit.asset.byte_length > search.options.max_image_bytes) return null;
             const cost = unit.asset.byte_length *| 2 +| unit.text.len *| 8 +| path.len *| 8 +| 65536;
-            if (wave > 0 and cost > 8 * 1024 * 1024 -| bytes) break;
-            bytes +|= cost;
+            if (wave > 0 and cost > 8 * 1024 * 1024 -| wave_bytes) break;
+            wave_bytes +|= cost;
+            // Projection transfer and decoded/provider scratch are separate
+            // stages. Do not multiply HTTP requests by charging both here.
+            bytes +|= unit.asset.byte_length *| 2 +| unit.text.len *| 8 +| path.len *| 8 +| 65536;
             wave += 1;
             const present = for (fields.items) |field| {
                 if (std.mem.eql(u8, field, unit.asset.field)) break true;
@@ -357,12 +481,19 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
 }
 
 const Page = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    response: ?httpx.Response = null,
     memory: @import("antfly_regex").Budget,
     arena: std.heap.ArenaAllocator,
-    parsed: std.json.Parsed(std.json.Value),
+    parsed: struct { value: std.json.Value },
     page_size: usize,
+    fn retain(self: *Page) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
     fn deinit(self: *Page, a: A) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
         self.arena.deinit();
+        if (self.response) |*response| response.deinit();
         a.destroy(self);
     }
 };
@@ -475,13 +606,13 @@ const Fetch = struct {
             const memory = &page.memory;
             const body = try std.json.Stringify.valueAlloc(a, .{ .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
             const auth = if (self.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
-            const headers: ?[]const [2][]const u8 = if (auth) |value| &.{.{ "Authorization", value }} else null;
+            const headers: ?[]const [2][]const u8 = if (auth) |value| &.{ .{ "Authorization", value }, .{ "Content-Type", "application/json" } } else &.{.{ "Content-Type", "application/json" }};
             var attempt: usize = 0;
             const parsed = retry: while (true) {
                 if (self.stopped()) return error.Canceled;
                 if (!Limits.reserve(&self.limits.requests, 1, self.options.max_requests)) return error.RequestBudgetExceeded;
                 self.summary.index_requests += 1;
-                var response = self.http.post(self.url, .{ .json = body, .headers = headers, .timeout_ms = self.options.timeout_ms, .max_response_size = self.config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .cancellation = httpx.CancellationToken.fromCallback(self, Fetch.cancelled) }) catch |err| {
+                var response = self.http.post(self.url, .{ .borrowed_body = body, .headers = headers, .timeout_ms = self.options.timeout_ms, .max_response_size = self.config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .cancellation = httpx.CancellationToken.fromCallback(self, Fetch.cancelled) }) catch |err| {
                     if (self.ordered and err == error.ResponseTooLarge and page_size.* > 1) {
                         page_size.* = @max(1, page_size.* / 2);
                         continue :resize;
@@ -491,7 +622,8 @@ const Fetch = struct {
                     attempt += 1;
                     continue;
                 };
-                defer response.deinit();
+                var transferred = false;
+                defer if (!transferred) response.deinit();
                 const status = response.status.code;
                 if (status == 413 and !self.ordered) return error.IndexProjectionTooLarge;
                 if (status == 413 and page_size.* > 1) {
@@ -507,13 +639,26 @@ const Fetch = struct {
                     attempt += 1;
                     continue;
                 }
-                const decoded = std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.EmptyIndexResponse, .{ .allocate = .alloc_always }) catch |err| {
+                const response_body = response.body orelse return error.EmptyIndexResponse;
+                // Retain the response instead of copying ordinary JSON strings
+                // (notably base64 payloads). Charge retained bytes alongside
+                // parsed allocations; escaped strings are still arena-owned.
+                memory.limit = self.config.max_page_memory -| response_body.len;
+                if (memory.live > memory.limit) {
+                    if (self.ordered and page_size.* > 1) {
+                        page_size.* = @max(1, page_size.* / 2);
+                        continue :resize;
+                    }
+                    return error.IndexPageMemoryExceeded;
+                }
+                const value = @import("borrowed_json.zig").parse(a, response_body) catch |err| {
                     if (self.ordered and memory.denied and page_size.* > 1) {
                         page_size.* = @max(1, page_size.* / 2);
                         continue :resize;
                     }
                     return if (memory.denied) error.IndexPageMemoryExceeded else err;
                 };
+                const decoded: @FieldType(Page, "parsed") = .{ .value = value };
                 const envelope = document.field(decoded.value, "responses") orelse return error.InvalidIndexResponse;
                 if (envelope != .array or envelope.array.items.len != 1) return error.InvalidIndexResponse;
                 const result_status = document.integer(document.field(envelope.array.items[0], "status")) orelse return error.InvalidIndexResponse;
@@ -528,6 +673,8 @@ const Fetch = struct {
                     attempt += 1;
                     continue;
                 }
+                page.response = response;
+                transferred = true;
                 break :retry decoded;
             };
             page.parsed = parsed;
@@ -686,6 +833,19 @@ fn AssetResolver(comptime SearchType: type) type {
         revision: []const u8,
         filter: ?std.json.Value,
         materialized: ?Materialized = null,
+        wave_page: ?*?*Page = null,
+        point_pages: [16]?*Page = @splat(null),
+        fn releaseWave(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (&self.point_pages) |*slot| if (slot.*) |page| {
+                page.deinit(self.search.a);
+                slot.* = null;
+            };
+            if (self.wave_page) |lease| if (lease.*) |page| {
+                page.deinit(self.search.a);
+                lease.* = null;
+            };
+        }
         const media = @import("antfly_source_evidence");
         fn load(raw: *anyopaque, a: A, unit: media.Unit) !media.Image {
             var result: [1]media.Loaded = undefined;
@@ -739,7 +899,7 @@ fn AssetResolver(comptime SearchType: type) type {
             }
             if (fields.items.len == 2) return;
             const ids = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = .{self.id} } } }, .{});
-            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false };
+            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false };
             defer self.search.summary.index_requests += fetch.summary.index_requests;
             // Point reads deliberately omit ordering/cursors. They reauthorize
             // current rows without creating a durable pagination snapshot.
@@ -753,7 +913,8 @@ fn AssetResolver(comptime SearchType: type) type {
                 break :blk true;
             } else false;
             const page = if (borrowed) self.materialized.?.page else try fetch.load(.{ .cursor = null, .snapshot = null, .page_size = 1 });
-            defer if (!borrowed) page.deinit(self.search.a);
+            var transferred = false;
+            defer if (!borrowed and !transferred) page.deinit(self.search.a);
             const responses = document.field(page.parsed.value, "responses") orelse return error.InvalidIndexResponse;
             if (responses != .array or responses.array.items.len != 1) return error.InvalidIndexResponse;
             const result = responses.array.items[0];
@@ -774,6 +935,14 @@ fn AssetResolver(comptime SearchType: type) type {
             const parent = document.at(source, self.table.document_field) orelse return error.InvalidIndexResponse;
             if (!document.allowed(parent, self.config.principals)) return error.IndexAuthorizationFailed;
             if (!std.mem.eql(u8, try document.string(parent, "revision"), self.revision)) return error.EvidenceRevisionChanged;
+            if (!borrowed) {
+                for (&self.point_pages) |*slot| if (slot.* == null) {
+                    slot.* = page;
+                    transferred = true;
+                    break;
+                };
+                if (!transferred) return error.InvalidEvidenceUnits;
+            }
             for (units, output, 0..) |unit, *item, i| {
                 if (item.* == .failed and item.failed != error.MissingEvidenceAsset) continue;
                 const reused = for (units[0..i], output[0..i]) |prior, value| {
@@ -788,13 +957,12 @@ fn AssetResolver(comptime SearchType: type) type {
                     item.* = .{ .failed = error.InvalidEvidenceAsset };
                     continue;
                 }
-                var image = media.Image.fromDataUrl(a, payload.string, unit.asset, self.search.options.max_image_bytes, self.search.options.max_image_pixels) catch |err| {
+                const image = media.Image.fromDataUrl(a, payload.string, unit.asset, self.search.options.max_image_bytes, self.search.options.max_image_pixels) catch |err| {
                     item.* = .{ .failed = err };
                     continue;
                 };
-                // Group pages are pinned until every lane joins. Point pages
-                // retire here, so only those require a retained URL copy.
-                if (!borrowed) image.data_url = try a.dupe(u8, image.data_url);
+                // Both grouped and split point responses are pinned through
+                // the wave; no second base64 URL allocation is needed.
                 item.* = .{ .image = image };
             }
         }
