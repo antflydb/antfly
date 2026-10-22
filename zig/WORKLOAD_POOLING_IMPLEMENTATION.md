@@ -23474,3 +23474,40 @@ exactly three expected error logs. Separate error ABI (43), released status ABI
 (1) and failure identity (7) checks pass. All 5,506 native/schema inputs remain
 unchanged, with receipts under `controlled-derived-finalization-final` and
 `controlled-derived-finalization-regressions` in the cumulative directory.
+
+
+### Index apply contention releases catalog ownership
+
+Managed and vector apply acquisition no longer wait for a per-index mutex while
+pinning the catalog read lease. The default path releases the catalog on failed
+apply acquisition, yields through the injected I/O runtime, then resolves the
+current index and mutex again. Successful guards still hold both resources
+through use. This allows structural writers to retire or replace a generation
+without being pinned by unrelated queued apply callers. Names remain borrowed
+from callers for the full acquisition.
+
+Controlled variants require the original finite lifetime and execution-wait
+boundary. They lend execution only after releasing catalog ownership; pointer
+lookup and apply acquisition occur after successful reentry. Catalog acquisition
+uses the existing controlled writer-preferring lock. A physical retry sleep does
+not acquire guards while parked. Missing wait/deadline authority fails closed,
+and begin, lifetime and reentry failures leave no acquired catalog/apply guard.
+The helper resolves all five index kinds plus dense/sparse vector selection.
+
+Pinned Darwin Debug validation passes 53 build steps and 57 focused tests,
+including replacement during a parked acquisition across all five kinds and
+original-failure matrices. A separate current-source regression run passes 62
+tests without skips or leaks, including live vector lock sharing, text query and
+publication lifetime, dense replay/resource budgets, algebraic pointer stability
+and threaded runtime shutdown. Its three error logs are all expected. Separate
+error ABI (43), released status ABI (1), and failure identity (7) checks pass.
+All 5,506 native/schema inputs match the receipts under `controlled-index-apply-v2`
+and `controlled-index-apply-regressions`.
+
+These checks establish catalog/control progress and lock ownership, not
+cross-engine performance or complete callback funding. Controlled acquisition
+still must be threaded through finalization and other remaining callers;
+compatibility paths do not inherit a request deadline. Opaque callback I/O/cost
+contracts, mandatory completion, other stage/backend teardown and the broader
+qualification gates remain open. Strong required providers remain disabled.
+Full GNU/Linux qualification is waived; Linux requires pinned Nix/glibc Zig.

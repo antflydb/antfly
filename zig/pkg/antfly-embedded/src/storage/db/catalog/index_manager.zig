@@ -3320,52 +3320,103 @@ pub const IndexManager = struct {
         }
     }
 
-    pub fn lockManagedIndexApply(self: *IndexManager, index_ref: ManagedIndexRef) !ManagedIndexApplyGuard {
-        self.catalog_mutex.lockShared();
-        errdefer self.catalog_mutex.unlockShared();
-        const mutex = switch (index_ref.kind) {
+    const ApplyTarget = struct { name: []const u8, kind: ?types.IndexKind };
+
+    fn applyMutexAssumeCatalog(self: *IndexManager, target: ApplyTarget) !*std.atomic.Mutex {
+        const kind = target.kind orelse {
+            if (self.denseIndex(target.name)) |entry| return entry.apply_mutex;
+            if (self.sparseIndex(target.name)) |entry| return entry.apply_mutex;
+            return error.IndexNotFound;
+        };
+        return switch (kind) {
             .full_text => blk: {
-                const entry = self.textIndexEntry(index_ref.name) orelse return error.IndexNotFound;
+                const entry = self.textIndexEntry(target.name) orelse return error.IndexNotFound;
                 break :blk entry.apply_mutex;
             },
             .dense_vector => blk: {
-                const entry = self.denseIndex(index_ref.name) orelse return error.IndexNotFound;
+                const entry = self.denseIndex(target.name) orelse return error.IndexNotFound;
                 break :blk entry.apply_mutex;
             },
             .sparse_vector => blk: {
-                const entry = self.sparseIndex(index_ref.name) orelse return error.IndexNotFound;
+                const entry = self.sparseIndex(target.name) orelse return error.IndexNotFound;
                 break :blk entry.apply_mutex;
             },
             .graph => blk: {
-                const entry = self.graphIndex(index_ref.name) orelse return error.IndexNotFound;
+                const entry = self.graphIndex(target.name) orelse return error.IndexNotFound;
                 break :blk entry.apply_mutex;
             },
             .algebraic => blk: {
-                const entry = self.algebraicIndex(index_ref.name) orelse return error.IndexNotFound;
+                const entry = self.algebraicIndex(target.name) orelse return error.IndexNotFound;
                 break :blk entry.apply_mutex;
             },
         };
-        self.lockAtomicWithBackoff(mutex);
-        return .{
-            .manager = self,
-            .mutex = mutex,
-        };
+    }
+
+    fn lockIndexApply(self: *IndexManager, target: ApplyTarget) !ManagedIndexApplyGuard {
+        while (true) {
+            self.catalog_mutex.lockShared();
+            const mutex = self.applyMutexAssumeCatalog(target) catch |cause| {
+                self.catalog_mutex.unlockShared();
+                return cause;
+            };
+            if (mutex.tryLock()) return .{ .manager = self, .mutex = mutex };
+            // A waiter must not pin the catalog generation needed by a
+            // structural writer. Never retain the mutex pointer across unlock.
+            self.catalog_mutex.unlockShared();
+            self.checkpointIo().sleep(.fromNanoseconds(1), .awake) catch {};
+        }
+    }
+
+    /// The caller keeps the name alive through acquisition. Both the catalog
+    /// entry and apply mutex are resolved anew after each physical wait.
+    pub fn lockManagedIndexApply(self: *IndexManager, index_ref: ManagedIndexRef) !ManagedIndexApplyGuard {
+        return self.lockIndexApply(.{ .name = index_ref.name, .kind = index_ref.kind });
     }
 
     pub fn lockVectorIndexApply(self: *IndexManager, index_name: []const u8) !ManagedIndexApplyGuard {
-        self.catalog_mutex.lockShared();
-        errdefer self.catalog_mutex.unlockShared();
-        const mutex = if (self.denseIndex(index_name)) |entry|
-            entry.apply_mutex
-        else if (self.sparseIndex(index_name)) |entry|
-            entry.apply_mutex
-        else
-            return error.IndexNotFound;
-        self.lockAtomicWithBackoff(mutex);
-        return .{
-            .manager = self,
-            .mutex = mutex,
+        return self.lockIndexApply(.{ .name = index_name, .kind = null });
+    }
+
+    fn lockIndexApplyWithAdmission(self: *IndexManager, target: ApplyTarget, original: @import("../../../common/read_admission.zig").Port) !ManagedIndexApplyGuard {
+        const control = original;
+        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        const Lifetime = struct {
+            fn check(raw: *const anyopaque) !void {
+                const port: *const @import("../../../common/read_admission.zig").Port = @ptrCast(@alignCast(raw));
+                try port.checkLifetime();
+            }
         };
+        const acquisition: apply_rw_lock_mod.ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &control, .check_fn = Lifetime.check }, .execution_wait = boundary };
+        const io = self.checkpointIo();
+        while (true) {
+            try control.checkpoint();
+            try self.catalog_mutex.lockSharedControlledIo(io, acquisition);
+            const mutex = self.applyMutexAssumeCatalog(target) catch |cause| {
+                self.catalog_mutex.unlockShared();
+                return cause;
+            };
+            if (mutex.tryLock()) {
+                errdefer {
+                    mutex.unlock();
+                    self.catalog_mutex.unlockShared();
+                }
+                try control.checkLifetime();
+                return .{ .manager = self, .mutex = mutex };
+            }
+            self.catalog_mutex.unlockShared();
+            try @import("../../../common/cleanup_wait.zig").waitForRetry(io, control);
+        }
+    }
+
+    /// Original finite lifetime and CPU wait authority; no service guard may
+    /// be held by the caller while acquisition lends execution capacity.
+    pub fn lockManagedIndexApplyWithAdmission(self: *IndexManager, index_ref: ManagedIndexRef, original: @import("../../../common/read_admission.zig").Port) !ManagedIndexApplyGuard {
+        return self.lockIndexApplyWithAdmission(.{ .name = index_ref.name, .kind = index_ref.kind }, original);
+    }
+
+    pub fn lockVectorIndexApplyWithAdmission(self: *IndexManager, index_name: []const u8, original: @import("../../../common/read_admission.zig").Port) !ManagedIndexApplyGuard {
+        return self.lockIndexApplyWithAdmission(.{ .name = index_name, .kind = null }, original);
     }
 
     // Keep publication, cleanup, and pointer validation on the same adapter
@@ -49536,4 +49587,192 @@ test "logical query analyzer revision covers configuration and dynamic schema al
         const plain_cfg: types.IndexConfig = .{ .name = "ft", .kind = .full_text, .config_json = "{}", .coverage_generation = 11 };
         try std.testing.expectEqual(changed, !(try TextProjectionProvenance.fromRuntimeSchemaRevision(a, plain_cfg, schema, 0)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, plain_cfg, schema)));
     }
+}
+
+fn managedApplyTestManager() IndexManager {
+    var manager: IndexManager = undefined;
+    manager.io = std.testing.io;
+    manager.catalog_mutex = .{ .io = std.testing.io };
+    manager.text_indexes = .empty;
+    manager.dense_indexes = .empty;
+    manager.sparse_indexes = .empty;
+    manager.graph_indexes = .empty;
+    manager.algebraic_indexes = .empty;
+    return manager;
+}
+
+test "controlled managed index apply retries resolve replacement after original reentry" {
+    const admission = @import("../../../common/read_admission.zig");
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    inline for (.{
+        .{ "text_indexes", types.IndexKind.full_text, IndexManager.TextIndex },
+        .{ "dense_indexes", types.IndexKind.dense_vector, IndexManager.DenseIndex },
+        .{ "sparse_indexes", types.IndexKind.sparse_vector, IndexManager.SparseIndex },
+        .{ "graph_indexes", types.IndexKind.graph, IndexManager.GraphIndex },
+        .{ "algebraic_indexes", types.IndexKind.algebraic, IndexManager.AlgebraicIndex },
+    }) |spec| {
+        const Entry = spec[2];
+        for (std.enums.values(Case)) |case| {
+            var manager = managedApplyTestManager();
+            var old_mutex: std.atomic.Mutex = .unlocked;
+            var replacement: std.atomic.Mutex = .unlocked;
+            var entries: [1]Entry = undefined;
+            entries[0].config.name = "idx";
+            entries[0].apply_mutex = &old_mutex;
+            @field(manager, spec[0]).items = &entries;
+            @field(manager, spec[0]).capacity = 1;
+            const Control = struct {
+                manager: *IndexManager,
+                entry: *Entry,
+                old: *std.atomic.Mutex,
+                replacement: *std.atomic.Mutex,
+                case: Case,
+                old_held: bool = true,
+                replaced: bool = false,
+                begins: usize = 0,
+                ends: usize = 0,
+                fn release(self: *@This()) void {
+                    if (!self.old_held) return;
+                    self.old.unlock();
+                    self.old_held = false;
+                }
+                fn check(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+                }
+                fn deadline(_: *anyopaque) !?u64 {
+                    return 1000;
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.begins += 1;
+                    // A structural writer can replace the pointer while the
+                    // caller is parked: neither catalog nor apply is pinned.
+                    try std.testing.expect(self.manager.catalog_mutex.tryLockExclusive());
+                    defer self.manager.catalog_mutex.unlockExclusive();
+                    if (self.case == .begin_failure) return error.NotFound;
+                    self.entry.apply_mutex = self.replacement;
+                    self.replaced = true;
+                    if (self.case != .lifetime_in_wait) self.release();
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    self.release();
+                    try std.testing.expect(self.manager.catalog_mutex.tryLockExclusive());
+                    self.manager.catalog_mutex.unlockExclusive();
+                    if (self.case == .end_failure) return error.Canceled;
+                }
+            };
+            try std.testing.expect(old_mutex.tryLock());
+            var control: Control = .{ .manager = &manager, .entry = &entries[0], .old = &old_mutex, .replacement = &replacement, .case = case };
+            defer control.release();
+            var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+            const result = manager.lockManagedIndexApplyWithAdmission(.{ .name = "idx", .kind = spec[1] }, .init(&payload));
+            if (case == .success) {
+                var guard = try result;
+                try std.testing.expect(guard.mutex == &replacement);
+                guard.unlock();
+            } else {
+                try std.testing.expectError(switch (case) {
+                    .begin_failure => error.NotFound,
+                    .end_failure => error.Canceled,
+                    .lifetime_in_wait => error.DeadlineExceeded,
+                    .success => unreachable,
+                }, result);
+                try std.testing.expect(manager.catalog_mutex.tryLockExclusive());
+                manager.catalog_mutex.unlockExclusive();
+                try std.testing.expect(replacement.tryLock());
+                replacement.unlock();
+                control.release();
+                control.case = .success;
+                var guard = try manager.lockManagedIndexApplyWithAdmission(.{ .name = "idx", .kind = spec[1] }, .init(&payload));
+                try std.testing.expect(guard.mutex == if (control.replaced) &replacement else &old_mutex);
+                guard.unlock();
+            }
+            if (spec[1] == .dense_vector or spec[1] == .sparse_vector) {
+                var vector_guard = try manager.lockVectorIndexApplyWithAdmission("idx", .init(&payload));
+                vector_guard.unlock();
+            }
+            try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_failure), control.ends);
+        }
+    }
+}
+
+test "controlled managed index apply rejects missing wait authority before touching catalog" {
+    const admission = @import("../../../common/read_admission.zig");
+    var manager = managedApplyTestManager();
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return null;
+        }
+    };
+    var payload: admission.Payload = .{ .ptr = &manager, .vtable = &.{ .checkpoint = Control.check, .deadline_ns = Control.deadline } };
+    manager.catalog_mutex.lockExclusive();
+    defer manager.catalog_mutex.unlockExclusive();
+    try std.testing.expectError(error.ExecutionWaitUnsupported, manager.lockManagedIndexApplyWithAdmission(.{ .name = "missing", .kind = .full_text }, .init(&payload)));
+    payload.execution_wait = .{ .ptr = &manager, .begin = Control.check, .end = Control.check };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, manager.lockVectorIndexApplyWithAdmission("missing", .init(&payload)));
+}
+
+test "controlled managed index default apply wait permits catalog replacement" {
+    if (builtin.single_threaded or is_hostless) return error.SkipZigTest;
+    const io = std.testing.io;
+    var manager = managedApplyTestManager();
+    var old: std.atomic.Mutex = .unlocked;
+    var replacement: std.atomic.Mutex = .unlocked;
+    var entries: [1]IndexManager.TextIndex = undefined;
+    entries[0].config.name = "idx";
+    entries[0].apply_mutex = &old;
+    manager.text_indexes.items = &entries;
+    manager.text_indexes.capacity = 1;
+    const F = struct {
+        manager: *IndexManager,
+        io: std.Io,
+        picked: ?*std.atomic.Mutex = null,
+        failure: ?anyerror = null,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            var guard = self.manager.lockManagedIndexApply(.{ .name = "idx", .kind = .full_text }) catch |cause| {
+                self.failure = cause;
+                self.done.set(self.io);
+                return;
+            };
+            self.picked = guard.mutex;
+            guard.unlock();
+            self.done.set(self.io);
+        }
+    };
+    try std.testing.expect(old.tryLock());
+    var old_held = true;
+    defer if (old_held) old.unlock();
+    var f: F = .{ .manager = &manager, .io = io };
+    var future = try io.concurrent(F.run, .{&f});
+    defer {
+        if (old_held) {
+            old.unlock();
+            old_held = false;
+        }
+        future.await(io);
+    }
+    const test_deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(5), .clock = .awake });
+    // Two catalog acquisitions prove the waiter has retried the busy apply
+    // mutex, rather than merely being delayed before entering the method.
+    while (manager.catalog_mutex.shared_lock_calls.load(.acquire) < 2) {
+        if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, test_deadline)) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    while (!manager.catalog_mutex.tryLockExclusive()) {
+        if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, test_deadline)) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    entries[0].apply_mutex = &replacement;
+    manager.catalog_mutex.unlockExclusive();
+    try f.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expect(f.failure == null);
+    try std.testing.expect(f.picked.? == &replacement);
+    // The original apply owner has not released; progress required a fresh
+    // catalog lookup and must never wait on its retired mutex pointer.
+    try std.testing.expect(old_held);
 }

@@ -59,6 +59,34 @@ pub fn until(io: ?std.Io, original: admission.Port, context: *anyopaque, ready: 
     }
 }
 
+/// Retry a failed nonblocking acquisition after one physical polling wait.
+/// The caller must release every service guard before entering this function;
+/// the next acquisition attempt belongs strictly after successful reentry.
+pub fn waitForRetry(io: std.Io, original: admission.Port) !void {
+    var trace: admission.RejectionTrace = .{};
+    const control = trace.bind(original).?;
+    const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+    _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+    try control.checkpoint();
+    try boundary.beginWait();
+    var failure: ?anyerror = null;
+    control.checkLifetime() catch |cause| {
+        failure = trace.failure orelse cause;
+    };
+    if (failure == null) io.sleep(.fromMilliseconds(1), .awake) catch |cause| {
+        failure = cause;
+    };
+    control.checkLifetime() catch |cause| {
+        if (failure == null) failure = trace.failure orelse cause;
+    };
+    boundary.endWait() catch |cause| {
+        if (failure) |first| return first;
+        return trace.failure orelse cause;
+    };
+    if (failure) |cause| return cause;
+    try control.checkpoint();
+}
+
 /// Readiness observation never takes a guard while execution is parked.
 /// Acquire only after reentry; contention races simply retry the same root.
 pub fn lockIo(mutex: *std.Io.Mutex, io: std.Io, original: admission.Port) !void {
