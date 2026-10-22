@@ -233,7 +233,12 @@ pub const View = struct {
         };
         if (target == .configured and target.configured.task == .decide and !target.configured.chain) {
             const caps = self.providers.getDeciderCapabilities(target.configured.name) catch return .{};
-            return typedDecisionCapabilities(caps.images);
+            var result = typedDecisionCapabilities(caps.images);
+            const cfg = self.providers.getDeciderConfig(target.configured.name) catch return result;
+            // Native model facts are discovered by the executor at invocation.
+            // Configuration alone cannot promise image support for every model.
+            if (cfg.decision_method == .generated and cfg.generator.?.provider == .antfly and caps.images and !self.providers.inference_capabilities.contains(id)) result.images = .unknown;
+            return result;
         }
         const declared = self.providers.inference_capabilities.get(id) orelse Capabilities{};
         if (target == .connection and target.connection.task == .decide) {
@@ -844,4 +849,21 @@ test "provider registry gateway hosted connection decisions require adapter supp
     try std.testing.expectEqual(Support.supported, view.capabilities(target).images);
     // Missing connection metadata cannot qualify hosted decision media.
     try std.testing.expectEqual(Support.unknown, (View{ .providers = &config.registry }).capabilities(target).images);
+}
+
+test "provider registry gateway generated decision discovery intersects image and constrained model capabilities" {
+    const a = std.testing.allocator;
+    var registry = providers.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("vision", .{ .decision_method = .generated, .generator = .{ .provider = .openai, .model = "gpt-4.1", .url = "https://api.openai.com/v1" }, .probabilities = .verdict_only, .max_image_input_tokens = 8192 });
+    try registry.registerDeciderConfig("text", .{ .decision_method = .generated, .generator = .{ .provider = .openai, .model = "o3-mini", .url = "https://api.openai.com/v1" }, .probabilities = .verdict_only, .max_image_input_tokens = 8192 });
+    try registry.registerDeciderConfig("native", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "native-vision", .url = "" }, .probabilities = .verdict_only, .max_image_input_tokens = 8192 });
+    const named = View{ .providers = &registry };
+    try std.testing.expectEqual(Support.supported, named.capabilities(.{ .configured = .{ .task = .decide, .name = "vision" } }).images);
+    try std.testing.expectEqual(Support.unsupported, named.capabilities(.{ .configured = .{ .task = .decide, .name = "text" } }).images);
+    try std.testing.expectEqual(Support.unknown, named.capabilities(.{ .configured = .{ .task = .decide, .name = "native" } }).images);
+    try registry.inference_capabilities.put(a, try a.dupe(u8, "deciders/native"), .{ .images = .supported });
+    try std.testing.expectEqual(Support.supported, named.capabilities(.{ .configured = .{ .task = .decide, .name = "native" } }).images);
+    try registry.inference_capabilities.put(a, try a.dupe(u8, "deciders/vision"), .{ .images = .unsupported });
+    try std.testing.expectEqual(Support.unsupported, named.capabilities(.{ .configured = .{ .task = .decide, .name = "vision" } }).images);
 }

@@ -675,6 +675,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     structured_mod.addImport("antfly_extracting", extracting_mod);
 
     const image_mod = image_build.createModule(b, b.path("lib/image"), target, optimize, hash_mod);
+    structured_mod.addImport("antfly_image", image_mod);
     const pdf_standard_fonts_mod = @import("fonts.zig").create(b, target, optimize);
     const font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
@@ -752,6 +753,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .shared_lib_root = "",
         },
         .backend = .{
+            .allow_downloads = b.option(bool, "allow-downloads", "Advertise support for model acquisition") orelse true,
             .enable_metal = inference_enable_metal,
             .enable_cuda = inference_enable_cuda,
             .cuda_artifacts = inference_cuda_artifacts,

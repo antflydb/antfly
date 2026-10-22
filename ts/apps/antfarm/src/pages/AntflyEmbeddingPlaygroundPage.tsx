@@ -5,7 +5,6 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
-  DashboardPage,
   DashboardPageActions,
   DashboardPageDescription,
   DashboardPageHeader,
@@ -20,13 +19,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@antfly/design-system";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import { Clock, Database, Hash, Maximize2, Minimize2, RotateCcw, Search, Zap } from "lucide-react";
 import type React from "react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { AIWorkflowPage, AIWorkflowSubmitButton } from "@/components/ai-workflow";
 import { NoResultsState, PlaygroundEmptyState } from "@/components/branded-empty-state";
+import { RetrievalContextBar } from "@/components/retrieval-context";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useTable } from "@/hooks/use-table";
+import { beginAbortableRequest, finishAbortableRequest } from "@/lib/utils";
 
 interface HitResult {
   id: string;
@@ -102,6 +103,17 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
   const [showRawScores, setShowRawScores] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: table/query client identity invalidates in-flight results
+  useEffect(() => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
+    setResults(null);
+    setError(null);
+    setProcessingTime(null);
+    return () => abortControllerRef.current?.abort();
+  }, [client, selectedTable, selectedIndex]);
+
   const handleSearch = async () => {
     if (!query.trim()) {
       setError("Please enter a query");
@@ -116,11 +128,7 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
       return;
     }
 
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-
-    abortControllerRef.current = new AbortController();
+    const controller = beginAbortableRequest(abortControllerRef);
     setIsLoading(true);
     setError(null);
     setResults(null);
@@ -128,11 +136,16 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
     const startTime = performance.now();
 
     try {
-      const response = await client.tables.query(selectedTable, {
-        semantic_search: query,
-        indexes: [selectedIndex],
-        limit,
-      });
+      const response = await client.tables.query(
+        selectedTable,
+        {
+          semantic_search: query,
+          indexes: [selectedIndex],
+          limit,
+        },
+        { signal: controller.signal }
+      );
+      if (abortControllerRef.current !== controller || controller.signal.aborted) return;
 
       const hits = response?.responses?.[0]?.hits?.hits || [];
 
@@ -146,16 +159,23 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
       setResults(parsed);
       setProcessingTime(performance.now() - startTime);
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
+      if (
+        abortControllerRef.current !== controller ||
+        controller.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
         return;
       }
       setError(err instanceof Error ? err.message : "Search failed");
     } finally {
-      setIsLoading(false);
+      if (finishAbortableRequest(abortControllerRef, controller)) setIsLoading(false);
     }
   };
 
   const handleReset = () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
     setQuery("");
     setResults(null);
     setError(null);
@@ -165,7 +185,7 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
   const maxScore = results && results.length > 0 ? Math.max(...results.map((r) => r.score)) : 1;
 
   return (
-    <DashboardPage className="h-full space-y-3">
+    <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
           <DashboardPageTitle className="font-aeonik">Embedding Explorer</DashboardPageTitle>
@@ -180,14 +200,13 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
           </Button>
         </DashboardPageActions>
       </DashboardPageHeader>
-
+      <RetrievalContextBar />
       {!selectedTable && (
         <DashboardToolbar className="items-center justify-center border-dashed text-center text-sm text-muted-foreground md:items-center">
           <Database className="h-8 w-8 mx-auto mb-2 opacity-30" />
           Select a table from the sidebar to start exploring embeddings
         </DashboardToolbar>
       )}
-
       {/* Configuration Panel */}
       <Card>
         <CardHeader className="pb-4">
@@ -254,33 +273,29 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
           </div>
 
           <FormActions>
-            <Button
+            <AIWorkflowSubmitButton
               onClick={handleSearch}
               disabled={isLoading || !query.trim() || !selectedTable || !selectedIndex}
+              running={isLoading}
+              runningLabel="Searching"
+              onCancel={() => {
+                abortControllerRef.current?.abort();
+                abortControllerRef.current = null;
+                setIsLoading(false);
+              }}
             >
-              {isLoading ? (
-                <>
-                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                  Searching
-                </>
-              ) : (
-                <>
-                  <Search className="h-4 w-4 mr-2" />
-                  Search &amp; Analyze
-                </>
-              )}
-            </Button>
+              <Search className="h-4 w-4 mr-2" />
+              Search &amp; Analyze
+            </AIWorkflowSubmitButton>
           </FormActions>
         </CardContent>
       </Card>
-
       {/* Error Display */}
       {error && (
         <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
-
       {/* Results Stats Bar */}
       {results && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
@@ -309,7 +324,6 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
           </Button>
         </DashboardToolbar>
       )}
-
       {/* Results */}
       {results ? (
         <div className="space-y-3">
@@ -347,7 +361,6 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
       ) : (
         !error && selectedTable && <PlaygroundEmptyState />
       )}
-
       {/* Help text */}
       {results && (
         <div className="text-xs text-muted-foreground space-y-1">
@@ -363,7 +376,7 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
           </p>
         </div>
       )}
-    </DashboardPage>
+    </AIWorkflowPage>
   );
 };
 

@@ -13,11 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Compatibility exports for the shared Decisions evidence contract.
+//! The shared evidence contract is also used by native generated decisions.
 const evidence = @import("antfly_decisions").evidence;
 pub const Input = evidence.Input;
 pub const InlineImage = evidence.InlineImage;
 pub const inlineImage = evidence.inlineImage;
-test {
-    _ = evidence;
-}

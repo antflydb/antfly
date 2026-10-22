@@ -353,6 +353,22 @@ fn renderParsedPagePngEffectiveWithRotationAlloc(
     );
 }
 
+fn compatibilityCanvasSize(parsed: *reader.Reader, page_number: usize, dpi: u16, rotation: render.PageRotation) !render.CanvasSize {
+    // Share native rendering's source-box arithmetic and integer admission.
+    const box = try parsed.extractPageBox(page_number);
+    const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
+    const width = rasterAxisExtent(box.min_x, box.max_x, scale);
+    const height = rasterAxisExtent(box.min_y, box.max_y, scale);
+    if (!std.math.isFinite(width) or !std.math.isFinite(height) or
+        width > std.math.maxInt(u32) or height > std.math.maxInt(u32))
+        return error.RenderedPageTooLarge;
+    const swaps_dimensions = rotation == .clockwise_90 or rotation == .clockwise_270;
+    return .{
+        .width = @intFromFloat(if (swaps_dimensions) height else width),
+        .height = @intFromFloat(if (swaps_dimensions) width else height),
+    };
+}
+
 fn renderParsedPagePngEffectiveWithRotationAllocators(
     scratch_alloc: Allocator,
     output_alloc: Allocator,
@@ -375,18 +391,18 @@ fn renderParsedPagePngEffectiveWithRotationAllocators(
         error.UnexpectedEof,
         => if (builtin.os.tag == .macos) blk: {
             if (used_compatibility_backend) |value| value.* = true;
+            const canvas_size = try compatibilityCanvasSize(parsed, page_number, dpi, rotation);
             break :blk if (compatibility_session) |session|
                 try session.renderPagePngAlloc(
                     scratch_alloc,
                     output_alloc,
                     page_number,
-                    dpi,
+                    canvas_size,
                     max_pixels,
-                    rotation,
                     parsed.cancellationProbe(),
                 )
             else
-                try darwin_render.renderPagePngAlloc(scratch_alloc, output_alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
+                try darwin_render.renderPagePngAlloc(scratch_alloc, output_alloc, parsed.sourceBytes(), page_number, canvas_size, max_pixels);
         } else return err,
         else => return err,
     };
@@ -546,17 +562,17 @@ fn renderParsedPageRgbaEffectiveWithRotationAllocators(
         => if (builtin.os.tag == .macos) blk: {
             if (used_compatibility_backend) |value| value.* = true;
             try parsed.checkCancellation();
+            const canvas_size = try compatibilityCanvasSize(parsed, page_number, dpi, rotation);
             const raw = if (compatibility_session) |session|
                 try session.renderPageRgbaAlloc(
                     output_alloc,
                     page_number,
-                    dpi,
+                    canvas_size,
                     max_pixels,
-                    rotation,
                     parsed.cancellationProbe(),
                 )
             else
-                try darwin_render.renderPageRgbaAlloc(output_alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
+                try darwin_render.renderPageRgbaAlloc(output_alloc, parsed.sourceBytes(), page_number, canvas_size, max_pixels);
             errdefer output_alloc.free(raw.rgba);
             try parsed.checkCancellation();
             const pixels = std.math.mul(u64, raw.width, raw.height) catch return error.RenderedPageTooLarge;
@@ -5885,5 +5901,88 @@ test "adaptive raster preserves planned dimensions for negative fractional origi
         defer raster.deinit(alloc);
         try std.testing.expectEqual(planned.width, raster.width);
         try std.testing.expectEqual(planned.height, raster.height);
+    }
+}
+
+test "compatibility rendering fits the exact admitted fractional-box canvas" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        pub fn check(_: @This()) !void {}
+    };
+    for ([_]i32{ 0, 90, 180, 270 }) |rotation| {
+        // CoreGraphics reports a width of 604.8000000000001 on Darwin.
+        const fixture = try buildBoxTestPdfAlloc(alloc, rotation, "0 0 604.8 786.96");
+        defer alloc.free(fixture);
+        var parsed = try reader.Reader.init(alloc, fixture);
+        defer parsed.deinit();
+        const planned = try planParsedPageRenderGeometry(&parsed, .{
+            .page_number = 1,
+            .requested_dpi = 150,
+            .max_pixels = 40_000_000,
+            .max_dimension = 4096,
+        });
+        const quarter_turn = rotation == 90 or rotation == 270;
+        const expected_width: usize = if (quarter_turn) 1640 else 1260;
+        const expected_height: usize = if (quarter_turn) 1260 else 1640;
+        const pixels = expected_width * expected_height;
+        const storage = try alloc.alloc(u8, pixels * 4);
+        defer alloc.free(storage);
+        var output = std.heap.FixedBufferAllocator.init(storage);
+        var session = darwin_render.SharedSession.init(fixture);
+        defer session.deinit();
+        const size = try compatibilityCanvasSize(&parsed, 1, planned.effective_dpi, try normalizedPageRotation(rotation));
+        const raw = try session.renderPageRgbaAlloc(output.allocator(), 1, size, pixels, Probe{});
+        defer output.allocator().free(raw.rgba);
+        try std.testing.expectEqual(expected_width, raw.width);
+        try std.testing.expectEqual(expected_height, raw.height);
+        try std.testing.expectEqual(storage.len, raw.rgba.len);
+        try std.testing.expectEqual(storage.len, output.end_index);
+        try std.testing.expectEqual(planned.width, raw.width);
+        try std.testing.expectEqual(planned.height, raw.height);
+        try std.testing.expectError(error.RenderedPageTooLarge, session.renderPageRgbaAlloc(alloc, 1, size, pixels - 1, Probe{}));
+    }
+}
+
+test "compatibility rendering scales page content up and down through rotations" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const scales = [_]struct { numerator: u32, denominator: u32, mark: u32 }{
+        .{ .numerator = 2, .denominator = 1, .mark = 20 },
+        .{ .numerator = 1, .denominator = 2, .mark = 5 },
+    };
+    for ([_]i32{ 0, 90, 180, 270 }) |rotation| {
+        const fixture = try buildRotatedTestPdfAlloc(alloc, rotation);
+        defer alloc.free(fixture);
+        for (scales) |scale| {
+            const quarter_turn = rotation == 90 or rotation == 270;
+            const width = (if (quarter_turn) @as(u32, 30) else 20) * scale.numerator / scale.denominator;
+            const height = (if (quarter_turn) @as(u32, 20) else 30) * scale.numerator / scale.denominator;
+            const raw = try darwin_render.renderPageRgbaAlloc(alloc, fixture, 1, .{ .width = width, .height = height }, width * height);
+            defer alloc.free(raw.rgba);
+            var bounds = [4]usize{ width, height, 0, 0 };
+            var black_pixels: usize = 0;
+            for (0..height) |y| {
+                for (0..width) |x| {
+                    const offset = (y * width + x) * 4;
+                    if (raw.rgba[offset] >= 32 or raw.rgba[offset + 1] >= 32 or raw.rgba[offset + 2] >= 32) continue;
+                    black_pixels += 1;
+                    bounds[0] = @min(bounds[0], x);
+                    bounds[1] = @min(bounds[1], y);
+                    bounds[2] = @max(bounds[2], x + 1);
+                    bounds[3] = @max(bounds[3], y + 1);
+                }
+            }
+            const mark = scale.mark;
+            const expected: [4]usize = switch (rotation) {
+                0 => .{ 0, height - mark, mark, height },
+                90 => .{ 0, 0, mark, mark },
+                180 => .{ width - mark, 0, width, mark },
+                270 => .{ width - mark, height - mark, width, height },
+                else => unreachable,
+            };
+            try std.testing.expectEqual(@as(usize, mark) * mark, black_pixels);
+            try std.testing.expectEqualSlices(usize, &expected, &bounds);
+        }
     }
 }

@@ -118,16 +118,17 @@ pub const Input = union(enum) {
 
     /// Enforce the same serialized evidence limit for text and multimodal calls.
     /// This includes inline image bytes and message framing.
-    pub fn checkLimit(self: Input, a: std.mem.Allocator, limit: usize) !void {
+    pub fn byteSize(self: Input, a: std.mem.Allocator) !usize {
         try self.validate();
-        if (self == .text) {
-            if (self.text.len > limit) return error.DecisionLimitExceeded;
-        } else {
-            var buffer: [512]u8 = undefined;
-            var counter: std.Io.Writer.Discarding = .init(&buffer);
-            try std.json.Stringify.value(self.jsonValue(a), .{}, &counter.writer);
-            if (counter.fullCount() > limit) return error.DecisionLimitExceeded;
-        }
+        if (self == .text) return self.text.len;
+        var buffer: [1024]u8 = undefined;
+        var counter = std.Io.Writer.Discarding.init(&buffer);
+        try std.json.Stringify.value(self.jsonValue(a), .{}, &counter.writer);
+        return std.math.cast(usize, counter.fullCount()) orelse error.DecisionLimitExceeded;
+    }
+
+    pub fn checkLimit(self: Input, a: std.mem.Allocator, limit: usize) !void {
+        if (try self.byteSize(a) > limit) return error.DecisionLimitExceeded;
     }
 };
 

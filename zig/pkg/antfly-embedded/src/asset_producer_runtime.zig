@@ -1644,6 +1644,7 @@ pub const Runtime = struct {
             .antfly_url = self.inference_api_url,
             .source_table = self.execution.routing.source_table,
         };
+        defer execution.deinit();
         const results = try execution.evaluateGeneratedPartial(a, "materialized", inputs);
         const items = try alloc.alloc(asset_producer.ProducedItem, requests.len);
         var initialized: usize = 0;
@@ -1686,6 +1687,7 @@ pub const Runtime = struct {
             .antfly_url = self.inference_api_url,
             .source_table = self.execution.routing.source_table,
         };
+        defer execution.deinit();
         const results = try execution.provider().evaluateBatch(arena.allocator(), &.{.{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } }});
         var response = results[0];
         var info = try materialization.provenance(arena.allocator(), parsed.value, request.source_fingerprint);
