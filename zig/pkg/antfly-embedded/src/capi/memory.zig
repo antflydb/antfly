@@ -390,6 +390,7 @@ test "capi native memory internal assertion refresh survives reopen and preserve
             return allocator.dupe(f32, &.{ 1, 0 });
         }
     };
+    var original_revision: u64 = 0;
     for (0..3) |phase| {
         var id: ?*anyopaque = null;
         try std.testing.expectEqual(h.capi.ErrorCode.ok, if (phase == 0) api.antfly_lite_create(path, &id) else api.antfly_lite_open(path, &id));
@@ -411,7 +412,8 @@ test "capi native memory internal assertion refresh survives reopen and preserve
         if (phase == 0) {
             const config: memory.types.Config = .{ .models = .{ .embedder = .{ .provider = "fixture", .model = "internal", .revision = "v1", .dimensions = 2 } }, .semantic_discovery = .{ .enabled = true } };
             _ = try service.execute(alloc, .create, "", try std.json.Stringify.valueAlloc(alloc, config, .{}), "create");
-            _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}],\"assertions\":[{\"id\":\"root\",\"subject\":\"other\",\"predicate\":\"p\",\"value\":\"root\",\"statement\":\"Root premise\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"middle\",\"subject\":\"other\",\"predicate\":\"p\",\"value\":\"middle\",\"statement\":\"Middle premise\",\"depends_on\":[\"root\"],\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"description\",\"subject\":\"graph\",\"predicate\":\"p\",\"value\":\"graph\",\"statement\":\"Derived graph description\",\"depends_on\":[\"middle\"],\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+            const admitted = try std.json.parseFromSliceLeaky(memory.types.OperationStatus, alloc, try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}],\"assertions\":[{\"id\":\"root\",\"subject\":\"other\",\"predicate\":\"p\",\"value\":\"root\",\"statement\":\"Root premise\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"middle\",\"subject\":\"other\",\"predicate\":\"p\",\"value\":\"middle\",\"statement\":\"Middle premise\",\"depends_on\":[\"root\"],\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"description\",\"subject\":\"graph\",\"predicate\":\"p\",\"value\":\"graph\",\"statement\":\"Derived graph description\",\"depends_on\":[\"middle\"],\"evidence\":[{\"id\":\"e\"}]}]}", "observe"), .{});
+            original_revision = admitted.revision;
         } else {
             try std.testing.expectEqual(@as(usize, 3), (try backend.scan(backend.ptr, alloc, "dependency/semantic-assertion/", null, 8)).rows.len);
             const claims = try backend.scan(backend.ptr, alloc, "assertion/", null, 8);
@@ -435,7 +437,7 @@ test "capi native memory internal assertion refresh survives reopen and preserve
         for (claims.rows) |row| {
             const claim = try std.json.parseFromSliceLeaky(memory.types.StoredAssertion, alloc, row.json, .{});
             if (std.mem.eql(u8, claim.assertion.id, "root")) continue;
-            try std.testing.expectEqual(@as(u64, 2), claim.revision);
+            try std.testing.expectEqual(original_revision, claim.revision);
             try std.testing.expectEqual(memory.types.Lifecycle.active, claim.lifecycle);
         }
     }
