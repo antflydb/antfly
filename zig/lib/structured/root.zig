@@ -43,23 +43,28 @@ pub const Batch = struct {
 pub const Limits = struct {
     max_media_parts_per_call: ?usize = null,
     max_encoded_media_bytes_per_call: ?usize = null,
+    max_decoded_pixels_per_call: ?u64 = null,
 
     pub fn fromNativeBatch(batch: anytype) Limits {
-        return .{ .max_media_parts_per_call = batch.max_media_parts_per_item, .max_encoded_media_bytes_per_call = batch.max_encoded_media_bytes };
+        return .{ .max_media_parts_per_call = batch.max_media_parts_per_item, .max_encoded_media_bytes_per_call = batch.max_encoded_media_bytes, .max_decoded_pixels_per_call = batch.max_decoded_pixels };
     }
     fn accepts(self: Limits, cost: EvidenceCost) bool {
-        return (self.max_media_parts_per_call == null or cost.media_parts <= self.max_media_parts_per_call.?) and
-            (self.max_encoded_media_bytes_per_call == null or cost.encoded_media_bytes <= self.max_encoded_media_bytes_per_call.?);
+        return !cost.overflow and (self.max_media_parts_per_call == null or cost.media_parts <= self.max_media_parts_per_call.?) and
+            (self.max_encoded_media_bytes_per_call == null or cost.encoded_media_bytes <= self.max_encoded_media_bytes_per_call.?) and
+            (self.max_decoded_pixels_per_call == null or cost.decoded_pixels <= self.max_decoded_pixels_per_call.?);
     }
 };
 const EvidenceCost = struct {
     media_parts: usize = 0,
     encoded_media_bytes: usize = 0,
+    decoded_pixels: u64 = 0,
+    overflow: bool = false,
     fn add(self: EvidenceCost, other: EvidenceCost) EvidenceCost {
-        return .{ .media_parts = self.media_parts +| other.media_parts, .encoded_media_bytes = self.encoded_media_bytes +| other.encoded_media_bytes };
+        const pixels = @addWithOverflow(self.decoded_pixels, other.decoded_pixels);
+        return .{ .media_parts = self.media_parts +| other.media_parts, .encoded_media_bytes = self.encoded_media_bytes +| other.encoded_media_bytes, .decoded_pixels = pixels[0], .overflow = self.overflow or other.overflow or pixels[1] != 0 };
     }
 };
-fn evidenceCost(input: Json) !EvidenceCost {
+fn evidenceCost(a: Allocator, input: Json, measure_pixels: bool) !EvidenceCost {
     var cost = EvidenceCost{};
     if (input == .string) return cost;
     if (input != .array) return error.UnsupportedInferenceFeature;
@@ -79,8 +84,21 @@ fn evidenceCost(input: Json) !EvidenceCost {
             cost.media_parts += 1;
             if (std.mem.startsWith(u8, url.string, "data:")) {
                 const offset = std.mem.indexOf(u8, url.string, ";base64,") orelse return error.UnsupportedInferenceFeature;
-                cost.encoded_media_bytes +|= std.base64.standard.Decoder.calcSizeForSlice(url.string[offset + 8 ..]) catch return error.UnsupportedInferenceFeature;
-            }
+                const encoded = url.string[offset + 8 ..];
+                const size = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.UnsupportedInferenceFeature;
+                cost.encoded_media_bytes +|= size;
+                if (measure_pixels) {
+                    // Inspect physical dimensions without allocating decoded rasters.
+                    const image = @import("antfly_image");
+                    const bytes = try a.alloc(u8, size);
+                    defer a.free(bytes);
+                    std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InvalidInferenceMedia;
+                    const format = image.inferenceFormatForMimeEssence(url.string[5..offset]) orelse return error.UnsupportedInferenceFeature;
+                    if (image.detectFormat(bytes) != format) return error.InvalidInferenceMedia;
+                    const info = image.inspectEncoded(bytes) catch return error.InvalidInferenceMedia;
+                    cost.decoded_pixels = std.math.add(u64, cost.decoded_pixels, info.pixels() catch return error.ConstrainedInputTooLarge) catch return error.ConstrainedInputTooLarge;
+                }
+            } else if (measure_pixels) return error.UnsupportedInferenceFeature;
         }
     }
     return cost;
@@ -96,6 +114,16 @@ pub const Capabilities = struct {
     token_logprobs: bool = false,
     tool_call_token_logprobs: bool = false,
     model_revision: ?[]const u8 = null,
+
+    pub fn sameModelContract(self: Capabilities, other: Capabilities) bool {
+        var left = self;
+        var right = other;
+        left.model_revision = null;
+        right.model_revision = null;
+        if (!std.meta.eql(left, right)) return false;
+        if (self.model_revision) |revision| return std.mem.eql(u8, revision, other.model_revision orelse return false);
+        return other.model_revision == null;
+    }
 
     pub fn select(self: Capabilities, output: Output, probabilities: ?Probabilities) !Output {
         if (probabilities == .token_logprobs and !self.token_logprobs)
@@ -339,7 +367,14 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
     try validateSchema(value_schema);
     const costs = try a.alloc(EvidenceCost, inputs.len);
     defer a.free(costs);
-    for (inputs, costs) |input, *cost| cost.* = try evidenceCost(input);
+    const cost_failures = try a.alloc(?anyerror, inputs.len);
+    defer a.free(cost_failures);
+    @memset(cost_failures, null);
+    for (inputs, costs, cost_failures) |input, *cost, *failure| cost.* = evidenceCost(a, input, executor.limits.max_decoded_pixels_per_call != null) catch |err| blk: {
+        if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled) return err;
+        failure.* = err;
+        break :blk .{};
+    };
     const sizes = try a.alloc(usize, inputs.len);
     defer a.free(sizes);
     for (inputs, sizes) |input, *size| {
@@ -365,8 +400,8 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
     @memset(result.token_evidence, null);
     var begin: usize = 0;
     while (begin < inputs.len) {
-        if (sizes[begin] > batch.max_input_bytes or !executor.limits.accepts(costs[begin])) {
-            result.failures[begin] = error.ConstrainedInputTooLarge;
+        if (cost_failures[begin] != null or sizes[begin] > batch.max_input_bytes or !executor.limits.accepts(costs[begin])) {
+            result.failures[begin] = cost_failures[begin] orelse error.ConstrainedInputTooLarge;
             result.execution.rejected_items += 1;
             begin += 1;
             continue;
@@ -376,7 +411,7 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
         var media = EvidenceCost{};
         while (begin + pending.items.len < inputs.len and pending.items.len < batch.max_items_per_call) {
             const id = begin + pending.items.len;
-            if (sizes[id] > batch.max_input_bytes) break;
+            if (cost_failures[id] != null or sizes[id] > batch.max_input_bytes) break;
             if (sizes[id] > batch.max_input_bytes - bytes) break;
             const next_media = media.add(costs[id]);
             if (!executor.limits.accepts(next_media)) break;
@@ -960,4 +995,59 @@ test "constrained timeout retains reported attempt usage and successful siblings
     try std.testing.expectEqual(error.Timeout, result.failures[2].?);
     try std.testing.expectEqual(@as(u64, 24), result.input_tokens);
     try std.testing.expectEqual(@as(u64, 6), result.output_tokens);
+}
+
+test "constrained batches pack physical pixels and isolate oversized or malformed images" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fake = struct {
+        calls: usize = 0,
+        fn invoke(ptr: *anyopaque, alloc: Allocator, request: Invocation) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            var rows = try array(alloc, &.{});
+            for (request.items) |item| {
+                var row = object();
+                try put(alloc, &row, "item", .{ .integer = @intCast(item.id) });
+                try put(alloc, &row, "value", .{ .bool = true });
+                try rows.array.append(row);
+            }
+            var root = object();
+            try put(alloc, &root, "items", rows);
+            return .{ .value = root };
+        }
+    };
+    var fake = Fake{};
+    var png: [24]u8 = @splat(0);
+    @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, png[16..20], 7, .big);
+    std.mem.writeInt(u32, png[20..24], 5, .big);
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+    _ = std.base64.standard.Encoder.encode(encoded, &png);
+    const image = try parseReply(a, try std.fmt.allocPrint(a, "[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,{s}\"}}]}}]", .{encoded}));
+    const schema = try parseReply(a, "{\"type\":\"boolean\"}");
+    var executor = Executor{ .ptr = &fake, .invoke = Fake.invoke, .limits = .{ .max_decoded_pixels_per_call = 35 } };
+    const split = try executeEvidence(a, executor, .grammar, schema, "", .{}, &.{ image, image });
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expect(split.values[0].?.bool and split.values[1].?.bool);
+    for ([_]u64{ 34, 0 }) |ceiling| {
+        executor.limits.max_decoded_pixels_per_call = ceiling;
+        const partial = try executeEvidence(a, executor, .grammar, schema, "", .{}, &.{ image, .{ .string = "valid text" } });
+        try std.testing.expectEqual(error.ConstrainedInputTooLarge, partial.failures[0].?);
+        try std.testing.expect(partial.values[1].?.bool);
+    }
+    std.mem.writeInt(u32, png[16..20], std.math.maxInt(u32), .big);
+    std.mem.writeInt(u32, png[20..24], std.math.maxInt(u32), .big);
+    _ = std.base64.standard.Encoder.encode(encoded, &png);
+    const enormous = try parseReply(a, try std.fmt.allocPrint(a, "[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,{s}\"}}]}}]", .{encoded}));
+    executor.limits.max_decoded_pixels_per_call = std.math.maxInt(u64);
+    const overflow = try executeEvidence(a, executor, .grammar, schema, "", .{}, &.{ enormous, enormous });
+    try std.testing.expect(overflow.values[0].?.bool and overflow.values[1].?.bool);
+    try std.testing.expectEqual(@as(usize, 6), fake.calls);
+    const invalid = try parseReply(a, "[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,aGVsbG8=\"}]}]");
+    const isolated = try executeEvidence(a, executor, .grammar, schema, "", .{}, &.{ invalid, .{ .string = "valid text" } });
+    try std.testing.expectEqual(error.InvalidInferenceMedia, isolated.failures[0].?);
+    try std.testing.expect(isolated.values[1].?.bool);
+    try std.testing.expectEqual(@as(usize, 7), fake.calls);
 }

@@ -123,16 +123,18 @@ pub const Runtime = struct {
     provenance: std.ArrayList(struct { decider: []const u8, provider: []const u8, model: []const u8, rows: u64 = 0 }) = .empty,
     const ResolvedGenerator = struct {
         arena: std.heap.ArenaAllocator,
+        cache: remote_capabilities.Cache,
         name: []const u8,
         source_table: []const u8,
         generator: @import("../generating/mod.zig").GeneratorConfig,
         capabilities: @import("antfly_structured").Capabilities,
     };
 
-    /// Capability and routing facts live for this runtime's request/statement.
+    /// Model facts live for this runtime's request/statement; routing leases renew.
     /// Profile/provenance storage remains owned by profile_allocator's caller.
     pub fn deinit(self: *Runtime) void {
         for (self.resolved_generators.items) |entry| {
+            entry.cache.deinit();
             entry.arena.deinit();
             self.resolution_allocator.destroy(entry);
         }
@@ -140,7 +142,7 @@ pub const Runtime = struct {
         self.resolved_generators = .empty;
     }
 
-    fn resolveGenerator(self: *Runtime, name: []const u8, source_table: []const u8) !*const ResolvedGenerator {
+    fn resolveGenerator(self: *Runtime, name: []const u8, source_table: []const u8) !*ResolvedGenerator {
         @import("antfly_platform").sync.lockYielding(&self.resolution_mutex);
         defer self.resolution_mutex.unlock();
         for (self.resolved_generators.items) |entry| {
@@ -153,18 +155,25 @@ pub const Runtime = struct {
         var generator = try (cfg.generator orelse return error.InvalidDeciderConfig).clone(a);
         if (generator.provider == .antfly and generator.url.len == 0) {
             generator.url = try a.dupe(u8, self.antfly_url orelse "");
+            if (generator.url.len > 0 and generator.api_key == null) {
+                if (self.antfly_api_key) |key| generator.api_key = try a.dupe(u8, key);
+            }
         }
-        var cache = remote_capabilities.Cache.init(self.resolution_allocator, self.io);
-        defer cache.deinit();
-        var engine = self.constrainedRuntime(&cache);
+        const entry = try self.resolution_allocator.create(ResolvedGenerator);
+        errdefer self.resolution_allocator.destroy(entry);
+        entry.cache = remote_capabilities.Cache.init(self.resolution_allocator, self.io);
+        errdefer entry.cache.deinit();
+        var engine = self.constrainedRuntime(&entry.cache);
         engine.options.source_table = source_table;
         engine.options.execution.routing.source_table = source_table;
         const caps = try engine.capabilities(a, &generator);
-        const entry = try self.resolution_allocator.create(ResolvedGenerator);
-        errdefer self.resolution_allocator.destroy(entry);
         const owned_name = try a.dupe(u8, name);
         const owned_table = try a.dupe(u8, source_table);
-        entry.* = .{ .arena = arena, .name = owned_name, .source_table = owned_table, .generator = generator, .capabilities = caps };
+        entry.arena = arena;
+        entry.name = owned_name;
+        entry.source_table = owned_table;
+        entry.generator = generator;
+        entry.capabilities = caps;
         try self.resolved_generators.append(self.resolution_allocator, entry);
         return entry;
     }
@@ -222,6 +231,7 @@ pub const Runtime = struct {
         return .{ .http = self.http, .cache = cache, .options = .{
             .antfly_provider = self.antfly_provider,
             .secret_store = self.secret_store,
+            .inference_api_key = self.antfly_api_key,
             .max_response_bytes = max_response_bytes,
             .source_table = self.source_table,
             .execution = .{ .routing = .{ .source_table = self.source_table } },
@@ -260,9 +270,9 @@ pub const Runtime = struct {
     fn generateBatchPartial(self: *Runtime, a: std.mem.Allocator, cfg: decisions.DeciderConfig, requests: []const decisions.Request) !GeneratedBatch {
         const source_table = if (requests[0].source_table.len > 0) requests[0].source_table else self.source_table;
         const resolved = try self.resolveGenerator(requests[0].decider, source_table);
-        var cache = remote_capabilities.Cache.init(a, self.io);
-        defer cache.deinit();
-        var engine = self.constrainedRuntime(&cache);
+        var engine = self.constrainedRuntime(&resolved.cache);
+        engine.capability_snapshot = resolved.capabilities;
+        engine.require_execution_lease = resolved.generator.capability_token != null;
         engine.options.source_table = source_table;
         engine.options.execution.routing.source_table = source_table;
         var generator = try resolved.generator.clone(a);
@@ -1577,4 +1587,215 @@ test "decision functions native generated batches pack media limits and preserve
     try std.testing.expectEqual(error.ConstrainedInputTooLarge, partial.failures[0].?);
     try std.testing.expect(partial.values[1] != null);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "decision functions native generated batches pack decoded pixel limits and preserve oversized siblings" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("vision", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only, .max_image_input_tokens = 100 });
+    const Fake = struct {
+        calls: usize = 0,
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const body = try std.json.parseFromSliceLeaky(decisions.Json, alloc, bytes, .{});
+            var images: usize = 0;
+            for (body.object.get("messages").?.array.items) |message| {
+                const content = message.object.get("content").?;
+                if (content == .array) for (content.array.items) |part| {
+                    if (std.mem.eql(u8, part.object.get("type").?.string, "media")) images += 1;
+                };
+            }
+            var pixels: u64 = 0;
+            for (body.object.get("messages").?.array.items) |message| {
+                const content = message.object.get("content").?;
+                if (content == .array) for (content.array.items) |part| {
+                    if (!std.mem.eql(u8, part.object.get("type").?.string, "media")) continue;
+                    const encoded = part.object.get("data").?.string;
+                    const image_bytes = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(encoded));
+                    try std.base64.standard.Decoder.decode(image_bytes, encoded);
+                    pixels += try @import("antfly_inference_work").encodedImagePixels(part.object.get("mime_type").?.string, image_bytes);
+                };
+            }
+            const capabilities = try caps(ptr, alloc, "vision", .generate);
+            try capabilities.validateInvocation(.generate, .{ .item_count = 1, .modalities = .{ .text = true, .image = images > 0 }, .decoded_pixels = pixels, .max_media_parts_per_item = images });
+            return alloc.dupe(u8,
+                \\{"choices":[{"message":{"content":"{\"items\":[{\"item\":0,\"value\":{\"answer\":\"same\"}},{\"item\":1,\"value\":{\"answer\":\"same\"}}]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+            );
+        }
+        fn caps(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_inference_work").Task) !@import("antfly_inference_work").InferenceCapabilities {
+            return .{ .task = .generate, .input_modalities = .{ .text = true, .image = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true, .batch = .{ .max_media_parts_per_item = 8, .max_decoded_pixels = 1 } };
+        }
+    };
+    var fake = Fake{};
+    var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = std.testing.io, .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate, .model_capabilities = Fake.caps } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"answer":{"type":"choice","instructions":"Compare concepts","criteria":{"same":"Same entity","different":"Distinct entities"}}}
+    , .{});
+    const raw = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAEAAAAB"}]}]
+    , .{});
+    const parts = raw.array.items[0].object.getPtr("content").?;
+    const image = parts.array.items[0];
+
+    const input = try decisions.Input.fromJson(raw);
+    const result = try runtime.evaluatePartial(scratch, &.{ .{ .decider = "vision", .questions = questions, .input = input }, .{ .decider = "vision", .questions = questions, .input = input } });
+    try std.testing.expect(result.values[0] != null and result.values[1] != null);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(u64, 20), runtime.input_tokens);
+    try parts.array.append(image);
+    const large = try decisions.Input.fromJson(raw);
+    const partial = try runtime.evaluatePartial(scratch, &.{ .{ .decider = "vision", .questions = questions, .input = large }, .{ .decider = "vision", .questions = questions, .input = .{ .text = "Valid sibling" } } });
+    try std.testing.expectEqual(error.ConstrainedInputTooLarge, partial.failures[0].?);
+    try std.testing.expect(partial.values[1] != null);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "decision functions generated statement renews revoked leases without changing its model contract" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Scenario = enum { renew, changed_model, changed_limit, outage, repeatedly_stale, missing_lease, cancelled, cancelled_discovery, upstream_failure };
+    const Fixture = struct {
+        var scenario: Scenario = .renew;
+        var revoked: bool = false;
+        var routes: []httpx.testing_mod.Route = undefined;
+        var cancellation: *std.atomic.Value(bool) = undefined;
+        const answer = "{\"choices\":[{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"item\\\":0,\\\"value\\\":{\\\"answer\\\":\\\"same\\\"}}]}\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}";
+        const revision = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const headers = [_]httpx.testing_mod.HeaderPair{ .{ .name = "X-Antfly-Capability-Token", .value = "new-token" }, .{ .name = "X-Antfly-Capability-Revision", .value = revision } };
+        fn authority(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer fixture", req.header("Authorization") orelse return error.MissingAuthorization);
+            try std.testing.expectEqualStrings("docs", req.header("X-Antfly-Source-Table") orelse return error.MissingScope);
+        }
+        fn catalog(req: httpx.testing_mod.RequestInfo) !void {
+            try authority(req);
+            // The concrete execution is /generate, not /generate/batch.
+            try std.testing.expectEqualStrings("model=vision&task=generate&operation=generate", req.query);
+            if (revoked and scenario == .cancelled_discovery) cancellation.store(true, .release);
+        }
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try authority(req);
+            try std.testing.expectEqualStrings(revision, req.header("X-Antfly-Capability-Revision") orelse return error.MissingRevision);
+            const token = req.header("X-Antfly-Capability-Token") orelse return error.MissingToken;
+            if (revoked and scenario == .cancelled) cancellation.store(true, .release);
+            if (revoked and scenario == .upstream_failure) {
+                routes[1].respond = .{ .status = 503, .body = "{\"error\":\"service unavailable\"}" };
+            } else if (revoked and (scenario == .repeatedly_stale or std.mem.eql(u8, token, "old-token"))) {
+                routes[1].respond = .{ .status = 409, .headers = &.{.{ .name = "X-Antfly-Capability-Stale", .value = "true" }}, .body = "{\"error\":\"stale lease\",\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}" };
+            } else routes[1].respond = .{ .body = answer };
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            while (true) server.handleOne() catch |err| {
+                if (err != error.Canceled and err != error.Cancelled) failure.* = err;
+                return;
+            };
+        }
+    };
+    const catalog =
+        \\{"generators":{"vision":{"model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","inputs":["text"],"inference_capabilities":{"version":3,"task":"generate","input_modalities":["text"],"accepted_mime_types":["text/plain"],"input_granularity":"item","output":"generated_text","result_cardinality":"one_per_item","prompt_policy":"explicit","borrowed_attachments":false,"numeric_responses_v1":false,"rerank_documents_v1":false,"generation_grammar_v1":true,"batch":{"mode":"none","preferred_items":1,"max_items":1,"max_encoded_media_bytes":null,"max_decoded_pixels":null,"max_media_parts_per_item":0,"per_item_failures":false}}}}}
+    ;
+    for (std.enums.values(Scenario)) |scenario| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var routes = [_]httpx.testing_mod.Route{
+            .{ .path = "/ai/v1/models", .assert_request = Fixture.catalog, .respond = .{ .body = catalog, .headers = &.{ .{ .name = "X-Antfly-Capability-Token", .value = "old-token" }, .{ .name = "X-Antfly-Capability-Revision", .value = Fixture.revision } } } },
+            .{ .method = .POST, .path = "/generate", .assert_request = Fixture.request },
+        };
+        var cancellation = std.atomic.Value(bool).init(false);
+        Fixture.cancellation = &cancellation;
+        Fixture.scenario = scenario;
+        Fixture.revoked = false;
+        Fixture.routes = &routes;
+        var server = try httpx.TestServer.start(a, io, &routes);
+        defer server.deinit();
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Fixture.serve, .{ &server, &failure });
+        var client = httpx.Client.initWithConfig(a, io, .{ .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        var registry = registry_mod.Registry.init(a);
+        defer registry.deinit();
+        try registry.registerDeciderConfig("judge", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only });
+        var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = io, .source_table = "docs", .antfly_url = server.baseUrl(), .antfly_api_key = "fixture" };
+        defer runtime.deinit();
+        runtime.context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancellation) };
+        const questions = try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+            \\{"answer":{"type":"choice","instructions":"Compare","criteria":{"same":"Same","different":"Different"}}}
+        , .{});
+        const requests = [_]decisions.Request{.{ .decider = "judge", .questions = questions, .input = .{ .text = "A B" } }};
+        const first = try runtime.provider().evaluateBatch(alloc, &requests);
+        try std.testing.expectEqualStrings("same", first[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
+        try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
+        Fixture.revoked = true;
+        routes[0].respond.headers = &Fixture.headers;
+        if (scenario == .changed_model) {
+            routes[0].respond.body = try std.mem.replaceOwned(u8, alloc, catalog, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        }
+        if (scenario == .changed_limit) routes[0].respond.body = try std.mem.replaceOwned(u8, alloc, catalog, "\"max_decoded_pixels\":null", "\"max_decoded_pixels\":0");
+        if (scenario == .outage) routes[0].respond.status = 503;
+        if (scenario == .missing_lease) routes[0].respond.headers = &.{};
+        if (scenario == .cancelled_discovery) routes[0].respond.delay_ns = 5 * std.time.ns_per_s;
+        const started = @import("antfly_platform").time.monotonicNs();
+        const second = runtime.provider().evaluateBatch(alloc, &requests);
+        switch (scenario) {
+            .renew => {
+                const values = try second;
+                try std.testing.expectEqualStrings("same", values[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
+                try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", values[0].object.get("model_revision").?.string);
+                // Reuse the replacement on a later window, including after the
+                // result has been normalized against the original snapshot.
+                _ = try runtime.provider().evaluateBatch(alloc, &requests);
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 4), server.routeHitCount(1));
+                try std.testing.expectEqual(@as(u64, 32), runtime.input_tokens);
+                try std.testing.expectEqual(@as(u64, 16), runtime.output_tokens);
+            },
+            .changed_model, .changed_limit, .missing_lease => {
+                try std.testing.expectError(error.InferenceCapabilitiesStale, second);
+                try std.testing.expectError(error.InferenceCapabilitiesStale, runtime.provider().evaluateBatch(alloc, &requests));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
+            },
+            .outage => {
+                try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, second);
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
+                routes[0].respond.status = 200;
+                _ = try runtime.provider().evaluateBatch(alloc, &requests);
+                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(1));
+            },
+            .repeatedly_stale => {
+                try std.testing.expectError(error.InferenceCapabilitiesStale, second);
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(1));
+            },
+            .cancelled, .cancelled_discovery => {
+                // Cancellation must interrupt the in-flight discovery read,
+                // rather than waiting for its delayed response to complete.
+                try std.testing.expect(@import("antfly_platform").time.monotonicNs() - started < 2 * std.time.ns_per_s);
+                if (second) |_| return error.TestExpectedError else |err| try std.testing.expect(err == error.Cancelled or err == error.Canceled);
+                try std.testing.expectEqual(@as(usize, if (scenario == .cancelled) 1 else 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
+            },
+            .upstream_failure => {
+                if (second) |_| return error.TestExpectedError else |_| {}
+                try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
+            },
+        }
+        group.cancel(io);
+        if (failure) |err| return err;
+    }
 }

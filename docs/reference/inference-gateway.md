@@ -216,11 +216,15 @@ URLs and detail; native, Gemini, and Vertex generators accept inline images with
 `detail: "auto"`. Generated batches obey `batch.max_input_bytes` (64 KiB by
 default, configurable up to 4 MiB) including encoded media, and retain successful
 siblings during repair without resending their evidence. Native batches also
-partition by the selected executor's media count and encoded-media byte ceilings.
-An item that exceeds a ceiling fails individually while valid siblings continue.
-Native capability and routing facts are captured for the request or SQL statement
-and reused through generation and result validation; a new request resolves them
-again. Configure the generator's `rate_limit` for generated calls; each attempt
+partition according to the selected executor's limits on media count, encoded
+media bytes, and decoded pixels. Pixel counts come from the actual image headers. An item that
+exceeds a ceiling fails individually while valid siblings continue. Native model
+facts are captured for the request or SQL statement and reused through result
+validation. Remote execution leases can renew independently: an authoritative
+stale-lease response triggers one rediscovery and retry if the model revision and
+capabilities still match. Changed model facts fail closed; a discovery outage
+cannot restore a revoked lease. A new request resolves its own model facts.
+Configure the generator's `rate_limit` for generated calls; each attempt
 reserves its image allowances and serialized non-image bytes against that shared
 quota. Aggregate usage includes provider-reported tokens from failed attempts and
 repairs, counting each attempt once.

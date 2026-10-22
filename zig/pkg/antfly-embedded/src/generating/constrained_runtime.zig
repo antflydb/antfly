@@ -50,12 +50,61 @@ pub const Runtime = struct {
     options: generating.BackendFactory.Options = .{},
     cache: *remote.Cache,
     limits: constrained.Limits = .{},
+    capability_snapshot: ?constrained.Capabilities = null,
+    require_execution_lease: bool = false,
     semantic_validation: ?struct {
         ptr: *anyopaque,
         validate: *const fn (*anyopaque, Allocator, usize, Json, ?constrained.TokenEvidence) anyerror!void,
     } = null,
 
     pub fn capabilities(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig) !constrained.Capabilities {
+        const caps = try self.resolveCapabilities(a, cfg);
+        self.capability_snapshot = caps;
+        self.require_execution_lease = self.require_execution_lease or cfg.capability_token != null;
+        return caps;
+    }
+
+    const RemoteHeaders = struct {
+        entries: [2][2][]const u8 = undefined,
+        count: usize = 0,
+        authorization: ?[]u8 = null,
+        fn deinit(self: RemoteHeaders, a: Allocator) void {
+            if (self.authorization) |value| a.free(value);
+        }
+    };
+    fn remoteHeaders(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig) !RemoteHeaders {
+        var source = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key orelse (if (cfg.url.len == 0) self.options.inference_api_key else null), "ANTFLY_INFERENCE_API_KEY");
+        defer source.deinit(a);
+        const key = try source.resolveOwned(a, self.options.secret_store);
+        defer if (key) |value| a.free(value);
+        var headers = RemoteHeaders{};
+        errdefer headers.deinit(a);
+        if (key) |value| {
+            headers.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{value});
+            headers.entries[0] = .{ "Authorization", headers.authorization.? };
+            headers.count = 1;
+        }
+        headers.count = try self.options.execution.routing.appendHeaders(&headers.entries, headers.count);
+        return headers;
+    }
+    fn checkCancellation(ptr: *const anyopaque) !void {
+        const self: *const Runtime = @ptrCast(@alignCast(ptr));
+        try self.options.execution.cancellation.check();
+        if (self.options.request_context) |context| try context.check();
+    }
+    fn cancellationRequested(ptr: *const anyopaque) bool {
+        checkCancellation(ptr) catch return true;
+        return false;
+    }
+    fn waitContext(self: *Runtime) remote.WaitContext {
+        var context = self.options.execution.waitContext();
+        if (self.options.request_context) |request| if (request.deadline_ns) |deadline| {
+            context.deadline_ns = if (context.deadline_ns) |existing| @min(existing, deadline) else deadline;
+        };
+        context.cancellation = .{ .ptr = self, .is_cancelled_fn = cancellationRequested, .check_fn = checkCancellation };
+        return context;
+    }
+    fn resolveCapabilities(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig) !constrained.Capabilities {
         try cfg.validate();
         if (cfg.provider != .antfly) return hostedCapabilities(cfg.*);
         var native: ?work.InferenceCapabilities = null;
@@ -69,27 +118,34 @@ pub const Runtime = struct {
                 native = try managed.AntflyProviderBoundary.call("model_capabilities", local.boundary_dispatch, resolve, .{ local.ptr, a, cfg.model, work.Task.generate });
             }
         } else {
-            var source = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key, "ANTFLY_INFERENCE_API_KEY");
-            defer source.deinit(a);
-            const key = try source.resolveOwned(a, self.options.secret_store);
-            defer if (key) |value| a.free(value);
-            var headers: [2][2][]const u8 = undefined;
-            var count: usize = 0;
-            var auth: ?[]u8 = null;
-            defer if (auth) |value| a.free(value);
-            if (key) |value| {
-                auth = try std.fmt.allocPrint(a, "Bearer {s}", .{value});
-                headers[count] = .{ "Authorization", auth.? };
-                count += 1;
-            }
-            count = try self.options.execution.routing.appendHeaders(&headers, count);
-            const lease = try self.cache.getOrDiscoverLeaseWithContext(self.http, cfg.url, cfg.model, .generate_batch, headers[0..count], self.options.execution.waitContext());
+            const headers = try self.remoteHeaders(a, cfg.*);
+            defer headers.deinit(a);
+            // Constrained batches are scalar /generate requests, so their lease
+            // must be scoped to that concrete operation as well.
+            const lease = try self.cache.getOrDiscoverLeaseWithContext(self.http, cfg.url, cfg.model, .generate, headers.entries[0..headers.count], self.waitContext());
             native = lease.capabilities;
-            if (lease.routing_token) |token| cfg.capability_token = try a.dupe(u8, token.slice());
-            if (lease.descriptor_revision) |revision| cfg.capability_revision = try a.dupe(u8, revision.slice());
+            cfg.capability_token = if (lease.routing_token) |token| try a.dupe(u8, token.slice()) else null;
+            cfg.capability_revision = if (lease.descriptor_revision) |revision| try a.dupe(u8, revision.slice()) else null;
         }
         const caps = native orelse return error.UnsupportedConstrainedOutput;
         return .{ .limits = constrained.Limits.fromNativeBatch(caps.batch), .images = caps.input_modalities.image, .grammar = caps.generation_grammar_v1, .token_logprobs = caps.generation_token_logprobs_v1, .model_revision = if (caps.model_revision) |revision| try std.fmt.allocPrint(a, "{x}", .{&revision}) else null };
+    }
+
+    /// Refresh routing credentials before dispatch, while keeping the model
+    /// contract used for packing, probability evidence and response validation.
+    fn bindExecutionLease(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig) !void {
+        if (cfg.provider != .antfly or cfg.url.len == 0) return;
+        const renewed = try self.resolveCapabilities(a, cfg);
+        if (self.require_execution_lease and cfg.capability_token == null) return error.InferenceCapabilitiesStale;
+        self.require_execution_lease = self.require_execution_lease or cfg.capability_token != null;
+        if (self.capability_snapshot) |snapshot| {
+            if (!snapshot.sameModelContract(renewed)) return error.InferenceCapabilitiesStale;
+        } else self.capability_snapshot = renewed;
+    }
+    fn invalidateExecutionLease(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig) !void {
+        const headers = try self.remoteHeaders(a, cfg);
+        defer headers.deinit(a);
+        try self.cache.invalidate(cfg.url, cfg.model, .generate, headers.entries[0..headers.count]);
     }
 
     pub fn execute(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig, mode: constrained.Output, schema: Json, instructions: []const u8, batch: constrained.Batch, inputs: []const []const u8) !constrained.Result {
@@ -121,6 +177,7 @@ pub const Runtime = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try checkpoint(ptr);
             var cfg = self.cfg;
+            try self.runtime.bindExecutionLease(a, &cfg);
             const wire_schema = try constrained.providerSchema(a, cfg, request.mode, request.schema);
             // Invocation-owned options must never mutate the registered spec.
             cfg.tools_json = null;
@@ -144,19 +201,36 @@ pub const Runtime = struct {
             const schema_text = try std.json.Stringify.valueAlloc(a, request.schema, .{});
             const system = try std.fmt.allocPrint(a, "Return one structured result per input item. Preserve the item IDs exactly. The JSON schema is: {s}", .{schema_text});
             const messages = try constrained.evidenceMessages(a, request, system, cfg.provider == .openai);
-            var result = generating.executeChainWithOptions(a, self.runtime.http, &.{.{ .generator = cfg }}, .{
-                .antfly_provider = self.runtime.options.antfly_provider,
-                .secret_store = self.runtime.options.secret_store,
-                .inference_api_key = self.runtime.options.inference_api_key,
-                .max_response_bytes = self.runtime.options.max_response_bytes,
-                .source_table = self.runtime.options.source_table,
-                .execution = self.runtime.options.execution,
-                .request_context = self.runtime.options.request_context,
-                .limits = self.runtime.options.limits,
-                .usage_observer = if (request.usage) |usage| .{ .ptr = usage, .record_fn = recordUsage } else null,
-            }, messages) catch |err| switch (err) {
-                error.InvalidStructuredOutput, error.InvalidGeneratedToolArguments => return .{ .value = try std.json.parseFromSliceLeaky(Json, a, "{\"items\":[]}", .{}) },
-                else => return err,
+            var refreshed = false;
+            var result = while (true) {
+                const generated = generating.executeChainWithOptions(a, self.runtime.http, &.{.{ .generator = cfg }}, .{
+                    .antfly_provider = self.runtime.options.antfly_provider,
+                    .secret_store = self.runtime.options.secret_store,
+                    .inference_api_key = self.runtime.options.inference_api_key,
+                    .max_response_bytes = self.runtime.options.max_response_bytes,
+                    .source_table = self.runtime.options.source_table,
+                    .execution = self.runtime.options.execution,
+                    .request_context = self.runtime.options.request_context,
+                    .limits = self.runtime.options.limits,
+                    .usage_observer = if (request.usage) |usage| .{ .ptr = usage, .record_fn = recordUsage } else null,
+                }, messages) catch |err| {
+                    if (err == error.InferenceCapabilitiesStale and cfg.provider == .antfly and cfg.url.len > 0) {
+                        // An authoritative rejection happened before inference.
+                        // Revoke even on the final attempt; never resurrect its
+                        // stale tuple if rediscovery encounters an outage.
+                        try self.runtime.invalidateExecutionLease(a, cfg);
+                        if (refreshed) return err;
+                        try checkpoint(ptr);
+                        try self.runtime.bindExecutionLease(a, &cfg);
+                        refreshed = true;
+                        continue;
+                    }
+                    switch (err) {
+                        error.InvalidStructuredOutput, error.InvalidGeneratedToolArguments => return .{ .value = try std.json.parseFromSliceLeaky(Json, a, "{\"items\":[]}", .{}) },
+                        else => return err,
+                    }
+                };
+                break generated;
             };
             defer result.deinit();
             const raw = if (request.mode == .tool_call) blk: {
