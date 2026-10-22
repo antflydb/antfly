@@ -774,15 +774,45 @@ const Execution = struct {
                 break :mapped result;
             } else refs[0..count];
             if (translated.len != count) return error.InvalidLogicalRowIdentity;
-            for (translated, positions[0..count]) |ref, position| output[position] = try self.allowsCurrentVectorRef(ref);
+            var candidates: [128]RowRef = undefined;
+            var candidate_positions: [128]usize = undefined;
+            var candidate_count: usize = 0;
+            for (translated, positions[0..count]) |ref, position| {
+                output[position] = false;
+                if (!self.allowsCurrentVectorMask(ref)) continue;
+                candidates[candidate_count] = ref;
+                candidate_positions[candidate_count] = position;
+                candidate_count += 1;
+            }
+            var allowed: [128]bool = undefined;
+            @memset(allowed[0..candidate_count], true);
+            if (candidate_count != 0) if (self.vector_include_provider) |*provider| try provider.allowsMany(candidates[0..candidate_count], allowed[0..candidate_count]);
+            if (self.vector_exclude_provider) |*provider| {
+                var remaining_refs: [128]RowRef = undefined;
+                var remaining_positions: [128]usize = undefined;
+                var remaining_count: usize = 0;
+                for (candidates[0..candidate_count], allowed[0..candidate_count], 0..) |ref, keep, ci| if (keep) {
+                    remaining_refs[remaining_count] = ref;
+                    remaining_positions[remaining_count] = ci;
+                    remaining_count += 1;
+                };
+                var excluded: [128]bool = undefined;
+                if (remaining_count != 0) try provider.allowsMany(remaining_refs[0..remaining_count], excluded[0..remaining_count]);
+                for (remaining_positions[0..remaining_count], excluded[0..remaining_count]) |ci, exclude| allowed[ci] = !exclude;
+            }
+            for (candidate_positions[0..candidate_count], allowed[0..candidate_count]) |position, keep| output[position] = keep;
             begin = end;
         }
     }
     fn allowsCurrentVectorRef(self: *Execution, ref: local.storage_rowsource_types.RowRef) !bool {
-        const current = ref.external;
-        if (self.overlay) |overlay| if (overlay.physical) |*mask| if (mask.contains(current.file_id, current.row_group_ordinal, current.row_ordinal)) return false;
+        if (!self.allowsCurrentVectorMask(ref)) return false;
         if (self.vector_include_provider) |*provider| if (!try provider.allows(ref)) return false;
         if (self.vector_exclude_provider) |*provider| if (try provider.allows(ref)) return false;
+        return true;
+    }
+    fn allowsCurrentVectorMask(self: *Execution, ref: local.storage_rowsource_types.RowRef) bool {
+        const current = ref.external;
+        if (self.overlay) |overlay| if (overlay.physical) |*mask| if (mask.contains(current.file_id, current.row_group_ordinal, current.row_ordinal)) return false;
         if (self.vector_include) |*include| if (!include.contains(current.file_id, current.row_group_ordinal, current.row_ordinal)) return false;
         if (self.vector_exclude) |*exclude| if (exclude.contains(current.file_id, current.row_group_ordinal, current.row_ordinal)) return false;
         return true;
@@ -4553,6 +4583,35 @@ test "external lake covering search hydration survives missing Parquet and prese
     const second = try local.storage_rowsource_identity.allocId(ca, .{ .external = .{ .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .file_id = source.inventory.files[0].file_id, .row_group_ordinal = 0, .row_ordinal = 1 } });
     try owner.files.put(ca, first[6..70], source.inventory.files[0].file_id);
     try client.deleteObject("antfly", "part.parquet", .{});
+    {
+        const predicates = @import("lake_index_text_predicate.zig");
+        const ordered_rows = @import("lake_index_sql_rows.zig");
+        const resolver: predicates.PhysicalResolver = .{ .server = &server, .table = table, .source = &source, .context = .{}, .store = artifacts, .store_identity = store.identity, .read_context = owner.context, .pinned = .{ .artifacts = artifacts, .store_identity = store.identity, .domain = owner.domain, .declarations = owner.declarations, .read_context = owner.context } };
+        var membership: predicates.PhysicalResolver.Membership = .{ .a = a, .resolver = resolver, .arena = .init(a), .json = "{\"amount\":9007199254740993}", .budget = std.math.maxInt(u64) };
+        defer membership.deinit();
+        // Exercise the tile probe even for this tiny fixture; normal planning
+        // would eagerly materialize such a selective predicate. Parquet is
+        // already gone, so both routes must consume authenticated native state.
+        var predicate = (try ordered_rows.tryOpenPredicateWithContext(a, &server, table, &.{.{ .column = "amount", .op = .eq, .value = .{ .integer = 9007199254740993 } }}, .{}, &source, resolver.pinned)).?;
+        membership.predicates.append(membership.arena.allocator(), predicate) catch |err| {
+            predicate.deinit();
+            return err;
+        };
+        const current: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .identity_version = source.inventory.row_identity_version, .file_id = source.inventory.files[0].file_id, .row_group_ordinal = 0, .row_ordinal = 0 } };
+        var other = current;
+        other.external.row_ordinal = 1;
+        const shuffled = [_]local.storage_rowsource_types.RowRef{ other, current, current };
+        var allowed: [3]bool = undefined;
+        try membership.allowsMany(&shuffled, &allowed);
+        try std.testing.expectEqualSlices(bool, &.{ false, true, true }, &allowed);
+        try std.testing.expect(membership.complete == null and membership.spent != 0);
+        // Admission decline must discard tile work and produce the same exact
+        // set through the complete native predicate path.
+        membership.budget = 0;
+        try membership.allowsMany(&shuffled, &allowed);
+        try std.testing.expectEqualSlices(bool, &.{ false, true, true }, &allowed);
+        try std.testing.expect(membership.complete != null);
+    }
     var reads: ?u64 = null;
     for (0..2) |_| {
         const values = try Execution.loadSelected(types.ColumnSource, &owner, a, &.{ second, first, second }, &.{ "amount", "body" });

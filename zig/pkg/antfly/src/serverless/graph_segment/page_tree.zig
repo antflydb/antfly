@@ -445,13 +445,18 @@ fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
     try store.check(store.ptr);
     try ref.validate();
     if (store.decoded_page) |cache| return cache.read(cache.ptr, alloc, ref);
-    const bytes = try store.get(store.ptr, alloc, ref);
+    return decodePage(alloc, store.domain, ref, try store.get(store.ptr, alloc, ref));
+}
+/// Consume independently read page bytes on success and failure. Batched range
+/// readers retain the same full-reference and structural validation as get.
+pub fn decodePage(alloc: Allocator, domain: [32]u8, ref: Ref, bytes: []u8) !Page {
     errdefer alloc.free(bytes);
+    try ref.validate();
     if (bytes.len != ref.bytes) return error.InvalidGraphPage;
     var digest: [32]u8 = undefined;
     Sha256.hash(bytes, &digest, .{});
     if (!std.mem.eql(u8, &digest, &ref.digest)) return error.ArtifactIntegrityMismatch;
-    if (!std.mem.eql(u8, bytes[24..56], &store.domain)) return error.GraphPageDomainMismatch;
+    if (!std.mem.eql(u8, bytes[24..56], &domain)) return error.GraphPageDomainMismatch;
     if (!std.mem.eql(u8, bytes[0..8], magic) or bytes[8] != ref.height or
         bytes[9] & ~@as(u8, 7) != 0 or readU64(bytes, 16) != ref.records)
         return error.InvalidGraphPage;
@@ -1008,6 +1013,7 @@ pub const SortedBuilder = struct {
     store: Store,
     target_bytes: usize = target_page_bytes,
     previous: ?[]u8 = null,
+    previous_storage: std.ArrayList(u8) = .empty,
     previous_is_upper: bool = false,
     closed: bool = false,
     pending: [max_write_batch]Write = undefined,
@@ -1019,13 +1025,10 @@ pub const SortedBuilder = struct {
     const Level = struct {
         entries: std.ArrayListUnmanaged(Entry) = .empty,
         bytes: usize = header_bytes,
+        arena: ?std.heap.ArenaAllocator = null,
 
-        fn clear(self: *Level, alloc: Allocator) void {
-            for (self.entries.items) |entry| {
-                alloc.free(entry.key);
-                if (entry.child == null) alloc.free(entry.value);
-                alloc.free(entry.aggregate);
-            }
+        fn clear(self: *Level, _: Allocator) void {
+            if (self.arena) |*arena| _ = arena.reset(.free_all);
             self.entries.clearRetainingCapacity();
             self.bytes = header_bytes;
         }
@@ -1035,12 +1038,14 @@ pub const SortedBuilder = struct {
         try self.store.check(self.store.ptr);
         if (key.len == 0 or key.len > max_key_bytes or value.len > max_record_bytes - 8 - key.len) return error.GraphPageRecordTooLarge;
         try self.checkOrder(key);
-        const previous = try self.alloc.dupe(u8, key);
-        errdefer self.alloc.free(previous);
         try self.append(0, .{ .key = key, .value = value });
-        if (self.previous) |old| self.alloc.free(old);
-        self.previous = previous;
+        try self.remember(key);
         self.previous_is_upper = false;
+    }
+    fn remember(self: *SortedBuilder, key: []const u8) !void {
+        self.previous_storage.clearRetainingCapacity();
+        try self.previous_storage.appendSlice(self.alloc, key);
+        self.previous = self.previous_storage.items;
     }
     fn checkOrder(self: *SortedBuilder, key: []const u8) !void {
         if (self.closed) return error.UnsortedGraphPageMutations;
@@ -1054,12 +1059,9 @@ pub const SortedBuilder = struct {
         try ref.validate();
         try self.checkOrder(first);
         if (upper) |bound| if (!less(first, bound)) return error.InvalidGraphPage;
-        const previous = if (upper) |bound| try self.alloc.dupe(u8, bound) else null;
-        errdefer if (previous) |bytes| self.alloc.free(bytes);
         for (0..@as(usize, ref.height) + 1) |height| if (self.levels[height].entries.items.len != 0) try self.flush(height);
         try self.append(@as(usize, ref.height) + 1, .{ .key = first, .child = ref, .aggregate = aggregate });
-        if (self.previous) |old| self.alloc.free(old);
-        self.previous = previous;
+        if (upper) |bound| try self.remember(bound) else self.previous = null;
         self.previous_is_upper = true;
         self.closed = upper == null;
     }
@@ -1083,9 +1085,9 @@ pub const SortedBuilder = struct {
 
     pub fn deinit(self: *SortedBuilder) void {
         for (self.pending[0..self.pending_count]) |page| self.alloc.free(page.bytes);
-        if (self.previous) |previous| self.alloc.free(previous);
+        self.previous_storage.deinit(self.alloc);
         for (&self.levels) |*level| {
-            level.clear(self.alloc);
+            if (level.arena) |*arena| arena.deinit();
             level.entries.deinit(self.alloc);
         }
     }
@@ -1096,12 +1098,11 @@ pub const SortedBuilder = struct {
         const minimum: usize = if (height == 0) 1 else 2;
         if (level.entries.items.len >= minimum and level.bytes + entry.size() > self.target_bytes)
             try self.flush(height);
-        const key = try self.alloc.dupe(u8, entry.key);
-        errdefer self.alloc.free(key);
-        const value = if (entry.child == null) try self.alloc.dupe(u8, entry.value) else "";
-        errdefer if (entry.child == null) self.alloc.free(value);
-        const aggregate = try self.alloc.dupe(u8, entry.aggregate);
-        errdefer self.alloc.free(aggregate);
+        if (level.arena == null) level.arena = .init(self.alloc);
+        const a = level.arena.?.allocator();
+        const key = try a.dupe(u8, entry.key);
+        const value = if (entry.child == null) try a.dupe(u8, entry.value) else "";
+        const aggregate = try a.dupe(u8, entry.aggregate);
         try level.entries.append(self.alloc, .{ .key = key, .value = value, .child = entry.child, .aggregate = aggregate });
         level.bytes += entry.size();
     }
@@ -1207,6 +1208,60 @@ pub fn mergeSorted(alloc: Allocator, store: Store, left: Ref, right: Ref, reduce
     }
     return (try builder.finish()) orelse error.InvalidGraphPage;
 }
+/// Apply a strictly ordered mutation stream with one bounded tree frontier.
+/// Disjoint routing intervals are adopted without reading their descendants;
+/// only intersecting leaves and new routing boundaries are encoded. No root
+/// escapes if the producer fails or supplies an invalid stream.
+pub fn applySorted(alloc: Allocator, store: Store, prior: ?Ref, source: anytype) !?Ref {
+    const Checked = struct {
+        input: @TypeOf(source),
+        previous: std.ArrayList(u8) = .empty,
+        fn next(self: *@This(), a: Allocator) !?Mutation {
+            const change = (try self.input.next()) orelse return null;
+            if (change.key.len == 0 or change.key.len > max_key_bytes or
+                (if (change.value) |value| value.len else 0) > max_record_bytes - 8 - change.key.len)
+                return error.GraphPageRecordTooLarge;
+            if (self.previous.items.len != 0 and !less(self.previous.items, change.key)) return error.UnsortedGraphPageMutations;
+            self.previous.clearRetainingCapacity();
+            try self.previous.appendSlice(a, change.key);
+            return change;
+        }
+    };
+    var checked: Checked = .{ .input = source };
+    defer checked.previous.deinit(alloc);
+    var change = try checked.next(alloc);
+    if (change == null) return prior;
+    var old = if (prior) |root| try MergeFrontier.init(alloc, store, root) else MergeFrontier{ .alloc = alloc, .store = store };
+    defer old.deinit();
+    var builder: SortedBuilder = .{ .alloc = alloc, .store = store };
+    defer builder.deinit();
+    while (true) {
+        try store.check(store.ptr);
+        const item = old.peek();
+        if (item == null and change == null) break;
+        if (change != null and (item == null or !less(item.?.first, change.?.key))) {
+            if (item != null and std.mem.eql(u8, item.?.first, change.?.key)) {
+                if (item.?.ref != null) {
+                    try old.expand();
+                    continue;
+                }
+                old.consume();
+            }
+            if (change.?.value) |value| try builder.add(change.?.key, value);
+            change = try checked.next(alloc);
+        } else if (item.?.ref) |ref| {
+            if (change == null or (if (item.?.end) |end| !less(change.?.key, end) else false)) {
+                try builder.addSubtree(item.?.first, item.?.end, ref, item.?.aggregate);
+                old.consume();
+            } else try old.expand();
+        } else {
+            try builder.add(item.?.first, item.?.value);
+            old.consume();
+        }
+    }
+    return builder.finish();
+}
+
 const MergeFrontier = struct {
     alloc: Allocator,
     store: Store,
@@ -3423,5 +3478,88 @@ test "serverless graph prefixed pages preserve legacy cursors updates and alloca
             try std.testing.expectEqual(@as(usize, 64), count);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "serverless graph streamed mutations retain untouched branches and match batched edits" {
+    const a = std.testing.allocator;
+    var memory: TestStore = .{ .alloc = a };
+    defer memory.deinit();
+    const Input = struct {
+        n: usize = 0,
+        key: [8]u8 = undefined,
+        value: [64]u8 = @splat(7),
+        pub fn next(self: *@This()) !?Cursor.Record {
+            if (self.n == 10000) return null;
+            std.mem.writeInt(u64, &self.key, self.n * 2, .big);
+            self.n += 1;
+            return .{ .key = &self.key, .value = &self.value };
+        }
+    };
+    var input: Input = .{};
+    const prior = (try buildSortedWithOptions(a, memory.store(), &input, .{ .target_bytes = 4096 })).?;
+    var keys: [1024][8]u8 = undefined;
+    var edits: [1024]Mutation = undefined;
+    for (&keys, &edits, 0..) |*key, *change, i| {
+        std.mem.writeInt(u64, key, 2000 + i, .big);
+        change.* = .{ .key = key, .value = if (i % 3 == 0) null else "changed" };
+    }
+    const expected = try apply(a, memory.store(), prior, &edits);
+    const Stream = struct {
+        remaining: []const Mutation,
+        pub fn next(self: *@This()) !?Mutation {
+            if (self.remaining.len == 0) return null;
+            const change = self.remaining[0];
+            self.remaining = self.remaining[1..];
+            return change;
+        }
+    };
+    var stream: Stream = .{ .remaining = &edits };
+    memory.reads = 0;
+    memory.writes = 0;
+    const result = (try applySorted(a, memory.store(), prior, &stream)).?;
+    try std.testing.expect(memory.reads < 40);
+    try std.testing.expect(memory.writes < 40);
+    var left = try Cursor.init(a, memory.store(), expected, "", null);
+    defer left.deinit();
+    var right = try Cursor.init(a, memory.store(), result, "", null);
+    defer right.deinit();
+    while (try left.next()) |record| {
+        const actual = (try right.next()).?;
+        try std.testing.expectEqualSlices(u8, record.key, actual.key);
+        try std.testing.expectEqualSlices(u8, record.value, actual.value);
+    }
+    try std.testing.expect((try right.next()) == null);
+    try std.testing.expectEqual(@as(u64, 10000), prior.records);
+    var bad: Stream = .{ .remaining = &.{ edits[1], edits[0] } };
+    try std.testing.expectError(error.UnsortedGraphPageMutations, applySorted(a, memory.store(), prior, &bad));
+    var empty: Stream = .{ .remaining = &.{} };
+    try std.testing.expect(prior.eql((try applySorted(a, memory.store(), prior, &empty)).?));
+}
+
+test "serverless graph streamed mutation failures release frontier and partial output" {
+    const Run = struct {
+        fn run(a: Allocator) !void {
+            var memory: TestStore = .{ .alloc = a };
+            defer memory.deinit();
+            var builder: SortedBuilder = .{ .alloc = a, .store = memory.store(), .target_bytes = 128 };
+            defer builder.deinit();
+            for ([_][]const u8{ "a", "c", "e", "g", "i", "k", "m", "o" }) |key| try builder.add(key, "value");
+            const prior = (try builder.finish()).?;
+            const Stream = struct {
+                n: usize = 0,
+                pub fn next(self: *@This()) !?Mutation {
+                    const edits = [_]Mutation{ .{ .key = "a", .value = null }, .{ .key = "b", .value = "new" }, .{ .key = "i", .value = "changed" }, .{ .key = "z", .value = "tail" } };
+                    if (self.n == edits.len) return null;
+                    const value = edits[self.n];
+                    self.n += 1;
+                    return value;
+                }
+            };
+            var stream: Stream = .{};
+            const result = (try applySorted(a, memory.store(), prior, &stream)).?;
+            try std.testing.expectEqual(@as(u64, 9), result.records);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

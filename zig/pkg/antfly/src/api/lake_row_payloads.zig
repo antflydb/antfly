@@ -222,6 +222,7 @@ pub const Cluster = struct {
 
 pub const Capture = struct {
     const workspace_bytes = 64 * 1024 * 1024;
+    refs: std.atomic.Value(usize) = .init(1),
     a: A,
     budget: local.sql_memory_budget,
     manager: spill.Manager = undefined,
@@ -278,7 +279,11 @@ pub const Capture = struct {
     fn check(raw: *anyopaque) !void {
         try @as(*Capture, @ptrCast(@alignCast(raw))).context.ensureActive();
     }
+    pub fn retain(self: *Capture) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
     pub fn deinit(self: *Capture) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         if (self.cluster) |*cluster| cluster.deinit();
         if (self.edits) |*edits| edits.deinit();
         if (self.initialized) {

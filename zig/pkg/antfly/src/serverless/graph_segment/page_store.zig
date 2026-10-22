@@ -24,6 +24,8 @@ const refs = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 
 pub const ReadCache = struct {
     ptr: *anyopaque,
+    /// Own every output on success; release every partial output on failure.
+    read_many: ?*const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, [32]u8, []const tree.Ref, [][]u8, CancellationToken, *u64) anyerror!void = null,
     read: *const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, refs.ArtifactRef, u64, usize, [32]u8, CancellationToken, *u64) anyerror![]u8,
 };
 
@@ -159,6 +161,25 @@ pub const PageStore = struct {
             try ref.validate();
             bytes += ref.bytes;
         }
+        if (self.read_cache) |cache| if (cache.read_many) |many| {
+            const scheduler = @import("antfly_local_sources").sql_parallel_scheduler.global();
+            const reservation = @min(24 * 1024 * 1024, @as(usize, @intCast(bytes)) * 3 + refs_.len * 32 * 1024 + 256 * 1024);
+            if (scheduler.reservePull(0, reservation)) {
+                defer scheduler.releasePull(0, reservation);
+                var encoded: [tree.max_read_batch][]u8 = undefined;
+                try many(cache.ptr, a, self.artifacts, self.domain, refs_, encoded[0..refs_.len], self.cancellation, self.remaining_read_bytes);
+                var consumed: usize = 0;
+                var initialized: usize = 0;
+                errdefer for (encoded[consumed..refs_.len]) |data| a.free(data);
+                errdefer for (output[0..initialized]) |*page| page.deinit(a);
+                for (refs_, encoded[0..refs_.len], output) |ref, data, *page| {
+                    consumed += 1;
+                    page.* = try tree.decodePage(a, self.domain, ref, data);
+                    initialized += 1;
+                }
+                return;
+            }
+        };
         try artifacts.chargeReadBudget(self.remaining_read_bytes, bytes);
         // A wave reserves its total read budget before workers start. Each
         // worker owns counters; a cached reader callback only borrows metadata.

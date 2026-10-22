@@ -530,3 +530,45 @@ https://iceberg.apache.org/spec/#row-lineage
 Elasticsearch exposes logical document IDs while Lucene document numbers remain
 ephemeral. Antfly additionally needs an explicit contract for externally owned
 file rewrites.
+
+## Navigation and replay execution refinements
+
+Native metadata mutations consume one validated ordered stream against a lazy
+old-tree frontier. Unaffected half-open routing intervals retain their existing
+page references; intersecting leaves and routing boundaries flow through one
+bounded sorted builder. There is no mutation-count threshold that forces a full
+old-tree replay, and no repeated publication of a root for each 256 changes.
+The old root stays authoritative until the existing publication CAS succeeds.
+Producer errors, duplicate/out-of-order edits, cancellation and upload failures
+cannot expose a partial replacement.
+
+Cold query navigation groups nearby missing ranges from the same immutable pack
+into physical requests of at most 1 MiB, allowing gaps of at most 16 KiB. It
+retains individual page digests and cache identities. Both logical page reads
+and extra gap bytes consume read allowance. Distinct physical ranges use the
+shared I/O scheduler. Identical or containing in-flight ranges share the existing
+physical-flight coordinator even when residency is denied. Each waiter validates
+its own page slices. All jobs drain before an error or owned result escapes.
+Warm decoded row-map pages bypass prefetch; warm encoded pages require no new
+provider request. Row-map prefetch holds an independent bounded retained-memory
+reservation through consumption and declines to the ordinary page path under
+admission pressure. Ordered reverse/forward navigation uses the same coalescing
+contract. This changes neither object generation selectors nor reader authority.
+
+Publication replay retains an operation-owned, evictable cache of up to eight
+decoded typed payload pages with an 8 MiB residency target. Independent index
+configurations share those immutable pages, including decimal normalization.
+Projected scatters copy only their requested columns once; contiguous selections
+borrow sliced vectors through explicit page leases. Small selections still copy
+to avoid pinning disproportionate payloads. Eviction releases the cache's lease,
+not leases held by active builders. Required decode can evict optional residency
+before retrying known working-memory exhaustion. The spool retains its capture owner explicitly, so releasing the caller's
+capture handle cannot retire payloads still leased by replay. All consumers drain
+before spool teardown; no payload cache becomes durable serving authority.
+
+Native vector residuals probe each indexed predicate over one candidate tile.
+Current-to-index relocation and reverse navigation are batched, shuffled and
+duplicate inputs preserve their positions, and conjunctions short-circuit only
+rows already rejected. Tile work is admitted before probing. Exhausted point-read
+allowance discards partial tile output and selects complete exact predicate
+materialization. Integrity, snapshot and cancellation failures still propagate.

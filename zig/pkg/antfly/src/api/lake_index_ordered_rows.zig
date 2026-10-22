@@ -889,7 +889,7 @@ pub const Reader = struct {
         self.* = .{ .root = root, .pages = undefined, .cached = cached };
         self.pages = .{ .domain = root.domain, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.remaining_reads, .remaining_write_bytes = &self.remaining_writes };
         if (cached) |shared| {
-            self.pages.read_cache = .{ .ptr = self, .read = readPage };
+            self.pages.read_cache = .{ .ptr = self, .read = readPage, .read_many = readPages };
             self.pages.io = shared.context.io;
         }
         self.cursor = try tree.Cursor.init(a, self.pages.store(), root.page, lower, upper);
@@ -897,6 +897,20 @@ pub const Reader = struct {
     /// Enclosed immutable subtrees carry exact counts without leaf reads.
     pub fn countRange(self: *Reader, a: A, lower: []const u8, upper: ?[]const u8) !u64 {
         return tree.countRange(a, self.pages.store(), self.root.page, lower, upper);
+    }
+    fn readPages(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, refs_: []const tree.Ref, output: [][]u8, token: Cancellation, remaining: *u64) !void {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        const Charge = struct {
+            fn charge(ptr: *anyopaque, bytes: u64) !void {
+                try stores.chargeReadBudget(@ptrCast(@alignCast(ptr)), bytes);
+            }
+        };
+        var batch = try @import("lake_index_page_ranges.zig").load(a, store.*, domain, refs_, token, self.cached, .{ .ptr = remaining, .charge = Charge.charge });
+        defer batch.deinit();
+        for (output, batch.values[0..output.len]) |*out, *value| {
+            out.* = value.*.?;
+            value.* = null;
+        }
     }
     fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, len: usize, digest: [32]u8, cancellation: Cancellation, budget: *u64) ![]u8 {
         const self: *Reader = @ptrCast(@alignCast(raw));
@@ -1040,6 +1054,37 @@ pub const Reader = struct {
         if (record.key.len < 32 or !std.mem.eql(u8, record.key[record.key.len - 16 ..], &physical)) return error.InvalidNativeLakeRowIndex;
         const key = record.key[16..];
         return std.mem.order(u8, key, lower) != .lt and (upper == null or std.mem.order(u8, key, upper.?) == .lt);
+    }
+    /// Share reverse navigation for a bounded, arbitrarily ordered tile. A
+    /// missing address remains a non-match, including across leaf boundaries.
+    pub fn containsPhysicalMany(self: *Reader, backing: A, refs_: []const rows.RowRef, lower: []const u8, upper: ?[]const u8, output: []bool) !void {
+        if (refs_.len != output.len or refs_.len > tree.max_lookup_batch) return error.InvalidNativeLakeRowIndex;
+        var scratch = std.heap.ArenaAllocator.init(backing);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const coordinates = try a.alloc([16]u8, refs_.len);
+        const keys = try a.alloc([]const u8, refs_.len);
+        var files: std.StringHashMapUnmanaged(u32) = .empty;
+        for (refs_, coordinates, keys) |ref, *physical, *key| {
+            if (ref != .external) return error.InvalidNativeLakeRowIndex;
+            const row = ref.external;
+            if (!std.mem.eql(u8, row.source_id, self.root.source) or !std.mem.eql(u8, row.snapshot_id, self.root.snapshot)) return error.ExternalLakeSnapshotMismatch;
+            const slot = try files.getOrPut(a, row.file_id);
+            if (!slot.found_existing) slot.value_ptr.* = try self.fileSlot(a, row.file_id);
+            physical.* = coordinate(slot.value_ptr.*, row);
+            key.* = physical;
+        }
+        var pages = self.pages;
+        pages.remaining_read_bytes = &self.membership_reads;
+        const found = try tree.seekMany(a, pages.store(), self.root.reverse orelse return error.InvalidNativeLakeRowIndex, keys);
+        for (found, coordinates, output) |entry, physical, *keep| {
+            keep.* = false;
+            const record = entry orelse continue;
+            if (!std.mem.startsWith(u8, record.key, &physical)) continue;
+            if (record.key.len < 32 or !std.mem.endsWith(u8, record.key, &physical)) return error.InvalidNativeLakeRowIndex;
+            const tuple = record.key[16..];
+            keep.* = std.mem.order(u8, tuple, lower) != .lt and (upper == null or std.mem.order(u8, tuple, upper.?) == .lt);
+        }
     }
     pub fn intersectsPhysical(self: *Reader, first: rows.RowRef, last: rows.RowRef, lower: []const u8, upper: ?[]const u8) !?bool {
         if (first != .external or last != .external or !std.mem.eql(u8, first.external.file_id, last.external.file_id)) return error.InvalidNativeLakeRowIndex;
@@ -1273,6 +1318,17 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
         }
     };
     for ([_]u64{ 102, 99, 100, 103, 101, 16384 }) |n| try std.testing.expectEqual(n >= 100 and n < 103, try predicate_reader.containsPhysical(Probe.row(n), &lower_key, &upper_key));
+    const probes = [_]rows.RowRef{ Probe.row(102), Probe.row(99), Probe.row(100), Probe.row(103), Probe.row(101), Probe.row(16384), Probe.row(100) };
+    var expected_membership: [probes.len]bool = undefined;
+    predicate_reader.membership_reads = 8 * 1024 * 1024;
+    const scalar_start = predicate_reader.membership_reads;
+    for (probes, &expected_membership) |probe_ref, *keep| keep.* = try predicate_reader.containsPhysical(probe_ref, &lower_key, &upper_key);
+    const scalar_bytes = scalar_start - predicate_reader.membership_reads;
+    predicate_reader.membership_reads = scalar_start;
+    var batched_membership: [probes.len]bool = undefined;
+    try predicate_reader.containsPhysicalMany(a, &probes, &lower_key, &upper_key, &batched_membership);
+    try std.testing.expectEqualSlices(bool, &expected_membership, &batched_membership);
+    try std.testing.expect(scalar_start - predicate_reader.membership_reads < scalar_bytes);
     var wrong = Probe.row(100);
     wrong.external.snapshot_id = "changed";
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, predicate_reader.containsPhysical(wrong, &lower_key, &upper_key));

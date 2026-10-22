@@ -903,6 +903,51 @@ fn PredicateResolver(comptime Set: type) type {
                 const row = ref.external;
                 return self.complete.?.contains(row.file_id, row.row_group_ordinal, row.row_ordinal);
             }
+            /// Probe a complete conjunction over one native candidate tile.
+            /// Admission is reserved for the whole tile before any predicate
+            /// advances, so a declined tile safely materializes the exact set.
+            pub fn allowsMany(self: *@This(), refs: []const local.storage_rowsource_types.RowRef, output: []bool) !void {
+                if (refs.len != output.len or refs.len > 128) return error.InvalidNativeLakeRowIndex;
+                try self.resolver.context.ensureActive();
+                try self.resolver.read_context.ensureActive();
+                if (self.complete == null) {
+                    var cost: u64 = 0;
+                    var probe = self.predicates.items.len != 0;
+                    for (self.predicates.items) |predicate| {
+                        cost +|= predicate.membershipWork(refs.len);
+                        probe = probe and predicate.canProbeMembership();
+                    }
+                    if (probe and cost <= self.budget -| self.spent) {
+                        self.spent +|= cost;
+                        @memset(output, true);
+                        var selected: [128]local.storage_rowsource_types.RowRef = undefined;
+                        var positions: [128]usize = undefined;
+                        var allowed: [128]bool = undefined;
+                        for (self.predicates.items) |*predicate| {
+                            var count: usize = 0;
+                            for (refs, output, 0..) |ref, keep, i| if (keep) {
+                                selected[count] = ref;
+                                positions[count] = i;
+                                count += 1;
+                            };
+                            if (count == 0) break;
+                            predicate.containsMany(selected[0..count], allowed[0..count]) catch |err| {
+                                if (err != error.ArtifactReadBudgetExceeded and err != error.QueryCandidateBudgetExceeded) return err;
+                                try self.materialize();
+                                return self.allowsMany(refs, output);
+                            };
+                            for (positions[0..count], allowed[0..count]) |i, keep| output[i] = keep;
+                        }
+                        return;
+                    }
+                    try self.materialize();
+                }
+                for (refs, output) |ref, *keep| {
+                    if (ref != .external) return error.InvalidNativeLakeRowIndex;
+                    const row = ref.external;
+                    keep.* = self.complete.?.contains(row.file_id, row.row_group_ordinal, row.row_ordinal);
+                }
+            }
         };
         pub fn openMembership(self: Self, a: A, json: []const u8) !Membership {
             if (Set != PhysicalSet) @compileError("adaptive physical membership requires physical coordinates");

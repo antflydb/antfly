@@ -462,6 +462,7 @@ const Spool = struct {
     const spill = local.sql_spill;
     const Page = local.storage_db_types.ColumnSourcePage;
     const workspace_bytes = 64 * 1024 * 1024;
+    const CachedPayload = struct { offset: u64, page: *Page, used: u64 };
     const Spec = @import("lake_row_payloads.zig").Spec;
     a: A,
     owner: *Build,
@@ -482,13 +483,95 @@ const Spool = struct {
     adoption_rows: u64 = 0,
     payload_decodes: u64 = 0,
     captured: ?*@import("lake_row_payloads.zig").Capture = null,
+    decoded: [8]?CachedPayload = @splat(null),
+    decoded_bytes: usize = 0,
+    decoded_clock: u64 = 0,
+    payload_cache_hits: u64 = 0,
+    fn evictPayload(self: *Spool) bool {
+        var oldest: ?usize = null;
+        for (self.decoded, 0..) |entry, i| if (entry) |value| {
+            if (oldest == null or value.used < self.decoded[oldest.?].?.used) oldest = i;
+        };
+        const i = oldest orelse return false;
+        const page = self.decoded[i].?.page;
+        self.decoded_bytes -= page.retainedBytes();
+        self.decoded[i] = null;
+        page.release();
+        return true;
+    }
+    fn releaseBlock(raw: *anyopaque) void {
+        @as(*spill.Sequential.OwnedBlock, @ptrCast(@alignCast(raw))).release();
+    }
+    fn decodePayload(self: *Spool, offset: u64) !*Page {
+        const a = self.budget.allocator();
+        const payloads = if (self.captured) |capture| &capture.payloads else &self.payloads;
+        const block = try payloads.read(offset);
+        var owns = true;
+        defer if (owns) block.release();
+        const page = try a.create(Page);
+        page.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = block.count(), .owner = .{ .ptr = block, .release_fn = releaseBlock, .retained_bytes = block.retainedBytes() } };
+        owns = false;
+        errdefer page.release();
+        const pa = page.arena.allocator();
+        const columns = try pa.alloc(rows.ColumnVector, self.columns.len);
+        for (self.columns, self.specs, columns, 0..) |name, spec, *column, ordinal| {
+            column.* = try block.columnVector(pa, ordinal, if (spec.kind == .decimal128) .bytes else spec.kind);
+            column.name = try pa.dupe(u8, name);
+            if (spec.kind == .decimal128) {
+                const values = try pa.alloc(i128, block.count());
+                for (values, 0..) |*value, row| value.* = if (column.nulls.isNull(row)) 0 else blk: {
+                    const bytes = try column.bytesAt(row);
+                    if (bytes.len != 16) return error.InvalidSqlSpill;
+                    break :blk std.mem.readInt(i128, bytes[0..16], .big);
+                };
+                column.values = .{ .decimal128 = .{ .values = values, .precision = spec.precision, .scale = spec.scale } };
+            }
+        }
+        page.columns = columns;
+        self.payload_decodes += 1;
+        return page;
+    }
+    fn readPayload(self: *Spool, offset: u64) !*Page {
+        try self.mutex.lock(self.manager.io);
+        defer self.mutex.unlock(self.manager.io);
+        self.decoded_clock +|= 1;
+        for (&self.decoded) |*entry| if (entry.*) |*value| if (value.offset == offset) {
+            value.used = self.decoded_clock;
+            self.payload_cache_hits += 1;
+            value.page.retain();
+            return value.page;
+        };
+        const page = self.decodePayload(offset) catch |err| retry: {
+            const exhausted = self.budget.isExhausted() or (if (self.captured) |capture| capture.budget.isExhausted() else false);
+            if (err != error.OutOfMemory or !exhausted) return err;
+            // Optional residency cannot take memory from a required decode.
+            while (self.evictPayload()) {}
+            break :retry try self.decodePayload(offset);
+        };
+        const cost = page.retainedBytes();
+        if (cost <= 8 * 1024 * 1024) {
+            while (self.decoded_bytes + cost > 8 * 1024 * 1024) if (!self.evictPayload()) break;
+            while (true) {
+                for (&self.decoded) |*entry| if (entry.* == null) {
+                    page.retain();
+                    entry.* = .{ .offset = offset, .page = page, .used = self.decoded_clock };
+                    self.decoded_bytes += cost;
+                    return page;
+                };
+                if (!self.evictPayload()) break;
+            }
+        }
+        return page;
+    }
     fn deinit(self: *Spool) void {
+        while (self.evictPayload()) {}
         if (self.initialized) {
             self.routes.deinit();
             self.payloads.close();
         }
         self.positions.deinit(self.budget.allocator());
         self.arena.deinit();
+        if (self.captured) |capture| capture.deinit();
         self.manager.deinit();
         std.debug.assert(self.budget.live == 0);
         local.sql_parallel_scheduler.global().releasePull(0, workspace_bytes);
@@ -619,6 +702,7 @@ const Spool = struct {
         defer capture.routes.phase = null;
         self.columns = capture.columns;
         self.specs = capture.specs;
+        capture.retain();
         self.captured = capture;
         for (self.owner.slots, 0..) |slot, ordinal| try self.positions.put(a, slot, ordinal);
         self.route_store = try @import("../serverless/graph_segment/page_store.zig").PrivatePages.beginRun(&self.routes);
@@ -756,50 +840,20 @@ const Spool = struct {
             while (begin < count) {
                 var end = begin + 1;
                 while (end < count and items[end].offset == items[begin].offset) end += 1;
-                try self.owner.mutex.lock(self.owner.manager.io);
-                const payloads = if (self.owner.captured) |capture| &capture.payloads else &self.owner.payloads;
-                self.owner.payload_decodes += 1;
-                const block = payloads.read(items[begin].offset) catch |err| {
-                    self.owner.mutex.unlock(self.owner.manager.io);
-                    return phase.failed(err);
-                };
-                self.owner.mutex.unlock(self.owner.manager.io);
-                defer block.release();
-                var decode_arena = std.heap.ArenaAllocator.init(a);
-                defer decode_arena.deinit();
-                const da = decode_arena.allocator();
-                const columns = try da.alloc(rows.ColumnVector, self.binding.column_bindings.len);
-                for (self.binding.column_bindings, columns) |name, *column| {
-                    const ordinal = for (self.owner.columns, 0..) |candidate, i| {
-                        if (std.mem.eql(u8, name, candidate)) break i;
-                    } else return error.RowSourceColumnKindMismatch;
-                    const spec = self.owner.specs[ordinal];
-                    column.* = try block.columnVector(da, ordinal, if (spec.kind == .decimal128) .bytes else spec.kind);
-                    column.name = name;
-                    if (spec.kind == .decimal128) {
-                        const values = try da.alloc(i128, block.count());
-                        for (values, 0..) |*value, row| value.* = if (column.nulls.isNull(row)) 0 else blk: {
-                            const raw_value = try column.bytesAt(row);
-                            if (raw_value.len != 16) return error.InvalidSqlSpill;
-                            break :blk std.mem.readInt(i128, raw_value[0..16], .big);
-                        };
-                        column.values = .{ .decimal128 = .{ .values = values, .precision = spec.precision, .scale = spec.scale } };
-                    }
-                }
-                const row_refs = try da.alloc(rows.RowRef, block.count());
-                @memset(row_refs, .{ .relational_key = "spool" });
-                var selection: [256]usize = undefined;
-                for (items[begin..end], selection[0 .. end - begin]) |value, *selected| selected.* = value.row;
-                const page = try Page.copy(a, .{ .snapshot = .{ .table_id = self.binding.source_id, .snapshot_id = self.binding.snapshot_id }, .row_refs = row_refs, .columns = columns }, selection[0 .. end - begin]);
+                const page = self.owner.readPayload(items[begin].offset) catch |err| return phase.failed(err);
                 chunks.append(a, page) catch |err| {
                     page.release();
                     return err;
                 };
-                for (items[begin..end], 0..) |value, row| positions[value.position] = .{ .page = page, .row = row };
+                for (items[begin..end]) |value| positions[value.position] = .{ .page = page, .row = value.row };
                 begin = end;
             }
             try phase.finish();
-            const page = try Page.gatherPositions(a, positions[0..count]);
+            const projected = try ta.alloc(usize, self.binding.column_bindings.len);
+            for (self.binding.column_bindings, projected) |name, *ordinal| ordinal.* = for (self.owner.columns, 0..) |candidate, ci| {
+                if (std.mem.eql(u8, name, candidate)) break ci;
+            } else return error.RowSourceColumnKindMismatch;
+            const page = try Page.gatherProjectedPositions(a, positions[0..count], projected);
             errdefer page.release();
             const owned_refs = try page.arena.allocator().dupe(rows.RowRef, refs);
             for (owned_refs) |*ref| ref.external.file_id = try page.arena.allocator().dupe(u8, ref.external.file_id);
@@ -1389,6 +1443,48 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
     try std.testing.expect(native.spool != null);
     if (fused) try std.testing.expectEqual(@as(u64, if (selective) 17 else row_count), native.spool.?.adoption_rows);
     try std.testing.expectEqual(@as(u64, if (fused) 0 else 1), native.spool.?.source_passes);
+    // Two independent configurations reuse the same decoded first tile even
+    // when their projections differ. Closing either cursor cannot invalidate
+    // the other's borrowed vectors or cached dependencies.
+    {
+        const bound: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .column_bindings = &.{ "id", "body", "price" }, .index_config_hash = "shared-tile-test" };
+        const first = try Build.open(native, a, bound, if (hashed) null else 0, .none, null);
+        defer first.deinit(a);
+        const first_batch = (try first.next(a)).?;
+        var projected = bound;
+        projected.column_bindings = &.{ "price", "id" };
+        const second = try Build.open(native, a, projected, if (hashed) null else 0, .none, null);
+        defer second.deinit(a);
+        const before = native.spool.?.payload_decodes;
+        const hits = native.spool.?.payload_cache_hits;
+        const second_batch = (try second.next(a)).?;
+        try std.testing.expectEqual(first_batch.rowCount(), second_batch.rowCount());
+        try std.testing.expectEqual(before, native.spool.?.payload_decodes);
+        try std.testing.expect(native.spool.?.payload_cache_hits > hits);
+        try std.testing.expectEqual(@as(usize, 2), second_batch.columns.len);
+        try std.testing.expectEqual(try first_batch.findColumn("id").?.integerAt(0), try second_batch.findColumn("id").?.integerAt(0));
+    }
+    if (hashed) {
+        const spool = native.spool.?;
+        var routes = try tree.Cursor.init(a, spool.storage(), spool.route_root, "", null);
+        defer routes.deinit();
+        const offset = while (try routes.next()) |record| {
+            const candidate = std.mem.readInt(u64, record.value[0..8], .big);
+            const resident = for (spool.decoded) |entry| {
+                if (entry != null and entry.?.offset == candidate) break true;
+            } else false;
+            if (!resident) break candidate;
+        } else return error.TestUnexpectedResult;
+        // Deny the next decode until optional residency is released. Capture
+        // blocks use their original allocator; standalone spools use their own.
+        const budget = if (captured) |capture| &capture.budget else &spool.budget;
+        const limit = budget.limit;
+        budget.limit = budget.live;
+        defer budget.limit = limit;
+        const page = try spool.readPayload(offset);
+        defer page.release();
+        try std.testing.expect(page.len != 0);
+    }
     for (0..2) |_| {
         native.spool.?.payload_decodes = 0;
         const input = try Build.open(native, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .column_bindings = &.{ "id", "body", "price" }, .index_config_hash = "test" }, if (hashed) null else 0, .none, null);

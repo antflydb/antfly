@@ -572,6 +572,21 @@ pub const Predicate = struct {
         const index_ref = try owner.toIndex(scratch.allocator(), ref);
         return owner.reader.containsPhysical(index_ref, owner.predicate_lower, owner.predicate_upper);
     }
+    pub fn containsMany(self: *Predicate, refs: []const local.storage_rowsource_types.RowRef, output: []bool) !void {
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        var workspace: local.sql_memory_budget = .{ .backing = owner.a, .limit = 4 * 1024 * 1024 };
+        var scratch = std.heap.ArenaAllocator.init(workspace.allocator());
+        defer scratch.deinit();
+        const mapped = owner.mapToIndex(scratch.allocator(), refs) catch |err| {
+            if (err == error.OutOfMemory and workspace.isExhausted()) return error.QueryCandidateBudgetExceeded;
+            return err;
+        };
+        owner.reader.containsPhysicalMany(scratch.allocator(), mapped, owner.predicate_lower, owner.predicate_upper, output) catch |err| {
+            if (err == error.OutOfMemory and workspace.isExhausted()) return error.QueryCandidateBudgetExceeded;
+            return err;
+        };
+    }
     pub fn intersectsPhysical(self: *Predicate, first: local.storage_rowsource_types.RowRef, last: local.storage_rowsource_types.RowRef) !?bool {
         if (self.scan) return null;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));

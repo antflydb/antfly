@@ -63,7 +63,9 @@ test {
     _ = @import("api/lake_row_identity.zig");
     _ = @import("api/lake_row_fragments.zig");
     _ = @import("api/lake_row_payloads.zig");
+    _ = @import("api/lake_index_page_ranges.zig");
     _ = @import("antfly_local_sources").storage_rowsource_identity.logical;
+    _ = @import("antfly_local_sources").storage_db_column_source;
     _ = @import("antfly_local_sources").search_scorer;
     _ = @import("api/lake_index_seekable_text.zig");
     _ = @import("api/lake_index_native_directory.zig");

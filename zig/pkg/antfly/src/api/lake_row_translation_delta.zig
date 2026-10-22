@@ -287,7 +287,7 @@ test "external lake persistent translations retain unchanged maps and update swa
             try std.testing.expectEqual(next.rows, extended.reverse.records);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ &pages, original.current, third, current.current, initial });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failure.run, .{ &pages, original.current, third, current.current, initial });
     // No original ID tree is needed when changed values leave addresses intact.
     // Keep the original coordinate map and only compare current COW state.
     for (&values, &edits) |*value, *edit| {

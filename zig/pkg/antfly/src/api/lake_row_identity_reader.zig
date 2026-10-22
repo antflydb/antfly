@@ -451,6 +451,7 @@ const ReadLane = struct {
     allowance: ?*Source.TranslationAllowance,
     pages: @import("../serverless/graph_segment/page_store.zig").PageStore = undefined,
     cache: @import("../serverless/graph_segment/page_tree.zig").Cache = undefined,
+    preloaded: ?*const @import("lake_index_page_ranges.zig").Batch = null,
     unused_reads: u64 = 0,
     unused_writes: u64 = 0,
     fn init(self: *ReadLane, owner_: *Owner, a: A, allowance: ?*Source.TranslationAllowance) void {
@@ -461,15 +462,70 @@ const ReadLane = struct {
         if (allowance == null and owner_.cached.context.io != null) storage.read_many = .{ .ptr = self, .read = readMany };
         self.cache = .{ .alloc = a, .underlying = storage, .max_bytes = 256 * 1024 };
     }
+    fn releaseDecoded(owner: *anyopaque, item: *anyopaque) void {
+        const lease: local.serverless_query_lake_decoded_cache.Lease = .{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) };
+        lease.release();
+    }
+    fn leasedPage(lease: local.serverless_query_lake_decoded_cache.Lease) @import("../serverless/graph_segment/page_tree.zig").Page {
+        const value: *const DecodedPage = @ptrCast(@alignCast(lease.item.payload.extension));
+        var page = value.page;
+        page.lease = .{ .owner = lease.cache, .item = lease.item, .release = releaseDecoded };
+        return page;
+    }
     fn readMany(raw: *anyopaque, a: A, refs: []const @import("../serverless/graph_segment/page_tree.zig").Ref, output: []@import("../serverless/graph_segment/page_tree.zig").Page) !void {
         const self: *ReadLane = @ptrCast(@alignCast(raw));
-        if (self.allowance != null) return error.InvalidLogicalRowIdentity;
-        var source = self.pages.store();
-        source.decoded_page = .{ .ptr = self, .read = decodedPage };
-        var stores_: [@import("../serverless/graph_segment/page_tree.zig").max_read_batch]@import("../serverless/graph_segment/page_tree.zig").Store = undefined;
-        if (refs.len > stores_.len) return error.InvalidLogicalRowIdentity;
-        @memset(stores_[0..refs.len], source);
-        try @import("../serverless/graph_segment/page_store.zig").readBatch(self.owner.cached.context.io.?, a, stores_[0..refs.len], refs, output);
+        const tree = @import("../serverless/graph_segment/page_tree.zig");
+        if (self.allowance != null or refs.len != output.len or refs.len > tree.max_read_batch) return error.InvalidLogicalRowIdentity;
+        var ready: [tree.max_read_batch]?tree.Page = @splat(null);
+        defer for (&ready) |*page| if (page.*) |*value| value.deinit(a);
+        var missing: [tree.max_read_batch]tree.Ref = undefined;
+        var positions: [tree.max_read_batch]usize = undefined;
+        var count: usize = 0;
+        for (refs, 0..) |ref, i| {
+            try self.owner.cached.context.ensureActive();
+            if (self.owner.cached.cache.decoded.lookup(self.decodedKey(ref))) |lease| {
+                ready[i] = leasedPage(lease);
+            } else {
+                missing[count] = ref;
+                positions[count] = i;
+                count += 1;
+            }
+        }
+        if (count != 0) {
+            const scheduler = local.sql_parallel_scheduler.global();
+            var encoded_bytes: usize = 0;
+            for (missing[0..count]) |ref| encoded_bytes += ref.bytes;
+            const reservation = @min(24 * 1024 * 1024, encoded_bytes * 3 + count * 32 * 1024 + 256 * 1024);
+            const retained = scheduler.reservePull(0, reservation);
+            defer if (retained) scheduler.releasePull(0, reservation);
+            var workspace: local.sql_memory_budget = .{ .backing = a, .limit = reservation };
+            const Charge = struct {
+                fn charge(ptr: *anyopaque, bytes: u64) !void {
+                    try @as(*Owner, @ptrCast(@alignCast(ptr))).charge(bytes, null);
+                }
+            };
+            var encoded = if (retained) @import("lake_index_page_ranges.zig").load(workspace.allocator(), self.owner.artifacts, self.owner.reader.root.domain, missing[0..count], self.pages.cancellation, self.owner.cached, .{ .ptr = self.owner, .charge = Charge.charge }) catch |err| fallback: {
+                if (err != error.OutOfMemory or !workspace.isExhausted()) return err;
+                break :fallback null;
+            } else null;
+            defer if (encoded) |*batch| batch.deinit();
+            var lanes: [tree.max_read_batch]ReadLane = undefined;
+            var stores_: [tree.max_read_batch]tree.Store = undefined;
+            for (stores_[0..count], lanes[0..count]) |*source, *lane| {
+                lane.init(self.owner, a, null);
+                lane.preloaded = if (encoded) |*batch| batch else null;
+                source.* = lane.pages.store();
+                source.decoded_page = .{ .ptr = lane, .read = decodedPage };
+            }
+            defer for (lanes[0..count]) |*lane| lane.deinit();
+            var pages_: [tree.max_read_batch]tree.Page = undefined;
+            try @import("../serverless/graph_segment/page_store.zig").readBatch(self.owner.cached.context.io.?, a, stores_[0..count], missing[0..count], pages_[0..count]);
+            for (positions[0..count], pages_[0..count]) |i, page| ready[i] = page;
+        }
+        for (output, ready[0..refs.len]) |*out, *page| {
+            out.* = page.*.?;
+            page.* = null;
+        }
     }
     fn deinit(self: *ReadLane) void {
         self.cache.deinit();
@@ -477,20 +533,18 @@ const ReadLane = struct {
     fn readPage(raw: *anyopaque, a: A, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, page_digest: [32]u8, token: @import("antfly_cancellation").CancellationToken, _: *u64) ![]u8 {
         const self: *ReadLane = @ptrCast(@alignCast(raw));
         try self.owner.cached.context.ensureActive();
+        if (self.preloaded) |batch| for (batch.refs, batch.values[0..batch.refs.len]) |candidate, value| {
+            const id = try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(self.owner.reader.root.domain, candidate);
+            if (std.mem.eql(u8, &id, ref.artifact_id) and candidate.offset() == offset and candidate.bytes == length and std.mem.eql(u8, &candidate.digest, &page_digest)) return a.dupe(u8, value.?);
+        };
         try self.owner.charge(length, self.allowance);
         return @import("lake_index_aggregate_artifact.zig").readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, page_digest, token, self.owner.cached) catch |err| return self.owner.failed(err);
     }
-    const DecodedPage = struct { page: @import("../serverless/graph_segment/page_tree.zig").Page };
-    fn decodedPage(raw: *anyopaque, a: A, ref: @import("../serverless/graph_segment/page_tree.zig").Ref) !@import("../serverless/graph_segment/page_tree.zig").Page {
-        const lane: *ReadLane = @ptrCast(@alignCast(raw));
-        const self = lane.owner;
-        const tree = @import("../serverless/graph_segment/page_tree.zig");
-        try self.cached.context.ensureActive();
-        try self.pages.cancellation.check();
+    fn decodedKey(self: *ReadLane, ref: @import("../serverless/graph_segment/page_tree.zig").Ref) [32]u8 {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("native-lake-row-map-decoded-page-v1");
-        hash.update(&self.cached.scope);
-        hash.update(&self.reader.root.domain);
+        hash.update(&self.owner.cached.scope);
+        hash.update(&self.owner.reader.root.domain);
         hash.update(&ref.digest);
         hash.update(&ref.attempt);
         if (ref.pack) |pack_| {
@@ -507,6 +561,16 @@ const ReadLane = struct {
         hash.update(&shape);
         var key: [32]u8 = undefined;
         hash.final(&key);
+        return key;
+    }
+    const DecodedPage = struct { page: @import("../serverless/graph_segment/page_tree.zig").Page };
+    fn decodedPage(raw: *anyopaque, a: A, ref: @import("../serverless/graph_segment/page_tree.zig").Ref) !@import("../serverless/graph_segment/page_tree.zig").Page {
+        const lane: *ReadLane = @ptrCast(@alignCast(raw));
+        const self = lane.owner;
+        const tree = @import("../serverless/graph_segment/page_tree.zig");
+        try self.cached.context.ensureActive();
+        try self.pages.cancellation.check();
+        const key = lane.decodedKey(ref);
         const Loader = struct {
             lane: *ReadLane,
             ref: tree.Ref,

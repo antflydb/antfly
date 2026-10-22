@@ -234,5 +234,32 @@
     },
     "dense_metadata_verification": "one pinned sorted batch with exact key verification",
     "scatter_dictionary": "shared string dictionary across gathered source pages"
+  },
+  "navigation_and_replay_refinements": {
+    "coalesced_range_max_bytes": 1048576,
+    "coalesced_range_max_gap_bytes": 16384,
+    "range_cache_units": "individual authenticated pages",
+    "extra_gap_bytes_charged": true,
+    "row_map_prefetch_retained_reservation_bytes": 25165824,
+    "row_map_warm_decoded_prefetch": false,
+    "replay_decoded_payload_cache_max_pages": 8,
+    "replay_decoded_payload_cache_target_bytes": 8388608,
+    "projected_scatter_payload_copies": 1,
+    "contiguous_tiles": "borrowed immutable sliced vectors with retained page owner",
+    "metadata_mutations": "one sorted frontier traversal, retaining disjoint subtrees",
+    "metadata_mutation_full_rebuild_count_threshold": null,
+    "indexed_residual_max_tile_rows": 128,
+    "predicate_reverse_navigation": "batched exact lower-bound seeks",
+    "membership_read_decline": "complete exact materialization",
+    "cold_shuffled_three_page_pack_provider_requests": 1,
+    "warm_range_wave_additional_provider_requests": 0,
+    "two_600_kib_pages_in_large_pack_provider_requests": 2,
+    "coalesced_16_byte_gap_allowance_for_two_128_byte_pages": 272,
+    "streamed_mutation_prior_records": 10000,
+    "streamed_mutation_delta_records": 1024,
+    "streamed_mutation_page_reads_less_than": 40,
+    "streamed_mutation_page_writes_less_than": 40,
+    "replay_capture_owner": "retained reference through spool teardown",
+    "range_flights": "shared containing immutable physical intervals without requiring residency"
   }
 }

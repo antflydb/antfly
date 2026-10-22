@@ -112,59 +112,16 @@ pub const Mutations = struct {
         if (self.reduction) |reduction| storage.reduce = reduction;
         var delta = try tree.Cursor.init(self.a, self.forest.store, changes, "", null);
         defer delta.deinit();
-        if (prior != null and changes.records < @max(4096, prior.?.records / 4)) {
-            var cache: tree.Cache = .{ .alloc = self.a, .underlying = storage };
-            defer cache.deinit();
-            var arena = std.heap.ArenaAllocator.init(self.a);
-            defer arena.deinit();
-            var root = prior;
-            var done = false;
-            while (!done) {
-                _ = arena.reset(.retain_capacity);
-                const a = arena.allocator();
-                var batch: std.ArrayList(tree.Mutation) = .empty;
-                var bytes: usize = 0;
-                while (batch.items.len < 256 and bytes < 512 * 1024) {
-                    const record = try delta.next() orelse {
-                        done = true;
-                        break;
-                    };
-                    const mutation_ = try decode(record);
-                    try batch.append(a, .{ .key = try a.dupe(u8, mutation_.key), .value = if (mutation_.value) |value| try a.dupe(u8, value) else null });
-                    bytes += record.key.len + record.value.len;
-                }
-                if (batch.items.len != 0) root = try tree.apply(self.a, cache.store(), root, batch.items);
-            }
-            return root;
-        }
-        var old = try tree.Cursor.init(self.a, storage, prior, "", null);
-        defer old.deinit();
-        const Merge = struct {
-            old: *tree.Cursor,
-            delta: *tree.Cursor,
-            left: ?tree.Cursor.Record = null,
-            right: ?tree.Cursor.Record = null,
-            advance_left: bool = true,
-            advance_right: bool = true,
-            pub fn next(self_: *@This()) !?tree.Cursor.Record {
-                while (true) {
-                    if (self_.advance_left) self_.left = try self_.old.next();
-                    if (self_.advance_right) self_.right = try self_.delta.next();
-                    self_.advance_left = false;
-                    self_.advance_right = false;
-                    if (self_.left == null and self_.right == null) return null;
-                    const order: std.math.Order = if (self_.left == null) .gt else if (self_.right == null) .lt else std.mem.order(u8, self_.left.?.key, self_.right.?.key);
-                    self_.advance_left = order != .gt;
-                    self_.advance_right = order != .lt;
-                    if (order == .lt) return self_.left;
-                    const mutation_ = try decode(self_.right.?);
-                    if (mutation_.value) |value| return .{ .key = mutation_.key, .value = value };
-                }
+        const Source = struct {
+            cursor: *tree.Cursor,
+            pub fn next(self_: *@This()) !?tree.Mutation {
+                return if (try self_.cursor.next()) |record| try decode(record) else null;
             }
         };
-        var source: Merge = .{ .old = &old, .delta = &delta };
-        return tree.buildSorted(self.a, storage, &source);
+        var source: Source = .{ .cursor = &delta };
+        return tree.applySorted(self.a, storage, prior, &source);
     }
+
     fn decode(record: tree.Cursor.Record) !tree.Mutation {
         if (record.value.len == 0 or record.value[0] > 1 or (record.value[0] == 0 and record.value.len != 1)) return error.InvalidNativeLakeTextCorpus;
         return .{ .key = record.key, .value = if (record.value[0] == 0) null else record.value[1..] };
