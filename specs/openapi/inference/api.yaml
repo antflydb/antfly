@@ -1169,7 +1169,7 @@ paths:
     post:
       operationId: decide
       summary: Answer named decision questions
-      description: Execute text or multimodal evidence through named deciders, or an Antfly text batch. OpenAI and Jev adapters support images; native deciders require text. Embedding similarity supports choice and multi_choice;
+      description: Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items. Hosted typed deciders accept text and images per batch item; native and generated deciders require text. OpenAI and Jev adapters support images; native deciders require text. Embedding similarity supports choice and multi_choice;
         trained decision models support choice, score and predicate. Answer variants distinguish trained
         probabilities from raw cosine similarities.
       tags:

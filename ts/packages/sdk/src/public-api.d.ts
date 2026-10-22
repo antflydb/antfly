@@ -5237,7 +5237,7 @@ export interface paths {
         put?: never;
         /**
          * Answer named decision questions
-         * @description Execute text or multimodal evidence through named deciders, or an Antfly text batch. OpenAI and Jev adapters support images; native deciders require text. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
+         * @description Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items. Hosted typed deciders accept text and images per batch item; native and generated deciders require text. OpenAI and Jev adapters support images; native deciders require text. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
          */
         post: operations["decide"];
         delete?: never;
@@ -21879,7 +21879,7 @@ export interface components {
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
             inputs?: string[];
         };
-        /** @description Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage. */
+        /** @description Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage including reported usage from failed items. Named gateway batches identify the configured model at the top level and resolved models per successful item. */
         InferenceDecideResponse: {
             model: string;
             model_identity?: string;
@@ -23200,8 +23200,8 @@ export interface components {
         DecisionEvidence: string | components["schemas"]["DecisionEvidenceMessage"][];
         DecisionInput: {
             id?: string;
-            input: string;
-            /** @description Index into request contexts. Requires context_version 1. Effective input is context, newline, then input; the 1 MiB input limit applies after expansion. */
+            input: components["schemas"]["DecisionEvidence"];
+            /** @description Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native and generated models require text. */
             context_index?: number;
         };
         /** @description Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text. */
@@ -23269,7 +23269,7 @@ export interface components {
              */
             dimensions?: 768 | 512 | 256 | 128;
         };
-        /** @description Supply exactly one of input (single evidence item) or inputs (text-only Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
+        /** @description Supply exactly one of input (single evidence item) or inputs (ordered Antfly batch extension; hosted typed deciders also accept multimodal evidence per item). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
         InferenceDecideRequest: {
             /**
              * @description Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
@@ -23717,8 +23717,10 @@ export interface components {
         DecisionBatchItem: {
             input_index: number;
             id?: string;
-            /** @description Generated batches preserve valid siblings; a failed item has an empty answers array and this error code. */
+            /** @description Named gateway and generated batches preserve valid siblings; a failed item has an empty answers array and this error code. Invalid input or request budgets fail validation before dispatch. */
             error?: string;
+            /** @description Resolved model reported for a successful named gateway batch item. */
+            model?: string;
             answers: components["schemas"]["InferenceDecideAnswer"][];
         };
         DecisionUsage: {

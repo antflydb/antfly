@@ -4320,7 +4320,7 @@ pub const AntflyApiHandler = struct {
             error.Timeout => 504,
             error.EmbeddingIdentityMismatch => 409,
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.InvalidDecisionSpecification, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
+            error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
             else => 502,
         };
         _ = ctx.status(status);
@@ -18050,6 +18050,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
             } else {
                 const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
                 defer parsed.deinit();
+                if (parsed.value.object.get("input").? == .string) return;
                 const content = parsed.value.object.get("input").?.array.items[0].object.get("content").?.array.items;
                 try std.testing.expectEqualStrings("Inspect", content[0].object.get("text").?.string);
                 try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgo=", content[1].object.get("image_url").?.string);
@@ -18076,8 +18077,8 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
     try config.registry.registerEmbedderConfig("dense", .{ .provider = .openai, .model = "backend", .url = upstream.baseUrl(), .api_key = "gateway-test-key", .dimensions = 2 });
     const hosted_url = try std.fmt.allocPrint(alloc, "{s}/v1", .{upstream.baseUrl()});
     defer alloc.free(hosted_url);
-    try config.registry.registerDeciderConfig("visual-openai", .{ .provider = .openai, .model = "backend", .max_image_input_tokens = 8192, .url = hosted_url, .api_key = "gateway-test-key" });
-    try config.registry.registerDeciderConfig("visual-jev", .{ .provider = .jev, .model = "jev-preview", .max_image_input_tokens = 8192, .url = upstream.baseUrl(), .api_key = "gateway-test-key" });
+    try config.registry.registerDeciderConfig("visual-openai", .{ .provider = .openai, .model = "backend", .max_image_input_tokens = 8192, .batch_size = 1, .url = hosted_url, .api_key = "gateway-test-key" });
+    try config.registry.registerDeciderConfig("visual-jev", .{ .provider = .jev, .model = "jev-preview", .max_image_input_tokens = 8192, .batch_size = 1, .url = upstream.baseUrl(), .api_key = "gateway-test-key" });
     try config.connections.put(alloc, try alloc.dupe(u8, "vendor"), .{
         .kind = .inference,
         .capabilities = try alloc.dupe([]u8, &.{try alloc.dupe(u8, "models.decide")}),
@@ -18112,6 +18113,10 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 .{ "{\"model\":\"deciders/visual-openai\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
                 .{ "{\"model\":\"connections/vendor/models/backend\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
                 .{ "{\"model\":\"deciders/visual-jev\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
+                .{ "{\"model\":\"deciders/visual-openai\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}],\"inputs\":[{\"id\":\"first\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]},{\"id\":\"second\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]}]}", "0.9" },
+                .{ "{\"model\":\"deciders/visual-jev\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}],\"inputs\":[{\"id\":\"first\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]},{\"id\":\"second\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]}]}", "0.9" },
+                .{ "{\"model\":\"connections/vendor/models/backend\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}],\"inputs\":[{\"id\":\"first\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]},{\"id\":\"second\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]}]}", "0.9" },
+                .{ "{\"model\":\"deciders/triage\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}],\"inputs\":[{\"id\":\"first\",\"input\":\"refund\"},{\"id\":\"second\",\"input\":\"refund\"}]}", "0.9" },
             };
             inline for (requests, 0..) |item, i| {
                 var req = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/test");
@@ -18121,7 +18126,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 defer ctx.deinit();
                 var response = try h.gatewayRequest(&ctx, switch (i) {
                     0 => .generate,
-                    1, 5, 6, 7 => .decide,
+                    1, 5, 6, 7, 8, 9, 10, 11 => .decide,
                     2 => .read,
                     else => .embed,
                 });
@@ -18129,6 +18134,18 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 if (response.status.code != 200) std.debug.print("gateway response: {s}\n", .{response.body orelse ""});
                 try std.testing.expectEqual(@as(u16, 200), response.status.code);
                 try std.testing.expect(std.mem.indexOf(u8, response.body.?, item[1]) != null);
+                if (i >= 8) {
+                    var typed = try std.json.parseFromSlice(@import("inference_api").DecideResponse, a, response.body.?, .{});
+                    defer typed.deinit();
+                    const envelope = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+                    defer envelope.deinit();
+                    const data = envelope.value.object.get("data").?.array.items;
+                    try std.testing.expectEqual(@as(usize, 2), data.len);
+                    try std.testing.expectEqualStrings("first", data[0].object.get("id").?.string);
+                    try std.testing.expectEqualStrings("second", data[1].object.get("id").?.string);
+                    try std.testing.expectEqual(@as(i64, 1), data[1].object.get("input_index").?.integer);
+                    try std.testing.expectEqual(@as(i64, 4), envelope.value.object.get("usage").?.object.get("input_tokens").?.integer);
+                }
             }
         }
     };
@@ -18136,7 +18153,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
     var failure: ?anyerror = null;
     try group.concurrent(io, Fiber.run, .{ alloc, io, &handler, &failure });
     defer group.cancel(io);
-    for (0..8) |_| try upstream.handleOne();
+    for (0..16) |_| try upstream.handleOne();
     try group.await(io);
     if (failure) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), api_server.inferenceAdmissionStats().in_flight);

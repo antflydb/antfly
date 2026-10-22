@@ -24,9 +24,10 @@ T = TypeVar("T", bound="InferenceDecideRequest")
 
 @_attrs_define
 class InferenceDecideRequest:
-    """Supply exactly one of input (single evidence item) or inputs (text-only Antfly batch extension). Question names must
-    be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text
-    input and string choice values. Request bodies are bounded at 16 MiB.
+    """Supply exactly one of input (single evidence item) or inputs (ordered Antfly batch extension; hosted typed deciders
+    also accept multimodal evidence per item). Question names must be unique. Single text and named question arrays
+    follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are
+    bounded at 16 MiB.
 
         Attributes:
             model (str):

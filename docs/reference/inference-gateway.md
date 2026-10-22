@@ -149,6 +149,41 @@ Named OpenAI and Jev deciders accept the same multimodal `input` on
 }
 ```
 
+Batch the same evidence using `inputs` on a named decider or hosted connection:
+
+```json
+{
+  "model": "deciders/visual-triage",
+  "inputs": [
+    {"id": "ticket", "input": "The parcel arrived damaged."},
+    {"id": "photo", "input": [{"role": "user", "content": [{"type": "input_image", "image_url": "https://example.org/parcel.png"}]}]}
+  ],
+  "questions": [{"name": "damaged", "type": "predicate", "instructions": "Is the item damaged?"}]
+}
+```
+
+Supply exactly one of `input` or `inputs`. Batches contain 1–128 items and return
+`data` in input order, preserving each `input_index` and optional `id`. Successful
+items contain `answers` and the reported `model`; provider failures contain empty
+`answers` and an `error` code without dropping valid siblings. Cancellation,
+deadline expiry, and request-wide resource failures end the request. Aggregate
+`usage` includes reported usage from failed items. The top-level batch `model`
+identifies the configured model, while successful items report resolved models.
+
+Every item is validated and the complete batch's token budget is reserved before
+inference dispatch. Fan-out follows the decider's `batch_size` (at most 32 active
+calls) and shared provider concurrency/rate limits. Each image in each item is
+charged its configured allowance. Limits are 1 MiB of evidence per item and
+16 MiB of evidence across the batch, including expanded shared contexts.
+
+Shared text contexts use `context_version: 1`, `contexts: ["..."]`, and optional
+`context_index` on each item. Text inputs become context, newline, and input;
+message inputs receive a leading user message containing that context. Images
+and their ordering are retained. Named native and generated deciders accept text
+batches and reject image/message evidence before inference dispatch. Native
+runtime batch inputs remain text-only. Jev batches require inline PNG/JPEG images;
+HTTP(S) image URLs in the example above require an OpenAI decider.
+
 Existing string inputs continue to work. Message order and content order are
 preserved. Inputs allow only user messages, `input_text`, and `input_image`;
 audio, files, tools, and other roles fail validation. Limits are 128 messages,

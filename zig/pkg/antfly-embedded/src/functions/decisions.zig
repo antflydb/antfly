@@ -681,7 +681,7 @@ pub const DecisionProvider = struct {
     pub fn validate(self: @This(), decider: []const u8, questions: Json) !void {
         try self.validate_fn(self.ptr, decider, questions);
     }
-    pub fn evaluateBatch(self: @This(), a: std.mem.Allocator, requests: []const Request) ![]const Json {
+    pub fn validateRequests(self: @This(), a: std.mem.Allocator, requests: []const Request) !void {
         try self.checkpoint();
         for (requests) |request| {
             try self.validate(request.decider, request.questions);
@@ -691,6 +691,9 @@ pub const DecisionProvider = struct {
             if (!caps.images and request.input.imageCount() != 0) return error.UnsupportedInferenceFeature;
             try request.input.checkLimit(a, caps.max_input_bytes);
         }
+    }
+    pub fn evaluateBatch(self: @This(), a: std.mem.Allocator, requests: []const Request) ![]const Json {
+        try self.validateRequests(a, requests);
         const scoped = if (self.source_table.len > 0) try a.dupe(Request, requests) else null;
         defer if (scoped) |owned| a.free(owned);
         if (scoped) |owned| for (owned) |*request| {

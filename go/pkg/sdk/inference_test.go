@@ -1356,3 +1356,26 @@ func TestInferenceDecidePreservesTextAndMultimodalEvidence(t *testing.T) {
 		})
 	}
 }
+
+func TestInferenceDecidePreservesMultimodalBatchAndItemErrors(t *testing.T) {
+	const body = `{"model":"deciders/visual","context_version":1,"contexts":["Inspect the return"],"inputs":[{"id":"text","input":"Damaged parcel","context_index":0},{"id":"photo","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/a.png"}]}],"context_index":0}],"questions":[{"name":"damaged","type":"predicate","instructions":"Damaged?"}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		actual, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		assert.JSONEq(t, body, string(actual))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"model":"vision","data":[{"input_index":0,"id":"text","model":"resolved","answers":[]},{"input_index":1,"id":"photo","answers":[],"error":"DecisionRefused"}],"usage":{"input_tokens":12,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	var request oapi.InferenceDecideRequest
+	require.NoError(t, json.Unmarshal([]byte(body), &request))
+	response, err := client.Decide(context.Background(), request)
+	require.NoError(t, err)
+	require.Len(t, response.Data, 2)
+	assert.Equal(t, "photo", response.Data[1].Id)
+	assert.Equal(t, "DecisionRefused", response.Data[1].Error)
+	assert.Equal(t, "resolved", response.Data[0].Model)
+	assert.Equal(t, 12, response.Usage.InputTokens)
+}

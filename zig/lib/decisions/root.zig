@@ -686,3 +686,11 @@ test "shared context expansion enforces per-input and aggregate byte limits" {
 test {
     _ = generated;
 }
+
+test "decisions native batches reject message evidence after the public hosted schema expands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.InvalidDecideRequest, parse(arena.allocator(),
+        \\{"model":"native","inputs":[{"input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/a.png"}]}]}],"questions":[{"name":"safe","type":"predicate","instructions":"Safe?"}]}
+    ));
+}

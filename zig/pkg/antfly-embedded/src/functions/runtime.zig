@@ -73,14 +73,25 @@ fn estimateInputTokens(cfg: decisions.DeciderConfig, input: decisions.Input, pay
     return std.math.add(u64, text_bytes, images) catch error.DecisionLimitExceeded;
 }
 
-fn reconcileUsage(reservation: *quotas.TokenReservation, source: decisions.Json) void {
-    if (source != .object) return;
-    const usage = source.object.get("usage") orelse return;
-    if (usage != .object) return;
-    const input = usage.object.get("input_tokens") orelse return;
-    const output = usage.object.get("output_tokens") orelse return;
-    if (input != .integer or output != .integer or input.integer < 0 or output.integer < 0) return;
-    reservation.reconcile(@intCast(input.integer), @intCast(output.integer));
+const Usage = struct { input_tokens: u64 = 0, output_tokens: u64 = 0 };
+fn reportedUsage(source: decisions.Json) ?Usage {
+    if (source != .object) return null;
+    const usage = source.object.get("usage") orelse return null;
+    if (usage != .object) return null;
+    const input = usage.object.get("input_tokens") orelse return null;
+    const output = usage.object.get("output_tokens") orelse return null;
+    if (input != .integer or output != .integer or input.integer < 0 or output.integer < 0) return null;
+    return .{ .input_tokens = @intCast(input.integer), .output_tokens = @intCast(output.integer) };
+}
+fn upstreamFailure(status: u16) anyerror {
+    return switch (status) {
+        429, 529 => error.DecisionRateLimited,
+        401, 403 => error.DecisionUnauthorized,
+        else => error.DecisionUpstreamFailure,
+    };
+}
+fn fatalItemFailure(err: anyerror) bool {
+    return err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled or err == error.Timeout;
 }
 
 pub const Runtime = struct {
@@ -95,6 +106,7 @@ pub const Runtime = struct {
     antfly_api_key: ?[]const u8 = null,
     source_table: []const u8 = "",
     rows: u64 = 0,
+    reserved_rows: u64 = 0,
     input_tokens: u64 = 0,
     estimated_input_tokens: u64 = 0,
     output_tokens: u64 = 0,
@@ -167,7 +179,7 @@ pub const Runtime = struct {
         if (cfg.decision_method != .generated) return error.InvalidDeciderConfig;
         var lease = admission.tryAcquireLease() orelse return error.DecisionRateLimited;
         defer lease.release();
-        if (self.rows + requests.len > cfg.max_rows) return error.DecisionLimitExceeded;
+        if (self.reserved_rows + requests.len > cfg.max_rows) return error.DecisionLimitExceeded;
         var estimated = self.estimated_input_tokens;
         for (requests) |request| {
             try request.input.checkLimit(a, cfg.resolvedCapabilities().max_input_bytes);
@@ -178,6 +190,7 @@ pub const Runtime = struct {
             if (estimated > cfg.max_input_tokens) return error.DecisionLimitExceeded;
         }
         self.estimated_input_tokens = estimated;
+        self.reserved_rows += requests.len;
         const result = try self.generateBatchPartial(a, cfg, requests);
         self.rows += requests.len;
         self.input_tokens +|= result.input_tokens;
@@ -240,12 +253,6 @@ pub const Runtime = struct {
             self.responses[id] = try generated.responseValue(a, self.cfg, self.requests[id].questions, value, proof, id, 0, 0);
         }
     };
-    fn generateBatch(self: *Runtime, a: std.mem.Allocator, cfg: decisions.DeciderConfig, requests: []const decisions.Request) ![]const decisions.Json {
-        const partial = try self.generateBatchPartial(a, cfg, requests);
-        const responses = try a.alloc(decisions.Json, requests.len);
-        for (partial.values, partial.failures, responses) |value, failure, *response| response.* = value orelse return failure orelse error.InvalidDecisionOutput;
-        return responses;
-    }
     const Job = struct {
         runtime: *Runtime,
         request: decisions.Request,
@@ -254,6 +261,11 @@ pub const Runtime = struct {
         budget: @import("../sql/memory_budget.zig"),
         response: ?decisions.Json = null,
         failure: ?anyerror = null,
+        usage: Usage = .{},
+        fn observeUsage(self: *Job, reservation: *quotas.TokenReservation, source: decisions.Json) void {
+            self.usage = reportedUsage(source) orelse return;
+            reservation.reconcile(self.usage.input_tokens, self.usage.output_tokens);
+        }
         fn run(self: *Job) void {
             self.response = self.invoke() catch |err| {
                 self.failure = if (self.budget.exhausted) error.DecisionLimitExceeded else err;
@@ -269,7 +281,11 @@ pub const Runtime = struct {
             try checkpoint(self.runtime);
             const a = self.arena.allocator();
             const cfg = self.cfg;
-            if (cfg.decision_method == .generated) return (try self.runtime.generateBatch(a, cfg, &.{self.request}))[0];
+            if (cfg.decision_method == .generated) {
+                const result = try self.runtime.generateBatchPartial(a, cfg, &.{self.request});
+                self.usage = .{ .input_tokens = result.input_tokens, .output_tokens = result.output_tokens };
+                return result.values[0] orelse return result.failures[0] orelse error.InvalidDecisionOutput;
+            }
             const payload = try requestPayload(a, self.runtime.io, cfg, self.request);
             const body = payload.body;
             const base = if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_url) |endpoint| try registry_mod.gateway.apiBaseAlloc(a, endpoint) else cfg.baseUrl() else cfg.baseUrl();
@@ -292,6 +308,9 @@ pub const Runtime = struct {
             } }, try quotas.Policy.fromConfig(cfg.rate_limit));
             defer quota.release();
             var reservation: quotas.TokenReservation = .{ .limiter = quota.limiter(), .input_tokens = try estimateInputTokens(cfg, self.request.input, payload) };
+            defer if (reservation.reported_usage) |usage| {
+                self.usage = .{ .input_tokens = usage.input_tokens, .output_tokens = usage.output_tokens };
+            };
             const observer = reservation.observer();
             if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_provider) |embedded| if (embedded.decide_json) |_| {
                 try observer.before(observer.ptr, .{
@@ -310,7 +329,7 @@ pub const Runtime = struct {
                     return operationalError(err);
                 };
                 const parsed = try parseResponse(a, bytes);
-                reconcileUsage(&reservation, parsed);
+                self.observeUsage(&reservation, parsed);
                 return parsed;
             };
             const key = key_source.resolveOwned(a, self.runtime.secret_store) catch |err| return operationalError(err);
@@ -344,16 +363,12 @@ pub const Runtime = struct {
                 .cancellation = if (ctx) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else null,
             }) catch |err| return operationalError(err);
             defer response.deinit();
-            if (!response.ok()) return switch (response.status.code) {
-                429, 529 => error.DecisionRateLimited,
-                401, 403 => error.DecisionUnauthorized,
-                else => error.DecisionUpstreamFailure,
-            };
-            const bytes = response.body orelse return error.InvalidDecisionOutput;
-            const parsed = try parseResponse(a, bytes);
+            const bytes = response.body orelse return if (response.ok()) error.InvalidDecisionOutput else upstreamFailure(response.status.code);
+            const parsed = parseResponse(a, bytes) catch |err| return if (response.ok()) err else upstreamFailure(response.status.code);
             // Account usage before semantic output validation, including refused
             // or invalid answers for which the provider has already spent tokens.
-            reconcileUsage(&reservation, parsed);
+            self.observeUsage(&reservation, parsed);
+            if (!response.ok()) return upstreamFailure(response.status.code);
             if (cfg.provider == .antfly) {
                 const root = try decisions.object(parsed);
                 const answers = root.get("answers") orelse return error.InvalidDecisionOutput;
@@ -362,29 +377,51 @@ pub const Runtime = struct {
             return if (cfg.provider == .openai) openai.response(a, self.request.questions, parsed) else parsed;
         }
     };
+    pub const PartialBatch = struct {
+        values: []?decisions.Json,
+        failures: []?anyerror,
+    };
+    pub fn evaluatePartial(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request) !PartialBatch {
+        try self.provider().validateRequests(a, requests);
+        return self.evaluateCore(a, requests, true);
+    }
     fn evaluate(ptr: *anyopaque, a: std.mem.Allocator, requests: []const decisions.Request) ![]const decisions.Json {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
+        const result = try self.evaluateCore(a, requests, false);
+        const out = try a.alloc(decisions.Json, requests.len);
+        for (result.values, result.failures, out) |value, failure, *target| target.* = value orelse return failure orelse error.InvalidDecisionOutput;
+        return out;
+    }
+    fn evaluateCore(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, preserve_failures: bool) !PartialBatch {
+        const ptr: *anyopaque = self;
         const started = std.Io.Clock.awake.now(self.io).nanoseconds;
         defer self.latency_ns +|= @intCast(@max(0, std.Io.Clock.awake.now(self.io).nanoseconds - started));
         var lease = admission.tryAcquireLease() orelse return error.DecisionRateLimited;
         defer lease.release();
-        const out = try a.alloc(decisions.Json, requests.len);
+        const out = try a.alloc(?decisions.Json, requests.len);
+        @memset(out, null);
+        const failures = try a.alloc(?anyerror, requests.len);
+        @memset(failures, null);
         var batch_size: usize = 32;
         var estimated = self.estimated_input_tokens;
         for (requests) |request| {
             const cfg = try self.registry.getDeciderConfig(request.decider);
-            if (self.rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
+            if (self.reserved_rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
             try request.input.checkLimit(a, cfg.resolvedCapabilities().max_input_bytes);
             // Reserve text bytes plus the configured visual token bound before
             // any I/O. The shared quota uses this same estimate and actual usage.
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
             const payload = try requestPayload(scratch.allocator(), self.io, cfg, request);
-            estimated = std.math.add(u64, estimated, try estimateInputTokens(cfg, request.input, payload)) catch return error.DecisionLimitExceeded;
+            const estimate = try estimateInputTokens(cfg, request.input, payload);
+            const policy = try quotas.Policy.fromConfig(cfg.rate_limit);
+            if (policy.tokens_per_minute != 0 and estimate > policy.tokens_per_minute) return error.DecisionLimitExceeded;
+            estimated = std.math.add(u64, estimated, estimate) catch return error.DecisionLimitExceeded;
             if (estimated > cfg.max_input_tokens) return error.DecisionLimitExceeded;
             batch_size = @min(batch_size, cfg.batch_size);
         }
         self.estimated_input_tokens = estimated;
+        self.reserved_rows += requests.len;
         if (requests.len > 0) {
             const first = try self.registry.getDeciderConfig(requests[0].decider);
             var compatible = first.decision_method == .generated;
@@ -402,11 +439,17 @@ pub const Runtime = struct {
                 self.output_tokens +|= partial.output_tokens;
                 self.batches +|= partial.calls;
                 if (self.input_tokens > first.max_input_tokens) return error.DecisionLimitExceeded;
-                for (partial.values, partial.failures, out, requests) |value, failure, *response, request| {
-                    response.* = value orelse return failure orelse error.InvalidDecisionOutput;
-                    try self.recordProvenance(request.decider, first, response.*);
+                for (partial.values, partial.failures, out, failures, requests) |value, failure, *response, *failed, request| {
+                    if (value) |valid| {
+                        response.* = valid;
+                        try self.recordProvenance(request.decider, first, valid);
+                    } else {
+                        const err = failure orelse error.InvalidDecisionOutput;
+                        if (!preserve_failures or fatalItemFailure(err)) return err;
+                        failed.* = err;
+                    }
                 }
-                return out;
+                return .{ .values = out, .failures = failures };
             }
         }
 
@@ -431,25 +474,37 @@ pub const Runtime = struct {
             }
             try group.await(self.io);
             self.batches += 1;
-            for (jobs, out[begin..end]) |*job, *value| {
-                if (job.failure) |err| return err;
-                if (job.cfg.model_identity) |expected| {
-                    const root = try decisions.object(job.response.?);
-                    const actual = root.get("model_identity") orelse return error.InvalidDecisionOutput;
-                    if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InvalidDecisionOutput;
+            try checkpoint(ptr);
+            for (jobs, out[begin..end], failures[begin..end]) |*job, *value, *failure| {
+                const usage = if (job.response) |response| reportedUsage(response) orelse job.usage else job.usage;
+                self.input_tokens +|= usage.input_tokens;
+                self.output_tokens +|= usage.output_tokens;
+                if (self.input_tokens > job.cfg.max_input_tokens) return error.DecisionLimitExceeded;
+                if (job.failure) |err| {
+                    if (!preserve_failures or fatalItemFailure(err)) return err;
+                    failure.* = err;
+                    continue;
                 }
-                const normalized = try decisions.normalizeResponseWithConfig(a, job.request.questions, job.response.?, job.cfg);
-                const usage = normalized.object.get("usage").?.object;
+                const normalized = self.normalizeJob(a, job) catch |err| {
+                    if (!preserve_failures or fatalItemFailure(err)) return err;
+                    failure.* = err;
+                    continue;
+                };
                 try self.recordProvenance(job.request.decider, job.cfg, normalized);
                 self.rows += 1;
-                self.input_tokens +|= @intCast(usage.get("input_tokens").?.integer);
-                self.output_tokens +|= @intCast(usage.get("output_tokens").?.integer);
-                if (self.input_tokens > job.cfg.max_input_tokens) return error.DecisionLimitExceeded;
                 value.* = normalized;
             }
             begin = end;
         }
-        return out;
+        return .{ .values = out, .failures = failures };
+    }
+    fn normalizeJob(_: *Runtime, a: std.mem.Allocator, job: *const Job) !decisions.Json {
+        if (job.cfg.model_identity) |expected| {
+            const root = try decisions.object(job.response.?);
+            const actual = root.get("model_identity") orelse return error.InvalidDecisionOutput;
+            if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InvalidDecisionOutput;
+        }
+        return decisions.normalizeResponseWithConfig(a, job.request.questions, job.response.?, job.cfg);
     }
 };
 
@@ -980,4 +1035,124 @@ test "decision functions image token estimates account for opaque URLs and requi
     overflow.max_image_input_tokens = std.math.maxInt(u64);
     try std.testing.expectError(error.DecisionLimitExceeded, estimateInputTokens(overflow, input, .{ .body = &body }));
     try std.testing.expectEqual(@as(u64, 100), try estimateInputTokens(cfg, .{ .text = "unchanged" }, .{ .body = &body }));
+}
+
+test "decision functions partial batches preserve siblings order and failed usage across bounded windows" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("batch", .{ .model = "native", .batch_size = 2 });
+    const Fake = struct {
+        fn decide(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const parsed = try std.json.parseFromSlice(decisions.Json, alloc, body, .{});
+            defer parsed.deinit();
+            const bad = std.mem.eql(u8, parsed.value.object.get("input").?.string, "invalid");
+            return std.json.Stringify.valueAlloc(alloc, .{
+                .model = "native",
+                .answers = .{.{ .name = "answer", .type = "predicate", .decision_method = "typed", .probability = if (bad) @as(f64, 2) else @as(f64, 0.9) }},
+                .usage = .{ .input_tokens = if (bad) @as(u64, 7) else @as(u64, 3), .output_tokens = @as(u64, 1) },
+            }, .{});
+        }
+    };
+    var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io, .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide } };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const parsed = try @import("decision_batch.zig").parse(alloc, try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+        \\{"inputs":[{"id":"a","input":"first"},{"id":"b","input":"invalid"},{"id":"c","input":"last"}]}
+    , .{}));
+    const questions = try decisions.questionsFor(alloc, .ai_probability, &.{ .{ .string = "x" }, .{ .string = "Safe?" }, .{ .string = "batch" } });
+    var requests: [3]decisions.Request = undefined;
+    for (&requests, parsed.items) |*request, item| request.* = .{ .input = item.input, .questions = questions, .decider = "batch" };
+    const result = try runtime.evaluatePartial(alloc, &requests);
+    try std.testing.expect(result.values[0] != null and result.values[1] == null and result.values[2] != null);
+    try std.testing.expectEqual(@as(?anyerror, error.InvalidDecisionOutput), result.failures[1]);
+    try std.testing.expectEqual(@as(u64, 13), runtime.input_tokens);
+    try std.testing.expectEqual(@as(u64, 3), runtime.output_tokens);
+    try std.testing.expectEqual(@as(u64, 2), runtime.batches);
+    try std.testing.expectEqual(@as(u64, 2), runtime.rows);
+    try std.testing.expectEqual(@as(u64, 3), runtime.reserved_rows);
+    // The same preflight keeps native providers text-only even in a mixed batch.
+    requests[2].input = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/a.png"}]}]
+    , .{}));
+    try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.evaluatePartial(alloc, &requests));
+    try std.testing.expectEqual(@as(u64, 2), runtime.rows);
+}
+
+test "decision functions hosted partial batches retain failed provider usage and preflight quotas" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const valid = try std.json.Stringify.valueAlloc(alloc, .{
+        .model = "resolved-vision",
+        .answers = .{.{ .name = "answer", .type = "predicate", .probability = @as(f64, 0.9) }},
+        .usage = .{ .input_tokens = @as(u64, 3), .output_tokens = @as(u64, 1), .total_tokens = @as(u64, 4), .input_tokens_details = .{ .cached_tokens = 0, .cache_write_tokens = 0 }, .output_tokens_details = .{ .reasoning_tokens = 0 } },
+    }, .{});
+    const Check = struct {
+        fn image(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer batch-key", req.header("authorization").?);
+            const parsed = try std.json.parseFromSlice(decisions.Json, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), (try decisions.Input.fromJson(parsed.value.object.get("input").?)).imageCount());
+        }
+    };
+    var server = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/v1/decisions", .max_uses = 1, .assert_request = Check.image, .respond = .{ .status = 503, .body = "{\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}" } },
+        .{ .method = .POST, .path = "/v1/decisions", .assert_request = Check.image, .respond = .{ .body = valid } },
+    });
+    defer server.deinit();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    const cfg = decisions.DeciderConfig{ .provider = .openai, .model = "vision", .url = try std.fmt.allocPrint(alloc, "{s}/v1", .{server.baseUrl()}), .api_key = "batch-key", .max_image_input_tokens = 8192, .batch_size = 1 };
+    try registry.registerDeciderConfig("hosted", cfg);
+    var tiny = cfg;
+    tiny.rate_limit = .{ .tokens_per_minute = 1000 };
+    try registry.registerDeciderConfig("tiny", tiny);
+    var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+    const input = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, alloc,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/a.png"}]}]
+    , .{}));
+    const q = try decisions.questionsFor(alloc, .ai_probability, &.{ .{ .string = "x" }, .{ .string = "Safe?" }, .{ .string = "hosted" } });
+    var requests: [3]decisions.Request = @splat(.{ .input = input, .questions = q, .decider = "hosted" });
+    const Run = struct {
+        fn run(r: *Runtime, allocator: std.mem.Allocator, reqs: []const decisions.Request, failure: *?anyerror) void {
+            execute(r, allocator, reqs) catch |err| {
+                failure.* = err;
+            };
+        }
+        fn execute(r: *Runtime, allocator: std.mem.Allocator, reqs: []const decisions.Request) !void {
+            const result = try r.evaluatePartial(allocator, reqs);
+            try std.testing.expectEqual(@as(?anyerror, error.DecisionUpstreamFailure), result.failures[0]);
+            try std.testing.expect(result.values[0] == null and result.values[1] != null and result.values[2] != null);
+            try std.testing.expectEqualStrings("resolved-vision", result.values[1].?.object.get("model").?.string);
+        }
+    };
+    var group = std.Io.Group.init;
+    var failure: ?anyerror = null;
+    try group.concurrent(io, Run.run, .{ &runtime, alloc, &requests, &failure });
+    defer group.cancel(io);
+    for (0..3) |_| try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(u64, 13), runtime.input_tokens);
+    try std.testing.expectEqual(@as(u64, 3), runtime.output_tokens);
+    // An oversized per-item TPM reservation rejects the whole request before I/O.
+    requests[2].decider = "tiny";
+    try std.testing.expectError(error.DecisionLimitExceeded, runtime.evaluatePartial(alloc, &requests));
+    try std.testing.expectEqual(@as(u64, 2), runtime.rows);
+    var cancelled = std.atomic.Value(bool).init(true);
+    runtime.context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) };
+    try std.testing.expectError(error.Cancelled, runtime.evaluatePartial(alloc, &requests));
 }

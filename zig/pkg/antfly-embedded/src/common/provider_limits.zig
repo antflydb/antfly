@@ -118,6 +118,9 @@ pub const TokenReservation = struct {
     input_tokens: u64,
     output_tokens: u64 = 0,
     charged: u64 = 0,
+    /// Retain observed usage even if a caller cannot parse or validate the full
+    /// response within its arena budget. Reconciliation may run more than once.
+    reported_usage: ?struct { input_tokens: u64, output_tokens: u64 } = null,
 
     pub fn observer(self: *@This()) httpx.AttemptObserver {
         return .{ .ptr = self, .before = before, .after = after, .output_tokens = self.output_tokens };
@@ -144,6 +147,7 @@ pub const TokenReservation = struct {
         Limiter.after(self.limiter, response);
     }
     pub fn reconcile(self: *@This(), input_tokens: u64, output_tokens: u64) void {
+        self.reported_usage = .{ .input_tokens = input_tokens, .output_tokens = output_tokens };
         const actual = input_tokens +| output_tokens;
         if (actual <= self.charged) return;
         sync.lockYielding(&self.limiter.mutex);
@@ -646,6 +650,9 @@ test "decision functions quota reservations reconcile actual usage before releas
         }
     };
     try observer.before(observer.ptr, .{ .io = std.testing.io, .deadline_ms = null, .cancellation_ptr = &limiter, .is_cancelled = Cancel.no, .body_bytes = 1, .output_tokens = 0 });
+    try std.testing.expectEqual(@as(u64, 400), reservation.charged);
+    reservation.reconcile(3, 1);
+    try std.testing.expectEqual(@as(u64, 3), reservation.reported_usage.?.input_tokens);
     try std.testing.expectEqual(@as(u64, 400), reservation.charged);
     var response = httpx.Response.init(std.testing.allocator, 200);
     defer response.deinit();

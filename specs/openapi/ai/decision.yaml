@@ -199,14 +199,12 @@ components:
       properties:
         id: *id001
         input:
-          type: string
-          minLength: 1
-          maxLength: 1048576
+          $ref: '#/components/schemas/DecisionEvidence'
         context_index:
           x-go-type-skip-optional-pointer: false
           type: integer
           minimum: 0
-          description: Index into request contexts. Requires context_version 1. Effective input is context, newline, then input; the 1 MiB input limit applies after expansion.
+          description: Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native and generated models require text.
     DecideLongDocument:
       type: object
       additionalProperties: false
@@ -412,7 +410,7 @@ components:
           maxItems: 64
         embedding_options:
           $ref: '#/components/schemas/EmbeddingDecisionOptions'
-      description: Supply exactly one of input (single evidence item) or inputs (text-only Antfly batch extension). Question
+      description: Supply exactly one of input (single evidence item) or inputs (ordered Antfly batch extension; hosted typed deciders also accept multimodal evidence per item). Question
         names must be unique. Single text and named question arrays follow OpenAI Decisions conventions;
         local models support text input and string choice values. Request bodies are bounded at 16 MiB.
     DecisionUsage:
@@ -799,7 +797,10 @@ components:
         id: *id001
         error:
           type: string
-          description: Generated batches preserve valid siblings; a failed item has an empty answers array and this error code.
+          description: Named gateway and generated batches preserve valid siblings; a failed item has an empty answers array and this error code. Invalid input or request budgets fail validation before dispatch.
+        model:
+          type: string
+          description: Resolved model reported for a successful named gateway batch item.
         answers:
           type: array
           items:
@@ -828,4 +829,4 @@ components:
         usage:
           $ref: '#/components/schemas/DecisionUsage'
       description: Single-input responses have answers. Batch responses have data in input order, with
-        one named answer array per input and aggregate usage.
+        one named answer array per input and aggregate usage including reported usage from failed items. Named gateway batches identify the configured model at the top level and resolved models per successful item.
