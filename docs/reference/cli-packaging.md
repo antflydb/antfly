@@ -258,7 +258,7 @@ Container staging writes only digest-addressed candidates and therefore runs
 before approval without selecting a public alias. `release-promotion` is used
 exactly once, by the preflight job, as the main-only human gate before the
 transaction is reserved. The separate `container-publish` environment remains
-tag-only for legacy and operator publishers. Their required reviewers and
+tag-only for legacy runtime publishers. Their required reviewers and
 allowed refs are declared in `scripts/release/github-environments.json`. Both
 release preflight and GC planning compare the live environments with that
 contract. Apply an intentional configuration change with `python3

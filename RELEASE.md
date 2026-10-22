@@ -256,7 +256,7 @@ Nightly uses R2 as its only policy-selected source.
 The deployment environments follow the versioned contract in
 `scripts/release/github-environments.json`. `release-promotion` accepts only the
 default `main` branch and protects release preflight plus retention approval;
-`container-publish` accepts only the legacy release and operator tag patterns.
+`container-publish` accepts only the legacy runtime release tag pattern.
 `crates-io` accepts only `main` for embedded Rust publication.
 All three copy the required-reviewer set from the `npm` environment and prevent
 self-review. Release preflight and retention planning audit the live GitHub

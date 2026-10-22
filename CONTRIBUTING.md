@@ -13,8 +13,6 @@ go/pkg/
   evalaf/            LLM/RAG evaluation framework
   genkit/            Firebase Genkit plugins (antfly, openrouter)
   memoryaf/          Memory-focused Antfly helpers
-  operator/          Kubernetes operator
-  proxy/             Antfly and Inference proxy packages
 ts/
   packages/sdk/      TypeScript SDK (@antfly/sdk)
   packages/embedded/    TypeScript embedded binding (@antfly/embedded)
@@ -69,15 +67,6 @@ Run `make help` for the full list. Key targets:
 | `make license-headers` | Add first-party license headers |
 | `make license-check` | Verify first-party license headers are present |
 
-### Operator targets
-
-| Target | Description |
-|--------|-------------|
-| `make operator-build` | Build the antfly-operator binary |
-| `make operator-test` | Run operator tests |
-| `make operator-lint` | Lint operator code |
-| `make operator-docker-build` | Build operator Docker image |
-
 ### Minikube targets
 
 | Target | Description |
@@ -109,8 +98,6 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 |--------|-----------|
 | Antfly embedded binding | `go/pkg/embedded/` |
 | Go SDK | `go/pkg/sdk/` |
-| Operator | `go/pkg/operator/` |
-| Proxies (Antfly gateway, inference) | `go/pkg/proxy/` |
 | docsaf | `go/pkg/docsaf/` |
 | evalaf | `go/pkg/evalaf/` |
 | evalaf antfly plugin | `go/pkg/evalaf/plugins/antfly/` |
@@ -210,10 +197,9 @@ Example configs live in `configs/`:
 Release tags:
 
 - `v*` — Zig runtime archives, CLI packages, and container images
-- `go/pkg/operator/v*` — operator container build
 
-The previous standalone operator tag streams were consolidated into
-`go/pkg/operator/v*`.
+Colony owns the Kubernetes operator, hosted proxies, and operator release tags
+and image publishing. They are developed and tested in that repository.
 
 See [RELEASE.md](RELEASE.md) for the Zig release pipeline.
 

@@ -93,7 +93,7 @@ See [LICENSING.md](LICENSING.md) for third-party notices and source ownership.
 - **Fine-tuning** — [LoRA, QLoRA, SFT, DPO, GRPO and more](zig/pkg/inference/src/finetune) with recipes for Gemma 4, GLiNER2, ColQwen2, LayoutLMv3, rerankers, and chunkers
 - **Auth** — built-in [user management](zig/pkg/antfly/src/usermgr) with API keys, basic auth, and bearer tokens
 - **Backup & restore** — portable backups to local disk, S3, or Google Cloud Storage
-- **Kubernetes operator** — deploy and manage clusters with the [operator](go/pkg/operator) ([docs](go/pkg/operator/docs))
+- **Self-hosting examples** — deploy with [Docker Compose](devops/docker-compose) or [Kubernetes manifests](devops/minikube)
 - **MCP and A2A protocols** — [protocol adapters](zig/pkg/antfly/src/api/protocol_adapters.zig) let agents and LLMs use Antfly directly, and an [n8n guide](docs/guides/n8n.mdx) wires it into workflows
 - **Relational tables** — `storage_mode: relational` tables with typed packed rows, `relational` indexes, row query and mutate APIs, databases, a system catalog, and tablespaces
 - **Antfarm** — [web dashboard](ts/apps/antfarm) with playgrounds for search, RAG, chat, knowledge graphs, embeddings, reranking, chunking, extraction, OCR, transcription, and evals
@@ -184,6 +184,9 @@ Join the [Discord](https://discord.gg/zrdjguy84P) for support, discussion, and u
 Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
+
+Hosted Kubernetes orchestration and tenant/inference gateways are maintained in
+Colony. This repository builds and runs independently of those managed-service components.
 
 All first-party Antfly code, including the database server, distributed and serverless
 runtime, embedded engine, inference, CLI, SDKs, and bindings, is

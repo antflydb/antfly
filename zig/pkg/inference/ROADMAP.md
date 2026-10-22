@@ -11,8 +11,7 @@ The HTTP surface is generated from
 (`src/api/generated/inference_api/server.zig`) and registered under `/ai/v1`
 and `/ml/v1` by `Node.registerHttpRoutes` in `src/server/server.zig`. The
 Kubernetes operator (`InferencePool`, `InferenceProxy`, `ExternalInferencePool`
-CRDs, [go/pkg/operator](../../../go/pkg/operator)) and the inference proxy
-([go/pkg/proxy/inference](../../../go/pkg/proxy/inference)) stay in Go.
+CRDs) and the inference proxy are Go components owned by Colony.
 
 Repository-wide open work lives in [zig/TODO.md](../../TODO.md) and
 [zig/ROADMAP.md](../../ROADMAP.md); this file does not repeat it.
