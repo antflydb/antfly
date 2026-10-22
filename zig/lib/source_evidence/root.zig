@@ -144,9 +144,18 @@ pub fn parseUnits(a: A, value: V) ![]const Unit {
     }
     return units;
 }
+pub const Loaded = union(enum) { image: Image, failed: anyerror };
 pub const Loader = struct {
     ctx: *anyopaque,
     load: *const fn (*anyopaque, A, Unit) anyerror!Image,
+    load_many: ?*const fn (*anyopaque, A, []const Unit, []Loaded) anyerror!void = null,
+    pub fn batch(self: Loader, a: A, units: []const Unit, output: []Loaded) !void {
+        std.debug.assert(units.len == output.len);
+        if (self.load_many) |many| return many(self.ctx, a, units, output);
+        for (units, output) |unit, *item| {
+            item.* = if (self.load(self.ctx, a, unit)) |value| .{ .image = value } else |err| .{ .failed = err };
+        }
+    }
 };
 
 pub fn imageMime(bytes: []const u8) ?[]const u8 {

@@ -242,7 +242,7 @@ pub const Options = struct {
         if (self.backend != .local and self.decision_transport == .single and self.decision_context == .shared_v1) return error.SharedContextRequiresAntflyBatch;
     }
     pub fn decisionBatchSize(self: *const Options) usize {
-        return if (self.media != .text) 1 else if (self.backend == .local or self.decision_transport == .antfly_batch) self.batch_size else 1;
+        return if (self.backend == .local or self.decision_transport == .antfly_batch) self.batch_size else 1;
     }
     pub fn selectProvider(self: *Options, name: []const u8) !void {
         const profiles = @import("providers.zig");
@@ -827,7 +827,7 @@ pub const Options = struct {
         if (self.ask != null and self.model == null) return error.DecisionModelRequired;
         if (self.media != .text) {
             if (self.ask == null) return error.MediaRequiresDecision;
-            if (self.backend == .local or self.decision_context != .legacy or self.pre != null or self.patterns.items.len > 0 or self.pattern_files.items.len > 0 or self.triage or self.workspace_watch) return error.ConflictingMediaOptions;
+            if (self.backend == .local or self.pre != null or self.patterns.items.len > 0 or self.pattern_files.items.len > 0 or self.triage or self.workspace_watch) return error.ConflictingMediaOptions;
             if (self.max_image_bytes == 0 or self.max_image_bytes > 768 * 1024 or self.max_image_pixels == 0) return error.InvalidImageLimit;
         }
         if (!std.math.isFinite(self.threshold) or self.threshold < 0 or self.threshold > 1 or self.chunk_lines == 0 or self.batch_size == 0 or self.batch_size > 128 or self.decision_batch_wait_ms > 1000 or self.timeout_ms == 0 or (self.max_file_bytes == 0 and !self.skip_oversize)) return error.InvalidNumber;

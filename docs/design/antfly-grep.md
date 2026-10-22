@@ -155,8 +155,9 @@ compatibility baseline is Decisions, not Chat Completions or Structured Outputs.
 
 PR [#1252](https://github.com/antflydb/antfly/pull/1252) supplies the common
 Decisions message contract. Grep uses it with `--media images --ask QUESTION`:
-one visual unit and its descriptive text per request, with all requested questions
-sharing that image upload. `--media text` remains the default. This is visual
+one visual unit and its descriptive text per batch item, with all requested
+questions sharing that image upload. Antfly supports multimodal batch envelopes
+from #1253; explicit common single-input services remain supported. `--media text` remains the default. This is visual
 question evaluation, not a claim of OCR, object detection, or model relevance.
 
 ### Versioned units and storage
@@ -227,15 +228,20 @@ media URL requirement. Fresh asset reads must reauthorize even when a decision
 score is cached. Snapshot membership alone must never be treated as an enduring
 permission grant; Cloud must specify and test revocation/current-auth fences.
 
-Processing retains one bounded image per active evaluation, inspects headers
-without allocating a decoded raster, base64-encodes local bytes once, and checks
+Processing uses bounded waves of at most 16 units and 8 MiB of conservative
+serialized-evidence estimates, inspects headers without allocating a decoded
+raster, base64-encodes local bytes once, and checks
 the 1 MiB serialized Decisions evidence limit with a counting writer. Defaults
 are 512 KiB per encoded image and 16,777,216 pixels; `--max-image-bytes` (up to
 768 KiB) and `--max-image-pixels` tune admission. Metadata/page memory, source bytes,
 request count, evaluation count, deadlines, cancellation, retries and retained
-ranked-output limits continue to apply. Image evaluation uses single-input
-requests even on the Antfly batch profile: `inputs` and shared-context extensions
-are text-only. The gateway admits image-capable deciders and reserves image-token
+ranked-output limits continue to apply. Antfly `inputs` batches and shared text
+contexts preserve image messages. Custom services retain explicit single-input
+transport. Image evidence is never subdivided into textual halves. Oversized
+batches split into partitions, and a failed partition does not suppress valid
+siblings. Envelope identities are checked before any score becomes visible;
+refused/failed items remain incomplete, while valid siblings can be emitted and
+cached. Reported usage is retained even when item decoding fails. The gateway admits image-capable deciders and reserves image-token
 budgets; unsupported/text-only adapters reject rather than discard media.
 
 Decision keys bind image digest/MIME, unit metadata (including recipe/location),
@@ -252,8 +258,8 @@ captured media lifetimes can preserve snapshot semantics.
 ### Search and result semantics
 
 Image mode evaluates every visual unit in the explicitly filtered source scope,
-subject to visible budgets/partial results. It rejects lexical prefilters,
-repository triage and text-only shared contexts, avoiding false negatives when
+subject to visible budgets/partial results. It rejects lexical prefilters and
+repository triage, avoiding false negatives when
 an answer exists only in pixels. Text mode and visual mode are explicit choices;
 automatic modality selection is not inferred from the question. Future semantic
 candidate retrieval must be an explicit ranked/approximate mode with candidate
@@ -292,3 +298,37 @@ live provider relevance or image token prices. Cloud acceptance additionally
 requires real Drive ACL/group/revocation scenarios, concurrent revisions,
 rendering failure recovery, lifecycle cleanup, cross-tenant isolation and labeled
 visual-question quality/cost evaluation. These remain issue deliverables.
+
+
+### Multimodal batch retrieval and admission follow-up
+
+Each indexed wave projects all distinct same-parent payload fields in one
+current authenticated ID query. These point reads omit `order_by`, cursors and
+`remote_snapshot`; requesting pagination ordering would otherwise capture and
+publish an unnecessary retained cut for every image read. Manifest enumeration
+continues using ascending-ID retained pagination. The point query preserves the
+table credential, user filter, server row policy and explicit client principal
+intersection, and checks the current parent revision before examining assets.
+
+Every unit still checks digest/MIME/length/pixels before score reuse. Identical
+field/digest/length/MIME references within a wave share one verified immutable
+image view; distinct unit prompts and cache identities remain independent.
+Materialization and provider work do not accumulate the whole document or corpus.
+Waves are admitted in source order. Quiet/file-selection modes use one-unit
+waves; finite result caps bound wave width by remaining selected-unit capacity.
+Source/evaluation/request limits count actual admitted work and HTTP attempts,
+including retries; exhaustion preserves completed evidence and exits 2.
+
+`--max-filesize` skips oversized local images before encoding or inference;
+`--max-file-size` enforces a hard local read limit. `--max-image-bytes` remains
+an independent visual-evidence admission limit. Quiet mode stops on a selected
+file, including the negated selection of `--files-without-match`, and emits no
+filename. These semantics also apply to text, multiline and buffered input.
+
+The byte/round-trip fixture compares the previous binary and this implementation
+using identical image units and fixed-score local servers. It cannot establish
+live relevance, token prices or a universal throughput ratio. Batching primarily
+removes HTTP overhead and enables the gateway's bounded provider fan-out; it does
+not imply reduced model tokens per image. Cross-parent scheduling is separate
+from same-parent unit batching and must preserve each parent's authorization,
+revision, result ownership and budgets.

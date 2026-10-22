@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "qualification": "Bounded same-parent visual batches and revision-bound original-value proof reuse",
+  "source": {
+    "parent_commit": "0122816e4a24291f21ab34daabe612ca96153020",
+    "baseline_commit": "270f575386d3e8576d3d7dce995b11c16b6284b7",
+    "merged_main": "ddba6584b38b59c62e261ef63e0374dc1f711617",
+    "directories": [
+      "zig/pkg/antfly-grep",
+      "zig/lib/decisions",
+      "zig/lib/source_evidence",
+      "zig/pkg/antfly-embedded/src/storage"
+    ],
+    "source_sha256": "33f189a300ed776a879f86170dca0533ad7baa80cf236a8b62ee4b5277154231",
+    "files": 701,
+    "framing": "sorted relative .zig/.py paths NUL file bytes NUL"
+  },
+  "zig_version": "0.17.0",
+  "scope": {
+    "visual_units": 8,
+    "rounds_per_arm": 5,
+    "artificial_delay_ms_per_http_request": 20,
+    "order": "alternating baseline/candidate; cold then warm for each arm",
+    "same_parent": true,
+    "output_equivalence": "exact evidence/probability/revision records; digest in each host record"
+  },
+  "limitations": [
+    "Synthetic constant-score loopback fixtures on shared hardware, no live-provider relevance, model tokens or billing measured.",
+    "Linux runs use the existing ARM64 Docker VM constrained to two CPUs and 1 GiB RAM, not independent native Linux hardware.",
+    "Batching is bounded within one parent document; cross-parent scheduling is still serial.",
+    "The proof registry skips original-value revision metadata reads on hits; complete segment predicate membership certificates and coordinator-owned work grants remain separate future work.",
+    "Warm score reuse still reauthorizes the parent and validates current asset revision, digest, MIME, length and dimensions. Requests are not zero cost.",
+    "Raw reports/logs are ignored local artifacts, not published downloadable evidence.",
+    "Windows is cross-compiled only."
+  ],
+  "hosts": [
+    {
+      "host": "macos",
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "binaries": {
+        "baseline": {
+          "sha256": "690e60b2175800650211d8982feeb5d04535a14f45845e3f238ff97549b05e74",
+          "bytes": 8154232
+        },
+        "candidate": {
+          "sha256": "5e6698363639563dcecd0d964c422328ebe93adb279bcd2408273480f17a797e",
+          "bytes": 8154088
+        }
+      },
+      "output_sha256": "f4bb83d3cefbd2dddf4494e79eab6833d42cde2af1492837b585a67ba3c8c6f5",
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 468054542,
+          "provider_requests": 8,
+          "index_requests": 9,
+          "logical_provider_json_bytes": 7584,
+          "evaluated_units": 8
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 231815500,
+          "provider_requests": 0,
+          "index_requests": 9,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 8
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 108390625,
+          "provider_requests": 1,
+          "index_requests": 2,
+          "logical_provider_json_bytes": 5533,
+          "evaluated_units": 8
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 66401166,
+          "provider_requests": 0,
+          "index_requests": 2,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 8
+        }
+      ],
+      "local_raw_report": "output/grep-batching/macos-visual-final.json",
+      "raw_report_sha256": "9b2d2b63c97be755901874eef0bb7459442c5c6a4e410a2d62b1a92f5f449e1d"
+    },
+    {
+      "host": "linux",
+      "platform": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+      "machine": "aarch64",
+      "binaries": {
+        "baseline": {
+          "sha256": "e02f26261c4256ffd020288fa3c2e69687faef3f998dc5bba7a3c88f0dc8406f",
+          "bytes": 31429304
+        },
+        "candidate": {
+          "sha256": "66159e330291919659a18d97c0ad3269dc9e67480291973c2c6cda6c9d42af68",
+          "bytes": 32324688
+        }
+      },
+      "output_sha256": "f4bb83d3cefbd2dddf4494e79eab6833d42cde2af1492837b585a67ba3c8c6f5",
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 414077876,
+          "provider_requests": 8,
+          "index_requests": 9,
+          "logical_provider_json_bytes": 7584,
+          "evaluated_units": 8
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 216700667,
+          "provider_requests": 0,
+          "index_requests": 9,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 8
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 71191459,
+          "provider_requests": 1,
+          "index_requests": 2,
+          "logical_provider_json_bytes": 5533,
+          "evaluated_units": 8
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 49946208,
+          "provider_requests": 0,
+          "index_requests": 2,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 8
+        }
+      ],
+      "local_raw_report": "output/grep-batching/linux-visual-final.json",
+      "raw_report_sha256": "f8be2c5dec67503a0cccd592fc88815090fc7bbb097f3809d9f37db4fa964f40"
+    }
+  ],
+  "checks": {
+    "macos_cli": {
+      "total": 270,
+      "passed": 268,
+      "skipped": 2
+    },
+    "native_server_indexed_e2e": {
+      "passed": 22,
+      "skipped": 7,
+      "note": "existing native server binary; includes 3 added point-read/revision/permissions cases"
+    },
+    "release_packaging_tests": 4,
+    "apache_boundary_source_files": 2428,
+    "compatibility_manifest": "pass",
+    "toolchain_policy": "pass"
+  },
+  "reproduction": [
+    "From worktree root, freeze baseline and candidate binaries before building the other target.",
+    "python3 zig/pkg/antfly-grep/bench/visual_batches.py CANDIDATE --baseline BASELINE --fixture-library FIXTURE --rounds 5 --units 8 --delay-ms 20 --output output/visual-batching.json",
+    "Run the same command inside the existing ARM64 Linux VM with --cpus=2 --memory=1g.",
+    "cd zig && zig build logical-field-db-test source-proof-test -Dtest-filter=\"logical source certificates\" -Doptimize=ReleaseFast -j2"
+  ]
+}

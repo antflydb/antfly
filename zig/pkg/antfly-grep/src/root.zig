@@ -1774,7 +1774,14 @@ pub const Search = struct {
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         const a = scratch.allocator();
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(self.options.max_image_bytes));
+        if (self.options.skip_oversize) {
+            const info = try std.Io.Dir.cwd().statFile(self.io, path, .{});
+            if (info.size > self.options.max_file_bytes) {
+                self.skipped();
+                return;
+            }
+        }
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(@min(self.options.max_image_bytes, self.options.max_file_bytes)));
         const image = try media.Image.fromBytes(a, bytes, self.options.max_image_bytes, self.options.max_image_pixels);
         const format = image.mime_type;
         const digest = try a.dupe(u8, &std.fmt.bytesToHex(image.sha256, .lower));
@@ -1833,55 +1840,110 @@ pub const Search = struct {
                 } else c.deinit();
             } else output.deinit();
         }
-        for (doc.evidence) |unit| {
+        const media = @import("antfly_source_evidence");
+        // Two bounds are independent: at most 16 units and 8 MiB conservative
+        // evidence per wave. Neither provider concurrency nor corpus size can
+        // grow retained image data without bound. A fresh wave reauthorizes.
+        var offset: usize = 0;
+        while (offset < doc.evidence.len) {
             if (self.stopped()) return;
-            if (selected >= @min(self.options.max_count, self.options.max_regions_per_file)) break;
-            self.summary.regions_considered += 1;
+            const selection_limit = @min(self.options.max_count, self.options.max_regions_per_file);
+            if (selected >= selection_limit) break;
+            const cap = if (self.options.quiet or self.options.files_with_matches or self.options.files_without_match) @as(usize, 1) else @min(selection_limit - selected, @min(@as(usize, 16), self.options.decisionBatchSize() *| self.options.providerJobs()));
+            var end = offset;
+            var estimated: usize = 0;
+            var failure: ?anyerror = null;
             const limits = self.shared_limits orelse &self.limits;
-            if (!Limits.reserve(&limits.regions, 1, self.options.max_regions)) return error.RegionBudgetExceeded;
+            while (end < doc.evidence.len and end - offset < cap) {
+                const unit = doc.evidence[end];
+                const bytes = unit.asset.byte_length *| 2 +| unit.text.len *| 6 +| doc.path.len *| 6 +| 65536;
+                if (end > offset and bytes > 8 * 1024 * 1024 -| estimated) break;
+                if (!Limits.reserve(&limits.regions, 1, self.options.max_regions)) {
+                    failure = error.RegionBudgetExceeded;
+                    break;
+                }
+                estimated +|= bytes;
+                end += 1;
+            }
+            if (end == offset) return failure orelse error.InvalidEvidenceUnits;
+            const units = doc.evidence[offset..end];
+            offset = end;
+            self.summary.regions_considered += units.len;
             var scratch = std.heap.ArenaAllocator.init(self.a);
             defer scratch.deinit();
             const a = scratch.allocator();
-            // Resolver authorization and immutable digest checks precede score
-            // cache access; a warm cache never grants access to private assets.
-            const image = try loader.load(loader.ctx, a, unit);
-            if (!Limits.reserve(&limits.source_bytes, image.bytes, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
-            self.summary.bytes += image.bytes;
-            const listing = try std.json.Stringify.valueAlloc(a, .{ .path = doc.path, .id = unit.id, .kind = unit.kind, .location = unit.location, .text = unit.text, .label = unit.label, .asset = unit.asset }, .{ .emit_null_optional_fields = false });
-            const prompt = try std.fmt.allocPrint(a, "TARGET visual evidence unit (image is authoritative; text is context):\n{s}", .{listing});
-            var scores: [1]f64 = undefined;
-            try self.decider.search(&.{.{ .id = unit.id, .input = prompt, .image = image }}, &scores);
-            self.summary.regions_evaluated += 1;
-            const score = scores[0];
-            if (score < 0 or ((score >= self.options.threshold) == self.options.invert)) continue;
-            selected += 1;
-            if (!self.options.files_without_match) self.summary.matches += 1;
-            self.summary.occurrences += 1;
-            self.best_probability = @max(self.best_probability, score);
-            if (selected == 1) self.summary.files_with_matches += 1;
+            var loaded: [16]media.Loaded = undefined;
+            try loader.batch(a, units, loaded[0..units.len]);
+            var inputs: [16]decision.Input = undefined;
+            var mapping: [16]usize = undefined;
+            var count: usize = 0;
+            for (units, loaded[0..units.len], 0..) |unit, item, i| {
+                const image = switch (item) {
+                    .image => |value| value,
+                    .failed => |err| {
+                        failure = failure orelse err;
+                        continue;
+                    },
+                };
+                if (!Limits.reserve(&limits.source_bytes, image.bytes, self.options.max_source_bytes)) {
+                    failure = failure orelse error.SourceBudgetExceeded;
+                    break;
+                }
+                self.summary.bytes += image.bytes;
+                const listing = try std.json.Stringify.valueAlloc(a, .{ .path = doc.path, .id = unit.id, .kind = unit.kind, .location = unit.location, .text = unit.text, .label = unit.label, .asset = unit.asset }, .{ .emit_null_optional_fields = false });
+                inputs[count] = .{ .id = unit.id, .input = try std.fmt.allocPrint(a, "TARGET visual evidence unit (image is authoritative; text is context):\n{s}", .{listing}), .image = image };
+                if (try inputs[count].evidenceBytes() > 1024 * 1024) {
+                    failure = failure orelse error.DecisionLimitExceeded;
+                    continue;
+                }
+                mapping[count] = i;
+                count += 1;
+            }
+            var scores: [16]f64 = @splat(std.math.nan(f64));
+            if (count > 0) self.decider.search(inputs[0..count], scores[0..count]) catch |err| {
+                failure = failure orelse err;
+            };
+            for (scores[0..count], mapping[0..count]) |score, i| {
+                if (!std.math.isFinite(score)) continue;
+                self.summary.regions_evaluated += 1;
+                const unit = units[i];
+                const image = loaded[i].image;
+                if (score < 0 or ((score >= self.options.threshold) == self.options.invert)) continue;
+                selected += 1;
+                if (!self.options.files_without_match) self.summary.matches += 1;
+                self.summary.occurrences += 1;
+                self.best_probability = @max(self.best_probability, score);
+                if (selected == 1) self.summary.files_with_matches += 1;
+                if (self.options.files_without_match) break;
+                if (self.options.quiet) {
+                    self.stop = true;
+                    return;
+                }
+                if (self.options.files_with_matches) {
+                    try self.write(doc.path);
+                    try self.write(if (self.options.null_paths) "\x00" else "\n");
+                    committed = output.written().len;
+                    return;
+                }
+                if (self.options.count or self.options.count_matches) continue;
+                if (self.options.json) {
+                    try self.json(.{ .type = "evidence", .data = .{ .path = doc.path, .unit = unit.id, .kind = unit.kind, .location = unit.location, .label = unit.label, .sha256 = unit.asset.sha256, .recipe = unit.asset.recipe, .width = image.width, .height = image.height }, .probability = score, .scope = @tagName(unit.kind) });
+                } else {
+                    const location = if (unit.location.page) |page| try std.fmt.allocPrint(a, "#page={d}", .{page}) else if (unit.location.slide) |slide| try std.fmt.allocPrint(a, "#slide={d}", .{slide}) else "";
+                    const row = try std.fmt.allocPrint(a, "{s}{s}  probability={d:.3}  unit={s}\n", .{ doc.path, location, score, unit.id });
+                    try self.write(row);
+                }
+                committed = output.written().len;
+            }
+            if (failure) |err| return err;
+            if (self.options.files_without_match and selected > 0) return;
+        }
+        if (self.options.files_without_match and selected == 0) {
+            self.summary.matches += 1;
             if (self.options.quiet) {
                 self.stop = true;
                 return;
             }
-            if (self.options.files_without_match) continue;
-            if (self.options.files_with_matches) {
-                try self.write(doc.path);
-                try self.write(if (self.options.null_paths) "\x00" else "\n");
-                committed = output.written().len;
-                return;
-            }
-            if (self.options.count or self.options.count_matches) continue;
-            if (self.options.json) {
-                try self.json(.{ .type = "evidence", .data = .{ .path = doc.path, .unit = unit.id, .kind = unit.kind, .location = unit.location, .label = unit.label, .sha256 = unit.asset.sha256, .recipe = unit.asset.recipe, .width = image.width, .height = image.height }, .probability = score, .scope = @tagName(unit.kind) });
-            } else {
-                const location = if (unit.location.page) |page| try std.fmt.allocPrint(a, "#page={d}", .{page}) else if (unit.location.slide) |slide| try std.fmt.allocPrint(a, "#slide={d}", .{slide}) else "";
-                const row = try std.fmt.allocPrint(a, "{s}{s}  probability={d:.3}  unit={s}\n", .{ doc.path, location, score, unit.id });
-                try self.write(row);
-            }
-            committed = output.written().len;
-        }
-        if (self.options.files_without_match and selected == 0) {
-            self.summary.matches += 1;
             try self.write(doc.path);
             try self.write(if (self.options.null_paths) "\x00" else "\n");
         } else if ((self.options.count or self.options.count_matches) and (selected > 0 or self.options.include_zero)) {
@@ -2474,7 +2536,7 @@ pub const Search = struct {
                 const occurrences = if (self.options.ask != null or self.options.invert) @as(usize, 1) else (exact_occurrences orelse (if (self.current_hits) |hits| hits.len else 1));
                 match_count += occurrences;
                 self.summary.occurrences += occurrences;
-                if (self.options.quiet) {
+                if (self.options.quiet and !self.options.files_without_match) {
                     self.stop = true;
                     return;
                 }
@@ -2546,6 +2608,11 @@ pub const Search = struct {
         }
         if (self.options.files_without_match) {
             if (count == 0) {
+                if (self.options.quiet) {
+                    self.summary.matches += 1;
+                    self.stop = true;
+                    return;
+                }
                 try self.write(path_name);
                 try self.write(if (self.options.null_paths) "\x00" else "\n");
                 self.summary.matches += 1;
@@ -2698,7 +2765,10 @@ pub const Search = struct {
         self.summary.occurrences += matched_occurrences;
         if (!self.options.files_without_match) self.summary.matches += count;
         if (self.options.quiet) {
-            if (count > 0) self.stop = true;
+            if ((count > 0) != self.options.files_without_match) {
+                if (self.options.files_without_match) self.summary.matches += 1;
+                self.stop = true;
+            }
             return;
         }
         if (self.options.files_with_matches or self.options.files_without_match) {

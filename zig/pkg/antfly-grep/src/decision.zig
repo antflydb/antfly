@@ -61,7 +61,7 @@ pub const Input = struct {
         try self.writeEvidence(json);
         try json.endObject();
     }
-    fn writeEvidence(self: Input, json: *std.json.Stringify) !void {
+    pub fn writeEvidence(self: Input, json: *std.json.Stringify) !void {
         const image = self.image orelse return self.writeText(json);
         try json.beginArray();
         try json.beginObject();
@@ -79,6 +79,13 @@ pub const Input = struct {
         try json.endArray();
         try json.endObject();
         try json.endArray();
+    }
+    pub fn evidenceBytes(self: Input) !usize {
+        var buffer: [512]u8 = undefined;
+        var counter: std.Io.Writer.Discarding = .init(&buffer);
+        var json: std.json.Stringify = .{ .writer = &counter.writer };
+        try self.writeEvidence(&json);
+        return std.math.cast(usize, counter.fullCount()) orelse error.DecisionLimitExceeded;
     }
     fn writeText(self: Input, json: *std.json.Stringify) !void {
         try json.beginWriteRaw();
@@ -716,8 +723,7 @@ pub const Client = struct {
         // Shared transport counts each context once, just like its encoder.
         if (inputs.len > 1 and rawRequestBytes(inputs, self.options.decision_context == .shared_v1) > 16 * 1024 * 1024) {
             const half = inputs.len / 2;
-            try self.requestDirect(inputs[0..half], probabilities[0..half]);
-            try self.requestDirect(inputs[half..], probabilities[half..]);
+            try self.requestHalves(inputs, probabilities, half);
             return;
         }
         var attempt: usize = 0;
@@ -744,8 +750,7 @@ pub const Client = struct {
                         return;
                     }
                     const half = inputs.len / 2;
-                    try self.requestDirect(inputs[0..half], probabilities[0..half]);
-                    try self.requestDirect(inputs[half..], probabilities[half..]);
+                    try self.requestHalves(inputs, probabilities, half);
                     return;
                 }
                 const transient = self.last_status == 429 or self.last_status == 408 or self.last_status >= 500 or (self.last_status == 0 and self.requests > requests_before and self.options.backend != .local and err != error.RequestBudgetExceeded and err != error.Canceled and err != error.OutOfMemory);
@@ -765,6 +770,16 @@ pub const Client = struct {
             return;
         }
     }
+    fn requestHalves(self: *Client, inputs: []const Input, scores: []f64, half: usize) anyerror!void {
+        var failure: ?anyerror = null;
+        self.requestDirect(inputs[0..half], scores[0..half]) catch |err| {
+            failure = err;
+        };
+        self.requestDirect(inputs[half..], scores[half..]) catch |err| {
+            failure = failure orelse err;
+        };
+        if (failure) |err| return err;
+    }
     fn requestOnce(self: *Client, inputs: []const Input, probabilities: []f64) !void {
         // Bound serialization/response scratch by provider concurrency too.
         // Release only after those buffers are freed, including split/retry
@@ -774,7 +789,13 @@ pub const Client = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        for (inputs) |input| if (input.image != null and inputs.len != 1) return error.MultimodalBatchUnsupported;
+        for (inputs) |input| if (input.image != null) {
+            var buffer: [512]u8 = undefined;
+            var counter: std.Io.Writer.Discarding = .init(&buffer);
+            var json: std.json.Stringify = .{ .writer = &counter.writer };
+            try input.writeEvidence(&json);
+            if (counter.fullCount() > 1024 * 1024) return error.DecisionLimitExceeded;
+        };
         const query_count = 1 + (if (self.query == null) self.options.queries.items.len else @as(usize, 0));
         const policy_count = if (self.query == null and self.stage != .directory) self.options.filters.items.len + self.options.only.items.len + self.options.not.items.len else 0;
         const count = query_count + policy_count;
@@ -808,7 +829,7 @@ pub const Client = struct {
         // entire expanded request (including JSON escaping and shared state).
         var body_budget = @import("antfly_regex").Budget{ .backing = self.a, .limit = 32 * 1024 * 1024 };
         const body_a = body_budget.allocator();
-        const body = (if (self.options.backend != .local and (self.options.decision_transport == .single or inputs[0].image != null)) singleBody(body_a, inputs, questions, self.options.model.?) else if (self.options.decision_context == .shared_v1) sharedBody(body_a, inputs, questions, self.options.model.?) else std.json.Stringify.valueAlloc(body_a, .{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{})) catch |err| {
+        const body = (if (self.options.backend != .local and self.options.decision_transport == .single) singleBody(body_a, inputs, questions, self.options.model.?) else if (self.options.decision_context == .shared_v1) sharedBody(body_a, inputs, questions, self.options.model.?) else std.json.Stringify.valueAlloc(body_a, .{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{})) catch |err| {
             return if (body_budget.denied) error.DecisionRequestTooLarge else err;
         };
         defer body_a.free(body);
@@ -829,8 +850,8 @@ pub const Client = struct {
             defer self.a.free(response);
             const parsed = try std.json.parseFromSlice(std.json.Value, self.a, response, .{ .duplicate_field_behavior = .@"error" });
             defer parsed.deinit();
-            try parseQuestions(parsed.value, inputs, probabilities, names);
             self.recordUsage(parsed.value);
+            try parseQuestions(parsed.value, inputs, probabilities, names);
             return;
         }
         self.recordRequest(body.len, inputs.len);
@@ -854,8 +875,8 @@ pub const Client = struct {
         }
         const parsed = try std.json.parseFromSlice(std.json.Value, self.a, response.body orelse return error.EmptyDecisionResponse, .{ .duplicate_field_behavior = .@"error" });
         defer parsed.deinit();
-        try parseQuestions(parsed.value, inputs, probabilities, names);
         self.recordUsage(parsed.value);
+        try parseQuestions(parsed.value, inputs, probabilities, names);
     }
     fn recordRequest(self: *Client, bytes: usize, inputs: usize) void {
         self.requests += 1;
@@ -874,6 +895,7 @@ fn rawRequestBytes(inputs: []const Input, shared: bool) usize {
     var count: usize = 0;
     for (inputs, 0..) |input, i| {
         count +|= input.input.len;
+        if (input.image) |image| count +|= image.data_url.len;
         var repeated = false;
         if (shared) for (inputs[0..i]) |prior| {
             if (prior.context.ptr == input.context.ptr and prior.context.len == input.context.len) {
@@ -1001,12 +1023,30 @@ fn sharedBody(a: Allocator, inputs: []const Input, questions: anytype, model: []
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const WireInput = struct { id: []const u8, input: []const u8, context_index: ?usize };
+    const WireInput = struct {
+        id: []const u8,
+        input: Input,
+        context_index: ?usize,
+        pub fn jsonStringify(self: @This(), json: *std.json.Stringify) !void {
+            try json.beginObject();
+            try json.objectField("id");
+            try json.write(self.id);
+            try json.objectField("input");
+            try self.input.writeEvidence(json);
+            if (self.context_index) |index| {
+                try json.objectField("context_index");
+                try json.write(index);
+            }
+            try json.endObject();
+        }
+    };
     const wire = try scratch.alloc(WireInput, inputs.len);
     var contexts: std.ArrayList([]const u8) = .empty;
     var indexes: std.AutoHashMap(struct { address: usize, len: usize }, usize) = .init(scratch);
     for (inputs, wire) |input, *out| {
-        out.* = .{ .id = input.id, .input = input.input, .context_index = null };
+        var evidence = input;
+        evidence.context = "";
+        out.* = .{ .id = input.id, .input = evidence, .context_index = null };
         if (input.context.len == 0) continue;
         const entry = try indexes.getOrPut(.{ .address = @intFromPtr(input.context.ptr), .len = input.context.len });
         if (!entry.found_existing) {
@@ -1019,13 +1059,6 @@ fn sharedBody(a: Allocator, inputs: []const Input, questions: anytype, model: []
 }
 fn singleBody(a: Allocator, inputs: []const Input, questions: anytype, model: []const u8) ![]u8 {
     if (inputs.len != 1) return error.InvalidDecisionBatch;
-    if (inputs[0].image != null) {
-        var buffer: [512]u8 = undefined;
-        var counter: std.Io.Writer.Discarding = .init(&buffer);
-        var json: std.json.Stringify = .{ .writer = &counter.writer };
-        try inputs[0].writeEvidence(&json);
-        if (counter.fullCount() > 1024 * 1024) return error.DecisionLimitExceeded;
-    }
     // Reuse Input's streaming JSON string encoder, avoiding a copy of context.
     const Wire = struct {
         model: []const u8,
@@ -1071,14 +1104,26 @@ fn parseQuestions(value: std.json.Value, inputs: []const Input, probabilities: [
     }
     const data = field(value, "data") orelse return error.InvalidDecisionResponse;
     if (data != .array or data.array.items.len != inputs.len) return error.InvalidDecisionResponse;
+    // Validate the entire identity envelope before making evidence visible.
+    var seen: [128]bool = @splat(false);
+    if (inputs.len > seen.len) return error.InvalidDecisionResponse;
     for (data.array.items) |row| {
         const index = field(row, "input_index") orelse return error.InvalidDecisionResponse;
         if (index != .integer or index.integer < 0 or index.integer >= inputs.len) return error.InvalidDecisionResponse;
         const i: usize = @intCast(index.integer);
-        if (!std.math.isNan(probabilities[i])) return error.InvalidDecisionResponse;
+        if (seen[i]) return error.InvalidDecisionResponse;
+        seen[i] = true;
         if (field(row, "id")) |id| if (!string(id, inputs[i].id)) return error.InvalidDecisionResponse;
-        probabilities[i] = try aggregate(row, names);
     }
+    var failure: ?anyerror = null;
+    for (data.array.items) |row| {
+        const i: usize = @intCast(field(row, "input_index").?.integer);
+        probabilities[i] = aggregate(row, names) catch |err| {
+            failure = failure orelse err;
+            continue;
+        };
+    }
+    if (failure) |err| return err;
 }
 fn aggregate(row: std.json.Value, names: []const []const u8) !f64 {
     var values: [@import("antfly_predicate_client").max_questions]f64 = undefined;

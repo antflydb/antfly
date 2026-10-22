@@ -2464,3 +2464,147 @@ def test_logical_retained_page_profile(stateful_api):
         )
         + "\n"
     )
+
+
+@pytest.mark.parametrize("change", [None, "revision", "permissions"])
+def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
+    stateful_api, tmp_path, change
+):
+    """Real query server; only inference is a fixed-answer local fixture."""
+    import hashlib
+
+    image = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII="
+    )
+    table = f"grep_visual_{time.time_ns()}"
+    stateful_api.create_table(table)
+    item = document("Drive/chart.png", "")
+    item["grep"].update(
+        version=2,
+        evidence=[
+            {
+                "id": "image",
+                "kind": "image",
+                "asset": {
+                    "field": "payloads.image",
+                    "sha256": hashlib.sha256(image).hexdigest(),
+                    "mime_type": "image/png",
+                    "byte_length": len(image),
+                    "recipe": "original-v1",
+                },
+            }
+        ],
+    )
+    item["payloads"] = {
+        "image": "data:image/png;base64," + base64.b64encode(image).decode(),
+        "unrelated": "x" * 262144,
+    }
+    stateful_api.batch_write(table, inserts={"source": item}, sync_level="full_index")
+    seen, responses, provider_calls = [], [], []
+
+    class QueryProxy(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(body)
+            response = requests.post(
+                stateful_api.url + f"/tables/{table}/query", json=body, timeout=60
+            )
+            try:
+                responses.append(response.json())
+            except ValueError:
+                responses.append(
+                    {
+                        "http_status": response.status_code,
+                        "body": response.text,
+                        "logs": stateful_api.debug_logs()[-6000:],
+                    }
+                )
+            if len(seen) == 1 and change:
+                if change == "revision":
+                    item["grep"]["revision"] = "new-revision"
+                else:
+                    item["grep"]["permissions"] = {"public": False, "readers": []}
+                stateful_api.batch_write(
+                    table, inserts={"source": item}, sync_level="full_index"
+                )
+            self.send_response(response.status_code)
+            self.send_header("Content-Length", str(len(response.content)))
+            self.end_headers()
+            self.wfile.write(response.content)
+
+    class Decisions(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            provider_calls.append(body)
+            data = [
+                {
+                    "input_index": i,
+                    "id": entry["id"],
+                    "answers": [
+                        {"type": "predicate", "name": q["name"], "probability": 0.9}
+                        for q in body["questions"]
+                    ],
+                }
+                for i, entry in enumerate(body["inputs"])
+            ]
+            payload = json.dumps({"data": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    query = ThreadingHTTPServer(("127.0.0.1", 0), QueryProxy)
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), Decisions)
+    threads = [start_http_server(query), start_http_server(provider)]
+    try:
+        result = run_grep(
+            tmp_path,
+            f"http://127.0.0.1:{query.server_port}",
+            table,
+            "--media=images",
+            "--ask=Does this contain a chart?",
+            "--model=fixture",
+            "--endpoint",
+            f"http://127.0.0.1:{provider.server_port}/decisions",
+            "--no-cache",
+            "--json",
+            page_size=8,
+        )
+        assert len(seen) == 2, (seen, result.stderr.decode())
+        assert seen[0]["order_by"] == [{"field": "_id", "desc": False}]
+        assert responses[0]["responses"][0]["remote_snapshot"]
+        point = seen[1]
+        assert point["query"] == {"bool": {"filter": {"ids": ["source"]}}}
+        assert "execution" not in point
+        assert not {"order_by", "search_after", "remote_snapshot"} & point.keys()
+        assert set(point["fields"]) == {
+            "grep.revision",
+            "grep.permissions",
+            "payloads.image",
+        }
+        assert "responses" in responses[1], responses[1]
+        assert not responses[1]["responses"][0].get("remote_snapshot")
+        if change:
+            assert result.returncode == 2, result.stdout
+            assert not provider_calls
+            expected = (
+                b"EvidenceRevisionChanged"
+                if change == "revision"
+                else b"IndexAuthorizationFailed"
+            )
+            assert expected in result.stderr
+        else:
+            assert result.returncode == 0, result.stderr.decode()
+            assert len(provider_calls) == 1
+            assert json.loads(result.stdout.splitlines()[0])["type"] == "evidence"
+    finally:
+        for server, thread in zip((query, provider), threads, strict=True):
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()

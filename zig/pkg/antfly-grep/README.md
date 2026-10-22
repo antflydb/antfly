@@ -4467,8 +4467,10 @@ Visual mode sends one ordered text/image evidence message per unit, with multipl
 questions sharing that image. JSON evidence records identify the unit, page/slide,
 source revision, image digest and recipe; they contain no invented line numbers
 or bounding boxes. Counts refer to matching visual units. The provider must
-support image Decisions; native text-only models, text batch/shared contexts,
-lexical prefilters, triage, stdin and workspace media are rejected.
+support image Decisions; native text-only models, lexical prefilters, triage,
+stdin and workspace media are rejected. Antfly multimodal batches and shared text
+contexts preserve images; explicit single-input transport remains available for
+custom services.
 
 Default image limits are 512 KiB and 16,777,216 pixels. Adjust
 `--max-image-bytes SIZE` (maximum 768 KiB) / `--max-image-pixels N`; the 1 MiB
@@ -4481,3 +4483,25 @@ and [Cloud delivery issue](https://github.com/antflydb/colony/issues/790) for th
 private asset, ACL and connector lifecycle requirements. Cloud connector work is
 not included in this CLI implementation; fixture tests do not establish visual
 model quality.
+
+
+Visual evaluations use waves capped at 16 units and 8 MiB conservative evidence.
+Indexed waves fetch distinct same-parent image fields together with one fresh
+authorized ID query; these point reads create no pagination snapshots. The
+manifest scan keeps its retained snapshot and ascending-ID order. Identical asset
+references share validated bytes within a wave, and successful siblings survive
+refusal, malformed item answers and oversized-batch partition failures. Warm
+scores still require current asset authorization, revision and digest validation.
+Local `--max-filesize` filtering and hard `--max-file-size` limits apply before
+inference. Quiet mode respects file selection, including `--files-without-match`.
+
+The [visual batching qualification](bench/results/grep-visual-batching-summary.json)
+compares the prior PR binary with this implementation using eight distinct
+same-parent images, five alternating trials and 20 ms artificial delay per HTTP
+request. Cold requests drop from 17 to 3 (8 to 1 Decisions; 9 to 2 index queries),
+and warm requests from 9 to 2 with no inference. Median elapsed time was
+468 to 108 ms cold / 232 to 66 ms warm on macOS, and 414 to 71 ms cold /
+217 to 50 ms warm in the two-CPU, 1-GiB ARM64 Linux VM. These synthetic delays
+measure transport shape, not live-provider speed or model-token savings.
+Cross-parent scheduling is still serial. Reproduce with
+`bench/visual_batches.py --help`; raw trial reports remain in ignored `output/`.

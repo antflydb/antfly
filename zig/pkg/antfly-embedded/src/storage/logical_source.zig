@@ -28,6 +28,8 @@ pub const ReadProfile = struct {
     calls: Counter = .init(0),
     total_ns: Counter = .init(0),
     revision_ns: Counter = .init(0),
+    proof_cache_hits: Counter = .init(0),
+    proof_cache_misses: Counter = .init(0),
     directory_read_ns: Counter = .init(0),
     directory_plan_ns: Counter = .init(0),
     range_read_ns: Counter = .init(0),
@@ -40,9 +42,10 @@ pub const ReadProfile = struct {
         if (self) |profile| _ = @field(profile, field).fetchAdd(@import("antfly_platform").time.monotonicNs() - started, .monotonic);
     }
     pub fn report(self: *const @This()) void {
-        std.log.info("antfly_bench_logical_sources calls={d} total_us={d} revision_us={d} directory_read_us={d} directory_plan_us={d} range_read_us={d} reconstruct_us={d} fallback_us={d}", .{
+        std.log.info("antfly_bench_logical_sources calls={d} total_us={d} revision_us={d} proof_cache_hits={d} proof_cache_misses={d} directory_read_us={d} directory_plan_us={d} range_read_us={d} reconstruct_us={d} fallback_us={d}", .{
             self.calls.load(.monotonic),                    self.total_ns.load(.monotonic) / 1000,
-            self.revision_ns.load(.monotonic) / 1000,       self.directory_read_ns.load(.monotonic) / 1000,
+            self.revision_ns.load(.monotonic) / 1000,       self.proof_cache_hits.load(.monotonic),
+            self.proof_cache_misses.load(.monotonic),       self.directory_read_ns.load(.monotonic) / 1000,
             self.directory_plan_ns.load(.monotonic) / 1000, self.range_read_ns.load(.monotonic) / 1000,
             self.reconstruct_ns.load(.monotonic) / 1000,    self.fallback_ns.load(.monotonic) / 1000,
         });
@@ -105,7 +108,11 @@ pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const 
     var timestamps: [64]u64 = undefined;
     // Without storage authentication a directory is not authority to omit bytes.
     var phase = ReadProfile.clock(profile);
-    if (authenticated and roots.len != 0) try revision.loadWindow(scope, scratch, physical, ids, proofs[0..ids.len], timestamps[0..ids.len]);
+    if (authenticated and roots.len != 0) {
+        if (comptime @hasDecl(@typeInfo(@TypeOf(scope)).pointer.child, "loadProofWindow")) {
+            try scope.loadProofWindow(scratch, physical, ids, proofs[0..ids.len], timestamps[0..ids.len]);
+        } else try revision.loadWindow(scope, scratch, physical, ids, proofs[0..ids.len], timestamps[0..ids.len]);
+    }
     ReadProfile.add(profile, "revision_ns", phase);
     phase = ReadProfile.clock(profile);
     var directory_keys: [64]projection.Key = undefined;

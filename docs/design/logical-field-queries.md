@@ -794,8 +794,8 @@ query semantics, verification controls and freshness options are unchanged.
 
 ### Remaining source-certificate ownership
 
-Reuse across writes still requires implementation of the segment/source binding
-certificates described above. A maintained implementation must register complete
+Segment predicate reuse across writes still requires implementation of the
+segment/source binding certificates described above. A maintained implementation must register complete
 source identities at a publication fence, invalidate affected registrations from
 both transaction and batch source-mutation paths (including unindexed updates),
 and capture immutable certificates with the retained cut. The existing
@@ -811,5 +811,47 @@ modes fall back to the whole-generation proof. Restart and compaction cannot
 inherit a certificate merely because segment IDs or analyzed terms match.
 Validation needs concurrent unindexed updates, registration/publication races,
 failed and ambiguous commits, deletion/recreation, repair, compaction, restart,
-expiry and allocation-failure cases. This follow-up does not advertise that
-cross-write reuse is implemented or that complete requests have zero cost.
+expiry and allocation-failure cases. The scalar source registry below does not establish these segment membership
+certificates or make complete requests zero cost.
+
+
+### Bounded original-value certificate registry
+
+Original-value metadata now has an owner-local proof registry, distinct from
+segment predicate membership reuse. Each native DocStore admits at most 4,096
+scalar facts keyed by the complete document mutation identity: content revision,
+length, kind, digest and stored timestamp. No JSON bodies, selected values, ACLs
+or predicate answers are cached here. The registry is lazy, ephemeral and uses
+the store allocator; pressure, allocation failure and missing coverage are misses.
+It is retired on store close and never restored from segment IDs or disk files.
+
+Read admission captures an owner-lifetime nonce and stable mutation epoch around
+primary snapshot creation. Proof hits and new registrations require that exact
+owner/epoch with no active mutation attempts. A retained old cut may continue
+reading its pinned storage snapshot after writes, but cannot certify facts in a
+new live epoch. Transaction and batch commits invalidate the actual document
+mutation set immediately before backend commit, including unindexed-field/TTL
+changes and delete/reinsert. Fences remain active until the backend attempt
+returns, including ambiguous failure. Unrelated mutations preserve registered
+facts for fresh readers. Large invalidation sets clear the registry instead of
+creating unbounded fan-out. Imports and bulk publication fence/clear all facts;
+bulk sessions remain fenced until finish or abort. Epoch/nonce exhaustion fails
+closed.
+
+The shared logical source reader consults these facts before reading revision,
+content-authority and timestamp keys, then continues directory and selected-range
+verification against the same primary snapshot. Every selected range still
+checks its digest. Original-byte budgets and authenticated row policy remain
+unchanged. Optional `ANTFLY_BENCH_LOGICAL_SOURCE_PHASES=1` output includes
+`proof_cache_hits` and `proof_cache_misses`, permitting qualification of eliminated
+metadata reads separately from range I/O and end-to-end latency.
+
+This implements bounded original-value proof reuse across unrelated writes.
+It does not make whole predicate/segment membership reusable across writes:
+complete segment-to-source coverage certificates and coordinator-owned work
+grants described above remain separate ownership work. Current conservative
+whole-generation predicate proofs remain authoritative. Registry tests cover old
+cuts, unrelated writes, rejected registration, overlapping writers, ambiguous
+attempt retirement, allocation failure, capacity and epoch exhaustion; native
+DocStore/DB tests cover transaction/batch invalidation, delete/recreate, pinned
+readers and the actual original-value loading path.

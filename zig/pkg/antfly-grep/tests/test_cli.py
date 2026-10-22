@@ -213,14 +213,24 @@ class DecisionHandler(BaseHTTPRequestHandler):
         self.server.index_requests.append(
             (self.path, self.headers.get("Authorization"), body)
         )
-        if body.get("order_by") != [{"field": "_id", "desc": False}]:
+        asset_read = any(
+            field.startswith("payloads.") for field in body.get("fields", [])
+        )
+        if (
+            not asset_read and body.get("order_by") != [{"field": "_id", "desc": False}]
+        ) or (
+            asset_read
+            and not getattr(self.server, "allow_asset_order", False)
+            and (
+                "order_by" in body
+                or "search_after" in body
+                or "remote_snapshot" in body
+            )
+        ):
             self.send_response(400)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        asset_read = any(
-            field.startswith("payloads.") for field in body.get("fields", [])
-        )
         if asset_read and getattr(self.server, "asset_mode", None):
             mode = self.server.asset_mode
             if mode == "revoked":
@@ -274,6 +284,8 @@ class DecisionHandler(BaseHTTPRequestHandler):
                 return True
             if "ids" in query:
                 return doc["_id"] in query["ids"]
+            if "bool" in query:
+                return candidate_matches(query["bool"].get("filter"), doc)
             if "disjuncts" in query:
                 return any(candidate_matches(q, doc) for q in query["disjuncts"])
             if "must_not" in query:
@@ -379,6 +391,14 @@ class DecisionHandler(BaseHTTPRequestHandler):
                 assert parts[1]["image_url"].startswith("data:image/")
                 text = "TARGET 1: STOP\n" + parts[0]["text"]
             body = {**body, "inputs": [{"id": "single", "input": text}]}
+        if any(isinstance(item["input"], list) for item in body.get("inputs", [])):
+            body = json.loads(json.dumps(body))
+            for item in body["inputs"]:
+                if isinstance(item["input"], list):
+                    parts = [p for message in item["input"] for p in message["content"]]
+                    assert [p["type"] for p in parts] == ["input_text", "input_image"]
+                    assert parts[1]["image_url"].startswith("data:image/")
+                    item["input"] = "TARGET 1: STOP\n" + parts[0]["text"]
         if body.get("context_version") == 1:
             body = json.loads(json.dumps(body))
             for item in body["inputs"]:
@@ -386,6 +406,13 @@ class DecisionHandler(BaseHTTPRequestHandler):
                     item["input"] = (
                         body["contexts"][item["context_index"]] + "\n" + item["input"]
                     )
+        if self.server.mode == "reject_visual_first" and any(
+            item["id"] == "slide-1" for item in body.get("inputs", [])
+        ):
+            self.send_response(413)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.server.mode == "split_partial":
             text = body["inputs"][0]["input"]
             status = (
@@ -1973,6 +2000,7 @@ class CliTests(unittest.TestCase):
         self.env["HOME"] = str(self.root)
         self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
         self.server.asset_mode = None
+        self.server.allow_asset_order = False
         self.server.requests = []
         self.server.client_ports = []
         self.server.index_requests = []
@@ -3531,7 +3559,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual((match["data"]["width"], match["data"]["height"]), (2, 3))
         self.assertNotIn("line_number", match["data"])
         self.assertEqual(match["source"]["revision"], hashlib.sha256(image).hexdigest())
-        self.assertIsInstance(self.server.requests[0][2]["input"], list)
+        self.assertIsInstance(self.server.requests[0][2]["inputs"][0]["input"], list)
         self.assertEqual(len(self.server.requests), 1)
         self.server.requests.clear()
         self.raw_cli(*args)
@@ -3618,7 +3646,6 @@ class CliTests(unittest.TestCase):
         for flags in [
             ["--max-image-pixels", "5"],
             ["--max-image-bytes", "4"],
-            ["--decision-context", "shared-v1"],
             ["--backend", "local"],
             ["--triage"],
             ["-e", "STOP"],
@@ -3652,8 +3679,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(self.server.requests), 3)
         for _, _, body in self.server.requests:
             self.assertEqual(len(body["questions"]), 2)
-            self.assertEqual(len(body["input"][0]["content"]), 2)
-            self.assertNotIn("inputs", body)
+            evidence = body["inputs"][0]["input"] if "inputs" in body else body["input"]
+            self.assertEqual(len(evidence[0]["content"]), 2)
         self.server.requests.clear()
         config = self.visual_document(units=2)
         self.server.index_documents[0]["_source"]["grep"]["evidence"][1]["asset"][
@@ -3703,6 +3730,156 @@ class CliTests(unittest.TestCase):
         records = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertFalse(any(row["type"] == "evidence" for row in records))
         self.assertEqual(self.server.requests, [])
+
+    def test_quiet_files_without_match_respects_file_selection(self):
+        self.write("a.txt", "STOP\n")
+        self.write("b.txt", "noise\n")
+        for flags in ([], ["-U"], ["--no-mmap"]):
+            for paths, expected in [
+                (["a.txt"], 1),
+                (["b.txt"], 0),
+                (["a.txt", "b.txt"], 0),
+            ]:
+                result = self.raw_cli(
+                    *flags,
+                    "--quiet",
+                    "--files-without-match",
+                    "STOP",
+                    *paths,
+                    code=expected,
+                )
+                self.assertEqual(result.stdout, b"")
+        for name in ["a.png", "b.png"]:
+            self.write(name, self.image_fixture())
+        self.server.after_decision = lambda: setattr(
+            self.server, "mode", "accept_lines"
+        )
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--media=images",
+            "--no-cache",
+            "--quiet",
+            "--files-without-match",
+            "-j1",
+            "a.png",
+            "b.png",
+        )
+        self.assertEqual(result.stdout, b"")
+
+    def test_media_file_size_admission_happens_before_inference(self):
+        self.write("a.png", self.image_fixture())
+        self.raw_cli(
+            *self.decision_args(), "--media=images", "--max-filesize=4", "a.png", code=1
+        )
+        self.raw_cli(
+            *self.decision_args(),
+            "--media=images",
+            "--max-file-size=4",
+            "a.png",
+            code=2,
+        )
+        self.assertEqual(self.server.requests, [])
+
+    def test_media_batches_asset_projection_and_provider_evaluation(self):
+        config = self.visual_document(units=8)
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--media=images",
+            "--no-cache",
+            "--table-config",
+            config,
+            "--json",
+            "--decision-concurrency=4",
+        )
+        self.assertEqual(
+            sum(
+                json.loads(line)["type"] == "evidence"
+                for line in result.stdout.splitlines()
+            ),
+            8,
+        )
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(len(self.server.requests[0][2]["inputs"]), 8)
+        self.assertEqual(len(self.server.index_requests), 2)
+        self.assertNotIn("order_by", self.server.index_requests[1][2])
+        self.server.requests.clear()
+        self.raw_cli(
+            *self.decision_args(),
+            "--media=images",
+            "--decision-context=shared-v1",
+            "--no-cache",
+            "--table-config",
+            config,
+        )
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(self.server.requests[0][2]["context_version"], 1)
+        self.assertIsInstance(self.server.requests[0][2]["inputs"][0]["input"], list)
+        # Explicit common transport remains interoperable and concurrent.
+        self.server.requests.clear()
+        self.server.index_requests.clear()
+        self.server.delay = 0.02
+        try:
+            self.raw_cli(
+                *self.decision_args(),
+                "--media=images",
+                "--decision-transport=single",
+                "--decision-concurrency=4",
+                "--no-cache",
+                "--table-config",
+                config,
+            )
+        finally:
+            self.server.delay = 0
+        self.assertEqual(len(self.server.requests), 8)
+        self.assertGreater(self.server.peak, 1)
+        self.assertLessEqual(self.server.peak, 4)
+
+    def test_media_batch_refusal_preserves_and_caches_valid_siblings(self):
+        config = self.visual_document(units=3)
+        self.server.mode = "refusal"
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--media=images",
+            "--json",
+            "--table-config",
+            config,
+            code=2,
+        )
+        units = [
+            json.loads(line)["data"]["unit"]
+            for line in result.stdout.splitlines()
+            if json.loads(line)["type"] == "evidence"
+        ]
+        self.assertEqual(units, ["slide-2", "slide-3"])
+        self.assertEqual(len(self.server.requests), 1)
+        self.server.requests.clear()
+        self.server.mode = "ok"
+        self.raw_cli(
+            *self.decision_args(), "--media=images", "--json", "--table-config", config
+        )
+        self.assertEqual(
+            sum(len(body["inputs"]) for _, _, body in self.server.requests), 1
+        )
+
+    def test_media_rejected_batch_keeps_other_partition(self):
+        config = self.visual_document(units=3)
+        self.server.mode = "reject_visual_first"
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--media=images",
+            "--json",
+            "--table-config",
+            config,
+            "--no-cache",
+            code=2,
+        )
+        units = [
+            json.loads(line)["data"]["unit"]
+            for line in result.stdout.splitlines()
+            if json.loads(line)["type"] == "evidence"
+        ]
+        self.assertEqual(units, ["slide-2", "slide-3"])
+        self.assertIn(b"DecisionImageTooLarge", result.stderr)
 
     def test_shared_refinement_retains_all_targets(self):
         self.write("a.txt", "STOP one\nnoise\nSTOP two\nnoise\n")

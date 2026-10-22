@@ -213,7 +213,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             if (search.options.media == .images) {
                 const units = document.field(value, "evidence");
                 if (units) |raw| doc.evidence = try @import("antfly_source_evidence").parseUnits(a, raw);
-                doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load };
+                doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany };
             }
             search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
         }
@@ -243,6 +243,7 @@ const Fetch = struct {
     filter: ?std.json.Value,
     text_query: ?std.json.Value = null,
     fields: []const []const u8,
+    ordered: bool = true,
     http: *httpx.Client,
     summary: struct { index_requests: usize = 0 } = .{},
     cancel: std.atomic.Value(bool) = .init(false),
@@ -336,7 +337,7 @@ const Fetch = struct {
             defer if (!retained) page.deinit(self.a);
             const a = page.arena.allocator();
             const memory = &page.memory;
-            const body = try std.json.Stringify.valueAlloc(a, .{ .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            const body = try std.json.Stringify.valueAlloc(a, .{ .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
             const auth = if (self.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
             const headers: ?[]const [2][]const u8 = if (auth) |value| &.{.{ "Authorization", value }} else null;
             var attempt: usize = 0;
@@ -546,19 +547,43 @@ fn AssetResolver(comptime SearchType: type) type {
         id: []const u8,
         revision: []const u8,
         filter: ?std.json.Value,
-        fn load(raw: *anyopaque, a: A, unit: @import("antfly_source_evidence").Unit) !@import("antfly_source_evidence").Image {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.search.stopped()) return error.Canceled;
-            try unit.validate();
-            if (unit.asset.byte_length > self.search.options.max_image_bytes) return error.ImageByteBudgetExceeded;
-            const fields = [_][]const u8{
-                try std.fmt.allocPrint(a, "{s}.revision", .{self.table.document_field}),
-                try std.fmt.allocPrint(a, "{s}.permissions", .{self.table.document_field}),
-                unit.asset.field,
+        const media = @import("antfly_source_evidence");
+        fn load(raw: *anyopaque, a: A, unit: media.Unit) !media.Image {
+            var result: [1]media.Loaded = undefined;
+            try loadMany(raw, a, &.{unit}, &result);
+            return switch (result[0]) {
+                .image => |image| image,
+                .failed => |err| err,
             };
-            const ids = try std.json.Stringify.valueAlloc(a, .{ .ids = .{self.id} }, .{});
-            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = &fields };
+        }
+        fn loadMany(raw: *anyopaque, a: A, units: []const media.Unit, output: []media.Loaded) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(units.len == output.len and units.len <= 16);
+            if (self.search.stopped()) return error.Canceled;
+            var fields: std.ArrayList([]const u8) = .empty;
+            try fields.append(a, try std.fmt.allocPrint(a, "{s}.revision", .{self.table.document_field}));
+            try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{self.table.document_field}));
+            for (units, output) |unit, *item| {
+                item.* = .{ .failed = error.MissingEvidenceAsset };
+                unit.validate() catch |err| {
+                    item.* = .{ .failed = err };
+                    continue;
+                };
+                if (unit.asset.byte_length > self.search.options.max_image_bytes) {
+                    item.* = .{ .failed = error.ImageByteBudgetExceeded };
+                    continue;
+                }
+                const present = for (fields.items) |field| {
+                    if (std.mem.eql(u8, field, unit.asset.field)) break true;
+                } else false;
+                if (!present) try fields.append(a, unit.asset.field);
+            }
+            if (fields.items.len == 2) return;
+            const ids = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = .{self.id} } } }, .{});
+            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false };
             defer self.search.summary.index_requests += fetch.summary.index_requests;
+            // Point reads deliberately omit ordering/cursors. They reauthorize
+            // current rows without creating a durable pagination snapshot.
             const page = try fetch.load(.{ .cursor = null, .snapshot = null, .page_size = 1 });
             defer page.deinit(self.search.a);
             const responses = document.field(page.parsed.value, "responses") orelse return error.InvalidIndexResponse;
@@ -576,12 +601,27 @@ fn AssetResolver(comptime SearchType: type) type {
             const parent = document.at(source, self.table.document_field) orelse return error.InvalidIndexResponse;
             if (!document.allowed(parent, self.config.principals)) return error.IndexAuthorizationFailed;
             if (!std.mem.eql(u8, try document.string(parent, "revision"), self.revision)) return error.EvidenceRevisionChanged;
-            const payload = document.at(source, unit.asset.field) orelse return error.MissingEvidenceAsset;
-            if (payload != .string) return error.InvalidEvidenceAsset;
-            var image = try @import("antfly_source_evidence").Image.fromDataUrl(a, payload.string, unit.asset, self.search.options.max_image_bytes, self.search.options.max_image_pixels);
-            // Transfer only one bounded inline image from the temporary response.
-            image.data_url = try a.dupe(u8, image.data_url);
-            return image;
+            for (units, output, 0..) |unit, *item, i| {
+                if (item.* == .failed and item.failed != error.MissingEvidenceAsset) continue;
+                const reused = for (units[0..i], output[0..i]) |prior, value| {
+                    if (value == .image and std.mem.eql(u8, prior.asset.field, unit.asset.field) and std.mem.eql(u8, prior.asset.sha256, unit.asset.sha256) and std.mem.eql(u8, prior.asset.mime_type, unit.asset.mime_type) and prior.asset.byte_length == unit.asset.byte_length) break value.image;
+                } else null;
+                if (reused) |image| {
+                    item.* = .{ .image = image };
+                    continue;
+                }
+                const payload = document.at(source, unit.asset.field) orelse continue;
+                if (payload != .string) {
+                    item.* = .{ .failed = error.InvalidEvidenceAsset };
+                    continue;
+                }
+                var image = media.Image.fromDataUrl(a, payload.string, unit.asset, self.search.options.max_image_bytes, self.search.options.max_image_pixels) catch |err| {
+                    item.* = .{ .failed = err };
+                    continue;
+                };
+                image.data_url = try a.dupe(u8, image.data_url);
+                item.* = .{ .image = image };
+            }
         }
     };
 }
