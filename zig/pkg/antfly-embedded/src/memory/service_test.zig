@@ -4158,3 +4158,119 @@ test "memory episode catalog pagination merges audience lanes without duplicate 
     try std.testing.expectEqual(@as(usize, 30), seen.count());
     for (0..30) |i| try std.testing.expect(seen.contains(try std.fmt.allocPrint(a, "thread-{d}", .{i})));
 }
+
+fn proposalOperationExplanation(store: *Store, operation: m.types.OperationStatus, now: i64, known: ?i64) ![]const u8 {
+    const a = store.arena.allocator();
+    const request: m.types.provenance.ExplainRequest = .{ .resource = .{ .table = "memory_", .table_id = 0, .kind = .operation, .id = operation.id, .revision = operation.revision }, .max_nodes = 1, .max_bytes = 65536, .known_at = known };
+    return store.service("alice", true, now).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, request, .{}), "");
+}
+
+test "memory stale open proposal replacement preserves immutable attempts and fences old verdicts" {
+    for ([_]bool{ false, true }) |legacy| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try externalReviewSetup(&store);
+        const old: m.types.Evidence = .{ .id = "old-context", .resource_selector = .{ .table = "business", .id = "approval" } };
+        _ = try store.service("alice", true, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{old} }, .{}), "old-context");
+        var proposal: m.types.EntityProposalRequest = .{ .action = .merge, .from = "a", .to = "b", .expected_revision = 4, .actor = "old-judge", .evidence = &.{.{ .id = "old-context" }} };
+        const first = try store.service("alice", true, 4).execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, proposal, .{}), "first-proposal");
+        const original = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, first, .{});
+        if (legacy) {
+            const path = try fixtureKey(a, "proposal-input", original.proposal_id.?);
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, a, store.values.get(path).?, .{});
+            _ = value.object.swapRemove("revision");
+            _ = value.object.swapRemove("operation");
+            try store.values.put(a, path, try std.json.Stringify.valueAlloc(a, value, .{}));
+            _ = store.values.remove(try fixtureKey(a, "proposal-attempt", original.id));
+        }
+        store.resource_revision = 8;
+        try std.testing.expectError(error.MemoryForgotten, store.service("alice", true, 5).execute(a, .review_entity, original.proposal_id.?, "{\"expected_revision\":5,\"accept\":true}", "stale-verdict"));
+        const fresh: m.types.Evidence = .{ .id = "fresh-context", .resource_selector = .{ .table = "business", .id = "approval" } };
+        _ = try store.service("alice", true, 6).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{fresh} }, .{}), "fresh-context");
+        proposal.expected_revision = 6;
+        proposal.evidence = &.{.{ .id = "fresh-context" }};
+        proposal.actor = "new-judge";
+        const second = try store.service("alice", true, 7).execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, proposal, .{}), "second-proposal");
+        const latest = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, second, .{});
+        try std.testing.expectEqualStrings(original.proposal_id.?, latest.proposal_id.?);
+        const old_history = try proposalOperationExplanation(&store, original, 8, null);
+        try std.testing.expect(std.mem.indexOf(u8, old_history, "old-context") != null);
+        try std.testing.expect(std.mem.indexOf(u8, old_history, "fresh-context") == null);
+        const limited_request: m.types.provenance.ExplainRequest = .{ .resource = .{ .table = "memory_", .table_id = 0, .kind = .operation, .id = original.id, .revision = original.revision }, .max_nodes = 1 };
+        const limited = try store.service("alice", false, 8).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, limited_request, .{}), "");
+        try std.testing.expect(std.mem.indexOf(u8, limited, "old-context") == null);
+        const new_history = try proposalOperationExplanation(&store, latest, 8, null);
+        try std.testing.expect(std.mem.indexOf(u8, new_history, "fresh-context") != null);
+        try std.testing.expect(std.mem.indexOf(u8, new_history, "new-judge") != null);
+        try std.testing.expectError(error.MemoryNotFound, proposalOperationExplanation(&store, latest, 8, 5));
+        try std.testing.expectError(error.MemoryRevisionConflict, store.service("alice", true, 8).execute(a, .review_entity, latest.proposal_id.?, "{\"expected_revision\":5,\"accept\":true}", "old-judge-result"));
+        _ = try store.service("alice", true, 8).execute(a, .review_entity, latest.proposal_id.?, "{\"expected_revision\":7,\"accept\":true}", "fresh-verdict");
+        proposal.expected_revision = 8;
+        _ = try store.service("alice", true, 9).execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, proposal, .{}), "terminal-retry");
+        try std.testing.expectError(error.MemoryEntityConflict, store.service("alice", true, 9).execute(a, .review_entity, latest.proposal_id.?, "{\"expected_revision\":9,\"accept\":false}", "reopen"));
+        _ = try store.service("alice", true, 10).execute(a, .forget, "", "{\"evidence_ids\":[\"old-context\"]}", "forget-old");
+        const forgotten = try proposalOperationExplanation(&store, original, 11, null);
+        try std.testing.expect(std.mem.indexOf(u8, forgotten, "old-context") == null);
+        const retained = try store.service("alice", true, 11).execute(a, .entity_proposal, latest.proposal_id.?, "{}", "");
+        try std.testing.expect(std.mem.indexOf(u8, retained, "fresh-context") != null);
+        for (0..25) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "attempt-cleanup-{d}", .{i}), @intCast(12 + i));
+        try std.testing.expect(store.values.get(try fixtureKey(a, "proposal-attempt", original.id)) == null);
+    }
+}
+
+test "memory open proposals refresh configuration and recover after old context retirement" {
+    for ([_]bool{ false, true }) |retire| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try externalReviewSetup(&store);
+        if (retire) {
+            _ = try store.service("alice", true, 3).execute(a, .observe, "", "{\"evidence\":[{\"id\":\"old\",\"source_id\":\"old\",\"source_version\":\"1\",\"text\":\"OLD_REVIEW_CONTEXT\"}]}", "old");
+        }
+        var state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        var request: m.types.EntityProposalRequest = .{ .action = .merge, .from = "a", .to = "b", .expected_revision = state.revision, .evidence = if (retire) &.{.{ .id = "old" }} else &.{} };
+        const raw = try store.service("alice", true, 4).execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, request, .{}), "proposal");
+        const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, raw, .{});
+        if (retire) {
+            _ = try store.service("alice", true, 5).execute(a, .forget, "", "{\"evidence_ids\":[\"old\"]}", "forget");
+            for (0..20) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "retire-binding-{d}", .{i}), @intCast(6 + i));
+            try std.testing.expect(store.values.get(try fixtureKey(a, "proposal-input", receipt.proposal_id.?)) == null);
+        } else {
+            state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+            _ = try store.service("alice", true, 5).execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = state.revision, .config = m.types.Config{ .policy_version = "new-policy" } }, .{}), "config");
+        }
+        state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        request.expected_revision = state.revision;
+        request.evidence = &.{.{ .id = "e" }};
+        _ = try store.service("alice", true, 30).execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, request, .{}), "refresh");
+        _ = try store.service("alice", true, 31).execute(a, .review_entity, receipt.proposal_id.?, try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = state.revision + 1, .accept = false }, .{}), "reject");
+    }
+}
+
+test "memory historical mentions apply canonical entity temporal admission in every episode projection" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    _ = try store.service("alice", true, 1).execute(a, .create, "", "{}", "create");
+    const early: m.types.Evidence = .{ .id = "early", .source_id = "history", .source_version = "1", .text = "Original entity", .thread_id = "thread", .ordinal = 0 };
+    const original: m.types.Entity = .{ .id = "a", .name = "Original", .evidence = &.{.{ .id = "early" }} };
+    _ = try store.service("alice", true, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{early}, .entities = &.{original} }, .{}), "early");
+    const late: m.types.Evidence = .{ .id = "late", .source_id = "notes", .source_version = "2", .text = "Later entity" };
+    const future: m.types.Entity = .{ .id = "future-entity", .name = "Future", .evidence = &.{.{ .id = "late" }} };
+    _ = try store.service("alice", true, 10).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{late}, .entities = &.{future} }, .{}), "late");
+    _ = try store.service("alice", true, 20).execute(a, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"a\",\"to\":\"future-entity\",\"expected_revision\":4}", "merge");
+    for ([_]m.Action{ .episode, .episodes }) |action| {
+        const raw = try store.service("alice", true, 30).execute(a, action, if (action == .episode) "thread" else "", "{\"known_at\":3}", "");
+        try std.testing.expect(std.mem.indexOf(u8, raw, "Original entity") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "future-entity") == null);
+    }
+    try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 30).execute(a, .entity_view, "a", "{\"known_at\":3}", ""));
+    const graph = try store.service("alice", true, 30).execute(a, .recall, "", "{\"known_at\":3,\"graph\":{\"entity_seeds\":[\"a\"]},\"token_budget\":8192}", "");
+    try std.testing.expect(std.mem.indexOf(u8, graph, "future-entity") == null);
+    const current = try store.service("alice", true, 30).execute(a, .episode, "thread", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, current, "future-entity") != null);
+    // A target already known at the cutoff may be projected normally.
+    const later = try store.service("alice", true, 30).execute(a, .episode, "thread", "{\"known_at\":11}", "");
+    try std.testing.expect(std.mem.indexOf(u8, later, "future-entity") != null);
+}

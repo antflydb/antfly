@@ -10210,3 +10210,52 @@ test "capi native memory migration views episodes graph and external reviews sur
         }
     }
 }
+
+test "capi native memory refreshed proposal attempts retain immutable explanations across reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-proposal-attempts");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    const memory = @import("../memory/service.zig");
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .create, memory.types.Config{}, "create", "");
+    const source: memory.types.ObservationRequest = .{
+        .evidence = &.{.{ .id = "e", .source_id = "test", .source_version = "1", .text = "Grounded concept pair" }},
+        .entities = &.{ .{ .id = "a", .name = "A", .evidence = &.{.{ .id = "e" }} }, .{ .id = "b", .name = "B", .evidence = &.{.{ .id = "e" }} } },
+    };
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .observe, source, "observe", "");
+    var request: memory.types.EntityProposalRequest = .{ .action = .merge, .from = "a", .to = "b", .expected_revision = 3, .actor = "old-judge" };
+    const first = try std.json.parseFromSliceLeaky(memory.types.OperationStatus, temporary, try nativeMemoryTestCall(id, temporary, "alice", .propose_entity, request, "first", ""), .{});
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .configure, .{ .expected_revision = @as(u64, 4), .config = memory.types.Config{ .policy_version = "new-policy" } }, "configure", "");
+    request.expected_revision = 5;
+    request.actor = "new-judge";
+    const second = try std.json.parseFromSliceLeaky(memory.types.OperationStatus, temporary, try nativeMemoryTestCall(id, temporary, "alice", .propose_entity, request, "second", ""), .{});
+    try std.testing.expectEqualStrings(first.proposal_id.?, second.proposal_id.?);
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .review_entity, memory.types.EntityVerdict{ .expected_revision = 6, .accept = false }, "reject", second.proposal_id.?);
+    for (0..2) |attempt| {
+        const current = try nativeMemoryTestCall(id, temporary, "alice", .entity_proposal, .{}, "", first.proposal_id.?);
+        try std.testing.expect(std.mem.indexOf(u8, current, "\"state\":\"rejected\"") != null);
+        for ([_]memory.types.OperationStatus{ first, second }, [_][]const u8{ "old-judge", "new-judge" }) |operation, actor| {
+            const context = try std.json.parseFromSliceLeaky(std.json.Value, temporary, current, .{});
+            const resource = try std.json.parseFromValueLeaky(memory.types.provenance.Resource, temporary, context.object.get("inputs").?.object.get("operation").?, .{});
+            var reference = resource;
+            reference.id = operation.id;
+            reference.revision = operation.revision;
+            const explanation = try nativeMemoryTestCall(id, temporary, "alice", .explain, memory.types.provenance.ExplainRequest{ .resource = reference, .max_nodes = 1, .max_bytes = 65536 }, "", "");
+            try std.testing.expect(std.mem.indexOf(u8, explanation, "entity_proposal") != null);
+            try std.testing.expect(std.mem.indexOf(u8, explanation, actor) != null);
+        }
+        if (attempt == 0) {
+            antfly_db_close(id);
+            id = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        }
+    }
+}

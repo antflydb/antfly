@@ -233,6 +233,10 @@ principal and episode. A repeated mention has its own immutable `id`,
 original immutable identity evidence. Entity admission also creates a grounded
 initial mention. Managed mentions inherit every causal generation input, just
 as managed assertions do; external mentions use the ordinary evidence gate.
+Historical mention projection admits both the original entity and its current
+canonical target against `known_at`, using the same identity admission as entity
+views and graph seeds. A later merge cannot introduce a target first recorded
+after the requested cutoff; the earlier turn remains readable without that ID.
 
 An episode read filters each source and mention before returning text or entity
 IDs. Losing any conjunctive mention input removes that mention; independent
@@ -280,6 +284,23 @@ Verdict admission revalidates both the proposal's original evidence and any new
 judge evidence against current source resources. Retained changed captures may
 remain available for audit, but cannot authorize a new identity judgment.
 Terminal queue entries cannot be reopened by changing an idempotency token.
+For an open queue item, an explicit `propose_entity` with changed evidence,
+configuration, attribution or options replaces its review inputs at a new
+attempt revision. The queue ID stays stable, and the space revision fence rejects
+verdicts prepared against the earlier attempt. Identical submissions preserve
+the current attempt. The shared resolver validates replacement options and
+refuses to refresh terminal decisions.
+
+`inputs.revision` identifies the input attempt; `inputs.operation` points to its
+latest proposal/review snapshot. The ordinary native `explain` operation accepts
+that operation resource and returns an immutable `entity_proposal` snapshot for
+administrators, with links to earlier operations and exact input dependencies.
+Refreshing or judging a proposal does not rewrite earlier snapshots. Bindings
+written before operation pointers existed recover their operation from the
+native entity audit index. Each attempt has independent retention: forgotten
+inputs hide its snapshot immediately and maintenance scrubs it, while a later
+attempt with independent live evidence remains reviewable. Retired old bindings
+do not prevent a fresh attempt for an otherwise live, still-open entity pair.
 
 Typed relationship candidates use `propose_relationship`,
 `relationship_proposal`, and `review_relationship`, exposed at

@@ -52,7 +52,8 @@ const EntityCurationProvenance = struct {
     evidence: []const t.EvidenceRef = &.{},
 };
 
-const ProposalBinding = struct { owner: []const u8, actor: []const u8 = "", verdict_actor: []const u8 = "", config_generation: u64, entities: []const struct { id: []const u8, revision: u64 }, evidence: []const t.EvidenceRef, verdict_revision: ?u64 = null, model: ?t.Model = null };
+const ProposalBinding = struct { revision: u64 = 0, operation: ?prov.Resource = null, owner: []const u8, actor: []const u8 = "", verdict_actor: []const u8 = "", config_generation: u64, entities: []const struct { id: []const u8, revision: u64 }, evidence: []const t.EvidenceRef, verdict_revision: ?u64 = null, model: ?t.Model = null };
+const ProposalAttempt = struct { proposal: curation.Proposal, inputs: ProposalBinding, previous: ?prov.Resource = null };
 const EpisodeCatalog = struct { thread_id: []const u8, members: u64 = 0 };
 const EpisodeListPosition = struct {
     after: ?[]const u8 = null,
@@ -1391,6 +1392,20 @@ const Run = struct {
         }
         return canonical_id;
     }
+    /// Every derived identity projection uses the same temporal admission of
+    /// both the mentioned identity and the current canonical destination.
+    fn visibleCanonicalEntity(self: *Run, id: []const u8, known: ?i64) !?t.EntityRecord {
+        const original = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return null;
+        self.authorize(original.owner, original.entity.visibility) catch return null;
+        if (known) |time| if ((original.recorded_at orelse 0) > time) return null;
+        if (!try self.entityVisible(original)) return null;
+        const target = (try self.canonical(id)) orelse return null;
+        const record = (try self.read(t.EntityRecord, try key(self.a, "entity", target))) orelse return null;
+        self.authorize(record.owner, record.entity.visibility) catch return null;
+        if (known) |time| if ((record.recorded_at orelse 0) > time) return null;
+        if (!try self.entityVisible(record)) return null;
+        return record;
+    }
     fn requireDistinctIdentities(self: *Run, names: *std.StringHashMapUnmanaged(void), redirects: curation.RedirectIndex) !void {
         var members = names.keyIterator();
         while (members.next()) |id| {
@@ -1525,10 +1540,7 @@ const Run = struct {
         self.authorize(record.owner, record.mention.visibility) catch return false;
         if (known) |time| if (record.recorded_at > time) return false;
         if (!try self.supportVisibleTime(record.mention.evidence, &.{}, known, null, 0) or !try self.generationVisible("mention", record.mention.id)) return false;
-        const entity_record = (try self.read(t.EntityRecord, try key(self.a, "entity", record.mention.entity_id))) orelse return false;
-        self.authorize(entity_record.owner, entity_record.entity.visibility) catch return false;
-        if (known) |time| if ((entity_record.recorded_at orelse 0) > time) return false;
-        return try self.entityVisible(entity_record) and try self.canonical(record.mention.entity_id) != null;
+        return try self.visibleCanonicalEntity(record.mention.entity_id, known) != null;
     }
     fn evidenceEntities(self: *Run, source: t.StoredEvidence, known: ?i64) !struct { ids: []const []const u8, complete: bool } {
         var ids: std.StringHashMapUnmanaged(void) = .empty;
@@ -1673,10 +1685,7 @@ const Run = struct {
         try self.authorize(requested.owner, requested.entity.visibility);
         if (!try self.entityVisible(requested)) return error.MemoryNotFound;
         const selected = (try self.canonical(id)) orelse return error.MemoryEntitySuppressed;
-        const record = (try self.read(t.EntityRecord, try key(self.a, "entity", selected))) orelse return error.MemoryNotFound;
-        try self.authorize(record.owner, record.entity.visibility);
-        if (!try self.entityVisible(record)) return error.MemoryNotFound;
-        if (request.known_at) |known| if ((requested.recorded_at orelse 0) > known or (record.recorded_at orelse 0) > known) return error.MemoryNotFound;
+        const record = (try self.visibleCanonicalEntity(id, request.known_at)) orelse return error.MemoryNotFound;
         const related = try self.relatedAssertions(selected, 256);
         var dependencies: std.ArrayList(t.DerivedDependency) = .empty;
         try dependencies.append(self.a, .{ .resource = try self.resourceRef(.entity, selected, record.revision), .evidence = record.entity.evidence });
@@ -1862,6 +1871,31 @@ const Run = struct {
         const count = @min(matches.items.len, request.limit);
         return self.encode(.{ .seed = seed, .seed_view = seed_view, .kind = request.kind, .relationship_predicates = if (self.state.config.ontology_pack == .software_team_v1) &[_][]const u8{ "is_a", "part_of", "alternative_to" } else &[_][]const u8{}, .items = matches.items[0..count], .revision = self.state.revision, .config_generation = self.state.config.generation, .next_cursor = try self.encodeCursor("entity/", page.next), .complete = views_complete and page.next == null and count == matches.items.len, .omitted = matches.items.len - count, .basis = "name_and_grounded_description_matches_not_identity_or_calibrated_confidence" });
     }
+    fn proposalOperation(self: *Run, proposal: curation.Proposal, binding: ?ProposalBinding) !prov.Resource {
+        if (binding) |value| if (value.operation) |operation| return operation;
+        // Recover the operation reference for bindings written before attempt
+        // snapshots existed, using the native entity audit index.
+        const revision = if (binding) |value| value.verdict_revision orelse proposal.origin.revision else proposal.origin.revision;
+        var decision = (try self.read(prov.Resource, try std.fmt.allocPrint(self.a, "audit-event/entity/{s}/{d:0>20}", .{ try hash(self.a, proposal.key), revision }))) orelse return error.MemoryCorruptState;
+        decision.kind = .operation;
+        return decision;
+    }
+    fn archiveProposal(self: *Run, proposal: curation.Proposal, binding: ProposalBinding, operation: prov.Resource) !void {
+        const path = try key(self.a, "proposal-attempt", operation.id);
+        if (try self.read(ProposalAttempt, path) != null or !try self.proposalInputsRetained(binding)) return;
+        var inputs = binding;
+        if (inputs.revision == 0) inputs.revision = proposal.origin.revision;
+        inputs.operation = operation;
+        try self.put(path, ProposalAttempt{ .proposal = proposal, .inputs = inputs });
+    }
+    fn storeProposalAttempt(self: *Run, id: []const u8, binding: ProposalBinding, receipt: t.Operation, previous: ?prov.Resource) !void {
+        const policy = (try self.read(EntityPolicy, "entity-policy")) orelse return error.MemoryCorruptState;
+        const proposal = for (policy.state.proposals) |value| {
+            if (eql(u8, value.id, id)) break value;
+        } else return error.MemoryCorruptState;
+        try self.put(try key(self.a, "proposal-input", id), binding);
+        try self.put(try key(self.a, "proposal-attempt", receipt.id), ProposalAttempt{ .proposal = proposal, .inputs = binding, .previous = previous });
+    }
     fn proposeEntity(self: *Run, request: t.EntityProposalRequest, receipt: *t.Operation) !void {
         try self.requireAdmin();
         if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
@@ -1880,16 +1914,35 @@ const Run = struct {
         }
         const input: curation.ProposalRequest = .{ .action = std.meta.stringToEnum(curation.EntityAction, @tagName(request.action)).?, .key = request.from, .into = request.to, .options = .{ .replace = request.replace, .pin_distinct = request.pin_distinct, .absorbed = std.meta.stringToEnum(curation.Absorbed, @tagName(request.absorbed)).? } };
         const proposal_id = try curation.proposalId(self.a, input);
-        if (try self.read(ProposalBinding, try key(self.a, "proposal-input", proposal_id))) |_| {
-            // Stable engine proposal IDs retain terminal outcomes; a new
-            // idempotency token cannot reopen an accepted/rejected judgment.
-            receipt.proposal_id = proposal_id;
-            return;
-        }
-        for (stored.state.proposals) |prior| if (eql(u8, prior.id, proposal_id)) return error.MemoryForgotten;
-        const plan = try curation.propose(self.a, stored.state, stored.redirects, input, .{ .actor = self.service.context.principal, .created_at_ms = @intCast(@max(0, self.service.context.now_ms)), .revision = self.state.revision });
+        const prior = for (stored.state.proposals) |value| {
+            if (eql(u8, value.id, proposal_id)) break @as(?curation.Proposal, value);
+        } else null;
+        const previous_binding = try self.read(ProposalBinding, try key(self.a, "proposal-input", proposal_id));
+        const binding: ProposalBinding = .{ .revision = self.state.revision, .operation = try self.resourceRef(.operation, receipt.id, receipt.revision), .owner = self.service.context.principal, .actor = request.actor, .config_generation = self.state.config.generation, .entities = entities.items, .evidence = request.evidence };
+        var previous: ?prov.Resource = null;
+        if (prior) |proposal| {
+            if (proposal.state != .open) {
+                // Replacing open inputs never reopens a terminal decision.
+                if (previous_binding == null) return error.MemoryForgotten;
+                receipt.proposal_id = proposal_id;
+                return;
+            }
+            if (previous_binding) |old| {
+                if (eql(u8, old.owner, binding.owner) and eql(u8, old.actor, binding.actor) and old.config_generation == binding.config_generation and
+                    eql(u8, try self.encode(old.entities), try self.encode(binding.entities)) and eql(u8, try self.encode(old.evidence), try self.encode(binding.evidence)) and
+                    eql(u8, try self.encode(proposal.options), try self.encode(input.options)))
+                {
+                    receipt.proposal_id = proposal_id;
+                    return;
+                }
+            }
+            previous = try self.proposalOperation(proposal, previous_binding);
+            if (previous_binding) |old| try self.archiveProposal(proposal, old, previous.?);
+        } else if (previous_binding != null) return error.MemoryCorruptState;
+        const stamp: curation.Origin = .{ .actor = self.service.context.principal, .created_at_ms = @intCast(@max(0, self.service.context.now_ms)), .revision = self.state.revision };
+        const plan = if (prior != null) try curation.refreshProposal(self.a, stored.state, stored.redirects, input, stamp) else try curation.propose(self.a, stored.state, stored.redirects, input, stamp);
         try self.put("entity-policy", EntityPolicy{ .state = plan.state, .redirects = plan.merges });
-        try self.put(try key(self.a, "proposal-input", proposal_id), ProposalBinding{ .owner = self.service.context.principal, .actor = request.actor, .config_generation = self.state.config.generation, .entities = entities.items, .evidence = request.evidence });
+        try self.storeProposalAttempt(proposal_id, binding, receipt.*, previous);
         for (entities.items) |entity_ref| try self.decision_targets.append(self.a, try self.resourceRef(.entity, entity_ref.id, entity_ref.revision));
         receipt.proposal_id = proposal_id;
     }
@@ -1942,6 +1995,8 @@ const Run = struct {
             if (eql(u8, proposal.id, id)) break proposal;
         } else return error.MemoryNotFound;
         if (proposal.state != .open) return error.MemoryEntityConflict;
+        const previous = try self.proposalOperation(proposal, binding);
+        try self.archiveProposal(proposal, binding, previous);
         const inputs = try self.a.alloc(t.EvidenceRef, binding.evidence.len + request.evidence.len);
         if (inputs.len > t.max_items) return error.MemoryInputTooLarge;
         @memcpy(inputs[0..binding.evidence.len], binding.evidence);
@@ -1959,7 +2014,9 @@ const Run = struct {
         binding.verdict_revision = self.state.revision;
         binding.model = request.model;
         binding.verdict_actor = request.actor;
-        try self.put(try key(self.a, "proposal-input", id), binding);
+        if (binding.revision == 0) binding.revision = proposal.origin.revision;
+        binding.operation = try self.resourceRef(.operation, receipt.id, receipt.revision);
+        try self.storeProposalAttempt(id, binding, receipt.*, previous);
         for (binding.entities) |entity_ref| try self.decision_targets.append(self.a, try self.resourceRef(.entity, entity_ref.id, entity_ref.revision));
         receipt.proposal_id = id;
     }
@@ -2719,6 +2776,9 @@ const Run = struct {
             }
         } else if (std.mem.startsWith(u8, row.key, "proposal-input/")) {
             if (!try self.proposalInputsRetained(try parse(ProposalBinding, self.a, row.json))) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "proposal-attempt/")) {
+            const attempt = try parse(ProposalAttempt, self.a, row.json);
+            if (!try self.proposalInputsRetained(attempt.inputs)) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "entity-curation/")) {
             const provenance = try parse(EntityCurationProvenance, self.a, row.json);
             if (!try self.curationProvenanceRetained(provenance)) try self.remove(row.key);
@@ -3195,6 +3255,14 @@ const Run = struct {
                 try self.requireKnownAt(ref.*, if (snapshot) |version| version.recorded_at else null, request);
                 if (snapshot == null) self.explanation_incomplete_history = true;
                 value = try parse(std.json.Value, self.a, try self.encode(record));
+                if (self.service.context.admin) if (try self.read(ProposalAttempt, try key(self.a, "proposal-attempt", record.id))) |attempt| {
+                    if (attempt.inputs.operation) |operation| if (operation.revision == ref.revision and try self.proposalInputsRetained(attempt.inputs)) {
+                        try value.object.put(self.a, "entity_proposal", try parse(std.json.Value, self.a, try self.encode(attempt)));
+                        if (attempt.previous) |previous| try links.append(self.a, .{ .relation = .supersedes, .target = previous });
+                        for (attempt.inputs.evidence) |evidence_ref| if (try self.evidence(evidence_ref.id)) |source| try links.append(self.a, .{ .relation = .supported_by, .target = try self.resourceRef(.evidence, source.evidence.id, source.revision) });
+                        for (attempt.inputs.entities) |entity_ref| try links.append(self.a, .{ .relation = .depends_on, .target = try self.resourceRef(.entity, entity_ref.id, entity_ref.revision) });
+                    };
+                };
                 const decision_ref = if (snapshot) |version| version.decision else if (try self.read(prov.Decision, try key(self.a, "audit", record.id))) |decision| decision.resource else null;
                 if (decision_ref) |decision| {
                     try self.explanation_decisions.put(self.a, try hash(self.a, decision), {});
@@ -3356,16 +3424,8 @@ const Run = struct {
         }
     };
     fn graphEntity(self: *Run, graph: *RecallGraph, id: []const u8, depth: u8, seed: f64, known: ?i64) !?usize {
-        const original = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return null;
-        self.authorize(original.owner, original.entity.visibility) catch return null;
-        if (known) |time| if ((original.recorded_at orelse 0) > time) return null;
-        if (!try self.entityVisible(original)) return null;
-        const canonical_id = (try self.canonical(id)) orelse return null;
-        const selected = (try self.read(t.EntityRecord, try key(self.a, "entity", canonical_id))) orelse return null;
-        self.authorize(selected.owner, selected.entity.visibility) catch return null;
-        if (known) |time| if ((selected.recorded_at orelse 0) > time) return null;
-        if (!try self.entityVisible(selected)) return null;
-        return graph.add(.{ .kind = .entity, .id = canonical_id, .depth = depth, .seed = seed });
+        const record = (try self.visibleCanonicalEntity(id, known)) orelse return null;
+        return graph.add(.{ .kind = .entity, .id = record.entity.id, .depth = depth, .seed = seed });
     }
     fn graphRecall(self: *Run, request: t.Recall, vector: ?[]const f32, hits: *std.ArrayList(t.RecallHit)) !struct { status: t.GraphRecallStatus, entities: []const t.EntityView, episodes: []const t.Episode } {
         const options = request.graph.?;
