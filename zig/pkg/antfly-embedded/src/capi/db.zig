@@ -2390,6 +2390,7 @@ pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
         handle.lease_snapshot = true;
         handles.closeHandle(handle);
     }
+    @import("entity_sink.zig").attach(handle, &handle.db);
     try refreshLiteManagedEmbeddingRuntime(handle);
     try @import("tables.zig").loadCatalog(handle);
     handle.database().*.startResidentBackgroundWorkersIfNeeded();
@@ -2912,6 +2913,7 @@ pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOpti
         handle.lease_snapshot = true;
         handles.closeHandle(handle);
     }
+    @import("entity_sink.zig").attach(handle, &handle.db);
     try refreshLiteManagedEmbeddingRuntime(handle);
     try @import("tables.zig").loadCatalog(handle);
     handle.database().*.startResidentBackgroundWorkersIfNeeded();

@@ -3104,6 +3104,9 @@ pub const DB = struct {
     stable_address: bool = false,
     graph_cleanup_owner: @import("graph_cleanup_owner.zig").Owner = .{},
     group_source_owner: @import("group_source_owner.zig").Owner = .{},
+    /// Borrowed from the native connection owner; stable across DB refreshes.
+    /// The owner serializes every producer slice and outlives this wrapper.
+    borrowed_group_source_state: ?*GroupSourceMaintenanceState = null,
     alloc: Allocator,
     runtime_alloc: Allocator,
     generation_read_lease: ?generation_lifecycle.ReadLease,
@@ -6017,6 +6020,14 @@ pub const DB = struct {
         if (self.local_execution.optional_runtime_workers_enabled) try self.startResolverReplayRuntimesIfConfigured();
     }
 
+    /// Join callbacks that borrow a serving owner's cross-table catalog before
+    /// that owner destroys any namespace or shared inference provider.
+    pub fn deactivateResolverReplayRuntimes(self: *DB) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("deactivateResolverReplayRuntimes", .{self}) catch @panic("incompatible storage owner");
+        self.resolver_workers_enabled = false;
+        self.stopResolverReplayRuntimes();
+    }
+
     fn startResolverReplayRuntimes(self: *DB) !void {
         if (!self.resolver_workers_enabled or !self.local_execution.optional_runtime_workers_enabled) return;
         var resolution_started = false;
@@ -7179,7 +7190,7 @@ pub const DB = struct {
     }
 
     fn runGroupSourceSlice(self: *DB) !bool {
-        return self.runGroupSourceSliceWithState(&self.group_source_owner.state);
+        return self.runGroupSourceSliceWithState(self.borrowed_group_source_state orelse &self.group_source_owner.state);
     }
     const LocalGroupSourceContext = struct { db: *DB, state: *GroupSourceMaintenanceState };
     fn runGroupSourceSliceWithState(self: *DB, state: *GroupSourceMaintenanceState) !bool {
@@ -32870,7 +32881,7 @@ pub const DB = struct {
             if (self.promotion_runtime == null) try self.initPromotionRuntime();
         }
         {
-            const group_state = options.group_source_state orelse &self.group_source_owner.state;
+            const group_state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
             const drive_groups = self.async_context.replay_publication == null;
             if (drive_groups) {
                 // A manual drain owns this producer lane until its fair round
@@ -33317,7 +33328,7 @@ pub const DB = struct {
 
     pub fn runUntilIdle(self: *DB) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdle", .{self});
-        return self.runUntilIdleWithGroupSourceState(&self.group_source_owner.state);
+        return self.runUntilIdleWithGroupSourceState(self.borrowed_group_source_state orelse &self.group_source_owner.state);
     }
 
     /// A connection's explicit drain borrows the same cursor/lease identity as

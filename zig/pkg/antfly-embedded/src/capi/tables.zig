@@ -49,6 +49,8 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     if (handle.owned_lite_backend) |*backend| try backend.configureDbOpenOptionsForNamespace(&options, namespace);
     table.* = .{ .name = owned_name, .id = id, .namespace = namespace, .db = try h.db_mod.DB.open(alloc, path, options) };
     errdefer table.db.close();
+    if (handle.lite_scheduling_owner) |owner|
+        table.db.borrowed_group_source_state = try owner.groupSourceState(&table.db);
     @import("entity_sink.zig").attach(handle, &table.db);
     try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
     if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startResidentBackgroundWorkersIfNeeded();

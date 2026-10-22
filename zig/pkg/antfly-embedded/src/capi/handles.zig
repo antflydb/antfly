@@ -68,6 +68,8 @@ pub const Handle = struct {
     maintenance_references: usize = 0,
     maintenance_publication: ?*@import("lite_connection.zig").PreparedPublication = null,
     maintenance_owner: ?*@import("lite_connection.zig").Owner = null,
+    /// Live coordinator only; detached provider snapshots never drive groups.
+    lite_scheduling_owner: ?*@import("lite_connection.zig").Owner = null,
     maintenance_writer_lease: ?lite_backend.native.PathWriterLock = null,
     maintenance_writer_references: usize = 0,
     maintenance_admission_mutex: std.Io.Mutex = .init,
@@ -233,6 +235,23 @@ pub fn invalidateQueryProducer(handle: *Handle) void {
 pub fn closeHandle(handle: *Handle) void {
     const io_lifetime_lease = handle.io_lifetime_lease;
     defer if (io_lifetime_lease) @import("io_lifetime.zig").release();
+    if (handle.lite_connection == null and handle.parent_id == null and handle.db_live) {
+        handle.db.deactivateResolverReplayRuntimes();
+        // Each worker can resolve/open another table while joining. Select
+        // under the catalog mutex and restart after every join; never retain
+        // an iterator across a callback that can grow the table map.
+        while (true) {
+            handle.embedded_table_open_mutex.lockUncancelable(handleLockIo());
+            var pending: ?*db_mod.DB = null;
+            var tables = handle.embedded_tables.valueIterator();
+            while (tables.next()) |table| if (table.*.db.resolver_workers_enabled) {
+                pending = &table.*.db;
+                break;
+            };
+            handle.embedded_table_open_mutex.unlock(handleLockIo());
+            if (pending) |database| database.deactivateResolverReplayRuntimes() else break;
+        }
+    }
     invalidateQueryProducer(handle);
     if (handle.lite_connection) |connection| {
         connection.close();

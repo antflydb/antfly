@@ -30,10 +30,14 @@ import antfly_embedded as af
 
 @pytest.mark.parametrize("storage", [af.Storage.LITE, af.Storage.DIRECTORY])
 @pytest.mark.parametrize("child", [False, True], ids=["root", "table"])
-@pytest.mark.parametrize("completion", ["background", "idle", "visibility"])
+@pytest.mark.parametrize("completion", ["background", "idle", "visibility", "overlap"])
 def test_grouped_sources_drive_downstream_graph(require_native, tmp_path, storage, child, completion):
     inputs = []
     errors = []
+    provider_started = threading.Event()
+    provider_release = threading.Event()
+    if completion != "overlap":
+        provider_release.set()
 
     class Generator(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -54,6 +58,9 @@ def test_grouped_sources_drive_downstream_graph(require_native, tmp_path, storag
                             },
                         }
                     )
+                provider_started.set()
+                if not provider_release.wait(10):
+                    raise TimeoutError("review regression did not release the grouped provider")
                 response = {
                     "choices": [
                         {
@@ -186,7 +193,7 @@ def test_grouped_sources_drive_downstream_graph(require_native, tmp_path, storag
                             {
                                 "name": "concepts",
                                 "table": "concepts",
-                                "promote": False,
+                                "promote": True,
                                 "source_artifact": "turn_concepts",
                                 "resolution_artifact": "resolved",
                                 "key_template": "concept/{{ uslug _entity.text }}",
@@ -210,6 +217,27 @@ def test_grouped_sources_drive_downstream_graph(require_native, tmp_path, storag
                 table.batch_json(
                     {"inserts": rows, "sync_level": "enrichments" if completion == "visibility" else "write"}
                 )
+                if completion == "overlap":
+                    # The connection's background owner has claimed a group
+                    # and published producer rows. Hold its provider response
+                    # until the foreground starts waiting on that same debt.
+                    assert provider_started.wait(10), table.pending_work_stats()
+                    release = threading.Timer(0.5, provider_release.set)
+                    started = time.monotonic()
+                    release.start()
+                    try:
+                        table.batch_json(
+                            {
+                                "inserts": {"tool": {**rows["tool"], "text": "updated-tool"}},
+                                "sync_level": "enrichments",
+                            }
+                        )
+                    finally:
+                        provider_release.set()
+                        release.join()
+                    # A different worker identity waits for the old owner's
+                    # 30-second lease, even though inference takes 0.5 seconds.
+                    assert time.monotonic() - started < 10
                 if completion == "idle":
                     table.run_until_idle()
                 deadline = time.monotonic() + (0 if completion == "idle" else 30)
@@ -225,6 +253,11 @@ def test_grouped_sources_drive_downstream_graph(require_native, tmp_path, storag
                     "concept/ada",
                     "concept/carol",
                 }
+                if completion == "idle":
+                    with db.open_table("concepts") as concepts:
+                        assert concepts.get_raw("concept/ada")
+                        assert concepts.get_raw("concept/carol")
+                    assert not table.pending_work_stats()["promotion"]["blocked"]
                 assert any("turn-one" in text and "answer" in text for text in inputs), inputs
                 assert any("turn-two" in text for text in inputs), inputs
                 assert all("excluded-tool" not in text for text in inputs), inputs
@@ -242,12 +275,17 @@ def test_grouped_sources_drive_downstream_graph(require_native, tmp_path, storag
                 table.run_until_idle()
                 edges = table.edges("turn_graph", "thread/t1", "about", 0)
                 assert len(edges) == 2, (edges, inputs, table.pending_work_stats())
+                with reopened.open_table("concepts") as concepts:
+                    assert concepts.get_raw("concept/ada")
+                    assert concepts.get_raw("concept/carol")
+                assert not table.pending_work_stats()["promotion"]["blocked"]
                 assert any("after-reopen" in text for text in inputs), inputs
                 assert not errors, errors
             finally:
                 if child:
                     table.close()
     finally:
+        provider_release.set()
         server.shutdown()
         server.server_close()
         thread.join()

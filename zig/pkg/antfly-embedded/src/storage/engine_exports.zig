@@ -269,6 +269,11 @@ fn activateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
     return .{ .value = self.activateResolverReplayRuntimes() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn deactivateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
+    self.deactivateResolverReplayRuntimes();
+    return .{ .value = {} };
+}
+
 fn batchPrepared(self: *DB.PreparedBatchOwner, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions, memo: *@import("db/execution_resources.zig").GeneratedEmbeddingMemo, allocator: *@import("db/execution_resources.zig").PreparedRowAllocator) engine.Outcome(void) {
     return .{ .value = self.batchInternalPrepared(req, profile, opts, memo, allocator) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
