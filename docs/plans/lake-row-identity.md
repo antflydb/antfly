@@ -500,6 +500,21 @@ result. Archive-scale throughput and real-provider retention qualification remai
 1 GiB default remains an explicit scratch quota; larger archives may require
 more configured scratch capacity even with compact navigation.
 
+Protocol 74 qualification with main `f95a5a5820`: all three real-file Parquet,
+PyIceberg and mixed-precision decimal E2Es passed in 355.62 seconds. The two
+8,193-row hashed-ID spool regressions cover both capture paths and repeated
+consumers, bounding payload decodes to four times encoded pages; the old physical
+layout measured 27.57 times on that fixture. This is a decode-locality regression,
+not an archive throughput benchmark. Allocation-failure sweeps cover covering
+entries, exact decimal/raw-JSON payloads and packed builders. All 88 page/storage
+tests passed, as did the native dense batch/scalar equivalence and cancellation
+checks. Cloud generation/certificate tests cover packed range reads after restart,
+all sibling dependencies, durable per-page expansion marks and retained readers.
+The main merge keeps borrowed membership pins and batched relocation ranks; a
+combined regression and the filtered-top-k suite passed. Generic and typed page
+expansion have independent marks in both synchronous and resumable GC. Full
+archive throughput and live-provider retention qualification remain unmeasured.
+
 ## Prior art
 
 Lance fragment reuse defers physical index remapping through verified transitions:

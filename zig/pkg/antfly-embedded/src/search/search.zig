@@ -11166,3 +11166,51 @@ test "logical value borrowed ranked producer gates retain one pin per segment" {
     try std.testing.expectEqual(include.borrows, include.releases);
     try std.testing.expectEqual(exclude.borrows, exclude.releases);
 }
+
+test "producer top k combines borrowed membership pins with batched relocation ranks" {
+    const a = std.testing.allocator;
+    const State = struct {
+        bitmap: roaring.RoaringBitmap,
+        borrows: usize = 0,
+        releases: usize = 0,
+        batches: usize = 0,
+        fn borrow(raw: *anyopaque, _: u32, _: u32) !?roaring.BorrowedBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.borrows += 1;
+            return .{ .bitmap = &self.bitmap, .context = .{ self, self }, .release = release };
+        }
+        fn release(context: [2]*anyopaque) void {
+            @as(*@This(), @ptrCast(@alignCast(context[0]))).releases += 1;
+        }
+        fn produce(_: *anyopaque, _: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            return error.UnexpectedMaterialization;
+        }
+        fn rank(_: *const anyopaque, doc: u32) u64 {
+            return 300000 - @as(u64, doc);
+        }
+        fn ranks(raw: *const anyopaque, _: Allocator, docs: []const u32, output: []u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.batches += 1;
+            try std.testing.expect(docs.len <= 64);
+            for (docs, output) |doc, *out| out.* = rank(raw, doc);
+        }
+    };
+    var state: State = .{ .bitmap = roaring.RoaringBitmap.init(a) };
+    defer state.bitmap.deinit();
+    for (0..256) |i| try state.bitmap.add(@intCast(i * 2));
+    {
+        var collector: FastTopK = .{ .alloc = a, .k = 3, .producers = .{ .include = .{ .ptr = &state, .borrow = State.borrow, .produce = State.produce } }, .tie_rank = .{ .ptr = &state, .rank = State.rank, .resolve_many = State.ranks } };
+        defer collector.deinit();
+        for ([_]u32{ 100000, 200000 }) |offset| {
+            try collector.beginSegment(offset, 512);
+            for (0..512) |i| try collector.collect(offset + @as(u32, @intCast(i)), 1);
+        }
+        const hits = try collector.finish();
+        defer a.free(hits);
+        try std.testing.expectEqual(@as(u32, 512), collector.total_count);
+        for (hits, [_]u32{ 200510, 200508, 200506 }) |hit, expected| try std.testing.expectEqual(expected, hit.doc_id);
+        try std.testing.expectEqual(@as(usize, 2), state.borrows);
+        try std.testing.expect(state.batches > 1);
+    }
+    try std.testing.expectEqual(state.borrows, state.releases);
+}
