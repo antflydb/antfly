@@ -11266,15 +11266,19 @@ pub const Reader = struct {
     }
 
     fn buildFontDecoder(self: *const Reader, font_obj: *const syntax.Object) !FontDecoder {
-        const subtype_name = if (font_obj.get("Subtype")) |value| value.asName() orelse "" else "";
-        var decoder = FontDecoder{ .simple_font = !std.mem.eql(u8, subtype_name, "Type0") };
+        var resolved_subtype = if (font_obj.get("Subtype")) |value| try self.resolveValue(value) else null;
+        defer if (resolved_subtype) |*value| value.deinit(self.alloc);
+        const subtype_name = if (resolved_subtype) |value| value.asName() orelse "" else "";
+        // Force one-byte codes only for positively identified simple fonts.
+        // Missing or unrecognized subtypes retain ToUnicode width detection.
+        var decoder = FontDecoder{ .simple_font = std.mem.eql(u8, subtype_name, "Type1") or
+            std.mem.eql(u8, subtype_name, "MMType1") or
+            std.mem.eql(u8, subtype_name, "TrueType") or
+            std.mem.eql(u8, subtype_name, "Type3") };
         errdefer decoder.deinit(self.alloc);
 
-        if (font_obj.get("Encoding") == null) {
-            if (font_obj.get("Subtype")) |subtype| {
-                if (std.mem.eql(u8, subtype.asName() orelse "", "Type1")) decoder.base_encoding = .standard;
-            }
-        }
+        if (font_obj.get("Encoding") == null and std.mem.eql(u8, subtype_name, "Type1"))
+            decoder.base_encoding = .standard;
 
         if (font_obj.get("Encoding")) |encoding_obj| {
             var resolved_encoding = try self.resolveValue(encoding_obj);
@@ -31278,4 +31282,59 @@ test "simple font character codes stay single byte with oversized ToUnicode code
         // C expands to a ligature; D exercises WinAnsi fallback.
         try std.testing.expectEqualStrings("ABfiD\n", text);
     }
+}
+
+test "font decoder resolves indirect simple subtypes and default encoding" {
+    const alloc = std.testing.allocator;
+    const cmap = "begincmap\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n2 beginbfchar\n<41> <0041>\n<42> <0042>\nendbfchar\nendcmap\n";
+    for ([_][]const u8{ "Type1", "TrueType", "MMType1", "Type3" }) |subtype| {
+        const objects = [_][]const u8{
+            "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+            "2 0 obj\n<< /Type /Font /Subtype 3 0 R /ToUnicode 4 0 R >>\nendobj\n",
+            try std.fmt.allocPrint(alloc, "3 0 obj\n/{s}\nendobj\n", .{subtype}),
+            try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap }),
+        };
+        defer alloc.free(objects[2]);
+        defer alloc.free(objects[3]);
+        const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+        defer alloc.free(sample);
+        var reader = try Reader.init(alloc, sample);
+        defer reader.deinit();
+        var font_obj = try reader.readIndirectObject(.{ .id = 2, .gen = 0 });
+        defer font_obj.deinit(alloc);
+        var decoder = try reader.buildFontDecoder(&font_obj);
+        defer decoder.deinit(alloc);
+        const decoded = try decoder.decodeAlloc(alloc, "AB");
+        defer alloc.free(decoded);
+        try std.testing.expectEqualStrings("AB", decoded);
+        if (std.mem.eql(u8, subtype, "Type1")) {
+            const fallback = try decoder.decodeAlloc(alloc, "'");
+            defer alloc.free(fallback);
+            try std.testing.expectEqualStrings("\u{2019}", fallback);
+        }
+    }
+}
+
+test "reader resolves indirect Type0 subtype before decoding" {
+    const alloc = std.testing.allocator;
+    const content = "BT /F1 12 Tf <0001> Tj ET\n";
+    const cmap = "begincmap\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n1 beginbfchar\n<0001> <0041>\nendbfchar\nendcmap\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+        "5 0 obj\n<< /Type /Font /Subtype 7 0 R /ToUnicode 6 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "6 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap }),
+        "7 0 obj\n/Type0\nendobj\n",
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[5]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const text = try reader.extractPlainTextAlloc();
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("A\n", text);
 }
