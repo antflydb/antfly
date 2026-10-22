@@ -1,7 +1,6 @@
+import type { components } from "@antfly/sdk";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useApiConfig } from "@/hooks/use-api-config";
-
-import type { components } from "@antfly/sdk";
 
 export type ModelInstance = components["schemas"]["InferenceModelInstance"];
 // A catalog-row projection of the flat instance inventory. Shared instances

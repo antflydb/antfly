@@ -76,10 +76,10 @@ import {
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useInferenceRegistry } from "@/hooks/use-inference-registry";
 import {
-  type ModelInstancesForModel,
   type ModelInstance,
-  useModelInstancesForModel,
+  type ModelInstancesForModel,
   modelInstanceTask,
+  useModelInstancesForModel,
 } from "@/hooks/use-model-instances";
 import { huggingFaceRepoId } from "@/lib/huggingface-model-ref";
 import { cn } from "@/lib/utils";
