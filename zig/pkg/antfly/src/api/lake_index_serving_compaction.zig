@@ -207,7 +207,15 @@ const Builder = struct {
                 try self.addAt(level + 1, input);
                 return;
             }
-            const ref = try @import("lake_index_seekable_text.zig").publishSource(a, out, self.store, staged.source(), self.token);
+            var prior_blocks: [8]Chunk = undefined;
+            var prior_count: usize = 0;
+            for (inputs) |input| if (input.ref) |ref| {
+                prior_blocks[prior_count] = ref;
+                prior_count += 1;
+            };
+            const reuse_blocks = if (prior_count != 0) try @import("lake_index_seekable_text.zig").Reuse.create(a, self.store.*, prior_blocks[0..prior_count], self.token) else null;
+            defer if (reuse_blocks) |reuse_| reuse_.deinit();
+            const ref = try @import("lake_index_seekable_text.zig").publishSourceReusing(a, out, self.store, staged.source(), self.token, null, reuse_blocks);
             const contributions: corpus.statistics.Contributions = .{ .directory = if (self.collect_term_deltas) self.terms else null, .segment = corpus.term_directory.identity(ref.artifact_id) };
             const summary = if (staged.statistics != null and !staged.statistics.?.disabled)
                 try staged.statistics.?.publishConsuming(self.store, self.token, self.context.io, contributions)

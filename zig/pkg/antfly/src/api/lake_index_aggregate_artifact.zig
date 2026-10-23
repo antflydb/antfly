@@ -425,8 +425,12 @@ const TreeControl = struct {
     }
 };
 fn loadTreeControl(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead) !TreeControl {
+    return loadTreeControlInner(a, store, ref, token, cached, false);
+}
+fn loadTreeControlInner(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead, publication: bool) !TreeControl {
     if (ref.kind != .algebraic_segment or !isTree(ref.metadata_version) or ref.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
-    const bytes = try readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
+    const chunk: ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
+    const bytes = if (publication) try readPublicationArtifact(a, store, chunk, token) else try readArtifact(a, store, chunk, token, cached);
     defer a.free(bytes);
     const value = try std.json.parseFromSliceLeaky(TreeControl, a, bytes, .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, value.format, if (ref.metadata_version == 8) "native-sql-aggregate-v8" else "native-sql-aggregate-v7") or value.names.len == 0 or value.names.len > 256 or value.names.len != value.recipe.inputs.len) return error.InvalidNativeAggregateArtifact;
@@ -442,7 +446,7 @@ fn loadTreeControl(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellat
 pub const RowSeed = struct { index: state_tree.Index, rows: RowState };
 pub fn rowSeed(a: A, store: stores.ArtifactStore, ref: Ref, recipe: recipes.Recipe, token: Cancellation) !?RowSeed {
     if (ref.metadata_version != 8) return null;
-    const control = try loadTreeControl(a, store, ref, token, null);
+    const control = try loadTreeControlInner(a, store, ref, token, null, true);
     if (!control.recipe.eql(recipe) or control.index.layout != 2 or control.row_state == null) return null;
     return .{ .index = control.index, .rows = control.row_state.? };
 }

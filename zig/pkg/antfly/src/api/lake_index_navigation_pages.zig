@@ -150,10 +150,27 @@ pub const Reader = struct {
             const scheduler = local.sql_parallel_scheduler.global();
             if (scheduler.reservePull(0, reservation)) {
                 defer scheduler.releasePull(0, reservation);
-                var workspace: local.sql_memory_budget = .{ .backing = a, .limit = reservation };
-                var encoded = try ranges.load(workspace.allocator(), self.store, self.domain, missing[0..count], self.token, self.cached, budget);
-                defer encoded.deinit();
-                for (missing[0..count], positions[0..count], encoded.values[0..count]) |ref, i, bytes| ready[i] = try self.read(a, ref, bytes);
+                var workspace: local.sql_memory_budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = reservation };
+                // Charge the wave once, including coalesced gaps. A declined
+                // optional copy must leave the required page path available.
+                const Charge = struct {
+                    target: ranges.Budget,
+                    charged: bool = false,
+                    fn apply(raw: *anyopaque, bytes: u64) !void {
+                        const self_: *@This() = @ptrCast(@alignCast(raw));
+                        try self_.target.charge(self_.target.ptr, bytes);
+                        self_.charged = true;
+                    }
+                };
+                var charge: Charge = .{ .target = budget };
+                var encoded: ?ranges.Batch = ranges.load(workspace.allocator(), self.store, self.domain, missing[0..count], self.token, self.cached, .{ .ptr = &charge, .charge = Charge.apply }) catch |err| fallback: {
+                    if (err != error.OutOfMemory or !workspace.isExhausted()) return err;
+                    try self.check();
+                    if (!charge.charged) for (missing[0..count]) |ref| try budget.charge(budget.ptr, ref.bytes);
+                    break :fallback null;
+                };
+                defer if (encoded) |*value| value.deinit();
+                for (missing[0..count], positions[0..count], 0..) |ref, i, j| ready[i] = try self.read(a, ref, if (encoded) |value| value.values[j] else null);
             } else for (missing[0..count], positions[0..count]) |ref, i| {
                 try budget.charge(budget.ptr, ref.bytes);
                 ready[i] = try self.read(a, ref, null);
@@ -195,6 +212,17 @@ test "external lake shared navigation leases reuse decoded pages and preserve au
         }
     };
     const refs = [_]tree.Ref{ roots[1], roots[0], roots[1] };
+    // Optional encoded copies cannot fail required cache-owned page reads.
+    var narrow: local.sql_memory_budget = .{ .backing = a, .limit = 1 };
+    const before_narrow = reads;
+    var recovered: [3]tree.Page = undefined;
+    try reader.many(narrow.allocator(), &refs, &recovered, .{ .ptr = &reads, .charge = Charge.charge });
+    for (&recovered) |*value| value.deinit(narrow.allocator());
+    try std.testing.expectEqual(before_narrow - refs[0].bytes - refs[1].bytes - refs[2].bytes, reads);
+    reader.cached.scope = @splat(20);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, reader.many(failing.allocator(), &refs, &recovered, .{ .ptr = &reads, .charge = Charge.charge }));
+    reader.cached.scope = @splat(9);
     var first: [3]tree.Page = undefined;
     try reader.many(a, &refs, &first, .{ .ptr = &reads, .charge = Charge.charge });
     defer for (&first) |*value| value.deinit(a);

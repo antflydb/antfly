@@ -704,9 +704,10 @@ lock spans a CPU/I/O admission transition.
 The input-version COW difference now also identifies changed logical rows.
 Admitted deltas prove unchanged fragment membership and the same old/current
 native coordinates. They are bounded to 32,768 identities per cohort; a missing
-proof keeps the existing whole-fragment path. Input fragment versions compose
-independent domain-separated row hashes, so a payload change applies the old
-and new fingerprint without scanning the other input fingerprints.
+proof keeps the existing whole-fragment path. Input fragment versions use
+canonical bucketed Merkle commitments. An affected radix bucket rehashes its
+ordered IDs and captured input fingerprints; untouched buckets retain their
+commitments. XOR composition is never evidence of unchanged inputs.
 
 Ordered/covering indexes retire exact coordinate ranges in their reverse tree
 before inserting fresh tuples. Vector fragments bind a stable private-key digest
@@ -734,3 +735,73 @@ group disappears. These roots are included in ordinary and resumable GC and clou
 retention closure. Dense/sparse key-state directories now use the logical census
 without claiming physical object immutability, retaining untouched pages during
 sparse refreshes. Legacy and unsupported representations keep complete rebuilding.
+
+
+### Collision-resistant versions and bounded native publication
+
+Reader protocol 78 adds an optional `input_commitments` page-tree root to native
+coordinate spaces. Its immutable records hold 256 fixed radix bucket digests and
+counts per fragment/input cohort. Each bucket hashes ordered, fixed-width logical
+IDs and captured input fingerprints. Eight domain-separated binary Merkle levels
+and a root binding namespace, cohort, fragment prefix/depth and row count produce
+the file version. The root is independent of physical locations, page packing and
+publication attempts. A sparse refresh rehashes reached buckets and path-copies
+their bounded commitment records; unchanged fragments require no evidence replay.
+The ordinary identity dependency iterator retains these pages for readers, cloud
+certificates and both GC modes. Retired cohorts and split fragment records are
+removed when the corresponding census changes.
+
+Legacy `iv1`/`iv2`/`iv3` versions are readable but cannot seed incremental input
+commitments. New non-coordinate versions use `iv4`; stable text/vector coordinates
+use `iv5`. A legacy fragment rebuilds its version before incremental reuse. This
+migration matters because XOR of row hashes is linear: among 257 candidate row
+updates, a nonempty subset necessarily cancels a 256-bit XOR accumulator. The
+regression constructs that subset, verifies that the historical digest stays
+unchanged, and checks that the real native planner nevertheless rebuilds the
+changed fragment under its Merkle version. A separate migration regression
+removes the old commitment root and restores legacy version prefixes, then
+checks that every fragment rebuilds without seeding row deltas.
+
+Optional encoded navigation waves reclaim their private allocation owner before
+falling back to required page reads after a known quota decline. A completed wave
+charge, including coalesced gaps, is not charged again. Failure before that charge
+still pays each required logical read. Cancellation, provider/integrity failures
+and genuine backing OOM remain errors. The navigation owner is explicitly
+registered in the lake integration test root.
+
+Keyed aggregate fragment jobs have private source views, allocator arenas and
+CPU/I/O execution capabilities. Bounded retained-state reservations precede child
+execution, and the parent parks CPU admission while joining. Workers publish
+immutable row-state roots; only the coordinator adopts references and updates
+contribution ownership after all jobs drain. Rejected concurrency keeps serial
+execution. Tests exercise overlapping jobs with one shared I/O lane, failure and
+deadline cleanup, and persistence of forward/reverse row contributions.
+
+Partial aggregate merges gather a bounded source tile before pinning destination
+pages. This permits source and destination to share a pager with one resident
+frame. Each reached source/destination page is pinned once per tile, and lanes
+for each group preserve their original reduction order. Primitive states remain
+typed; AGS merges likewise update one destination page at a time. The shuffled,
+duplicate-lane regression uses four pins for 128 partials across two source and
+two destination pages, and two pins for the equivalent fixed-state merge.
+
+Native posting publication uses content-defined SHA256 blocks between 8 and
+64 KiB, clipped at physical pack and metadata boundaries. A small insertion can
+therefore resynchronize with unchanged content despite moving native byte
+offsets. Canonical row updates and cross-file serving merges load a bounded
+operation-owned block directory, retain matching old pack/range references and
+upload only unmatched payloads. Fresh directories preserve independently
+verified ranges, compressed opening metadata and exact collection statistics;
+queries need no historical delta chain or new visibility semantics. The ordinary
+retention closure follows reused physical packs, including older attempts.
+Unknown/denied optional reuse admission keeps complete publication.
+
+The 4 MiB deterministic insertion fixture requires more than 75% of payload bytes
+to be reused and less than 25% uploaded, verifies exact readback after releasing
+the local reuse owner and reopening the artifact store without verification
+caches, and verifies zero payload uploads on an identical repeat.
+These are local structural bounds, not archive throughput measurements. Bounded
+native merges still read retained postings and compute the new native output;
+this refinement reduces provider write amplification without claiming to remove
+that merge cost. A query-visible posting-overlay format would require a separate
+visibility/statistics contract and is not introduced here.

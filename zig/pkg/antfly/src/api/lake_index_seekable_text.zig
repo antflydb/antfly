@@ -166,6 +166,151 @@ fn packedPiece(a: A, pack: Ref, offset: usize, pack_offset: usize, bytes: []cons
     const id = try scope.artifactId(checksum);
     return .{ .offset = offset, .ref = .{ .artifact_id = try a.dupe(u8, &id), .checksum = checksum, .byte_len = bytes.len }, .pack = pack, .pack_offset = pack_offset };
 }
+/// Content-defined boundaries resynchronize after posting insertions/deletions.
+/// Logical ranges remain at most 64 KiB and retain ordinary SHA256 proofs.
+const gear_table = blk: {
+    @setEvalBranchQuota(10000);
+    var table: [256]u64 = undefined;
+    for (&table, 0..) |*entry, byte| {
+        var gear = @as(u64, byte) +% 0x9e3779b97f4a7c15;
+        gear = (gear ^ (gear >> 30)) *% 0xbf58476d1ce4e5b9;
+        gear = (gear ^ (gear >> 27)) *% 0x94d049bb133111eb;
+        entry.* = gear ^ (gear >> 31);
+    }
+    break :blk table;
+};
+fn chunkLength(bytes: []const u8) usize {
+    const maximum = @min(block_bytes, bytes.len);
+    if (maximum <= 8 * 1024) return maximum;
+    var rolling: u64 = 0;
+    for (bytes[0..maximum], 0..) |byte, i| {
+        rolling = (rolling << 1) +% gear_table[byte];
+        if (i >= 8 * 1024 and rolling & 0x7fff == 0) return i + 1;
+    }
+    return maximum;
+}
+/// Operation-owned reusable immutable blocks. References keep their original
+/// attempt/pack locators, so existing cloud certificates and GC trace them.
+pub const Reuse = struct {
+    a: A,
+    budget: local.sql_memory_budget,
+    arena: std.heap.ArenaAllocator = undefined,
+    pieces: std.AutoHashMapUnmanaged([32]u8, Piece) = .empty,
+    reused_bytes: u64 = 0,
+    uploaded_bytes: u64 = 0,
+    pub fn create(a: A, store: stores.ArtifactStore, refs: []const Ref, token: Cancellation) !?*Reuse {
+        const self = try a.create(Reuse);
+        self.* = .{ .a = a, .budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = 16 * 1024 * 1024 } };
+        self.arena = .init(self.budget.allocator());
+        var owned = true;
+        defer if (owned) self.deinit();
+        self.prepare(store, refs, token) catch |err| {
+            if (err == error.OutOfMemory and self.budget.isExhausted()) return null;
+            return err;
+        };
+        owned = false;
+        return self;
+    }
+    fn prepare(self: *Reuse, store: stores.ArtifactStore, refs: []const Ref, token: Cancellation) !void {
+        const a = self.arena.allocator();
+        for (refs) |ref| {
+            try token.check();
+            const directory = try loadDirectoryInner(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = token }, ref, true);
+            for (directory.blocks) |piece| try self.pieces.put(a, try stores.sha256DigestFromChecksum(piece.ref.checksum), piece);
+        }
+    }
+    pub fn deinit(self: *Reuse) void {
+        self.arena.deinit();
+        self.a.destroy(self);
+    }
+};
+/// Repack only changed content. A merge may change every native byte offset,
+/// while unchanged posting blocks keep their authenticated old physical ranges.
+pub fn publishSourceReusing(a: A, out: A, store: *stores.ArtifactStore, source: local.index.SegmentSource, cancellation: Cancellation, opening: ?*@import("lake_index_text_opening_pack.zig").Collector, reuse: ?*Reuse) !Ref {
+    const previous = reuse orelse return publishSourceWithOpeningCollector(a, out, store, source, cancellation, opening);
+    const length = std.math.cast(usize, source.len()) orelse return error.NativeLakeTextCorpusTooLarge;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const ranges = try initialMetadata(ca, source);
+    var metadata: std.ArrayList(Piece) = .empty;
+    var blocks: std.ArrayList(Piece) = .empty;
+    var compressed_bundle: ?Ref = null;
+    var decoded_bytes: usize = 0;
+    if (ranges.len != 0) {
+        var bundle: std.ArrayList(u8) = .empty;
+        for (ranges) |range| try source.readInto(range.offset, try bundle.addManyAsSlice(ca, range.len));
+        const compressed = try local.encoding_snappy.encode(ca, bundle.items);
+        if (compressed.len <= bundle.items.len - bundle.items.len / 8) {
+            compressed_bundle = try upload(ca, store, compressed, cancellation);
+            if (opening) |collector| try collector.add(compressed_bundle.?, compressed);
+            decoded_bytes = bundle.items.len;
+        } else {
+            const pack = try upload(ca, store, bundle.items, cancellation);
+            if (opening) |collector| try collector.add(pack, bundle.items);
+            var offset: usize = 0;
+            for (ranges) |range| {
+                try metadata.append(ca, try packedPiece(ca, pack, range.offset, offset, bundle.items[offset..][0..range.len]));
+                offset += range.len;
+            }
+        }
+    }
+    const Pending = struct { offset: usize, bytes: []const u8, pack_offset: usize, retained: ?Piece, metadata: bool };
+    var position: usize = 0;
+    var meta: usize = 0;
+    while (position < length) {
+        try cancellation.check();
+        var wave = std.heap.ArenaAllocator.init(a);
+        defer wave.deinit();
+        const wa = wave.allocator();
+        const end = @min(length, position + pack_bytes);
+        const payload = if (source == .contiguous) source.contiguous[position..end] else blk: {
+            const bytes = try wa.alloc(u8, end - position);
+            try source.readInto(position, bytes);
+            break :blk bytes;
+        };
+        var pending: std.ArrayList(Pending) = .empty;
+        var changed: std.ArrayList(u8) = .empty;
+        var offset = position;
+        while (offset < end) {
+            while (meta < ranges.len and ranges[meta].offset + ranges[meta].len <= offset) meta += 1;
+            const is_meta = meta < ranges.len and ranges[meta].offset <= offset;
+            const limit = @min(end, if (meta < ranges.len) (if (is_meta) ranges[meta].offset + ranges[meta].len else ranges[meta].offset) else length);
+            if (is_meta and compressed_bundle == null) {
+                offset = limit;
+                continue;
+            }
+            const next = if (is_meta) limit else offset + chunkLength(payload[offset - position .. limit - position]);
+            const bytes = payload[offset - position .. next - position];
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            const retained = if (!is_meta) previous.pieces.get(digest) else null;
+            const reused = if (retained) |piece| piece.ref.byte_len == bytes.len else false;
+            try pending.append(wa, .{ .offset = offset, .bytes = bytes, .pack_offset = changed.items.len, .retained = if (reused) retained else null, .metadata = is_meta });
+            if (!reused) try changed.appendSlice(wa, bytes);
+            offset = next;
+        }
+        const pack = if (changed.items.len != 0) try upload(ca, store, changed.items, cancellation) else null;
+        previous.uploaded_bytes += changed.items.len;
+        for (pending.items) |item| {
+            const piece = if (item.retained) |retained| blk: {
+                var result = retained;
+                result.offset = item.offset;
+                previous.reused_bytes += item.bytes.len;
+                break :blk result;
+            } else try packedPiece(ca, pack.?, item.offset, item.pack_offset, item.bytes);
+            if (item.metadata) try metadata.append(ca, piece) else try blocks.append(ca, piece);
+        }
+        position = end;
+    }
+    const directory: Directory = .{ .version = if (compressed_bundle != null) 5 else 4, .metadata_bundle = compressed_bundle, .metadata_decoded_bytes = decoded_bytes, .bytes = length, .metadata = metadata.items, .blocks = blocks.items, .terms = &.{} };
+    try directory.validate();
+    const encoded = try std.json.Stringify.valueAlloc(ca, directory, .{});
+    if (encoded.len > 4 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
+    const result = try upload(out, store, encoded, cancellation);
+    if (opening) |collector| try collector.add(result, encoded);
+    return result;
+}
 fn uploadWidth(a: A, store: *const stores.ArtifactStore) usize {
     const phase = store.io_phase orelse return 1;
     const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse return 1;
@@ -329,7 +474,8 @@ pub fn publishSourceWithOpeningCollector(a: A, out: A, store: *stores.ArtifactSt
                     offset = end;
                     continue;
                 }
-                const end = @min(@min(offset + block_bytes, pack_end), if (metadata_position < ranges.len) ranges[metadata_position].offset else length);
+                const limit = @min(pack_end, if (metadata_position < ranges.len) ranges[metadata_position].offset else length);
+                const end = offset + chunkLength(payload[offset - position .. limit - position]);
                 try blocks.append(ca, try packedPiece(ca, pack, offset, offset - position, payload[offset - position .. end - position]));
                 offset = end;
             }
@@ -2389,4 +2535,60 @@ test "external lake source pack upload failure and cancellation drain pending lo
     try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
     try std.testing.expect(execution.active);
+}
+
+test "external lake content block reuse survives shifted offsets restart and integrity checks" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("posting-block-reuse");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(8), 1, std.testing.io);
+    const input = try a.alloc(u8, 4 * pack_bytes);
+    defer a.free(input);
+    var random: u64 = 0x123456789abcdef;
+    for (input) |*byte| {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        byte.* = @truncate(random);
+    }
+    const first = try publish(a, out, &store, input, .none);
+    const changed = try a.alloc(u8, input.len + 17);
+    defer a.free(changed);
+    @memcpy(changed[0..100], input[0..100]);
+    @memset(changed[100..117], 'x');
+    @memcpy(changed[117..], input[100..]);
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(8), 2, std.testing.io);
+    const reuse = (try Reuse.create(a, store, &.{first}, .none)).?;
+    const second = try publishSourceReusing(a, out, &store, .{ .contiguous = changed }, .none, null, reuse);
+    try std.testing.expect(reuse.reused_bytes > changed.len * 3 / 4);
+    try std.testing.expect(reuse.uploaded_bytes < changed.len / 4);
+    reuse.deinit();
+    // Reopen without local verification caches or the reuse index. The
+    // persisted directory alone owns old and new physical pack ranges.
+    fs.deinit();
+    fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.initExisting(a, directory.path());
+    store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(8), 3, std.testing.io);
+    var data = try load(a, .{ .store = fs.artifactStore(), .cache = null, .context = .{}, .cancellation = .none }, second);
+    defer data.deinit(a);
+    const restored = try a.alloc(u8, changed.len);
+    defer a.free(restored);
+    try data.source().readInto(0, restored);
+    try std.testing.expectEqualSlices(u8, changed, restored);
+    const committed = try loadDirectory(out, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, second);
+    var old_refs: usize = 0;
+    for (committed.blocks) |piece| {
+        if ((try stores.uploadScopeFromArtifactId(piece.retainedArtifact().artifact_id)).?.fencingToken() == 1) old_refs += 1;
+    }
+    try std.testing.expect(old_refs > 32);
+    const identical = (try Reuse.create(a, store, &.{second}, .none)).?;
+    defer identical.deinit();
+    _ = try publishSourceReusing(a, out, &store, .{ .contiguous = changed }, .none, null, identical);
+    try std.testing.expectEqual(@as(u64, 0), identical.uploaded_bytes);
 }

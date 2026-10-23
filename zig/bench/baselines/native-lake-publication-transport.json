@@ -278,5 +278,28 @@
     "distinct_score_fixture_resolved_ranks": 3,
     "heap_rank_resolution": "score ties and final winners; repeated score classes batched",
     "local_segment_read_lock": "blocking std.Io mutex, outside CPU/I/O admission transitions"
+  },
+  "native_refresh_refinements": {
+    "reader_protocol": 78,
+    "input_versions": "iv4/iv5 canonical bucketed Merkle commitments; no XOR reuse",
+    "buckets_per_fragment": 256,
+    "input_commitment_record_bytes": 9216,
+    "merkle_internal_levels": 8,
+    "legacy_xor_collision_regression": "257 candidate updates; nonempty cancelling subset must change the planned native fragment",
+    "navigation_quota_decline": "reclaim optional copies; required serial reads; charge once",
+    "keyed_aggregate_job_retained_bytes": 71303168,
+    "keyed_aggregate_job_io_lanes_in_regression": 1,
+    "paged_partial_tile_rows": 128,
+    "paged_partial_two_source_two_target_page_pins": 4,
+    "paged_fixed_two_target_page_pins": 2,
+    "content_block_minimum_bytes": 8192,
+    "content_block_maximum_bytes": 65536,
+    "content_block_reuse_directory_limit_bytes": 16777216,
+    "shifted_fixture_bytes": 4194304,
+    "shifted_fixture_reused_fraction_greater_than": 0.75,
+    "shifted_fixture_uploaded_fraction_less_than": 0.25,
+    "identical_repeat_payload_upload_bytes": 0,
+    "remaining_text_cost": "bounded native posting reads and merge CPU; no query-visible overlay chain",
+    "performance_claim": "structural regression bounds; no production archive latency claim"
   }
 }

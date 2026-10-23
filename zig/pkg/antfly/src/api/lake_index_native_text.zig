@@ -1975,6 +1975,7 @@ const Compactor = struct {
     encoder: ?*EncoderPipeline = null,
     context: local.serverless_query_lake_read_context.Context = .{},
     row_patch: ?struct { base: FileGroup, rows: []const u64 } = null,
+    reusable_blocks: ?*@import("lake_index_seekable_text.zig").Reuse = null,
     patch_inputs: std.ArrayList(Owned) = .empty,
     out: A,
     store: *stores.ArtifactStore,
@@ -1999,6 +2000,7 @@ const Compactor = struct {
         if (self.encoder) |encoder| try encoder.finish();
     }
     fn deinit(self: *Compactor) void {
+        if (self.reusable_blocks) |reuse| reuse.deinit();
         if (self.encoder) |encoder| {
             encoder.deinit();
             self.a.destroy(encoder);
@@ -2163,7 +2165,10 @@ const Compactor = struct {
         if (segments.items.len == max_segments or source.len() > 32 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
         // Pack workers allocate concurrently. Keep their synchronized transport
         // allocator; the seekable publisher copies final refs into out serially.
-        const ref = @import("lake_index_seekable_text.zig").publishSourceWithOpeningCollector(a, out, store, source, cancellation, self.opening) catch |err| return buildFailure(err, "segment_packs", self.file_ordinal, segments.items.len);
+        if (self.row_patch) |patch| {
+            if (self.reusable_blocks == null) self.reusable_blocks = try @import("lake_index_seekable_text.zig").Reuse.create(a, store.*, patch.base.segments, cancellation);
+        }
+        const ref = @import("lake_index_seekable_text.zig").publishSourceReusing(a, out, store, source, cancellation, self.opening, self.reusable_blocks) catch |err| return buildFailure(err, "segment_packs", self.file_ordinal, segments.items.len);
         var reader = try local.segment.SegmentReader.initSource(a, source);
         defer reader.deinit();
         try self.admissions.append(out, try reader.admission(out));

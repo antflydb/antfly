@@ -706,10 +706,28 @@ pub const Column = struct {
     pub fn mergeFixedBatch(self: *Column, a: A, ids: []const usize, states: []const @import("aggregate_partial.zig").Fixed) !void {
         if (self.paged != null) {
             if (ids.len != states.len) return error.InvalidSqlBackendResponse;
-            for (ids, states) |id, state| {
-                var view = try self.pageView(id, true);
-                defer view.lease.release();
-                try view.column.mergeFixedBatch(a, &.{0}, &.{state});
+            var begin: usize = 0;
+            while (begin < ids.len) {
+                const end = @min(ids.len, begin + 128);
+                var done: [128]bool = @splat(false);
+                for (ids[begin..end], 0..) |id, lane| {
+                    if (done[lane]) continue;
+                    const first = self.pageStart(id);
+                    var selected: [128]usize = undefined;
+                    var input: [128]@import("aggregate_partial.zig").Fixed = undefined;
+                    var count: usize = 0;
+                    for (ids[begin..end], 0..) |candidate, i| {
+                        if (done[i] or self.pageStart(candidate) != first) continue;
+                        done[i] = true;
+                        selected[count] = candidate - first;
+                        input[count] = states[begin + i];
+                        count += 1;
+                    }
+                    var view = try self.pageWindow(id);
+                    defer view.lease.release();
+                    try view.column.mergeFixedBatch(a, selected[0..count], input[0..count]);
+                }
+                begin = end;
             }
             return;
         }
@@ -770,13 +788,36 @@ pub const Column = struct {
         return self.mergeSelectedBatch(a, ids, source, begin, null);
     }
     /// Selection vectors keep partial states typed across hash-owner exchanges.
-    pub fn mergeSelectedBatch(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize, indices: ?[]const usize) !void {
-        if (self.paged != null or source.paged != null) {
-            if (indices) |selected| if (selected.len != ids.len) return error.InvalidSqlBackendResponse;
-            if (!std.meta.eql(self.spec, source.spec)) return error.InvalidSqlBackendResponse;
+    pub fn mergeSelectedBatch(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize, indices: ?[]const usize) anyerror!void {
+        if (!std.meta.eql(self.spec, source.spec)) return error.InvalidSqlBackendResponse;
+        if (indices) |selected| if (selected.len != ids.len) return error.InvalidSqlBackendResponse;
+        if (self == source and self.paged != null) {
             for (ids, 0..) |id, lane| try self.mergeExact(a, id, try source.snapshot(a, if (indices) |selected| selected[lane] else begin + lane));
             return;
         }
+        if (source.paged) |paged| switch (paged) {
+            inline else => |array, tag| {
+                var offset: usize = 0;
+                while (offset < ids.len) {
+                    const end = @min(ids.len, offset + 128);
+                    var selected: [128]usize = undefined;
+                    for (selected[0 .. end - offset], offset..) |*index, lane| index.* = if (indices) |input| input[lane] else begin + lane;
+                    const Element = switch (tag) {
+                        .counts => u64,
+                        .integers => Integer,
+                        .numbers => Number,
+                        .booleans => Boolean,
+                    };
+                    var values: [128]Element = undefined;
+                    try array.getMany(selected[0 .. end - offset], values[0 .. end - offset]);
+                    const tile: Column = .{ .spec = source.spec, .values = @unionInit(Values, @tagName(tag), .{ .items = values[0 .. end - offset], .capacity = values.len, .pointer_stability = .{} }) };
+                    try self.mergeDestinationTiles(a, ids[offset..end], &tile, 0, null);
+                    offset = end;
+                }
+                return;
+            },
+        };
+        if (self.paged != null) return self.mergeDestinationTiles(a, ids, source, begin, indices);
         if (indices) |selected| if (selected.len != ids.len) return error.InvalidSqlBackendResponse;
         if (!std.meta.eql(self.spec, source.spec)) return error.InvalidSqlBackendResponse;
         if (std.meta.activeTag(self.values) != std.meta.activeTag(source.values)) {
@@ -849,6 +890,35 @@ pub const Column = struct {
                     try self.mergeExact(a, id, try source.snapshot(arena.allocator(), index));
                 }
             },
+        }
+    }
+    /// Source pages are gathered before destination pinning, so one-frame
+    /// residency and a shared source/destination pager cannot deadlock. Lanes
+    /// for each destination retain their exact partial-reduction order.
+    fn mergeDestinationTiles(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize, indices: ?[]const usize) anyerror!void {
+        if (self.paged == null) return self.mergeSelectedBatch(a, ids, source, begin, indices);
+        var offset: usize = 0;
+        while (offset < ids.len) {
+            const end = @min(ids.len, offset + 128);
+            var done: [128]bool = @splat(false);
+            for (ids[offset..end], 0..) |id, lane| {
+                if (done[lane]) continue;
+                const first = self.pageStart(id);
+                var target: [128]usize = undefined;
+                var input: [128]usize = undefined;
+                var count: usize = 0;
+                for (ids[offset..end], 0..) |candidate, position| {
+                    if (done[position] or self.pageStart(candidate) != first) continue;
+                    done[position] = true;
+                    target[count] = candidate - first;
+                    input[count] = if (indices) |selected| selected[offset + position] else begin + offset + position;
+                    count += 1;
+                }
+                var view = try self.pageWindow(id);
+                defer view.lease.release();
+                try view.column.mergeSelectedBatch(a, target[0..count], source, 0, input[0..count]);
+            }
+            offset = end;
         }
     }
     fn mergedCount(left: u64, right: u64) !u64 {
@@ -1267,4 +1337,54 @@ test "SQL paged native kernels pin each reached state page once per tile" {
     for (cells, 0..) |cell, lane| try expected[lane % 2].update(cell);
     try std.testing.expectEqualDeep(try expected[0].finish(), try column.finish(0));
     try std.testing.expectEqualDeep(try expected[1].finish(), try column.finish(2999));
+}
+
+test "SQL paged partial merges gather source pages before destination kernels" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.check };
+    defer manager.deinit();
+    for ([_]operators.AggregateSpec{ .{ .kind = .sum, .input_type = .integer }, .{ .kind = .sum, .input_type = .number }, .{ .kind = .avg, .input_type = .number }, .{ .kind = .count }, .{ .kind = .bool_or, .input_type = .boolean } }) |spec| {
+        var source = Column.init(spec);
+        source.page_manager = &manager;
+        defer source.clear(a);
+        var target = Column.init(spec);
+        target.page_manager = &manager;
+        defer target.clear(a);
+        var reference = Column.init(spec);
+        defer reference.clear(a);
+        for (0..3000) |_| {
+            try source.append(a);
+            try target.append(a);
+        }
+        try reference.append(a);
+        try reference.append(a);
+        const pager = manager.execution_pages.?;
+        pager.limit = Column.paging.page_bytes;
+        const values = [_]Datum{ if (spec.input_type == .boolean) Datum.json(.{ .bool = true }) else Datum.json(.{ .integer = 17 }), if (spec.input_type == .boolean) Datum.json(.{ .bool = false }) else Datum.json(.{ .integer = -3 }) };
+        try source.update(a, 0, values[0]);
+        try source.update(a, 2999, values[1]);
+        var ids: [128]usize = undefined;
+        var selected: [128]usize = undefined;
+        for (&ids, &selected, 0..) |*id, *from, i| {
+            id.* = if (i % 2 == 0) 2999 else 0;
+            from.* = if (i % 3 == 0) 0 else 2999;
+            try reference.update(a, i % 2, values[if (i % 3 == 0) 0 else 1]);
+        }
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const before = pager.pins;
+        try target.mergeSelectedBatch(none.allocator(), &ids, &source, 0, &selected);
+        try std.testing.expectEqual(@as(u64, 4), pager.pins - before);
+        try std.testing.expectEqualDeep(try reference.finish(0), try target.finish(2999));
+        try std.testing.expectEqualDeep(try reference.finish(1), try target.finish(0));
+        if (spec.input_type == .integer) {
+            const fixed: [128]@import("aggregate_partial.zig").Fixed = @splat(.{ .count = 1, .sum = 5, .boolean = false, .selected = .{} });
+            const pinned = pager.pins;
+            try target.mergeFixedBatch(none.allocator(), &ids, &fixed);
+            try std.testing.expectEqual(@as(u64, 2), pager.pins - pinned);
+        }
+    }
 }
