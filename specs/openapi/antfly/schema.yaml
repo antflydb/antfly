@@ -841,7 +841,7 @@ components:
             and readiness are local to each owning shard, not client-writable.
         default_type:
           type: string
-          description: Default type to use from the document_types.
+          description: Default type to use from the document_schemas.
         enforce_types:
           type: boolean
           description: |

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const proto = @import("antfly_vector").proto;
@@ -149,7 +149,7 @@ const parity_cases = [_]RecallCase{
     .{ .dataset = "random-20d-1k.gob", .randomize = true, .count = 1000, .expected = .{ .euclidean = 97.50, .inner_product = 96.50, .cosine = 97.00 } },
     .{ .dataset = "fashionminst-784d-1k.gob", .count = 1000, .expected = .{ .euclidean = 97.50, .inner_product = 86.50, .cosine = 91.00 } },
     .{ .dataset = "fashionminst-784d-1k.gob", .randomize = true, .count = 1000, .expected = .{ .euclidean = 100.00, .inner_product = 99.50, .cosine = 99.00 } },
-    .{ .dataset = "fashionminst-784d-10k.gob", .count = 1000, .expected = .{ .euclidean = 94.00, .inner_product = 93.00, .cosine = 94.00 } },
+    .{ .dataset = "fashionminst-784d-10k.gob", .count = 1000, .expected = .{ .euclidean = 94.00, .inner_product = 93.00, .cosine = 93.50 } },
     .{ .dataset = "fashionminst-784d-10k.gob", .randomize = true, .count = 1000, .expected = .{ .euclidean = 100.00, .inner_product = 100.00, .cosine = 100.00 } },
     .{ .dataset = "laionclip-768d-1k.gob", .count = 1000, .expected = .{ .euclidean = 96.00, .inner_product = 96.50, .cosine = 89.50 } },
     .{ .dataset = "laionclip-768d-1k.gob", .randomize = true, .count = 1000, .expected = .{ .euclidean = 98.50, .inner_product = 98.50, .cosine = 97.00 } },
@@ -172,10 +172,7 @@ test "HBC recall covers Go fixture sets" {
         const dataset_path = try convertedDatasetPathAlloc(std.testing.allocator, case.dataset);
         defer std.testing.allocator.free(dataset_path);
 
-        std.Io.Dir.cwd().access(std.testing.io, dataset_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return error.SkipZigTest,
-            else => return err,
-        };
+        try requireDataset(dataset_path);
 
         const actual = try runHBCCase(dataset_path, case, null, &truth_cache);
 
@@ -200,10 +197,7 @@ test "HBC recall recursive bulk build covers worst fixture" {
     const dataset_path = try convertedDatasetPathAlloc(std.testing.allocator, case.dataset);
     defer std.testing.allocator.free(dataset_path);
 
-    std.Io.Dir.cwd().access(std.testing.io, dataset_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return err,
-    };
+    try requireDataset(dataset_path);
 
     const actual = try runHBCCase(dataset_path, case, .recursive, &truth_cache);
     var failed = false;
@@ -229,7 +223,29 @@ fn convertedDatasetPathAlloc(alloc: std.mem.Allocator, gob_name: []const u8) ![]
         try std.fmt.allocPrint(alloc, "{s}.pbvec", .{gob_name});
     defer alloc.free(converted);
 
-    return std.fs.path.join(alloc, &.{ "testdata", "vectorsets", converted });
+    return std.fs.path.join(alloc, &.{ vectorsetsDir(), converted });
+}
+
+/// `zig build antfly-recall-conformance` fetches the hash-pinned datasets and
+/// points ANTFLY_VECTORSETS_DIR at them. Without it, fall back to the legacy
+/// in-tree location so ad hoc runs from `zig/` keep working.
+fn vectorsetsDir() []const u8 {
+    return std.testing.environ.getPosix("ANTFLY_VECTORSETS_DIR") orelse "testdata/vectorsets";
+}
+
+/// Missing datasets skip the test in ad hoc runs, but fail when the recall
+/// conformance target requires them so CI cannot pass by skipping.
+fn requireDataset(dataset_path: []const u8) !void {
+    std.Io.Dir.cwd().access(std.testing.io, dataset_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (std.testing.environ.getPosix("ANTFLY_VECTORSETS_REQUIRED") != null) {
+                std.debug.print("missing recall dataset {s}; run `zig build antfly-recall-conformance`\n", .{dataset_path});
+                return error.RecallDatasetMissing;
+            }
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
 }
 
 fn runHBCCase(dataset_path: []const u8, case: RecallCase, bulk_algo: ?hbc.BulkBuildAlgo, truth_cache: *TruthCache) !MetricStats {

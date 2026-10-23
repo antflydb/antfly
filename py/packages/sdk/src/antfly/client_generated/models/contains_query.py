@@ -62,6 +62,13 @@ class ContainsQuery:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        if set(src_dict) - {
+            "contains",
+            "field",
+            "case_sensitive",
+            "boost",
+        }:
+            raise ValueError("Unexpected properties for ContainsQuery")
         d = dict(src_dict)
         contains = d.pop("contains")
 

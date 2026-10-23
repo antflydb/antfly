@@ -1219,6 +1219,26 @@ pub const ManagedEmbedder = struct {
         return self.entries.len > 0;
     }
 
+    /// Native task adapters retain the runtime's complete envelope while using
+    /// the same credential source and embedding quota as typed vector calls.
+    /// The observer borrows this embedder and must not outlive it.
+    pub const NativeRequestControls = struct {
+        endpoint: []const u8,
+        authorization: ?[]u8,
+        attempt_observer: ?httpx.AttemptObserver,
+    };
+
+    pub fn nativeRequestControls(self: *ManagedEmbedder, alloc: std.mem.Allocator, name: []const u8) !NativeRequestControls {
+        const entry = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (entry.provider != .antfly) return error.UnsupportedEmbeddingProvider;
+        const authorization = if (entry.api_key) |*key| try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, key) else null;
+        return .{
+            .endpoint = entry.base_url,
+            .authorization = authorization,
+            .attempt_observer = embeddingAttemptObserver(entry),
+        };
+    }
+
     pub fn hasDenseEntries(self: ManagedEmbedder) bool {
         for (self.entries) |entry| {
             if (!entry.sparse) return true;
@@ -4596,16 +4616,19 @@ fn catalogSemanticExecutionBindingAlloc(
     };
 }
 
-fn shouldUseAntflyProvider(embedder: embeddings_types.Config, options: InitOptions) bool {
-    if (options.antfly_provider == null) return false;
-    if (embedder.url.len > 0) return false;
-    const env_url = resolveOptionalEnv(std.heap.page_allocator, "ANTFLY_INFERENCE_URL");
-    if (env_url) |value| {
+/// Native gateway and typed vector adapters share transport precedence. A
+/// process-local runtime is eligible only when no remote endpoint is selected.
+pub fn hasRemoteAntflyEndpoint(embedder: embeddings_types.Config, default_endpoint: ?[]const u8) bool {
+    if (embedder.url.len > 0) return true;
+    if (resolveOptionalEnv(std.heap.page_allocator, "ANTFLY_INFERENCE_URL")) |value| {
         std.heap.page_allocator.free(value);
-        return false;
+        return true;
     }
-    if (configuredDefaultAntflyInferenceURL(options) != null) return false;
-    return true;
+    return if (default_endpoint) |value| std.mem.trim(u8, value, " \t\r\n").len > 0 else false;
+}
+
+fn shouldUseAntflyProvider(embedder: embeddings_types.Config, options: InitOptions) bool {
+    return options.antfly_provider != null and !hasRemoteAntflyEndpoint(embedder, options.inference_api_url);
 }
 
 fn buildManagedEmbeddingEntry(
@@ -7194,6 +7217,7 @@ fn optionalBearerAuthHeaderOwned(
 
 fn mapEmbedStatus(status: u16) anyerror {
     return switch (status) {
+        401, 403 => error.InferenceEndpointAccessDenied,
         429 => error.EmbedRateLimited,
         408,
         502,
@@ -10521,4 +10545,28 @@ pub fn testSparseCacheRevision() !void {
     try std.testing.expectEqual(@as([32]u8, @splat(7)), revision);
     const dense = managed.denseInterface();
     try std.testing.expect((try dense.cache_revision_fn.?(dense.ptr, std.testing.allocator, "semantic_idx")) == null);
+}
+
+test "managed embedder endpoint access denial survives HTTP probing and runtime transport" {
+    const a = std.testing.allocator;
+    const Denied = struct {
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return .{ .status = 403, .content_type = try alloc.dupe(u8, "application/json"), .body = try alloc.dupe(u8, "{\"error\":\"forbidden\"}") };
+        }
+    };
+    var marker: u8 = 0;
+    var listener = std_http_listener.StdHttpListener.init(a, .{}, .{ .ptr = &marker, .vtable = &.{ .execute = Denied.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(a);
+    defer a.free(base_uri);
+    for ([_][]const u8{ "openai", "antfly" }) |provider| {
+        const raw = try std.fmt.allocPrint(a, "{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{{\"provider\":\"{s}\",\"model\":\"model\",\"api_url\":\"{s}\"}}}}", .{ provider, base_uri });
+        defer a.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InferenceEndpointAccessDenied, normalizeEmbeddingsIndexDimensionJsonWithOptions(a, "semantic", parsed.value, .{}));
+    }
+    const abi = @import("antfly_runtime_abi").error_abi;
+    try std.testing.expectEqual(error.InferenceEndpointAccessDenied, abi.errorFromStatus(abi.statusFromError(error.InferenceEndpointAccessDenied)));
 }

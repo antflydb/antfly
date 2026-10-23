@@ -80,6 +80,8 @@ from .bedrock_embedder_config import BedrockEmbedderConfig
 from .bedrock_embedder_config_provider import BedrockEmbedderConfigProvider
 from .bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
 from .bool_field_query import BoolFieldQuery
+from .bool_query import BoolQuery
+from .bool_query_body import BoolQueryBody
 from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
@@ -262,6 +264,14 @@ from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
 from .decision_choice import DecisionChoice
 from .decision_choice_probability import DecisionChoiceProbability
+from .decision_evidence_image import DecisionEvidenceImage
+from .decision_evidence_image_detail import DecisionEvidenceImageDetail
+from .decision_evidence_image_type import DecisionEvidenceImageType
+from .decision_evidence_message import DecisionEvidenceMessage
+from .decision_evidence_message_role import DecisionEvidenceMessageRole
+from .decision_evidence_message_type import DecisionEvidenceMessageType
+from .decision_evidence_text import DecisionEvidenceText
+from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
@@ -985,6 +995,15 @@ from .inference_model_info import InferenceModelInfo
 from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
 from .inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
+from .inference_model_instance import InferenceModelInstance
+from .inference_model_instance_list import InferenceModelInstanceList
+from .inference_model_instance_list_object import InferenceModelInstanceListObject
+from .inference_model_instance_load_request import InferenceModelInstanceLoadRequest
+from .inference_model_instance_residency_mode import InferenceModelInstanceResidencyMode
+from .inference_model_instance_state import InferenceModelInstanceState
+from .inference_model_instance_unload_blocked_reason import InferenceModelInstanceUnloadBlockedReason
+from .inference_model_instance_unload_response import InferenceModelInstanceUnloadResponse
+from .inference_model_instance_unload_response_outcome import InferenceModelInstanceUnloadResponseOutcome
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
@@ -1037,6 +1056,8 @@ from .inference_runtime_config_model_strategies_additional_property import (
 )
 from .inference_sparse_vector import InferenceSparseVector
 from .inference_style import InferenceStyle
+from .inference_synthesis_request import InferenceSynthesisRequest
+from .inference_synthesis_request_format import InferenceSynthesisRequestFormat
 from .inference_text_content import InferenceTextContent
 from .inference_text_content_part import InferenceTextContentPart
 from .inference_text_content_part_type import InferenceTextContentPartType
@@ -1106,9 +1127,6 @@ from .lake_catalog_create_request_write_order import LakeCatalogCreateRequestWri
 from .lake_catalog_response import LakeCatalogResponse
 from .lake_catalog_response_metadata import LakeCatalogResponseMetadata
 from .lake_catalog_response_state import LakeCatalogResponseState
-from .lake_read_receipt import LakeReadReceipt
-from .lake_read_requirement import LakeReadRequirement
-from .lake_read_requirement_visibility import LakeReadRequirementVisibility
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
@@ -1241,6 +1259,7 @@ from .query_evaluation_compute import QueryEvaluationCompute
 from .query_evaluation_order_by_item import QueryEvaluationOrderByItem
 from .query_evaluation_scope import QueryEvaluationScope
 from .query_evaluation_where import QueryEvaluationWhere
+from .query_execution import QueryExecution
 from .query_expression import QueryExpression
 from .query_expression_call import QueryExpressionCall
 from .query_expression_criteria_type_0 import QueryExpressionCriteriaType0
@@ -1263,10 +1282,10 @@ from .query_hits import QueryHits
 from .query_hits_total import QueryHitsTotal
 from .query_hits_total_relation import QueryHitsTotalRelation
 from .query_profile import QueryProfile
-from .query_profile_value_search import QueryProfileValueSearch
-from .query_profile_value_search_plans_item import QueryProfileValueSearchPlansItem
-from .query_profile_value_search_plans_item_operation import QueryProfileValueSearchPlansItemOperation
-from .query_profile_value_search_plans_item_verification import QueryProfileValueSearchPlansItemVerification
+from .query_profile_value_verification import QueryProfileValueVerification
+from .query_profile_value_verification_plans_item import QueryProfileValueVerificationPlansItem
+from .query_profile_value_verification_plans_item_operation import QueryProfileValueVerificationPlansItemOperation
+from .query_profile_value_verification_plans_item_verification import QueryProfileValueVerificationPlansItemVerification
 from .query_request import QueryRequest
 from .query_request_aggregations import QueryRequestAggregations
 from .query_request_embeddings import QueryRequestEmbeddings
@@ -1501,7 +1520,6 @@ from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
 from .sql_request import SQLRequest
-from .sql_request_lake_visibility import SQLRequestLakeVisibility
 from .sql_response import SQLResponse
 from .sql_setting_database_default import SqlSettingDatabaseDefault
 from .sql_setting_mutation_drop import SqlSettingMutationDrop
@@ -1676,7 +1694,7 @@ from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
-from .value_search_execution import ValueSearchExecution
+from .value_verification import ValueVerification
 from .vector_source_storage_status import VectorSourceStorageStatus
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_embedder_config_provider import VertexEmbedderConfigProvider
@@ -1779,6 +1797,8 @@ __all__ = (
     "BedrockEmbedderConfigRequestFormat",
     "BooleanQuery",
     "BoolFieldQuery",
+    "BoolQuery",
+    "BoolQueryBody",
     "BraveSearchConfig",
     "BraveSearchConfigFreshness",
     "BraveSearchConfigProvider",
@@ -1960,6 +1980,14 @@ __all__ = (
     "DecisionBatchItem",
     "DecisionChoice",
     "DecisionChoiceProbability",
+    "DecisionEvidenceImage",
+    "DecisionEvidenceImageDetail",
+    "DecisionEvidenceImageType",
+    "DecisionEvidenceMessage",
+    "DecisionEvidenceMessageRole",
+    "DecisionEvidenceMessageType",
+    "DecisionEvidenceText",
+    "DecisionEvidenceTextType",
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
@@ -2673,6 +2701,15 @@ __all__ = (
     "InferenceModelInfoChunkingLimits",
     "InferenceModelInfoInferenceCapabilities",
     "InferenceModelInfoQualifiedLimits",
+    "InferenceModelInstance",
+    "InferenceModelInstanceList",
+    "InferenceModelInstanceListObject",
+    "InferenceModelInstanceLoadRequest",
+    "InferenceModelInstanceResidencyMode",
+    "InferenceModelInstanceState",
+    "InferenceModelInstanceUnloadBlockedReason",
+    "InferenceModelInstanceUnloadResponse",
+    "InferenceModelInstanceUnloadResponseOutcome",
     "InferenceModelKind",
     "InferenceModelQuantization",
     "InferenceModelRef",
@@ -2724,6 +2761,8 @@ __all__ = (
     "InferenceschemasConfig",
     "InferenceSparseVector",
     "InferenceStyle",
+    "InferenceSynthesisRequest",
+    "InferenceSynthesisRequestFormat",
     "InferenceTextContent",
     "InferenceTextContentPart",
     "InferenceTextContentPartType",
@@ -2792,9 +2831,6 @@ __all__ = (
     "LakeCatalogResponse",
     "LakeCatalogResponseMetadata",
     "LakeCatalogResponseState",
-    "LakeReadReceipt",
-    "LakeReadRequirement",
-    "LakeReadRequirementVisibility",
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
@@ -2923,6 +2959,7 @@ __all__ = (
     "QueryEvaluationOrderByItem",
     "QueryEvaluationScope",
     "QueryEvaluationWhere",
+    "QueryExecution",
     "QueryExpression",
     "QueryExpressionCall",
     "QueryExpressionCriteriaType0",
@@ -2945,10 +2982,10 @@ __all__ = (
     "QueryHitsTotal",
     "QueryHitsTotalRelation",
     "QueryProfile",
-    "QueryProfileValueSearch",
-    "QueryProfileValueSearchPlansItem",
-    "QueryProfileValueSearchPlansItemOperation",
-    "QueryProfileValueSearchPlansItemVerification",
+    "QueryProfileValueVerification",
+    "QueryProfileValueVerificationPlansItem",
+    "QueryProfileValueVerificationPlansItemOperation",
+    "QueryProfileValueVerificationPlansItemVerification",
     "QueryRequest",
     "QueryRequestAggregations",
     "QueryRequestEmbeddings",
@@ -3185,7 +3222,6 @@ __all__ = (
     "SQLPreparedResponse",
     "SQLPrepareRequest",
     "SQLRequest",
-    "SQLRequestLakeVisibility",
     "SQLResponse",
     "SqlSettingDatabaseDefault",
     "SqlSettingMutationDrop",
@@ -3358,7 +3394,7 @@ __all__ = (
     "User",
     "UserMetadataType0",
     "VADOptions",
-    "ValueSearchExecution",
+    "ValueVerification",
     "VectorSourceStorageStatus",
     "VertexEmbedderConfig",
     "VertexEmbedderConfigProvider",

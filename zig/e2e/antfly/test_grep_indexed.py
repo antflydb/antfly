@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Native grep against the real query server, including retained multi-page reads."""
 
@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 import requests
 import test_auth as auth
+from e2e_scheduler import e2e_resource
 from helpers import start_http_server
 
 pytestmark = pytest.mark.reuse_antfly_process
@@ -221,6 +222,7 @@ def test_native_grep_snapshot_survives_concurrent_mutation(stateful_api, tmp_pat
 
 
 @pytest.fixture
+@e2e_resource("antfly_process")
 def short_cursor_api(monkeypatch, request):
     import conftest
 
@@ -552,7 +554,7 @@ def test_native_grep_builtin_substring_and_regex_candidates(
     assert len(filtered.content) < len(full.content) // 8
     hits = filtered.json()["responses"][0]["hits"]["hits"]
     assert {h["_id"] for h in hits} == {"a", "d", "f"}
-    profile = filtered.json()["responses"][0]["profile"]["value_search"]
+    profile = filtered.json()["responses"][0]["profile"]["value_verification"]
     assert profile["documents"] >= 3 and profile["bytes"] > 0
     assert any(
         plan["candidate_field"] == "grep.content._substring"
@@ -563,7 +565,7 @@ def test_native_grep_builtin_substring_and_regex_candidates(
     def query_ids(query, execution=None):
         payload = {"query": query, "fields": [], "limit": 100}
         if execution is not None:
-            payload["value_search_execution"] = execution
+            payload["execution"] = {"value_verification": execution}
         response = requests.post(url, json=payload, timeout=60)
         assert response.status_code == 200, response.text
         return {h["_id"] for h in response.json()["responses"][0]["hits"]["hits"]}
@@ -589,19 +591,21 @@ def test_native_grep_builtin_substring_and_regex_candidates(
         url, json={"query": {"contains": "!", "field": "grep.content"}}, timeout=60
     )
     assert (
-        refused.status_code == 422 and "value_search_requires_scan" in refused.text
+        refused.status_code == 422
+        and "value_verification_requires_scan" in refused.text
     ), refused.text
     exhausted = requests.post(
         url,
         json={
             "query": {"contains": "TARGET", "field": "grep.content"},
             "count": True,
-            "value_search_execution": {"max_documents": 1},
+            "execution": {"value_verification": {"max_documents": 1}},
         },
         timeout=60,
     )
     assert (
-        exhausted.status_code == 422 and "value_search_limit_exceeded" in exhausted.text
+        exhausted.status_code == 422
+        and "value_verification_limit_exceeded" in exhausted.text
     ), exhausted.text
 
     def update_miss():
@@ -624,6 +628,38 @@ def test_native_grep_builtin_substring_and_regex_candidates(
     assert all(q["query"] == seen[0]["query"] for q in seen)
     assert all("remote_snapshot" in q for q in seen[1:])
     assert all("grep_scan" not in q for q in seen)
+
+
+def test_canonical_execution_rejects_removed_public_controls(stateful_api):
+    table = f"canonical_execution_{time.time_ns()}"
+    stateful_api.post(f"/tables/{table}", {"num_shards": 1})
+    stateful_api.batch_write(
+        table, inserts={"a": {"content": "needle"}}, sync_level="full_index"
+    )
+    url = stateful_api.url + f"/tables/{table}/query"
+    base = {"query": {"match_all": {}}, "limit": 1}
+    canonical = {
+        **base,
+        "execution": {"value_verification": {"max_documents": 1}},
+    }
+    response = requests.post(url, json=canonical, timeout=60)
+    assert response.status_code == 200, response.text
+    assert response.json()["responses"][0]["hits"]["total"]["value"] == 1
+    for removed, value in (
+        ("lake_read", {}),
+        ("lake_visibility", "accepted"),
+        ("value_search_execution", {}),
+        ("execution", {"max_documents": 1}),
+    ):
+        response = requests.post(url, json={**base, removed: value}, timeout=60)
+        assert response.status_code == 400, (removed, response.text)
+    for removed in ("lake_visibility", "lake_read"):
+        response = requests.post(
+            stateful_api.url + "/sql",
+            json={"statement": "SELECT 1", removed: "accepted"},
+            timeout=60,
+        )
+        assert response.status_code == 400, (removed, response.text)
 
 
 def test_logical_keyword_and_autocomplete_use_source_fields(stateful_api):
@@ -677,11 +713,11 @@ def test_logical_keyword_and_autocomplete_use_source_fields(stateful_api):
             {"a"} if "equals" in query else {"a", "b"}
         )
         if "equals" in query:
-            plan = result["profile"]["value_search"]["plans"][0]
+            plan = result["profile"]["value_verification"]["plans"][0]
             assert plan["field"] == "title" and plan["candidate_field"] is not None
             assert plan["verification"] == "lossless_keyword"
-            assert result["profile"]["value_search"]["documents"] == 0
-            assert result["profile"]["value_search"]["bytes"] == 0
+            assert result["profile"]["value_verification"]["documents"] == 0
+            assert result["profile"]["value_verification"]["bytes"] == 0
     capabilities = stateful_api.get(f"/tables/{table}")["field_capabilities"]
     title = [cap for cap in capabilities if cap.get("field") == "title"]
     assert len(title) == 1, capabilities
@@ -839,7 +875,7 @@ def test_logical_verification_reuses_sources_and_retained_predicate_facts(statef
     url = stateful_api.url + f"/tables/{table}/query"
     payload = {
         "query": {"contains": "needle", "field": "title"},
-        "value_search_execution": {"allow_scan": True},
+        "execution": {"value_verification": {"allow_scan": True}},
         "profile": True,
         "limit": 1,
         "order_by": [{"field": "_id", "desc": False}],
@@ -853,8 +889,28 @@ def test_logical_verification_reuses_sources_and_retained_predicate_facts(statef
         payload["search_after"] = page["hits"]["hits"][-1]["_sort"]
         payload["remote_snapshot"] = page["remote_snapshot"]
     assert [p["hits"]["hits"][0]["_id"] for p in pages] == ["000", "001", "002"]
-    assert [p["profile"]["value_search"]["documents"] for p in pages] == [20, 0, 0]
+    assert [p["profile"]["value_verification"]["documents"] for p in pages] == [
+        20,
+        0,
+        0,
+    ]
     assert all(p["hits"]["total"]["value"] == 20 for p in pages)
+
+    # A warm count must borrow the complete predicate without source work,
+    # including when the caller admits less verification than a cold scan needs.
+    warm_count = {
+        k: v for k, v in payload.items() if k not in ("search_after", "order_by")
+    }
+    warm_count["count"] = True
+    warm_count["execution"] = {
+        "value_verification": {"allow_scan": True, "max_documents": 1, "max_bytes": 1}
+    }
+    response = requests.post(url, json=warm_count, timeout=60)
+    assert response.status_code == 200, response.text
+    counted = response.json()["responses"][0]
+    assert counted["hits"]["total"]["value"] == 20, counted
+    assert counted["profile"]["value_verification"]["documents"] == 0, counted
+    assert counted["profile"]["value_verification"]["bytes"] == 0, counted
 
     # Reuse is predicate-specific, and excludes ordinary mutable queries.
     payload.pop("search_after")
@@ -871,8 +927,8 @@ def test_logical_verification_reuses_sources_and_retained_predicate_facts(statef
     response = requests.post(url, json=payload, timeout=60)
     assert response.status_code == 200, response.text
     result = response.json()["responses"][0]
-    assert result["profile"]["value_search"]["documents"] == 20
-    assert result["profile"]["value_search"]["bytes"] == 580
+    assert result["profile"]["value_verification"]["documents"] == 20
+    assert result["profile"]["value_verification"]["bytes"] == 580
 
     payload["query"] = {"contains": "absent", "field": "title"}
     payload["remote_snapshot"] = pages[0]["remote_snapshot"]
@@ -881,7 +937,7 @@ def test_logical_verification_reuses_sources_and_retained_predicate_facts(statef
     assert response.status_code == 200, response.text
     missing = response.json()["responses"][0]
     assert missing["hits"]["total"]["value"] == 0
-    assert missing["profile"]["value_search"]["documents"] == 20
+    assert missing["profile"]["value_verification"]["documents"] == 20
 
     # A newer cut must observe writes rather than reuse the earlier membership.
     stateful_api.batch_write(
@@ -893,7 +949,78 @@ def test_logical_verification_reuses_sources_and_retained_predicate_facts(statef
     assert response.status_code == 200, response.text
     fresh = response.json()["responses"][0]
     assert fresh["hits"]["total"]["value"] == 19
-    assert fresh["profile"]["value_search"]["documents"] == 20
+    assert fresh["profile"]["value_verification"]["documents"] == 20
+
+
+@pytest.mark.parametrize("num_shards", [1, 3])
+def test_logical_retained_boolean_counts_need_no_source_work(stateful_api, num_shards):
+    table = f"logical_boolean_count_{num_shards}_{time.time_ns()}"
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    stateful_api.batch_write(
+        table,
+        inserts={f"{i:03}": {"title": "needle alpha beta"} for i in range(20)},
+        sync_level="full_index",
+    )
+    leaves = [
+        {"contains": term, "field": "title"}
+        for term in ("needle", "alpha", "beta", "absent")
+    ]
+    url = stateful_api.url + f"/tables/{table}/query"
+    warm = requests.post(
+        url,
+        json={
+            "query": {"bool": {"should": leaves}},
+            "execution": {"value_verification": {"allow_scan": True}},
+            "profile": True,
+            "limit": 1,
+            "order_by": [{"field": "_id", "desc": False}],
+        },
+        timeout=60,
+    )
+    assert warm.status_code == 200, warm.text
+    snapshot = warm.json()["responses"][0]["remote_snapshot"]
+    cases = [
+        ({"must": leaves[:2]}, 20),
+        ({"should": leaves[2:]}, 20),
+        ({"should": [leaves[0], leaves[1], leaves[3]], "minimum_should_match": 2}, 20),
+        ({"must": leaves[:1], "must_not": leaves[1:2]}, 0),
+        ({"should": leaves[3:], "minimum_should_match": 0}, 20),
+        (
+            {"filter": leaves[0], "should": leaves[3:], "minimum_should_match": 1},
+            0,
+        ),
+        (
+            {
+                "must": [leaves[0]],
+                "filter": {"bool": {"should": [leaves[1], leaves[3]]}},
+                "must_not": [leaves[3]],
+            },
+            20,
+        ),
+    ]
+    for expression, expected in cases:
+        counted = requests.post(
+            url,
+            json={
+                "query": {"bool": expression},
+                "count": True,
+                "remote_snapshot": snapshot,
+                "profile": True,
+                "execution": {
+                    "value_verification": {
+                        "allow_scan": True,
+                        "max_documents": 1,
+                        "max_bytes": 1,
+                    }
+                },
+            },
+            timeout=60,
+        )
+        assert counted.status_code == 200, (expression, counted.text)
+        result = counted.json()["responses"][0]
+        assert result["hits"]["total"]["value"] == expected, result
+        assert result["profile"]["value_verification"]["documents"] == 0, result
+        assert result["profile"]["value_verification"]["bytes"] == 0, result
 
 
 def test_logical_verification_work_profile(stateful_api):
@@ -913,7 +1040,7 @@ def test_logical_verification_work_profile(stateful_api):
     stateful_api.batch_write(table, inserts=documents, sync_level="full_index")
     url = stateful_api.url + f"/tables/{table}/query"
     base = {
-        "value_search_execution": {"allow_scan": True},
+        "execution": {"value_verification": {"allow_scan": True}},
         "profile": True,
         "limit": 1,
         "fields": ["title"],
@@ -931,7 +1058,7 @@ def test_logical_verification_work_profile(stateful_api):
             {
                 "name": name,
                 "elapsed_ns": elapsed,
-                "value_search": result["profile"]["value_search"],
+                "value_verification": result["profile"]["value_verification"],
             }
         )
         return result
@@ -1031,11 +1158,13 @@ def test_logical_mixed_streaming_exceeds_decoded_source_cache(stateful_api):
             "fields": [],
             "profile": True,
             # Exactly one source pass fits. Repeated passes must fail admission.
-            "value_search_execution": {
-                "allow_scan": True,
-                "max_documents": documents,
-                "max_bytes": 20 * 1024 * 1024,
-                "max_regex_work": 1_000_000_000,
+            "execution": {
+                "value_verification": {
+                    "allow_scan": True,
+                    "max_documents": documents,
+                    "max_bytes": 20 * 1024 * 1024,
+                    "max_regex_work": 1_000_000_000,
+                }
             },
         },
         timeout=120,
@@ -1044,8 +1173,8 @@ def test_logical_mixed_streaming_exceeds_decoded_source_cache(stateful_api):
     result = response.json()["responses"][0]
     assert result["status"] == 200, result
     assert result["hits"]["total"] == {"value": documents, "relation": "exact"}
-    assert result["profile"]["value_search"]["documents"] == documents
-    assert result["profile"]["value_search"]["bytes"] == documents * len(
+    assert result["profile"]["value_verification"]["documents"] == documents
+    assert result["profile"]["value_verification"]["bytes"] == documents * len(
         json.dumps({"title": title}, separators=(",", ":")).encode()
     )
 
@@ -1096,10 +1225,12 @@ def test_logical_mixed_work_profile(stateful_api):
                     "limit": 1,
                     "fields": [],
                     "profile": True,
-                    "value_search_execution": {
-                        "allow_scan": True,
-                        "max_bytes": 256 * 1024 * 1024,
-                        "max_regex_work": 1000000000,
+                    "execution": {
+                        "value_verification": {
+                            "allow_scan": True,
+                            "max_bytes": 256 * 1024 * 1024,
+                            "max_regex_work": 1000000000,
+                        }
                     },
                 },
                 timeout=120,
@@ -1114,7 +1245,7 @@ def test_logical_mixed_work_profile(stateful_api):
                     "trial": trial,
                     "name": name,
                     "elapsed_ns": elapsed,
-                    "work": result["profile"]["value_search"],
+                    "work": result["profile"]["value_verification"],
                 }
             )
     corpus = hashlib.sha256()
@@ -1194,6 +1325,161 @@ def logical_process_reader(pid):
 
         return read
     pytest.skip("process qualification requires macOS or Linux")
+
+
+def qualification_query(body):
+    # Qualification-only adapter for immutable binaries predating the public
+    # execution envelope. Never used by CLI or server compatibility paths.
+    if os.environ.get("ANTFLY_BENCH_LEGACY_VALUE_WIRE") != "1":
+        return body
+    body = dict(body)
+    execution = body.pop("execution", None)
+    if execution is not None:
+        assert set(execution) == {"value_verification"}
+        body["value_search_execution"] = execution["value_verification"]
+    return body
+
+
+def qualification_verification(result):
+    key = (
+        "value_search"
+        if os.environ.get("ANTFLY_BENCH_LEGACY_VALUE_WIRE") == "1"
+        else "value_verification"
+    )
+    return result["profile"][key]
+
+
+def logical_process_io(pid):
+    """Linux process counters include background I/O, not just the timed RPC."""
+    path = Path(f"/proc/{pid}/io")
+    if not path.is_file():
+        return None
+    counters = dict(line.split(":", 1) for line in path.read_text().splitlines())
+    return {
+        name: int(counters[name])
+        for name in ("rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes")
+    }
+
+
+def test_logical_substring_ingestion_profile(stateful_api):
+    """Opt-in production substring pipeline: full_index publication and cleanup."""
+    import hashlib
+    import random
+
+    destination = os.environ.get("ANTFLY_LOGICAL_INGESTION_REPORT")
+    if not destination:
+        pytest.skip(
+            "set ANTFLY_LOGICAL_INGESTION_REPORT to profile substring ingestion"
+        )
+    assert stateful_api._server is not None
+    read_process = logical_process_reader(stateful_api._server.proc.pid)
+    size = 180 * 1024
+    random_source = random.Random(0x51FF1C)
+    corpora = {
+        "repetitive": ("needle-" * (size // 7 + 1))[:size],
+        "source_code": (
+            "pub fn function(value: usize) usize { return value + 997; }\n"
+            * (size // 32)
+        )[:size],
+        "distinct_word": "".join(
+            random_source.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(size)
+        ),
+    }
+    records = []
+    for name, content in corpora.items():
+        table = f"substring_ingestion_{name}_{time.time_ns()}"
+        stateful_api.post(
+            f"/tables/{table}",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "default_type": "doc",
+                    "document_schemas": {
+                        "doc": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "content": {
+                                        "type": "string",
+                                        "x-antfly-types": ["text", "substring"],
+                                    }
+                                },
+                            }
+                        }
+                    },
+                },
+            },
+        )
+        corpus = {f"{i:04}": {"content": content} for i in range(8)}
+        initial = read_process()
+        start = time.perf_counter_ns()
+        batches = []
+        for offset in range(0, len(corpus), 2):
+            before = read_process()
+            io_before = logical_process_io(stateful_api._server.proc.pid)
+            started = time.perf_counter_ns()
+            keys = list(corpus)[offset : offset + 2]
+            stateful_api.batch_write(
+                table, inserts={k: corpus[k] for k in keys}, sync_level="full_index"
+            )
+            request_elapsed_ns = time.perf_counter_ns() - started
+            after = read_process()
+            io_after = logical_process_io(stateful_api._server.proc.pid)
+            batches.append(
+                {
+                    "documents": len(keys),
+                    "http_ms": request_elapsed_ns / 1e6,
+                    "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1e6,
+                    "process_before": before,
+                    "process_after": after,
+                    "io_before": io_before,
+                    "io_after": io_after,
+                }
+            )
+        elapsed = time.perf_counter_ns() - start
+        final = read_process()
+        # Confirm the declared pipeline is actually admitted, then verify every
+        # row through its logical operation; timing covers writes, not this check.
+        caps = stateful_api.get(f"/tables/{table}")["field_capabilities"]
+        field = next(c for c in caps if c.get("field") == "content")
+        assert "substring" in {r["type"] for r in field["representations"]}, caps
+        result = stateful_api.post(
+            f"/tables/{table}/query",
+            {
+                "query": {"contains": content[:12], "field": "content"},
+                "limit": 10,
+            },
+        )["responses"][0]
+        assert {h["_id"] for h in result["hits"]["hits"]} == set(corpus), result
+        records.append(
+            {
+                "name": name,
+                "documents": len(corpus),
+                "source_bytes": len(content.encode()) * len(corpus),
+                "corpus_sha256": hashlib.sha256(
+                    json.dumps(corpus, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest(),
+                "http_ms": sum(batch["http_ms"] for batch in batches),
+                "wall_ms": elapsed / 1e6,
+                "cpu_ms": (final["cpu_ns"] - initial["cpu_ns"]) / 1e6,
+                "process_initial": initial,
+                "process_final": final,
+                "batches": batches,
+            }
+        )
+    with Path(os.environ["ANTFLY_BIN"]).open("rb") as binary:
+        binary_digest = hashlib.file_digest(binary, "sha256").hexdigest()
+    Path(destination).write_text(
+        json.dumps(
+            {
+                "protocol": 2,
+                "scope": "Schema-enabled substring pipeline; full_index batch writes include publication and cleanup. http_ms sums RPC durations; wall_ms includes inter-batch instrumentation. Process CPU and Linux I/O counters include background work; kernel I/O counters do not establish cold-device traffic. RSS samples are endpoints, not peak-memory bounds.",
+                "binary_sha256": binary_digest,
+                "records": records,
+            },
+            separators=(",", ":"),
+        )
+    )
 
 
 def test_logical_scalable_work_profile(stateful_api):
@@ -1300,11 +1586,13 @@ def test_logical_scalable_work_profile(stateful_api):
             "limit": 1,
             "fields": [],
             "profile": True,
-            "value_search_execution": {
-                "allow_scan": True,
-                "max_documents": count,
-                "max_bytes": 256 * 1024 * 1024,
-                "max_regex_work": 1000000000,
+            "execution": {
+                "value_verification": {
+                    "allow_scan": True,
+                    "max_documents": count,
+                    "max_bytes": 256 * 1024 * 1024,
+                    "max_regex_work": 1000000000,
+                }
             },
         }
         # Warm code and source caches explicitly; retain this observation and
@@ -1314,7 +1602,9 @@ def test_logical_scalable_work_profile(stateful_api):
         warm_cpu = read_process()["cpu_ns"]
         warm_started = time.perf_counter_ns()
         warm_response = requests.post(
-            stateful_api.url + f"/tables/{table}/query", json=query, timeout=90
+            stateful_api.url + f"/tables/{table}/query",
+            json=qualification_query(query),
+            timeout=90,
         )
         warm_elapsed = (time.perf_counter_ns() - warm_started) / 1000000
         assert warm_response.status_code == 200, warm_response.text
@@ -1323,7 +1613,7 @@ def test_logical_scalable_work_profile(stateful_api):
         warmup = {
             "http_ms": warm_elapsed,
             "cpu_ms": (read_process()["cpu_ns"] - warm_cpu) / 1000000,
-            "profile": warm_result["profile"]["value_search"],
+            "profile": qualification_verification(warm_result),
         }
         assert warmup["profile"]["documents"] == count, warmup
         # Use complete one-second windows so Linux's CPU-accounting tick is
@@ -1386,7 +1676,7 @@ def test_logical_scalable_work_profile(stateful_api):
                 started = time.perf_counter_ns()
                 with requests.post(
                     stateful_api.url + f"/tables/{table}/query",
-                    json=query,
+                    json=qualification_query(query),
                     timeout=90,
                     stream=True,
                 ) as response:
@@ -1399,7 +1689,7 @@ def test_logical_scalable_work_profile(stateful_api):
                 result = json.loads(body)["responses"][0]
                 first_result_ms = (time.perf_counter_ns() - started) / 1000000
                 assert result["hits"]["total"]["value"] == count, result
-                profile = result["profile"]["value_search"]
+                profile = qualification_verification(result)
                 assert profile["documents"] == count, profile
                 if profile.get("verification_metrics_version") == 1:
                     if os.environ.get("ANTFLY_BENCH_VALUE_SOURCE_SCALAR") != "1":
@@ -1461,7 +1751,7 @@ def test_logical_scalable_work_profile(stateful_api):
                 while sampler.poll() is None and time.monotonic() < deadline:
                     response = requests.post(
                         stateful_api.url + f"/tables/{table}/query",
-                        json=query,
+                        json=qualification_query(query),
                         timeout=90,
                     )
                     assert response.status_code == 200, response.text
@@ -1569,10 +1859,12 @@ def test_logical_stored_field_reads_preserve_updates_and_original_budgets(statef
         "limit": 0,
         "fields": [],
         "profile": True,
-        "value_search_execution": {
-            "allow_scan": True,
-            "max_documents": 96,
-            "max_bytes": 8 * 1024 * 1024,
+        "execution": {
+            "value_verification": {
+                "allow_scan": True,
+                "max_documents": 96,
+                "max_bytes": 8 * 1024 * 1024,
+            }
         },
     }
 
@@ -1584,7 +1876,7 @@ def test_logical_stored_field_reads_preserve_updates_and_original_budgets(statef
         result = response.json()["responses"][0]
         assert not result.get("error"), result
         assert result["hits"]["total"]["value"] == expected, result
-        profile = result["profile"]["value_search"]
+        profile = result["profile"]["value_verification"]
         assert profile["documents"] == 96, profile
         assert profile["bytes"] > 96 * 32 * 1024, profile
         if os.environ.get("ANTFLY_BENCH_VALUE_SOURCE_FULL_READ") != "1":
@@ -1604,9 +1896,11 @@ def test_logical_stored_field_reads_preserve_updates_and_original_budgets(statef
         check(95)
     small_budget = {
         **query,
-        "value_search_execution": {
-            **query["value_search_execution"],
-            "max_bytes": 1024,
+        "execution": {
+            "value_verification": {
+                **query["execution"]["value_verification"],
+                "max_bytes": 1024,
+            }
         },
     }
     rejected = requests.post(
@@ -1665,10 +1959,12 @@ def test_logical_source_concurrency_profile(stateful_api):
         "limit": 0,
         "fields": [],
         "profile": True,
-        "value_search_execution": {
-            "allow_scan": True,
-            "max_documents": count,
-            "max_bytes": 64 * 1024 * 1024,
+        "execution": {
+            "value_verification": {
+                "allow_scan": True,
+                "max_documents": count,
+                "max_bytes": 64 * 1024 * 1024,
+            }
         },
     }
 
@@ -1738,7 +2034,10 @@ def test_logical_source_concurrency_profile(stateful_api):
                 barrier.wait(timeout=30)
             started = time.perf_counter_ns()
             with requests.post(
-                api.url + f"/tables/{table}/query", json=query, timeout=90, stream=True
+                api.url + f"/tables/{table}/query",
+                json=qualification_query(query),
+                timeout=90,
+                stream=True,
             ) as response:
                 response.raw.decode_content = True
                 first = response.raw.read(1)
@@ -1748,7 +2047,7 @@ def test_logical_source_concurrency_profile(stateful_api):
             result = json.loads(body)["responses"][0]
             assert not result.get("error"), result
             assert result["hits"]["total"]["value"] == count, result
-            profile = result["profile"]["value_search"]
+            profile = qualification_verification(result)
             assert profile["documents"] == count, profile
             return {
                 "http_ms": (time.perf_counter_ns() - started) / 1e6,
@@ -1866,17 +2165,19 @@ def test_native_grep_nested_authority_keeps_retained_revisions(stateful_api, tmp
         "fields": [],
         "profile": True,
         "order_by": [{"field": "_id", "desc": False}],
-        "value_search_execution": {
-            "allow_scan": True,
-            "max_documents": 96,
-            "max_bytes": 8 * 1024 * 1024,
+        "execution": {
+            "value_verification": {
+                "allow_scan": True,
+                "max_documents": 96,
+                "max_bytes": 8 * 1024 * 1024,
+            }
         },
     }
     first = requests.post(url, json=payload, timeout=60)
     assert first.status_code == 200, first.text
     original = first.json()["responses"][0]
     assert original["hits"]["total"]["value"] == 96, original
-    profile = original["profile"]["value_search"]
+    profile = original["profile"]["value_verification"]
     if os.environ.get("ANTFLY_BENCH_VALUE_SOURCE_FULL_READ") != "1":
         assert profile["stored_field_sources"] > 0, profile
     result = run_grep(tmp_path, api.url, table, "--json", "needle", page_size=128)
@@ -1904,3 +2205,420 @@ def test_native_grep_nested_authority_keeps_retained_revisions(stateful_api, tmp
     current = requests.post(url, json=fresh, timeout=60)
     assert current.status_code == 200, current.text
     assert current.json()["responses"][0]["hits"]["total"]["value"] == 1, current.text
+
+
+def logical_phase_offsets(server):
+    if os.environ.get("ANTFLY_BENCH_LOGICAL_SOURCE_PHASES") != "1":
+        return {}
+    paths = (getattr(server, "log_path", None), getattr(server, "data_log_path", None))
+    return {path: path.stat().st_size for path in paths if path is not None}
+
+
+def logical_phase_records(offsets):
+    import re
+
+    records = []
+    for path, offset in offsets.items():
+        with path.open("rb") as stream:
+            stream.seek(offset)
+            lines = stream.read().decode("utf-8", errors="replace").splitlines()
+        for line in lines:
+            match = re.search(
+                r"antfly_bench_(logical_sources|logical_source_lookup) (.*)", line
+            )
+            if match:
+                values = {
+                    key: int(value)
+                    for key, value in re.findall(r"(\w+)=(\d+)", match[2])
+                }
+                records.append({"phase": match[1], **values})
+    return records
+
+
+def test_logical_retained_source_hint_profile(stateful_api):
+    """Opt-in repeated reader calibration with distinct, uncached predicates."""
+    import hashlib
+    import platform
+
+    report = os.environ.get("ANTFLY_LOGICAL_HINT_REPORT")
+    if not report:
+        pytest.skip("Set ANTFLY_LOGICAL_HINT_REPORT to capture provider calibration")
+    words = [f"needle{i:02}" for i in range(12)]
+    title = "seed " + " ".join(words) + " " + "x" * 1024
+    documents = {f"{i:06}": {"title": title, "unused": "z" * 16384} for i in range(512)}
+    table = f"logical_hint_profile_{time.time_ns()}"
+    stateful_api.create_table(table)
+    for start in range(0, len(documents), 128):
+        keys = list(documents)[start : start + 128]
+        stateful_api.batch_write(
+            table,
+            inserts={key: documents[key] for key in keys},
+            sync_level="full_index",
+        )
+    url = stateful_api.url + f"/tables/{table}/query"
+    policy = {"value_verification": {"allow_scan": True}}
+    warm = requests.post(
+        url,
+        json=qualification_query(
+            {
+                "query": {"contains": "seed", "field": "title"},
+                "execution": policy,
+                "order_by": [{"field": "_id", "desc": False}],
+                "limit": 1,
+            }
+        ),
+        timeout=90,
+    )
+    assert warm.status_code == 200, warm.text
+    snapshot = warm.json()["responses"][0]["remote_snapshot"]
+    assert stateful_api._server is not None
+    read_process = logical_process_reader(stateful_api._server.proc.pid)
+    runs = []
+    for word in words:
+        phase_offsets = logical_phase_offsets(stateful_api._server)
+        before = read_process()
+        start = time.perf_counter_ns()
+        response = requests.post(
+            url,
+            json=qualification_query(
+                {
+                    "query": {"contains": word, "field": "title"},
+                    "execution": policy,
+                    "remote_snapshot": snapshot,
+                    "count": True,
+                    "fields": [],
+                    "limit": 0,
+                    "profile": True,
+                }
+            ),
+            timeout=90,
+        )
+        elapsed = (time.perf_counter_ns() - start) / 1_000_000
+        after = read_process()
+        assert response.status_code == 200, response.text
+        result = response.json()["responses"][0]
+        assert result["hits"]["total"]["value"] == len(documents), result
+        profile = qualification_verification(result)
+        # Every predicate is new: membership reuse must not make calibration
+        # look cheaper by skipping the provider reads being measured.
+        assert profile["documents"] == len(documents), profile
+        runs.append(
+            {
+                "predicate": word,
+                "http_ms": elapsed,
+                "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1_000_000,
+                "process_before": before,
+                "process_after": after,
+                "profile": profile,
+                "source_phase_probes": logical_phase_records(phase_offsets),
+            }
+        )
+    with Path(os.environ["ANTFLY_BIN"]).open("rb") as binary:
+        binary_sha256 = hashlib.file_digest(binary, "sha256").hexdigest()
+    destination = Path(report)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(
+            {
+                "protocol": 1,
+                "platform": platform.platform(),
+                "binary_sha256": binary_sha256,
+                "scope": "Warm retained source, distinct unindexed predicates; every measured request verifies the entire corpus. Latency includes HTTP and host contention. No predicate-hit speedup is included.",
+                "records": [
+                    {
+                        "name": "retained_distinct_predicates",
+                        "documents": len(documents),
+                        "corpus_sha256": hashlib.sha256(
+                            json.dumps(documents, sort_keys=True).encode()
+                        ).hexdigest(),
+                        "runs": runs,
+                    }
+                ],
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def test_logical_retained_page_profile(stateful_api):
+    """Opt-in warm membership pages, with real ID ordering and no source reads."""
+    import hashlib
+    import platform
+
+    report = os.environ.get("ANTFLY_LOGICAL_PAGES_REPORT")
+    if not report:
+        pytest.skip("Set ANTFLY_LOGICAL_PAGES_REPORT to measure retained pages")
+    count = 16384
+    documents = {
+        f"{i:06}": {
+            "title": "needle" if i % 16 == 0 else "other",
+            "dense": "needle",
+            "unused": "payload",
+        }
+        for i in range(count)
+    }
+    table = f"logical_pages_{time.time_ns()}"
+    stateful_api.create_table(table)
+    keys = list(documents)
+    for start in range(0, count, 512):
+        stateful_api.batch_write(
+            table,
+            inserts={key: documents[key] for key in keys[start : start + 512]},
+            sync_level="full_index",
+        )
+    url = stateful_api.url + f"/tables/{table}/query"
+    base = {
+        "query": {"contains": "needle", "field": "dense"},
+        "execution": {"value_verification": {"allow_scan": True}},
+        "order_by": [{"field": "_id", "desc": False}],
+        "fields": [],
+    }
+    warm = requests.post(
+        url, json=qualification_query({**base, "limit": 1}), timeout=90
+    )
+    assert warm.status_code == 200, warm.text
+    snapshot = warm.json()["responses"][0]["remote_snapshot"]
+    assert stateful_api._server is not None
+    read_process = logical_process_reader(stateful_api._server.proc.pid)
+    records = []
+    for label, field, selected in (
+        ("dense", "dense", keys),
+        ("sparse", "title", keys[::16]),
+    ):
+        query_base = {**base, "query": {"contains": "needle", "field": field}}
+        complete_body = {
+            **query_base,
+            "remote_snapshot": snapshot,
+            "count": True,
+            "limit": 0,
+        }
+        complete_body.pop("order_by")
+        complete = requests.post(
+            url, json=qualification_query(complete_body), timeout=90
+        )
+        assert complete.status_code == 200, complete.text
+        assert complete.json()["responses"][0]["hits"]["total"]["value"] == len(
+            selected
+        ), complete.text
+        runs = []
+        for _ in range(3):
+            for offset in (0, len(selected) // 2, len(selected) - 64):
+                body = {
+                    **query_base,
+                    "remote_snapshot": snapshot,
+                    "profile": True,
+                    "limit": 64,
+                }
+                if offset:
+                    body["search_after"] = [selected[offset - 1]]
+                phase_offsets = logical_phase_offsets(stateful_api._server)
+                before = read_process()
+                started = time.perf_counter_ns()
+                response = requests.post(
+                    url, json=qualification_query(body), timeout=90
+                )
+                elapsed = (time.perf_counter_ns() - started) / 1_000_000
+                after = read_process()
+                assert response.status_code == 200, response.text
+                result = response.json()["responses"][0]
+                assert [hit["_id"] for hit in result["hits"]["hits"]] == selected[
+                    offset : offset + 64
+                ], result
+                profile = qualification_verification(result)
+                assert profile["documents"] == 0, profile
+                runs.append(
+                    {
+                        "offset": offset,
+                        "http_ms": elapsed,
+                        "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1_000_000,
+                        "process_before": before,
+                        "process_after": after,
+                        "profile": profile,
+                        "source_phase_probes": logical_phase_records(phase_offsets),
+                    }
+                )
+        records.append(
+            {
+                "name": "retained_pages_" + label,
+                "documents": count,
+                "matches": len(selected),
+                "runs": runs,
+            }
+        )
+    with Path(os.environ["ANTFLY_BIN"]).open("rb") as stream:
+        binary_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+    destination = Path(report)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(
+            {
+                "protocol": 1,
+                "platform": platform.platform(),
+                "binary_sha256": binary_sha,
+                "scope": "Warm retained complete membership, public ID ordering, three page positions. Every measured request must verify zero source documents. Phase-instrumented trials are separate from ordinary latency qualification.",
+                "corpus_sha256": hashlib.sha256(
+                    json.dumps(documents, sort_keys=True).encode()
+                ).hexdigest(),
+                "records": records,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+@pytest.mark.parametrize("change", [None, "revision", "permissions"])
+@pytest.mark.parametrize("parents", [1, 8])
+def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
+    stateful_api, tmp_path, change, parents
+):
+    """Real query server; only inference is a fixed-answer local fixture."""
+    import hashlib
+
+    image = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII="
+    )
+    table = f"grep_visual_{time.time_ns()}"
+    stateful_api.create_table(table)
+    item = document("Drive/chart.png", "")
+    item["grep"].update(
+        version=2,
+        evidence=[
+            {
+                "id": "image",
+                "kind": "image",
+                "asset": {
+                    "field": "payloads.image",
+                    "sha256": hashlib.sha256(image).hexdigest(),
+                    "mime_type": "image/png",
+                    "byte_length": len(image),
+                    "recipe": "original-v1",
+                },
+            }
+        ],
+    )
+    item["payloads"] = {
+        "image": "data:image/png;base64," + base64.b64encode(image).decode(),
+        "unrelated": "x" * 262144,
+    }
+    import copy
+
+    identities = [f"source-{i}" for i in range(parents)]
+    documents = {identity: copy.deepcopy(item) for identity in identities}
+    for i, value in enumerate(documents.values()):
+        value["grep"]["path"] = f"Drive/chart{i}.png"
+    item = documents[identities[0]]
+    stateful_api.batch_write(table, inserts=documents, sync_level="full_index")
+    seen, responses, provider_calls = [], [], []
+
+    class QueryProxy(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(body)
+            response = requests.post(
+                stateful_api.url + f"/tables/{table}/query", json=body, timeout=60
+            )
+            try:
+                responses.append(response.json())
+            except ValueError:
+                responses.append(
+                    {
+                        "http_status": response.status_code,
+                        "body": response.text,
+                        "logs": stateful_api.debug_logs()[-6000:],
+                    }
+                )
+            if len(seen) == 1 and change:
+                if change == "revision":
+                    item["grep"]["revision"] = "new-revision"
+                else:
+                    item["grep"]["permissions"] = {"public": False, "readers": []}
+                stateful_api.batch_write(
+                    table, inserts={identities[0]: item}, sync_level="full_index"
+                )
+            self.send_response(response.status_code)
+            self.send_header("Content-Length", str(len(response.content)))
+            self.end_headers()
+            self.wfile.write(response.content)
+
+    class Decisions(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            provider_calls.append(body)
+            data = [
+                {
+                    "input_index": i,
+                    "id": entry["id"],
+                    "answers": [
+                        {"type": "predicate", "name": q["name"], "probability": 0.9}
+                        for q in body["questions"]
+                    ],
+                }
+                for i, entry in enumerate(body["inputs"])
+            ]
+            payload = json.dumps({"data": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    query = ThreadingHTTPServer(("127.0.0.1", 0), QueryProxy)
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), Decisions)
+    threads = [start_http_server(query), start_http_server(provider)]
+    try:
+        result = run_grep(
+            tmp_path,
+            f"http://127.0.0.1:{query.server_port}",
+            table,
+            "--media=images",
+            "--ask=Does this contain a chart?",
+            "--model=fixture",
+            "--endpoint",
+            f"http://127.0.0.1:{provider.server_port}/decisions",
+            "--no-cache",
+            "--json",
+            "--decision-concurrency=8",
+            "--decision-batch-wait-ms=20",
+            page_size=16,
+        )
+        assert len(seen) == 2, (seen, result.stderr.decode())
+        assert seen[0]["order_by"] == [{"field": "_id", "desc": False}]
+        assert responses[0]["responses"][0]["remote_snapshot"]
+        point = seen[1]
+        assert point["query"] == {"bool": {"filter": {"ids": identities}}}
+        assert "execution" not in point
+        assert not {"order_by", "search_after", "remote_snapshot"} & point.keys()
+        assert set(point["fields"]) == {
+            "grep.revision",
+            "grep.permissions",
+            "payloads.image",
+        }
+        assert "responses" in responses[1], responses[1]
+        assert not responses[1]["responses"][0].get("remote_snapshot")
+        if change:
+            assert result.returncode == 2, result.stdout
+            assert "Drive/chart0.png" not in json.dumps(provider_calls)
+            assert sum(len(call["inputs"]) for call in provider_calls) == parents - 1
+            expected = (
+                b"EvidenceRevisionChanged"
+                if change == "revision"
+                else b"IndexAuthorizationFailed"
+            )
+            assert expected in result.stderr
+        else:
+            assert result.returncode == 0, result.stderr.decode()
+            assert len(provider_calls) == 1
+            assert len(provider_calls[0]["inputs"]) == parents
+            assert json.loads(result.stdout.splitlines()[0])["type"] == "evidence"
+    finally:
+        for server, thread in zip((query, provider), threads, strict=True):
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()

@@ -93,8 +93,10 @@ pub fn describe(err: anyerror) Diagnostic {
         error.ReadRequirementNotReady => .{ .code = "53300", .message = "The requested write is not yet visible within the readiness budget.", .retryable = true },
         error.ReadSnapshotTooOld => .{ .code = "40001", .message = "The transaction snapshot cannot include the requested write.", .hint = "Start a new transaction with the write receipt before its first read.", .retryable = false },
         error.InvalidDecisionSpecification, error.InvalidDeciderConfig => .{ .code = "22023", .message = "The decision specification is invalid.", .retryable = false },
+        error.InvalidInferenceMedia => .{ .code = "22023", .message = "The inference image evidence is malformed or does not match its declared format.", .retryable = false },
         error.UnknownDecider => .{ .code = "42704", .message = "The configured decider does not exist.", .retryable = false },
         error.DecisionLimitExceeded => .{ .code = "54000", .message = "The decision evaluation budget was exceeded.", .retryable = false },
+        error.ConstrainedInputTooLarge => .{ .code = "54000", .message = "The inference input exceeds the model or batch limit.", .retryable = false },
         error.DecisionRateLimited, error.DecisionProviderUnavailable, error.MissingDecisionApiKey => .{ .code = "53300", .message = "The decision provider is unavailable or rate limited.", .retryable = false },
         error.InvalidDecisionOutput, error.DecisionUpstreamFailure, error.DecisionUnauthorized => .{ .code = "38000", .message = "The decision provider failed.", .retryable = false },
         error.SqlPreparedNotFound => .{ .code = "26000", .message = "The prepared resource is unknown, expired or inaccessible.", .retryable = false },
@@ -415,4 +417,20 @@ test "SQL context-specific assignment window and conflict diagnostics preserve P
     try std.testing.expectEqual(@as(?bool, false), conflict.retryable);
     try std.testing.expect(!isRowEvaluationError(error.SqlWindowingError));
     try std.testing.expect(isRowEvaluationError(error.SqlConflictCardinalityViolation));
+}
+
+test "SQL decision evidence failures are nonretryable client diagnostics" {
+    const cases = [_]struct { err: anyerror, code: []const u8 }{
+        .{ .err = error.InvalidInferenceMedia, .code = "22023" },
+        .{ .err = error.ConstrainedInputTooLarge, .code = "54000" },
+    };
+    for (cases) |case| {
+        const diagnostic = describe(case.err);
+        try std.testing.expectEqualStrings(case.code, diagnostic.code);
+        try std.testing.expectEqual(@as(u16, 400), diagnostic.httpStatus());
+        try std.testing.expectEqual(@as(?bool, false), diagnostic.retryable);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, @errorName(case.err)) == null);
+    }
+    try std.testing.expectEqualStrings("38000", describe(error.InvalidDecisionOutput).code);
+    try std.testing.expectEqual(@as(u16, 502), describe(error.InvalidDecisionOutput).httpStatus());
 }

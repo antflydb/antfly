@@ -39,6 +39,7 @@ extern fn CGPDFDocumentRelease(document: *CGPDFDocument) void;
 extern fn CGPDFDocumentGetNumberOfPages(document: *CGPDFDocument) usize;
 extern fn CGPDFDocumentGetPage(document: *CGPDFDocument, page_number: usize) ?*CGPDFPage;
 extern fn CGPDFPageGetBoxRect(page: *CGPDFPage, box: c_int) CGRect;
+extern fn CGPDFPageGetRotationAngle(page: *CGPDFPage) c_int;
 extern fn CGPDFPageGetDrawingTransform(page: *CGPDFPage, box: c_int, rect: CGRect, rotate: c_int, preserve_aspect_ratio: bool) CGAffineTransform;
 extern fn CGColorSpaceCreateDeviceRGB() ?*CGColorSpace;
 extern fn CGColorSpaceRelease(space: *CGColorSpace) void;
@@ -57,19 +58,18 @@ pub fn renderPagePngAlloc(
     output_alloc: std.mem.Allocator,
     pdf_bytes: []const u8,
     page_number: usize,
-    dpi: u16,
+    canvas_size: render.CanvasSize,
     max_pixels: u64,
-    rotation: render.PageRotation,
 ) ![]u8 {
     var session = try Session.init(pdf_bytes);
     defer session.deinit();
-    return try session.renderPagePngAlloc(scratch_alloc, output_alloc, page_number, dpi, max_pixels, rotation);
+    return try session.renderPagePngAlloc(scratch_alloc, output_alloc, page_number, canvas_size, max_pixels);
 }
 
-pub fn renderPageRgbaAlloc(alloc: std.mem.Allocator, pdf_bytes: []const u8, page_number: usize, dpi: u16, max_pixels: u64, rotation: render.PageRotation) !render.RgbaCanvas {
+pub fn renderPageRgbaAlloc(alloc: std.mem.Allocator, pdf_bytes: []const u8, page_number: usize, canvas_size: render.CanvasSize, max_pixels: u64) !render.RgbaCanvas {
     var session = try Session.init(pdf_bytes);
     defer session.deinit();
-    return session.renderPageRgbaAlloc(alloc, page_number, dpi, max_pixels, rotation);
+    return session.renderPageRgbaAlloc(alloc, page_number, canvas_size, max_pixels);
 }
 
 pub const SharedSession = struct {
@@ -97,9 +97,8 @@ pub const SharedSession = struct {
         scratch_alloc: std.mem.Allocator,
         output_alloc: std.mem.Allocator,
         page_number: usize,
-        dpi: u16,
+        canvas_size: render.CanvasSize,
         max_pixels: u64,
-        rotation: render.PageRotation,
         cancellation: anytype,
     ) ![]u8 {
         // CoreGraphics document concurrency and retained allocation behavior
@@ -114,18 +113,18 @@ pub const SharedSession = struct {
         // CoreGraphics once the current page releases the document session.
         try cancellation.check();
         if (self.session == null) self.session = try Session.init(self.pdf_bytes);
-        return try self.session.?.renderPagePngAlloc(scratch_alloc, output_alloc, page_number, dpi, max_pixels, rotation);
+        return try self.session.?.renderPagePngAlloc(scratch_alloc, output_alloc, page_number, canvas_size, max_pixels);
     }
 
     /// Only the final canvas is charged to the retained-output allocator.
     /// Keep the same document lock and cancellation boundary as PNG rendering.
-    pub fn renderPageRgbaAlloc(self: *@This(), alloc: std.mem.Allocator, page_number: usize, dpi: u16, max_pixels: u64, rotation: render.PageRotation, cancellation: anytype) !render.RgbaCanvas {
+    pub fn renderPageRgbaAlloc(self: *@This(), alloc: std.mem.Allocator, page_number: usize, canvas_size: render.CanvasSize, max_pixels: u64, cancellation: anytype) !render.RgbaCanvas {
         try cancellation.check();
         self.mutex.lockUncancelable(self.sync_io);
         defer self.mutex.unlock(self.sync_io);
         try cancellation.check();
         if (self.session == null) self.session = try Session.init(self.pdf_bytes);
-        const raw = try self.session.?.renderPageRgbaAlloc(alloc, page_number, dpi, max_pixels, rotation);
+        const raw = try self.session.?.renderPageRgbaAlloc(alloc, page_number, canvas_size, max_pixels);
         errdefer alloc.free(raw.rgba);
         try cancellation.check();
         return raw;
@@ -145,9 +144,8 @@ test "shared session checks cancellation before opening the document" {
         std.testing.allocator,
         std.testing.allocator,
         1,
-        72,
+        .{ .width = 612, .height = 792 },
         1_000_000,
-        .none,
         Cancelled{},
     ));
 }
@@ -158,14 +156,14 @@ test "compatibility raster needs only one retained canvas and matches PNG" {
     const Probe = struct {
         fn check(_: @This()) !void {}
     };
-    const png = try session.renderPagePngAlloc(std.testing.allocator, std.testing.allocator, 1, 72, 1_000_000, .none, Probe{});
+    const png = try session.renderPagePngAlloc(std.testing.allocator, std.testing.allocator, 1, .{ .width = 612, .height = 792 }, 1_000_000, Probe{});
     defer std.testing.allocator.free(png);
     const decoded = try image.png.decodeRgba(std.testing.allocator, png);
     defer std.testing.allocator.free(decoded.rgba);
     const storage = try std.testing.allocator.alloc(u8, decoded.rgba.len);
     defer std.testing.allocator.free(storage);
     var output = std.heap.FixedBufferAllocator.init(storage);
-    const raw = try session.renderPageRgbaAlloc(output.allocator(), 1, 72, 1_000_000, .none, Probe{});
+    const raw = try session.renderPageRgbaAlloc(output.allocator(), 1, .{ .width = 612, .height = 792 }, 1_000_000, Probe{});
     defer output.allocator().free(raw.rgba);
     try std.testing.expectEqualSlices(u8, decoded.rgba, raw.rgba);
     try std.testing.expectEqual(storage.len, output.end_index);
@@ -178,14 +176,14 @@ test "compatibility PNG retains only encoded bytes under the output budget" {
     const Probe = struct {
         fn check(_: @This()) !void {}
     };
-    const reference_png = try session.renderPagePngAlloc(alloc, alloc, 1, 72, 1_000_000, .none, Probe{});
+    const reference_png = try session.renderPagePngAlloc(alloc, alloc, 1, .{ .width = 612, .height = 792 }, 1_000_000, Probe{});
     defer alloc.free(reference_png);
     const reference = try image.png.decodeRgba(alloc, reference_png);
     defer alloc.free(reference.rgba);
     const storage = try alloc.alloc(u8, reference_png.len);
     defer alloc.free(storage);
     var output = std.heap.FixedBufferAllocator.init(storage);
-    const png = try session.renderPagePngAlloc(alloc, output.allocator(), 1, 72, 1_000_000, .none, Probe{});
+    const png = try session.renderPagePngAlloc(alloc, output.allocator(), 1, .{ .width = 612, .height = 792 }, 1_000_000, Probe{});
     defer output.allocator().free(png);
     const decoded = try image.png.decodeRgba(alloc, png);
     defer alloc.free(decoded.rgba);
@@ -225,30 +223,24 @@ pub const Session = struct {
         scratch_alloc: std.mem.Allocator,
         output_alloc: std.mem.Allocator,
         page_number: usize,
-        dpi: u16,
+        canvas_size: render.CanvasSize,
         max_pixels: u64,
-        rotation: render.PageRotation,
     ) ![]u8 {
-        const raw = try self.renderPageRgbaAlloc(scratch_alloc, page_number, dpi, max_pixels, rotation);
+        const raw = try self.renderPageRgbaAlloc(scratch_alloc, page_number, canvas_size, max_pixels);
         defer scratch_alloc.free(raw.rgba);
         return image.png.encodeRgbaWithCancellation(scratch_alloc, output_alloc, @intCast(raw.width), @intCast(raw.height), raw.rgba, .{});
     }
 
-    pub fn renderPageRgbaAlloc(self: *@This(), alloc: std.mem.Allocator, page_number: usize, dpi: u16, max_pixels: u64, rotation: render.PageRotation) !render.RgbaCanvas {
+    pub fn renderPageRgbaAlloc(self: *@This(), alloc: std.mem.Allocator, page_number: usize, canvas_size: render.CanvasSize, max_pixels: u64) !render.RgbaCanvas {
         if (page_number == 0) return error.InvalidPageNumber;
         if (page_number > CGPDFDocumentGetNumberOfPages(self.document)) return error.InvalidPageNumber;
         const page = CGPDFDocumentGetPage(self.document, page_number) orelse return error.SystemPdfRenderingFailed;
         const box = CGPDFPageGetBoxRect(page, crop_box);
-        if (!(box.size.width > 0) or !(box.size.height > 0)) return error.InvalidPageBox;
-        const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
-        const swaps_dimensions = rotation == .clockwise_90 or rotation == .clockwise_270;
-        const display_width = if (swaps_dimensions) box.size.height else box.size.width;
-        const display_height = if (swaps_dimensions) box.size.width else box.size.height;
-        const width_f = @ceil(display_width * scale);
-        const height_f = @ceil(display_height * scale);
-        if (width_f > @as(f64, @floatFromInt(std.math.maxInt(u32))) or height_f > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return error.RenderedPageTooLarge;
-        const width: u32 = @intFromFloat(width_f);
-        const height: u32 = @intFromFloat(height_f);
+        if (!(box.size.width > 0) or !(box.size.height > 0) or !std.math.isFinite(box.size.width) or !std.math.isFinite(box.size.height)) return error.InvalidPageBox;
+        // Allocation and metadata must use the parser's admitted integer
+        // canvas, not a second rounding of CoreGraphics' floating CropBox.
+        const width = std.math.cast(u32, canvas_size.width) orelse return error.RenderedPageTooLarge;
+        const height = std.math.cast(u32, canvas_size.height) orelse return error.RenderedPageTooLarge;
         const pixel_count = @as(u64, width) * @as(u64, height);
         if (pixel_count == 0 or pixel_count > max_pixels) return error.RenderedPageTooLarge;
         const row_bytes = std.math.mul(usize, width, 4) catch return error.RenderedPageTooLarge;
@@ -262,7 +254,24 @@ pub const Session = struct {
         const destination = CGRect{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = @floatFromInt(width), .height = @floatFromInt(height) } };
         CGContextSetRGBFillColor(context, 1, 1, 1, 1);
         CGContextFillRect(context, destination);
-        CGContextConcatCTM(context, CGPDFPageGetDrawingTransform(page, crop_box, destination, 0, true));
+        // GetDrawingTransform only scales down. Obtain the logical page
+        // transform first, then scale its basis and translation explicitly.
+        const quarter_turn = switch (@mod(CGPDFPageGetRotationAngle(page), 360)) {
+            90, 270 => true,
+            else => false,
+        };
+        const page_width = if (quarter_turn) box.size.height else box.size.width;
+        const page_height = if (quarter_turn) box.size.width else box.size.height;
+        const point_destination = CGRect{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = page_width, .height = page_height } };
+        var transform = CGPDFPageGetDrawingTransform(page, crop_box, point_destination, 0, true);
+        const scale = @min(destination.size.width / page_width, destination.size.height / page_height);
+        transform.a *= scale;
+        transform.b *= scale;
+        transform.c *= scale;
+        transform.d *= scale;
+        transform.tx = transform.tx * scale + (destination.size.width - page_width * scale) / 2;
+        transform.ty = transform.ty * scale + (destination.size.height - page_height * scale) / 2;
+        CGContextConcatCTM(context, transform);
         CGContextDrawPDFPage(context, page);
         return .{ .rgba = rgba, .width = width, .height = height };
     }

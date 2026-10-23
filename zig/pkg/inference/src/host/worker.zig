@@ -32,6 +32,7 @@ const ForwardControl = struct {
     progress: bridge.ProgressView = .{},
     stream: http.StreamSink = .{},
     stream_started: bool = false,
+    body_source: http.RequestBodySource = .{},
 
     fn check(raw: ?*anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -62,8 +63,16 @@ const ForwardControl = struct {
         }
     }
 
+    fn readBody(raw: ?*anyopaque, dest: []u8) !usize {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try check(raw);
+        var count: usize = 0;
+        try callbackResult((self.body_source.read orelse return error.BodySourceUnavailable)(self.body_source.context, dest.ptr, dest.len, &count));
+        if (count > dest.len) return error.BodyReadFailed;
+        return count;
+    }
     fn view(self: *@This()) rpc.Control {
-        return .{ .ptr = self, .check = check, .event = event };
+        return .{ .ptr = self, .check = check, .event = event, .read_body = if (self.body_source.read != null) readBody else null };
     }
 };
 
@@ -115,10 +124,13 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
     const alloc = arena.allocator();
     // Events can be numerous on a long stream: use a freeing allocator rather
     // than retaining every decoded frame in the request arena.
-    var control = ForwardControl{ .alloc = client.alloc, .cancellation = context.cancellation, .stream = context.stream };
+    var control = ForwardControl{ .alloc = client.alloc, .cancellation = context.cancellation, .stream = context.stream, .body_source = context.body_source };
     try ForwardControl.check(&control);
     var body = context.request.body;
-    if (body.slice() == null) if (context.body_source.read_all) |read| {
+    const streaming_body = context.body_source.streaming != 0 and context.body_source.read != null and
+        std.mem.endsWith(u8, context.request.path.slice(), "/stream") and
+        std.mem.indexOf(u8, context.request.path.slice(), "/transcription/sessions/") != null;
+    if (!streaming_body and body.slice() == null) if (context.body_source.read_all) |read| {
         try callbackResult(read(context.body_source.context, &body));
     };
     const headers = try alloc.alloc(wire.Header, context.request.headers_len);
@@ -135,6 +147,7 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
         .headers = headers,
         .params = params,
         .has_body = body.slice() != null,
+        .streaming_body = streaming_body,
     }, .{});
     const result = client.invoke(.http, data, body.slice() orelse "", control.view()) catch |err| {
         if (control.stream_started) return err;
@@ -149,7 +162,7 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
             var response = httpx.Response.init(client.alloc, 503);
             errdefer response.deinit();
             try response.headers.append("content-type", "application/json");
-            response.body = "{\"error\":\"inference worker executable not configured; set ANTFLY_INFERENCE_WORKER to an antfly-inference-worker or antfly-lite executable\",\"code\":\"InferenceWorkerExecutableNotConfigured\"}";
+            response.body = "{\"error\":\"inference worker executable not configured; set ANTFLY_INFERENCE_WORKER to an antfly executable\",\"code\":\"InferenceWorkerExecutableNotConfigured\"}";
             return response;
         }
         if (err == error.InferenceWorkerUnavailable or err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) {
@@ -245,7 +258,7 @@ pub const Client = struct {
             .stderr = .inherit,
             .environ_map = &self.environment,
         }) catch |err| {
-            std.log.warn("could not start inference worker executable={s} err={s}; set {s} to an executable antfly-inference-worker or antfly-lite binary", .{ executable, @errorName(err), worker_executable_env });
+            std.log.warn("could not start inference worker executable={s} err={s}; set {s} to an executable antfly binary", .{ executable, @errorName(err), worker_executable_env });
             return switch (err) {
                 error.FileNotFound, error.AccessDenied, error.InvalidExe => error.InferenceWorkerExecutableNotConfigured,
                 else => err,
@@ -333,9 +346,7 @@ fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []c
 /// Explicit override for the worker executable. Takes priority over every
 /// other resolution step; see `resolveWorkerExecutable`.
 const worker_executable_env = "ANTFLY_INFERENCE_WORKER";
-const inference_worker_binary_name = if (builtin.target.os.tag == .windows) "antfly-inference-worker.exe" else "antfly-inference-worker";
-const lite_binary_name = if (builtin.target.os.tag == .windows) "antfly-lite.exe" else "antfly-lite";
-const worker_binary_names = [_][]const u8{ inference_worker_binary_name, lite_binary_name };
+const worker_binary_names = [_][]const u8{if (builtin.target.os.tag == .windows) "antfly.exe" else "antfly"};
 
 /// Layout shared by glibc, musl, and Darwin's libc; sufficient to recover the
 /// path of the image an address was loaded from.
@@ -397,8 +408,8 @@ fn findOnPathAlloc(alloc: std.mem.Allocator, io: std.Io, name: []const u8) !?[]u
 ///  2. The image this code was loaded from, via `dladdr`: for the statically
 ///     linked `antfly` binary this resolves to itself (unchanged behavior);
 ///     for a shared `libantfly`, it resolves to the `.dylib`/`.so`, next to
-///     which we look for a sibling Apache worker or Lite binary.
-///  3. An Apache worker or Lite binary on `PATH`.
+///     which we look for a sibling antfly binary.
+///  3. An antfly binary on `PATH`.
 fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
     if (platform.env.getenvSlice(worker_executable_env)) |override| {
         if (override.len == 0) return error.InferenceWorkerExecutableNotConfigured;
@@ -420,7 +431,7 @@ fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
     }
     std.log.err(
         "no inference worker executable found for the embedded runtime; set {s} to the path " ++
-            "of an `antfly-inference-worker` or `antfly-lite` executable next to the loaded libantfly or on PATH",
+            "of an `antfly` executable next to the loaded libantfly or on PATH",
         .{worker_executable_env},
     );
     return error.InferenceWorkerExecutableNotConfigured;
@@ -717,6 +728,7 @@ const Child = struct {
                     .route_handle = route_handle,
                     .request = &view,
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
+                    .body_source = if (incoming.streaming_body) .{ .context = request, .streaming = 1, .read = readBody, .read_all = readAllBody } else .{},
                     .stream = .{ .context = request, .start = streamStart, .write = streamWrite, .close = streamClose },
                     .out_response_handle = &response_handle,
                     .out_response = &response,
@@ -732,6 +744,18 @@ const Child = struct {
             },
             else => return error.UnsupportedOperation,
         }
+    }
+
+    fn readBody(raw: ?*anyopaque, dest: [*]u8, capacity: usize, out: *usize) callconv(.c) http.CallbackStatus {
+        const request: *rpc.Request = @ptrCast(@alignCast(raw orelse return .failed));
+        out.* = request.readBody(dest[0..capacity]) catch |err| return switch (err) {
+            error.Canceled, error.Cancelled => .canceled,
+            else => .failed,
+        };
+        return .ok;
+    }
+    fn readAllBody(_: ?*anyopaque, _: *http.OptionalBytes) callconv(.c) http.CallbackStatus {
+        return .failed;
     }
 
     fn cancelled(raw: ?*const anyopaque) callconv(.c) u8 {

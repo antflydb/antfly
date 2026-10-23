@@ -127,6 +127,23 @@ export default function ChatBar({
     ]
   );
 
+  // A conversation belongs to one source and model. Reset its active request and
+  // history when that context changes, while keeping the composer draft mounted.
+  const conversationContext = JSON.stringify([
+    url,
+    headers,
+    resolvedTable,
+    semanticIndexes,
+    generator,
+  ]);
+  const previousContext = useRef(conversationContext);
+  useEffect(() => {
+    if (previousContext.current !== conversationContext) {
+      previousContext.current = conversationContext;
+      reset();
+    }
+  }, [conversationContext, reset]);
+
   // Wrap sendMessage to include lifecycle callbacks
   const sendMessage = useCallback(
     (text: string) => {

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const httpx = @import("httpx");
@@ -108,7 +108,7 @@ pub const StdHttpExecutor = struct {
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
-        const safe_io = threaded_connect_io.io(io_impl, io_vtable);
+        const safe_io = threaded_connect_io.ioWithOwnedVTable(io_impl, io_vtable);
         self.client = .{
             .allocator = alloc,
             .io = safe_io,
@@ -137,7 +137,7 @@ pub const StdHttpExecutor = struct {
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
-        const safe_io = threaded_connect_io.io(io_impl, io_vtable);
+        const safe_io = threaded_connect_io.ioWithOwnedVTable(io_impl, io_vtable);
         self.client = .{
             .allocator = alloc,
             .io = safe_io,
@@ -328,7 +328,7 @@ pub const StdHttpExecutor = struct {
         req: common.HttpRequest,
         downstream: common.StreamWriter,
     ) !void {
-        const io = threaded_connect_io.io(self.io_impl, self.io_vtable);
+        const io = threaded_connect_io.ioWithOwnedVTable(self.io_impl, self.io_vtable);
         if (self.cfg.keep_alive) try self.client_mutex.lock(io);
         defer if (self.cfg.keep_alive) self.client_mutex.unlock(io);
 
@@ -692,7 +692,7 @@ pub const StdHttpExecutor = struct {
     }
 
     fn executeDirect(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
-        const io = threaded_connect_io.io(self.io_impl, self.io_vtable);
+        const io = threaded_connect_io.ioWithOwnedVTable(self.io_impl, self.io_vtable);
         // A controlled request queued behind the serialized keep-alive client
         // must remain interruptible before it acquires a socket of its own.
         if (self.cfg.keep_alive) try self.client_mutex.lock(io);
@@ -1580,7 +1580,7 @@ test "std http executor cancellation interrupts a request queued for the pooled 
 
     var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
     defer executor.deinit();
-    const io = threaded_connect_io.io(executor.io_impl, executor.io_vtable);
+    const io = threaded_connect_io.ioWithOwnedVTable(executor.io_impl, executor.io_vtable);
     executor.client_mutex.lockUncancelable(io);
     var client_locked = true;
     defer if (client_locked) executor.client_mutex.unlock(io);

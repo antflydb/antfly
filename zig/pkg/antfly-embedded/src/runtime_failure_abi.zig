@@ -791,66 +791,67 @@ pub const Status = enum(u32) {
     unsupported_media_token_budget = 832,
     grouped_source_topology_unavailable = 833,
     grouped_source_owner_changed = 834,
-    value_search_requires_scan = 835,
-    value_search_limit_exceeded = 836,
-    catalog_occupancy_not_ready = 837,
-    immutable_relational_index_definition_conflict = 838,
-    invalid_index_publication_candidate = 839,
-    invalid_private_index_cancellation = 840,
-    invalid_private_index_claim_inventory = 841,
-    invalid_private_index_claim_receipt = 842,
-    invalid_private_index_inputs = 843,
-    invalid_private_index_native_receipt = 844,
-    invalid_private_index_owner_job = 845,
-    invalid_relational_index_progress = 846,
-    missing_relational_index_definitions = 847,
-    private_index_cancellation_pending = 848,
-    private_index_cancellation_required = 849,
-    private_index_job_required = 850,
-    private_index_owner_job_changed = 851,
-    private_index_publication_canceled = 852,
-    private_index_publication_required = 853,
-    relational_index_catalog_schema_mismatch = 854,
-    sql_invalid_power_argument = 855,
-    invalid_schema_reader_requirements = 856,
-    private_index_root_recovery_required = 857,
-    invalid_relational_index_budget = 858,
-    private_index_claim_backlog_full = 859,
-    unsupported_native_index_owner = 860,
-    invalid_schema_validation_job = 861,
-    schema_validation_job_changed = 862,
-    schema_validation_job_required = 863,
-    schema_validation_runtime_recovery_required = 864,
-    invalid_schema_owner_control = 865,
-    invalid_schema_validation_page_command = 866,
-    invalid_nullability_replay = 867,
-    schema_validation_canceled = 868,
-    schema_validation_not_ready = 869,
-    schema_validation_publication_required = 870,
-    schema_validation_cancellation_required = 871,
-    invalid_ordered_apply_receipt = 872,
-    conflicting_ordered_apply_receipt = 873,
-    index_owner_receipt_changed = 874,
-    invalid_sql_view_record = 875,
-    sql_view_cycle = 876,
-    sql_view_column_rename = 877,
-    sql_view_column_type_changed = 878,
-    sql_view_column_dropped = 879,
-    sql_dependent_objects_exist = 880,
-    sql_program_limit_exceeded = 881,
-    relational_check_violation = 882,
-    foreign_key_match_full_violation = 883,
-    conflicting_data_apply_batch = 884,
-    invalid_data_apply_batch = 885,
-    split_source_projection_not_ready = 886,
-    apply_store_group_retired = 887,
-    apply_store_shutting_down = 888,
-    schema_validation_command_rejected = 889,
-    schema_validation_preparation_changed = 890,
-    corrupt_schema_apply_outcome = 891,
-    invalid_native_backup_origin = 892,
-    native_backup_origin_mismatch = 893,
-    sequence_catalog_state_required = 894,
+    value_verification_requires_scan = 835,
+    value_verification_limit_exceeded = 836,
+    graph_start_identity_required = 837,
+    catalog_occupancy_not_ready = 838,
+    immutable_relational_index_definition_conflict = 839,
+    invalid_index_publication_candidate = 840,
+    invalid_private_index_cancellation = 841,
+    invalid_private_index_claim_inventory = 842,
+    invalid_private_index_claim_receipt = 843,
+    invalid_private_index_inputs = 844,
+    invalid_private_index_native_receipt = 845,
+    invalid_private_index_owner_job = 846,
+    invalid_relational_index_progress = 847,
+    missing_relational_index_definitions = 848,
+    private_index_cancellation_pending = 849,
+    private_index_cancellation_required = 850,
+    private_index_job_required = 851,
+    private_index_owner_job_changed = 852,
+    private_index_publication_canceled = 853,
+    private_index_publication_required = 854,
+    relational_index_catalog_schema_mismatch = 855,
+    sql_invalid_power_argument = 856,
+    invalid_schema_reader_requirements = 857,
+    private_index_root_recovery_required = 858,
+    invalid_relational_index_budget = 859,
+    private_index_claim_backlog_full = 860,
+    unsupported_native_index_owner = 861,
+    invalid_schema_validation_job = 862,
+    schema_validation_job_changed = 863,
+    schema_validation_job_required = 864,
+    schema_validation_runtime_recovery_required = 865,
+    invalid_schema_owner_control = 866,
+    invalid_schema_validation_page_command = 867,
+    invalid_nullability_replay = 868,
+    schema_validation_canceled = 869,
+    schema_validation_not_ready = 870,
+    schema_validation_publication_required = 871,
+    schema_validation_cancellation_required = 872,
+    invalid_ordered_apply_receipt = 873,
+    conflicting_ordered_apply_receipt = 874,
+    index_owner_receipt_changed = 875,
+    invalid_sql_view_record = 876,
+    sql_view_cycle = 877,
+    sql_view_column_rename = 878,
+    sql_view_column_type_changed = 879,
+    sql_view_column_dropped = 880,
+    sql_dependent_objects_exist = 881,
+    sql_program_limit_exceeded = 882,
+    relational_check_violation = 883,
+    foreign_key_match_full_violation = 884,
+    conflicting_data_apply_batch = 885,
+    invalid_data_apply_batch = 886,
+    split_source_projection_not_ready = 887,
+    apply_store_group_retired = 888,
+    apply_store_shutting_down = 889,
+    schema_validation_command_rejected = 890,
+    schema_validation_preparation_changed = 891,
+    corrupt_schema_apply_outcome = 892,
+    invalid_native_backup_origin = 893,
+    native_backup_origin_mismatch = 894,
+    sequence_catalog_state_required = 895,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
@@ -895,13 +896,13 @@ test "concurrent main and SQL statuses retain distinct wire identities" {
     try std_test.testing.expectEqual(@as(u32, 778), @backingInt(Status.seed_replica_policy_mismatch));
     try std_test.testing.expectEqual(@as(u32, 779), @backingInt(Status.document_artifact_publication_failed));
     try std_test.testing.expectEqual(@as(u32, 834), @backingInt(Status.grouped_source_owner_changed));
-    try std_test.testing.expectEqual(@as(u32, 837), @backingInt(Status.catalog_occupancy_not_ready));
+    try std_test.testing.expectEqual(@as(u32, 838), @backingInt(Status.catalog_occupancy_not_ready));
 }
 
 test "released native value search Status identifiers retain their numeric values" {
     const testing = @import("std").testing;
-    try testing.expectEqual(@as(u32, 835), @backingInt(Status.value_search_requires_scan));
-    try testing.expectEqual(@as(u32, 836), @backingInt(Status.value_search_limit_exceeded));
+    try testing.expectEqual(@as(u32, 835), @backingInt(Status.value_verification_requires_scan));
+    try testing.expectEqual(@as(u32, 836), @backingInt(Status.value_verification_limit_exceeded));
 }
 
 test "released main Status identifiers retain their exact names and numeric values" {
@@ -910,7 +911,7 @@ test "released main Status identifiers retain their exact names and numeric valu
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
     inline for (@typeInfo(Status).@"enum".field_names, @typeInfo(Status).@"enum".field_values) |reflected_name, field_value| {
-        if (field_value <= 834) {
+        if (field_value <= 837) {
             for (reflected_name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
             std_test.mem.writeInt(u32, &encoded, @intCast(field_value), .little);
@@ -918,6 +919,6 @@ test "released main Status identifiers retain their exact names and numeric valu
             count += 1;
         }
     }
-    try std_test.testing.expectEqual(@as(usize, 765), count);
-    try std_test.testing.expectEqual(@as(u64, 0x1e43ab13434dd2d7), fingerprint);
+    try std_test.testing.expectEqual(@as(usize, 768), count);
+    try std_test.testing.expectEqual(@as(u64, 0x3d720d41936e164f), fingerprint);
 }

@@ -567,11 +567,20 @@ pub fn parseBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatch
         .parse_numbers = false,
         .allocate = .alloc_always,
         .max_value_len = public_limits.max_json_value_len,
-    }, false);
+    }, false, false);
 }
 
 pub fn parseInternalBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatchRequest {
-    return try parseBatchRequestWithOptions(alloc, body, internal_json_options, true);
+    return parsePrivateBatchRequest(alloc, body, false);
+}
+
+/// Only a local owner may evaluate unprepared optimistic predicates.
+pub fn parseOwnerBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatchRequest {
+    return parsePrivateBatchRequest(alloc, body, true);
+}
+
+fn parsePrivateBatchRequest(alloc: std.mem.Allocator, body: []const u8, local_owner: bool) !OwnedBatchRequest {
+    return try parseBatchRequestWithOptions(alloc, body, internal_json_options, true, local_owner);
 }
 
 /// Shared by private envelope owners before parseInternalBatchValue. Keep
@@ -626,6 +635,7 @@ fn parseBatchRequestWithOptions(
     body: []const u8,
     options: std.json.ParseOptions,
     allow_internal: bool,
+    local_owner: bool,
 ) !OwnedBatchRequest {
     if (body.len == 0) return .{};
 
@@ -635,7 +645,7 @@ fn parseBatchRequestWithOptions(
         else => return error.InvalidBatchRequest,
     };
     defer parsed.deinit();
-    return parseBatchValue(alloc, parsed.value, allow_internal);
+    return parseBatchValue(alloc, parsed.value, allow_internal, local_owner);
 }
 
 /// Internal transport owners may reuse their already parsed envelope. Numeric
@@ -643,10 +653,10 @@ fn parseBatchRequestWithOptions(
 /// request owns its data independently of the borrowed tree, just as the text
 /// ingress parser owns it independently of its temporary parse arena.
 pub fn parseInternalBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedBatchRequest {
-    return parseBatchValue(alloc, value, true);
+    return parseBatchValue(alloc, value, true, false);
 }
 
-fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_internal: bool) !OwnedBatchRequest {
+fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_internal: bool, local_owner: bool) !OwnedBatchRequest {
     const versioned = input_value == .array;
     const root_value = if (versioned) blk: {
         const entries = input_value.array.items;
@@ -1490,7 +1500,7 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
     {
         return error.InvalidBatchRequest;
     }
-    if (predicates.len != 0 and transaction == null) return error.InvalidBatchRequest;
+    if (predicates.len != 0 and transaction == null and !local_owner) return error.InvalidBatchRequest;
     if (range_guards != null and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (integrity.len != 0 and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (integrity_commands != null and (transaction == null or transaction.? != .prepare or integrity.len != 0)) return error.InvalidBatchRequest;
@@ -1709,14 +1719,24 @@ fn validateRowPolicyPublicationRequest(req: db_mod.types.BatchRequest) !void {
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    return encodeBatchRequestOwned(alloc, req) catch |err| switch (err) {
+    return encodeBatchRequestOwned(alloc, req, false) catch |err| switch (err) {
         // This memory writer can fail only when allocation fails.
         error.WriteFailed => error.OutOfMemory,
         else => err,
     };
 }
 
-fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+/// A local compiled owner evaluates optimistic predicates under its apply
+/// fence. Remote replicated batches still require the prepare protocol and
+/// continue to use encodeBatchRequest, which rejects unscoped predicates.
+pub fn encodeOwnerBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+    return encodeBatchRequestOwned(alloc, req, true) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest, local_owner: bool) ![]u8 {
     try @import("../storage/db/relational_index_raft_contract.zig").validateBatchRequest(req);
     try @import("../storage/db/resolver_review.zig").validateRequest(req);
     try @import("../storage/db/group_source_contract.zig").validateRequest(req);
@@ -1747,7 +1767,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         if (req.transaction == null or req.transaction.? != .prepare or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_repair or req.restore_staging_scope != null) return error.InvalidBatchRequest;
     }
     try db_mod.types.validateMergeArtifacts(req);
-    if (req.predicates.len > 0 and req.transaction == null) {
+    if (req.predicates.len > 0 and req.transaction == null and !local_owner) {
         return error.UnsupportedBatchRequestEncoding;
     }
     if ((req.split_transition != null or req.merge_source_transition != null) and
@@ -2841,7 +2861,7 @@ fn consumerTests() type {
             const body =
                 \\{"inserts":{"doc:a":{"raw_payload":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
             ;
-            try std.testing.expectError(error.ValueTooLong, parseBatchRequestWithOptions(std.testing.allocator, body, .{ .allocate = .alloc_always, .max_value_len = 64 }, false));
+            try std.testing.expectError(error.ValueTooLong, parseBatchRequestWithOptions(std.testing.allocator, body, .{ .allocate = .alloc_always, .max_value_len = 64 }, false, false));
         }
 
         test "internal batch parser owns and round trips split checkpoint" {
@@ -3383,4 +3403,23 @@ test "graph cleanup owner replay afterimages survive internal batch round trip" 
     try std.testing.expectEqualSlices(u8, &contract.checkpointDigest(old), &parsed.req.graph_endpoint_cleanup_guards[0].checkpoint_digest);
     try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, bytes));
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_merge_artifacts\":[{\"key\":\"arbitrary\",\"value\":\"payload\"}]}"));
+}
+
+test "local owner conditional batch wire retains predicates without exposing remote authority" {
+    const a = std.testing.allocator;
+    const req: db_mod.types.BatchRequest = .{
+        .writes = &.{.{ .key = "entity/ada", .value = "{}" }},
+        .predicates = &.{.{ .key = "entity/ada", .expected_version = 7, .expected_content_digest = @splat(11) }},
+        .sync_level = .write,
+    };
+    try std.testing.expectError(error.UnsupportedBatchRequestEncoding, encodeBatchRequest(a, req));
+    const encoded = try encodeOwnerBatchRequest(a, req);
+    defer a.free(encoded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, encoded));
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, encoded));
+    var decoded = try parseOwnerBatchRequest(a, encoded);
+    defer decoded.deinit(a);
+    try std.testing.expect(decoded.req.transaction == null);
+    try std.testing.expectEqual(@as(u64, 7), decoded.req.predicates[0].expected_version);
+    try std.testing.expectEqual(@as([32]u8, @splat(11)), decoded.req.predicates[0].expected_content_digest.?);
 }

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! A term-first hierarchy in two ordinary authenticated page trees. Branches
 //! describe hash buckets and conservative identity/score ranges. Leaves retain
@@ -103,6 +103,46 @@ pub fn reduce(a: A, entries: []const tree.Entry, height: u8) ![]u8 {
     }
     var buffer: [Branch.max_bytes]u8 = undefined;
     return a.dupe(u8, (result orelse return error.InvalidNativeLakeTermDirectory).encode(&buffer));
+}
+
+/// Build branch summaries while emitting the sorted leaf stream. Dense
+/// updates already visit every retained leaf, so a second range fold per
+/// changed bucket would repeatedly authenticate and decode the same pages.
+fn BranchStream(comptime Source: type) type {
+    return struct {
+        source: *Source,
+        a: A,
+        branches: *tree.SortedBuilder,
+        key: ?[]u8 = null,
+        branch: ?Branch = null,
+        fn deinit(self: *@This()) void {
+            if (self.key) |key| self.a.free(key);
+        }
+        fn flush(self: *@This()) !void {
+            var buffer: [Branch.max_bytes]u8 = undefined;
+            if (self.key) |key| try self.branches.add(key, self.branch.?.encode(&buffer));
+        }
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            const row = (try self.source.next()) orelse {
+                try self.flush();
+                if (self.key) |key| self.a.free(key);
+                self.key = null;
+                return null;
+            };
+            if (row.key.len < 34) return error.InvalidNativeLakeTermDirectory;
+            const branch_key = row.key[0 .. row.key.len - 31];
+            const id: [32]u8 = row.key[row.key.len - 32 ..][0..32].*;
+            const value: Branch = .{ .first = id, .last = id, .envelope = try stats.Summary.decode(row.value) };
+            if (self.key == null or !std.mem.eql(u8, self.key.?, branch_key)) {
+                try self.flush();
+                if (self.key) |key| self.a.free(key);
+                self.key = null;
+                self.key = try self.a.dupe(u8, branch_key);
+                self.branch = value;
+            } else try self.branch.?.merge(value);
+            return row;
+        }
+    };
 }
 
 pub const Builder = struct {
@@ -274,48 +314,24 @@ pub const Builder = struct {
                 value.deinit();
                 value.* = try tree.Cursor.init(self.a, store, run, "", null);
             } else try self.changes.rewind();
-            self.selected = if (self.strategy == .auto) (if (self.distinct_changes >= @max(4096, prior.leaves.?.records / 4)) .merge else .cow) else self.strategy;
+            // Density determines whether shared leaf/branch reconstruction is
+            // cheaper, including directories with fewer than 4096 records.
+            self.selected = if (self.strategy == .auto) (if (self.distinct_changes >= @max(1, prior.leaves.?.records / 4)) .merge else .cow) else self.strategy;
         }
         if (prior.leaves == null) {
             const Initial = struct {
                 changes: *Changes,
-                branches: *tree.SortedBuilder,
-                key: ?[]u8 = null,
-                branch: ?Branch = null,
-                fn flush(source: *@This()) !void {
-                    var buffer: [Branch.max_bytes]u8 = undefined;
-                    if (source.key) |key| try source.branches.add(key, source.branch.?.encode(&buffer));
-                }
                 pub fn next(source: *@This()) !?tree.Cursor.Record {
-                    const row = (try source.changes.next()) orelse {
-                        try source.flush();
-                        if (source.key) |key| source.changes.owner.a.free(key);
-                        source.key = null;
-                        return null;
-                    };
-                    const value = row.value orelse return error.InvalidNativeLakeTermDirectory;
-                    const branch_key = row.key[0 .. row.key.len - 31];
-                    const id: [32]u8 = row.key[row.key.len - 32 ..][0..32].*;
-                    const summary = try stats.Summary.decode(value);
-                    if (source.key == null or !std.mem.eql(u8, source.key.?, branch_key)) {
-                        try source.flush();
-                        if (source.key) |key| source.changes.owner.a.free(key);
-                        source.key = null;
-                        source.key = try source.changes.owner.a.dupe(u8, branch_key);
-                        source.branch = .{ .first = id, .last = id, .envelope = summary };
-                    } else {
-                        try source.branch.?.merge(.{ .first = id, .last = id, .envelope = summary });
-                    }
-                    return .{ .key = row.key, .value = value };
+                    const row = (try source.changes.next()) orelse return null;
+                    return .{ .key = row.key, .value = row.value orelse return error.InvalidNativeLakeTermDirectory };
                 }
             };
-            // Leaf order already groups each term/bucket. Emit reductions
-            // directly into a bounded page builder, with no second disk sort.
             var branch_builder: tree.SortedBuilder = .{ .alloc = self.a, .store = store };
             defer branch_builder.deinit();
-            var initial: Initial = .{ .changes = &changes, .branches = &branch_builder };
-            defer if (initial.key) |key| self.a.free(key);
-            roots.leaves = try tree.buildSorted(self.a, leaf_store, &initial);
+            var initial: Initial = .{ .changes = &changes };
+            var stream: BranchStream(Initial) = .{ .source = &initial, .a = self.a, .branches = &branch_builder };
+            defer stream.deinit();
+            roots.leaves = try tree.buildSorted(self.a, leaf_store, &stream);
             roots.branches = try branch_builder.finish();
             return roots;
         } else if (self.selected == .merge) {
@@ -344,7 +360,13 @@ pub const Builder = struct {
             var cursor = try tree.Cursor.init(self.a, store, prior.leaves, "", null);
             defer cursor.deinit();
             var merged: Merge = .{ .old = &cursor, .changes = &changes };
-            roots.leaves = try tree.buildSorted(self.a, leaf_store, &merged);
+            var branch_builder: tree.SortedBuilder = .{ .alloc = self.a, .store = store };
+            defer branch_builder.deinit();
+            var stream: BranchStream(Merge) = .{ .source = &merged, .a = self.a, .branches = &branch_builder };
+            defer stream.deinit();
+            roots.leaves = try tree.buildSorted(self.a, leaf_store, &stream);
+            roots.branches = try branch_builder.finish();
+            return roots;
         } else {
             var batch = std.heap.ArenaAllocator.init(self.a);
             defer batch.deinit();
@@ -540,6 +562,8 @@ test "external lake text statistics subtree reductions bound small updates and d
     }
     const current = try cow.finish(memory.store(), prior);
     const merged = try dense.finish(memory.store(), prior);
+    try std.testing.expectEqual(@as(u64, 0), dense.reduced_records);
+    try std.testing.expectEqual(@as(u64, 0), dense.aggregate_nodes);
     try std.testing.expect(cow.aggregate_nodes > 0);
     try std.testing.expect(cow.reduced_records < 1000);
     try std.testing.expectEqual(@as(u64, 2), cow.distinct_changes);
@@ -558,6 +582,56 @@ test "external lake text statistics subtree reductions bound small updates and d
     const branch = try Branch.decode((try branch_cursor.next()).?.value);
     try std.testing.expectEqual(@as(u64, 10000), branch.count);
     try std.testing.expectEqual(@as(u8, 255), branch.first[0]);
+}
+
+test "external lake text statistics dense small directories stream branch summaries with exact deletions" {
+    const a = std.testing.allocator;
+    var memory: tree.testing.MemoryStore = .{ .alloc = a };
+    defer memory.deinit();
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var initial = Builder.init(a, &manager);
+    defer initial.deinit();
+    var buffer: [stats.Summary.max_bytes]u8 = undefined;
+    const summary = (stats.Summary{ .frequency = 2, .max_frequency = 3, .min_norm = 10 }).encode(&buffer);
+    for (0..256) |i| {
+        var key: [32]u8 = undefined;
+        try initial.addRecord(.{ .key = try std.fmt.bufPrint(&key, "term-{d:0>4}", .{i}), .value = summary }, @splat(1), 1);
+    }
+    const prior = try initial.finish(memory.store(), .{});
+    var dense = Builder.init(a, &manager);
+    defer dense.deinit();
+    var sparse = Builder.init(a, &manager);
+    defer sparse.deinit();
+    sparse.strategy = .cow;
+    for ([_]*Builder{ &dense, &sparse }) |builder| for (0..128) |i| {
+        var key: [32]u8 = undefined;
+        const record: tree.Cursor.Record = .{ .key = try std.fmt.bufPrint(&key, "term-{d:0>4}", .{i}), .value = summary };
+        try builder.addRecord(record, @splat(1), -1);
+        if (i % 2 == 0) try builder.addRecord(record, @splat(2), 1);
+    };
+    const streamed = try dense.finish(memory.store(), prior);
+    const reference = try sparse.finish(memory.store(), prior);
+    try std.testing.expect(dense.selected == .merge);
+    try std.testing.expectEqual(@as(u64, 0), dense.reduced_records);
+    try std.testing.expectEqual(@as(u64, 0), dense.aggregate_nodes);
+    try std.testing.expectEqual(@as(u64, 192), streamed.leaves.?.records);
+    for ([_]?tree.Ref{ streamed.leaves, streamed.branches }, [_]?tree.Ref{ reference.leaves, reference.branches }) |left_root, right_root| {
+        var left = try tree.Cursor.init(a, memory.store(), left_root, "", null);
+        defer left.deinit();
+        var right = try tree.Cursor.init(a, memory.store(), right_root, "", null);
+        defer right.deinit();
+        while (try left.next()) |row| {
+            const other = (try right.next()).?;
+            try std.testing.expectEqualSlices(u8, row.key, other.key);
+            try std.testing.expectEqualSlices(u8, row.value, other.value);
+        }
+        try std.testing.expect((try right.next()) == null);
+    }
 }
 
 test "external lake text statistics durable directory bounds temporary disk and disables exhausted acceleration" {

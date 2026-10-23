@@ -193,12 +193,22 @@ pub const RemoteContentConfig = struct {
     };
 
     pub const RemoteContentRuntime = struct {
+        // These callbacks cross server/kernel archives with independent Zig
+        // error tables. Return a stable code and write the snapshot on success.
+        pub const AcquireStatus = enum(u8) { ok, out_of_memory, timeout, canceled, unavailable };
         context: *anyopaque,
-        acquire_fn: *const fn (*anyopaque) anyerror!Snapshot,
+        acquire_fn: *const fn (*anyopaque, *Snapshot) callconv(.c) AcquireStatus,
         health_fn: ?*const fn (*anyopaque) RuntimeHealth = null,
 
         pub fn acquire(self: RemoteContentRuntime) !Snapshot {
-            return self.acquire_fn(self.context);
+            var snapshot: Snapshot = undefined;
+            switch (self.acquire_fn(self.context, &snapshot)) {
+                .ok => return snapshot,
+                .out_of_memory => return error.OutOfMemory,
+                .timeout => return error.Timeout,
+                .canceled => return error.Canceled,
+                .unavailable => return error.ResourceTemporarilyUnavailable,
+            }
         }
 
         pub fn health(self: RemoteContentRuntime) ?RuntimeHealth {
@@ -771,7 +781,7 @@ fn allocRemainingBounded(reader: *std.Io.Reader, alloc: Allocator, max_size: usi
 /// Version-pinned range transport under the same URI, DNS and credential
 /// boundaries as ordinary downloads. No redirects or mutable-object fallback.
 pub const PinnedRange = struct {
-    pub const VersionKind = enum { strong_etag, s3_version_id };
+    pub const VersionKind = @import("antfly_source_reference").VersionKind;
     allocator: Allocator,
     context: DownloadContext,
     security: ?*const ContentSecurityConfig,
@@ -789,20 +799,7 @@ pub const PinnedRange = struct {
     /// resolution, transport construction or I/O. Destination policy and
     /// credentials are checked separately when creating the transport.
     pub fn validateReference(uri: []const u8, version: []const u8, kind: VersionKind, length: u64) !std.Uri {
-        if (length == 0 or version.len == 0 or version.len > 4096 or uri.len > 16 * 1024) return error.InvalidSourceReference;
-        if (kind == .strong_etag) {
-            if (version.len < 2 or version[0] != '"' or version[version.len - 1] != '"') return error.ImmutableVersionRequired;
-            for (version[1 .. version.len - 1]) |byte| if (byte < 0x21 or byte == 0x22 or byte == 0x7f) return error.ImmutableVersionRequired;
-        } else if (std.mem.eql(u8, version, "null")) return error.ImmutableVersionRequired;
-        const parsed = try std.Uri.parse(uri);
-        if (parsed.user != null or parsed.password != null or parsed.fragment != null) return error.InvalidSourceReference;
-        if (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) {
-            if (kind != .strong_etag) return error.InvalidSourceReference;
-            try validateHttpUri(parsed);
-        } else if (std.ascii.eqlIgnoreCase(parsed.scheme, "s3")) {
-            try validateS3Uri(parsed, .{});
-        } else return error.UnsupportedUrlScheme;
-        return parsed;
+        return @import("antfly_source_reference").validateReference(uri, version, kind, length);
     }
 
     pub fn create(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, headers: []const HTTPHeader) !*PinnedRange {

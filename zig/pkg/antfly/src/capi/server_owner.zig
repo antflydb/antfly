@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Private server storage-provider operations, separate from public C exports.
 const server_group_metadata = @import("../storage/server_group_metadata.zig");
@@ -668,7 +668,16 @@ pub const StorageOwnerRuntimeHooks = struct {
     const entity_sink_vtable = db_mod.EntitySink.VTable{
         .upsert = entityUpsert,
         .upsert_batch = entityUpsertBatch,
+        .supports_curation = entitySupportsCuration,
     };
+
+    fn entitySupportsCuration(ptr: *anyopaque) anyerror!bool {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.entity_sink.supports_curation_fn orelse return false;
+        var supported: u8 = 0;
+        try kernel_error_identity.statusToError(callback(self.config.entity_sink.callback_ctx, &supported));
+        return supported != 0;
+    }
 
     pub fn entityUpsert(
         ptr: *anyopaque,
@@ -694,7 +703,7 @@ pub const StorageOwnerRuntimeHooks = struct {
     ) anyerror!void {
         const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
         const callback = self.config.entity_sink.upsert_batch_fn orelse {
-            for (entries) |entry| if (entry.storage_table != null or entry.delete) return error.EntityPromotionAtomicCommitUnavailable;
+            for (entries) |entry| if (entry.storage_table != null or entry.delete or entry.skip_if_missing) return error.EntityPromotionAtomicCommitUnavailable;
             for (entries) |entry| try entityUpsert(ptr, alloc, entry.table, entry.key, entry.doc_json);
             return;
         };
@@ -706,6 +715,7 @@ pub const StorageOwnerRuntimeHooks = struct {
             .key = .fromSlice(source.key),
             .doc_json = .fromSlice(source.doc_json),
             .delete = @intFromBool(source.delete),
+            .skip_if_missing = @intFromBool(source.skip_if_missing),
         };
         try kernel_error_identity.statusToError(callback(
             self.config.entity_sink.callback_ctx,
@@ -915,7 +925,17 @@ const RemoteContentSnapshot = struct {
     }
 };
 
-fn acquireRemoteContent(raw: *anyopaque) anyerror!scraping.RemoteContentConfig.Snapshot {
+fn acquireRemoteContent(raw: *anyopaque, output: *scraping.RemoteContentConfig.Snapshot) callconv(.c) scraping.RemoteContentConfig.RemoteContentRuntime.AcquireStatus {
+    output.* = acquireRemoteContentImpl(raw) catch |err| return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        error.Timeout => .timeout,
+        error.Canceled => .canceled,
+        else => .unavailable,
+    };
+    return .ok;
+}
+
+fn acquireRemoteContentImpl(raw: *anyopaque) !scraping.RemoteContentConfig.Snapshot {
     const owner: *StorageOwnerContext = @ptrCast(@alignCast(raw));
     const source = owner.remote_content_source.?;
     var bytes: kernel_owner_abi.OwnedBytes = .{};
@@ -3561,7 +3581,8 @@ pub fn storageOwnerOpen(
             runtime_hooks_config.resolution_candidates.get_fn == null))
         return .invalid_argument;
     const entity_sink_configured = runtime_hooks_config.entity_sink.upsert_fn != null or
-        runtime_hooks_config.entity_sink.upsert_batch_fn != null;
+        runtime_hooks_config.entity_sink.upsert_batch_fn != null or
+        runtime_hooks_config.entity_sink.supports_curation_fn != null;
     if (entity_sink_configured and
         (runtime_hooks_config.entity_sink.callback_ctx == null or
             runtime_hooks_config.entity_sink.upsert_fn == null))
@@ -6481,7 +6502,7 @@ pub fn batchStorageKernelJson(
     // The group-local owner accepts the internal batch dialect so split
     // replication state and the caller's requested sync level survive the
     // compiled boundary. Public CAPI parsing remains intentionally narrower.
-    var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|
+    var owned = batch_api.parseOwnerBatchRequest(handle.alloc, request_json.bytes()) catch |err|
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
     if (owned.req.row_policy_publication != null) return .invalid_argument;

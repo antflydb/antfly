@@ -113,7 +113,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/packaging -p test_grep_packaging.py
           python3 scripts/packaging/package_grep_release.py --binary zig/zig-out/bin/antfly-grep --output zig/zig-out/grep-qualification/antfly-grep-linux-x86_64.tar.gz
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: native-grep-qualification
@@ -320,7 +320,6 @@ jobs:
             scripts/ci/test_embedded_sdk_native.py \
             scripts/test_pgwire_drivers.py \
             ':(glob)scripts/pgwire_drivers/**' \
-            ':(glob)go/pkg/operator/**' \
             ':(glob)go/pkg/sdk/admin/**' \
             go/pkg/sdk/go.mod \
             go/pkg/sdk/go.sum \
@@ -699,6 +698,7 @@ jobs:
           tools/test_run_test_partitions.py
           tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
+          tools/test_fetch_vectorsets.py
           tools/test_test_runner.py
           tools/test_local_test_partitions.py
           tools/test_sync_generated.py
@@ -1058,14 +1058,13 @@ jobs:
           cd ..
           python3 scripts/ci/prepare_lite_previous_reader.py
 
-      - name: Exercise real Lite extraction through public graph APIs
+      - name: Compile and run Lite model unit contracts
         if: needs.changes.outputs.zig_tests == 'true'
-        timeout-minutes: 25
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
           model_dir="$models_root/fastino/gliner2.5-base-v1"
-          trap 'rm -rf "$models_root"' EXIT
           python3 scripts/ci/prepare_lite_graph_model.py "$model_dir" --embedding-destination "$models_root/Qwen/Qwen3-Embedding-0.6B-GGUF"
           cd zig
           ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi-test \
@@ -1075,7 +1074,13 @@ jobs:
           python3 ../../tools/run_bounded_zig_build.py build test \
             '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
             --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix ../../zig-out
-          cd ../../..
+      - name: Exercise real Lite extraction through public graph APIs
+        if: needs.changes.outputs.zig_tests == 'true'
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
+          trap 'rm -rf "$models_root"' EXIT
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
           ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
           ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
@@ -1088,6 +1093,10 @@ jobs:
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
+
+      - name: Clean Lite qualification models
+        if: always() && needs.changes.outputs.zig_tests == 'true'
+        run: rm -rf "$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
 
       - name: Locate real-model extraction evaluation
         id: lite_extraction_report
@@ -1233,6 +1242,7 @@ jobs:
           tools/test_run_test_partitions.py
           tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
+          tools/test_fetch_vectorsets.py
           tools/test_test_runner.py
           tools/test_local_test_partitions.py
           tools/test_sync_generated.py
@@ -1461,12 +1471,28 @@ jobs:
           antfly-integration-test
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
-      - name: Run Zig recall checks
+      # Recall datasets are hash-pinned in zig/testdata/vectorsets.manifest.json
+      # and cached on the runner PVC, so they download once per manifest.
+      - name: Run Zig recall conformance
         working-directory: zig
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          antfly-recall-test
+          antfly-recall-conformance
+          -Dconformance-fixtures=/mnt/cache/antfly/conformance-fixtures
+          --maxrss ${{ steps.cpus.outputs.max_rss }}
+
+      # Library conformance fetches upstream corpora (toon, image, audio), so
+      # run it nightly rather than on every push.
+      - name: Run Zig library conformance
+        if: github.event.schedule == '0 8 * * *'
+        timeout-minutes: 45
+        working-directory: zig
+        run: >-
+          taskset -c ${{ steps.cpus.outputs.list }}
+          python3 tools/run_bounded_zig_build.py --zig zig -- build
+          conformance-test
+          -Dconformance-fixtures=/mnt/cache/antfly/conformance-fixtures
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Run Zig chaos tests
@@ -1531,8 +1557,26 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+            scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file
+        run: |
+          helper=scripts/ci/install_ubuntu_packages.sh
+          if [ ! -f "$helper" ]; then helper=.ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh; fi
+          bash "$helper" build-essential pkg-config ca-certificates git curl xz-utils file
 
       - name: Install uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -1564,20 +1608,6 @@ jobs:
       # Each shard gets its own runner and PVC. Physical storage ownership has
       # several production rebuilds, so give it the full job budget separately
       # from the cold host-generator and linked-cache contract fixtures.
-      # The admitted branch can predate this action. Bootstrap tooling from
-      # the same immutable revision as the executing approval workflow.
-      - name: Check out executing dependency policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: .ci-dependency-policy
-          persist-credentials: false
-          sparse-checkout: |
-            .github/actions/prepare-zig-dependencies
-            scripts/ci/prepare_zig_dependencies.py
-            scripts/ci/zig-dependencies.json
-          sparse-checkout-cone-mode: false
-
       - name: Prepare verified Zig source dependencies
         uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
@@ -1776,8 +1806,20 @@ jobs:
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
 
+      - name: Build optimized model E2E executable
+        if: inputs.full_validation
+        working-directory: zig
+        run: python3 tools/run_bounded_zig_build.py --zig zig -- build inference-http-server -Doptimize=ReleaseFast -Dcpu=baseline -Dstrip=true -Dcuda=false --summary all
+
       - name: Package E2E executable
-        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" zig-out/bin/antfly zig-out/bin/antfly-grep
+        env:
+          FULL_VALIDATION: ${{ inputs.full_validation }}
+        run: |
+          artifacts=(zig-out/bin/antfly zig-out/bin/antfly-grep)
+          if [[ "$FULL_VALIDATION" == "true" ]]; then
+            artifacts+=(zig-out/bin/antfly-inference-http-server)
+          fi
+          tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" "${artifacts[@]}"
 
       - name: Upload E2E executable
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -2091,27 +2133,6 @@ jobs:
           path: ${{ runner.temp }}/e2e-plan
       - name: Initialize lane timing history
         run: cp "${RUNNER_TEMP}/e2e-plan/durations.json" "$ANTFLY_E2E_DURATION_FILE"
-
-      - name: Set up Go for operator runtime contract
-        if: matrix.suite == 'inference'
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ steps.toolchain.outputs.go_version }}
-          cache: false
-
-      # Execute the SAME reconciler-generated contract as the operator job's
-      # pinned v0.2.1 baseline, now against this PR's newly built runtime.
-      - name: Test generated inference command against candidate runtime
-        if: matrix.suite == 'inference'
-        working-directory: go/pkg/operator
-        env:
-          ANTFLY_RUNTIME_BIN: ${{ github.workspace }}/zig/zig-out/bin/antfly
-          GOWORK: 'off'
-          GOEXPERIMENT: simd
-        run: >-
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} go test
-          -tags runtimeintegration ./controllers/inference
-          -run '^Test(InferenceRuntimeContract|RuntimeModelPullRetry)$' -count=1 -v -timeout=20m
 
       - name: Test exhaustive E2E shard partition
         if: matrix.suite == 'antfly-ordinary-0'
@@ -2453,8 +2474,17 @@ jobs:
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
 
+      - name: Build optimized model E2E executable
+        working-directory: zig
+        # Model latency includes attention/quantization kernels that BLAS does
+        # not cover. Optimize the entire inference graph, without rebuilding
+        # the storage/API owners in ReleaseFast or dropping their Debug checks.
+        # Use the production HTTP entry so offline training and benchmark CLI
+        # commands do not add optimization work to the shared E2E artifact.
+        run: python3 tools/run_bounded_zig_build.py --zig zig -- build inference-http-server -Doptimize=ReleaseFast -Dcpu=baseline -Dstrip=true -Dcuda=false --summary all
+
       - name: Package E2E executable
-        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly
+        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly zig-out/bin/antfly-grep zig-out/bin/antfly-inference-http-server
 
       - name: Upload E2E executable
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -2645,6 +2675,7 @@ jobs:
           ANTFLY_INFERENCE_BLAS: openblas
           OPENBLAS_NUM_THREADS: "2"
           ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_SERVER_BIN: ./zig-out/bin/antfly-inference-http-server
           ANTFLY_INFERENCE_REPORT_DIR: ${{ runner.temp }}/inference-reports
           ANTFLY_INFERENCE_SERVER_LOG_DIR: ${{ runner.temp }}/inference-server-logs
           ANTFLY_INFERENCE_DOWNLOAD: "1"

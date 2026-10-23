@@ -3199,7 +3199,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (append_derived_replay and S.ownerField(self, "executor").*.hasWorkers()) {
                 if (opts.wait_for_sync_level) {
                     const sync_wait_start_ns = monotonicTimeNs();
-                    try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    if (opts.visibility_completion) |completion| {
+                        std.debug.assert(completion.sequence == null);
+                        completion.sequence = sequence;
+                        completion.sync_level = effective_req.sync_level;
+                        completion.enrichment_fully_precomputed = enrichment_fully_precomputed;
+                        completion.targets = sync_targets;
+                        sync_targets = .{};
+                    } else try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             } else if (append_derived_replay) {
@@ -3214,7 +3221,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (opts.wait_for_sync_level) {
                     const sync_wait_start_ns = monotonicTimeNs();
-                    try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    if (opts.visibility_completion) |completion| {
+                        std.debug.assert(completion.sequence == null);
+                        completion.sequence = sequence;
+                        completion.sync_level = effective_req.sync_level;
+                        completion.enrichment_fully_precomputed = enrichment_fully_precomputed;
+                        completion.targets = sync_targets;
+                        sync_targets = .{};
+                    } else try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             }

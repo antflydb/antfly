@@ -106,6 +106,32 @@ type BoolFieldQuery struct {
 	Field string `json:"field,omitempty,omitzero"`
 }
 
+// BoolQuery Canonical Boolean wrapper. Must clauses score; filter clauses constrain without scoring.
+type BoolQuery struct {
+	Bool BoolQueryBody `json:"bool"`
+}
+
+// BoolQueryBody defines model for BoolQueryBody.
+type BoolQueryBody struct {
+	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
+	Boost  Boost           `json:"boost,omitempty,omitzero"`
+	Filter BoolQueryClause `json:"filter,omitempty,omitzero"`
+
+	// MinimumShouldMatch Minimum optional clauses required; omission follows the runtime's required-clause defaults.
+	MinimumShouldMatch uint32          `json:"minimum_should_match,omitempty,omitzero"`
+	Must               BoolQueryClause `json:"must,omitempty,omitzero"`
+	MustNot            BoolQueryClause `json:"must_not,omitempty,omitzero"`
+	Should             BoolQueryClause `json:"should,omitempty,omitzero"`
+}
+
+// BoolQueryClause defines model for BoolQueryClause.
+type BoolQueryClause struct {
+	union json.RawMessage
+}
+
+// BoolQueryClause1 defines model for BoolQueryClause.1.
+type BoolQueryClause1 = []Query
+
 // BooleanQuery defines model for BooleanQuery.
 type BooleanQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
@@ -408,9 +434,12 @@ type PhraseQuery struct {
 // substring, exactly like `match` on that field.
 type PrefixQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
-	Boost  Boost  `json:"boost,omitempty,omitzero"`
-	Field  string `json:"field,omitempty,omitzero"`
-	Prefix string `json:"prefix"`
+	Boost Boost `json:"boost,omitempty,omitzero"`
+
+	// CaseInsensitive Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+	CaseInsensitive bool   `json:"case_insensitive,omitempty,omitzero"`
+	Field           string `json:"field,omitempty,omitzero"`
+	Prefix          string `json:"prefix"`
 }
 
 // Query defines model for Query.
@@ -425,20 +454,26 @@ type QueryStringQuery struct {
 	Query string `json:"query"`
 }
 
-// RegexpQuery defines model for RegexpQuery.
+// RegexpQuery Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed natural-language input.
 type RegexpQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
-	Boost  Boost  `json:"boost,omitempty,omitzero"`
-	Field  string `json:"field,omitempty,omitzero"`
-	Regexp string `json:"regexp"`
+	Boost Boost `json:"boost,omitempty,omitzero"`
+
+	// CaseInsensitive Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+	CaseInsensitive bool   `json:"case_insensitive,omitempty,omitzero"`
+	Field           string `json:"field,omitempty,omitzero"`
+	Regexp          string `json:"regexp"`
 }
 
-// TermQuery defines model for TermQuery.
+// TermQuery Match an indexed post-analysis term exactly. Use match for analyzed natural-language input.
 type TermQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
-	Boost Boost  `json:"boost,omitempty,omitzero"`
-	Field string `json:"field,omitempty,omitzero"`
-	Term  string `json:"term"`
+	Boost Boost `json:"boost,omitempty,omitzero"`
+
+	// CaseInsensitive Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+	CaseInsensitive bool   `json:"case_insensitive,omitempty,omitzero"`
+	Field           string `json:"field,omitempty,omitzero"`
+	Term            string `json:"term"`
 }
 
 // TermRangeQuery defines model for TermRangeQuery.
@@ -452,12 +487,77 @@ type TermRangeQuery struct {
 	Min          *string `json:"min,omitempty"`
 }
 
-// WildcardQuery defines model for WildcardQuery.
+// WildcardQuery Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed natural-language input.
 type WildcardQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
-	Boost    Boost  `json:"boost,omitempty,omitzero"`
-	Field    string `json:"field,omitempty,omitzero"`
-	Wildcard string `json:"wildcard"`
+	Boost Boost `json:"boost,omitempty,omitzero"`
+
+	// CaseInsensitive Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+	CaseInsensitive bool   `json:"case_insensitive,omitempty,omitzero"`
+	Field           string `json:"field,omitempty,omitzero"`
+	Wildcard        string `json:"wildcard"`
+}
+
+// AsQuery returns the union data inside the BoolQueryClause as a Query
+func (t BoolQueryClause) AsQuery() (Query, error) {
+	var body Query
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromQuery overwrites any union data inside the BoolQueryClause as the provided Query
+func (t *BoolQueryClause) FromQuery(v Query) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeQuery performs a merge with any union data inside the BoolQueryClause, using the provided Query
+func (t *BoolQueryClause) MergeQuery(v Query) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsBoolQueryClause1 returns the union data inside the BoolQueryClause as a BoolQueryClause1
+func (t BoolQueryClause) AsBoolQueryClause1() (BoolQueryClause1, error) {
+	var body BoolQueryClause1
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromBoolQueryClause1 overwrites any union data inside the BoolQueryClause as the provided BoolQueryClause1
+func (t *BoolQueryClause) FromBoolQueryClause1(v BoolQueryClause1) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeBoolQueryClause1 performs a merge with any union data inside the BoolQueryClause, using the provided BoolQueryClause1
+func (t *BoolQueryClause) MergeBoolQueryClause1(v BoolQueryClause1) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t BoolQueryClause) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *BoolQueryClause) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
 }
 
 // AsFuzziness0 returns the union data inside the Fuzziness as a Fuzziness0
@@ -990,6 +1090,32 @@ func (t *Query) MergeDateRangeStringQuery(v DateRangeStringQuery) error {
 	return err
 }
 
+// AsBoolQuery returns the union data inside the Query as a BoolQuery
+func (t Query) AsBoolQuery() (BoolQuery, error) {
+	var body BoolQuery
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromBoolQuery overwrites any union data inside the Query as the provided BoolQuery
+func (t *Query) FromBoolQuery(v BoolQuery) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeBoolQuery performs a merge with any union data inside the Query, using the provided BoolQuery
+func (t *Query) MergeBoolQuery(v BoolQuery) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsBooleanQuery returns the union data inside the Query as a BooleanQuery
 func (t Query) AsBooleanQuery() (BooleanQuery, error) {
 	var body BooleanQuery
@@ -1437,55 +1563,60 @@ type ClientWithResponsesInterface interface {
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

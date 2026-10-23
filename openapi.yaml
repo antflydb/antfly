@@ -2955,6 +2955,14 @@ paths:
 
         If all versions match, writes are executed atomically via 2PC.
 
+        A 409 with diagnostic code `transaction_outcome_unknown` is different
+
+        from an aborted optimistic conflict: it may already have committed and
+
+        MUST NOT be replayed. A committed 202 result requires observation or
+
+        repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
+
 
         Stateless clients manage their own read set. For server-managed
 
@@ -14706,9 +14714,12 @@ paths:
     post:
       operationId: decide
       summary: Answer named decision questions
-      description: Execute one text input or an Antfly batch. Embedding similarity supports choice and
-        multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish
-        trained probabilities from raw cosine similarities.
+      description: Execute text or multimodal evidence through named deciders, or an ordered batch of
+        evidence items. Hosted typed deciders and qualified constrained generators accept text and images
+        per batch item. Generated native models must support both images and constrained output. Native
+        trained and embedding deciders require text. Embedding similarity supports choice and multi_choice;
+        trained decision models support choice, score and predicate. Answer variants distinguish trained
+        probabilities from raw cosine similarities.
       tags:
         - Inference
       requestBody:
@@ -14847,6 +14858,122 @@ paths:
             when authentication is enabled but its backend is not ready.
         '401':
           description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/models/instances:
+    get:
+      summary: List model instances
+      description: Inspect this inference server's shared model cache without loading models or extending
+        idle eviction deadlines. Each incarnation appears once, even when it supports multiple tasks.
+      operationId: listModelInstances
+      tags:
+        - Models
+      responses:
+        '200':
+          description: Loaded and loading model instances
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceModelInstanceList'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+    post:
+      summary: Load a model instance
+      description: Prepare the instance used by the requested task. Reuses an existing compatible instance.
+        Normal idle eviction still applies; loading does not pin weights or guarantee device residency.
+      operationId: loadModelInstance
+      tags:
+        - Models
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceModelInstanceLoadRequest'
+      responses:
+        '200':
+          description: Prepared model instance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceModelInstance'
+        '400':
+          description: Invalid model or unsupported task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '404':
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/models/instances/{instance_id}:
+    delete:
+      summary: Unload a model instance
+      description: Evict one exact incarnation from the shared server cache. A stale ID is an idempotent
+        miss and never evicts a replacement. Loading, busy, and startup-managed instances cannot be unloaded.
+      operationId: unloadModelInstance
+      tags:
+        - Models
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Instance unloaded or already absent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceModelInstanceUnloadResponse'
+        '400':
+          description: Malformed instance ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '409':
+          description: Instance is loading, has active owners, or is managed by startup configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
           content:
             application/json:
               schema:
@@ -15145,6 +15272,70 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ml/v1/predictors:
+    get:
+      operationId: listGatewayPredictors
+      summary: List predictor feature schemas through the gateway
+      responses:
+        '200':
+          description: Predictor schemas keyed by callable model ID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferencePredictorsResponse'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/synthesize:
+    post:
+      operationId: synthesizeSpeech
+      summary: Synthesize speech using a named text-to-speech configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceSynthesisRequest'
+      responses:
+        '200':
+          description: Synthesized audio in the requested format; usage is reported only when supplied
+            by the provider.
+          content:
+            audio/mpeg:
+              schema:
+                type: string
+                format: binary
+            audio/wav:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid or unsupported synthesis options
+        '502':
+          description: Upstream synthesis failure
         '401':
           description: Authentication is enabled and valid credentials were not supplied
           content:
@@ -16034,10 +16225,6 @@ components:
     SQLRequest:
       type: object
       additionalProperties: false
-      not:
-        required:
-          - read_requirements
-          - lake_visibility
       required:
         - statement
       description: >
@@ -16059,17 +16246,6 @@ components:
       properties:
         read_requirements:
           $ref: '#/components/schemas/ReadRequirements'
-        lake_visibility:
-          deprecated: true
-          type: string
-          enum:
-            - committed
-            - accepted
-          description: Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over
-            the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions
-            inside a transaction retain the first accepted read cut for each table, including across savepoint
-            rollback. Cuts expire after one hour. Serializable write transactions over external sources
-            are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
         statement:
           type: string
           minLength: 1
@@ -16993,8 +17169,8 @@ components:
             - reranker_upstream_failure
             - decision_limit_exceeded
             - invalid_decision_evaluation
-            - value_search_requires_scan
-            - value_search_limit_exceeded
+            - value_verification_requires_scan
+            - value_verification_limit_exceeded
             - decision_provider_unavailable
             - decision_rate_limited
             - decision_upstream_failure
@@ -17898,6 +18074,9 @@ components:
             - $ref: '#/components/schemas/CohereEmbedderConfig'
             - $ref: '#/components/schemas/AntflyEmbedderConfig'
         - properties:
+            sparse:
+              type: boolean
+              description: This named embedder produces sparse index/value vectors.
             rate_limit:
               x-go-type-skip-optional-pointer: false
               $ref: '#/components/schemas/RateLimitConfig'
@@ -18243,6 +18422,9 @@ components:
         - reader
         - transcriber
         - extractor
+        - decider
+        - synthesizer
+        - predictor
         - other
       description: >
         Model task type. Mirrors the inference registry taxonomy; "other" is
@@ -18258,6 +18440,15 @@ components:
         name:
           type: string
           description: Model identifier as reported by the provider.
+        id:
+          type: string
+          description: Canonical public gateway identity when available.
+        availability:
+          type: string
+          description: Availability observation independent of capability support.
+        freshness:
+          type: string
+          description: Whether metadata is configured, live, or cached.
         display_name:
           type: string
           description: Human-readable model name when the provider reports one.
@@ -18268,6 +18459,16 @@ components:
           type: boolean
           description: True when this model is referenced by a configured embedder, generator, reranker,
             or chunker.
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: Inference capabilities advertised by the provider for this model and task.
+        inputs:
+          type: array
+          items:
+            type: string
+          description: Input modalities accepted by the provider's resolved executor.
     InferenceConnection:
       type: object
       required:
@@ -18277,7 +18478,8 @@ components:
           $ref: '#/components/schemas/InferenceProviderType'
         url:
           type: string
-          description: Resolved endpoint URL when applicable.
+          description: Transport endpoint. Omitted from public inference discovery to keep server-owned
+            URLs private.
         region:
           type: string
           description: Cloud region (Bedrock).
@@ -20060,7 +20262,10 @@ components:
               - matches
               - autocomplete
           description: >
-            Supported original-value operations on field. Availability does not
+            Supported logical query operations on field. Equals, contains and matches
+
+            verify original values; autocomplete performs analyzed bool-prefix matching. Availability
+            does not
 
             attest index coverage or authorize scans. Case sensitivity, execution
 
@@ -25576,8 +25781,7 @@ components:
       additionalProperties: false
       description: Freshness requirements for writable Iceberg reads. Search supports accepted and published
         (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility
-        modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction
-        snapshot never advances to satisfy a newer receipt.
+        modes fail explicitly. A pinned transaction snapshot never advances to satisfy a newer receipt.
       properties:
         visibility:
           type: string
@@ -25597,45 +25801,7 @@ components:
           maximum: 60000
           description: Readiness wait budget within the query or statement timeout. Defaults to 5000 ms
             when requirements are supplied; zero fails immediately if coverage is unavailable.
-    LakeReadReceipt:
-      type: object
-      additionalProperties: false
-      required:
-        - table_id
-        - object_generation
-        - wal_lsn
-      properties:
-        table_id:
-          type: integer
-          format: uint64
-        object_generation:
-          type: integer
-          format: uint64
-        wal_lsn:
-          type: integer
-          format: uint64
-    LakeReadRequirement:
-      type: object
-      additionalProperties: false
-      properties:
-        visibility:
-          type: string
-          enum:
-            - accepted
-            - published
-          description: Accepted requires current WAL visibility; vector/hybrid reads wait for matching
-            publication. Published explicitly permits the retained archive generation. Applies to native
-            writable Iceberg reads.
-        through:
-          $ref: '#/components/schemas/LakeReadReceipt'
-        wait_ms:
-          type: integer
-          format: uint32
-          minimum: 0
-          maximum: 60000
-          description: Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded
-            by query timeout and cancellation.
-    ValueSearchExecution:
+    ValueVerification:
       type: object
       additionalProperties: false
       description: >
@@ -25666,13 +25832,23 @@ components:
           default: 100000000
           description: Bound on the sum of original string bytes multiplied by compiled regex states.
             Charged before regex evaluation; sensitive literals bypass this work.
+    QueryExecution:
+      type: object
+      additionalProperties: false
+      description: Execution controls; these affect admitted work, never predicate meaning or read freshness.
+      properties:
+        value_verification:
+          $ref: '#/components/schemas/ValueVerification'
     QueryRequest:
       type: object
       not:
         anyOf:
           - required:
-              - read_requirements
               - lake_read
+          - required:
+              - lake_visibility
+          - required:
+              - value_search_execution
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required:
@@ -25836,21 +26012,19 @@ components:
                   - required:
                       - foreign_sources
                   - required:
-                      - value_search_execution
+                      - execution
       properties:
-        value_search_execution:
-          $ref: '#/components/schemas/ValueSearchExecution'
+        execution:
+          $ref: '#/components/schemas/QueryExecution'
         read_requirements:
           $ref: '#/components/schemas/ReadRequirements'
-        lake_read:
-          deprecated: true
-          $ref: '#/components/schemas/LakeReadRequirement'
         remote_snapshot:
           type: string
           description: Opaque retained snapshot token returned by an ordered native or external-table
             query. Echo with search_after or search_before. Native and lake cuts expire within the configured
             retention period (default five minutes; maximum one hour); missing, expired or incompatible
-            generations return 409.
+            generations return 409. Also supported when resuming hierarchy.children; its revision-bound
+            ascending position cursor remains required.
         evaluate:
           $ref: '#/components/schemas/QueryEvaluation'
         table_target:
@@ -26965,7 +27139,7 @@ components:
 
         when the request sets `profile: true`.
       properties:
-        value_search:
+        value_verification:
           type: object
           description: Actual logical value verification work, summed across participating shards; plans
             describe selected physical fields and scan fallback reasons. Budgets remain per shard.
@@ -26976,6 +27150,55 @@ components:
             bytes:
               type: integer
               format: int64
+            verification_metrics_version:
+              type: integer
+              format: int64
+              minimum: 0
+              description: One when every participating shard supplied these verification counters; zero
+                means aggregate coverage is incomplete.
+            source_read_us:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Sum of measured provider-read time in microseconds, including admitted source
+                lookup work.
+            source_parse_us:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Sum of original-value parsing time in microseconds.
+            source_batches:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Number of completed source read windows.
+            source_scalar_reads:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Number of required individual source reads.
+            projected_sources:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Rows observed while considering projected reads, including rows that require
+                a full-source fallback.
+            stored_field_sources:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Rows actually verified from stored-field projections.
+            batch_refusals:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Source windows refused by allocation admission before bounded fallback.
+            batch_peak_bytes:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Largest admitted source-window allocation observed on any participating shard;
+                not process RSS or a sum of concurrent allocations.
             plans:
               type: array
               items:
@@ -32861,6 +33084,15 @@ components:
           type: integer
           minimum: 1
           default: 1000000
+        max_image_input_tokens:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Provider/model upper bound on the input-token contribution of one image. Required
+            when sending images through typed hosted or generated deciders, including native generators
+            and image URLs. The runtime reserves this allowance per image in addition to serialized non-image
+            request bytes; actual usage can add shared quota debt. Generated deciders apply the allowance
+            to the selected generator's shared quota. Omit for text-only deciders.
         rate_limit:
           $ref: '#/components/schemas/RateLimitConfig'
         batch_size:
@@ -34828,7 +35060,7 @@ components:
             and readiness are local to each owning shard, not client-writable.
         default_type:
           type: string
-          description: Default type to use from the document_types.
+          description: Default type to use from the document_schemas.
         enforce_types:
           type: boolean
           description: >
@@ -38983,7 +39215,13 @@ components:
           $ref: '#/components/schemas/Boost'
     TermQuery:
       type: object
+      description: Match an indexed post-analysis term exactly. Use match for analyzed natural-language
+        input.
       properties:
+        case_insensitive:
+          type: boolean
+          default: false
+          description: Fold ASCII letter case when matching indexed terms, without stemming the pattern.
         term:
           type: string
         field:
@@ -39138,6 +39376,10 @@ components:
 
         substring, exactly like `match` on that field.
       properties:
+        case_insensitive:
+          type: boolean
+          default: false
+          description: Fold ASCII letter case when matching indexed terms, without stemming the pattern.
         prefix:
           type: string
         field:
@@ -39148,7 +39390,13 @@ components:
         - prefix
     RegexpQuery:
       type: object
+      description: Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed
+        natural-language input.
       properties:
+        case_insensitive:
+          type: boolean
+          default: false
+          description: Fold ASCII letter case when matching indexed terms, without stemming the pattern.
         regexp:
           type: string
         field:
@@ -39159,7 +39407,13 @@ components:
         - regexp
     WildcardQuery:
       type: object
+      description: Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed
+        natural-language input.
       properties:
+        case_insensitive:
+          type: boolean
+          default: false
+          description: Fold ASCII letter case when matching indexed terms, without stemming the pattern.
         wildcard:
           type: string
         field:
@@ -39179,6 +39433,7 @@ components:
         - query
     NumericRangeQuery:
       type: object
+      additionalProperties: false
       properties:
         min:
           type: number
@@ -39204,6 +39459,7 @@ components:
           $ref: '#/components/schemas/Boost'
     TermRangeQuery:
       type: object
+      additionalProperties: false
       properties:
         min:
           type: string
@@ -39227,6 +39483,7 @@ components:
           $ref: '#/components/schemas/Boost'
     DateRangeStringQuery:
       type: object
+      additionalProperties: false
       properties:
         start:
           type: string
@@ -39250,6 +39507,41 @@ components:
           $ref: '#/components/schemas/Boost'
         datetime_parser:
           type: string
+    BoolQueryClause:
+      oneOf:
+        - $ref: '#/components/schemas/Query'
+        - type: array
+          items:
+            $ref: '#/components/schemas/Query'
+    BoolQueryBody:
+      type: object
+      additionalProperties: false
+      properties:
+        must:
+          $ref: '#/components/schemas/BoolQueryClause'
+        should:
+          $ref: '#/components/schemas/BoolQueryClause'
+        must_not:
+          $ref: '#/components/schemas/BoolQueryClause'
+        filter:
+          $ref: '#/components/schemas/BoolQueryClause'
+        minimum_should_match:
+          type: integer
+          format: uint32
+          minimum: 0
+          description: Minimum optional clauses required; omission follows the runtime's required-clause
+            defaults.
+        boost:
+          $ref: '#/components/schemas/Boost'
+    BoolQuery:
+      type: object
+      additionalProperties: false
+      required:
+        - bool
+      description: Canonical Boolean wrapper. Must clauses score; filter clauses constrain without scoring.
+      properties:
+        bool:
+          $ref: '#/components/schemas/BoolQueryBody'
     ConjunctionQuery:
       type: object
       properties:
@@ -39281,6 +39573,7 @@ components:
         - disjuncts
     BooleanQuery:
       type: object
+      additionalProperties: false
       properties:
         must:
           $ref: '#/components/schemas/ConjunctionQuery'
@@ -39487,6 +39780,7 @@ components:
         - $ref: '#/components/schemas/NumericRangeQuery'
         - $ref: '#/components/schemas/TermRangeQuery'
         - $ref: '#/components/schemas/DateRangeStringQuery'
+        - $ref: '#/components/schemas/BoolQuery'
         - $ref: '#/components/schemas/BooleanQuery'
         - $ref: '#/components/schemas/ConjunctionQuery'
         - $ref: '#/components/schemas/DisjunctionQuery'
@@ -43070,6 +43364,100 @@ components:
           maxLength: 4096
         wait:
           $ref: '#/components/schemas/ResolverWait'
+    InferenceModelInstance:
+      type: object
+      description: One loading or loaded incarnation of a model in this inference server. Backend session
+        and composite-cache implementation details are private.
+      required:
+        - id
+        - model
+        - tasks
+        - state
+        - active_handles
+        - startup_managed
+        - unloadable
+        - residency_mode
+        - idle_ms
+      properties:
+        id:
+          type: string
+          description: Opaque incarnation identifier; changes after eviction and reload.
+        model:
+          type: string
+        tasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceModelKind'
+        state:
+          type: string
+          enum:
+            - loading
+            - loaded
+        active_handles:
+          type: integer
+          format: int64
+          description: Internal owners or loading waiters preventing eviction. This is not a count of
+            HTTP requests.
+        startup_managed:
+          type: boolean
+        unloadable:
+          type: boolean
+          description: Whether an unload would be permitted at snapshot time; concurrent use can change
+            this.
+        unload_blocked_reason:
+          type: string
+          enum:
+            - loading
+            - in_use
+            - startup_managed
+        backend:
+          type: string
+          description: Selected execution backend, when known.
+        residency_mode:
+          type: string
+          enum:
+            - backend_managed
+            - streamed
+            - resident
+          description: Weight residency policy; loaded does not imply full device residency.
+        idle_ms:
+          type: integer
+          format: int64
+          description: Elapsed milliseconds since last use, not a wall-clock timestamp.
+    InferenceModelInstanceList:
+      type: object
+      required:
+        - object
+        - data
+      properties:
+        object:
+          type: string
+          enum:
+            - list
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceModelInstance'
+    InferenceModelInstanceLoadRequest:
+      type: object
+      required:
+        - model
+        - task
+      properties:
+        model:
+          type: string
+        task:
+          $ref: '#/components/schemas/InferenceModelKind'
+    InferenceModelInstanceUnloadResponse:
+      type: object
+      required:
+        - outcome
+      properties:
+        outcome:
+          type: string
+          enum:
+            - unloaded
+            - already_unloaded
     InferenceError:
       type: object
       required:
@@ -43217,6 +43605,10 @@ components:
         - object
         - predictors
       properties:
+        public_inference_enabled:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: Whether public inference execution is enabled on this deployment.
         object:
           type: string
           enum:
@@ -43409,7 +43801,6 @@ components:
         - object
         - data
         - model
-        - usage
       properties:
         backend:
           type: string
@@ -43699,7 +44090,6 @@ components:
         - object
         - data
         - model
-        - usage
       properties:
         object:
           type: string
@@ -43900,7 +44290,6 @@ components:
         - object
         - data
         - model
-        - usage
       properties:
         object:
           type: string
@@ -43957,6 +44346,10 @@ components:
           type: string
           description: Force specific language for transcription (optional, model-dependent)
           example: en
+        timestamps:
+          type: boolean
+          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for
+            transcribe, on for dictate).
         diarization:
           type: boolean
           description: Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`)
@@ -43968,7 +44361,6 @@ components:
         - object
         - data
         - model
-        - usage
       properties:
         object:
           type: string
@@ -44058,6 +44450,10 @@ components:
           type: string
           description: Force the transcript language (ISO 639-1). Omit for automatic detection.
           example: en
+        timestamps:
+          type: boolean
+          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for
+            transcribe, on for dictate).
         cleanup_model:
           type: string
           description: Generator model from models_dir/generators/ that rewrites the transcript. Omit
@@ -44166,7 +44562,6 @@ components:
         - model
         - transcript
         - text
-        - usage
       properties:
         object:
           type: string
@@ -44604,7 +44999,9 @@ components:
         usage:
           $ref: '#/components/schemas/DecisionUsage'
       description: Single-input responses have answers. Batch responses have data in input order, with
-        one named answer array per input and aggregate usage.
+        one named answer array per input and aggregate usage including reported usage from failed items.
+        Named gateway batches identify the configured model at the top level and resolved models per successful
+        item.
     InferenceModelsResponse:
       type: object
       required:
@@ -44622,6 +45019,11 @@ components:
         - readers
         - transcribers
       properties:
+        public_inference_enabled:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: Whether public inference execution is enabled on this deployment. Internal database
+            inference is independent. Omitted by standalone inference runtimes without deployment policy.
         object:
           type: string
           enum:
@@ -45091,7 +45493,6 @@ components:
         - created
         - model
         - choices
-        - usage
       properties:
         id:
           type: string
@@ -45115,7 +45516,11 @@ components:
             $ref: '#/components/schemas/InferenceGenerateChoice'
           description: List of completion choices (currently always 1)
         usage:
-          $ref: '#/components/schemas/InferenceGenerateUsage'
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          description: Provider-reported token usage, or null when the provider does not supply it.
+          allOf:
+            - $ref: '#/components/schemas/InferenceGenerateUsage'
         speculation:
           x-go-type-skip-optional-pointer: false
           nullable: true
@@ -46112,6 +46517,34 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used
+    InferenceSynthesisRequest:
+      type: object
+      required:
+        - model
+        - text
+      additionalProperties: false
+      properties:
+        model:
+          type: string
+          description: Canonical synthesizers/name target or qualified connection model.
+        text:
+          type: string
+          minLength: 1
+        voice:
+          type: string
+        format:
+          type: string
+          enum:
+            - mp3
+            - wav
+            - opus
+            - aac
+            - flac
+            - pcm
+        speed:
+          type: number
+          minimum: 0.25
+          maximum: 4
     PackageKind:
       type: string
       enum:
@@ -46858,6 +47291,86 @@ components:
             - chunk.embedding.error
         code:
           type: string
+    DecisionEvidenceText:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - text
+      properties:
+        type:
+          type: string
+          enum:
+            - input_text
+        text:
+          type: string
+          minLength: 1
+    DecisionEvidenceImage:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - image_url
+      properties:
+        type:
+          type: string
+          enum:
+            - input_image
+        image_url:
+          type: string
+          minLength: 1
+          description: Base64 data URL (image/png, image/jpeg, image/webp, image/gif), or a public HTTP(S)
+            URL for OpenAI. Antfly never fetches image URLs for decision adapters.
+        detail:
+          type: string
+          enum:
+            - auto
+            - low
+            - high
+          default: auto
+    DecisionEvidenceMessage:
+      type: object
+      additionalProperties: false
+      required:
+        - role
+        - content
+      properties:
+        type:
+          type: string
+          enum:
+            - message
+        role:
+          type: string
+          enum:
+            - user
+        content:
+          oneOf:
+            - type: string
+              minLength: 1
+            - type: array
+              minItems: 1
+              maxItems: 256
+              items:
+                oneOf:
+                  - $ref: '#/components/schemas/DecisionEvidenceText'
+                  - $ref: '#/components/schemas/DecisionEvidenceImage'
+    DecisionEvidence:
+      description: Text or ordered user messages containing text and images. Named OpenAI and Jev deciders
+        and constrained generators accept messages. Generated image decisions require a model that supports
+        both images and constrained output; native, Gemini, and Vertex generators require inline images
+        and automatic detail. Native trained and embedding deciders require text. At most 128 images and
+        1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto;
+        OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user
+        roles are unsupported.
+      oneOf:
+        - type: string
+          minLength: 1
+          maxLength: 1048576
+        - type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/DecisionEvidenceMessage'
     DecisionInput:
       type: object
       additionalProperties: false
@@ -46868,15 +47381,16 @@ components:
           type: string
           minLength: 1
         input:
-          type: string
-          minLength: 1
-          maxLength: 1048576
+          $ref: '#/components/schemas/DecisionEvidence'
         context_index:
           x-go-type-skip-optional-pointer: false
           type: integer
           minimum: 0
-          description: Index into request contexts. Requires context_version 1. Effective input is context,
-            newline, then input; the 1 MiB input limit applies after expansion.
+          description: Index into request contexts. Requires context_version 1. Text expands to context,
+            newline, then input. Message evidence gets a leading user message containing the context.
+            The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native trained
+            and embedding deciders require text. Generated deciders accept image evidence when the selected
+            generator supports images and constrained output.
     InferenceDecideLongDocument:
       type: object
       additionalProperties: false
@@ -47069,9 +47583,7 @@ components:
           pattern: ^[0-9a-f]{64}$
           description: Pin the exact EmbeddingGemma 2 assets and embedding recipe.
         input:
-          type: string
-          minLength: 1
-          maxLength: 1048576
+          $ref: '#/components/schemas/DecisionEvidence'
         inputs:
           type: array
           items:
@@ -47088,9 +47600,10 @@ components:
           maxItems: 64
         embedding_options:
           $ref: '#/components/schemas/EmbeddingDecisionOptions'
-      description: Supply exactly one of input (single text) or inputs (Antfly batch extension). Question
-        names must be unique. Single text and named question arrays follow OpenAI Decisions conventions;
-        local models support text input and string choice values. Request bodies are bounded at 16 MiB.
+      description: Supply exactly one of input (single evidence item) or inputs (ordered Antfly batch
+        extension; hosted typed deciders also accept multimodal evidence per item). Question names must
+        be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models
+        support text input and string choice values. Request bodies are bounded at 16 MiB.
     GeneratedChoiceDecisionQuestion:
       type: object
       additionalProperties: false
@@ -47201,9 +47714,7 @@ components:
         generator:
           $ref: '#/components/schemas/GeneratorConfig'
         input:
-          type: string
-          minLength: 1
-          maxLength: 1048576
+          $ref: '#/components/schemas/DecisionEvidence'
         inputs:
           type: array
           minItems: 1
@@ -48218,8 +48729,12 @@ components:
           minLength: 1
         error:
           type: string
-          description: Generated batches preserve valid siblings; a failed item has an empty answers array
-            and this error code.
+          description: Named gateway and generated batches preserve valid siblings; a failed item has
+            an empty answers array and this error code. Invalid input or request budgets fail validation
+            before dispatch.
+        model:
+          type: string
+          description: Resolved model reported for a successful named gateway batch item.
         answers:
           type: array
           items:
@@ -48241,7 +48756,12 @@ components:
           description: Zero for classifiers, which generate no tokens.
   responses:
     CommittedMutationAccepted:
-      description: Mutation committed with pending visibility or explicit repair debt
+      description: >
+        Mutation committed with pending visibility or explicit repair debt.
+
+        This is a committed result: observe recovery/repair rather than replaying
+
+        the business mutation. See https://antfly.io/docs/reference/transaction-outcomes.
       content:
         application/json:
           schema:

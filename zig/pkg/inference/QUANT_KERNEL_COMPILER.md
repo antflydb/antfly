@@ -596,7 +596,7 @@ evidence file also records the compiler benchmark manifest schema, case count,
 and case fingerprint, and the evidence checker rejects stale or partial case
 sets before trusting benchmark speedups. Successful production-regression checks
 also print the identity in the summary line as:
-`benchmark_manifest=antfly.quant_kernel_benchmarks.v6:22:<fingerprint>`.
+`benchmark_manifest=antfly.quant_kernel_benchmarks.v7:22:<fingerprint>`.
 
 ## Runtime Observability
 
@@ -736,3 +736,18 @@ GQA decode route is independently gated and remains covered by exact-token and
 paired llama.cpp benchmarks. Continuous batching uses the same rule: all
 multi-row CUDA execution remains experimental until the long-run KV
 page-boundary, response-equivalence, and throughput gates pass.
+
+### CUDA evidence command versions
+
+Current reproduction commands use `antfly inference bench-cuda`. Newly written
+CUDA benchmark receipts use the `antfly.quant_kernel_benchmark_evidence.v2` or
+`antfly.quant_kernel_q4_0_benchmark_evidence.v2` schema. The v2 command contract
+accepts the public CLI and the development command
+`zig-out/bin/antfly-inference-dev bench-cuda`; the remaining benchmark arguments
+must match exactly.
+
+Frozen v1 receipts retain their original command and measurements. Their command
+identity is checked under the historical v1 contract when matching them to a
+current reproduction command. The retired executable name is rejected in v2
+receipts. Generated v7 manifests distinguish reproduction commands from
+historical evidence records with an explicit command version.

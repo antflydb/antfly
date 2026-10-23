@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Upgrade root-only source authority without rewriting primary documents.
 
@@ -49,10 +49,12 @@ def test_logical_source_authority_upgrade_and_rollback(stateful_api):
         "limit": 0,
         "fields": [],
         "profile": True,
-        "value_search_execution": {
-            "allow_scan": True,
-            "max_documents": count,
-            "max_bytes": 16 * 1024 * 1024,
+        "execution": {
+            "value_verification": {
+                "allow_scan": True,
+                "max_documents": count,
+                "max_bytes": 16 * 1024 * 1024,
+            }
         },
     }
 
@@ -62,14 +64,20 @@ def test_logical_source_authority_upgrade_and_rollback(stateful_api):
         api.resume_server()
 
     def query(expected):
+        # Exercise each preserved binary's own public protocol. This fixture
+        # proves on-disk upgrade/rollback, not support for removed API aliases.
+        legacy = Path(server.binary).resolve() == Path(baseline)
+        wire = dict(payload)
+        if legacy:
+            wire["value_search_execution"] = wire.pop("execution")["value_verification"]
         response = requests.post(
-            api.url + f"/tables/{table}/query", json=payload, timeout=60
+            api.url + f"/tables/{table}/query", json=wire, timeout=60
         )
         assert response.status_code == 200, response.text
         result = response.json()["responses"][0]
         assert not result.get("error"), result
         assert result["hits"]["total"]["value"] == expected, result
-        profile = result["profile"]["value_search"]
+        profile = result["profile"]["value_search" if legacy else "value_verification"]
         assert profile["documents"] == count, profile
         assert profile["bytes"] > count * 32 * 1024, profile
         return profile

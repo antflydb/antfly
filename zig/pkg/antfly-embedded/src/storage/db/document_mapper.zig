@@ -893,6 +893,11 @@ pub const BuildTextSegmentResult = struct {
 pub const default_text_segment_target_bytes: usize = 32 * 1024 * 1024;
 
 pub const BuildTextSegmentsOptions = struct {
+    /// Encoded results belong to the caller's allocator. Transient builders
+    /// may have a shorter, reclaiming lifetime even when results use a region.
+    scratch_allocator: ?Allocator = null,
+    postings_run_io: ?std.Io = null,
+    postings_run_directory: []const u8 = ".",
     target_segment_bytes: usize = default_text_segment_target_bytes,
     target_build_memory_bytes: ?usize = null,
     doc_scratch_retained_bytes: ?usize = null,
@@ -1348,6 +1353,8 @@ fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introdu
     var build_options = introducer_mod.BuildTextOptions{
         .profile = options.profile,
         .resource_manager = options.resource_manager,
+        .postings_run_io = options.postings_run_io,
+        .postings_run_directory = options.postings_run_directory,
         .index_sort = options.index_sort,
         .store_document_source = options.store_document_source,
     };
@@ -1394,10 +1401,17 @@ pub fn buildTextSegmentsFromProjectionBatch(
             .docs = projection_batch.docs[start..end],
             .observed_field_analyzers = &.{},
         };
-        const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, chunk.docs, &analysis_mod.default_analyzer, text_analysis, build_options);
+        const segment = blk: {
+            var output = segment_mod.MemorySegmentSink.init(alloc);
+            defer output.deinit();
+            var sink = output.sink();
+            try introducer_mod.writeSegmentFromTextWithAnalysisOptions(options.scratch_allocator orelse alloc, chunk.docs, &analysis_mod.default_analyzer, text_analysis, build_options, &sink);
+            break :blk try output.finishOwned();
+        };
+        errdefer alloc.free(segment);
         if (segment.len > 0) {
             try segments.append(alloc, segment);
-        }
+        } else alloc.free(segment);
         start = end;
     }
 

@@ -66,10 +66,12 @@ class LicenseHeaderTests(unittest.TestCase):
 
     def test_product_groups(self):
         self.assertEqual(
-            policy.group_for("zig/pkg/antfly-embedded/src/lite_main.zig", "all"),
+            policy.group_for("zig/pkg/antfly-embedded/src/public_capi_root.zig", "all"),
             "apache",
         )
-        self.assertEqual(policy.group_for("zig/pkg/antfly/src/main.zig", "all"), "elv2")
+        self.assertEqual(
+            policy.group_for("zig/pkg/antfly/src/main.zig", "all"), "apache"
+        )
         self.assertEqual(
             policy.group_for("zig/pkg/inference/src/main.zig", "all"), "apache"
         )
@@ -94,7 +96,7 @@ class LicenseHeaderTests(unittest.TestCase):
             policy.group_for(
                 "zig/pkg/antfly/src/storage/hot_standby/primary.zig", "all"
             ),
-            "elv2",
+            "apache",
         )
 
     def test_preserves_shebang_and_is_idempotent(self):

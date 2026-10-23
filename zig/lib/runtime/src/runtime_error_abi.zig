@@ -46,6 +46,13 @@ test "document extraction failures retain terminal identity across callbacks" {
     }
 }
 
+test "metadata head races remain retryable across runtime callbacks" {
+    const transported = statusFromError(error.MetadataSnapshotHeadMismatch);
+    try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
+    try std.testing.expectEqual(error.MetadataSnapshotHeadMismatch, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.MetadataSnapshotHeadMismatch));
+}
+
 pub const Code = enum(c_int) {
     ok = 0,
     out_of_memory,
@@ -873,9 +880,12 @@ pub const Detail = enum(c_int) {
     unsupported_constrained_schema,
     unsupported_generated_extraction_schema,
     resolver_curation_conflict,
-    value_search_requires_scan,
-    value_search_limit_exceeded,
+    value_verification_requires_scan,
+    value_verification_limit_exceeded,
     invalid_embedding_identity,
+    graph_start_identity_required,
+    metadata_snapshot_head_mismatch,
+    inference_endpoint_access_denied,
     sql_index_already_exists,
     sql_constraint_already_exists,
     program_limit_exceeded,
@@ -1246,6 +1256,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.MissingSplitRuntime => status(.not_found, .missing_split_runtime),
         error.MissingMergeRuntime => status(.not_found, .missing_merge_runtime),
         error.MetadataSnapshotUnavailable => status(.retryable, .metadata_snapshot_unavailable),
+        error.MetadataSnapshotHeadMismatch => status(.retryable, .metadata_snapshot_head_mismatch),
         error.SplitSourceProjectionNotReady => status(.retryable, .split_source_projection_not_ready),
         error.SplitSourceProjectionAdvanced => status(.retryable, .split_source_projection_advanced),
         error.DurableRootIncarnationUnavailable => status(.retryable, .durable_root_incarnation_unavailable),
@@ -1555,8 +1566,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
         error.NameServerFailure => status(.unavailable, .name_server_failure),
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
-        error.ValueSearchRequiresScan => status(.unsupported, .value_search_requires_scan),
-        error.ValueSearchLimitExceeded => status(.invalid_argument, .value_search_limit_exceeded),
+        error.ValueSearchRequiresScan => status(.unsupported, .value_verification_requires_scan),
+        error.ValueSearchLimitExceeded => status(.invalid_argument, .value_verification_limit_exceeded),
         error.DecisionLimitExceeded => status(.invalid_argument, .decision_limit_exceeded),
         error.GraphWorkBudgetExceeded => status(.invalid_argument, .graph_work_budget_exceeded),
         error.GraphMinWeightDomainViolation => status(.invalid_argument, .graph_min_weight_domain_violation),
@@ -1568,12 +1579,14 @@ pub fn statusFromError(err: anyerror) Status {
         // Preserve the append-only runtime detail code while the public error
         // name reflects that unsupported exact modes are not topology-specific.
         error.GraphQueryModeUnsupported => status(.unsupported, .graph_cross_range_mode_unsupported),
+        error.GraphStartIdentityRequired => status(.unsupported, .graph_start_identity_required),
         error.QueryEmbeddingInputTooLarge => status(.invalid_argument, .query_embedding_input_too_large),
         error.QueryEmbeddingOverloaded => status(.unavailable, .query_embedding_overloaded),
         error.EmbedRateLimited => status(.retryable, .embed_rate_limited),
         error.EmbedTransientFailure => status(.retryable, .embed_transient_failure),
         error.EmbedUpstreamFailure => status(.unavailable, .embed_upstream_failure),
         error.EmbeddingProbeUnavailable => status(.unavailable, .embedding_probe_unavailable),
+        error.InferenceEndpointAccessDenied => status(.forbidden, .inference_endpoint_access_denied),
         error.InvalidEmbeddingResponse => status(.invalid_argument, .invalid_embedding_response),
         error.InvalidEmbeddingDimensions => status(.invalid_argument, .invalid_embedding_dimensions),
         error.BackupAlreadyExists => status(.already_exists, .backup_already_exists),
@@ -2155,6 +2168,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .missing_split_runtime => "MissingSplitRuntime",
         .missing_merge_runtime => "MissingMergeRuntime",
         .metadata_snapshot_unavailable => "MetadataSnapshotUnavailable",
+        .metadata_snapshot_head_mismatch => "MetadataSnapshotHeadMismatch",
         .split_source_projection_not_ready => "SplitSourceProjectionNotReady",
         .split_source_projection_advanced => "SplitSourceProjectionAdvanced",
         .durable_root_incarnation_unavailable => "DurableRootIncarnationUnavailable",
@@ -2476,8 +2490,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .temporary_name_server_failure => "TemporaryNameServerFailure",
         .name_server_failure => "NameServerFailure",
         .query_candidate_budget_exceeded => "QueryCandidateBudgetExceeded",
-        .value_search_requires_scan => "ValueSearchRequiresScan",
-        .value_search_limit_exceeded => "ValueSearchLimitExceeded",
+        .value_verification_requires_scan => "ValueSearchRequiresScan",
+        .value_verification_limit_exceeded => "ValueSearchLimitExceeded",
         .decision_limit_exceeded => "DecisionLimitExceeded",
         .query_embedding_input_too_large => "QueryEmbeddingInputTooLarge",
         .query_embedding_overloaded => "QueryEmbeddingOverloaded",
@@ -2485,6 +2499,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .embed_transient_failure => "EmbedTransientFailure",
         .embed_upstream_failure => "EmbedUpstreamFailure",
         .embedding_probe_unavailable => "EmbeddingProbeUnavailable",
+        .inference_endpoint_access_denied => "InferenceEndpointAccessDenied",
         .invalid_embedding_response => "InvalidEmbeddingResponse",
         .invalid_embedding_dimensions => "InvalidEmbeddingDimensions",
         .backup_already_exists => "BackupAlreadyExists",
@@ -2672,6 +2687,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .graph_anchor_filter_requires_index => "GraphAnchorFilterRequiresIndex",
         .graph_match_operation_limit_exceeded => "GraphMatchOperationLimitExceeded",
         .graph_cross_range_mode_unsupported => "GraphQueryModeUnsupported",
+        .graph_start_identity_required => "GraphStartIdentityRequired",
         .graph_work_budget_exceeded => "GraphWorkBudgetExceeded",
         .graph_min_weight_domain_violation => "GraphMinWeightDomainViolation",
         .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
@@ -2938,12 +2954,12 @@ test "catalog publication preparation preserves explicit retry identity across a
 }
 
 test "released main Detail identifiers retain their exact names and numeric values" {
-    @setEvalBranchQuota(2000);
+    @setEvalBranchQuota(20_000);
     const std_test = @import("std");
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
     inline for (@typeInfo(Detail).@"enum".field_names, @typeInfo(Detail).@"enum".field_values) |reflected_name, field_value| {
-        if (field_value <= 370) {
+        if (field_value <= 781) {
             for (reflected_name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
             std_test.mem.writeInt(u32, &encoded, @intCast(field_value), .little);
@@ -2951,8 +2967,8 @@ test "released main Detail identifiers retain their exact names and numeric valu
             count += 1;
         }
     }
-    try std_test.testing.expectEqual(@as(usize, 371), count);
-    try std_test.testing.expectEqual(@as(u64, 0xa07c5018c0739e78), fingerprint);
+    try std_test.testing.expectEqual(@as(usize, 782), count);
+    try std_test.testing.expectEqual(@as(u64, 0xf7de08bbd998f30a), fingerprint);
 }
 
 test "metadata proposal recovery errors preserve identity across runtime archives" {
@@ -3198,4 +3214,10 @@ test "resolver namespace rejection retains its conflict identity across runtime 
     const value = statusFromError(error.ResolverCurationConflict);
     try std.testing.expectEqual(@backingInt(Code.conflict), value.code);
     try std.testing.expectEqual(error.ResolverCurationConflict, errorFromStatus(value));
+}
+
+test "graph start identity requirement retains its semantic identity" {
+    const value = statusFromError(error.GraphStartIdentityRequired);
+    try std.testing.expectEqual(@backingInt(Code.unsupported), value.code);
+    try std.testing.expectEqual(error.GraphStartIdentityRequired, errorFromStatus(value));
 }

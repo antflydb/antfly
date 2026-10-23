@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const bridge = @import("antfly_runtime_abi").io_abi;
@@ -131,4 +131,46 @@ export fn runtime_io_abi_test_inference_control(output: *InferenceControl, failu
 export fn runtime_io_abi_test_consume_inference_control(control: *const InferenceControl) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
     control.check() catch |err| return @import("antfly_runtime_abi").error_abi.statusFromError(err);
     return .ok;
+}
+
+const RemoteConfig = @import("antfly_scraping").RemoteContentConfig;
+var remote_failure: RemoteConfig.RemoteContentRuntime.AcquireStatus = .ok;
+var remote_config: RemoteConfig = .{};
+fn remoteSnapshot(_: *anyopaque, output: *RemoteConfig.Snapshot) callconv(.c) RemoteConfig.RemoteContentRuntime.AcquireStatus {
+    if (remote_failure == .ok) output.* = .{ .config = &remote_config };
+    return remote_failure;
+}
+export fn runtime_io_abi_test_remote_snapshot(output: *RemoteConfig.RemoteContentRuntime, failure: u8) callconv(.c) void {
+    remote_failure = @fromBackingInt(@intCast(failure));
+    output.* = .{ .context = &remote_failure, .acquire_fn = remoteSnapshot };
+}
+
+export fn runtime_io_abi_test_remote_fetch(borrow: *const bridge.Borrow, url: [*]const u8, url_len: usize) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+    const errors = @import("antfly_runtime_abi").error_abi;
+    var receiver = borrow.receive() catch |err| return errors.statusFromError(err);
+    const scraping = @import("antfly_scraping");
+    var hosts = [_][]u8{@constCast("127.0.0.1")};
+    const security: scraping.ContentSecurityConfig = .{ .block_private_ips = false, .allowed_hosts = &hosts, .max_download_size_bytes = 1024 };
+    var outcome = scraping.downloadContentOutcomeAllocWithHeadersAndContext(std.heap.page_allocator, .{ .io = receiver.io(), .timeout_ms = 1000 }, url[0..url_len], &security, null, null) catch |err| return errors.statusFromError(err);
+    if (outcome == .ok) outcome.ok.deinit(std.heap.page_allocator);
+    return .{};
+}
+
+export fn runtime_io_abi_test_threaded_create(output: *?*std.Io.Threaded, output_table: *?*std.Io.VTable) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+    const a = std.heap.page_allocator;
+    const runtime = a.create(std.Io.Threaded) catch return @import("antfly_runtime_abi").error_abi.statusFromError(error.OutOfMemory);
+    runtime.* = std.Io.Threaded.init(a, .{});
+    const table = @import("antfly_local_sources").common_threaded_connect_io.createVTable(a, runtime) catch {
+        runtime.deinit();
+        a.destroy(runtime);
+        return @import("antfly_runtime_abi").error_abi.statusFromError(error.OutOfMemory);
+    };
+    output.* = runtime;
+    output_table.* = table;
+    return .{};
+}
+export fn runtime_io_abi_test_threaded_destroy(runtime: *std.Io.Threaded, table: *std.Io.VTable) callconv(.c) void {
+    runtime.deinit();
+    std.heap.page_allocator.destroy(table);
+    std.heap.page_allocator.destroy(runtime);
 }

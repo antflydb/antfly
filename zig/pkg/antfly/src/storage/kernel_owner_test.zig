@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const hot_standby_write_gate_adapter = @import("hot_standby/write_gate.zig");
 const hot_standby_publisher_adapter = @import("hot_standby/db_commit.zig");
@@ -88,6 +88,49 @@ test "opaque owner retained relational read crosses checked archive boundary" {
     try std.testing.expectEqual(@as(usize, 0), end.rows.len);
     try std.testing.expect(end.after == null);
     try std.testing.expectError(error.PreparedGenerationChanged, provider.open(alloc, "rows", "", "", .{ .relational_query = .{ .schema_version = 2, .fields = &.{} }, .limit = 1 }));
+}
+
+test "opaque owner conditional writes retain version and digest fences" {
+    const alloc = std.testing.allocator;
+    const batch = @import("antfly_local_sources").api_batch;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    var owner = try client.Owner.open(.{
+        .path = .fromSlice(root),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7001,
+    });
+    defer owner.deinit();
+    var inserted = try owner.batchJson("docs",
+        \\{"inserts":{"entity/ada":{"value":"original"}},"_timestamp_ns":"5000","sync_level":"write"}
+    );
+    inserted.deinit();
+    // Both observations must cross the compiled owner boundary unchanged.
+    for ([_]u64{ 4999, 5000 }) |version| {
+        const encoded = try batch.encodeOwnerBatchRequest(alloc, .{
+            .writes = &.{.{ .key = "entity/ada", .value = "{\"value\":\"stale\"}" }},
+            .predicates = &.{.{ .key = "entity/ada", .expected_version = version, .expected_content_digest = if (version == 5000) @as([32]u8, @splat(0)) else null }},
+            .sync_level = .write,
+        });
+        defer alloc.free(encoded);
+        try std.testing.expectError(error.VersionConflict, owner.batchJson("docs", encoded));
+        var unchanged = try owner.lookupJson("docs", "{\"key\":\"entity/ada\"}");
+        defer unchanged.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, unchanged.bytes(), "original") != null);
+    }
+    const matching = try batch.encodeOwnerBatchRequest(alloc, .{
+        .writes = &.{.{ .key = "entity/ada", .value = "{\"value\":\"current\"}" }},
+        .predicates = &.{.{ .key = "entity/ada", .expected_version = 5000 }},
+        .sync_level = .write,
+    });
+    defer alloc.free(matching);
+    var committed = try owner.batchJson("docs", matching);
+    committed.deinit();
+    var current = try owner.lookupJson("docs", "{\"key\":\"entity/ada\"}");
+    defer current.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, current.bytes(), "current") != null);
 }
 
 test "opaque owner retains newer durable schema when reopening a stale descriptor" {

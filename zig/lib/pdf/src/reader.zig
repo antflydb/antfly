@@ -499,15 +499,18 @@ const CodeSpaceRange = struct {
 
 const FontDecoder = struct {
     code_bytes: usize = 1,
+    simple_font: bool = false,
     base_encoding: text_encoding.NamedEncoding = .pdf_doc,
     differences: [256]?[]u8 = @as([256]?[]u8, @splat(null)),
     difference_codepoints: [256]?u21 = @as([256]?u21, @splat(null)),
     difference_defined: [256]bool = @as([256]bool, @splat(false)),
+    type1_builtin_fallbacks: [256]?[]u8 = @as([256]?[]u8, @splat(null)),
     to_unicode: []ToUnicodeEntry = &.{},
     codespace_ranges: []CodeSpaceRange = &.{},
 
     pub fn deinit(self: *FontDecoder, alloc: Allocator) void {
         for (self.differences) |mapping| if (mapping) |bytes| alloc.free(bytes);
+        for (self.type1_builtin_fallbacks) |mapping| if (mapping) |bytes| alloc.free(bytes);
         for (self.to_unicode) |entry| alloc.free(entry.dst);
         if (self.to_unicode.len > 0) alloc.free(self.to_unicode);
         if (self.codespace_ranges.len > 0) alloc.free(self.codespace_ranges);
@@ -532,6 +535,10 @@ const FontDecoder = struct {
         }
         if (self.difference_defined[b]) {
             try out.appendSlice(alloc, "�");
+            return;
+        }
+        if (self.type1_builtin_fallbacks[b]) |mapping| {
+            try out.appendSlice(alloc, mapping);
             return;
         }
         const decoded = try text_encoding.decodeNamedAlloc(alloc, self.base_encoding, &.{b});
@@ -572,6 +579,9 @@ const FontDecoder = struct {
     }
 
     fn detectCodeWidth(self: *const FontDecoder, remaining: []const u8) usize {
+        // Simple-font codes are one byte even when a producer declares an
+        // oversized ToUnicode codespace. Do not consume adjacent glyphs.
+        if (self.simple_font) return 1;
         if (self.codespace_ranges.len == 0) return self.code_bytes;
 
         var len: usize = 1;
@@ -585,11 +595,27 @@ const FontDecoder = struct {
         return @min(self.code_bytes, remaining.len);
     }
 
+    fn applyType1BuiltinFallbacks(self: *FontDecoder, alloc: Allocator, font: *const Type1Font) !void {
+        for (font.glyphs) |glyph| {
+            if (!glyph.encoded or
+                self.lookupToUnicode(glyph.code, 1) != null or
+                self.difference_defined[glyph.code] or
+                self.type1_builtin_fallbacks[glyph.code] != null) continue;
+            self.type1_builtin_fallbacks[glyph.code] = try type1GlyphNameToUtf8Alloc(alloc, glyph.name) orelse continue;
+        }
+    }
+
     /// Resolve a simple-font character code for painting. ToUnicode is
     /// intentionally excluded: it describes extraction text and may expand
     /// one PDF code into several Unicode scalars.
     fn paintCodepoint(self: *const FontDecoder, code: u8) ?u21 {
         if (self.difference_defined[code]) return self.difference_codepoints[code];
+        if (self.type1_builtin_fallbacks[code]) |mapping| {
+            var view = std.unicode.Utf8View.init(mapping) catch return null;
+            var iterator = view.iterator();
+            const codepoint = iterator.nextCodepoint() orelse return null;
+            return if (iterator.nextCodepoint() == null) codepoint else null;
+        }
         const cp = switch (self.base_encoding) {
             .pdf_doc => text_encoding.pdf_doc_encoding[code],
             .win_ansi => text_encoding.win_ansi_encoding[code],
@@ -731,6 +757,7 @@ const Type1Glyph = struct {
 const Type1Font = struct {
     local_subrs: [][]u8 = &.{},
     glyphs: []Type1Glyph = &.{},
+    uses_builtin_encoding: bool = false,
     missing_width: f64 = 0,
 
     pub fn deinit(self: *Type1Font, alloc: Allocator) void {
@@ -1321,6 +1348,9 @@ pub const TextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
+    /// Consistent TJ positioning measured on both sides of authored whitespace.
+    /// Only matching local gaps between glyph fragments count as tracking.
+    text_show_tracking_gap: ?f64 = null,
     paint_phase: usize = 0,
     output_span: ?TextOutputSpan = null,
 
@@ -1360,6 +1390,7 @@ const LayoutTextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
+    text_show_tracking_gap: ?f64 = null,
     output_span: ?TextOutputSpan = null,
 
     pub fn deinit(self: *LayoutTextRun, alloc: Allocator) void {
@@ -3085,6 +3116,55 @@ const ShadingStitchingFunction = struct {
     }
 };
 
+fn markTextShowRunsTracking(runs: anytype) void {
+    var start: usize = 0;
+    while (start < runs.len) {
+        if (!textIsTrackingFragment(runs[start].text)) {
+            start += 1;
+            continue;
+        }
+        var end = start + 1;
+        while (end < runs.len and textIsTrackingFragment(runs[end].text) and
+            textRunsShareLine(runs[end - 1], runs[end])) : (end += 1)
+        {}
+        // A multi-glyph label or numeric cell breaks the tracking group.
+        // Evidence in prose must not propagate into neighboring table cells.
+        markTextShowRunGroupTracking(runs[start..end]);
+        start = end;
+    }
+}
+
+fn textIsTrackingFragment(text: []const u8) bool {
+    return text.len > 0 and (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0 or
+        textHasSingleTrackingCodepoint(text));
+}
+
+fn markTextShowRunGroupTracking(runs: anytype) void {
+    var tracking_gap: ?f64 = null;
+    for (runs, 0..) |run, i| {
+        if (i == 0 or i + 1 == runs.len) continue;
+        if (std.mem.indexOfAny(u8, run.text, &std.ascii.whitespace) == null) continue;
+        // A label such as "Grades " is not evidence of per-glyph tracking.
+        // Accept an isolated space or one glyph carrying authored whitespace.
+        if (std.mem.trim(u8, run.text, &std.ascii.whitespace).len > 0 and
+            !textHasSingleTrackingCodepoint(run.text)) continue;
+        if (!textHasSingleTrackingCodepoint(runs[i - 1].text) or
+            !textHasSingleTrackingCodepoint(runs[i + 1].text)) continue;
+        const em = @abs(run.font_size) * textRunAxisLength(run) * @abs(run.horizontal_scale);
+        const tolerance = em * 0.01;
+        const before = textRunForwardGap(runs[i - 1], run);
+        const after = textRunForwardGap(run, runs[i + 1]);
+        if (!(before >= 0 and before < em) or !std.math.isFinite(after) or
+            @abs(before - after) > tolerance) continue;
+        if (tracking_gap) |prior| {
+            // Conflicting spacing evidence is ambiguous; retain geometry.
+            if (@abs(prior - before) > tolerance) return;
+        } else tracking_gap = before;
+    }
+    if (tracking_gap == null) return;
+    for (runs) |*run| run.text_show_tracking_gap = tracking_gap;
+}
+
 const PositionedTextOutput = union(enum) {
     layout: *std.ArrayList(LayoutTextRun),
     analysis: *std.ArrayList(TextRun),
@@ -3095,6 +3175,13 @@ const PositionedTextOutput = union(enum) {
             .layout => |out| out.items.len,
             .analysis, .render => |out| out.items.len,
         };
+    }
+
+    fn markTextShowTracking(self: PositionedTextOutput, start: usize) void {
+        switch (self) {
+            .layout => |out| markTextShowRunsTracking(out.items[start..]),
+            .analysis, .render => |out| markTextShowRunsTracking(out.items[start..]),
+        }
     }
 
     fn isTextOnly(self: PositionedTextOutput) bool {
@@ -11119,6 +11206,10 @@ pub const Reader = struct {
                 break :blk null;
             },
         };
+        if (font.type1) |*type1| {
+            if (type1.uses_builtin_encoding)
+                try font.decoder.applyType1BuiltinFallbacks(self.alloc, type1);
+        }
         try self.checkCancellation();
         const built_sfnt = self.buildSfntFont(font_obj, &font.decoder) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -11202,14 +11293,19 @@ pub const Reader = struct {
     }
 
     fn buildFontDecoder(self: *const Reader, font_obj: *const syntax.Object) !FontDecoder {
-        var decoder = FontDecoder{};
+        var resolved_subtype = if (font_obj.get("Subtype")) |value| try self.resolveValue(value) else null;
+        defer if (resolved_subtype) |*value| value.deinit(self.alloc);
+        const subtype_name = if (resolved_subtype) |value| value.asName() orelse "" else "";
+        // Force one-byte codes only for positively identified simple fonts.
+        // Missing or unrecognized subtypes retain ToUnicode width detection.
+        var decoder = FontDecoder{ .simple_font = std.mem.eql(u8, subtype_name, "Type1") or
+            std.mem.eql(u8, subtype_name, "MMType1") or
+            std.mem.eql(u8, subtype_name, "TrueType") or
+            std.mem.eql(u8, subtype_name, "Type3") };
         errdefer decoder.deinit(self.alloc);
 
-        if (font_obj.get("Encoding") == null) {
-            if (font_obj.get("Subtype")) |subtype| {
-                if (std.mem.eql(u8, subtype.asName() orelse "", "Type1")) decoder.base_encoding = .standard;
-            }
-        }
+        if (font_obj.get("Encoding") == null and std.mem.eql(u8, subtype_name, "Type1"))
+            decoder.base_encoding = .standard;
 
         if (font_obj.get("Encoding")) |encoding_obj| {
             var resolved_encoding = try self.resolveValue(encoding_obj);
@@ -12078,6 +12174,20 @@ pub const Reader = struct {
                 }
             }
         }
+        var builtin_encoding = Type1BuiltinEncoding{};
+        defer builtin_encoding.deinit(self.alloc);
+        var uses_builtin_encoding = false;
+        if (font_obj.get("Encoding") == null and
+            (try self.simpleFontSymbolicAlloc(font_obj)) == true)
+        {
+            builtin_encoding = try parseType1BuiltinEncodingAlloc(self.alloc, bytes);
+            uses_builtin_encoding = builtin_encoding.has_entries;
+            if (uses_builtin_encoding) {
+                for (builtin_encoding.names, 0..) |glyph_name, code| {
+                    if (glyph_name) |value| code_to_name[code] = value;
+                }
+            }
+        }
 
         const first_char: usize = if (font_obj.get("FirstChar")) |obj| blk: {
             const value = (try self.resolvedIntegerObjectValue(obj)) orelse return error.InvalidPdf;
@@ -12106,6 +12216,7 @@ pub const Reader = struct {
         return .{
             .local_subrs = local_subrs,
             .glyphs = glyphs,
+            .uses_builtin_encoding = uses_builtin_encoding,
             .missing_width = missing_width,
         };
     }
@@ -14039,6 +14150,117 @@ fn decryptType1BytesAlloc(alloc: Allocator, len_iv: i64, bytes: []const u8) ![]u
     return try font_lib.type1.decryptCharStringAlloc(alloc, bytes, @intCast(len_iv));
 }
 
+const Type1BuiltinEncoding = struct {
+    names: [256]?[]u8 = @as([256]?[]u8, @splat(null)),
+    has_entries: bool = false,
+
+    fn deinit(self: *Type1BuiltinEncoding, alloc: Allocator) void {
+        for (self.names) |name| if (name) |owned| alloc.free(owned);
+        self.* = undefined;
+    }
+};
+
+fn parseType1BuiltinEncodingAlloc(alloc: Allocator, bytes: []const u8) !Type1BuiltinEncoding {
+    const cleartext_end = std.mem.indexOf(u8, bytes, "currentfile eexec") orelse bytes.len;
+    var scanner = syntax.Scanner.init(alloc, bytes[0..cleartext_end]);
+    defer scanner.deinit();
+    var result = Type1BuiltinEncoding{};
+    errdefer result.deinit(alloc);
+    var in_encoding = false;
+
+    while (true) {
+        var tok = try scanner.readLexeme();
+        defer syntax.Scanner.freeLexeme(alloc, &tok);
+        switch (tok) {
+            .eof => return result,
+            .name => |name| {
+                if (!in_encoding and std.mem.eql(u8, name, "Encoding"))
+                    in_encoding = true;
+            },
+            .keyword => |keyword| {
+                if (!in_encoding) continue;
+                if (std.mem.eql(u8, keyword, "def")) return result;
+                if (!std.mem.eql(u8, keyword, "dup")) continue;
+
+                var code_tok = try scanner.readLexeme();
+                defer syntax.Scanner.freeLexeme(alloc, &code_tok);
+                var name_tok = try scanner.readLexeme();
+                defer syntax.Scanner.freeLexeme(alloc, &name_tok);
+                var put_tok = try scanner.readLexeme();
+                defer syntax.Scanner.freeLexeme(alloc, &put_tok);
+                const code = type1EncodingCode(code_tok) orelse continue;
+                if (name_tok != .name or
+                    put_tok != .keyword or
+                    !std.mem.eql(u8, put_tok.keyword, "put")) continue;
+
+                if (result.names[code]) |old| alloc.free(old);
+                result.names[code] = name_tok.name;
+                name_tok = .eof;
+                result.has_entries = true;
+            },
+            else => {},
+        }
+    }
+}
+
+// The PDF lexer returns PostScript radix integers as keywords. Decode them
+// locally rather than extending PDF numeric syntax to accept PostScript tokens.
+fn type1EncodingCode(tok: syntax.Lexeme) ?u8 {
+    if (tok == .integer) return std.math.cast(u8, tok.integer);
+    if (tok != .keyword) return null;
+    const text = tok.keyword;
+    const separator = std.mem.indexOfScalar(u8, text, '#') orelse return null;
+    if (separator == 0 or separator + 1 == text.len) return null;
+    for (text[0..separator]) |digit| if (digit < '0' or digit > '9') return null;
+    const base = std.fmt.parseInt(u8, text[0..separator], 10) catch return null;
+    if (base < 2 or base > 36) return null;
+    var code: u16 = 0;
+    for (text[separator + 1 ..]) |digit| {
+        code = code * base + (std.fmt.charToDigit(digit, base) catch return null);
+        if (code > 255) return null;
+    }
+    return @intCast(code);
+}
+
+test "Type1 built-in encoding accepts decimal and PostScript radix codes" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { token: []const u8, code: ?u8 }{
+        .{ .token = "8", .code = 8 },
+        .{ .token = "2#1000", .code = 8 },
+        .{ .token = "8#10", .code = 8 },
+        .{ .token = "16#FF", .code = 255 },
+        .{ .token = "36#z", .code = 35 },
+        .{ .token = "-1", .code = null },
+        .{ .token = "256", .code = null },
+        .{ .token = "16#100", .code = null },
+        .{ .token = "1#0", .code = null },
+        .{ .token = "37#0", .code = null },
+        .{ .token = "8#8", .code = null },
+        .{ .token = "16#", .code = null },
+        .{ .token = "16#1#0", .code = null },
+    };
+    for (cases) |case| {
+        const program = try std.fmt.allocPrint(alloc, "/Encoding 256 array dup {s} /braceleftbig put readonly def", .{case.token});
+        defer alloc.free(program);
+        var encoding = try parseType1BuiltinEncodingAlloc(alloc, program);
+        defer encoding.deinit(alloc);
+        try std.testing.expectEqual(case.code != null, encoding.has_entries);
+        if (case.code) |code| try std.testing.expectEqualStrings("braceleftbig", encoding.names[code].?);
+    }
+}
+
+fn type1GlyphNameToUtf8Alloc(alloc: Allocator, name: []const u8) !?[]u8 {
+    if (try text_encoding.glyphNameToUtf8Alloc(alloc, name)) |mapping| return mapping;
+    // TeX Type 1 extension fonts suffix delimiter names with their visual
+    // size. The semantic character is still the unsuffixed delimiter.
+    for ([_][]const u8{ "bigg", "Bigg", "big", "Big" }) |suffix| {
+        if (name.len <= suffix.len or !std.mem.endsWith(u8, name, suffix)) continue;
+        if (try text_encoding.glyphNameToUtf8Alloc(alloc, name[0 .. name.len - suffix.len])) |mapping|
+            return mapping;
+    }
+    return null;
+}
+
 fn ensureType1SubrCapacity(alloc: Allocator, subrs: *std.ArrayList([]u8), index: usize) !void {
     if (index < subrs.items.len) return;
     const old_len = subrs.items.len;
@@ -15378,6 +15600,7 @@ fn applyTextRunOperator(
         if (operands.len == 0) return;
         const last = &operands[operands.len - 1];
         if (last.* != .array) return;
+        const start_len = out.len();
         for (last.array) |item| {
             switch (item) {
                 .string => try appendTextRunDecodedString(alloc, out, state, current_clip_points.items, current_clip_fill_rule.*, fonts, paint_order.*, item.string),
@@ -15392,6 +15615,7 @@ fn applyTextRunOperator(
                 else => {},
             }
         }
+        out.markTextShowTracking(start_len);
         paint_order.* += 1;
         return;
     }
@@ -17995,6 +18219,21 @@ fn endsWithColon(text: []const u8) bool {
     return text.len > 0 and text[text.len - 1] == ':';
 }
 
+fn textHasSingleTrackingCodepoint(text: []const u8) bool {
+    var view = std.unicode.Utf8View.init(text) catch return false;
+    var iterator = view.iterator();
+    var found = false;
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (codepoint <= 0x7f and std.ascii.isWhitespace(@intCast(codepoint))) continue;
+        // Numeric cells may share a TJ with an explicitly spaced label.
+        // Preserve their geometric boundaries instead of joining values.
+        if (codepoint >= '0' and codepoint <= '9') return false;
+        if (found) return false;
+        found = true;
+    }
+    return found;
+}
+
 fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: anytype) ![]u8 {
     return reconstructTextFromRunsCancelableAlloc(alloc, runs, .{});
 }
@@ -18028,7 +18267,17 @@ fn reconstructTextFromRunsCancelableAlloc(alloc: Allocator, runs: anytype, cance
                     startsWithAsciiUpper(run.text);
                 // A text-showing operator boundary can split a single word.
                 // Infer separators from geometry, not content-stream chunking.
-                if (gap > word_gap or caption_boundary) {
+                // Suppress a geometric boundary only when its gap matches
+                // tracking measured around authored whitespace in this TJ.
+                // Unrelated table-cell gaps retain their geometric boundaries.
+                const tracked_glyph_fragments =
+                    prior.paint_order == run.paint_order and
+                    prior.text_show_tracking_gap != null and
+                    run.text_show_tracking_gap != null and
+                    @abs(gap - prior.text_show_tracking_gap.?) <= font_scale * @abs(prior.horizontal_scale) * 0.01 and
+                    textHasSingleTrackingCodepoint(prior.text) and
+                    textHasSingleTrackingCodepoint(run.text);
+                if ((!tracked_glyph_fragments and gap > word_gap) or caption_boundary) {
                     try out.append(alloc, ' ');
                 }
             }
@@ -21359,6 +21608,57 @@ test "reader uses ToUnicode cmap for text extraction" {
     try std.testing.expectEqualStrings("A\n", text);
 }
 
+test "reader uses symbolic Type1 built-in encoding for partial ToUnicode gaps and radix codes" {
+    const alloc = std.testing.allocator;
+    const content = "BT\n/F1 12 Tf\n<084109> Tj\nET\n";
+    const cmap =
+        "begincmap\n" ++
+        "1 begincodespacerange\n" ++
+        "<00> <FF>\n" ++
+        "endcodespacerange\n" ++
+        "1 beginbfchar\n" ++
+        "<41> <03B2>\n" ++
+        "endbfchar\n" ++
+        "endcmap\n";
+    const type1 =
+        "%!PS-AdobeFont-1.0: Delimiters 1.0\n" ++
+        "/FontType 1 def\n" ++
+        "/FontMatrix [0.001 0 0 0.001 0 0] readonly def\n" ++
+        "/Encoding 256 array\n" ++
+        "0 1 255 {1 index exch /.notdef put} for\n" ++
+        "dup 8#10 /braceleftbig put\n" ++
+        "dup 16#09 /bracerightbig put\n" ++
+        "readonly def\n" ++
+        "/Private 1 dict dup begin\n" ++
+        "/lenIV -1 def\n" ++
+        "end\n" ++
+        "/CharStrings 2 dict dup begin\n" ++
+        "/braceleftbig <0e> def\n" ++
+        "/bracerightbig <0e> def\n" ++
+        "end\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Delimiters /ToUnicode 6 0 R /FontDescriptor 7 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "6 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap }),
+        "7 0 obj\n<< /Type /FontDescriptor /FontName /Delimiters /Flags 4 /FontFile 8 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "8 0 obj\n<< /Length {d} /Length1 {d} >>\nstream\n{s}endstream\nendobj\n", .{ type1.len, type1.len, type1 }),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[5]);
+    defer alloc.free(objects[7]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const text = try reader.extractPlainTextAlloc();
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("{β}\n", text);
+}
+
 test "reader uses ToUnicode codespacerange for multibyte text extraction" {
     const alloc = std.testing.allocator;
     const content = "BT\n/F1 12 Tf\n<0102> Tj\nET\n";
@@ -21875,6 +22175,82 @@ test "reader preserves scaled word gaps without splitting adjacent operators" {
         const text = try reader.extractPageTextAlloc(1);
         defer alloc.free(text);
         try std.testing.expectEqualStrings("Hello World\n", text);
+    }
+}
+
+test "reader distinguishes TJ glyph tracking from geometric word gaps" {
+    const alloc = std.testing.allocator;
+    const content =
+        "BT /F1 12 Tf 1 0 0 1 10 90 Tm\n" ++
+        "[(H) -250 (e) -250 (l) -250 (l) -250 (o) -250 ( ) -250 (W) -250 (o) -250 (r) -250 (l) -250 (d)] TJ\n" ++
+        "0 -20 Td [(No) -278 (Space)] TJ\n" ++
+        "0 -20 Td [(Hello World) -1200 (Next)] TJ\n" ++
+        "0 -20 Td [(Item ) -1200 (A) -1200 (B)] TJ ET\n";
+    const sample = try buildTextOrderingTestPdfAlloc(alloc, content);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqualStrings("Hello World\nNo Space\nHello World Next\nItem A B\n", analysis.text);
+
+    const text = try reader.extractPageTextAlloc(1);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Hello World\nNo Space\nHello World Next\nItem A B\n", text);
+}
+
+test "reader preserves TJ numeric cell gaps beside authored whitespace" {
+    const alloc = std.testing.allocator;
+    for ([_]u32{ 100, 25, 10 }) |horizontal_scale| {
+        for ([_]u32{ 250, 500, 750 }) |gap| {
+            const content = try std.fmt.allocPrint(alloc,
+                \\BT /F1 12 Tf {d} Tz 1 0 0 1 10 90 Tm
+                \\[(Item ) (1) -{d} (2) -{d} (3)] TJ
+                \\0 -20 Td [(1) -{d} (2) ( ) (3) -{d} (4)] TJ ET
+                \\
+            , .{ horizontal_scale, gap, gap, gap, gap });
+            defer alloc.free(content);
+            const sample = try buildTextOrderingTestPdfAlloc(alloc, content);
+            defer alloc.free(sample);
+            var reader = try Reader.init(alloc, sample);
+            defer reader.deinit();
+
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(alloc);
+            try std.testing.expectEqualStrings("Item 1 2 3\n1 2 3 4\n", analysis.text);
+
+            const text = try reader.extractPageTextAlloc(1);
+            defer alloc.free(text);
+            try std.testing.expectEqualStrings("Item 1 2 3\n1 2 3 4\n", text);
+        }
+    }
+}
+
+test "reader preserves alphabetic TJ cells without propagating prose tracking" {
+    const alloc = std.testing.allocator;
+    for ([_]u32{ 100, 25, 10 }) |horizontal_scale| {
+        for ([_]u32{ 250, 500, 750 }) |gap| {
+            const content = try std.fmt.allocPrint(alloc,
+                \\BT /F1 12 Tf {d} Tz 1 0 0 1 10 90 Tm
+                \\[(Grades ) (A) -{d} (B) -{d} (C)] TJ
+                \\0 -20 Td [(H) -250 (e) -250 (l) -250 (l) -250 (o) -250 ( ) -250 (W) -250 (o) -250 (r) -250 (l) -250 (d) -1500 (Grades ) (A) -{d} (B) -{d} (C)] TJ
+                \\0 -20 Td [(H) -250 (e) -250 (l) -250 (l) -250 (o ) -250 (W) -250 (o) -250 (r) -250 (l) -250 (d)] TJ ET
+                \\
+            , .{ horizontal_scale, gap, gap, gap, gap });
+            defer alloc.free(content);
+            const sample = try buildTextOrderingTestPdfAlloc(alloc, content);
+            defer alloc.free(sample);
+            var reader = try Reader.init(alloc, sample);
+            defer reader.deinit();
+            const expected = "Grades A B C\nHello World Grades A B C\nHello World\n";
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(alloc);
+            try std.testing.expectEqualStrings(expected, analysis.text);
+            const text = try reader.extractPageTextAlloc(1);
+            defer alloc.free(text);
+            try std.testing.expectEqualStrings(expected, text);
+        }
     }
 }
 
@@ -31063,4 +31439,106 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
     var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
     for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
     return result;
+}
+
+test "simple font character codes stay single byte with oversized ToUnicode codespaces" {
+    const alloc = std.testing.allocator;
+    const content = "BT\n/F1 12 Tf\n(ABCD) Tj\nET\n";
+    const cmap =
+        "begincmap\n" ++
+        "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n" ++
+        "3 beginbfchar\n<41> <0041>\n<42> <0042>\n<43> <00660069>\nendbfchar\n" ++
+        "endcmap\n";
+    for ([_][]const u8{ "Type1", "TrueType" }) |subtype| {
+        const objects = [_][]const u8{
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+            try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+            try std.fmt.allocPrint(alloc, "5 0 obj\n<< /Type /Font /Subtype /{s} /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>\nendobj\n", .{subtype}),
+            try std.fmt.allocPrint(alloc, "6 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap }),
+        };
+        defer alloc.free(objects[3]);
+        defer alloc.free(objects[4]);
+        defer alloc.free(objects[5]);
+        var prefix = std.ArrayList(u8).empty;
+        defer prefix.deinit(alloc);
+        try prefix.appendSlice(alloc, "%PDF-1.7\n");
+        var offsets: [objects.len]usize = undefined;
+        for (objects, 0..) |obj_src, i| {
+            offsets[i] = prefix.items.len;
+            try prefix.appendSlice(alloc, obj_src);
+        }
+        const xref_offset = prefix.items.len;
+        try prefix.appendSlice(alloc, "xref\n0 7\n0000000000 65535 f \n");
+        for (offsets) |off| {
+            const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+            defer alloc.free(line);
+            try prefix.appendSlice(alloc, line);
+        }
+        try prefix.appendSlice(alloc, "trailer\n<< /Size 7 /Root 1 0 R >>\n");
+        const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+        defer alloc.free(sample);
+        var reader = try Reader.init(alloc, sample);
+        defer reader.deinit();
+        const text = try reader.extractPlainTextAlloc();
+        defer alloc.free(text);
+        // C expands to a ligature; D exercises WinAnsi fallback.
+        try std.testing.expectEqualStrings("ABfiD\n", text);
+    }
+}
+
+test "font decoder resolves indirect simple subtypes and default encoding" {
+    const alloc = std.testing.allocator;
+    const cmap = "begincmap\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n2 beginbfchar\n<41> <0041>\n<42> <0042>\nendbfchar\nendcmap\n";
+    for ([_][]const u8{ "Type1", "TrueType", "MMType1", "Type3" }) |subtype| {
+        const objects = [_][]const u8{
+            "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+            "2 0 obj\n<< /Type /Font /Subtype 3 0 R /ToUnicode 4 0 R >>\nendobj\n",
+            try std.fmt.allocPrint(alloc, "3 0 obj\n/{s}\nendobj\n", .{subtype}),
+            try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap }),
+        };
+        defer alloc.free(objects[2]);
+        defer alloc.free(objects[3]);
+        const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+        defer alloc.free(sample);
+        var reader = try Reader.init(alloc, sample);
+        defer reader.deinit();
+        var font_obj = try reader.readIndirectObject(.{ .id = 2, .gen = 0 });
+        defer font_obj.deinit(alloc);
+        var decoder = try reader.buildFontDecoder(&font_obj);
+        defer decoder.deinit(alloc);
+        const decoded = try decoder.decodeAlloc(alloc, "AB");
+        defer alloc.free(decoded);
+        try std.testing.expectEqualStrings("AB", decoded);
+        if (std.mem.eql(u8, subtype, "Type1")) {
+            const fallback = try decoder.decodeAlloc(alloc, "'");
+            defer alloc.free(fallback);
+            try std.testing.expectEqualStrings("\u{2019}", fallback);
+        }
+    }
+}
+
+test "reader resolves indirect Type0 subtype before decoding" {
+    const alloc = std.testing.allocator;
+    const content = "BT /F1 12 Tf <0001> Tj ET\n";
+    const cmap = "begincmap\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n1 beginbfchar\n<0001> <0041>\nendbfchar\nendcmap\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+        "5 0 obj\n<< /Type /Font /Subtype 7 0 R /ToUnicode 6 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "6 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap }),
+        "7 0 obj\n/Type0\nendobj\n",
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[5]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const text = try reader.extractPlainTextAlloc();
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("A\n", text);
 }

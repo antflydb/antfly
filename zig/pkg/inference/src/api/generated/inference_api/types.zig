@@ -808,6 +808,8 @@ pub const DictateRequest = struct {
     audio: []const u8,
     /// Force the transcript language (ISO 639-1). Omit for automatic detection.
     language: ?[]const u8 = null,
+    /// Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
+    timestamps: ?bool = null,
     /// Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
     cleanup_model: ?[]const u8 = null,
     style: ?DictationStyle = null,
@@ -831,6 +833,7 @@ pub const DictateRequest = struct {
         .{ "model", "model", false },
         .{ "audio", "audio", false },
         .{ "language", "language", true },
+        .{ "timestamps", "timestamps", true },
         .{ "cleanup_model", "cleanup_model", true },
         .{ "style", "style", true },
         .{ "dictionary", "dictionary", true },
@@ -859,6 +862,10 @@ pub const DictateRequest = struct {
         try jw.write(self.audio);
         if (self.language) |value| {
             try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
             try jw.write(value);
         }
         if (self.cleanup_model) |value| {
@@ -2589,8 +2596,28 @@ pub const GenerateResponse = struct {
     model: []const u8,
     /// List of completion choices (currently always 1)
     choices: []const GenerateChoice,
-    usage: GenerateUsage,
+    /// Provider-reported token usage, or null when the provider does not supply it.
+    usage: ?GenerateUsage,
     speculation: OpenApiOptionalNullable(GenerateSpeculationStatus) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "created", "created", false },
+        .{ "model", "model", false },
+        .{ "choices", "choices", false },
+        .{ "usage", "usage", false },
+        .{ "speculation", "speculation", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -2929,6 +2956,95 @@ pub const ModelInfo = struct {
     }
 };
 
+/// One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private.
+pub const ModelInstance = struct {
+    /// Opaque incarnation identifier; changes after eviction and reload.
+    id: []const u8,
+    model: []const u8,
+    tasks: []const ModelKind,
+    state: []const u8,
+    /// Internal owners or loading waiters preventing eviction. This is not a count of HTTP requests.
+    active_handles: i64,
+    startup_managed: bool,
+    /// Whether an unload would be permitted at snapshot time; concurrent use can change this.
+    unloadable: bool,
+    unload_blocked_reason: ?[]const u8 = null,
+    /// Selected execution backend, when known.
+    backend: ?[]const u8 = null,
+    /// Weight residency policy; loaded does not imply full device residency.
+    residency_mode: []const u8,
+    /// Elapsed milliseconds since last use, not a wall-clock timestamp.
+    idle_ms: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "model", "model", false },
+        .{ "tasks", "tasks", false },
+        .{ "state", "state", false },
+        .{ "active_handles", "active_handles", false },
+        .{ "startup_managed", "startup_managed", false },
+        .{ "unloadable", "unloadable", false },
+        .{ "unload_blocked_reason", "unload_blocked_reason", true },
+        .{ "backend", "backend", true },
+        .{ "residency_mode", "residency_mode", false },
+        .{ "idle_ms", "idle_ms", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("tasks");
+        try jw.write(self.tasks);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("active_handles");
+        try jw.write(self.active_handles);
+        try jw.objectField("startup_managed");
+        try jw.write(self.startup_managed);
+        try jw.objectField("unloadable");
+        try jw.write(self.unloadable);
+        if (self.unload_blocked_reason) |value| {
+            try jw.objectField("unload_blocked_reason");
+            try jw.write(value);
+        }
+        if (self.backend) |value| {
+            try jw.objectField("backend");
+            try jw.write(value);
+        }
+        try jw.objectField("residency_mode");
+        try jw.write(self.residency_mode);
+        try jw.objectField("idle_ms");
+        try jw.write(self.idle_ms);
+        try jw.endObject();
+    }
+};
+
+pub const ModelInstanceList = struct {
+    object: []const u8,
+    data: []const ModelInstance,
+};
+
+pub const ModelInstanceLoadRequest = struct {
+    model: []const u8,
+    task: ModelKind,
+};
+
+pub const ModelInstanceUnloadResponse = struct {
+    outcome: []const u8,
+};
+
 /// Model registry kind.
 pub const ModelKind = enum {
     generator,
@@ -3075,6 +3191,8 @@ pub const ModelRef = struct {
 };
 
 pub const ModelsResponse = struct {
+    /// Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
+    public_inference_enabled: ?bool = null,
     /// OpenAI-compatible response object type.
     object: []const u8,
     /// OpenAI-compatible flat model list for generation/embedding models.
@@ -3100,6 +3218,67 @@ pub const ModelsResponse = struct {
     readers: std.json.ArrayHashMap(ModelInfo),
     /// Available transcriber/speech-to-text models from models_dir/transcribers/
     transcribers: std.json.ArrayHashMap(ModelInfo),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "public_inference_enabled", "public_inference_enabled", true },
+        .{ "object", "object", false },
+        .{ "data", "data", false },
+        .{ "allow_downloads", "allow_downloads", false },
+        .{ "backends", "backends", false },
+        .{ "chunkers", "chunkers", false },
+        .{ "rerankers", "rerankers", false },
+        .{ "embedders", "embedders", false },
+        .{ "extractors", "extractors", false },
+        .{ "deciders", "deciders", false },
+        .{ "generators", "generators", false },
+        .{ "rewriters", "rewriters", false },
+        .{ "readers", "readers", false },
+        .{ "transcribers", "transcribers", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.public_inference_enabled) |value| {
+            try jw.objectField("public_inference_enabled");
+            try jw.write(value);
+        }
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("allow_downloads");
+        try jw.write(self.allow_downloads);
+        try jw.objectField("backends");
+        try jw.write(self.backends);
+        try jw.objectField("chunkers");
+        try jw.write(self.chunkers);
+        try jw.objectField("rerankers");
+        try jw.write(self.rerankers);
+        try jw.objectField("embedders");
+        try jw.write(self.embedders);
+        try jw.objectField("extractors");
+        try jw.write(self.extractors);
+        try jw.objectField("deciders");
+        try jw.write(self.deciders);
+        try jw.objectField("generators");
+        try jw.write(self.generators);
+        try jw.objectField("rewriters");
+        try jw.write(self.rewriters);
+        try jw.objectField("readers");
+        try jw.write(self.readers);
+        try jw.objectField("transcribers");
+        try jw.write(self.transcribers);
+        try jw.endObject();
+    }
 };
 
 pub const PredictRequest = struct {
@@ -3198,10 +3377,40 @@ pub const PredictorTask = enum {
 };
 
 pub const PredictorsResponse = struct {
+    /// Whether public inference execution is enabled on this deployment.
+    public_inference_enabled: ?bool = null,
     /// Response object type.
     object: []const u8,
     /// Traditional ML predictors keyed by predictor name.
     predictors: std.json.ArrayHashMap(PredictorInfo),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "public_inference_enabled", "public_inference_enabled", true },
+        .{ "object", "object", false },
+        .{ "predictors", "predictors", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.public_inference_enabled) |value| {
+            try jw.objectField("public_inference_enabled");
+            try jw.write(value);
+        }
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("predictors");
+        try jw.write(self.predictors);
+        try jw.endObject();
+    }
 };
 
 /// Native generator prompt KV cache configuration.
@@ -4010,6 +4219,8 @@ pub const TranscribeRequest = struct {
     audio: []const u8,
     /// Force specific language for transcription (optional, model-dependent)
     language: ?[]const u8 = null,
+    /// Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
+    timestamps: ?bool = null,
     /// Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
     diarization: ?bool = null,
 
@@ -4018,6 +4229,7 @@ pub const TranscribeRequest = struct {
         .{ "model", "model", false },
         .{ "audio", "audio", false },
         .{ "language", "language", true },
+        .{ "timestamps", "timestamps", true },
         .{ "diarization", "diarization", true },
     };
 
@@ -4037,6 +4249,10 @@ pub const TranscribeRequest = struct {
         try jw.write(self.audio);
         if (self.language) |value| {
             try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
             try jw.write(value);
         }
         if (self.diarization) |value| {

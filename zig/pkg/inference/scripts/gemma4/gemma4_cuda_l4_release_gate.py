@@ -180,7 +180,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--binary",
         type=pathlib.Path,
-        default=inference / "zig-out/bin/antfly-inference",
+        default=inference / "zig-out/bin/antfly-inference-dev",
     )
     parser.add_argument(
         "--llama-cpp-bin",

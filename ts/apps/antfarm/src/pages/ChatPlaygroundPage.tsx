@@ -2,7 +2,6 @@ import type { ChatTurn } from "@antfly/components";
 import { Antfly, ChatBar } from "@antfly/components";
 import { createAIElementsRenderers, turnToStatus } from "@antfly/components/adapters";
 import {
-  Badge,
   Button,
   Card,
   CardContent,
@@ -11,12 +10,7 @@ import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
-  DashboardPage,
   DashboardPageActions,
-  DashboardPageDescription,
-  DashboardPageHeader,
-  DashboardPageTitle,
-  DashboardToolbar,
   Input,
   Label,
   Separator,
@@ -45,6 +39,7 @@ import {
 } from "@/components/ai-elements/prompt-input";
 import { Source, Sources, SourcesContent, SourcesTrigger } from "@/components/ai-elements/sources";
 import { Suggestion, Suggestions } from "@/components/ai-elements/suggestion";
+import { AIWorkflowHeader, AIWorkflowPage } from "@/components/ai-workflow";
 import { chatGPTErrorMessage, useChatGPT } from "@/components/chatgpt-provider";
 import { getChatRequestGenerator } from "@/components/playground/chat-generator";
 import {
@@ -53,6 +48,7 @@ import {
   getInheritedGeneratorLabels,
 } from "@/components/playground/GeneratorSelector";
 import { ReasoningChainCollapsible } from "@/components/playground/ReasoningChainCollapsible";
+import { AskModeNavigation, RetrievalContextBar } from "@/components/retrieval-context";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useGeneratorPreference } from "@/hooks/use-generator-preference";
 import { useTable } from "@/hooks/use-table";
@@ -111,7 +107,7 @@ const ChatPlaygroundPage: React.FC = () => {
   const { apiUrl } = useApiConfig();
   const { dashboardGenerator } = useGeneratorPreference();
   const chatgpt = useChatGPT();
-  const { selectedTable, chatIndexes } = useTable();
+  const { selectedTable, selectedIndex, chatIndexes } = useTable();
 
   // Config state
   const [generatorOverride, setGeneratorOverride] = useState<GeneratorConfig | null>(null);
@@ -147,49 +143,35 @@ const ChatPlaygroundPage: React.FC = () => {
 
   return (
     <Antfly url={apiUrl} table={selectedTable || ""}>
-      <DashboardPage className="h-full space-y-3">
-        <DashboardPageHeader>
-          <div>
-            <DashboardPageTitle className="font-aeonik">Chat Playground</DashboardPageTitle>
-            <DashboardPageDescription>
-              Multi-turn conversation with AI-powered retrieval
-            </DashboardPageDescription>
-          </div>
-          <DashboardPageActions>
-            <Button variant="outline" onClick={handleReset}>
-              <RotateCcw className="h-4 w-4 mr-2" />
-              Reset
-            </Button>
-          </DashboardPageActions>
-        </DashboardPageHeader>
+      <AIWorkflowPage className="h-full">
+        <AIWorkflowHeader
+          eyebrow="Retrieval"
+          title="Ask your data"
+          description="Explore your documents in a conversation, with sources and retrieval details."
+          actions={
+            <DashboardPageActions>
+              <Button variant="outline" onClick={handleReset}>
+                <RotateCcw className="h-4 w-4 mr-2" />
+                Reset
+              </Button>
+            </DashboardPageActions>
+          }
+        />
 
-        {/* Active Table/Index Indicator */}
-        {selectedTable ? (
-          <DashboardToolbar className="flex-row items-center gap-2 text-sm text-muted-foreground md:items-center">
-            <Badge>{selectedTable}</Badge>
-            {chatIndexes.length > 0 ? (
-              <Badge>
-                {chatIndexes.length} index{chatIndexes.length !== 1 ? "es" : ""}
-              </Badge>
-            ) : (
-              <span className="af-status-text-warning text-xs">No searchable index found</span>
-            )}
-          </DashboardToolbar>
-        ) : (
-          <DashboardToolbar className="border-dashed text-sm text-muted-foreground">
-            Select a table from the sidebar to get started.
-          </DashboardToolbar>
-        )}
-
+        <AskModeNavigation />
+        <RetrievalContextBar searchable />
         {/* Main Grid — asymmetric: narrow settings, wide chat */}
-        <div className="grid grid-cols-1 lg:grid-cols-[340px_1fr] gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,300px)_minmax(0,1fr)] gap-6">
           {/* Left Column - Settings */}
           <div className="space-y-4">
             <Card>
               <Collapsible open={settingsOpen} onOpenChange={setSettingsOpen}>
                 <CardHeader className="pb-3">
                   <CollapsibleTrigger asChild>
-                    <div className="flex items-center justify-between cursor-pointer">
+                    <button
+                      type="button"
+                      className="flex w-full items-center justify-between text-left"
+                    >
                       <CardTitle className="text-lg flex items-center gap-2">
                         <Settings className="h-4 w-4" />
                         Settings
@@ -199,7 +181,7 @@ const ChatPlaygroundPage: React.FC = () => {
                       ) : (
                         <ChevronRight className="h-4 w-4" />
                       )}
-                    </div>
+                    </button>
                   </CollapsibleTrigger>
                 </CardHeader>
                 <CollapsibleContent>
@@ -418,7 +400,7 @@ const ChatPlaygroundPage: React.FC = () => {
           </div>
 
           {/* Right Column - Chat */}
-          <Card className="flex flex-col h-[60vh] lg:h-[calc(100vh-280px)] min-h-[400px]">
+          <Card className="flex flex-col min-h-[28rem] lg:h-[calc(100vh-280px)] min-h-[400px]">
             <CardHeader className="pb-3 flex-none">
               <CardTitle className="text-lg">Chat</CardTitle>
             </CardHeader>
@@ -433,7 +415,7 @@ const ChatPlaygroundPage: React.FC = () => {
                   id="chat-playground"
                   generator={requestGenerator}
                   table={selectedTable}
-                  semanticIndexes={chatIndexes.length > 0 ? chatIndexes : undefined}
+                  semanticIndexes={selectedIndex ? [selectedIndex] : chatIndexes}
                   agentKnowledge={agentKnowledge || undefined}
                   systemPrompt={systemPrompt || undefined}
                   maxInternalIterations={agenticEnabled ? maxInternalIterations : undefined}
@@ -524,7 +506,7 @@ const ChatPlaygroundPage: React.FC = () => {
             </CardContent>
           </Card>
         </div>
-      </DashboardPage>
+      </AIWorkflowPage>
     </Antfly>
   );
 };

@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Real PyIceberg commits through public SQL attachment and cold restart.
 
@@ -37,7 +37,11 @@ from conftest import (
     resolve_binary_path,
 )
 
-pytestmark = [pytest.mark.iceberg_integration, pytest.mark.fresh_antfly_process]
+pytestmark = [
+    pytest.mark.iceberg_integration,
+    pytest.mark.fresh_antfly_process,
+    pytest.mark.e2e_resource("antfly_process"),
+]
 
 
 def _export_table(table, root):
@@ -1340,9 +1344,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             "fields": ["id", "body"],
             "limit": row_count,
             "profile": True,
-            "lake_read": {
+            "read_requirements": {
                 "visibility": "accepted",
-                "through": accepted["read_receipt"],
+                "after_write": accepted["read_receipt"],
             },
             "highlight": {"fields": ["body"]},
         }
@@ -1473,9 +1477,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 },
             )
             latest_request = dict(query, embeddings=embeddings)
-            latest_request["lake_read"] = {
+            latest_request["read_requirements"] = {
                 "visibility": "accepted",
-                "through": newer["read_receipt"],
+                "after_write": newer["read_receipt"],
             }
             deadline = time.monotonic() + 120
             while True:

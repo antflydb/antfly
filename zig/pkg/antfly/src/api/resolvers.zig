@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Table-owned resolver resources. Runtime policy changes use the metadata
 //! compare-and-swap contract; data owners consume them through reconciliation.
@@ -399,13 +399,13 @@ pub fn handle(server: anytype, alloc: std.mem.Allocator, op: Operation, table_na
 }
 
 fn executeWithRetry(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name: []const u8, resolver_name: []const u8, key: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext) !@import("public_table_http.zig").OwnedResponse {
-    const entity_request = op == .proposal_create or op == .proposal_accept or op == .proposal_reject or op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress or op == .entity_distinct;
+    const retryable_request = op == .merge or op == .unmerge or op == .suppress or op == .unsuppress or op == .proposal_create or op == .proposal_accept or op == .proposal_reject or op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress or op == .entity_distinct;
     var attempts: u8 = 0;
     while (true) {
         return execute(server, alloc, op, table_name, resolver_name, key, body, query, request) catch |err| {
             // These errors certify that the catalog CAS did not commit. Take
             // a fresh adoption cut, preserving any client expected_revision.
-            if (entity_request and attempts < 2 and (err == error.TableLifecycleConflict or err == error.TableGenerationChanged or err == error.CatalogGenerationChanged)) {
+            if (retryable_request and attempts < 2 and (err == error.TableLifecycleConflict or err == error.TableGenerationChanged or err == error.CatalogGenerationChanged)) {
                 attempts += 1;
                 continue;
             }

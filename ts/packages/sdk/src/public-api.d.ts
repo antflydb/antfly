@@ -476,6 +476,10 @@ export interface paths {
          *     response containing details about which key conflicted.
          *
          *     If all versions match, writes are executed atomically via 2PC.
+         *     A 409 with diagnostic code `transaction_outcome_unknown` is different
+         *     from an aborted optimistic conflict: it may already have committed and
+         *     MUST NOT be replayed. A committed 202 result requires observation or
+         *     repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
          *
          *     Stateless clients manage their own read set. For server-managed
          *     read-modify-write workflows, use the transaction session endpoints.
@@ -5360,7 +5364,7 @@ export interface paths {
         put?: never;
         /**
          * Answer named decision questions
-         * @description Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
+         * @description Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items. Hosted typed deciders and qualified constrained generators accept text and images per batch item. Generated native models must support both images and constrained output. Native trained and embedding deciders require text. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
          */
         post: operations["decide"];
         delete?: never;
@@ -5398,6 +5402,50 @@ export interface paths {
          */
         post: operations["extract"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/models/instances": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List model instances
+         * @description Inspect this inference server's shared model cache without loading models or extending idle eviction deadlines. Each incarnation appears once, even when it supports multiple tasks.
+         */
+        get: operations["listModelInstances"];
+        put?: never;
+        /**
+         * Load a model instance
+         * @description Prepare the instance used by the requested task. Reuses an existing compatible instance. Normal idle eviction still applies; loading does not pin weights or guarantee device residency.
+         */
+        post: operations["loadModelInstance"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/models/instances/{instance_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Unload a model instance
+         * @description Evict one exact incarnation from the shared server cache. A stale ID is an idempotent miss and never evicts a replacement. Loading, busy, and startup-managed instances cannot be unloaded.
+         */
+        delete: operations["unloadModelInstance"];
         options?: never;
         head?: never;
         patch?: never;
@@ -5531,6 +5579,40 @@ export interface paths {
          *     predictors and their feature schemas.
          */
         post: operations["predict"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ml/v1/predictors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List predictor feature schemas through the gateway */
+        get: operations["listGatewayPredictors"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/synthesize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Synthesize speech using a named text-to-speech configuration */
+        post: operations["synthesizeSpeech"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5966,12 +6048,6 @@ export interface components {
          */
         SQLRequest: {
             read_requirements?: components["schemas"]["ReadRequirements"];
-            /**
-             * @deprecated
-             * @description Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable write transactions over external sources are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
-             * @enum {string}
-             */
-            lake_visibility?: "committed" | "accepted";
             /** @description A single SQL statement. */
             statement: string;
             /** @description Positional JSON parameter values, including null. */
@@ -6458,7 +6534,7 @@ export interface components {
         /** @description A stable failure envelope for query execution policy and embedding, reranking, and decision dependencies. */
         QueryDependencyError: {
             /** @enum {string} */
-            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "decision_limit_exceeded" | "invalid_decision_evaluation" | "value_search_requires_scan" | "value_search_limit_exceeded" | "decision_provider_unavailable" | "decision_rate_limited" | "decision_upstream_failure" | "query_timeout";
+            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "decision_limit_exceeded" | "invalid_decision_evaluation" | "value_verification_requires_scan" | "value_verification_limit_exceeded" | "decision_provider_unavailable" | "decision_rate_limited" | "decision_upstream_failure" | "query_timeout";
             /** @description Legacy alias of code. Use code for programmatic handling. */
             error: string;
             message: string;
@@ -7009,6 +7085,8 @@ export interface components {
          *     }
          */
         EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+            /** @description This named embedder produces sparse index/value vectors. */
+            sparse?: boolean;
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["EmbedderProvider"];
             /**
@@ -7173,20 +7251,30 @@ export interface components {
          *     classify.
          * @enum {string}
          */
-        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "other";
+        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "decider" | "synthesizer" | "predictor" | "other";
         ConnectedModel: {
             /** @description Model identifier as reported by the provider. */
             name: string;
+            /** @description Canonical public gateway identity when available. */
+            id?: string;
+            /** @description Availability observation independent of capability support. */
+            availability?: string;
+            /** @description Whether metadata is configured, live, or cached. */
+            freshness?: string;
             /** @description Human-readable model name when the provider reports one. */
             display_name?: string;
             /** @description Embedding output dimension when known. */
             dimensions?: number;
             /** @description True when this model is referenced by a configured embedder, generator, reranker, or chunker. */
             configured?: boolean;
+            /** @description Inference capabilities advertised by the provider for this model and task. */
+            capabilities?: string[];
+            /** @description Input modalities accepted by the provider's resolved executor. */
+            inputs?: string[];
         };
         InferenceConnection: {
             provider: components["schemas"]["InferenceProviderType"];
-            /** @description Resolved endpoint URL when applicable. */
+            /** @description Transport endpoint. Omitted from public inference discovery to keep server-owned URLs private. */
             url?: string;
             /** @description Cloud region (Bedrock). */
             region?: string;
@@ -8314,7 +8402,8 @@ export interface components {
              */
             kind: "source" | "reserved" | "computed" | "template" | "unassociated";
             /**
-             * @description Supported original-value operations on field. Availability does not
+             * @description Supported logical query operations on field. Equals, contains and matches
+             *     verify original values; autocomplete performs analyzed bool-prefix matching. Availability does not
              *     attest index coverage or authorize scans. Case sensitivity, execution
              *     policy and work budgets apply. Reserved/computed/template/unassociated
              *     entries do not advertise original-document value operations.
@@ -11695,7 +11784,7 @@ export interface components {
             /** Format: uint64 */
             wal_lsn: number;
         };
-        /** @description Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction snapshot never advances to satisfy a newer receipt. */
+        /** @description Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. A pinned transaction snapshot never advances to satisfy a newer receipt. */
         ReadRequirements: {
             /**
              * @description Accepted includes durable WAL writes; committed reads an Iceberg commit; published reads the search index generation. These are distinct visibility stages.
@@ -11709,33 +11798,12 @@ export interface components {
              */
             wait_ms?: number;
         };
-        LakeReadReceipt: {
-            /** Format: uint64 */
-            table_id: number;
-            /** Format: uint64 */
-            object_generation: number;
-            /** Format: uint64 */
-            wal_lsn: number;
-        };
-        LakeReadRequirement: {
-            /**
-             * @description Accepted requires current WAL visibility; vector/hybrid reads wait for matching publication. Published explicitly permits the retained archive generation. Applies to native writable Iceberg reads.
-             * @enum {string}
-             */
-            visibility?: "accepted" | "published";
-            through?: components["schemas"]["LakeReadReceipt"];
-            /**
-             * Format: uint32
-             * @description Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
-             */
-            wait_ms?: number;
-        };
         /**
          * @description Execution policy for logical string-value operations. Limits apply to
          *     verification work per shard request, including repeated leaf evaluations.
          *     Exhaustion fails explicitly; it never returns a successful partial result.
          */
-        ValueSearchExecution: {
+        ValueVerification: {
             /**
              * @description Permit logical value verification without an indexed candidate constraint.
              * @default false
@@ -11758,12 +11826,14 @@ export interface components {
              */
             max_regex_work?: number;
         };
+        /** @description Execution controls; these affect admitted work, never predicate meaning or read freshness. */
+        QueryExecution: {
+            value_verification?: components["schemas"]["ValueVerification"];
+        };
         QueryRequest: {
-            value_search_execution?: components["schemas"]["ValueSearchExecution"];
+            execution?: components["schemas"]["QueryExecution"];
             read_requirements?: components["schemas"]["ReadRequirements"];
-            /** @deprecated */
-            lake_read?: components["schemas"]["LakeReadRequirement"];
-            /** @description Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. */
+            /** @description Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. Also supported when resuming hierarchy.children; its revision-bound ascending position cursor remains required. */
             remote_snapshot?: string;
             evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
@@ -12485,11 +12555,56 @@ export interface components {
          */
         QueryProfile: {
             /** @description Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard. */
-            value_search?: {
+            value_verification?: {
                 /** Format: int64 */
                 documents?: number;
                 /** Format: int64 */
                 bytes?: number;
+                /**
+                 * Format: int64
+                 * @description One when every participating shard supplied these verification counters; zero means aggregate coverage is incomplete.
+                 */
+                verification_metrics_version?: number;
+                /**
+                 * Format: int64
+                 * @description Sum of measured provider-read time in microseconds, including admitted source lookup work.
+                 */
+                source_read_us?: number;
+                /**
+                 * Format: int64
+                 * @description Sum of original-value parsing time in microseconds.
+                 */
+                source_parse_us?: number;
+                /**
+                 * Format: int64
+                 * @description Number of completed source read windows.
+                 */
+                source_batches?: number;
+                /**
+                 * Format: int64
+                 * @description Number of required individual source reads.
+                 */
+                source_scalar_reads?: number;
+                /**
+                 * Format: int64
+                 * @description Rows observed while considering projected reads, including rows that require a full-source fallback.
+                 */
+                projected_sources?: number;
+                /**
+                 * Format: int64
+                 * @description Rows actually verified from stored-field projections.
+                 */
+                stored_field_sources?: number;
+                /**
+                 * Format: int64
+                 * @description Source windows refused by allocation admission before bounded fallback.
+                 */
+                batch_refusals?: number;
+                /**
+                 * Format: int64
+                 * @description Largest admitted source-window allocation observed on any participating shard; not process RSS or a sum of concurrent allocations.
+                 */
+                batch_peak_bytes?: number;
                 plans?: {
                     /** @enum {string} */
                     operation?: "equals" | "contains" | "matches";
@@ -15968,6 +16083,11 @@ export interface components {
             max_rows?: number;
             /** @default 1000000 */
             max_input_tokens?: number;
+            /**
+             * Format: int64
+             * @description Provider/model upper bound on the input-token contribution of one image. Required when sending images through typed hosted or generated deciders, including native generators and image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Generated deciders apply the allowance to the selected generator's shared quota. Omit for text-only deciders.
+             */
+            max_image_input_tokens?: number;
             rate_limit?: components["schemas"]["RateLimitConfig"];
             /** @default 32 */
             batch_size?: number;
@@ -16929,7 +17049,7 @@ export interface components {
              *     and readiness are local to each owning shard, not client-writable.
              */
             relational_indexes?: components["schemas"]["RelationalIndexDefinition"][];
-            /** @description Default type to use from the document_types. */
+            /** @description Default type to use from the document_schemas. */
             default_type?: string;
             /**
              * @description Whether to enforce that documents must match one of the provided document types.
@@ -19442,7 +19562,13 @@ export interface components {
             field: string;
             boost?: components["schemas"]["Boost"];
         };
+        /** @description Match an indexed post-analysis term exactly. Use match for analyzed natural-language input. */
         TermQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             term: string;
             field?: string;
             boost?: components["schemas"]["Boost"];
@@ -19513,16 +19639,33 @@ export interface components {
          *     substring, exactly like `match` on that field.
          */
         PrefixQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             prefix: string;
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /** @description Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed natural-language input. */
         RegexpQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             regexp: string;
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /** @description Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed natural-language input. */
         WildcardQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             wildcard: string;
             field?: string;
             boost?: components["schemas"]["Boost"];
@@ -19559,6 +19702,23 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
             datetime_parser?: string;
+        };
+        BoolQueryClause: components["schemas"]["Query"] | components["schemas"]["Query"][];
+        BoolQueryBody: {
+            must?: components["schemas"]["BoolQueryClause"];
+            should?: components["schemas"]["BoolQueryClause"];
+            must_not?: components["schemas"]["BoolQueryClause"];
+            filter?: components["schemas"]["BoolQueryClause"];
+            /**
+             * Format: uint32
+             * @description Minimum optional clauses required; omission follows the runtime's required-clause defaults.
+             */
+            minimum_should_match?: number;
+            boost?: components["schemas"]["Boost"];
+        };
+        /** @description Canonical Boolean wrapper. Must clauses score; filter clauses constrain without scoring. */
+        BoolQuery: {
+            bool: components["schemas"]["BoolQueryBody"];
         };
         ConjunctionQuery: {
             conjuncts: components["schemas"]["Query"][];
@@ -19662,7 +19822,7 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
-        Query: components["schemas"]["EqualsQuery"] | components["schemas"]["ContainsQuery"] | components["schemas"]["MatchesQuery"] | components["schemas"]["AutocompleteQuery"] | components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
+        Query: components["schemas"]["EqualsQuery"] | components["schemas"]["ContainsQuery"] | components["schemas"]["MatchesQuery"] | components["schemas"]["AutocompleteQuery"] | components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BoolQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
         /**
          * @description Merge strategy for combining results from the semantic_search and full_text_search.
          *     rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
@@ -21242,6 +21402,50 @@ export interface components {
             reason?: string;
             wait?: components["schemas"]["ResolverWait"];
         };
+        /** @description One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private. */
+        InferenceModelInstance: {
+            /** @description Opaque incarnation identifier; changes after eviction and reload. */
+            id: string;
+            model: string;
+            tasks: components["schemas"]["InferenceModelKind"][];
+            /** @enum {string} */
+            state: "loading" | "loaded";
+            /**
+             * Format: int64
+             * @description Internal owners or loading waiters preventing eviction. This is not a count of HTTP requests.
+             */
+            active_handles: number;
+            startup_managed: boolean;
+            /** @description Whether an unload would be permitted at snapshot time; concurrent use can change this. */
+            unloadable: boolean;
+            /** @enum {string} */
+            unload_blocked_reason?: "loading" | "in_use" | "startup_managed";
+            /** @description Selected execution backend, when known. */
+            backend?: string;
+            /**
+             * @description Weight residency policy; loaded does not imply full device residency.
+             * @enum {string}
+             */
+            residency_mode: "backend_managed" | "streamed" | "resident";
+            /**
+             * Format: int64
+             * @description Elapsed milliseconds since last use, not a wall-clock timestamp.
+             */
+            idle_ms: number;
+        };
+        InferenceModelInstanceList: {
+            /** @enum {string} */
+            object: "list";
+            data: components["schemas"]["InferenceModelInstance"][];
+        };
+        InferenceModelInstanceLoadRequest: {
+            model: string;
+            task: components["schemas"]["InferenceModelKind"];
+        };
+        InferenceModelInstanceUnloadResponse: {
+            /** @enum {string} */
+            outcome: "unloaded" | "already_unloaded";
+        };
         InferenceError: {
             /** @description Stable machine-readable error code */
             error: string;
@@ -21313,6 +21517,8 @@ export interface components {
             source_framework?: string;
         };
         InferencePredictorsResponse: {
+            /** @description Whether public inference execution is enabled on this deployment. */
+            public_inference_enabled?: boolean;
             /**
              * @description Response object type.
              * @enum {string}
@@ -21404,7 +21610,7 @@ export interface components {
             data: components["schemas"]["InferenceEmbeddingObject"][];
             /** @description Model used for embedding generation */
             model: string;
-            usage: components["schemas"]["InferenceEmbeddingUsage"];
+            usage?: components["schemas"]["InferenceEmbeddingUsage"];
             /** @description Indexed per-input failures. Only populated when request error_policy is per_item. */
             errors?: components["schemas"]["InferenceEmbeddingItemError"][];
             summary?: components["schemas"]["InferenceEmbeddingBatchSummary"];
@@ -21584,7 +21790,7 @@ export interface components {
             data: components["schemas"]["InferenceRerankObject"][];
             /** @description Name of model used for reranking */
             model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
         };
         InferenceRerankObject: {
             /** @enum {string} */
@@ -21711,7 +21917,7 @@ export interface components {
             data: components["schemas"]["InferenceReadObject"][];
             /** @description Name of model used for reading */
             model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
             /** @description Observed execution path. Omitted by older compatible servers. */
             execution?: components["schemas"]["InferenceBatchExecutionReport"];
         };
@@ -21737,6 +21943,8 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate). */
+            timestamps?: boolean;
             /** @description Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance. */
             diarization?: boolean;
         };
@@ -21750,7 +21958,7 @@ export interface components {
             data: components["schemas"]["InferenceTranscribeObject"][];
             /** @description Name of model used for transcription */
             model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
         };
         InferenceTranscribeObject: {
             /** @enum {string} */
@@ -21798,6 +22006,8 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate). */
+            timestamps?: boolean;
             /**
              * @description Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
              * @example ggml-org/gemma-4-E4B-it-GGUF
@@ -21862,7 +22072,7 @@ export interface components {
             transcript: components["schemas"]["InferenceDictationTranscript"];
             /** @description Cleaned text, or the raw transcript when no cleanup ran. */
             text: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
         };
         /**
          * @description One Server-Sent Event of a streaming dictation. `dictation.transcript`
@@ -22071,7 +22281,7 @@ export interface components {
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
             inputs?: string[];
         };
-        /** @description Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage. */
+        /** @description Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage including reported usage from failed items. Named gateway batches identify the configured model at the top level and resolved models per successful item. */
         InferenceDecideResponse: {
             model: string;
             model_identity?: string;
@@ -22081,6 +22291,8 @@ export interface components {
             usage: components["schemas"]["DecisionUsage"];
         };
         InferenceModelsResponse: {
+            /** @description Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
+            public_inference_enabled?: boolean;
             /**
              * @description OpenAI-compatible response object type.
              * @enum {string}
@@ -22423,7 +22635,8 @@ export interface components {
             model: string;
             /** @description List of completion choices (currently always 1) */
             choices: components["schemas"]["InferenceGenerateChoice"][];
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            /** @description Provider-reported token usage, or null when the provider does not supply it. */
+            usage?: components["schemas"]["InferenceGenerateUsage"] | null;
             speculation?: components["schemas"]["InferenceGenerateSpeculationStatus"] | null;
         };
         /** @description Effective speculative-decoding decision for this completion. */
@@ -23027,6 +23240,15 @@ export interface components {
             /** @description Total tokens used */
             total_tokens: number;
         };
+        InferenceSynthesisRequest: {
+            /** @description Canonical synthesizers/name target or qualified connection model. */
+            model: string;
+            text: string;
+            voice?: string;
+            /** @enum {string} */
+            format?: "mp3" | "wav" | "opus" | "aac" | "flac" | "pcm";
+            speed?: number;
+        };
         /** @enum {string} */
         PackageKind: "extension";
         /** @description Path-safe extension or package identifier. */
@@ -23353,10 +23575,35 @@ export interface components {
             object: "chunk.embedding.error";
             code: string;
         };
+        DecisionEvidenceText: {
+            /** @enum {string} */
+            type: "input_text";
+            text: string;
+        };
+        DecisionEvidenceImage: {
+            /** @enum {string} */
+            type: "input_image";
+            /** @description Base64 data URL (image/png, image/jpeg, image/webp, image/gif), or a public HTTP(S) URL for OpenAI. Antfly never fetches image URLs for decision adapters. */
+            image_url: string;
+            /**
+             * @default auto
+             * @enum {string}
+             */
+            detail?: "auto" | "low" | "high";
+        };
+        DecisionEvidenceMessage: {
+            /** @enum {string} */
+            type?: "message";
+            /** @enum {string} */
+            role: "user";
+            content: string | (components["schemas"]["DecisionEvidenceText"] | components["schemas"]["DecisionEvidenceImage"])[];
+        };
+        /** @description Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported. */
+        DecisionEvidence: string | components["schemas"]["DecisionEvidenceMessage"][];
         DecisionInput: {
             id?: string;
-            input: string;
-            /** @description Index into request contexts. Requires context_version 1. Effective input is context, newline, then input; the 1 MiB input limit applies after expansion. */
+            input: components["schemas"]["DecisionEvidence"];
+            /** @description Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native trained and embedding deciders require text. Generated deciders accept image evidence when the selected generator supports images and constrained output. */
             context_index?: number;
         };
         /** @description Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text. */
@@ -23424,7 +23671,7 @@ export interface components {
              */
             dimensions?: 768 | 512 | 256 | 128;
         };
-        /** @description Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
+        /** @description Supply exactly one of input (single evidence item) or inputs (ordered Antfly batch extension; hosted typed deciders also accept multimodal evidence per item). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
         InferenceDecideRequest: {
             /**
              * @description Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
@@ -23436,7 +23683,7 @@ export interface components {
             model: string;
             /** @description Pin the exact EmbeddingGemma 2 assets and embedding recipe. */
             model_identity?: string;
-            input?: string;
+            input?: components["schemas"]["DecisionEvidence"];
             inputs?: components["schemas"]["DecisionInput"][];
             long_document?: components["schemas"]["InferenceDecideLongDocument"];
             questions: components["schemas"]["InferenceDecideQuestion"][];
@@ -23478,7 +23725,7 @@ export interface components {
             /** @enum {string} */
             decision_method: "generated";
             generator: components["schemas"]["GeneratorConfig"];
-            input?: string;
+            input?: components["schemas"]["DecisionEvidence"];
             inputs?: components["schemas"]["DecisionInput"][];
             questions: components["schemas"]["GeneratedDecideQuestion"][];
             instructions?: string;
@@ -23872,8 +24119,10 @@ export interface components {
         DecisionBatchItem: {
             input_index: number;
             id?: string;
-            /** @description Generated batches preserve valid siblings; a failed item has an empty answers array and this error code. */
+            /** @description Named gateway and generated batches preserve valid siblings; a failed item has an empty answers array and this error code. Invalid input or request budgets fail validation before dispatch. */
             error?: string;
+            /** @description Resolved model reported for a successful named gateway batch item. */
+            model?: string;
             answers: components["schemas"]["InferenceDecideAnswer"][];
         };
         DecisionUsage: {
@@ -23884,7 +24133,11 @@ export interface components {
         };
     };
     responses: {
-        /** @description Mutation committed with pending visibility or explicit repair debt */
+        /**
+         * @description Mutation committed with pending visibility or explicit repair debt.
+         *     This is a committed result: observe recovery/repair rather than replaying
+         *     the business mutation. See https://antfly.io/docs/reference/transaction-outcomes.
+         */
         CommittedMutationAccepted: {
             headers: {
                 [name: string]: unknown;
@@ -35924,6 +36177,155 @@ export interface operations {
             503: components["responses"]["TransientCapacity"];
         };
     };
+    listModelInstances: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Loaded and loading model instances */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstanceList"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    loadModelInstance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceModelInstanceLoadRequest"];
+            };
+        };
+        responses: {
+            /** @description Prepared model instance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstance"];
+                };
+            };
+            /** @description Invalid model or unsupported task */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    unloadModelInstance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                instance_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Instance unloaded or already absent */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstanceUnloadResponse"];
+                };
+            };
+            /** @description Malformed instance ID */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Instance is loading, has active owners, or is managed by startup configuration */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
     listModels: {
         parameters: {
             query?: never;
@@ -36181,6 +36583,101 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["InferenceError"];
                 };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    listGatewayPredictors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Predictor schemas keyed by callable model ID. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferencePredictorsResponse"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    synthesizeSpeech: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceSynthesisRequest"];
+            };
+        };
+        responses: {
+            /** @description Synthesized audio in the requested format; usage is reported only when supplied by the provider. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "audio/mpeg": string;
+                    "audio/wav": string;
+                };
+            };
+            /** @description Invalid or unsupported synthesis options */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Upstream synthesis failure */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {

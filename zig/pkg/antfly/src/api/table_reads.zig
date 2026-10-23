@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const local_query_contract = @import("antfly_local_sources").api_local_query_contract;
 const query_post_processing = @import("query_post_processing.zig");
@@ -4909,6 +4909,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
+        try distributed_graph.validateIncomingStartIdentities(alloc, self.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
             try table_catalog.RoutingSession.init(alloc, self.catalog, queryRoutingDeadline(self.catalog, req))
         else
@@ -7405,6 +7406,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         var req = requested;
         try checkQueryDeadline(req);
+        try distributed_graph.validateIncomingStartIdentities(alloc, hosted.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
             try table_catalog.RoutingSession.init(alloc, hosted.catalog, queryRoutingDeadline(hosted.catalog, req))
         else
@@ -8675,7 +8677,7 @@ fn validateDecisionRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchReq
     }
 
     const Validate = struct {
-        fn call(ptr: *anyopaque, name: []const u8, questions: std.json.Value) !void {
+        fn call(ptr: *anyopaque, name: []const u8, questions: std.json.Value, _: []const u8) !void {
             const cfgs: *const @import("antfly_local_sources").common_provider_registry.Registry = @ptrCast(@alignCast(ptr));
             const cfg = try cfgs.getDeciderConfig(name);
             try @import("antfly_local_sources").functions_decisions.validateQuestions(questions, @import("antfly_local_sources").functions_decisions.capabilities(cfg.provider));

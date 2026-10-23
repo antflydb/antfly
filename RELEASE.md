@@ -29,14 +29,14 @@ THIRD_PARTY_NOTICES.md
 ```
 
 For each platform, the Apache runtime is distributed as
-`antfly-embedded_<version>_<OS>_<arch>[_gnu].tar.gz`. It contains both public
-CLIs (`antfly-lite` and `antfly-inference`), `libantfly`, `include/antfly.h`, the
-private inference worker, runtime files and notices. The root license is Apache;
-third-party components retain their original notices. Database serving remains
-in the separate ELv2 server product.
+`antfly-embedded_<version>_<OS>_<arch>[_gnu].tar.gz`. It contains `libantfly`, `include/antfly.h`, pkg-config metadata, runtime files
+and notices, with no CLI or worker. The `antfly` archive provides the public
+CLI, including `antfly lite`, `antfly inference`, and database serving. All
+first-party code is Apache-2.0; third-party components retain their notices.
 
-Build contract schema 5 declares `server` and `embedded`, includes pkg-config
-metadata, and omits unused workers from language packages. Schema 3 retains
+Build contract schema 6 declares `server` and `embedded`, uses Apache licensing
+for both, and makes the embedded archive library-only. Schema 5 retains its
+combined CLI/library archive layout and pkg-config metadata. Schema 3 retains
 the original combined archive/package contract. Schema 1 retains the
 historical server-only layout; schema 2 retains separate Lite and inference
 archives. The controller follows the immutable source contract and promotion
@@ -55,6 +55,9 @@ The Homebrew C smoke test checks the installed library against
 `ANTFLY_ABI_VERSION` and the open-options layout in its installed header.
 `.github/workflows/embedded-release-publish.yml` automatically publishes embedded
 packages to npm, PyPI, and crates.io after a successful stable or RC build.
+The build-completion event validates source identity and dispatches the publisher
+on `main`; registry credentials are issued only to the dispatched run, since
+crates.io rejects `workflow_run` tokens.
 Nightlies retain artifacts without registry publication. Manual dispatch with
 the immutable tag and successful build run is the retry path. Rust crates are
 packaged from that source commit, stamped with the release version, verified,
@@ -82,7 +85,7 @@ not met.
 Zig source consumers receive `antfly-embedded-source_<version>.tar.gz`, its
 `.zig-hash`, and `embedded-zig-source.json`. The package has a public
 `build.zig.zon` and bundles the Apache build/dependency closure, source
-manifest, and notices; it excludes ELv2 implementations. The artifact builder
+manifest, and notices; it excludes server implementations. The artifact builder
 packages the immutable source commit and computes its Zig hash with the pinned
 compiler. Promotion requires matching commit/version provenance and digests;
 development packages made with `--working-tree` cannot be promoted. The source
@@ -253,7 +256,7 @@ Nightly uses R2 as its only policy-selected source.
 The deployment environments follow the versioned contract in
 `scripts/release/github-environments.json`. `release-promotion` accepts only the
 default `main` branch and protects release preflight plus retention approval;
-`container-publish` accepts only the legacy release and operator tag patterns.
+`container-publish` accepts only the legacy runtime release tag pattern.
 `crates-io` accepts only `main` for embedded Rust publication.
 All three copy the required-reviewer set from the `npm` environment and prevent
 self-review. Release preflight and retention planning audit the live GitHub
@@ -390,6 +393,15 @@ Archive checks verify product contents and native target identities. Compiler
 logs, memory summaries, and linker maps are uploaded on failure as separate
 diagnostic artifacts, without compiler caches. macOS cross builds resolve the
 versioned LLVM linker directory and check linker/nm availability before compiling.
+
+The immutable 0.3 and nightly build also runs the released v0.2.5 writer and
+`scripts/ci/qualify-v02-server-upgrade.py` against the newly built Darwin server
+archive. This gates publication on in-place data reopen, updates/deletes, crash
+recovery, the rollback gate, and portable/native restore. It is separate from
+the Homebrew package upgrade check. The old archive has a pinned SHA-256, and
+the fixture directories and server logs are retained as release artifacts.
+This gate covers v0.2.5; other 0.2 patches and the harness's optional managed,
+swarm, HA, and schema suites still require separate qualification.
 
 All archive targets use the bounded runner's detected memory budget (80% of the
 container limit by default), including Linux on the larger release builders.

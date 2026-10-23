@@ -24,6 +24,7 @@ const cuda_artifact = if (build_options.enable_cuda) @import("../ops/cuda/artifa
 };
 const native_embed = @import("../native_embed.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
+const benchmark_commands = @import("../benchmark_commands.zig");
 const quant_kernel_compiler = @import("../graph/quant_kernel_compiler.zig");
 const quant_kernel_cuda_renderer = @import("../graph/quant_kernel_cuda_renderer.zig");
 const quant_matmul = @import("../graph/quant_matmul.zig");
@@ -3955,7 +3956,7 @@ fn writeQuantCompilerQ4_0Evidence(
     defer out.deinit(allocator);
     try appendJsonFmt(allocator, &out,
         \\{{
-        \\"schema":"antfly.quant_kernel_q4_0_benchmark_evidence.v1",
+        \\"schema":"antfly.quant_kernel_q4_0_benchmark_evidence.v2",
         \\"kernel_id":{f},
         \\"generated_source_path":{f},
         \\"generated_source_fingerprint":{d},
@@ -4248,7 +4249,7 @@ fn writeQuantCompilerEvidence(
     baseline_max_abs_diff: f32,
     cpu_max_abs_diff: f32,
 ) !void {
-    const benchmark_command = try std.fmt.allocPrint(allocator, "zig-out/bin/antfly-inference bench-cuda --warmup-iters {d} --measure-iters {d} --quant-compiler-lazy-target {s} {s} --quant-compiler-repeat-runs {d} --quant-compiler-evidence-out {s}", .{
+    const benchmark_command = try std.fmt.allocPrint(allocator, benchmark_commands.current_prefix ++ " --warmup-iters {d} --measure-iters {d} --quant-compiler-lazy-target {s} {s} --quant-compiler-repeat-runs {d} --quant-compiler-evidence-out {s}", .{
         cfg.warmup_iters,
         cfg.measure_iters,
         bench.generated_ptx_arg,
@@ -4265,7 +4266,7 @@ fn writeQuantCompilerEvidence(
     defer out.deinit(allocator);
     try appendJsonFmt(allocator, &out,
         \\{{
-        \\"schema":"antfly.quant_kernel_benchmark_evidence.v1",
+        \\"schema":"antfly.quant_kernel_benchmark_evidence.v2",
         \\"kernel_id":{f},
         \\"generated_source_path":{f},
         \\"generated_source_fingerprint":{d},
@@ -4341,7 +4342,9 @@ fn checkQuantCompilerEvidenceJson(allocator: std.mem.Allocator, bytes: []const u
     const bench = quant_kernel_compiler.first_lazy_benchmark;
 
     const schema = jsonString(root.object.get("schema")) orelse return error.InvalidQuantCompilerEvidence;
-    if (!std.mem.eql(u8, schema, "antfly.quant_kernel_benchmark_evidence.v1")) return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, schema, benchmark_commands.evidence_schema) and
+        !std.mem.eql(u8, schema, "antfly.quant_kernel_benchmark_evidence.v1")) return error.InvalidQuantCompilerEvidence;
+    const command_version = benchmark_commands.schemaVersion(schema) orelse return error.InvalidQuantCompilerEvidence;
     const benchmark_mode = jsonString(root.object.get("benchmark_mode")) orelse return error.InvalidQuantCompilerEvidence;
     if (!std.mem.eql(u8, benchmark_mode, "sequential")) return error.InvalidQuantCompilerEvidence;
     const repeat_runs = jsonUsize(root.object.get("repeat_runs")) orelse return error.InvalidQuantCompilerEvidence;
@@ -4416,11 +4419,11 @@ fn checkQuantCompilerEvidenceJson(allocator: std.mem.Allocator, bytes: []const u
     const benchmark_command = jsonString(root.object.get("benchmark_command")) orelse return error.InvalidQuantCompilerEvidence;
     const expected_benchmark_command = try std.fmt.allocPrint(
         allocator,
-        "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target {s} {s} --quant-compiler-repeat-runs {d} --quant-compiler-evidence-out {s}",
+        benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target {s} {s} --quant-compiler-repeat-runs {d} --quant-compiler-evidence-out {s}",
         .{ bench.generated_ptx_arg, bench.generated_ptx_path, repeat_runs, benchmark_path },
     );
     defer allocator.free(expected_benchmark_command);
-    if (!std.mem.eql(u8, benchmark_command, expected_benchmark_command)) return error.InvalidQuantCompilerEvidence;
+    if (!benchmark_commands.matches(benchmark_command, command_version, expected_benchmark_command)) return error.InvalidQuantCompilerEvidence;
 
     if ((jsonUsize(root.object.get("warmup_iters")) orelse 0) != 5) return error.InvalidQuantCompilerEvidence;
     if ((jsonUsize(root.object.get("measure_iters")) orelse 0) != 50) return error.InvalidQuantCompilerEvidence;
@@ -4526,6 +4529,21 @@ test "cuda microbench promotion evidence requires manifest ptx path" {
     try std.testing.expectError(error.QuantCompilerEvidencePathMismatch, validateQuantCompilerEvidenceRequest(bench, bench.generated_ptx_path, "/tmp/other-evidence.json"));
 }
 
+test "cuda microbench writes quant compiler evidence q4 schema and public command" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "q4.json" });
+    defer std.testing.allocator.free(path);
+    const bench = quant_kernel_compiler.first_q4_0_mmv_benchmark;
+    try writeQuantCompilerQ4_0Evidence(std.testing.allocator, std.testing.io, path, bench, .{ .warmup_iters = 5, .measure_iters = 50, .quant_compiler_repeat_runs = 3 }, 1.25, 1.20, "");
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(benchmark_commands.q4_evidence_schema, parsed.value.object.get("schema").?.string);
+    try std.testing.expect(benchmark_commands.matches(parsed.value.object.get("benchmark_command").?.string, .current, bench.benchmark_command));
+}
+
 test "cuda microbench writes quant compiler evidence json" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4553,9 +4571,19 @@ test "cuda microbench writes quant compiler evidence json" {
     const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, evidence_path, std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(actual);
     try checkQuantCompilerEvidenceJson(std.testing.allocator, actual, false);
+    const historical_command = try replaceOnce(std.testing.allocator, actual, benchmark_commands.current_prefix, benchmark_commands.legacy_prefix);
+    defer std.testing.allocator.free(historical_command);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceJson(std.testing.allocator, historical_command, false));
+    const historical = try replaceOnce(std.testing.allocator, historical_command, benchmark_commands.evidence_schema, "antfly.quant_kernel_benchmark_evidence.v1");
+    defer std.testing.allocator.free(historical);
+    try checkQuantCompilerEvidenceJson(std.testing.allocator, historical, false);
+    const development = try replaceOnce(std.testing.allocator, actual, benchmark_commands.current_prefix, benchmark_commands.development_prefix);
+    defer std.testing.allocator.free(development);
+    try checkQuantCompilerEvidenceJson(std.testing.allocator, development, false);
+
     try checkQuantCompilerEvidenceFile(std.testing.allocator, std.testing.io, evidence_path, false);
     try std.testing.expectError(error.QuantCompilerEvidencePromotionNotReady, checkQuantCompilerEvidenceJson(std.testing.allocator, actual, true));
-    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"schema\":\"antfly.quant_kernel_benchmark_evidence.v1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"schema\":\"antfly.quant_kernel_benchmark_evidence.v2\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"generated_source_fingerprint\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"generated_ptx_command\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, quant_kernel_compiler.first_lazy_benchmark.generated_ptx_command));

@@ -38,6 +38,30 @@ pub const RoutingToken = work.RoutingToken;
 pub const CapabilityRevision = work.CapabilityRevision;
 pub const CapabilityLease = work.CapabilityLease;
 
+/// The routing tuple actually sent by an execution attempt. Compare the used
+/// bytes, not the unused tails of the fixed-size token and revision buffers.
+pub const LeaseIdentity = struct {
+    routing_token: ?RoutingToken = null,
+    descriptor_revision: ?CapabilityRevision = null,
+
+    pub fn init(token: ?[]const u8, revision: ?[]const u8) !LeaseIdentity {
+        return .{
+            .routing_token = if (token) |value| try RoutingToken.init(value) else null,
+            .descriptor_revision = if (revision) |value| try CapabilityRevision.init(value) else null,
+        };
+    }
+
+    fn eql(self: LeaseIdentity, other: LeaseIdentity) bool {
+        inline for (.{ "routing_token", "descriptor_revision" }) |field| {
+            if (@field(self, field)) |value| {
+                const right = @field(other, field) orelse return false;
+                if (!std.mem.eql(u8, value.slice(), right.slice())) return false;
+            } else if (@field(other, field) != null) return false;
+        }
+        return true;
+    }
+};
+
 fn legacyCapabilityLeaseForOwner(owner_context_error: ?anyerror) !CapabilityLease {
     if (owner_context_error) |err| return err;
     return .{ .capabilities = null };
@@ -91,6 +115,9 @@ fn classifyFailedDiscovery(
 
 const CapabilityFlight = struct {
     key: []u8,
+    /// Rejections received while discovery is in flight fence only those
+    /// tuples. The same discovery can still publish a valid replacement.
+    rejected_leases: std.ArrayList(LeaseIdentity) = .empty,
     refs: usize = 1,
     done: bool = false,
     value: ?work.InferenceCapabilities = null,
@@ -103,6 +130,11 @@ const CapabilityFlight = struct {
     invalidated: bool = false,
     ready: std.Io.Event = .unset,
     refs_changed: std.Io.Event = .unset,
+
+    fn rejects(self: *const CapabilityFlight, identity: LeaseIdentity) bool {
+        for (self.rejected_leases.items) |rejected| if (rejected.eql(identity)) return true;
+        return false;
+    }
 };
 
 pub const WaitContext = struct {
@@ -304,7 +336,7 @@ pub const Cache = struct {
                     break :blk null;
                 };
                 self.mutex.lockUncancelable(self.io);
-                if (self.retireInvalidatedFlightLocked(flight)) {
+                if (self.retireRejectedFlightLocked(flight, .{ .routing_token = value.routing_token, .descriptor_revision = value.descriptor_revision })) {
                     self.mutex.unlock(self.io);
                     continue;
                 }
@@ -357,6 +389,10 @@ pub const Cache = struct {
                 // absence so rolling upgrades and explicit compatibility
                 // endpoints do not pay one catalog probe per invocation.
                 if (err == error.RemoteCapabilityDiscoveryUnsupported) {
+                    if (self.retireRejectedFlightLocked(flight, .{})) {
+                        self.mutex.unlock(self.io);
+                        continue;
+                    }
                     self.admitLocked(key, null, null, null, monotonicNowNs(self.io)) catch |admit_err| {
                         flight.err = admit_err;
                         flight.done = true;
@@ -383,6 +419,10 @@ pub const Cache = struct {
                     owner_context_error,
                     err,
                 );
+                if (completion.err == null and self.retireRejectedFlightLocked(flight, .{ .routing_token = completion.routing_token, .descriptor_revision = completion.descriptor_revision })) {
+                    self.mutex.unlock(self.io);
+                    continue;
+                }
                 flight.value = completion.value;
                 flight.routing_token = completion.routing_token;
                 flight.descriptor_revision = completion.descriptor_revision;
@@ -508,6 +548,39 @@ pub const Cache = struct {
         }
     }
 
+    /// Revoke only the tuple rejected by this execution attempt. A delayed
+    /// stale response cannot discard a replacement or cancel its discovery.
+    /// An in-flight response can publish a different tuple, but cannot restore
+    /// this rejected tuple even if its source entry has already been evicted.
+    pub fn invalidateLease(
+        self: *Cache,
+        inference_url: []const u8,
+        model: []const u8,
+        operation: work.Operation,
+        headers: []const [2][]const u8,
+        rejected: LeaseIdentity,
+    ) !void {
+        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, operation, headers);
+        defer self.alloc.free(key);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.entries.get(key)) |entry| {
+            if (rejected.eql(.{ .routing_token = entry.routing_token, .descriptor_revision = entry.descriptor_revision })) self.removeEntryLocked(key);
+        }
+        if (self.flights.get(key)) |flight| {
+            if (flight.done) {
+                if (rejected.eql(.{ .routing_token = flight.routing_token, .descriptor_revision = flight.descriptor_revision })) self.invalidateFlightLocked(flight);
+            } else if (!flight.invalidated and !flight.rejects(rejected)) {
+                flight.rejected_leases.append(self.alloc, rejected) catch |err| {
+                    // Failure to retain the identity must still fence the
+                    // outstanding response from restoring a rejected lease.
+                    self.invalidateFlightLocked(flight);
+                    return err;
+                };
+            }
+        }
+    }
+
     /// Revoke every tracked completion for this key, not just an owner that is
     /// still performing discovery. Completed flights remain in the map while
     /// existing waiters hold references; poisoning their result prevents a new
@@ -549,6 +622,11 @@ pub const Cache = struct {
         }
     }
 
+    fn retireRejectedFlightLocked(self: *Cache, flight: *CapabilityFlight, identity: LeaseIdentity) bool {
+        if (flight.rejects(identity)) self.invalidateFlightLocked(flight);
+        return self.retireInvalidatedFlightLocked(flight);
+    }
+
     // Returns true after retiring an invalidated owner without publishing its
     // discovery result. The caller holds mutex and must unlock before retrying.
     fn retireInvalidatedFlightLocked(self: *Cache, flight: *CapabilityFlight) bool {
@@ -566,6 +644,7 @@ pub const Cache = struct {
         std.debug.assert(flight.done);
         _ = self.flights.remove(flight.key);
         self.alloc.free(flight.key);
+        flight.rejected_leases.deinit(self.alloc);
         self.alloc.destroy(flight);
     }
 };
@@ -1106,6 +1185,7 @@ fn discoveryResponseError(response: httpx.Response) anyerror {
 }
 
 fn discoveryStatusError(status: u16, capability_stale: bool) anyerror {
+    if (status == 401 or status == 403) return error.InferenceEndpointAccessDenied;
     if (status == 409 and capability_stale) return error.InferenceCapabilitiesStale;
     if (status == 404 or status == 405 or status == 501)
         return error.RemoteCapabilityDiscoveryUnsupported;
@@ -1737,4 +1817,106 @@ test "remote decoded pixel budgets retain wire width independently of pointer si
     try std.testing.expectEqual(@as(?u64, 4294967296), capabilities.max_decoded_pixels);
     parsed.value.object.getPtr("max_decoded_pixels").?.* = .{ .integer = -1 };
     try std.testing.expectError(error.InvalidInferenceCapabilities, parseResolvedBatchCapabilities(parsed.value, 2));
+}
+
+pub fn testExecutionLeaseRevocationIdentity() !void {
+    const a = std.testing.allocator;
+    var cache = Cache.init(a, std.Options.debug_io);
+    defer cache.deinit();
+    const headers: []const [2][]const u8 = &.{};
+    const key = try capabilityCacheKeyAlloc(a, "http://proxy", "model", .generate, headers);
+    defer a.free(key);
+    const rejected = try LeaseIdentity.init("old-token", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    const replacements = [_]LeaseIdentity{
+        try LeaseIdentity.init("new-token", rejected.descriptor_revision.?.slice()),
+        try LeaseIdentity.init("old-token", "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"),
+        try LeaseIdentity.init(null, null),
+    };
+    for (replacements) |replacement| {
+        try cache.admitLocked(key, null, replacement.routing_token, replacement.descriptor_revision, 0);
+        try cache.invalidateLease("http://proxy", "model", .generate, headers, rejected);
+        const retained = cache.entries.get(key) orelse return error.TestExpectedReplacementLease;
+        try std.testing.expect(replacement.eql(.{ .routing_token = retained.routing_token, .descriptor_revision = retained.descriptor_revision }));
+    }
+    try cache.admitLocked(key, null, rejected.routing_token, rejected.descriptor_revision, 0);
+    try cache.invalidateLease("http://proxy", "model", .generate, headers, rejected);
+    try std.testing.expect(cache.entries.get(key) == null);
+    const failure = classifyFailedDiscovery(cache.entries.get(key), 1, null, error.RemoteCapabilityDiscoveryTransient);
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, failure.err.?);
+}
+
+test "execution lease revocation compares both token and descriptor revision" {
+    try testExecutionLeaseRevocationIdentity();
+}
+
+pub fn testExecutionLeaseRevocationFlights() !void {
+    const a = std.testing.allocator;
+    const rejected = try LeaseIdentity.init("old-token", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    const replacement = try LeaseIdentity.init("new-token", rejected.descriptor_revision.?.slice());
+    const State = enum { active, completed_old, completed_new, completed_old_replaced };
+    for (std.enums.values(State)) |state| {
+        for ([_]bool{ false, true }) |publish_rejected| {
+            var cache = Cache.init(a, std.Options.debug_io);
+            defer cache.deinit();
+            const headers: []const [2][]const u8 = &.{};
+            const key = try capabilityCacheKeyAlloc(a, "http://proxy", "model", .generate, headers);
+            var key_owned = true;
+            defer if (key_owned) a.free(key);
+            const flight = try a.create(CapabilityFlight);
+            var flight_owned = true;
+            defer if (flight_owned) a.destroy(flight);
+            const completed = state != .active;
+            const old_completion = state == .completed_old or state == .completed_old_replaced;
+            const tuple = if (old_completion) rejected else replacement;
+            // One owner and one retained waiter let us inspect the publication
+            // gate after it retires the owner, before releasing the final ref.
+            flight.* = .{
+                .key = key,
+                .refs = 2,
+                .done = completed,
+                .routing_token = if (completed) tuple.routing_token else null,
+                .descriptor_revision = if (completed) tuple.descriptor_revision else null,
+            };
+            try cache.flights.put(a, key, flight);
+            key_owned = false;
+            flight_owned = false;
+            var owner_released = false;
+            defer {
+                cache.mutex.lockUncancelable(cache.io);
+                flight.done = true;
+                if (!owner_released) cache.releaseFlightLocked(flight);
+                cache.releaseFlightLocked(flight);
+                cache.mutex.unlock(cache.io);
+            }
+            if (completed) {
+                const cached = if (state == .completed_old_replaced) replacement else tuple;
+                try cache.admitLocked(key, null, cached.routing_token, cached.descriptor_revision, 0);
+            }
+            // Active discovery has no entry: it might have started after
+            // revocation or after eviction of its prior snapshot.
+            try cache.invalidateLease("http://proxy", "model", .generate, headers, rejected);
+            try cache.invalidateLease("http://proxy", "model", .generate, headers, rejected);
+            try std.testing.expectEqual(old_completion, flight.invalidated);
+            if (!completed) try std.testing.expectEqual(@as(usize, 1), flight.rejected_leases.items.len);
+            if (state == .active or state == .completed_old) {
+                try std.testing.expect(cache.entries.get(key) == null);
+            } else {
+                try std.testing.expect(replacement.eql(.{
+                    .routing_token = cache.entries.get(key).?.routing_token,
+                    .descriptor_revision = cache.entries.get(key).?.descriptor_revision,
+                }));
+            }
+            const publishing = if (publish_rejected) rejected else replacement;
+            cache.mutex.lockUncancelable(cache.io);
+            const retired = cache.retireRejectedFlightLocked(flight, publishing);
+            owner_released = retired;
+            cache.mutex.unlock(cache.io);
+            try std.testing.expectEqual(old_completion or (!completed and publish_rejected), retired);
+            if (retired) try std.testing.expectEqual(error.CapabilityDiscoveryInvalidated, flight.err.?);
+        }
+    }
+}
+
+test "execution lease revocation fences its refresh and preserves newer discovery" {
+    try testExecutionLeaseRevocationFlights();
 }
