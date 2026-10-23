@@ -409,6 +409,38 @@ Scheduler version three installs these internal bindings through a resumable
 backfill, reusing unchanged embeddings before acknowledging indexed readiness.
 Bindings are retired with their entity or when discovery is disabled.
 
+Scheduler version four adds a query-role vector to each names/view projection.
+The owner builds both document and query roles for the same exact text and
+qualified model, outside writer leases and under the existing dependency and
+publication fences. The document role is checkpointed before invoking the query
+role, so a timeout or upgrade never forces a successful document embedding to be
+recomputed. Version-three projections remain unready during a resumable backfill;
+valid document vectors are reused. Query vectors are private derived payloads,
+not additional ANN indexes. They retire and invalidate with their projection.
+Ready candidate pages, including continuations, need no provider calls. They
+still render and authorize live views and validate the projection provenance
+before using either vector; no authorization decision is cached across requests.
+Self-normalization continues to compare the query role against the document role.
+
+Candidate discovery keeps a request-local rendering map shared by both ANN
+projections and response assembly. A requested entity is rendered at most once
+within that read operation. Lexical/ANN union assembly uses an ID set and typed
+records, avoiding nested JSON decoding and serialize/parse round trips. This
+cache is deliberately separate from inference
+capture, maintenance, and final-publication rendering: those paths must replay
+their actual dependency capture and live fences. Policy-row reads memoize decoded
+assertions, evidence, entities, and projections within an operation, replaying
+assertion dependency and expiry/validity tracking on every cache hit. Overlay
+writes invalidate the affected decoded value; rollback clears all decoded values.
+
+The transaction overlay retains its ordered commit list and a key-to-position
+index, making exact reads, replacements and deletions expected constant time
+instead of scanning every pending write. Rollback reconstructs the index from
+the checkpoint. Canonical identity components are built alongside the redirect
+index and reused by member lookups; policy replacement, deletion, rollback and
+final-publication snapshot reconstruction invalidate that derived membership.
+These optimizations add no separate store or public wire contract.
+
 Dirty maintenance retires serving projections for merged, suppressed and
 currently ineligible entities. Native index deletion uses the same full-index
 publication barrier as projection insertion, before readiness is acknowledged.

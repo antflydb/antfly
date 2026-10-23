@@ -374,6 +374,12 @@ const Run = struct {
     state: t.State = undefined,
     state_row: ?Row = null,
     changes: std.ArrayList(Change) = .empty,
+    change_positions: std.StringHashMapUnmanaged(usize) = .empty,
+    assertion_rows: std.StringHashMapUnmanaged(t.StoredAssertion) = .empty,
+    evidence_rows: std.StringHashMapUnmanaged(t.StoredEvidence) = .empty,
+    entity_rows: std.StringHashMapUnmanaged(t.EntityRecord) = .empty,
+    projection_rows: std.StringHashMapUnmanaged(t.EntityProjection) = .empty,
+    identity_members: std.StringHashMapUnmanaged([]const []const u8) = .empty,
     identity_policy: ?EntityPolicy = null,
     identity_index: ?curation.RedirectIndex = null,
     suppression_index: ?curation.Index = null,
@@ -424,28 +430,62 @@ const Run = struct {
                 }
             }
         }
-        for (self.changes.items) |*change| if (eql(u8, change.key, path)) {
-            change.json = json;
-            return;
-        };
-        try self.changes.append(self.a, .{ .key = path, .json = json });
+        try self.stageChange(path, json);
     }
     fn remove(self: *Run, path: []const u8) !void {
         self.views.clearRetainingCapacity();
         self.historical.clearRetainingCapacity();
-        for (self.changes.items) |*change| if (eql(u8, change.key, path)) {
-            change.json = null;
-            return;
-        };
-        try self.changes.append(self.a, .{ .key = path, .json = null });
+        try self.stageChange(path, null);
+    }
+    fn stageChange(self: *Run, path: []const u8, json: ?[]const u8) !void {
+        if (eql(u8, path, "entity-policy")) {
+            self.identity_policy = null;
+            self.identity_index = null;
+            self.suppression_index = null;
+            self.identity_members.clearRetainingCapacity();
+        }
+        _ = self.assertion_rows.remove(path);
+        _ = self.evidence_rows.remove(path);
+        _ = self.entity_rows.remove(path);
+        _ = self.projection_rows.remove(path);
+        if (self.change_positions.get(path)) |position| {
+            self.changes.items[position].json = json;
+        } else {
+            const owned = try self.a.dupe(u8, path);
+            try self.change_positions.put(self.a, owned, self.changes.items.len);
+            try self.changes.append(self.a, .{ .key = owned, .json = json });
+        }
+    }
+    // Rollback must restore the lookup index and every decoded overlay value.
+    fn resetChanges(self: *Run, checkpoint: []const Change) !void {
+        self.changes.clearRetainingCapacity();
+        self.change_positions.clearRetainingCapacity();
+        self.assertion_rows.clearRetainingCapacity();
+        self.evidence_rows.clearRetainingCapacity();
+        self.entity_rows.clearRetainingCapacity();
+        self.projection_rows.clearRetainingCapacity();
+        self.identity_policy = null;
+        self.identity_index = null;
+        self.suppression_index = null;
+        self.identity_members.clearRetainingCapacity();
+        self.views.clearRetainingCapacity();
+        self.historical.clearRetainingCapacity();
+        for (checkpoint) |change| try self.stageChange(change.key, change.json);
     }
     fn read(self: *Run, comptime T: type, path: []const u8) !?T {
-        for (self.changes.items) |change| if (eql(u8, change.key, path)) return if (change.json) |json| try self.parseRead(T, json) else null;
-        if (self.backend_rows.getEntry(path)) |entry| return if (entry.value_ptr.*) |json| try self.parseRead(T, json) else null;
+        if (self.change_positions.get(path)) |position| return if (self.changes.items[position].json) |json| try self.parseRead(T, path, json) else null;
+        if (self.backend_rows.getEntry(path)) |entry| return if (entry.value_ptr.*) |json| try self.parseRead(T, path, json) else null;
         const row = try self.service.backend.get(self.service.backend.ptr, self.a, path);
         const json = if (row) |value| value.json else null;
         try self.backend_rows.put(self.a, try self.a.dupe(u8, path), json);
-        return if (json) |value| try self.parseRead(T, value) else null;
+        return if (json) |value| try self.parseRead(T, path, value) else null;
+    }
+    fn decodedRows(self: *Run, comptime T: type) *std.StringHashMapUnmanaged(T) {
+        if (T == t.StoredAssertion) return &self.assertion_rows;
+        if (T == t.StoredEvidence) return &self.evidence_rows;
+        if (T == t.EntityRecord) return &self.entity_rows;
+        if (T == t.EntityProjection) return &self.projection_rows;
+        @compileError("unsupported decoded memory record");
     }
     fn trackTime(self: *Run, time: ?i64) void {
         if (!self.temporal_tracking) return;
@@ -453,8 +493,16 @@ const Run = struct {
             self.temporal_boundary = at;
         };
     }
-    fn parseRead(self: *Run, comptime T: type, json: []const u8) !T {
-        const value = try parse(T, self.a, json);
+    fn parseRead(self: *Run, comptime T: type, path: []const u8, json: []const u8) !T {
+        const value = if (comptime T == t.StoredAssertion or T == t.StoredEvidence or T == t.EntityRecord or T == t.EntityProjection) blk: {
+            const rows = self.decodedRows(T);
+            if (rows.get(path)) |cached| break :blk cached;
+            const decoded = try parse(T, self.a, json);
+            try rows.put(self.a, try self.a.dupe(u8, path), decoded);
+            break :blk decoded;
+        } else try parse(T, self.a, json);
+        // These are read effects, not decode effects: replay them on cache hits.
+
         if (comptime T == t.StoredAssertion) {
             if (self.temporal_tracking) try self.semantic_assertions.put(self.a, try hash(self.a, value.assertion.id), {});
             self.trackTime(value.assertion.valid_from);
@@ -1385,22 +1433,32 @@ const Run = struct {
         self.identity_policy = policy;
         self.identity_index = redirects;
         self.suppression_index = suppression;
+        self.identity_members.clearRetainingCapacity();
+        var components: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
+        for (policy.redirects) |redirect| {
+            const target = redirects.canonical(redirect.key);
+            const entry = try components.getOrPut(self.a, target);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(self.a, target);
+            }
+            if (!eql(u8, redirect.key, target)) try entry.value_ptr.append(self.a, redirect.key);
+        }
+        var entries = components.iterator();
+        while (entries.next()) |entry| {
+            const members = entry.value_ptr.items;
+            std.mem.sort([]const u8, members, {}, stringLess);
+            try self.identity_members.put(self.a, entry.key_ptr.*, members);
+        }
     }
     fn identityMembers(self: *Run, id: []const u8) ![]const []const u8 {
         try self.prepareIdentityIndex();
-        const policy = self.identity_policy.?;
-        const index = self.identity_index.?;
-        const target = index.canonical(id);
-        var names: std.StringHashMapUnmanaged(void) = .empty;
-        try names.put(self.a, id, {});
-        try names.put(self.a, target, {});
-        for (policy.redirects) |redirect| if (eql(u8, index.canonical(redirect.key), target)) {
-            try names.put(self.a, redirect.key, {});
-        };
-        const result = try self.a.alloc([]const u8, names.count());
-        var iterator = names.keyIterator();
-        var count: usize = 0;
-        while (iterator.next()) |name| : (count += 1) result[count] = name.*;
+        const target = self.identity_index.?.canonical(id);
+        if (self.identity_members.get(target)) |members| return members;
+        // An identity outside the redirect graph is its own component.
+        const result = try self.a.alloc([]const u8, 1);
+        result[0] = try self.a.dupe(u8, id);
+        try self.identity_members.put(self.a, result[0], result);
         return result;
     }
     fn sameCanonicalGroup(self: *Run, left: t.Assertion, right: t.Assertion) !bool {
@@ -1650,6 +1708,12 @@ const Run = struct {
         // redirect/assertion overlay. The control CAS fences concurrent writes.
         var before = self.*;
         before.changes = .empty;
+        before.change_positions = .empty;
+        before.assertion_rows = .empty;
+        before.evidence_rows = .empty;
+        before.entity_rows = .empty;
+        before.projection_rows = .empty;
+        before.identity_members = .empty;
         before.identity_policy = null;
         before.identity_index = null;
         before.suppression_index = null;
@@ -2046,8 +2110,8 @@ const Run = struct {
         var records: std.StringHashMapUnmanaged(t.StoredAssertion) = .empty;
         var scanned: usize = 0;
         var complete = true;
+        // Components are sorted once when the redirect index is built.
         const names = try self.identityMembers(id);
-        std.mem.sort([]const u8, @constCast(names), {}, stringLess);
         for (names) |name| {
             if (scanned + 1 >= limit) {
                 complete = false;
@@ -2566,8 +2630,9 @@ const Run = struct {
         try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
         return error.MemorySemanticDeferred;
     }
-    fn semanticEmbedding(self: *Run, record: t.EntityRecord, model: t.Model, text: []const u8, inputs: ResourceSet, progressed: bool) ![]const f32 {
-        const computed = self.service.backend.embed_document.?(self.service.backend.ptr, self.a, model, text) catch |err| {
+    fn semanticEmbedding(self: *Run, record: t.EntityRecord, model: t.Model, text: []const u8, inputs: ResourceSet, progressed: bool, comptime query: bool) ![]const f32 {
+        const compute = if (query) self.service.backend.embed.? else self.service.backend.embed_document.?;
+        const computed = compute(self.service.backend.ptr, self.a, model, text) catch |err| {
             // Yield a cumulative budget after useful work. If the first
             // unfinished entity fails again on its own quantum, defer it and
             // advance the scan so it cannot pin unrelated healthy entities.
@@ -2662,19 +2727,29 @@ const Run = struct {
             inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
                 const path = try self.semanticProjectionKey(record, kind);
                 const existing = try self.read(t.EntityProjection, path);
-                if (existing == null or !try self.semanticCurrent(existing.?, record, view)) {
+                if (existing == null or existing.?.query_embedding == null or !try self.semanticCurrent(existing.?, record, view)) {
                     const text = if (kind == .names) try self.semanticNames(record.entity) else view.description;
                     const model = self.state.config.models.embedder.?;
                     const index_name = try self.semanticIndexName(record, kind);
                     try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, index_name, model.dimensions.?);
                     const reusable = if (existing) |prior| prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and eql(u8, prior.text, text) and eql(u8, try self.encode(prior.model), try self.encode(model)) else false;
                     const embedding = if (reusable) existing.?.embedding else blk: {
-                        break :blk try self.semanticEmbedding(record, model, text, captured.resources, progressed.*);
+                        break :blk try self.semanticEmbedding(record, model, text, captured.resources, progressed.*, false);
                     };
                     if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
                     for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
-                    try self.put(path, t.EntityProjection{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = embedding });
-                    progressed.* = true;
+                    var projection: t.EntityProjection = .{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = embedding, .query_embedding = if (reusable) existing.?.query_embedding else null };
+                    // Checkpoint the document role before another provider call.
+                    // Legacy backfills and retries never recompute that vector.
+                    if (existing == null or !try self.semanticCurrent(existing.?, record, view)) {
+                        try self.put(path, projection);
+                        progressed.* = true;
+                    }
+                    if (projection.query_embedding == null) {
+                        projection.query_embedding = try self.semanticEmbedding(record, model, text, captured.resources, progressed.*, true);
+                        try self.put(path, projection);
+                        progressed.* = true;
+                    }
                 }
             }
         } else {
@@ -2729,7 +2804,13 @@ const Run = struct {
     const candidate_cursor_limit = std.base64.url_safe_no_pad.Encoder.calcSize(candidate_json_limit) + 256;
     const CandidateRef = struct { id: []const u8, semantic: bool = false };
     const CandidateContinuation = struct { pending: []const CandidateRef = &.{}, lexical: ?[]const u8 = null, semantic: []const []const u8 = &.{} };
-    fn semanticCandidates(self: *Run, input_seed: t.EntityRecord, request: t.EntityCandidateRequest, pending: []const CandidateRef) !SemanticMatches {
+    fn candidateView(self: *Run, rendered: *std.StringHashMapUnmanaged(t.EntityView), id: []const u8) !t.EntityView {
+        if (rendered.get(id)) |view| return view;
+        const view = try self.entityView(id, .{});
+        try rendered.put(self.a, try self.a.dupe(u8, id), view);
+        return view;
+    }
+    fn semanticCandidates(self: *Run, input_seed: t.EntityRecord, request: t.EntityCandidateRequest, pending: []const CandidateRef, rendered: *std.StringHashMapUnmanaged(t.EntityView)) !SemanticMatches {
         if (!self.state.config.semantic_discovery.enabled) return .{};
         var result: SemanticMatches = .{ .state = .not_ready };
         const selected = (try self.canonical(input_seed.entity.id)) orelse return result;
@@ -2737,13 +2818,15 @@ const Run = struct {
         const index = (try self.read(t.SemanticIndex, "entity-semantic-index")) orelse return result;
         if (index.version != t.semantic_index_version or !index.complete or !index.backfill_complete or index.generation != self.state.config.generation) return result;
         if ((try self.service.backend.scan(self.service.backend.ptr, self.a, "entity-semantic-work/", null, 1)).rows.len != 0) return result;
-        const view = try self.entityView(seed.entity.id, .{});
+        const view = try self.candidateView(rendered, seed.entity.id);
         var matches: std.StringHashMapUnmanaged(SemanticMatch) = .empty;
         inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
             const projection = (try self.read(t.EntityProjection, try self.semanticProjectionKey(seed, kind))) orelse return result;
             if (!try self.semanticCurrent(projection, seed, view)) return result;
-            const captured = try self.captureResources(semanticView, .{seed});
-            const query = try self.embed(self.state.config.models.embedder.?, projection.text, captured.resources);
+            // Both roles were built under the same source/model fences. Ready
+            // pages never call a provider, including lexical continuations.
+            const query = projection.query_embedding orelse return result;
+            if (query.len != projection.embedding.len) return error.MemoryCorruptState;
             const self_score = try cosine(query, projection.embedding);
             if (!std.math.isFinite(self_score) or self_score <= 0) return result;
             result.queries[@backingInt(kind)] = query;
@@ -2777,7 +2860,7 @@ const Run = struct {
                     if (record.entity.visibility != seed.entity.visibility or (record.entity.visibility == .private and !eql(u8, seed.owner, record.owner)) or !try self.entityVisible(record)) continue;
                     const canonical_id = (try self.canonical(record.entity.id)) orelse continue;
                     if (!eql(u8, canonical_id, record.entity.id)) continue;
-                    const candidate_view = try self.entityView(record.entity.id, .{});
+                    const candidate_view = try self.candidateView(rendered, record.entity.id);
                     if (!try self.semanticCurrent(other, record, candidate_view)) continue;
                     const entry = try matches.getOrPut(self.a, record.entity.id);
                     if (!entry.found_existing) entry.value_ptr.* = .{ .id = record.entity.id };
@@ -2837,32 +2920,32 @@ const Run = struct {
             for (continuation.pending) |ref| if (try self.service.backend.get(self.service.backend.ptr, self.a, try key(self.a, "entity", ref.id))) |row| try rows.append(self.a, row);
             break :blk Page{ .rows = rows.items, .next = continuation.lexical };
         } else try self.candidatePage(seed, lexical_request);
-        const semantic = try self.semanticCandidates(seed, request, continuation.pending);
-        var candidate_rows: std.ArrayList(Row) = .empty;
-        try candidate_rows.appendSlice(self.a, page.rows);
+        var rendered: std.StringHashMapUnmanaged(t.EntityView) = .empty;
+        const semantic = try self.semanticCandidates(seed, request, continuation.pending, &rendered);
+        var candidate_records: std.ArrayList(t.EntityRecord) = .empty;
+        var candidate_ids: ResourceSet = .empty;
+        for (page.rows) |row| {
+            const record = try self.parseRead(t.EntityRecord, row.key, row.json);
+            if (candidate_ids.contains(record.entity.id)) continue;
+            try candidate_ids.put(self.a, record.entity.id, {});
+            try candidate_records.append(self.a, record);
+        }
         for (semantic.items) |item| {
+            if (candidate_ids.contains(item.id)) continue;
             const record = (try self.read(t.EntityRecord, try key(self.a, "entity", item.id))) orelse continue;
-            var found = false;
-            for (candidate_rows.items) |row| {
-                const prior = try parse(t.EntityRecord, self.a, row.json);
-                if (eql(u8, prior.entity.id, item.id)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) try candidate_rows.append(self.a, .{ .key = try key(self.a, "entity", item.id), .json = try self.encode(record) });
+            try candidate_ids.put(self.a, record.entity.id, {});
+            try candidate_records.append(self.a, record);
         }
         const seed_distinctions = try self.declaredDistinct(id);
-        const seed_view = try self.entityView(id, .{});
+        const seed_view = try self.candidateView(&rendered, id);
         const seed_terms = try self.candidateTerms(seed.entity);
         var views_complete = seed_view.complete;
         const Candidate = t.EntityCandidate;
         var description_query = try lexical.PreparedQuery.init(self.lexical_allocator, seed_view.description);
         defer description_query.deinit();
         var matches: std.ArrayList(Candidate) = .empty;
-        for (candidate_rows.items) |row| {
+        for (candidate_records.items) |candidate| {
             try self.service.context.check();
-            const candidate = try parse(t.EntityRecord, self.a, row.json);
             if (request.cursor != null and continuation.pending.len == 0) {
                 var emitted = false;
                 for (continuation.semantic) |semantic_id| if (eql(u8, semantic_id, candidate.entity.id)) {
@@ -2903,7 +2986,7 @@ const Run = struct {
                 break;
             };
             if (score <= 0 and name_similarity == null and view_similarity == null) continue;
-            const candidate_view = try self.entityView(candidate.entity.id, .{});
+            const candidate_view = try self.candidateView(&rendered, candidate.entity.id);
             views_complete = views_complete and candidate_view.complete;
             if (semantic.state == .indexed) inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
                 if (try self.read(t.EntityProjection, try self.semanticProjectionKey(candidate, kind))) |projection| {
@@ -3576,7 +3659,7 @@ const Run = struct {
         self.judged_views.clearRetainingCapacity();
         self.decision_targets.clearRetainingCapacity();
         // A rejected model output publishes no partial assertions or entities.
-        self.changes.clearRetainingCapacity();
+        try self.resetChanges(&.{});
         pending.phase = if (err == error.MemoryForgotten or err == error.MemoryResourceChanged) .cancelled else if (pending.attempts >= self.state.config.max_attempts) .failed else .pending;
         pending.error_code = @errorName(err);
         pending.assertions_ready = false;
@@ -3803,8 +3886,7 @@ const Run = struct {
         const state_before = self.state;
         @call(.auto, handler, .{self} ++ args) catch |err| {
             if (err != error.MemoryWorkLimit or work_before == 0) return err;
-            self.changes.clearRetainingCapacity();
-            try self.changes.appendSlice(self.a, checkpoint);
+            try self.resetChanges(checkpoint);
             self.state = state_before;
             self.views.clearRetainingCapacity();
             self.historical.clearRetainingCapacity();
@@ -5045,4 +5127,94 @@ fn nameNumbers(a: A, value: []const u8) ![]const u8 {
     }
     if (in_number) try result.append(a, '/');
     return result.items;
+}
+
+fn performanceTestRun(a: A) Run {
+    return .{ .a = a, .lexical_allocator = a, .service = .{ .backend = undefined, .context = .{ .principal = "alice", .admin = true, .now_ms = 10 } }, .state = .{ .config = .{}, .owner = "alice", .created_at = 1 }, .explanation_snapshot_scratch = .init(a) };
+}
+
+test "memory performance decoded records allocate once and replay temporal dependency tracking" {
+    const buffer = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(buffer);
+    var fixed = std.heap.FixedBufferAllocator.init(buffer);
+    const a = fixed.allocator();
+    var run = performanceTestRun(a);
+    const claim: t.StoredAssertion = .{ .assertion = .{ .id = "a", .subject = "s", .predicate = "fact", .value = "v", .statement = "Large repeated payload", .evidence = &.{.{ .id = "e" }}, .valid_from = 50 }, .owner = "alice", .recorded_from = 1, .revision = 1, .config_generation = 1 };
+    try run.put("assertion/a", claim);
+    try run.put("evidence/e", t.StoredEvidence{ .evidence = .{ .id = "e", .source_id = "s", .source_version = "1", .text = "Source", .expires_at = 60 }, .owner = "alice", .recorded_at = 1, .revision = 1 });
+    try run.put("entity/s", t.EntityRecord{ .entity = .{ .id = "s", .name = "Subject", .evidence = &.{.{ .id = "e" }} }, .owner = "alice", .revision = 1 });
+    _ = try run.read(t.StoredAssertion, "assertion/a");
+    _ = try run.read(t.StoredEvidence, "evidence/e");
+    _ = try run.read(t.EntityRecord, "entity/s");
+    const used = fixed.end_index;
+    for (0..1024) |_| {
+        _ = try run.read(t.StoredAssertion, "assertion/a");
+        _ = try run.read(t.StoredEvidence, "evidence/e");
+        _ = try run.read(t.EntityRecord, "entity/s");
+    }
+    try std.testing.expectEqual(used, fixed.end_index);
+    run.temporal_tracking = true;
+    _ = try run.read(t.StoredAssertion, "assertion/a");
+    try std.testing.expectEqual(@as(usize, 1), run.semantic_assertions.count());
+    try std.testing.expectEqual(@as(?i64, 50), run.temporal_boundary);
+    run.semantic_assertions.clearRetainingCapacity();
+    run.temporal_boundary = null;
+    _ = try run.read(t.StoredEvidence, "evidence/e");
+    try std.testing.expectEqual(@as(?i64, 60), run.temporal_boundary);
+    _ = try run.read(t.StoredAssertion, "assertion/a");
+    try std.testing.expectEqual(@as(usize, 1), run.semantic_assertions.count());
+    try std.testing.expectEqual(@as(?i64, 50), run.temporal_boundary);
+    const checkpoint = try a.dupe(Change, run.changes.items);
+    var changed = claim;
+    changed.assertion.statement = "Replacement";
+    try run.put("assertion/a", changed);
+    try std.testing.expectEqualStrings("Replacement", (try run.read(t.StoredAssertion, "assertion/a")).?.assertion.statement);
+    try run.remove("evidence/e");
+    try std.testing.expect(try run.read(t.StoredEvidence, "evidence/e") == null);
+    try run.resetChanges(checkpoint);
+    try std.testing.expectEqualStrings(claim.assertion.statement, (try run.read(t.StoredAssertion, "assertion/a")).?.assertion.statement);
+    try std.testing.expect(try run.read(t.StoredEvidence, "evidence/e") != null);
+}
+
+test "memory performance ten thousand overlay writes preserve order replacements tombstones and rollback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = performanceTestRun(a);
+    for (0..10000) |i| try run.put(try std.fmt.allocPrint(a, "row/{d}", .{i}), @as(u64, @intCast(i)));
+    const checkpoint = try a.dupe(Change, run.changes.items);
+    for (0..10000) |i| {
+        const path = try std.fmt.allocPrint(a, "row/{d}", .{i});
+        try std.testing.expectEqual(@as(?u64, @intCast(i)), try run.read(u64, path));
+        if (i % 2 == 0) try run.remove(path) else try run.put(path, @as(u64, 42));
+    }
+    try std.testing.expectEqual(@as(usize, 10000), run.changes.items.len);
+    for (run.changes.items, 0..) |change, i| {
+        try std.testing.expectEqualStrings(checkpoint[i].key, change.key);
+        if (i % 2 == 0) try std.testing.expect(change.json == null) else try std.testing.expectEqualStrings("42", change.json.?);
+    }
+    try run.resetChanges(checkpoint);
+    for (0..10000) |i| try std.testing.expectEqual(@as(?u64, @intCast(i)), try run.read(u64, try std.fmt.allocPrint(a, "row/{d}", .{i})));
+}
+
+test "memory performance identity components rebuild on policy replacement removal and rollback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = performanceTestRun(a);
+    const redirects = try a.alloc(curation.Redirect, 1000);
+    for (redirects, 0..) |*redirect, i| redirect.* = .{ .key = try std.fmt.allocPrint(a, "alias-{d}", .{i}), .target = if (i < 500) "first" else "second" };
+    try run.put("entity-policy", EntityPolicy{ .redirects = redirects });
+    const members = try run.identityMembers("alias-123");
+    try std.testing.expectEqual(@as(usize, 501), members.len);
+    const used = arena.queryCapacity();
+    for (0..1000) |_| try std.testing.expect((try run.identityMembers("first")).ptr == members.ptr);
+    try std.testing.expectEqual(used, arena.queryCapacity());
+    const checkpoint = try a.dupe(Change, run.changes.items);
+    try run.put("entity-policy", EntityPolicy{ .redirects = &.{.{ .key = "first", .target = "second" }} });
+    try std.testing.expectEqual(@as(usize, 2), (try run.identityMembers("first")).len);
+    try run.remove("entity-policy");
+    try std.testing.expectEqual(@as(usize, 1), (try run.identityMembers("first")).len);
+    try run.resetChanges(checkpoint);
+    try std.testing.expectEqual(@as(usize, 501), (try run.identityMembers("alias-123")).len);
 }

@@ -75,8 +75,11 @@ pub const EntityProjection = struct {
     dependencies: []const DerivedDependency,
     text: []const u8,
     embedding: []const f32,
+    // Derived query-role vector for the identical text and qualified model.
+    // Null denotes an older/partially built projection, never indexed readiness.
+    query_embedding: ?[]const f32 = null,
 };
-pub const semantic_index_version: u32 = 3;
+pub const semantic_index_version: u32 = 4;
 pub const SemanticIndex = struct { version: u32 = 0, generation: u64 = 0, cursor: ?[]const u8 = null, work_cursor: ?[]const u8 = null, backfill_complete: bool = false, complete: bool = false };
 pub const Config = struct {
     version: u32 = schema_version,

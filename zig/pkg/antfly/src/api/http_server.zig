@@ -59706,11 +59706,25 @@ test "native memory worker budgets slow semantic publication independently from 
     try std.testing.expectEqual(@as(usize, 12), fixture.embeddings);
     const partial = try std.json.parseFromSliceLeaky(memory.memory.types.SemanticIndex, alloc, (try backend.get(backend.ptr, alloc, "entity-semantic-index")).?.json, .{});
     try std.testing.expect(!partial.complete and !partial.backfill_complete and partial.cursor != null);
-    try std.testing.expectEqual(@as(usize, 11), (try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 32)).rows.len);
-    state = try Fixture.state(backend, alloc);
-    _ = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
-    _ = try service.advanceAtRevision(alloc, "", "resume", state.revision);
-    try std.testing.expectEqual(@as(usize, 17), fixture.embeddings);
+    const checkpointed = try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 32);
+    try std.testing.expectEqual(@as(usize, 6), checkpointed.rows.len);
+    var query_ready: usize = 0;
+    for (checkpointed.rows) |row| {
+        const projection = try std.json.parseFromSliceLeaky(memory.memory.types.EntityProjection, alloc, row.json, .{});
+        if (projection.query_embedding != null) query_ready += 1;
+    }
+    // Eleven provider calls succeeded: six document roles and five query
+    // roles. The timed-out query retains its completed document projection.
+    try std.testing.expectEqual(@as(usize, 5), query_ready);
+    for (0..4) |i| {
+        const progress = try std.json.parseFromSliceLeaky(memory.memory.types.SemanticIndex, alloc, (try backend.get(backend.ptr, alloc, "entity-semantic-index")).?.json, .{});
+        if (progress.complete) break;
+        state = try Fixture.state(backend, alloc);
+        _ = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
+        _ = try service.advanceAtRevision(alloc, "", try std.fmt.allocPrint(alloc, "resume-{d}", .{i}), state.revision);
+    }
+    // All 32 role vectors succeed, with two timeout attempts across quanta.
+    try std.testing.expectEqual(@as(usize, 34), fixture.embeddings);
     const index_row = (try backend.get(backend.ptr, alloc, "entity-semantic-index")).?;
     const index = try std.json.parseFromSliceLeaky(memory.memory.types.SemanticIndex, alloc, index_row.json, .{});
     try std.testing.expect(index.complete and index.backfill_complete);
