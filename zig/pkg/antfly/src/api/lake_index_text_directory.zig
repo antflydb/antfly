@@ -491,6 +491,21 @@ fn validatePhysical(record: SegmentRecord, domain: Id, upper: u32) !void {
     }
     if (covered < upper) return error.InvalidNativeLakeTextCorpus;
 }
+/// Load one authenticated serving descriptor under publication I/O admission.
+/// Source routing already selected this pack; no file inventory is materialized.
+pub fn loadSegmentPublication(a: A, root: corpus.Root, store: stores.ArtifactStore, token: Cancellation, id: Id, remaining: *u64) !corpus.FileGroup {
+    var read: Reader = .{ .store = store, .cached = null, .token = token, .publication = true, .external_budget = remaining };
+    read.init(root.domain);
+    try read.check();
+    const bytes = try get(a, read.pages.store(), root.directories.segments, id);
+    defer a.free(bytes);
+    const record = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
+    if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
+    try validateSegment(record, root.domain);
+    const group = try corpus.loadFileManifestPublicationBudget(a, store, record.route.descriptor.?, root.domain, token, remaining);
+    if (group.segments.len != 1 or group.admissions.len != 1 or !std.mem.eql(u8, group.segments[0].artifact_id, record.route.ref.artifact_id) or !std.mem.eql(u8, group.segments[0].checksum, record.route.ref.checksum) or group.segments[0].byte_len != record.route.ref.byte_len or group.admissions[0].bytes != record.route.bytes or group.admissions[0].doc_count != record.route.doc_count) return error.InvalidNativeLakeTextCorpus;
+    return group;
+}
 pub fn loadSelected(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation, selection: []const Id) !corpus.Root {
     var read: Reader = .{ .store = store, .cached = cached, .token = token };
     read.init(root.domain);

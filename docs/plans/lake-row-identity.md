@@ -808,3 +808,21 @@ native merges still read retained postings and compute the new native output;
 this refinement reduces provider write amplification without claiming to remove
 that merge cost. A query-visible posting-overlay format would require a separate
 visibility/statistics contract and is not introduced here.
+
+Sparse maintenance after serving compaction resolves a complete fragment cover
+through the paged source-to-pack index. It opens only those serving descriptors,
+masks unrelated fragments and changed logical rows, and merges retained postings
+with freshly analyzed rows. Canonical payloads remain collectible: maintenance
+needs their compact physical maps and statistics, rather than a duplicate copy of
+historical postings. Checkpoint-local deltas still read the canonical payloads
+they own until those deltas enter the serving publication. Optional merge
+admission bounds navigation to 8 MiB of memory and 16 MiB of metadata reads,
+4096 routes, 64 packs and 16 MiB of native input; larger work uses full fragment
+encoding. Authentication failures and cancellation still propagate.
+
+A deterministic publication regression rewrites three real Parquet files six
+times, changes index cohorts independently, and collects unreachable artifacts
+between publications through the object-store transport. It requires a payload
+change to preserve the untouched text navigation after a preceding sparse text
+update. The posting-merge regression separately exercises mixed-fragment packs
+and proves that unrelated rows and obsolete terms cannot enter the result.

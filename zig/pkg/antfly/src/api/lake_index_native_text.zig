@@ -693,7 +693,11 @@ pub fn loadFileManifestBudget(a: A, store: stores.ArtifactStore, ref: artifacts.
     return loadFileManifestInner(a, store, ref, domain, cancellation, cache, remaining, false);
 }
 pub fn loadFileManifestPublication(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation) !FileGroup {
-    return loadFileManifestInner(a, store, ref, domain, cancellation, null, null, true);
+    return loadFileManifestPublicationBudget(a, store, ref, domain, cancellation, null);
+}
+pub fn loadFileManifestPublicationBudget(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, remaining: ?*u64) !FileGroup {
+    if (remaining) |budget| try stores.chargeReadBudget(budget, ref.byte_len);
+    return loadFileManifestInner(a, store, ref, domain, cancellation, null, remaining, true);
 }
 fn loadFileManifestInner(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead, remaining: ?*u64, publication: bool) !FileGroup {
     if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
@@ -1160,6 +1164,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
         var file_arena = std.heap.ArenaAllocator.init(a);
         defer file_arena.deinit();
+        var patch_serving: ?Root = null;
         var input_bytes: usize = 0;
         var manifest_replay: ManifestReplay = undefined;
         manifest_replay.init(a, provider.context.io orelse return error.UnsupportedSqlExecution, cancellation);
@@ -1295,7 +1300,18 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 if (old) |previous_group| if (previous_group.file.key_digest != null and std.mem.eql(u8, &previous_group.file.key_digest.?, &file.key_digest.?)) {
                     var bytes: u64 = 0;
                     for (previous_group.admissions) |admission| bytes +|= admission.bytes;
-                    if (bytes <= 16 * 1024 * 1024) compactor.row_patch = .{ .base = previous_group, .rows = selected };
+                    if (bytes <= 16 * 1024 * 1024) {
+                        // A checkpoint's fresh delta still owns its canonical
+                        // payload. Baseline files are maintained from compacted
+                        // serving packs, whose source routes survive collection.
+                        const baseline_record = baseline_by_id.get(file.id);
+                        const current_record = previous_refs.get(file.id);
+                        const in_baseline = baseline_record != null and current_record != null and std.mem.eql(u8, baseline_record.?.manifest.artifact_id, current_record.?.manifest.artifact_id);
+                        if (baseline != null and baseline.?.serving != null and in_baseline) {
+                            if (patch_serving == null) patch_serving = try servingRootPublication(ca, store.*, baseline.?, cancellation);
+                            try compactor.prepareServingPatch(patch_serving.?, previous_group, selected);
+                        } else compactor.row_patch = .{ .base = previous_group, .rows = selected };
+                    }
                 };
             };
             var ordinals = physical.Builder.init(a, fa, store, cancellation);
@@ -1974,7 +1990,8 @@ const Compactor = struct {
     a: A,
     encoder: ?*EncoderPipeline = null,
     context: local.serverless_query_lake_read_context.Context = .{},
-    row_patch: ?struct { base: FileGroup, rows: []const u64 } = null,
+    row_patch: ?struct { base: FileGroup, rows: []const u64, intervals: []const []const text_directory.Interval = &.{} } = null,
+    patch_arena: ?std.heap.ArenaAllocator = null,
     reusable_blocks: ?*@import("lake_index_seekable_text.zig").Reuse = null,
     patch_inputs: std.ArrayList(Owned) = .empty,
     out: A,
@@ -2011,10 +2028,57 @@ const Compactor = struct {
         self.patch_inputs.deinit(self.a);
         self.patch_inputs = .empty;
     }
+    fn prepareServingPatch(self: *Compactor, root: Root, previous: FileGroup, rows: []const u64) !void {
+        self.patch_arena = .init(self.a);
+        defer if (self.row_patch == null) {
+            self.patch_arena.?.deinit();
+            self.patch_arena = null;
+        };
+        var budget: local.sql_memory_budget = .{ .backing = self.patch_arena.?.allocator(), .limit = 8 * 1024 * 1024, .monotonic = true };
+        const base = self.servingPatchBase(budget.allocator(), root, previous) catch |err| {
+            if (err == error.ArtifactReadBudgetExceeded or (err == error.OutOfMemory and budget.isLocallyExhausted())) return;
+            return err;
+        };
+        if (base) |value| self.row_patch = .{ .base = value.base, .rows = rows, .intervals = value.intervals };
+    }
+    fn servingPatchBase(self: *Compactor, a: A, root: Root, previous: FileGroup) !?struct { base: FileGroup, intervals: []const []const text_directory.Interval } {
+        var reads: u64 = 16 * 1024 * 1024;
+        var writes: u64 = 0;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = root.domain, .artifacts = self.store, .cancellation = self.cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        pages.admitPublication();
+        var rows: u32 = 0;
+        for (previous.admissions) |admission| rows = try std.math.add(u32, rows, admission.doc_count);
+        const ids = (try @import("lake_index_source_routes.zig").fileSegments(a, pages.store(), root, previous.file.id, previous.physical_manifest orelse return error.InvalidNativeLakeTextCorpus, rows, self.cancellation)) orelse return null;
+        var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+        var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+        var intervals: std.ArrayList([]const text_directory.Interval) = .empty;
+        var retained_rows: u32 = 0;
+        var bytes: u64 = 0;
+        for (ids) |id| {
+            try self.context.ensureActive();
+            const group = try text_directory.loadSegmentPublication(a, root, self.store.*, self.cancellation, id, &reads);
+            bytes +|= group.admissions[0].bytes;
+            if (bytes > 16 * 1024 * 1024) return null;
+            var selected: std.ArrayList(text_directory.Interval) = .empty;
+            for (group.sources) |span| if (std.mem.eql(u8, span.file.id, previous.file.id)) {
+                if (span.file.key_digest == null or !std.mem.eql(u8, &span.file.key_digest.?, &previous.file.key_digest.?) or !std.mem.eql(u8, span.physical.artifact_id, previous.physical_manifest.?.artifact_id) or span.file_rows != rows) return error.InvalidNativeLakeTextCorpus;
+                retained_rows = try std.math.add(u32, retained_rows, span.count);
+                try selected.append(a, .{ .lower = span.pack_lower, .count = span.count });
+            };
+            if (selected.items.len == 0) return error.InvalidNativeLakeTextCorpus;
+            try intervals.append(a, selected.items);
+            try segments.appendSlice(a, group.segments);
+            try admissions.appendSlice(a, group.admissions);
+        }
+        if (retained_rows != rows) return error.InvalidNativeLakeTextCorpus;
+        return .{ .base = .{ .file = previous.file, .segments = segments.items, .admissions = admissions.items }, .intervals = intervals.items };
+    }
     fn discardPatch(self: *Compactor) void {
         for (self.patch_inputs.items) |owned| owned.deinit(self.a);
         self.patch_inputs.clearRetainingCapacity();
         self.row_patch = null;
+        if (self.patch_arena) |*arena| arena.deinit();
+        self.patch_arena = null;
     }
     fn mergeRows(self: *Compactor) !?*@import("lake_index_segment_spill.zig").LocalSegment {
         var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = self.workspace_bytes };
@@ -2051,19 +2115,31 @@ const Compactor = struct {
             opened_readers += 1;
             deletes[i] = .init(a);
             opened_deletes += 1;
-            for (0..readers[i].doc_count) |doc| {
-                try self.cancellation.check();
-                try self.context.ensureActive();
-                const stored = (try readers[i].storedDoc(@intCast(doc))) orelse return error.InvalidNativeLakeTextCorpus;
-                if (stored.id.len != 96 or !std.mem.eql(u8, stored.id[6..70], &expected)) return error.InvalidNativeLakeTextCorpus;
-                const coordinate = try state.coordinates(stored.id);
-                if (coordinate.group != 0) return error.InvalidNativeLakeTextCorpus;
-                if (std.sort.binarySearch(u64, patch.rows, coordinate.row, struct {
-                    fn order(left: u64, right: u64) std.math.Order {
-                        return std.math.order(left, right);
-                    }
-                }.order) != null) try deletes[i].add(@intCast(doc));
+            const full = [_]text_directory.Interval{.{ .lower = 0, .count = readers[i].doc_count }};
+            const intervals = if (patch.intervals.len == 0) &full else patch.intervals[i];
+            var covered: u32 = 0;
+            for (intervals) |interval| {
+                const end = try std.math.add(u32, interval.lower, interval.count);
+                if (interval.lower < covered or end > readers[i].doc_count) return error.InvalidNativeLakeTextCorpus;
+                // Authenticated spans mask unrelated fragments by ordinal,
+                // without decoding their stored IDs or source documents.
+                try deletes[i].addRange(covered, interval.lower);
+                covered = end;
+                for (interval.lower..end) |doc| {
+                    try self.cancellation.check();
+                    try self.context.ensureActive();
+                    const stored = (try readers[i].storedDoc(@intCast(doc))) orelse return error.InvalidNativeLakeTextCorpus;
+                    if (stored.id.len != 96 or !std.mem.eql(u8, stored.id[6..70], &expected)) return error.InvalidNativeLakeTextCorpus;
+                    const coordinate = try state.coordinates(stored.id);
+                    if (coordinate.group != 0) return error.InvalidNativeLakeTextCorpus;
+                    if (std.sort.binarySearch(u64, patch.rows, coordinate.row, struct {
+                        fn order(left: u64, right: u64) std.math.Order {
+                            return std.math.order(left, right);
+                        }
+                    }.order) != null) try deletes[i].add(@intCast(doc));
+                }
             }
+            try deletes[i].addRange(covered, readers[i].doc_count);
             inputs[i] = .{ .reader = &readers[i], .deleted = deletes[i] };
         }
         for (self.patch_inputs.items, patch.base.segments.len..) |owned, i| {
@@ -3130,6 +3206,9 @@ test "external lake canonical multi-pack publication keeps worker allocations ou
 }
 
 test "external lake text row deltas merge retained postings without reanalyzing old rows" {
+    for ([_]bool{ false, true }) |mixed| try rowDeltaMergeScenario(mixed);
+}
+fn rowDeltaMergeScenario(mixed: bool) !void {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -3142,7 +3221,10 @@ test "external lake text row deltas merge retained postings without reanalyzing 
     store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
     var docs: [10]mapper.MapperDoc = undefined;
     for (&docs, 0..) |*doc, row| doc.* = .{ .key = try std.fmt.allocPrint(out, "lake2:{s}:00000000:{x:0>16}", .{ std.fmt.bytesToHex(&@as([32]u8, @splat(9)), .lower), row }), .value = if (row == 3) "{\"body\":\"obsolete shared\"}" else "{\"body\":\"retained shared\"}" };
-    const bytes = (try mapper.buildTextSegmentFromDocuments(a, &docs, .{}, null)).?;
+    var mixed_docs: [12]mapper.MapperDoc = undefined;
+    @memcpy(mixed_docs[1..11], &docs);
+    for ([_]usize{ 0, 11 }, [_]u8{ 8, 10 }) |slot, digest| mixed_docs[slot] = .{ .key = try std.fmt.allocPrint(out, "lake2:{s}:00000000:0000000000000000", .{std.fmt.bytesToHex(&@as([32]u8, @splat(digest)), .lower)}), .value = "{\"body\":\"unrelated shared\"}" };
+    const bytes = (try mapper.buildTextSegmentFromDocuments(a, if (mixed) &mixed_docs else &docs, .{}, null)).?;
     defer a.free(bytes);
     var reader = try local.segment.SegmentReader.init(a, bytes);
     defer reader.deinit();
@@ -3158,7 +3240,7 @@ test "external lake text row deltas merge retained postings without reanalyzing 
     var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
     var summaries: std.ArrayList(?statistics.Ref) = .empty;
     var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
-    var compactor: Compactor = .{ .a = a, .out = out, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .output_manager = &manager, .capture_manager = &manager, .io = std.testing.io, .row_patch = .{ .base = group, .rows = &.{3} } };
+    var compactor: Compactor = .{ .a = a, .out = out, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .output_manager = &manager, .capture_manager = &manager, .io = std.testing.io, .row_patch = .{ .base = group, .rows = &.{3}, .intervals = if (mixed) &.{&.{.{ .lower = 1, .count = 10 }}} else &.{} } };
     defer compactor.deinit();
     const changed = (try mapper.buildTextSegmentFromDocuments(a, &.{.{ .key = docs[3].key, .value = "{\"body\":\"replacement shared\"}" }}, .{}, null)).?;
     try compactor.addOwned(.{ .payload = .{ .memory = changed } });
@@ -3172,6 +3254,7 @@ test "external lake text row deltas merge retained postings without reanalyzing 
     var inverted = try local.section_inverted.ScopedInvertedIndexReader.initRanges(a, (try merged.sectionView("body", .inverted_text)).?, .{});
     defer inverted.deinit();
     try std.testing.expect((try inverted.lookup("obsolet")) == null);
+    try std.testing.expect((try inverted.lookup("unrel")) == null);
     try std.testing.expectEqual(@as(u32, 1), (try inverted.lookup("replac")).?.docFreq());
     try std.testing.expectEqual(@as(u32, 9), (try inverted.lookup("retain")).?.docFreq());
     try std.testing.expectEqual(@as(u32, 10), (try inverted.lookup("shar")).?.docFreq());
