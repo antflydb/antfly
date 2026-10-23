@@ -3,15 +3,25 @@ const WORKFLOW = '.github/workflows/zig-tests.yml';
 const SHUTDOWN = 'The runner has received a shutdown signal.';
 
 function interruptedE2e(job, log) {
-  if (job.conclusion !== 'failure' ||
-      !/^e2e-full \/ (inference-(generation|speech|embedding)|antfly)$/.test(job.name)) return false;
+  if (job.conclusion !== 'failure') return false;
+  const build = job.name === 'e2e-full / build';
+  if (!build && !/^e2e-full \/ (inference-(generation|speech|embedding)|antfly)$/.test(job.name)) return false;
   // Runner loss marks the executing step cancelled even when the enclosing
   // job fails. A deliberately cancelled job is excluded above.
   const failed = (job.steps || []).filter(step => ['failure', 'cancelled'].includes(step.conclusion));
-  if (failed.length !== 1 || !/^Run Antfly (inference )?full E2E$/.test(failed[0].name)) return false;
+  if (failed.length !== 1) return false;
+  if (build) {
+    if (failed[0].conclusion !== 'cancelled' ||
+        !/^Build (E2E executable once|optimized model E2E executable)$/.test(failed[0].name)) return false;
+  } else if (!/^Run Antfly (inference )?full E2E$/.test(failed[0].name)) return false;
   const shutdown = log.indexOf(SHUTDOWN);
   if (shutdown < 0 || /exceeded the maximum execution time/.test(log)) return false;
   const before = log.slice(0, shutdown);
+  // Rebuild only externally interrupted compilers. A compiler/smoke failure
+  // already present before shutdown must remain visible. The job-specific
+  // rerun also schedules its dependent artifact consumers, preserving the
+  // completed unit and SDK work instead of repeating the entire workflow.
+  if (build) return !/(?:^|\n)[^\n]*\berror:|\bFAIL(?:ED)?\b|failed command:/.test(before);
   // These lanes use verbose pytest progress. Do not erase an assertion failure
   // that happened before the runner was lost or retry explicit test deadlines.
   return !/\b(?:FAILED|ERROR)\s+\[\s*\d+%\]|\b(?:FAILED|ERROR)\s+(?:zig\/)?e2e\//.test(before);

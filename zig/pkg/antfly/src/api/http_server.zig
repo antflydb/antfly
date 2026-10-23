@@ -5846,12 +5846,13 @@ pub const ApiHttpServer = struct {
                     }) orelse continue;
                 },
                 .commit => |*commit| {
-                    const distributed_tables = commit.request.distributedTables(self.alloc) catch |err| {
+                    const distributed_view = commit.request.distributedTables(self.alloc) catch |err| {
                         std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                         _ = self.txn_sessions.remove(self.alloc, txn_id);
                         continue;
                     };
-                    defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
+                    defer distributed_view.deinit();
+                    const distributed_tables = distributed_view.tables;
                     var execution_plan = if (commit.execution_plan) |bytes| transactions_api.parseExecutionPlan(self.alloc, bytes) catch |err| {
                         // A damaged durable plan is not permission to re-plan
                         // or discard a potentially committed transaction.

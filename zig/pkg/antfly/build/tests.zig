@@ -251,7 +251,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const schema_contract_tests = b.addTest(.{
         .root_module = schema_contract_mod,
         .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
-        .filters = selectTestFilters(b, &.{ "relational contract schema parsing uses bounded stack", "created nested response allowlists cover generated schemas", "api http public sort capability gate", "logical field public capability ownership" }),
+        .filters = selectTestFilters(b, &.{ "relational contract schema parsing uses bounded stack", "relational contract property child traversal", "created nested response allowlists cover generated schemas", "api http public sort capability gate", "logical field public capability ownership" }),
     });
     const parser_source = schema_contract_mod.import_table.get("antfly_local_sources").?;
     const parser_selection = b.addOptions();
@@ -260,7 +260,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const schema_parser_tests = b.addTest(.{
         .root_module = parser_source,
         .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
-        .filters = selectTestFilters(b, &.{"relational contract schema parsing uses bounded stack"}),
+        .filters = selectTestFilters(b, &.{ "relational contract schema parsing uses bounded stack", "relational contract property child traversal" }),
     });
     const schema_contract_step = b.step("antfly-schema-contract-test", "Run bounded schema parsing and public response/sort contracts");
     schema_contract_step.dependOn(&b.addRunArtifact(schema_contract_tests).step);
@@ -6954,6 +6954,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.retained_effects.",
             "storage.rewrite_program_cache.",
             "storage.rewrite_tail_spool.",
+            "storage.source_proof_registry.",
             "storage.source_pin_state.",
             "storage.source_snapshot.",
             "storage.restore_owner.",

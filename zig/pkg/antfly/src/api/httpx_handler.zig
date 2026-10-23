@@ -4529,8 +4529,11 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
 
-        const distributed_tables = try commit_req.distributedTables(alloc);
-        defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
+        const distributed_tables_view = try commit_req.distributedTables(alloc);
+
+        defer distributed_tables_view.deinit();
+
+        const distributed_tables = distributed_tables_view.tables;
         self.api_server.validateCommitTablesAgainstSchema(operationContext(ctx, null), distributed_tables) catch |err| switch (err) {
             error.InvalidBatchRequest,
             error.InvalidArgument,
@@ -5328,8 +5331,9 @@ pub const AntflyApiHandler = struct {
 
         var execution_plan = try self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id);
         defer if (execution_plan) |*plan| plan.deinit();
-        const distributed_tables = try commit_req.distributedTables(alloc);
-        defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
+        const distributed_tables_view = try commit_req.distributedTables(alloc);
+        defer distributed_tables_view.deinit();
+        const distributed_tables = distributed_tables_view.tables;
         // Once execution starts, even a lost-response retry must replay the
         // exact durable plan, not reject a prior commit on its own new versions.
         if (execution_plan == null) {
