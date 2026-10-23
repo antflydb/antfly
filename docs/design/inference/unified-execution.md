@@ -697,6 +697,134 @@ backward, interpreter backward reference and rank-adapter backward paths. Final
 CPU/Metal/CUDA product compilation, generated-source freshness (67 files plus
 Metal/CUDA runtime regions) and whitespace checks pass.
 
+## Planned bulk consolidation campaign
+
+Status: planned; no production implementation in this section has landed.
+Baseline: `dd1ee1b4ffd1a4a3a14878c648355b18a4096b8f`. Treat the following as one
+implementation campaign with four work waves and one integrated acceptance
+checkpoint, rather than another sequence of single-family requests. Keep the
+existing `.worktrees/inference-unified-execution` branch and preserve its prior
+qualified work; do not rebase the benchmark baseline during the campaign.
+
+### Scope and accounting
+
+The working target is **1,500–3,000 additional net authored production lines /
+80–160 KB removed**, after counting all new helpers, templates, renderer code
+and production descriptor metadata. This is a planning estimate, not a measured
+saving or a reason to force incompatible schedules together. A separate target
+is **1,000–2,000 fewer emitted CUDA bundle lines** by emitting already-shared
+attention templates once. Do not add that generated-text reduction to authored
+implementation savings. Report test/qualification infrastructure and total
+repository change separately as well.
+
+The source inventory is retained in ignored
+`.benchmark-assets/1166/consolidation-plan/`. It identifies 13 Metal Q4_0/Q8_0
+matrix entry bodies, 50 quantized row/projection candidates, 45 memory/indexing
+candidates, 133 CUDA quantized linear candidates and 29 grouped-projection/FFN
+candidates. These sets overlap and include thin wrappers or generated bodies;
+they are candidate sets, not counts of independent duplicated implementations.
+CPU triage covers prepared Q4_K/Q6_K workers, grouped projection adapters and
+prepared tile ranges. In particular, the Q4_K/Q6_K parallel dispatchers have
+matching row/column job construction, and Metal's handwritten/generated paged
+attention still has separate authored bodies. Those are concrete ownership
+opportunities. Repeated generated CUDA attention text already has shared
+renderer/template owners and belongs in the generated-bundle accounting bucket.
+
+### Work packages
+
+Each package must identify its actual common schedule before editing. Keep
+already-shared wrappers as wrappers, and do not replace a tuned inner loop merely
+to make its syntax resemble another one.
+
+| ID | Work package | Intended long-term shape and preserved specialization |
+| --- | --- | --- |
+| 01 | Baseline, source-owner ledger and precision contracts | Map entry points to authored owners and generated outputs. Extend existing schedule/lowering metadata only where needed to represent separate-product rounding, contractible multiply/add expressions, reduction order, scale/load placement, storage widths and tail policies. Keep mathematical identity in `kernel_descriptor.zig` separate from target schedule policy. |
+| 02 | Reusable family qualification runner | Consolidate the existing direct harness protocols into reusable CPU/Metal/CUDA runners and fixture manifests. Cover entry points directly, retain raw timing arms and source/image hashes, and run the final model matrix against one frozen campaign baseline. |
+| 03 | Metal Q4_0/Q8_0 matrix core | Share matching `linear_mm_sg` staging/MMA/store schedules with compile-time format loaders, preserving dequantization order, swizzles, tile geometry and explicit unrolling. |
+| 04 | Metal Q8_0 v2/m64 matrix variants | Share each matching tile family across F32/F16 input and full/tail stores; retain distinct m32/m64 schedules and exact register-array sizes. |
+| 05 | Metal K-family high-row matrices | Compare Florence Q4_K m64/n64 and Q6_K high-row matrices; share their matching staging and epilogue scaffold while retaining format-specific decode/load placement. |
+| 06 | Metal paired quantized projections | Specialize projection arity, gate/up activation, RMS scaling and output representation for matching MMV schedules; preserve shared input reuse and separately rounded outputs. |
+| 07 | Metal remaining quantized row projections | Fold repeated scalar/SIMD row and epilogue scaffolds into format/tile policies, reusing existing packed recipes. Retain different reduction trees and prepared-weight layouts as separate schedules. |
+| 08 | CUDA Q4_0×Q8_1 multirow tiles | Share the matching tile4/w8 rows2/rows4 schedule with exact compile-time row count, staging extents and DP4A lane packing. Do not enlarge single-row accumulators to the maximum shape. |
+| 09 | CUDA quantized paired/triple projections | Consolidate remaining handwritten Q4_0/Q8_0/K-family grouped schedules where dataflow matches, with compile-time arity and epilogues. Existing tensor-core and ordinary dot schedules remain distinct. |
+| 10 | CUDA gated-down and activation-slice variants | Separate compile-time operand acquisition from common matching dot/reduction/store schedules. Preserve gate/up load hoisting, activation rounding and output addressing. |
+| 11 | CUDA typed dense load variants | Unify F16/BF16 weight-load variants with the same launch topology. Include F32 only where its actual schedule matches; retain its different tiled algorithm otherwise. |
+| 12 | CUDA plain/gated Q8_1 quantization | Share the matching row quantization body after compile-time source acquisition, including amax reduction, nearest-even conversion, clamp range and packed header bytes. |
+| 13 | One owner for Metal paged attention bodies | Make runtime embedding and standalone renderer qualification consume one authored decode/prefill implementation. Preserve production ABI wrappers, parameter layout, admitted schedules and plan identities; avoid source moves being reported as duplication deletion. |
+| 14 | Compact CUDA attention runtime emission | Emit existing split-K online and flash-prefill common template definitions once, then instantiate HD/window variants. Also compact matching rendered split-count variants where possible. Keep standalone artifacts self-contained and manifests/source checks fresh. This is primarily generated-bundle reduction. |
+| 15 | Metal vision q32 full/tail attention | Share the observed vision HD64 flash q32 pair through compile-time full/tail policy, preserving full-tile direct loads and ragged staging. |
+| 16 | Metal eight-query dense/paged attention | Compare the matching simdgroup MMA/online-softmax loops; use compile-time KV addressing/masking only if barriers, reduction and staging truly match. Otherwise share smaller identical components and retain distinct loop bodies. Depends on 13. |
+| 17 | Metal remaining norm/clamp families | Share matching SIMD4 RMS/clamp reduction bodies with compile-time load/epilogue policies. Preserve variance formulas, clamp placement, epsilon, finite handling and saved intermediates; exclude the already-consolidated norm wrappers. |
+| 18 | Metal argmax and sampling partial reductions | Reuse value/index combination and partial-store scaffolds where schedules match. Preserve lowest-index ties, NaN/Inf policy, suppression, seeded RNG and top-k ordering. Keep top-k and nucleus algorithms distinct. |
+| 19 | Metal typed memory/indexing families | Share typed gather/copy/cast and packed get/set-row loops with format traits. Preserve 64-bit integer bits, saturating versus wrapping conversions, quantization headers, offsets and overlapping/duplicate-index behavior. Parallel scatter races are not made legal by consolidation. |
+| 20 | CUDA typed memory/embedding families | Apply the same ownership boundary to matching embedding/gather/copy bodies, retaining vector width, alignment, tail checks and BF16 mirror semantics. Reuse format conversion owners rather than adding another conversion vocabulary. |
+| 21 | CPU Q4_K/Q6_K prepared worker dispatch | Share worker contexts, typed entry adapters and row/column job construction using comptime format policy. Preserve scheduling thresholds, chunk boundaries, errors and thread-pool behavior. |
+| 22 | CPU grouped projection adapters | Unify matching pair/triple dequantize-SGEMM and projection-result construction through comptime arity. Preserve prepared-cache identity, bias, partial failure cleanup and grouped input reuse. |
+| 23 | CPU prepared quantized tile scaffolds | Share matching prepared tile/range loops and boundary handling across formats; retain format-specific SIMD decode, panel layout, accumulator width and summation order. Reuse existing generic panel kernels rather than reintroducing them. |
+| 24 | Retire superseded bodies and qualify the composition | Delete replaced implementations and unused helpers, check every entry point has one intended owner, regenerate once per completed work wave, and run full integrated numerical/model/lifetime gates. Report authored, generated, binary and infrastructure changes independently. |
+
+### Execution order
+
+1. **Foundation: 01–02.** Freeze source, artifacts, models and executables once;
+   extend the precision contracts and create the reusable qualification matrix.
+   Do not build a general kernel language. Reuse `kernel_math.zig`,
+   `kernel_reduction.zig`, `quant_recipe.zig` and existing target lowerings.
+2. **Broad lower-risk families: 11–12, 17–22.** Consolidate typed loads,
+   quantization, memory/reduction policies and CPU dispatch/adapters. This also
+   exercises the common runner across all three targets before touching the
+   busiest packed schedules.
+3. **Quantized compute: 03–10 and 23.** Process compatible schedule cohorts
+   together: matrix, MMV, grouped projection and fused FFN. Validate a cohort
+   before building on it; do not ask for another user instruction per family.
+4. **Attention ownership and compact emission: 13–16.** Reuse the already
+   qualified math/staging policies, preserving full and tail paths. Compact
+   generated emission only after identifying whether a body is already shared.
+5. **Integrated acceptance: 24.** Freeze the final candidate and compare against
+   the original campaign baseline, so small losses cannot accumulate unnoticed
+   across individually passing cohorts.
+
+Use a handful of reviewable commits organized by work wave or schedule cohort,
+not one commit and user handoff per tiny helper. Keep the campaign running
+through final acceptance; an incompatible family can retain a documented
+specialized body while independent packages proceed. Source-size estimates are
+revised from the ledger after the first quantized cohort, without counting an
+unqualified implementation as achieved savings.
+
+### Acceptance and stopping rules
+
+- Every changed entry point gets direct representative and boundary coverage,
+  including aligned/tail shapes, all affected storage types and outputs. Include
+  aliases only where the public operation admits them, plus output guards,
+  nonfinite values, rounding ties and partial dimensions as applicable.
+- Prefer byte-identical baseline output where the old contract is deterministic;
+  retain independent F64/integer references and existing operator tolerances.
+  Arithmetic trees alone are insufficient: preserve full-expression FMA
+  boundaries, intermediate stores, narrowing and reduction trees explicitly.
+- CUDA compares instructions and register/shared/local/stack usage on all seven
+  packaged architectures after each completed compute cohort. Execute changed
+  kernels and captured-replay cases on Glowworm GB10; static SM89 parity is not
+  presented as SM89 hardware throughput qualification. Do not promote an
+  architecture-specific route or expand model admission during this campaign.
+- Metal compares pipeline thread limits and static scratch as well as outputs
+  and fixed-buffer GPU timings. CPU compares the actual SIMD/parallel schedules,
+  with controlled worker counts, affinity and working-set shapes. Do not run
+  competing builds/tests on a device during its timing series.
+- Aim for neutral or better throughput. The established ceilings remain 5% for
+  direct kernel/median model time and 10% for model p95. A reproducible hot-path
+  loss is investigated even within that ceiling; retain a better specialization
+  instead of accepting abstraction overhead merely to hit the deletion target.
+  Investigate unstable results with a predeclared longer balanced whole-cohort
+  series, retaining the original data as in prior checkpoints.
+- Run the complete admitted CPU/Metal/CUDA model matrix once on the final frozen
+  candidate, plus decoder oracle, strict-resident retained-frame/graph replay,
+  eviction/reset tests and representative soaks. Repeat lifetime-specific
+  checks when operand/output ownership changes; do not duplicate every earlier
+  soak for source-only helper edits with unchanged lifetime code.
+- Complete generated-source/artifact freshness, product and WASM builds,
+  appropriate reference tests, whitespace checks and cache collection. Finish
+  with committed source, refreshed images, retained receipts, actual net
+  deletion figures and a clean worktree. There is no push/deployment step.
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;
