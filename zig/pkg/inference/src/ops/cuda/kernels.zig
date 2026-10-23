@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const launch_abi = @import("launch_abi.zig");
 const build_options = @import("build_options");
 const cuda_identity = if (build_options.enable_cuda) @import("cuda_jit_identity") else struct {
     pub const baseline = z17RepeatString("0", 64);
@@ -4976,11 +4977,7 @@ pub const KernelModule = struct {
         var dst_ptr = dst.ptr;
         var n = try toU32(count);
         var fill_value = value;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&n),
-            @ptrCast(&fill_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &n, &fill_value });
         const block: c_uint = 256;
         const grid: c_uint = try toU32((count + block - 1) / block);
         try ctx.makeCurrent();
@@ -5015,11 +5012,7 @@ pub const KernelModule = struct {
         var dst_ptr = dst.ptr;
         var src_ptr = src.ptr;
         var n = try toU32(count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&src_ptr),
-            @ptrCast(&n),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &n });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -5038,11 +5031,7 @@ pub const KernelModule = struct {
         var dst_ptr = dst.ptr;
         var src_ptr = src.ptr;
         var n = try toU32(len);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&src_ptr),
-            @ptrCast(&n),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &n });
         try launch1d(function, ctx, len, &params);
     }
 
@@ -5068,14 +5057,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch1d(self.linear_f32, ctx, out_count, &params);
     }
 
@@ -5102,14 +5084,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
     }
 
@@ -5128,11 +5103,7 @@ pub const KernelModule = struct {
         var dst_ptr = dst.ptr;
         var src_ptr = src.ptr;
         var block_count_u32 = try toU32(block_count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&src_ptr),
-            @ptrCast(&block_count_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &block_count_u32 });
         const threads: usize = 256;
         const max_grid: usize = 65535;
         const blocks = @min((block_count + threads - 1) / threads, max_grid);
@@ -5155,11 +5126,7 @@ pub const KernelModule = struct {
         var dst_ptr = dst.ptr;
         var src_ptr = src.ptr;
         var block_count_u32 = try toU32(block_count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&src_ptr),
-            @ptrCast(&block_count_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &block_count_u32 });
         const threads: usize = 256;
         const byte_count = try checkedTensorElements(block_count, 34);
         const max_grid: usize = 65535;
@@ -5182,11 +5149,7 @@ pub const KernelModule = struct {
         var dst_ptr = dst.ptr;
         var input_ptr = input.ptr;
         var count_u32 = try toU32(count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&count_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &count_u32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -5205,11 +5168,7 @@ pub const KernelModule = struct {
         var dst_ptr = dst.ptr;
         var input_ptr = input.ptr;
         var count_u32 = try toU32(count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&count_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &count_u32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -5228,11 +5187,7 @@ pub const KernelModule = struct {
         var dst_ptr = dst.ptr;
         var input_ptr = input.ptr;
         var count_u32 = try toU32(count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&count_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &count_u32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -5251,11 +5206,7 @@ pub const KernelModule = struct {
         var dst_ptr = dst.ptr;
         var input_ptr = input.ptr;
         var count_u32 = try toU32(count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&count_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &count_u32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -5282,14 +5233,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
     }
 
@@ -5320,14 +5264,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
     }
 
@@ -5347,12 +5284,7 @@ pub const KernelModule = struct {
         var input_ptr = input.ptr;
         var count_u32 = try toU32(count);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&count_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &count_u32, &scale_value });
         try launch1d(self.scale_f32, ctx, count, &params);
     }
 
@@ -5372,12 +5304,7 @@ pub const KernelModule = struct {
         var input_ptr = input.ptr;
         var count_u32 = try toU32(count);
         var add_value = value;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&count_u32),
-            @ptrCast(&add_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &count_u32, &add_value });
         try launch1d(self.add_scalar_f32, ctx, count, &params);
     }
 
@@ -5404,14 +5331,7 @@ pub const KernelModule = struct {
         var count_u32 = try toU32(count);
         var op_u32: u32 = @backingInt(op);
         var scalar_on_left_u32: u32 = @intFromBool(scalar_on_left);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&scalar_ptr),
-            @ptrCast(&count_u32),
-            @ptrCast(&op_u32),
-            @ptrCast(&scalar_on_left_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &scalar_ptr, &count_u32, &op_u32, &scalar_on_left_u32 });
         try launch1d(self.binary_scalar_f32, ctx, count, &params);
     }
 
@@ -5435,13 +5355,7 @@ pub const KernelModule = struct {
         var b_ptr = b.ptr;
         var scalar_ptr = scalar.ptr;
         var count_u32 = try toU32(count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&a_ptr),
-            @ptrCast(&b_ptr),
-            @ptrCast(&scalar_ptr),
-            @ptrCast(&count_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &a_ptr, &b_ptr, &scalar_ptr, &count_u32 });
         try launch1d(self.add_mul_scalar_f32, ctx, count, &params);
     }
 
@@ -5466,14 +5380,7 @@ pub const KernelModule = struct {
         var scale_a_value = scale_a;
         var scale_b_value = scale_b;
         var count_u32 = try toU32(count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&a_ptr),
-            @ptrCast(&b_ptr),
-            @ptrCast(&scale_a_value),
-            @ptrCast(&scale_b_value),
-            @ptrCast(&count_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &a_ptr, &b_ptr, &scale_a_value, &scale_b_value, &count_u32 });
         try launch1d(self.add_weighted_scalars_f32, ctx, count, &params);
     }
 
@@ -5494,12 +5401,7 @@ pub const KernelModule = struct {
         var gate_ptr = gate.ptr;
         var up_ptr = up.ptr;
         var count_u32 = try toU32(count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&gate_ptr),
-            @ptrCast(&up_ptr),
-            @ptrCast(&count_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &count_u32 });
         try launch1d(self.silu_multiply_f32, ctx, count, &params);
     }
 
@@ -5522,13 +5424,7 @@ pub const KernelModule = struct {
         var up_ptr = up.ptr;
         var count_u32 = try toU32(count);
         var activation_u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&gate_ptr),
-            @ptrCast(&up_ptr),
-            @ptrCast(&count_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &count_u32, &activation_u32 });
         try launch1d(self.activation_multiply_f32, ctx, count, &params);
     }
 
@@ -5556,13 +5452,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var f_u32 = try toU32(f);
         var activation_u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&fused_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&f_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &fused_ptr, &rows_u32, &f_u32, &activation_u32 });
         try launch1d(function, ctx, out_count, &params);
     }
 
@@ -5594,16 +5484,7 @@ pub const KernelModule = struct {
         var start_u32 = try toU32(start);
         var out_cols_u32 = try toU32(out_cols);
         var activation_u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&gate_ptr),
-            @ptrCast(&source_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&source_cols_u32),
-            @ptrCast(&start_u32),
-            @ptrCast(&out_cols_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &source_ptr, &rows_u32, &source_cols_u32, &start_u32, &out_cols_u32, &activation_u32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -5623,12 +5504,7 @@ pub const KernelModule = struct {
         var input_ptr = input.ptr;
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &rows_u32, &dim_u32 });
         try launchBlocks(self.argmax_last_row_f32, ctx, 1, f32_tiled_threads, &params);
     }
 
@@ -5652,13 +5528,7 @@ pub const KernelModule = struct {
         var row_start_u32 = try toU32(row_start);
         var row_count_u32 = try toU32(row_count);
         var dim_u32 = try toU32(dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&row_start_u32),
-            @ptrCast(&row_count_u32),
-            @ptrCast(&dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &row_start_u32, &row_count_u32, &dim_u32 });
         try launchBlocks(function, ctx, row_count, f32_tiled_threads, &params);
         return true;
     }
@@ -5688,15 +5558,7 @@ pub const KernelModule = struct {
         var row_count_u32 = try toU32(row_count);
         var dim_u32 = try toU32(dim);
         var suppress_count_u32 = try toU32(suppress_count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&row_start_u32),
-            @ptrCast(&row_count_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &suppress_ptr, &row_start_u32, &row_count_u32, &dim_u32, &suppress_count_u32 });
         try launchBlocks(function, ctx, row_count, f32_tiled_threads, &params);
         return true;
     }
@@ -5723,14 +5585,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
         var suppress_count_u32 = try toU32(suppress_count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &suppress_ptr, &rows_u32, &dim_u32, &suppress_count_u32 });
         try launchBlocks(function, ctx, 1, f32_tiled_threads, &params);
     }
 
@@ -6362,12 +6217,7 @@ pub const KernelModule = struct {
         var input_ptr = input_q8_1.ptr;
         var weight_ptr = weight_raw.ptr;
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &out_dim_u32 });
         try launchBlocks(function, ctx, out_dim / 8, 160, &params);
     }
 
@@ -6542,16 +6392,7 @@ pub const KernelModule = struct {
         var draft_hidden_u32 = try toU32(draft_hidden);
         var concat_order_u32 = concat_order;
         var weight_dtype_u32 = weight_dtype;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&target_embedding_ptr),
-            @ptrCast(&activation_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&backbone_hidden_u32),
-            @ptrCast(&draft_hidden_u32),
-            @ptrCast(&concat_order_u32),
-            @ptrCast(&weight_dtype_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &target_embedding_ptr, &activation_ptr, &weight_ptr, &backbone_hidden_u32, &draft_hidden_u32, &concat_order_u32, &weight_dtype_u32 });
         try launchBlocks(self.gemma4_mtp_preproject_f32, ctx, draft_hidden, f32_tiled_threads, &params);
         return true;
     }
@@ -6592,19 +6433,7 @@ pub const KernelModule = struct {
         var top_k_u32 = try toU32(top_k);
         var inverse_u32: u32 = if (use_inverse_ordering) 1 else 0;
         var centroid_weight_dtype_u32 = centroid_weight_dtype;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&assistant_hidden_ptr),
-            @ptrCast(&logits_ptr),
-            @ptrCast(&centroid_weight_ptr),
-            @ptrCast(&token_ordering_ptr),
-            @ptrCast(&hidden_size_u32),
-            @ptrCast(&vocab_size_u32),
-            @ptrCast(&num_centroids_u32),
-            @ptrCast(&top_k_u32),
-            @ptrCast(&inverse_u32),
-            @ptrCast(&centroid_weight_dtype_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &assistant_hidden_ptr, &logits_ptr, &centroid_weight_ptr, &token_ordering_ptr, &hidden_size_u32, &vocab_size_u32, &num_centroids_u32, &top_k_u32, &inverse_u32, &centroid_weight_dtype_u32 });
         try launchBlocks(self.gemma4_mtp_masked_select_f32, ctx, 1, f32_tiled_threads, &params);
         return true;
     }
@@ -6646,20 +6475,7 @@ pub const KernelModule = struct {
         var inverse_u32: u32 = if (use_inverse_ordering) 1 else 0;
         var lm_head_dtype_u32 = lm_head_dtype;
         var centroid_weight_dtype_u32 = centroid_weight_dtype;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&assistant_hidden_ptr),
-            @ptrCast(&lm_head_weight_ptr),
-            @ptrCast(&centroid_weight_ptr),
-            @ptrCast(&token_ordering_ptr),
-            @ptrCast(&hidden_size_u32),
-            @ptrCast(&vocab_size_u32),
-            @ptrCast(&num_centroids_u32),
-            @ptrCast(&top_k_u32),
-            @ptrCast(&inverse_u32),
-            @ptrCast(&lm_head_dtype_u32),
-            @ptrCast(&centroid_weight_dtype_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &assistant_hidden_ptr, &lm_head_weight_ptr, &centroid_weight_ptr, &token_ordering_ptr, &hidden_size_u32, &vocab_size_u32, &num_centroids_u32, &top_k_u32, &inverse_u32, &lm_head_dtype_u32, &centroid_weight_dtype_u32 });
         try launchBlocks(self.gemma4_mtp_masked_select_hidden_f32, ctx, 1, f32_tiled_threads, &params);
         return true;
     }
@@ -6793,16 +6609,7 @@ pub const KernelModule = struct {
         var num_centroids_u32 = try toU32(num_centroids);
         var top_k_u32 = try toU32(top_k);
         var inverse_u32: u32 = if (use_inverse_ordering) 1 else 0;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&logits_ptr),
-            @ptrCast(&centroid_logits_ptr),
-            @ptrCast(&token_ordering_ptr),
-            @ptrCast(&vocab_size_u32),
-            @ptrCast(&num_centroids_u32),
-            @ptrCast(&top_k_u32),
-            @ptrCast(&inverse_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &logits_ptr, &centroid_logits_ptr, &token_ordering_ptr, &vocab_size_u32, &num_centroids_u32, &top_k_u32, &inverse_u32 });
         try launchBlocks(self.gemma4_mtp_masked_argmax_f32, ctx, 1, f32_tiled_threads, &params);
         return true;
     }
@@ -6832,15 +6639,7 @@ pub const KernelModule = struct {
         var draft_count_u32 = try toU32(draft_count);
         var eos_count_u32 = try toU32(eos_count);
         var accept_bonus_u32: u32 = if (accept_bonus) 1 else 0;
-        var params = [_]?*anyopaque{
-            @ptrCast(&result_ptr),
-            @ptrCast(&target_choices_ptr),
-            @ptrCast(&draft_tokens_ptr),
-            @ptrCast(&eos_token_ids_ptr),
-            @ptrCast(&draft_count_u32),
-            @ptrCast(&eos_count_u32),
-            @ptrCast(&accept_bonus_u32),
-        };
+        var params = launch_abi.addresses(.{ &result_ptr, &target_choices_ptr, &draft_tokens_ptr, &eos_token_ids_ptr, &draft_count_u32, &eos_count_u32, &accept_bonus_u32 });
         try launchBlocks(self.gemma4_mtp_verify_commit_u32, ctx, 1, 1, &params);
         return true;
     }
@@ -6870,15 +6669,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch1d(self.linear_bias_f32, ctx, out_count, &params);
     }
 
@@ -6899,12 +6690,7 @@ pub const KernelModule = struct {
         var bias_ptr = bias.ptr;
         var rows_u32 = try toU32(rows);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &bias_ptr, &rows_u32, &out_dim_u32 });
         try launch1d(self.add_bias_rows_f32, ctx, out_count, &params);
     }
 
@@ -6926,12 +6712,7 @@ pub const KernelModule = struct {
         var bias_ptr = bias.ptr;
         var rows_u32 = try toU32(rows);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &bias_ptr, &rows_u32, &out_dim_u32 });
         try launch1d(function, ctx, out_count, &params);
     }
 
@@ -7005,16 +6786,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&residual_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &residual_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(self.linear_bias_add_f32_tile4_r2, ctx, (out_dim + f32_col_tile - 1) / f32_col_tile, (rows + f32_row_tile - 1) / f32_row_tile, f32_tiled_threads, &params);
     }
 
@@ -7052,18 +6824,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&bias_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&bias_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(self.linear_pair_bias_f32_tile4_r2, ctx, (out_dim + f32_col_tile - 1) / f32_col_tile, (rows + f32_row_tile - 1) / f32_row_tile, f32_tiled_threads, &params);
     }
 
@@ -7110,21 +6871,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&dst_c_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&bias_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&bias_b_ptr),
-            @ptrCast(&weight_c_ptr),
-            @ptrCast(&bias_c_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &dst_c_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &weight_c_ptr, &bias_c_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(self.linear_triple_bias_f32_tile4_r2, ctx, (out_dim + f32_col_tile - 1) / f32_col_tile, (rows + f32_row_tile - 1) / f32_row_tile, f32_tiled_threads, &params);
     }
 
@@ -7155,15 +6902,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + f32_col_tile - 1) / f32_col_tile, (rows + f32_row_tile - 1) / f32_row_tile, f32_tiled_threads, &params);
     }
 
@@ -7189,14 +6928,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(total_rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&eps_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &dim_u32, &eps_value });
         try launchRows(self.rms_norm_f32, ctx, total_rows, &params);
     }
 
@@ -7226,15 +6958,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(total_rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&dst_bf16_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&eps_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &dst_bf16_ptr, &input_ptr, &weight_ptr, &rows_u32, &dim_u32, &eps_value });
         try launchRows(function, ctx, total_rows, &params);
     }
 
@@ -7267,16 +6991,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(total_rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&dst_bf16_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&residual_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&eps_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &dst_bf16_ptr, &input_ptr, &weight_ptr, &residual_ptr, &rows_u32, &dim_u32, &eps_value });
         try launchRows(function, ctx, total_rows, &params);
     }
 
@@ -7305,15 +7020,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(total_rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&residual_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&eps_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &residual_ptr, &rows_u32, &dim_u32, &eps_value });
         try launchRows(self.rms_norm_add_f32, ctx, total_rows, &params);
     }
 
@@ -7345,16 +7052,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(total_rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&residual_ptr),
-            @ptrCast(&scalar_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&eps_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &residual_ptr, &scalar_ptr, &rows_u32, &dim_u32, &eps_value });
         try launchRows(self.rms_norm_add_mul_scalar_f32, ctx, total_rows, &params);
     }
 
@@ -7387,16 +7085,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(total_rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&residual_ptr),
-            @ptrCast(&scalar_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&eps_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &residual_ptr, &scalar_ptr, &rows_u32, &dim_u32, &eps_value });
         try launchRows(function, ctx, total_rows, &params);
     }
 
@@ -7419,13 +7108,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(total_rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&eps_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &rows_u32, &dim_u32, &eps_value });
         try launchRows(self.rms_norm_bare_f32, ctx, total_rows, &params);
     }
 
@@ -7464,12 +7147,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(total_rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&first_ptr),        @ptrCast(&second_ptr),       @ptrCast(&third_ptr),
-            @ptrCast(&input_ptr),        @ptrCast(&first_weight_ptr), @ptrCast(&second_weight_ptr),
-            @ptrCast(&third_weight_ptr), @ptrCast(&rows_u32),         @ptrCast(&dim_u32),
-            @ptrCast(&eps_value),
-        };
+        var params = launch_abi.addresses(.{ &first_ptr, &second_ptr, &third_ptr, &input_ptr, &first_weight_ptr, &second_weight_ptr, &third_weight_ptr, &rows_u32, &dim_u32, &eps_value });
         try launchRows(function, ctx, total_rows, &params);
     }
 
@@ -7508,12 +7186,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(total_rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),      @ptrCast(&shared_ptr),        @ptrCast(&shared_weight_ptr),
-            @ptrCast(&routed_ptr),   @ptrCast(&routed_weight_ptr), @ptrCast(&combined_weight_ptr),
-            @ptrCast(&residual_ptr), @ptrCast(&rows_u32),          @ptrCast(&dim_u32),
-            @ptrCast(&eps_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &shared_ptr, &shared_weight_ptr, &routed_ptr, &routed_weight_ptr, &combined_weight_ptr, &residual_ptr, &rows_u32, &dim_u32, &eps_value });
         try launchRows(function, ctx, total_rows, &params);
     }
 
@@ -7536,13 +7209,7 @@ pub const KernelModule = struct {
         var b_ptr = b.ptr;
         var count_u32 = try toU32(count);
         var op_u32: u32 = @backingInt(op);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&a_ptr),
-            @ptrCast(&b_ptr),
-            @ptrCast(&count_u32),
-            @ptrCast(&op_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &a_ptr, &b_ptr, &count_u32, &op_u32 });
         try launch1d(self.elementwise_f32, ctx, count, &params);
     }
 
@@ -7582,16 +7249,7 @@ pub const KernelModule = struct {
         var a_dims_mut = a_dims;
         var b_dims_mut = b_dims;
         var output_dims_mut = output_dims;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),            @ptrCast(&a_ptr),              @ptrCast(&b_ptr),              @ptrCast(&count_u32),
-            @ptrCast(&a_rank_u32),         @ptrCast(&b_rank_u32),         @ptrCast(&output_rank_u32),    @ptrCast(&op_u32),
-            @ptrCast(&a_dims_mut[0]),      @ptrCast(&a_dims_mut[1]),      @ptrCast(&a_dims_mut[2]),      @ptrCast(&a_dims_mut[3]),
-            @ptrCast(&a_dims_mut[4]),      @ptrCast(&a_dims_mut[5]),      @ptrCast(&a_dims_mut[6]),      @ptrCast(&a_dims_mut[7]),
-            @ptrCast(&b_dims_mut[0]),      @ptrCast(&b_dims_mut[1]),      @ptrCast(&b_dims_mut[2]),      @ptrCast(&b_dims_mut[3]),
-            @ptrCast(&b_dims_mut[4]),      @ptrCast(&b_dims_mut[5]),      @ptrCast(&b_dims_mut[6]),      @ptrCast(&b_dims_mut[7]),
-            @ptrCast(&output_dims_mut[0]), @ptrCast(&output_dims_mut[1]), @ptrCast(&output_dims_mut[2]), @ptrCast(&output_dims_mut[3]),
-            @ptrCast(&output_dims_mut[4]), @ptrCast(&output_dims_mut[5]), @ptrCast(&output_dims_mut[6]), @ptrCast(&output_dims_mut[7]),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &a_ptr, &b_ptr, &count_u32, &a_rank_u32, &b_rank_u32, &output_rank_u32, &op_u32, &a_dims_mut[0], &a_dims_mut[1], &a_dims_mut[2], &a_dims_mut[3], &a_dims_mut[4], &a_dims_mut[5], &a_dims_mut[6], &a_dims_mut[7], &b_dims_mut[0], &b_dims_mut[1], &b_dims_mut[2], &b_dims_mut[3], &b_dims_mut[4], &b_dims_mut[5], &b_dims_mut[6], &b_dims_mut[7], &output_dims_mut[0], &output_dims_mut[1], &output_dims_mut[2], &output_dims_mut[3], &output_dims_mut[4], &output_dims_mut[5], &output_dims_mut[6], &output_dims_mut[7] });
         try launch1d(function, ctx, output_count, &params);
     }
 
@@ -7615,9 +7273,7 @@ pub const KernelModule = struct {
         var true_ptr = on_true.ptr;
         var false_ptr = on_false.ptr;
         var count_u32 = try toU32(count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr), @ptrCast(&cond_ptr), @ptrCast(&true_ptr), @ptrCast(&false_ptr), @ptrCast(&count_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &cond_ptr, &true_ptr, &false_ptr, &count_u32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -7652,17 +7308,7 @@ pub const KernelModule = struct {
         var k_u32 = try toU32(k);
         var lhs_contract_last_u32: u32 = @intFromBool(lhs_contract_last);
         var rhs_contract_last_u32: u32 = @intFromBool(rhs_contract_last);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr),
-            @ptrCast(&lhs_ptr),
-            @ptrCast(&rhs_ptr),
-            @ptrCast(&batch_count_u32),
-            @ptrCast(&m_u32),
-            @ptrCast(&n_u32),
-            @ptrCast(&k_u32),
-            @ptrCast(&lhs_contract_last_u32),
-            @ptrCast(&rhs_contract_last_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &lhs_ptr, &rhs_ptr, &batch_count_u32, &m_u32, &n_u32, &k_u32, &lhs_contract_last_u32, &rhs_contract_last_u32 });
         try launch1d(function, ctx, output_count, &params);
     }
 
@@ -7691,15 +7337,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&gamma_ptr),
-            @ptrCast(&beta_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&eps_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &gamma_ptr, &beta_ptr, &rows_u32, &dim_u32, &eps_value });
         try launchBlocks(self.layer_norm_f32, ctx, rows, f32_tiled_threads, &params);
     }
 
@@ -7731,16 +7369,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
         var eps_value = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&a_ptr),
-            @ptrCast(&b_ptr),
-            @ptrCast(&gamma_ptr),
-            @ptrCast(&beta_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&eps_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &a_ptr, &b_ptr, &gamma_ptr, &beta_ptr, &rows_u32, &dim_u32, &eps_value });
         try launchBlocks(self.add_layer_norm_f32, ctx, rows, f32_tiled_threads, &params);
     }
 
@@ -7766,14 +7395,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(self.embedding_lookup_f32, ctx, count, &params);
     }
 
@@ -7800,14 +7422,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -7834,14 +7449,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -7867,14 +7475,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(self.embedding_lookup_i32_f32, ctx, count, &params);
     }
 
@@ -7901,14 +7502,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -7935,14 +7529,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -7968,14 +7555,7 @@ pub const KernelModule = struct {
         var source_rows_u32 = try toU32(source_rows);
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&row_ids_ptr),
-            @ptrCast(&source_rows_u32),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &row_ids_ptr, &source_rows_u32, &rows_u32, &dim_u32 });
         try launch1d(self.take_rows_f32, ctx, count, &params);
     }
 
@@ -8007,10 +7587,7 @@ pub const KernelModule = struct {
         var num_experts_u32 = try toU32(num_experts);
         var top_k_u32 = try toU32(top_k);
         var scale_value = logit_scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&ids_ptr),  @ptrCast(&weights_ptr),     @ptrCast(&logits_ptr), @ptrCast(&scale_ptr),
-            @ptrCast(&rows_u32), @ptrCast(&num_experts_u32), @ptrCast(&top_k_u32),  @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &ids_ptr, &weights_ptr, &logits_ptr, &scale_ptr, &rows_u32, &num_experts_u32, &top_k_u32, &scale_value });
         try launchBlocks(function, ctx, rows, 128, &params);
     }
 
@@ -8049,11 +7626,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),         @ptrCast(&input_ptr),      @ptrCast(&gate_ptr), @ptrCast(&up_ptr),    @ptrCast(&ids_ptr),
-            @ptrCast(&gate_stride_u64), @ptrCast(&up_stride_u64),  @ptrCast(&rows_u32), @ptrCast(&top_k_u32), @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),     @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &gate_ptr, &up_ptr, &ids_ptr, &gate_stride_u64, &up_stride_u64, &rows_u32, &top_k_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launchBlocks(function, ctx, try checkedTensorElements(routes, (out_dim + 3) / 4), 256, &params);
     }
 
@@ -8086,11 +7659,7 @@ pub const KernelModule = struct {
         var top_k_u32 = try toU32(top_k);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),         @ptrCast(&input_ptr), @ptrCast(&down_ptr),  @ptrCast(&ids_ptr),
-            @ptrCast(&down_stride_u64), @ptrCast(&rows_u32),  @ptrCast(&top_k_u32), @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &down_ptr, &ids_ptr, &down_stride_u64, &rows_u32, &top_k_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + 7) / 8, routes, 128, &params);
     }
 
@@ -8122,11 +7691,7 @@ pub const KernelModule = struct {
         var top_k_u32 = try toU32(top_k);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),         @ptrCast(&input_ptr), @ptrCast(&down_ptr),  @ptrCast(&ids_ptr),
-            @ptrCast(&down_stride_u64), @ptrCast(&rows_u32),  @ptrCast(&top_k_u32), @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &down_ptr, &ids_ptr, &down_stride_u64, &rows_u32, &top_k_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, 352, routes, 64, &params);
     }
 
@@ -8152,10 +7717,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var top_k_u32 = try toU32(top_k);
         var dim_u32 = try toU32(dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),  @ptrCast(&output_ptr), @ptrCast(&weights_ptr),
-            @ptrCast(&rows_u32), @ptrCast(&top_k_u32),  @ptrCast(&dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &output_ptr, &weights_ptr, &rows_u32, &top_k_u32, &dim_u32 });
         try launch1d(function, ctx, try checkedTensorElements(rows, dim), &params);
     }
 
@@ -8189,16 +7751,7 @@ pub const KernelModule = struct {
         var source_rows_u32 = try toU32(source_rows);
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&start_ptr),
-            @ptrCast(&end_ptr),
-            @ptrCast(&start_rows_ptr),
-            @ptrCast(&end_rows_ptr),
-            @ptrCast(&source_rows_u32),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &start_ptr, &end_ptr, &start_rows_ptr, &end_rows_ptr, &source_rows_u32, &rows_u32, &dim_u32 });
         try launch1d(function, ctx, out_count, &params);
     }
 
@@ -8224,14 +7777,7 @@ pub const KernelModule = struct {
         var cols_u32 = try toU32(cols);
         var start_u32 = try toU32(start);
         var out_cols_u32 = try toU32(out_cols);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&cols_u32),
-            @ptrCast(&start_u32),
-            @ptrCast(&out_cols_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &rows_u32, &cols_u32, &start_u32, &out_cols_u32 });
         try launch1d(self.slice_last_dim_f32, ctx, count, &params);
     }
 
@@ -8260,15 +7806,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var hidden_size_u32 = try toU32(hidden_size);
         var num_words_u32 = try toU32(num_words);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&hidden_ptr),
-            @ptrCast(&words_mask_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&hidden_size_u32),
-            @ptrCast(&num_words_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &hidden_ptr, &words_mask_ptr, &batch_u32, &seq_len_u32, &hidden_size_u32, &num_words_u32 });
         try launch1d(self.gliner_word_embeddings_f32, ctx, out_count, &params);
     }
 
@@ -8289,12 +7827,7 @@ pub const KernelModule = struct {
         var src_ptr = src.ptr;
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&src_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &rows_u32, &dim_u32 });
         try launch1d(self.repeat_first_row_f32, ctx, count, &params);
     }
 
@@ -8322,14 +7855,7 @@ pub const KernelModule = struct {
         var gh_ptr = gh.ptr;
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&label_ptr),
-            @ptrCast(&gi_ptr),
-            @ptrCast(&gh_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &label_ptr, &gi_ptr, &gh_ptr, &rows_u32, &dim_u32 });
         try launch1d(self.gliner_gru_combine_f32, ctx, count, &params);
     }
 
@@ -8355,14 +7881,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(self.embedding_lookup_q4_k_f32, ctx, count, &params);
     }
 
@@ -8390,14 +7909,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(self.embedding_lookup_q6_k_f32, ctx, count, &params);
     }
 
@@ -8425,14 +7937,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(self.embedding_lookup_q4_0_f32, ctx, count, &params);
     }
 
@@ -8460,14 +7965,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(self.embedding_lookup_q8_0_f32, ctx, count, &params);
     }
 
@@ -8493,14 +7991,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(self.embedding_lookup_i32_q4_k_f32, ctx, count, &params);
     }
 
@@ -8528,14 +8019,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(self.embedding_lookup_i32_q6_k_f32, ctx, count, &params);
     }
 
@@ -8568,16 +8052,7 @@ pub const KernelModule = struct {
         var dim_u32 = try toU32(dim);
         var lhs_scale_value = lhs_scale;
         var rhs_scale_value = rhs_scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&rhs_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&lhs_scale_value),
-            @ptrCast(&rhs_scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &rhs_ptr, &total_u32, &dim_u32, &lhs_scale_value, &rhs_scale_value });
         try launch1d(self.embedding_add_weighted_i32_q6_k_f32, ctx, count, &params);
     }
 
@@ -8622,20 +8097,7 @@ pub const KernelModule = struct {
         var eps_value = eps;
         var lhs_scale_value = lhs_scale;
         var rhs_scale_value = rhs_scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&norm_weight_ptr),
-            @ptrCast(&embedding_weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&num_groups_u32),
-            @ptrCast(&group_dim_u32),
-            @ptrCast(&embedding_dim_u32),
-            @ptrCast(&eps_value),
-            @ptrCast(&lhs_scale_value),
-            @ptrCast(&rhs_scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &norm_weight_ptr, &embedding_weight_ptr, &ids_ptr, &total_u32, &num_groups_u32, &group_dim_u32, &embedding_dim_u32, &eps_value, &lhs_scale_value, &rhs_scale_value });
         try launchBlocks(function, ctx, rows, 256, &params);
     }
 
@@ -8663,14 +8125,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(self.embedding_lookup_i32_q4_0_f32, ctx, count, &params);
     }
 
@@ -8698,14 +8153,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_u32 = try toU32(dim);
         var scale_value = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&ids_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
         try launch1d(self.embedding_lookup_i32_q8_0_f32, ctx, count, &params);
     }
 
@@ -8731,14 +8179,7 @@ pub const KernelModule = struct {
         var total_u32 = try toU32(total);
         var dim_a_u32 = try toU32(dim_a);
         var dim_b_u32 = try toU32(dim_b);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&a_ptr),
-            @ptrCast(&b_ptr),
-            @ptrCast(&total_u32),
-            @ptrCast(&dim_a_u32),
-            @ptrCast(&dim_b_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &a_ptr, &b_ptr, &total_u32, &dim_a_u32, &dim_b_u32 });
         try launch1d(self.concat_lastdim_f32, ctx, count, &params);
     }
 
@@ -8789,26 +8230,7 @@ pub const KernelModule = struct {
         var groups_u32 = try toU32(groups);
         var out_h_u32 = try toU32(out_h);
         var out_w_u32 = try toU32(out_w);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&in_channels_u32),
-            @ptrCast(&out_channels_u32),
-            @ptrCast(&height_u32),
-            @ptrCast(&width_u32),
-            @ptrCast(&kernel_h_u32),
-            @ptrCast(&kernel_w_u32),
-            @ptrCast(&stride_h_u32),
-            @ptrCast(&stride_w_u32),
-            @ptrCast(&padding_h_u32),
-            @ptrCast(&padding_w_u32),
-            @ptrCast(&groups_u32),
-            @ptrCast(&out_h_u32),
-            @ptrCast(&out_w_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &batch_u32, &in_channels_u32, &out_channels_u32, &height_u32, &width_u32, &kernel_h_u32, &kernel_w_u32, &stride_h_u32, &stride_w_u32, &padding_h_u32, &padding_w_u32, &groups_u32, &out_h_u32, &out_w_u32 });
         try launch1d(self.conv2d_f32, ctx, out_count, &params);
     }
 
@@ -8845,16 +8267,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
         const query_tiles = (seq_len + 31) / 32;
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
         try launchBlocks(function, ctx, blocks, 256, &params);
@@ -9080,22 +8493,7 @@ pub const KernelModule = struct {
         var has_mask_u32: u32 = if (has_mask) 1 else 0;
         var bias_mode_u32 = bias_mode;
         var head_major_u32: u32 = if (head_major) 1 else 0;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&causal_u32),
-            @ptrCast(&has_mask_u32),
-            @ptrCast(&bias_mode_u32),
-            @ptrCast(&head_major_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &mask_ptr, &bias_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32, &causal_u32, &has_mask_u32, &bias_mode_u32, &head_major_u32 });
         const attention_mode = bertPrefillAttentionMode();
         if (attention_mode == .tensor_core and
             bertPrefillAttentionMmaComputeEligible(ctx.info.compute_major, ctx.info.compute_minor) and
@@ -9179,17 +8577,7 @@ pub const KernelModule = struct {
                 var enc_seq_u32 = try toU32(enc_seq);
                 var num_heads_u32 = try toU32(num_heads);
                 var head_dim_u32 = try toU32(head_dim);
-                var params = [_]?*anyopaque{
-                    @ptrCast(&dst_ptr),
-                    @ptrCast(&q_ptr),
-                    @ptrCast(&k_ptr),
-                    @ptrCast(&v_ptr),
-                    @ptrCast(&mask_ptr),
-                    @ptrCast(&batch_u32),
-                    @ptrCast(&enc_seq_u32),
-                    @ptrCast(&num_heads_u32),
-                    @ptrCast(&head_dim_u32),
-                };
+                var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &mask_ptr, &batch_u32, &enc_seq_u32, &num_heads_u32, &head_dim_u32 });
                 try launchBlocksShared(self.cross_attention_q1_f32, ctx, try checkedTensorElements(batch, num_heads), threads, shared_bytes, &params);
                 return;
             }
@@ -9205,18 +8593,7 @@ pub const KernelModule = struct {
         var enc_seq_u32 = try toU32(enc_seq);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&dec_seq_u32),
-            @ptrCast(&enc_seq_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &mask_ptr, &batch_u32, &dec_seq_u32, &enc_seq_u32, &num_heads_u32, &head_dim_u32 });
         try launch1d(self.cross_attention_f32, ctx, q_count, &params);
     }
 
@@ -9241,14 +8618,7 @@ pub const KernelModule = struct {
         var channels_u32 = try toU32(channels);
         var height_u32 = try toU32(height);
         var width_u32 = try toU32(width);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&src_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&channels_u32),
-            @ptrCast(&height_u32),
-            @ptrCast(&width_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &batch_u32, &channels_u32, &height_u32, &width_u32 });
         try launch1d(self.token_to_nchw_f32, ctx, count, &params);
     }
 
@@ -9273,14 +8643,7 @@ pub const KernelModule = struct {
         var channels_u32 = try toU32(channels);
         var height_u32 = try toU32(height);
         var width_u32 = try toU32(width);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&src_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&channels_u32),
-            @ptrCast(&height_u32),
-            @ptrCast(&width_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &batch_u32, &channels_u32, &height_u32, &width_u32 });
         try launch1d(self.nchw_to_token_f32, ctx, count, &params);
     }
 
@@ -9312,17 +8675,7 @@ pub const KernelModule = struct {
         var window_size_u32 = try toU32(window_size);
         var padded_h_u32 = try toU32(padded_h);
         var padded_w_u32 = try toU32(padded_w);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&src_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&height_u32),
-            @ptrCast(&width_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&window_size_u32),
-            @ptrCast(&padded_h_u32),
-            @ptrCast(&padded_w_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &batch_u32, &height_u32, &width_u32, &dim_u32, &window_size_u32, &padded_h_u32, &padded_w_u32 });
         try launch1d(self.pack_windows_f32, ctx, count, &params);
     }
 
@@ -9355,17 +8708,7 @@ pub const KernelModule = struct {
         var window_size_u32 = try toU32(window_size);
         var padded_h_u32 = try toU32(padded_h);
         var padded_w_u32 = try toU32(padded_w);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&src_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&height_u32),
-            @ptrCast(&width_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&window_size_u32),
-            @ptrCast(&padded_h_u32),
-            @ptrCast(&padded_w_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &batch_u32, &height_u32, &width_u32, &dim_u32, &window_size_u32, &padded_h_u32, &padded_w_u32 });
         try launch1d(self.unpad_windows_f32, ctx, count, &params);
     }
 
@@ -9395,14 +8738,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var dim_u32 = try toU32(dim);
         var groups_u32 = try toU32(groups);
-        var params = [_]?*anyopaque{
-            @ptrCast(&scores_ptr),
-            @ptrCast(&qkv_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&groups_u32),
-        };
+        var params = launch_abi.addresses(.{ &scores_ptr, &qkv_ptr, &batch_u32, &seq_len_u32, &dim_u32, &groups_u32 });
         try launchBlocks(self.channel_scores_softmax_f32, ctx, rows, 256, &params);
     }
 
@@ -9434,15 +8770,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var dim_u32 = try toU32(dim);
         var groups_u32 = try toU32(groups);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&qkv_ptr),
-            @ptrCast(&scores_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&groups_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &qkv_ptr, &scores_ptr, &batch_u32, &seq_len_u32, &dim_u32, &groups_u32 });
         try launch1d(self.channel_apply_f32, ctx, count, &params);
     }
 
@@ -9488,21 +8816,7 @@ pub const KernelModule = struct {
         var row_dtype_u32 = row_dtype;
         var col_dtype_u32 = col_dtype;
         var temporal_dtype_u32 = temporal_dtype;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&tokens_ptr),
-            @ptrCast(&row_ptr),
-            @ptrCast(&col_ptr),
-            @ptrCast(&temporal_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&height_u32),
-            @ptrCast(&width_u32),
-            @ptrCast(&dim_u32),
-            @ptrCast(&has_temporal_u32),
-            @ptrCast(&row_dtype_u32),
-            @ptrCast(&col_dtype_u32),
-            @ptrCast(&temporal_dtype_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &tokens_ptr, &row_ptr, &col_ptr, &temporal_ptr, &batch_u32, &height_u32, &width_u32, &dim_u32, &has_temporal_u32, &row_dtype_u32, &col_dtype_u32, &temporal_dtype_u32 });
         try launch1d(self.florence_vision_tail_sources_f32, ctx, dst_count, &params);
     }
 
@@ -9538,19 +8852,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var chunks_per_position_u32 = try toU32(chunks_per_position);
         var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&total_chunks_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&rope_dim_u32),
-            @ptrCast(&theta_f32),
-            @ptrCast(&freq_scale_f32),
-            @ptrCast(&position_offset_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&chunks_per_position_u32),
-            @ptrCast(&consecutive_pairs_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &theta_f32, &freq_scale_f32, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32 });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rope dst=0x{x} input=0x{x} total_chunks={d} head_dim={d} rope_dim={d} theta={d:.6} freq_scale={d:.6} position_offset={d} seq_len={d} chunks_per_position={d} consecutive_pairs={d}", .{
                 ctx.debug_graph_capture_id,
@@ -9603,19 +8905,7 @@ pub const KernelModule = struct {
         var freq_scale_f32 = freq_scale;
         var section_height_u32 = sections[1];
         var section_width_u32 = sections[2];
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&positions_ptr),
-            @ptrCast(&total_chunks_u32),
-            @ptrCast(&token_count_u32),
-            @ptrCast(&chunks_per_token_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&theta_f32),
-            @ptrCast(&freq_scale_f32),
-            @ptrCast(&section_height_u32),
-            @ptrCast(&section_width_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &positions_ptr, &total_chunks_u32, &token_count_u32, &chunks_per_token_u32, &head_dim_u32, &theta_f32, &freq_scale_f32, &section_height_u32, &section_width_u32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -9646,16 +8936,7 @@ pub const KernelModule = struct {
         var heads_per_token_u32 = try toU32(heads_per_token);
         var head_dim_u32 = try toU32(head_dim);
         var theta_f32 = theta;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&positions_ptr),
-            @ptrCast(&total_chunks_u32),
-            @ptrCast(&token_count_u32),
-            @ptrCast(&heads_per_token_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&theta_f32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &positions_ptr, &total_chunks_u32, &token_count_u32, &heads_per_token_u32, &head_dim_u32, &theta_f32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -9694,20 +8975,7 @@ pub const KernelModule = struct {
         var chunks_per_position_u32 = try toU32(chunks_per_position);
         var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
         var decode_scalars_ptr = decode_scalars.ptr;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&total_chunks_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&rope_dim_u32),
-            @ptrCast(&theta_f32),
-            @ptrCast(&freq_scale_f32),
-            @ptrCast(&position_offset_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&chunks_per_position_u32),
-            @ptrCast(&consecutive_pairs_u32),
-            @ptrCast(&decode_scalars_ptr),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &theta_f32, &freq_scale_f32, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32, &decode_scalars_ptr });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rope_decode_scalars dst=0x{x} input=0x{x} scalars=0x{x} fallback_position_offset={d} seq_len={d}", .{
                 ctx.debug_graph_capture_id,
@@ -9744,14 +9012,7 @@ pub const KernelModule = struct {
         var kv_seq_delta_arg = kv_seq_delta;
         var total_sequence_delta_arg = total_sequence_delta;
         var kv_position_delta_arg = kv_position_delta;
-        var params = [_]?*anyopaque{
-            @ptrCast(&decode_scalars_ptr),
-            @ptrCast(&position_delta_arg),
-            @ptrCast(&query_position_delta_arg),
-            @ptrCast(&kv_seq_delta_arg),
-            @ptrCast(&total_sequence_delta_arg),
-            @ptrCast(&kv_position_delta_arg),
-        };
+        var params = launch_abi.addresses(.{ &decode_scalars_ptr, &position_delta_arg, &query_position_delta_arg, &kv_seq_delta_arg, &total_sequence_delta_arg, &kv_position_delta_arg });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=decode_scalars_advance scalars=0x{x} deltas={d},{d},{d},{d},{d}", .{
                 ctx.debug_graph_capture_id,
@@ -9801,20 +9062,7 @@ pub const KernelModule = struct {
         var chunks_per_position_u32 = try toU32(chunks_per_position);
         var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
         var scale_f32 = scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&total_chunks_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&rope_dim_u32),
-            @ptrCast(&theta_f32),
-            @ptrCast(&freq_scale_f32),
-            @ptrCast(&position_offset_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&chunks_per_position_u32),
-            @ptrCast(&consecutive_pairs_u32),
-            @ptrCast(&scale_f32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &theta_f32, &freq_scale_f32, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32, &scale_f32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -9855,21 +9103,7 @@ pub const KernelModule = struct {
         var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
         var scale_f32 = scale;
         var decode_scalars_ptr = decode_scalars.ptr;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&total_chunks_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&rope_dim_u32),
-            @ptrCast(&theta_f32),
-            @ptrCast(&freq_scale_f32),
-            @ptrCast(&position_offset_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&chunks_per_position_u32),
-            @ptrCast(&consecutive_pairs_u32),
-            @ptrCast(&scale_f32),
-            @ptrCast(&decode_scalars_ptr),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &theta_f32, &freq_scale_f32, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32, &scale_f32, &decode_scalars_ptr });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rope_scaled_decode_scalars dst=0x{x} input=0x{x} scalars=0x{x} fallback_position_offset={d} seq_len={d}", .{
                 ctx.debug_graph_capture_id,
@@ -9921,20 +9155,7 @@ pub const KernelModule = struct {
         var theta_f32 = theta;
         var freq_scale_f32 = freq_scale;
         var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&query_lengths_ptr),
-            @ptrCast(&position_offsets_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&max_seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&rope_dim_u32),
-            @ptrCast(&theta_f32),
-            @ptrCast(&freq_scale_f32),
-            @ptrCast(&consecutive_pairs_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &query_lengths_ptr, &position_offsets_ptr, &batch_u32, &max_seq_len_u32, &num_heads_u32, &head_dim_u32, &rope_dim_u32, &theta_f32, &freq_scale_f32, &consecutive_pairs_u32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -9979,22 +9200,7 @@ pub const KernelModule = struct {
         var chunks_per_position_u32 = try toU32(chunks_per_position);
         var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
         var output_scale_value = output_scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&total_chunks_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&rope_dim_u32),
-            @ptrCast(&eps_value),
-            @ptrCast(&theta_value),
-            @ptrCast(&freq_scale_value),
-            @ptrCast(&position_offset_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&chunks_per_position_u32),
-            @ptrCast(&consecutive_pairs_u32),
-            @ptrCast(&output_scale_value),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &eps_value, &theta_value, &freq_scale_value, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32, &output_scale_value });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rms_norm_heads_rope dst=0x{x} input=0x{x} weight=0x{x} total_chunks={d} head_dim={d} rope_dim={d} eps={d:.8} theta={d:.6} freq_scale={d:.6} position_offset={d} seq_len={d} chunks_per_position={d} consecutive_pairs={d} output_scale={d:.6}", .{
                 ctx.debug_graph_capture_id,
@@ -10062,23 +9268,7 @@ pub const KernelModule = struct {
         var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
         var output_scale_value = output_scale;
         var decode_scalars_ptr = decode_scalars.ptr;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&total_chunks_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&rope_dim_u32),
-            @ptrCast(&eps_value),
-            @ptrCast(&theta_value),
-            @ptrCast(&freq_scale_value),
-            @ptrCast(&position_offset_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&chunks_per_position_u32),
-            @ptrCast(&consecutive_pairs_u32),
-            @ptrCast(&output_scale_value),
-            @ptrCast(&decode_scalars_ptr),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &eps_value, &theta_value, &freq_scale_value, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32, &output_scale_value, &decode_scalars_ptr });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rms_norm_heads_rope_decode_scalars dst=0x{x} input=0x{x} weight=0x{x} scalars=0x{x} fallback_position_offset={d} seq_len={d}", .{
                 ctx.debug_graph_capture_id,
@@ -10553,26 +9743,7 @@ pub const KernelModule = struct {
         var total_sequence_len_u32 = try toU32(total_sequence_len);
         var mask_len_u32 = try toU32(mask_len);
         var bias_mode_u32 = bias_mode;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&q_seq_len_u32),
-            @ptrCast(&kv_seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&num_kv_heads_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&query_position_offset_u32),
-            @ptrCast(&kv_position_offset_u32),
-            @ptrCast(&sliding_window_u32),
-            @ptrCast(&total_sequence_len_u32),
-            @ptrCast(&mask_len_u32),
-            @ptrCast(&bias_mode_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &mask_ptr, &bias_ptr, &batch_u32, &q_seq_len_u32, &kv_seq_len_u32, &num_heads_u32, &num_kv_heads_u32, &head_dim_u32, &query_position_offset_u32, &kv_position_offset_u32, &sliding_window_u32, &total_sequence_len_u32, &mask_len_u32, &bias_mode_u32 });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention dst=0x{x} q=0x{x} k=0x{x} v=0x{x} mask=0x{x} bias=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} query_position_offset={d} kv_position_offset={d} sliding_window={d} total_sequence_len={d} mask_len={d} bias_mode={d}", .{
                 ctx.debug_graph_capture_id,
@@ -10725,27 +9896,7 @@ pub const KernelModule = struct {
         var total_sequence_len_u32 = try toU32(total_sequence_len);
         var mask_len_u32 = try toU32(mask_len);
         var bias_mode_u32 = bias_mode;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&q_seq_len_u32),
-            @ptrCast(&kv_seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&num_kv_heads_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&query_position_offset_u32),
-            @ptrCast(&kv_position_offset_u32),
-            @ptrCast(&sliding_window_u32),
-            @ptrCast(&total_sequence_len_u32),
-            @ptrCast(&mask_len_u32),
-            @ptrCast(&bias_mode_u32),
-            @ptrCast(&decode_scalars_ptr),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &mask_ptr, &bias_ptr, &batch_u32, &q_seq_len_u32, &kv_seq_len_u32, &num_heads_u32, &num_kv_heads_u32, &head_dim_u32, &query_position_offset_u32, &kv_position_offset_u32, &sliding_window_u32, &total_sequence_len_u32, &mask_len_u32, &bias_mode_u32, &decode_scalars_ptr });
         if (generatedGqaDecodeEnabled() and mask_len == 0 and bias_mode == 0 and generatedGqaDecodeShapeEligible(batch, q_seq_len, head_dim, num_heads, num_kv_heads)) {
             const generated_schedule = generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len);
             if (captureParamTraceIndex(ctx)) |trace_index| {
@@ -10865,16 +10016,7 @@ pub const KernelModule = struct {
         var suffix_token_count_u32 = try toU32(suffix_token_count);
         var row_width_u32 = try toU32(row_width);
         var fallback_total_token_count_u32 = try toU32(fallback_total_token_count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&k_dst_ptr),
-            @ptrCast(&v_dst_ptr),
-            @ptrCast(&k_src_ptr),
-            @ptrCast(&v_src_ptr),
-            @ptrCast(&decode_scalars_ptr),
-            @ptrCast(&suffix_token_count_u32),
-            @ptrCast(&row_width_u32),
-            @ptrCast(&fallback_total_token_count_u32),
-        };
+        var params = launch_abi.addresses(.{ &k_dst_ptr, &v_dst_ptr, &k_src_ptr, &v_src_ptr, &decode_scalars_ptr, &suffix_token_count_u32, &row_width_u32, &fallback_total_token_count_u32 });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=kv_write_suffix_decode_scalars k_dst=0x{x} v_dst=0x{x} k_src=0x{x} v_src=0x{x} scalars=0x{x} suffix={d} row_width={d} fallback_total_token_count={d}", .{
                 ctx.debug_graph_capture_id,
@@ -10945,27 +10087,7 @@ pub const KernelModule = struct {
         var format_u32 = format;
         var value_format_u32 = value_format;
         var physical_token_capacity_u32 = try toU32(physical_token_capacity);
-        var params = [_]?*anyopaque{
-            @ptrCast(&k_dst_ptr),
-            @ptrCast(&v_dst_ptr),
-            @ptrCast(&block_table_ptr),
-            @ptrCast(&k_src_ptr),
-            @ptrCast(&v_src_ptr),
-            @ptrCast(&decode_scalars_ptr),
-            @ptrCast(&suffix_token_count_u32),
-            @ptrCast(&row_width_u32),
-            @ptrCast(&num_kv_heads_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&key_row_bytes_u32),
-            @ptrCast(&base_key_row_bytes_u32),
-            @ptrCast(&value_row_bytes_u32),
-            @ptrCast(&fallback_total_token_count_u32),
-            @ptrCast(&block_count_u32),
-            @ptrCast(&page_size_tokens_u32),
-            @ptrCast(&format_u32),
-            @ptrCast(&value_format_u32),
-            @ptrCast(&physical_token_capacity_u32),
-        };
+        var params = launch_abi.addresses(.{ &k_dst_ptr, &v_dst_ptr, &block_table_ptr, &k_src_ptr, &v_src_ptr, &decode_scalars_ptr, &suffix_token_count_u32, &row_width_u32, &num_kv_heads_u32, &head_dim_u32, &key_row_bytes_u32, &base_key_row_bytes_u32, &value_row_bytes_u32, &fallback_total_token_count_u32, &block_count_u32, &page_size_tokens_u32, &format_u32, &value_format_u32, &physical_token_capacity_u32 });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=kv_write_suffix_turboquant k_dst=0x{x} v_dst=0x{x} block_table=0x{x} k_src=0x{x} v_src=0x{x} scalars=0x{x} suffix={d} row_width={d} key_row_bytes={d} base_key_row_bytes={d} value_row_bytes={d} fallback_total_token_count={d} block_count={d} page_size={d} format={d} value_format={d}", .{
                 ctx.debug_graph_capture_id,
@@ -11108,37 +10230,7 @@ pub const KernelModule = struct {
         else
             cuda_kernel_renderer.generated_splitk_online_decode_hd512_max_visible_tokens);
         var decode_scalars_ptr = decode_scalars.ptr;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&completion_counters_ptr),
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_max_ptr),
-            @ptrCast(&partial_denom_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&block_table_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&q_seq_len_u32),
-            @ptrCast(&kv_seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&num_kv_heads_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&query_position_offset_u32),
-            @ptrCast(&kv_position_offset_u32),
-            @ptrCast(&sliding_window_u32),
-            @ptrCast(&total_sequence_len_u32),
-            @ptrCast(&key_row_bytes_u32),
-            @ptrCast(&base_key_row_bytes_u32),
-            @ptrCast(&value_row_bytes_u32),
-            @ptrCast(&block_count_u32),
-            @ptrCast(&page_size_tokens_u32),
-            @ptrCast(&format_u32),
-            @ptrCast(&value_format_u32),
-            @ptrCast(&physical_token_capacity_u32),
-            @ptrCast(&score_capacity_u32),
-            @ptrCast(&decode_scalars_ptr),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &completion_counters_ptr, &partial_values_ptr, &partial_max_ptr, &partial_denom_ptr, &q_ptr, &k_ptr, &v_ptr, &block_table_ptr, &batch_u32, &q_seq_len_u32, &kv_seq_len_u32, &num_heads_u32, &num_kv_heads_u32, &head_dim_u32, &query_position_offset_u32, &kv_position_offset_u32, &sliding_window_u32, &total_sequence_len_u32, &key_row_bytes_u32, &base_key_row_bytes_u32, &value_row_bytes_u32, &block_count_u32, &page_size_tokens_u32, &format_u32, &value_format_u32, &physical_token_capacity_u32, &score_capacity_u32, &decode_scalars_ptr });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_splitk_online_sm89 dst=0x{x} counters=0x{x} partial_values=0x{x} partial_max=0x{x} partial_denom=0x{x} q=0x{x} k=0x{x} v=0x{x} block_table=0x{x} scalars=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d} score_capacity={d}", .{
                 ctx.debug_graph_capture_id,
@@ -11351,36 +10443,7 @@ pub const KernelModule = struct {
         var value_format_u32 = value_format;
         var physical_token_capacity_u32 = try toU32(physical_token_capacity);
         var decode_scalars_ptr = decode_scalars.ptr;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&block_table_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&q_seq_len_u32),
-            @ptrCast(&kv_seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&num_kv_heads_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&query_position_offset_u32),
-            @ptrCast(&kv_position_offset_u32),
-            @ptrCast(&sliding_window_u32),
-            @ptrCast(&total_sequence_len_u32),
-            @ptrCast(&mask_len_u32),
-            @ptrCast(&bias_mode_u32),
-            @ptrCast(&key_row_bytes_u32),
-            @ptrCast(&base_key_row_bytes_u32),
-            @ptrCast(&value_row_bytes_u32),
-            @ptrCast(&block_count_u32),
-            @ptrCast(&page_size_tokens_u32),
-            @ptrCast(&format_u32),
-            @ptrCast(&value_format_u32),
-            @ptrCast(&physical_token_capacity_u32),
-            @ptrCast(&decode_scalars_ptr),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &block_table_ptr, &mask_ptr, &bias_ptr, &batch_u32, &q_seq_len_u32, &kv_seq_len_u32, &num_heads_u32, &num_kv_heads_u32, &head_dim_u32, &query_position_offset_u32, &kv_position_offset_u32, &sliding_window_u32, &total_sequence_len_u32, &mask_len_u32, &bias_mode_u32, &key_row_bytes_u32, &base_key_row_bytes_u32, &value_row_bytes_u32, &block_count_u32, &page_size_tokens_u32, &format_u32, &value_format_u32, &physical_token_capacity_u32, &decode_scalars_ptr });
         // A qualified split-K or score-prework route does not depend on the
         // unrelated scalar baseline symbol. Resolve it only when normal route
         // selection actually needs that fallback family.
@@ -12276,21 +11339,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&q_r_ptr),
-            @ptrCast(&k_r_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&use_bias_u32),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &bias_ptr, &use_bias_u32, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
         const threads: usize = 256;
         const shared_floats = std.math.add(usize, seq_len, threads) catch return error.InvalidCudaState;
         const shared_bytes = try checkedTensorElements(shared_floats, @sizeOf(f32));
@@ -12392,23 +11441,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&probabilities_ptr),
-            @ptrCast(&d_scores_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&q_r_ptr),
-            @ptrCast(&k_r_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&use_bias_u32),
-            @ptrCast(&d_out_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &probabilities_ptr, &d_scores_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &bias_ptr, &use_bias_u32, &d_out_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
         const threads: usize = 256;
         const shared_floats = std.math.add(usize, try checkedTensorElements(2, seq_len), threads) catch return error.InvalidCudaState;
         const shared_bytes = try checkedTensorElements(shared_floats, @sizeOf(f32));
@@ -12510,23 +11543,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&probabilities_ptr),
-            @ptrCast(&d_scores_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&q_r_ptr),
-            @ptrCast(&k_r_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&use_bias_u32),
-            @ptrCast(&d_out_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &probabilities_ptr, &d_scores_ptr, &q_ptr, &k_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &bias_ptr, &use_bias_u32, &d_out_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
         try launch1d(function, ctx, packed_count, &params);
     }
 
@@ -12548,13 +11565,7 @@ pub const KernelModule = struct {
         var count_u32 = try toU32(count);
         var scale_value = scale;
         var first_u32: u32 = @intFromBool(first);
-        var params = [_]?*anyopaque{
-            @ptrCast(&accum_ptr),
-            @ptrCast(&grad_ptr),
-            @ptrCast(&count_u32),
-            @ptrCast(&scale_value),
-            @ptrCast(&first_u32),
-        };
+        var params = launch_abi.addresses(.{ &accum_ptr, &grad_ptr, &count_u32, &scale_value, &first_u32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -12594,21 +11605,7 @@ pub const KernelModule = struct {
         var correction1_value = bias_correction1;
         var correction2_value = bias_correction2;
         var grad_scale_value = grad_scale;
-        var params = [_]?*anyopaque{
-            @ptrCast(&weight_ptr),
-            @ptrCast(&grad_ptr),
-            @ptrCast(&m_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&count_u32),
-            @ptrCast(&lr_value),
-            @ptrCast(&beta1_value),
-            @ptrCast(&beta2_value),
-            @ptrCast(&eps_value),
-            @ptrCast(&weight_decay_value),
-            @ptrCast(&correction1_value),
-            @ptrCast(&correction2_value),
-            @ptrCast(&grad_scale_value),
-        };
+        var params = launch_abi.addresses(.{ &weight_ptr, &grad_ptr, &m_ptr, &v_ptr, &count_u32, &lr_value, &beta1_value, &beta2_value, &eps_value, &weight_decay_value, &correction1_value, &correction2_value, &grad_scale_value });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -12626,11 +11623,7 @@ pub const KernelModule = struct {
         var output_ptr = output.ptr;
         var input_ptr = input.ptr;
         var count_u32 = try toU32(count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&count_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &count_u32 });
         // The kernel intentionally uses one block so its clipping-norm
         // reduction order is deterministic across launches and processes.
         try launchBlocks(function, ctx, 1, 256, &params);
@@ -12660,10 +11653,7 @@ pub const KernelModule = struct {
         var count_u32 = try toU32(count);
         var positive_weight_mut = positive_weight;
         var negative_weight_mut = negative_weight;
-        var params = [_]?*anyopaque{
-            @ptrCast(&accum_ptr), @ptrCast(&logits_ptr),          @ptrCast(&labels_ptr),          @ptrCast(&mask_ptr),
-            @ptrCast(&count_u32), @ptrCast(&positive_weight_mut), @ptrCast(&negative_weight_mut),
-        };
+        var params = launch_abi.addresses(.{ &accum_ptr, &logits_ptr, &labels_ptr, &mask_ptr, &count_u32, &positive_weight_mut, &negative_weight_mut });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -12717,11 +11707,7 @@ pub const KernelModule = struct {
         var negative_weight_mut = negative_weight;
         var eps_mut = eps;
         var mean_reduction_u32: u32 = @intFromBool(mean_reduction);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr),          @ptrCast(&logits_ptr), @ptrCast(&labels_ptr),         @ptrCast(&mask_ptr),
-            @ptrCast(&upstream_ptr),        @ptrCast(&accum_ptr),  @ptrCast(&count_u32),          @ptrCast(&positive_weight_mut),
-            @ptrCast(&negative_weight_mut), @ptrCast(&eps_mut),    @ptrCast(&mean_reduction_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &logits_ptr, &labels_ptr, &mask_ptr, &upstream_ptr, &accum_ptr, &count_u32, &positive_weight_mut, &negative_weight_mut, &eps_mut, &mean_reduction_u32 });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -12765,24 +11751,7 @@ pub const KernelModule = struct {
         var reduce_mask_mut = reduce_mask;
         var mode_mut = mode;
         var reduce_count_u32 = try toU32(reduce_count);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&input_count_u32),
-            @ptrCast(&output_count_u32),
-            @ptrCast(&dims_mut[0]),
-            @ptrCast(&dims_mut[1]),
-            @ptrCast(&dims_mut[2]),
-            @ptrCast(&dims_mut[3]),
-            @ptrCast(&dims_mut[4]),
-            @ptrCast(&dims_mut[5]),
-            @ptrCast(&dims_mut[6]),
-            @ptrCast(&dims_mut[7]),
-            @ptrCast(&rank_u32),
-            @ptrCast(&reduce_mask_mut),
-            @ptrCast(&mode_mut),
-            @ptrCast(&reduce_count_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &input_count_u32, &output_count_u32, &dims_mut[0], &dims_mut[1], &dims_mut[2], &dims_mut[3], &dims_mut[4], &dims_mut[5], &dims_mut[6], &dims_mut[7], &rank_u32, &reduce_mask_mut, &mode_mut, &reduce_count_u32 });
         try launch1d(function, ctx, output_count, &params);
     }
 
@@ -12811,18 +11780,7 @@ pub const KernelModule = struct {
         var axes_mut = axes;
         var input_rank_u32 = try toU32(input_rank);
         var output_rank_u32 = try toU32(output_rank);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr),         @ptrCast(&input_ptr),          @ptrCast(&output_count_u32),
-            @ptrCast(&input_dims_mut[0]),  @ptrCast(&input_dims_mut[1]),  @ptrCast(&input_dims_mut[2]),
-            @ptrCast(&input_dims_mut[3]),  @ptrCast(&input_dims_mut[4]),  @ptrCast(&input_dims_mut[5]),
-            @ptrCast(&input_dims_mut[6]),  @ptrCast(&input_dims_mut[7]),  @ptrCast(&output_dims_mut[0]),
-            @ptrCast(&output_dims_mut[1]), @ptrCast(&output_dims_mut[2]), @ptrCast(&output_dims_mut[3]),
-            @ptrCast(&output_dims_mut[4]), @ptrCast(&output_dims_mut[5]), @ptrCast(&output_dims_mut[6]),
-            @ptrCast(&output_dims_mut[7]), @ptrCast(&axes_mut[0]),        @ptrCast(&axes_mut[1]),
-            @ptrCast(&axes_mut[2]),        @ptrCast(&axes_mut[3]),        @ptrCast(&axes_mut[4]),
-            @ptrCast(&axes_mut[5]),        @ptrCast(&axes_mut[6]),        @ptrCast(&axes_mut[7]),
-            @ptrCast(&input_rank_u32),     @ptrCast(&output_rank_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &output_count_u32, &input_dims_mut[0], &input_dims_mut[1], &input_dims_mut[2], &input_dims_mut[3], &input_dims_mut[4], &input_dims_mut[5], &input_dims_mut[6], &input_dims_mut[7], &output_dims_mut[0], &output_dims_mut[1], &output_dims_mut[2], &output_dims_mut[3], &output_dims_mut[4], &output_dims_mut[5], &output_dims_mut[6], &output_dims_mut[7], &axes_mut[0], &axes_mut[1], &axes_mut[2], &axes_mut[3], &axes_mut[4], &axes_mut[5], &axes_mut[6], &axes_mut[7], &input_rank_u32, &output_rank_u32 });
         try launch1d(function, ctx, output_count, &params);
     }
 
@@ -12853,10 +11811,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
         var eps_mut = eps;
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr), @ptrCast(&input_ptr), @ptrCast(&gamma_ptr), @ptrCast(&d_y_ptr),
-            @ptrCast(&rows_u32),   @ptrCast(&dim_u32),   @ptrCast(&eps_mut),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &gamma_ptr, &d_y_ptr, &rows_u32, &dim_u32, &eps_mut });
         try launch1d(function, ctx, rows, &params);
     }
 
@@ -12878,9 +11833,7 @@ pub const KernelModule = struct {
         var count_u32 = try toU32(count);
         var last_dim_u32 = try toU32(last_dim);
         var log_u32: u32 = @intFromBool(log_softmax);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr), @ptrCast(&input_ptr), @ptrCast(&count_u32), @ptrCast(&last_dim_u32), @ptrCast(&log_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &count_u32, &last_dim_u32, &log_u32 });
         const rows = count / last_dim;
         try launch1d(function, ctx, rows, &params);
     }
@@ -12910,15 +11863,7 @@ pub const KernelModule = struct {
         var selected_count_u32 = try toU32(selected_count);
         var rows_u32 = try toU32(rows);
         var vocab_size_u32 = try toU32(vocab_size);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr),
-            @ptrCast(&logits_ptr),
-            @ptrCast(&row_indices_ptr),
-            @ptrCast(&token_ids_ptr),
-            @ptrCast(&selected_count_u32),
-            @ptrCast(&rows_u32),
-            @ptrCast(&vocab_size_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &logits_ptr, &row_indices_ptr, &token_ids_ptr, &selected_count_u32, &rows_u32, &vocab_size_u32 });
         try launchBlocks(function, ctx, selected_count, 256, &params);
     }
 
@@ -12947,11 +11892,7 @@ pub const KernelModule = struct {
         var index_count_u32 = try toU32(index_count);
         var axis_extent_u32 = try toU32(axis_extent);
         var suffix_size_u32 = try toU32(suffix_size);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr),       @ptrCast(&input_ptr),       @ptrCast(&indices_ptr),
-            @ptrCast(&output_count_u32), @ptrCast(&index_count_u32), @ptrCast(&axis_extent_u32),
-            @ptrCast(&suffix_size_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &indices_ptr, &output_count_u32, &index_count_u32, &axis_extent_u32, &suffix_size_u32 });
         try launch1d(function, ctx, output_count, &params);
     }
 
@@ -12980,11 +11921,7 @@ pub const KernelModule = struct {
         var index_count_u32 = try toU32(index_count);
         var axis_extent_u32 = try toU32(axis_extent);
         var suffix_size_u32 = try toU32(suffix_size);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr),       @ptrCast(&input_ptr),       @ptrCast(&indices_ptr),
-            @ptrCast(&output_count_u32), @ptrCast(&index_count_u32), @ptrCast(&axis_extent_u32),
-            @ptrCast(&suffix_size_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &indices_ptr, &output_count_u32, &index_count_u32, &axis_extent_u32, &suffix_size_u32 });
         try launch1d(function, ctx, output_count, &params);
     }
 
@@ -13011,10 +11948,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var cols_u32 = try toU32(cols);
         var output_rows_u32 = try toU32(output_rows);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr), @ptrCast(&input_ptr), @ptrCast(&indices_ptr),
-            @ptrCast(&rows_u32),   @ptrCast(&cols_u32),  @ptrCast(&output_rows_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &indices_ptr, &rows_u32, &cols_u32, &output_rows_u32 });
         try launch1d(function, ctx, input_count, &params);
     }
 
@@ -13046,26 +11980,14 @@ pub const KernelModule = struct {
             var rows_u32 = dims[0];
             var cols_u32 = dims[1];
             var tile_cols_mut = tile_cols;
-            var params = [_]?*anyopaque{
-                @ptrCast(&output_ptr),
-                @ptrCast(&input_ptr),
-                @ptrCast(&rows_u32),
-                @ptrCast(&cols_u32),
-                @ptrCast(&tile_cols_mut),
-            };
+            var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &rows_u32, &cols_u32, &tile_cols_mut });
             return launchBlocks(self.primitive_transpose_2d_f32.?, ctx, @as(usize, tile_cols) * @as(usize, tile_rows), 256, &params);
         }
         var count_u32 = try toU32(count);
         var rank_u32 = try toU32(rank);
         var dims_mut = dims;
         var perm_mut = perm;
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr),  @ptrCast(&input_ptr),   @ptrCast(&count_u32),   @ptrCast(&rank_u32),
-            @ptrCast(&dims_mut[0]), @ptrCast(&dims_mut[1]), @ptrCast(&dims_mut[2]), @ptrCast(&dims_mut[3]),
-            @ptrCast(&dims_mut[4]), @ptrCast(&dims_mut[5]), @ptrCast(&dims_mut[6]), @ptrCast(&dims_mut[7]),
-            @ptrCast(&perm_mut[0]), @ptrCast(&perm_mut[1]), @ptrCast(&perm_mut[2]), @ptrCast(&perm_mut[3]),
-            @ptrCast(&perm_mut[4]), @ptrCast(&perm_mut[5]), @ptrCast(&perm_mut[6]), @ptrCast(&perm_mut[7]),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &count_u32, &rank_u32, &dims_mut[0], &dims_mut[1], &dims_mut[2], &dims_mut[3], &dims_mut[4], &dims_mut[5], &dims_mut[6], &dims_mut[7], &perm_mut[0], &perm_mut[1], &perm_mut[2], &perm_mut[3], &perm_mut[4], &perm_mut[5], &perm_mut[6], &perm_mut[7] });
         try launch1d(function, ctx, count, &params);
     }
 
@@ -13095,10 +12017,7 @@ pub const KernelModule = struct {
         var a_axis_u32 = try toU32(a_axis);
         var b_axis_u32 = try toU32(b_axis);
         var inner_u32 = try toU32(inner);
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr), @ptrCast(&a_ptr),      @ptrCast(&b_ptr),     @ptrCast(&output_count_u32),
-            @ptrCast(&a_axis_u32), @ptrCast(&b_axis_u32), @ptrCast(&inner_u32),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &a_ptr, &b_ptr, &output_count_u32, &a_axis_u32, &b_axis_u32, &inner_u32 });
         try launch1d(function, ctx, output_count, &params);
     }
 
@@ -13128,17 +12047,7 @@ pub const KernelModule = struct {
         var output_dims_mut = output_dims;
         var starts_mut = starts;
         var strides_mut = strides;
-        var params = [_]?*anyopaque{
-            @ptrCast(&output_ptr),         @ptrCast(&input_ptr),          @ptrCast(&output_count_u32),   @ptrCast(&rank_u32),
-            @ptrCast(&input_dims_mut[0]),  @ptrCast(&input_dims_mut[1]),  @ptrCast(&input_dims_mut[2]),  @ptrCast(&input_dims_mut[3]),
-            @ptrCast(&input_dims_mut[4]),  @ptrCast(&input_dims_mut[5]),  @ptrCast(&input_dims_mut[6]),  @ptrCast(&input_dims_mut[7]),
-            @ptrCast(&output_dims_mut[0]), @ptrCast(&output_dims_mut[1]), @ptrCast(&output_dims_mut[2]), @ptrCast(&output_dims_mut[3]),
-            @ptrCast(&output_dims_mut[4]), @ptrCast(&output_dims_mut[5]), @ptrCast(&output_dims_mut[6]), @ptrCast(&output_dims_mut[7]),
-            @ptrCast(&starts_mut[0]),      @ptrCast(&starts_mut[1]),      @ptrCast(&starts_mut[2]),      @ptrCast(&starts_mut[3]),
-            @ptrCast(&starts_mut[4]),      @ptrCast(&starts_mut[5]),      @ptrCast(&starts_mut[6]),      @ptrCast(&starts_mut[7]),
-            @ptrCast(&strides_mut[0]),     @ptrCast(&strides_mut[1]),     @ptrCast(&strides_mut[2]),     @ptrCast(&strides_mut[3]),
-            @ptrCast(&strides_mut[4]),     @ptrCast(&strides_mut[5]),     @ptrCast(&strides_mut[6]),     @ptrCast(&strides_mut[7]),
-        };
+        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &output_count_u32, &rank_u32, &input_dims_mut[0], &input_dims_mut[1], &input_dims_mut[2], &input_dims_mut[3], &input_dims_mut[4], &input_dims_mut[5], &input_dims_mut[6], &input_dims_mut[7], &output_dims_mut[0], &output_dims_mut[1], &output_dims_mut[2], &output_dims_mut[3], &output_dims_mut[4], &output_dims_mut[5], &output_dims_mut[6], &output_dims_mut[7], &starts_mut[0], &starts_mut[1], &starts_mut[2], &starts_mut[3], &starts_mut[4], &starts_mut[5], &starts_mut[6], &starts_mut[7], &strides_mut[0], &strides_mut[1], &strides_mut[2], &strides_mut[3], &strides_mut[4], &strides_mut[5], &strides_mut[6], &strides_mut[7] });
         try launch1d(function, ctx, output_count, &params);
     }
 
@@ -13184,19 +12093,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&q_r_ptr),
-            @ptrCast(&k_r_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), seq_len);
         try launchBlocks(function, ctx, blocks, 256, &params);
         return true;
@@ -13245,19 +12142,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&q_r_ptr),
-            @ptrCast(&k_r_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
         const query_groups = (seq_len + 7) / 8;
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_groups);
         try launchBlocks(function, ctx, blocks, 256, &params);
@@ -13309,19 +12194,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&q_r_ptr),
-            @ptrCast(&k_r_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
         const query_tiles = (seq_len + 15) / 16;
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
         try launchBlocks(function, ctx, blocks, 256, &params);
@@ -13367,19 +12240,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&q_r_ptr),
-            @ptrCast(&k_r_ptr),
-            @ptrCast(&mask_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
         const query_tiles = (seq_len + 31) / 32;
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
         try launchBlocks(function, ctx, blocks, 256, &params);
@@ -13436,11 +12297,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&q_out_ptr), @ptrCast(&k_out_ptr),   @ptrCast(&v_out_ptr),     @ptrCast(&q_r_out_ptr),  @ptrCast(&k_r_out_ptr),
-            @ptrCast(&q_ptr),     @ptrCast(&k_ptr),       @ptrCast(&v_ptr),         @ptrCast(&q_r_ptr),      @ptrCast(&k_r_ptr),
-            @ptrCast(&batch_u32), @ptrCast(&seq_len_u32), @ptrCast(&num_heads_u32), @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &q_out_ptr, &k_out_ptr, &v_out_ptr, &q_r_out_ptr, &k_r_out_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
         try launch1d(function, ctx, @max(count, packed_rel_count), &params);
         return true;
     }
@@ -13475,10 +12332,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&content_ptr), @ptrCast(&c2p_ptr),     @ptrCast(&p2c_ptr),       @ptrCast(&mask_ptr),
-            @ptrCast(&batch_u32),   @ptrCast(&seq_len_u32), @ptrCast(&num_heads_u32), @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &content_ptr, &c2p_ptr, &p2c_ptr, &mask_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
         try launchBlocks(function, ctx, try checkedTensorElements(matrices, seq_len), 256, &params);
         return true;
     }
@@ -13504,9 +12358,7 @@ pub const KernelModule = struct {
         var seq_len_u32 = try toU32(seq_len);
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr), @ptrCast(&packed_ptr), @ptrCast(&batch_u32), @ptrCast(&seq_len_u32), @ptrCast(&num_heads_u32), @ptrCast(&head_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &packed_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
         try launch1d(function, ctx, count, &params);
         return true;
     }
@@ -13534,14 +12386,7 @@ pub const KernelModule = struct {
         var input_ptr = input.ptr;
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&first_ptr),
-            @ptrCast(&second_ptr),
-            @ptrCast(&third_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &first_ptr, &second_ptr, &third_ptr, &input_ptr, &rows_u32, &dim_u32 });
         try launch1d(self.split_last_dim3_f32, ctx, total, &params);
     }
 
@@ -13563,20 +12408,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch1d(self.linear_q8_0_f32, ctx, out_count, &params);
     }
 
@@ -13599,20 +12432,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q8_0_col_tile - 1) / q8_0_col_tile, rows, q8_0_tiled_threads, &params);
     }
 
@@ -13647,16 +12468,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&gate_ptr),
-            @ptrCast(&up_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launch2d(function, ctx, (out_dim + q8_0_col_tile - 1) / q8_0_col_tile, rows, q8_0_tiled_threads, &params);
     }
 
@@ -13691,16 +12503,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&gate_ptr),
-            @ptrCast(&up_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
     }
 
@@ -13735,16 +12538,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&gate_ptr),
-            @ptrCast(&up_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
     }
 
@@ -13779,16 +12573,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&gate_ptr),
-            @ptrCast(&up_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8, rows, q4_0_tiled_threads, &params);
     }
 
@@ -13823,16 +12608,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&gate_ptr),
-            @ptrCast(&up_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile16 - 1) / q4_0_col_tile16, rows, q4_0_tiled_threads, &params);
     }
 
@@ -14162,20 +12938,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_packed, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_packed.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_packed.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
     }
 
@@ -14202,20 +12966,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_packed, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_packed.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_packed.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
     }
 
@@ -14237,20 +12989,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch1d(self.linear_q4_0_f32, ctx, out_count, &params);
     }
 
@@ -14273,20 +13013,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
     }
 
@@ -14316,14 +13044,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&dst_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &input_ptr, &weight_ptr, &dst_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, 1, q4_0_tiled_threads, &params);
     }
 
@@ -14360,16 +13081,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &input_ptr, &weight_a_ptr, &weight_b_ptr, &dst_a_ptr, &dst_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, 1, q4_0_tiled_threads, &params);
     }
 
@@ -14399,14 +13111,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&dst_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &input_ptr, &weight_ptr, &dst_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 7) / 8, q4_0_tiled_threads, &params);
     }
 
@@ -14429,20 +13134,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
     }
 
@@ -14466,12 +13159,7 @@ pub const KernelModule = struct {
         var input_ptr = input.ptr;
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &rows_u32, &in_dim_u32 });
         try launchBlocks(function, ctx, (total_blocks + q8_1_quantize_warps - 1) / q8_1_quantize_warps, q8_1_quantize_threads, &params);
     }
 
@@ -14494,12 +13182,7 @@ pub const KernelModule = struct {
         var input_ptr = input.ptr;
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &rows_u32, &in_dim_u32 });
         try launchBlocks(function, ctx, total_blocks, 32, &params);
     }
 
@@ -14529,14 +13212,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&gate_ptr),
-            @ptrCast(&up_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &rows_u32, &in_dim_u32, &activation_u32 });
         try launchBlocks(function, ctx, (total_blocks + q8_1_quantize_warps - 1) / q8_1_quantize_warps, q8_1_quantize_threads, &params);
     }
 
@@ -14564,21 +13240,13 @@ pub const KernelModule = struct {
         if (rows == 1 and out_dim == 2560) {
             if (in_dim == 2048) {
                 if (self.linear_q4_0_q8_1_f32_tile4_e4b_attn_2048) |function| {
-                    var params = [_]?*anyopaque{
-                        @ptrCast(&dst_ptr),
-                        @ptrCast(&input_ptr),
-                        @ptrCast(&weight_ptr),
-                    };
+                    var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr });
                     try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads_w4, &params);
                     return;
                 }
             } else if (in_dim == 4096) {
                 if (self.linear_q4_0_q8_1_f32_tile4_e4b_attn_4096) |function| {
-                    var params = [_]?*anyopaque{
-                        @ptrCast(&dst_ptr),
-                        @ptrCast(&input_ptr),
-                        @ptrCast(&weight_ptr),
-                    };
+                    var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr });
                     try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads_w4, &params);
                     return;
                 }
@@ -14589,14 +13257,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
     }
 
@@ -14627,14 +13288,7 @@ pub const KernelModule = struct {
                     var rows_u32 = try toU32(rows);
                     var in_dim_u32 = try toU32(in_dim);
                     var out_dim_u32 = try toU32(out_dim);
-                    var params = [_]?*anyopaque{
-                        @ptrCast(&dst_ptr),
-                        @ptrCast(&input_ptr),
-                        @ptrCast(&weight_ptr),
-                        @ptrCast(&rows_u32),
-                        @ptrCast(&in_dim_u32),
-                        @ptrCast(&out_dim_u32),
-                    };
+                    var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
                     try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 7) / 8, q4_0_tiled_threads, &params);
                     return;
                 }
@@ -14643,14 +13297,7 @@ pub const KernelModule = struct {
                 var rows_u32 = try toU32(rows);
                 var in_dim_u32 = try toU32(in_dim);
                 var out_dim_u32 = try toU32(out_dim);
-                var params = [_]?*anyopaque{
-                    @ptrCast(&dst_ptr),
-                    @ptrCast(&input_ptr),
-                    @ptrCast(&weight_ptr),
-                    @ptrCast(&rows_u32),
-                    @ptrCast(&in_dim_u32),
-                    @ptrCast(&out_dim_u32),
-                };
+                var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
                 try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 3) / 4, q4_0_tiled_threads, &params);
                 return;
             }
@@ -14658,14 +13305,7 @@ pub const KernelModule = struct {
                 var rows_u32 = try toU32(rows);
                 var in_dim_u32 = try toU32(in_dim);
                 var out_dim_u32 = try toU32(out_dim);
-                var params = [_]?*anyopaque{
-                    @ptrCast(&dst_ptr),
-                    @ptrCast(&input_ptr),
-                    @ptrCast(&weight_ptr),
-                    @ptrCast(&rows_u32),
-                    @ptrCast(&in_dim_u32),
-                    @ptrCast(&out_dim_u32),
-                };
+                var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
                 try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 1) / 2, q4_0_tiled_threads, &params);
                 return;
             }
@@ -14673,31 +13313,19 @@ pub const KernelModule = struct {
         if (in_dim == 10240 and out_dim == 2560) {
             if (rows == 1 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN", false)) {
                 if (self.linear_q4_0_q8_1_f32_tile4_w10_e4b_down) |function| {
-                    var params = [_]?*anyopaque{
-                        @ptrCast(&dst_ptr),
-                        @ptrCast(&input_ptr),
-                        @ptrCast(&weight_ptr),
-                    };
+                    var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr });
                     try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads_w10, &params);
                     return;
                 }
             }
             if (rows > 1) {
                 if (self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows) |function| {
-                    var params = [_]?*anyopaque{
-                        @ptrCast(&dst_ptr),
-                        @ptrCast(&input_ptr),
-                        @ptrCast(&weight_ptr),
-                    };
+                    var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr });
                     try launch2d(function, ctx, out_dim / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
                     return;
                 }
             } else if (self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down) |function| {
-                var params = [_]?*anyopaque{
-                    @ptrCast(&dst_ptr),
-                    @ptrCast(&input_ptr),
-                    @ptrCast(&weight_ptr),
-                };
+                var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr });
                 try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads, &params);
                 return;
             }
@@ -14707,14 +13335,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
     }
 
@@ -14743,14 +13364,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8, rows, q4_0_tiled_threads_w4, &params);
     }
 
@@ -14773,20 +13387,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8, rows, q4_0_tiled_threads, &params);
     }
 
@@ -14825,18 +13427,7 @@ pub const KernelModule = struct {
         var source_cols_u32 = try toU32(source_cols);
         var source_start_u32 = try toU32(source_start);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&source_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&source_cols_u32),
-            @ptrCast(&source_start_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &source_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &source_cols_u32, &source_start_u32, &activation_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
     }
 
@@ -14875,18 +13466,7 @@ pub const KernelModule = struct {
         var source_cols_u32 = try toU32(source_cols);
         var source_start_u32 = try toU32(source_start);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&source_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&source_cols_u32),
-            @ptrCast(&source_start_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &source_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &source_cols_u32, &source_start_u32, &activation_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
     }
 
@@ -14925,18 +13505,7 @@ pub const KernelModule = struct {
         var source_cols_u32 = try toU32(source_cols);
         var source_start_u32 = try toU32(source_start);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&source_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&source_cols_u32),
-            @ptrCast(&source_start_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &source_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &source_cols_u32, &source_start_u32, &activation_u32 });
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
     }
 
@@ -14958,20 +13527,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch1d(self.linear_q4_k_f32, ctx, out_count, &params);
     }
 
@@ -14993,20 +13550,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launchBlocks(self.linear_q4_k_f32_tiled, ctx, out_count, q4_k_tiled_threads, &params);
     }
 
@@ -15042,20 +13587,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q4_k_col_tile - 1) / q4_k_col_tile, rows, q4_k_tiled_threads, &params);
     }
 
@@ -15090,16 +13623,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&gate_ptr),
-            @ptrCast(&up_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launch2d(function, ctx, (out_dim + q4_k_col_tile - 1) / q4_k_col_tile, rows, q4_k_tiled_threads, &params);
     }
 
@@ -15134,16 +13658,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&gate_ptr),
-            @ptrCast(&up_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launch2d(function, ctx, (out_dim + q4_k_col_tile - 1) / q4_k_col_tile, rows, q4_k_tiled_threads, &params);
     }
 
@@ -15187,15 +13702,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch1d(self.linear_q4_k_bias_f32, ctx, out_count, &params);
     }
 
@@ -15226,15 +13733,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(self.linear_q4_k_bias_f32_tiled, ctx, out_count, q4_k_tiled_threads, &params);
     }
 
@@ -15312,16 +13811,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&residual_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &residual_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + q4_k_col_tile - 1) / q4_k_col_tile, (rows + q4_k_row_tile - 1) / q4_k_row_tile, q4_k_tiled_threads, &params);
     }
 
@@ -15694,21 +14184,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&dst_c_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&bias_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&bias_b_ptr),
-            @ptrCast(&weight_c_ptr),
-            @ptrCast(&bias_c_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &dst_c_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &weight_c_ptr, &bias_c_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch3d(
             function,
             ctx,
@@ -15758,18 +14234,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&bias_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&bias_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch3d(
             function,
             ctx,
@@ -15808,15 +14273,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(self.linear_q4_k_bias_quick_gelu_f32_tiled, ctx, out_count, q4_k_tiled_threads, &params);
     }
 
@@ -15965,20 +14422,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + col_tile - 1) / col_tile, rows, q4_k_tiled_threads, &params);
     }
 
@@ -16011,15 +14456,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + q4_k_col_tile - 1) / q4_k_col_tile, (rows + q4_k_row_tile - 1) / q4_k_row_tile, q4_k_tiled_threads, &params);
     }
 
@@ -16069,21 +14506,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&dst_c_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&bias_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&bias_b_ptr),
-            @ptrCast(&weight_c_ptr),
-            @ptrCast(&bias_c_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &dst_c_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &weight_c_ptr, &bias_c_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch1d(self.linear_q4_k_triple_bias_f32, ctx, try checkedTensorElements(out_count, 3), &params);
     }
 
@@ -16133,21 +14556,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&dst_c_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&bias_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&bias_b_ptr),
-            @ptrCast(&weight_c_ptr),
-            @ptrCast(&bias_c_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &dst_c_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &weight_c_ptr, &bias_c_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(self.linear_q4_k_triple_bias_f32_tiled, ctx, try checkedTensorElements(out_count, 3), q4_k_tiled_threads, &params);
     }
 
@@ -16188,18 +14597,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&bias_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&bias_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(self.linear_q4_k_pair_bias_f32_tiled, ctx, try checkedTensorElements(out_count, 2), q4_k_tiled_threads, &params);
     }
 
@@ -16238,16 +14636,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q8_0_tiled_threads, &params);
     }
 
@@ -16286,16 +14675,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -16334,16 +14714,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -16382,16 +14753,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -16430,16 +14792,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -16478,16 +14831,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -16525,16 +14869,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_gate_ptr),
-            @ptrCast(&weight_up_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -16571,16 +14906,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_gate_ptr),
-            @ptrCast(&weight_up_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -16616,25 +14942,13 @@ pub const KernelModule = struct {
         if (rows == 1 and in_dim == 2560 and out_dim == 10240) {
             if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_TILE4_W5_E4B_FFN", true)) {
                 if (self.linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn) |function| {
-                    var params = [_]?*anyopaque{
-                        @ptrCast(&dst_ptr),
-                        @ptrCast(&input_ptr),
-                        @ptrCast(&weight_gate_ptr),
-                        @ptrCast(&weight_up_ptr),
-                        @ptrCast(&activation_u32),
-                    };
+                    var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &activation_u32 });
                     try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads_w5, &params);
                     return;
                 }
             }
             if (self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn) |function| {
-                var params = [_]?*anyopaque{
-                    @ptrCast(&dst_ptr),
-                    @ptrCast(&input_ptr),
-                    @ptrCast(&weight_gate_ptr),
-                    @ptrCast(&weight_up_ptr),
-                    @ptrCast(&activation_u32),
-                };
+                var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &activation_u32 });
                 try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads, &params);
                 return;
             }
@@ -16644,16 +14958,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_gate_ptr),
-            @ptrCast(&weight_up_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -16691,16 +14996,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_gate_ptr),
-            @ptrCast(&weight_up_ptr),
-            @ptrCast(&activation_u32),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &activation_u32, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, try checkedTensorElements(rows, out_row_blocks), generated_q4_0_q8_e2b_pair_threads, &params);
     }
 
@@ -16738,10 +15034,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),        @ptrCast(&input_ptr), @ptrCast(&weight_gate_ptr), @ptrCast(&weight_up_ptr),
-            @ptrCast(&activation_u32), @ptrCast(&rows_u32),  @ptrCast(&in_dim_u32),      @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &activation_u32, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, try checkedTensorElements(rows, out_row_blocks), generated_q4_0_q8_e2b_pair_threads, &params);
     }
 
@@ -16817,14 +15110,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(kernel, ctx, try checkedTensorElements(rows, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile), threads, &params);
     }
 
@@ -16855,10 +15141,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),  @ptrCast(&input_ptr),  @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32), @ptrCast(&in_dim_u32), @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         // Mirrors llama.cpp's Ada MMVQ launch: four warps and one output row
         // per CTA, so grid.x is exactly rows*out_dim.
         try launchBlocks(function, ctx, try checkedTensorElements(rows, out_dim), generated_q4_0_ggml_q8_1_down_threads, &params);
@@ -16922,16 +15205,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_gate_ptr),
-            @ptrCast(&weight_up_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launchBlocks(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, generated_q4_0_exact_ffn_pair_threads, &params);
     }
 
@@ -16957,20 +15231,8 @@ pub const KernelModule = struct {
         try checkBytes(input, try checkedTensorElements(rows, in_dim));
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launchBlocks(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, generated_q4_0_exact_ffn_down_threads, &params);
     }
 
@@ -16998,14 +15260,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, try checkedTensorElements(rows, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile), q4_0_tiled_threads, &params);
     }
 
@@ -17039,16 +15294,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_gate_ptr),
-            @ptrCast(&weight_up_ptr),
-            @ptrCast(&activation_u32),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &activation_u32, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, try checkedTensorElements(rows, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
     }
 
@@ -17083,14 +15329,7 @@ pub const KernelModule = struct {
             if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS16_C1", false)) {
                 if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1) |function| {
                     var rows_u32 = try toU32(rows);
-                    var params = [_]?*anyopaque{
-                        @ptrCast(&dst_ptr),
-                        @ptrCast(&input_ptr),
-                        @ptrCast(&weight_gate_ptr),
-                        @ptrCast(&weight_up_ptr),
-                        @ptrCast(&rows_u32),
-                        @ptrCast(&activation_u32),
-                    };
+                    var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &rows_u32, &activation_u32 });
                     try launchBlocks(function, ctx, try checkedTensorElements((rows + 15) / 16, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_rows16_threads, &params);
                     return;
                 }
@@ -17098,53 +15337,26 @@ pub const KernelModule = struct {
             if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS8_C2", false)) {
                 if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2) |function| {
                     var rows_u32 = try toU32(rows);
-                    var params = [_]?*anyopaque{
-                        @ptrCast(&dst_ptr),
-                        @ptrCast(&input_ptr),
-                        @ptrCast(&weight_gate_ptr),
-                        @ptrCast(&weight_up_ptr),
-                        @ptrCast(&rows_u32),
-                        @ptrCast(&activation_u32),
-                    };
+                    var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &rows_u32, &activation_u32 });
                     try launchBlocks(function, ctx, try checkedTensorElements((rows + 7) / 8, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
                     return;
                 }
             }
             if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4) |function| {
                 var rows_u32 = try toU32(rows);
-                var params = [_]?*anyopaque{
-                    @ptrCast(&dst_ptr),
-                    @ptrCast(&input_ptr),
-                    @ptrCast(&weight_gate_ptr),
-                    @ptrCast(&weight_up_ptr),
-                    @ptrCast(&rows_u32),
-                    @ptrCast(&activation_u32),
-                };
+                var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &rows_u32, &activation_u32 });
                 try launchBlocks(function, ctx, try checkedTensorElements((rows + 3) / 4, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
                 return;
             }
             if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2) |function| {
                 var rows_u32 = try toU32(rows);
-                var params = [_]?*anyopaque{
-                    @ptrCast(&dst_ptr),
-                    @ptrCast(&input_ptr),
-                    @ptrCast(&weight_gate_ptr),
-                    @ptrCast(&weight_up_ptr),
-                    @ptrCast(&rows_u32),
-                    @ptrCast(&activation_u32),
-                };
+                var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &rows_u32, &activation_u32 });
                 try launchBlocks(function, ctx, try checkedTensorElements((rows + 1) / 2, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
                 return;
             }
         }
         const function = self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn orelse return error.CudaKernelUnavailable;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_gate_ptr),
-            @ptrCast(&weight_up_ptr),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &activation_u32 });
         try launchBlocks(function, ctx, total_out_blocks, q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
     }
 
@@ -17181,16 +15393,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
         var activation_u32: u32 = activation;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_gate_ptr),
-            @ptrCast(&weight_up_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&activation_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -17229,16 +15432,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -17277,16 +15471,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_k_tiled_threads, &params);
     }
 
@@ -17334,19 +15519,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var q_out_dim_u32 = try toU32(q_out_dim);
         var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_q_ptr),
-            @ptrCast(&dst_k_ptr),
-            @ptrCast(&dst_v_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_q_ptr),
-            @ptrCast(&weight_k_ptr),
-            @ptrCast(&weight_v_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&q_out_dim_u32),
-            @ptrCast(&kv_out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
         try launchBlocks(function, ctx, total_with_v, q4_k_tiled_threads, &params);
     }
 
@@ -17390,19 +15563,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var q_out_dim_u32 = try toU32(q_out_dim);
         var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_q_ptr),
-            @ptrCast(&dst_k_ptr),
-            @ptrCast(&dst_v_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_q_ptr),
-            @ptrCast(&weight_k_ptr),
-            @ptrCast(&weight_v_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&q_out_dim_u32),
-            @ptrCast(&kv_out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
         try launchBlocks(function, ctx, total_with_v, f32_tiled_threads, &params);
     }
 
@@ -17453,19 +15614,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var q_out_dim_u32 = try toU32(q_out_dim);
         var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_q_ptr),
-            @ptrCast(&dst_k_ptr),
-            @ptrCast(&dst_v_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_q_ptr),
-            @ptrCast(&weight_k_ptr),
-            @ptrCast(&weight_v_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&q_out_dim_u32),
-            @ptrCast(&kv_out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q8_0_tiled_threads, &params);
     }
 
@@ -17516,19 +15665,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var q_out_dim_u32 = try toU32(q_out_dim);
         var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_q_ptr),
-            @ptrCast(&dst_k_ptr),
-            @ptrCast(&dst_v_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_q_ptr),
-            @ptrCast(&weight_k_ptr),
-            @ptrCast(&weight_v_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&q_out_dim_u32),
-            @ptrCast(&kv_out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -17579,19 +15716,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var q_out_dim_u32 = try toU32(q_out_dim);
         var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_q_ptr),
-            @ptrCast(&dst_k_ptr),
-            @ptrCast(&dst_v_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_q_ptr),
-            @ptrCast(&weight_k_ptr),
-            @ptrCast(&weight_v_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&q_out_dim_u32),
-            @ptrCast(&kv_out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -17642,19 +15767,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var q_out_dim_u32 = try toU32(q_out_dim);
         var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_q_ptr),
-            @ptrCast(&dst_k_ptr),
-            @ptrCast(&dst_v_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_q_ptr),
-            @ptrCast(&weight_k_ptr),
-            @ptrCast(&weight_v_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&q_out_dim_u32),
-            @ptrCast(&kv_out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -17706,37 +15819,13 @@ pub const KernelModule = struct {
         var kv_out_dim_u32 = try toU32(kv_out_dim);
         if (rows > 1) {
             if (self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4) |function| {
-                var params = [_]?*anyopaque{
-                    @ptrCast(&dst_q_ptr),
-                    @ptrCast(&dst_k_ptr),
-                    @ptrCast(&dst_v_ptr),
-                    @ptrCast(&input_ptr),
-                    @ptrCast(&weight_q_ptr),
-                    @ptrCast(&weight_k_ptr),
-                    @ptrCast(&weight_v_ptr),
-                    @ptrCast(&rows_u32),
-                    @ptrCast(&in_dim_u32),
-                    @ptrCast(&q_out_dim_u32),
-                    @ptrCast(&kv_out_dim_u32),
-                };
+                var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
                 try launchBlocks(function, ctx, try checkedTensorElements((rows + 3) / 4, tiles_with_v), q4_0_tiled_threads_w4, &params);
                 return;
             }
         }
         const function = self.linear_q4_0_qkv_nobias_q8_1_f32_tile8 orelse return error.CudaKernelUnavailable;
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_q_ptr),
-            @ptrCast(&dst_k_ptr),
-            @ptrCast(&dst_v_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_q_ptr),
-            @ptrCast(&weight_k_ptr),
-            @ptrCast(&weight_v_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&q_out_dim_u32),
-            @ptrCast(&kv_out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -17787,19 +15876,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var q_out_dim_u32 = try toU32(q_out_dim);
         var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_q_ptr),
-            @ptrCast(&dst_k_ptr),
-            @ptrCast(&dst_v_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_q_ptr),
-            @ptrCast(&weight_k_ptr),
-            @ptrCast(&weight_v_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&q_out_dim_u32),
-            @ptrCast(&kv_out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -17850,19 +15927,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var q_out_dim_u32 = try toU32(q_out_dim);
         var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_q_ptr),
-            @ptrCast(&dst_k_ptr),
-            @ptrCast(&dst_v_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_q_ptr),
-            @ptrCast(&weight_k_ptr),
-            @ptrCast(&weight_v_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&q_out_dim_u32),
-            @ptrCast(&kv_out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -17906,19 +15971,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var q_out_dim_u32 = try toU32(q_out_dim);
         var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_q_ptr),
-            @ptrCast(&dst_k_ptr),
-            @ptrCast(&dst_v_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_q_ptr),
-            @ptrCast(&weight_k_ptr),
-            @ptrCast(&weight_v_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&q_out_dim_u32),
-            @ptrCast(&kv_out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
         try launchBlocks(function, ctx, total_with_v, f32_tiled_threads, &params);
     }
 
@@ -17966,19 +16019,7 @@ pub const KernelModule = struct {
         var in_dim_u32 = try toU32(in_dim);
         var q_out_dim_u32 = try toU32(q_out_dim);
         var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_q_ptr),
-            @ptrCast(&dst_k_ptr),
-            @ptrCast(&dst_v_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_q_ptr),
-            @ptrCast(&weight_k_ptr),
-            @ptrCast(&weight_v_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&q_out_dim_u32),
-            @ptrCast(&kv_out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
         try launchBlocks(function, ctx, total_with_v, q4_k_tiled_threads, &params);
     }
     pub fn launchLinearQ4KSpanBiasTile8Rows2F32(
@@ -18072,15 +16113,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + cols_per_block - 1) / cols_per_block, (rows + rows_per_block - 1) / rows_per_block, q4_k_tiled_threads, &params);
     }
 
@@ -18122,18 +16155,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&bias_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&bias_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + q4_k_span_col_tile - 1) / q4_k_span_col_tile, (rows + q4_k_span_row_tile - 1) / q4_k_span_row_tile, q4_k_tiled_threads, &params);
     }
 
@@ -18197,19 +16219,7 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = [_]?*anyopaque{
-            @ptrCast(&dst_a_ptr),
-            @ptrCast(&dst_b_ptr),
-            @ptrCast(&input_a_ptr),
-            @ptrCast(&input_b_ptr),
-            @ptrCast(&weight_a_ptr),
-            @ptrCast(&bias_a_ptr),
-            @ptrCast(&weight_b_ptr),
-            @ptrCast(&bias_b_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        };
+        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_a_ptr, &input_b_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
         try launch2d(function, ctx, (out_dim + q4_k_span_col_tile - 1) / q4_k_span_col_tile, (rows + q4_k_span_row_tile - 1) / q4_k_span_row_tile, q4_k_tiled_threads, &params);
     }
 };
@@ -18251,18 +16261,7 @@ fn launchLinearQ4KSpanPairSharedInput(
     var rows_u32 = try toU32(rows);
     var in_dim_u32 = try toU32(in_dim);
     var out_dim_u32 = try toU32(out_dim);
-    var params = [_]?*anyopaque{
-        @ptrCast(&dst_a_ptr),
-        @ptrCast(&dst_b_ptr),
-        @ptrCast(&input_ptr),
-        @ptrCast(&weight_a_ptr),
-        @ptrCast(&bias_a_ptr),
-        @ptrCast(&weight_b_ptr),
-        @ptrCast(&bias_b_ptr),
-        @ptrCast(&rows_u32),
-        @ptrCast(&in_dim_u32),
-        @ptrCast(&out_dim_u32),
-    };
+    var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
     try launch2d(function, ctx, (out_dim + q4_k_span_col_tile - 1) / q4_k_span_col_tile, (rows + q4_k_span_row_tile - 1) / q4_k_span_row_tile, q4_k_tiled_threads, &params);
 }
 
@@ -25132,4 +23131,62 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "CUDA launch ABI all exported launch adapters typecheck" {
+    std.testing.refAllDecls(KernelModule);
+}
+
+test "CUDA launch ABI typed slots and native records survive captured replay" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    var input = try buffer_mod.DeviceBuffer.alloc(&ctx, 64 * 4);
+    defer input.free(&ctx);
+    var weights = try buffer_mod.DeviceBuffer.alloc(&ctx, 3 * 34);
+    defer weights.free(&ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(&ctx, 8 * 4);
+    defer output.free(&ctx);
+    var x: [64]f32 = undefined;
+    for (&x, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.25;
+    var raw: [3 * 34]u8 = @splat(0);
+    for (0..3) |row| {
+        raw[row * 34 + 1] = 0x38; // binary16 0.5, little endian
+        for (0..32) |j| raw[row * 34 + 2 + j] = @bitCast(@as(i8, @intCast(@as(i32, @intCast((row + j * 3) % 17)) - 8)));
+    }
+    var expected: [6]f32 = @splat(0);
+    for (0..2) |row| for (0..3) |col| {
+        for (0..32) |j| expected[row * 3 + col] += x[row * 32 + j] * @as(f32, @floatFromInt(@as(i8, @bitCast(raw[col * 34 + 2 + j])))) * 0.5;
+    };
+    try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&x));
+    try weights.copyFromHost(&ctx, &raw);
+    try ctx.synchronize();
+    const graph_mod = @import("graph.zig");
+    try graph_mod.beginCapture(&ctx);
+    var capturing = true;
+    errdefer if (capturing) {
+        const abandoned = ctx.endStreamCapture() catch null;
+        if (abandoned != null) ctx.destroyGraph(abandoned);
+    };
+    try module.launchFillF32(&ctx, output, 8, -777);
+    try module.launchLinearQ8_0F32(&ctx, output, input, weights, 2, 32, 3);
+    var graph = try graph_mod.endCapture(&ctx);
+    capturing = false;
+    defer graph.deinit(&ctx);
+    // The launch methods' local value records and pointer tables no longer
+    // exist here. The captured driver graph must own their copied values.
+    for (0..4) |_| {
+        try graph.launch(&ctx);
+        var actual: [8]f32 = undefined;
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(&actual));
+        try ctx.synchronize();
+        try std.testing.expectEqualSlices(f32, &expected, actual[0..6]);
+        try std.testing.expectEqual(@as(f32, -777), actual[6]);
+        try std.testing.expectEqual(@as(f32, -777), actual[7]);
+    }
 }

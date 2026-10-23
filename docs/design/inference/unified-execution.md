@@ -1241,6 +1241,22 @@ sizes and empty rows. Full source compilation succeeds on the actual Metal
 runtime compiler. Receipts are in `next-bulk/metal-q4-scalar/`; composition
 qualification remains pending.
 
+### CUDA launch ABI checkpoint
+
+N03/N25 migrate 230 argument-pointer arrays without heap allocation or runtime
+reflection. Of these, 217 preserve the original mutable slots directly; thirteen
+quantized-linear launchers use named records checked and ordered from the
+existing native `kernel_abi.cuh` parameter lists. The header remains the single
+signature owner. Partially initialized arrays keep their explicit construction.
+
+All launch adapters typecheck. On the DGX Spark, the typed-slot/named-record
+probe captures fill and quantized linear operations, returns from their launch
+stack frames, then verifies four replays against an independent dot reference
+and output guards. Four CUDA model cases pass byte parity and the original
+p50/p95 budgets across 32 balanced arms (warmup 25, measured 201); p50 ratios
+range from 0.9925 to 1.0037. Receipts are in `next-bulk/cuda-host/`.
+Symbol lifecycle consolidation and final composition remain separate gates.
+
 ### Six implementation waves
 
 1. **Ownership and contracts — N01–N04.** Freeze the source/images/executables;
