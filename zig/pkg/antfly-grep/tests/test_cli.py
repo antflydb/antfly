@@ -4281,9 +4281,21 @@ class CliTests(unittest.TestCase):
             code=2,
             timeout=30,
         )
-        self.assertEqual(
-            len(self.server.index_requests) + len(self.server.requests), 1000
+        summary = next(
+            row
+            for line in result.stdout.splitlines()
+            if (row := json.loads(line))["type"] == "summary"
         )
+        # The budget charges admission before transport. Exhaustion cancels
+        # other lanes, so an admitted request may never reach this server.
+        admitted = summary["stats"]["index_requests"] + summary["requests"]
+        self.assertEqual(admitted, 1000)
+        self.assertGreater(len(self.server.index_requests), 0)
+        self.assertGreater(len(self.server.requests), 0)
+        self.assertLessEqual(
+            len(self.server.index_requests) + len(self.server.requests), admitted
+        )
+        self.assertFalse(summary["stats"]["complete"])
         self.assertIn(b"RequestBudgetExceeded", result.stderr)
         self.assertIn(b"partial", result.stderr)
 
