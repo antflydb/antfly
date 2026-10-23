@@ -235,6 +235,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const source_identity_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "logical value conditional", "document mutation revision", "public graph metric borrowed wire cached content authority", "public graph metric borrowed wire backfill", "projected authority backfill" } });
     b.step("source-value-identity-test", "Verify atomic source identity publication, migration and conditional reads").dependOn(&b.addRunArtifact(source_identity_tests).step);
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, source_identity_tests, "source-value-identity-test-build", "Build portable source identity and bounded read-window tests without executing them", "antfly-source-value-identity-tests");
 
     const api_http_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_http_runtime_test_root.zig"),

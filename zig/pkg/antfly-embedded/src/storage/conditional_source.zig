@@ -257,6 +257,13 @@ pub fn loadPreparedWindow(a: A, scratch: A, scope: anytype, physical: []const []
         a.free(result);
     }
     if (!exactSelectedValues(fields, prepared.request)) return result;
+    if (ids.len == 1) {
+        // Point reads need no sorting, grouping or additional group arena.
+        if (check) |guard| try guard.run(guard.ctx);
+        result[0] = try loadPrepared(a, scratch, scope, physical[0], ids[0], fields, prepared, authorities[0], &repairs[0]);
+        if (check) |guard| try guard.run(guard.ctx);
+        return result;
+    }
     var plans: [64]?Plan = @splat(null);
     var order: [64]usize = undefined;
     var count: usize = 0;
@@ -430,7 +437,7 @@ test "logical value conditional identities avoid payload reads and reject stale 
         }
     };
     try Fixture.run(std.testing.allocator, 64);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{1});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{2});
 }
 
 test "logical value conditional real read scopes pin published certificates" {
