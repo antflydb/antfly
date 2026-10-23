@@ -2620,7 +2620,12 @@ def test_unreachable_pdf_error_identity_and_successful_repair_clear_debt(statefu
 
     failed = wait_until(failed_manifest, timeout_s=90, interval_s=0.5)
     assert failed is not None
-    assert "ConnectionRefused" in json.dumps(failed["manifest_json"]), failed
+    raw_manifest = failed["manifest_json"]
+    if isinstance(raw_manifest, str):
+        raw_manifest = json.loads(raw_manifest)
+    assert raw_manifest["last_error"]["code"] == "ConnectionRefused", raw_manifest[
+        "last_error"
+    ]
     issues_path = f"/tables/{table}/repair/issues"
     asset_issues = stateful_api.post(issues_path, {"kind": "asset", "limit": 100})
     assert asset_issues["issues"], asset_issues

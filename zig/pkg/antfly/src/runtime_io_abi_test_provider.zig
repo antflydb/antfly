@@ -155,3 +155,22 @@ export fn runtime_io_abi_test_remote_fetch(borrow: *const bridge.Borrow, url: [*
     if (outcome == .ok) outcome.ok.deinit(std.heap.page_allocator);
     return .{};
 }
+
+export fn runtime_io_abi_test_threaded_create(output: *?*std.Io.Threaded, output_table: *?*std.Io.VTable) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+    const a = std.heap.page_allocator;
+    const runtime = a.create(std.Io.Threaded) catch return @import("antfly_runtime_abi").error_abi.statusFromError(error.OutOfMemory);
+    runtime.* = std.Io.Threaded.init(a, .{});
+    const table = @import("antfly_local_sources").common_threaded_connect_io.createVTable(a, runtime) catch {
+        runtime.deinit();
+        a.destroy(runtime);
+        return @import("antfly_runtime_abi").error_abi.statusFromError(error.OutOfMemory);
+    };
+    output.* = runtime;
+    output_table.* = table;
+    return .{};
+}
+export fn runtime_io_abi_test_threaded_destroy(runtime: *std.Io.Threaded, table: *std.Io.VTable) callconv(.c) void {
+    runtime.deinit();
+    std.heap.page_allocator.destroy(table);
+    std.heap.page_allocator.destroy(runtime);
+}
