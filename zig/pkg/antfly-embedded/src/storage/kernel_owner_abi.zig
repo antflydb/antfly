@@ -44,7 +44,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Controlled close requires admitted metadata fencing and owning drain leases.
 // Close preflight fences TTL and sparse producers before derived finalization.
 // Graph metric producer close precedes derived and durable dependency fences.
-pub const abi_version: u32 = 156;
+// Close preflight drains detached index pins before durable backend admission closes.
+pub const abi_version: u32 = 157;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

@@ -6290,6 +6290,9 @@ pub const DB = struct {
         try self.executor.quiesceWithAdmission(original);
         if (self.text_merge_runtime) |runtime| try runtime.stopWithAdmission(original);
         try self.executor.finalizeWithAdmission(original);
+        // Detached graph page snapshots borrow inline index generations. Join
+        // their accepted users while primary-backend admission is still open.
+        try self.core.index_manager.drainGraphMetricSnapshotsWithAdmission(original);
         try self.local_execution.source_publication.stopWithAdmission(self.backend_runtime, original);
         try self.local_execution.online_merge_reader.closeWithAdmission(self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io, original);
         // Foreground users and preparation/maintenance producers are fenced.

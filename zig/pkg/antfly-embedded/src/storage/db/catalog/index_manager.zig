@@ -1501,6 +1501,9 @@ pub const IndexManager = struct {
     /// page quanta, while unrelated catalog readers and writers no longer wait
     /// for an entire maintenance drain.
     graph_metric_schedule_pins: std.atomic.Value(usize) = .init(0),
+    /// Permanent close fence for detached worker snapshots. Structural
+    /// rebuild/retirement admission remains independently restartable.
+    graph_metric_snapshot_closing: std.atomic.Value(bool) = .init(false),
     /// Workers acquire shared before catalog/index apply; primary publishers
     /// acquire exclusive under DB apply, without retaining a catalog lease. This fences
     /// primary contributor reads through commit while preserving worker
@@ -7108,6 +7111,50 @@ pub const IndexManager = struct {
         entry.config.deinit(self.alloc);
     }
 
+    /// Serving and recurring producers must already be fenced. Close detached
+    /// snapshot admission under the catalog barrier, then drain the accepted
+    /// pins with the caller's original finite cleanup execution. Neither the
+    /// catalog nor pin-retirement mutex may remain held while CPU is parked.
+    pub fn drainGraphMetricSnapshotsWithAdmission(self: *IndexManager, original: @import("../../../common/read_admission.zig").Port) !void {
+        const admission = @import("../../../common/read_admission.zig");
+        const cleanup = @import("../../../common/cleanup_wait.zig");
+        self.graph_metric_snapshot_closing.store(true, .release);
+        var trace: admission.RejectionTrace = .{};
+        const control = trace.bind(original).?;
+        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        const Lifetime = struct {
+            fn check(raw: *const anyopaque) !void {
+                const port: *const admission.Port = @ptrCast(@alignCast(raw));
+                try port.checkLifetime();
+            }
+        };
+        const io = self.checkpointIo();
+        try control.checkpoint();
+        self.catalog_mutex.lockExclusiveControlledIo(io, .{
+            .lifetime = .{ .context = &control, .check_fn = Lifetime.check },
+            .execution_wait = boundary,
+        }) catch |cause| return trace.failure orelse cause;
+        // Every earlier snapshot installer has now published its pin. Future
+        // installers observe the permanent fence before borrowing index arrays.
+        self.catalog_mutex.unlockExclusive();
+        const Ready = struct {
+            fn get(raw: *anyopaque) anyerror!bool {
+                const manager: *IndexManager = @ptrCast(@alignCast(raw));
+                return manager.graph_metric_schedule_pins.load(.acquire) == 0;
+            }
+        };
+        while (true) {
+            try cleanup.until(io, control, self, Ready.get, null);
+            // A last releaser decrements under this guard, then broadcasts and
+            // unlocks. Counter zero alone does not authorize destroying it.
+            try cleanup.lockIo(&self.graph_metric_schedule_pin_mutex, io, control);
+            const drained = self.graph_metric_schedule_pins.load(.acquire) == 0;
+            self.graph_metric_schedule_pin_mutex.unlock(io);
+            if (drained) return;
+        }
+    }
+
     fn waitForGraphMetricSchedulePins(self: *IndexManager) void {
         if (self.io) |io| {
             self.graph_metric_schedule_pin_mutex.lockUncancelable(io);
@@ -7157,6 +7204,11 @@ pub const IndexManager = struct {
     }
 
     fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
+        self.graph_metric_snapshot_closing.store(true, .release);
+        // Compatibility destruction owns quiesced cleanup. Serialize with an
+        // installer that passed admission before the close flag was published.
+        self.catalog_mutex.lockExclusive();
+        self.catalog_mutex.unlockExclusive();
         self.waitForGraphMetricSchedulePins();
         if (self.write_plan_cache) |cached| {
             self.write_plan_cache = null;
@@ -10265,8 +10317,10 @@ pub const IndexManager = struct {
     };
 
     fn graphMetricWorkerSnapshotAlloc(self: *IndexManager) !GraphMetricWorkerSnapshot {
+        if (self.graph_metric_snapshot_closing.load(.acquire)) return error.Canceled;
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+        if (self.graph_metric_snapshot_closing.load(.acquire)) return error.Canceled;
         if (!self.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (self.graph_artifact_rebuild_pending) {
             const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, 0);
@@ -49834,4 +49888,199 @@ test "index_manager bounded native prepared text publication spills before admis
     }
     try std.testing.expectEqual(@as(u32, 2), documents);
     std.debug.print("PREPARED_TEXT_SPILL documents={d} peak_bytes={d}\n", .{ documents, stats.peak_bytes });
+}
+
+test "controlled index retirement drains real detached graph pins and metadata with the sole CPU" {
+    const DB = @import("../db.zig").DB;
+    const background = @import("../../background_runtime.zig");
+    const admission = @import("../../../common/read_admission.zig");
+    const cpu = @import("../../../common/runnable_scheduler.zig");
+    const now = @import("antfly_platform").time.monotonicNs;
+    const Mode = enum { success, begin_failure, end_failure, expired };
+    const Held = enum { snapshot, catalog, retirement_metadata };
+    for (std.enums.values(Held)) |held| {
+        for (std.enums.values(Mode)) |mode| {
+            const a = std.testing.allocator;
+            var backend = try background.BackendRuntimeHandle.init(a, .{});
+            defer backend.deinit();
+            const io = backend.ptr().io().?;
+            var directory = std.testing.tmpDir(.{});
+            defer directory.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/index-retire", .{directory.sub_path});
+            defer a.free(path);
+            var db = try DB.open(a, path, .{
+                .backend_runtime = backend.ptr(),
+                .primary_backend = .{ .mem = .{} },
+                .executor = .{ .backend = .manual },
+                .start_index_workers = false,
+                .start_optional_runtimes = false,
+                .start_independent_maintenance = false,
+            });
+            defer db.close();
+            try db.addIndex(.{ .name = "pinned", .kind = .graph, .config_json = "{}" });
+            const manager = db.core.index_manager;
+            var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+            defer slots.close();
+            var closer: cpu.Execution = .{};
+            defer closer.finish();
+            try closer.start(&slots, .{ .io = io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .query);
+            var health: cpu.Execution = .{};
+            defer health.finish();
+            try health.start(&slots, .{ .io = io, .native_now_ns = now }, .control);
+            const F = struct {
+                db: *DB,
+                manager: *IndexManager,
+                io: std.Io,
+                slots: *cpu.Scheduler,
+                held: Held,
+                snapshot: ?IndexManager.GraphMetricWorkerSnapshot,
+                guard_held: bool = false,
+                future: ?std.Io.Future(void) = null,
+                entered: std.Io.Event = .unset,
+                release: std.Io.Event = .unset,
+                failure: ?anyerror = null,
+                child_runs: std.atomic.Value(usize) = .init(0),
+                child_retired: std.atomic.Value(usize) = .init(0),
+                child_failed: std.atomic.Value(bool) = .init(false),
+                fn run(self: *@This()) void {
+                    self.entered.set(self.io);
+                    self.release.waitUncancelable(self.io);
+                    self.work() catch |cause| {
+                        self.failure = cause;
+                    };
+                }
+                fn retire(self: *@This()) void {
+                    if (self.guard_held) {
+                        if (self.held == .catalog) self.manager.catalog_mutex.unlockShared() else self.manager.graph_metric_schedule_pin_mutex.unlock(self.io);
+                        self.guard_held = false;
+                    }
+                    if (self.snapshot) |*snapshot| snapshot.deinit();
+                    self.snapshot = null;
+                }
+                fn work(self: *@This()) !void {
+                    var execution: cpu.Execution = .{};
+                    defer execution.finish();
+                    defer self.retire();
+                    try execution.start(self.slots, .{ .io = self.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .background);
+                    if (self.held == .snapshot) {
+                        if (!self.manager.catalog_mutex.tryLockShared()) return error.TestUnexpectedResult;
+                        self.manager.catalog_mutex.unlockShared();
+                        if (!self.manager.graph_metric_schedule_pin_mutex.tryLock()) return error.TestUnexpectedResult;
+                        self.manager.graph_metric_schedule_pin_mutex.unlock(self.io);
+                    }
+                    const entry = if (self.snapshot) |snapshot| snapshot.entries[0].entry else &self.manager.graph_indexes.items[0];
+                    try std.testing.expectEqualStrings("pinned", entry.config.name);
+                    // Accepted pin users may still submit backend work. Their
+                    // backend generation must remain open until this retires.
+                    try self.db.backend_runtime.durable_jobs.submit(.{ .owner_id = self.db.backend_owner_id, .class = .commit_durable, .ptr = self, .run = child, .deinit = childRetire });
+                }
+                fn child(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    errdefer self.child_failed.store(true, .release);
+                    var execution: cpu.Execution = .{};
+                    defer execution.finish();
+                    try execution.start(self.slots, .{ .io = self.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .background);
+                    _ = self.child_runs.fetchAdd(1, .release);
+                }
+                fn childRetire(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    _ = self.child_retired.fetchAdd(1, .release);
+                }
+            };
+            var f: F = .{ .db = &db, .manager = manager, .io = io, .slots = &slots, .held = held, .snapshot = try manager.graphMetricWorkerSnapshotAlloc() };
+            defer {
+                closer.finish();
+                f.release.set(io);
+                if (f.future) |*future| future.await(io);
+                f.retire();
+                db.backend_runtime.durable_jobs.closeOwner(db.backend_owner_id);
+            }
+            try std.testing.expectEqual(@as(usize, 1), f.snapshot.?.entries.len);
+            switch (held) {
+                .snapshot => {},
+                .catalog => {
+                    manager.catalog_mutex.lockShared();
+                    f.guard_held = true;
+                },
+                .retirement_metadata => {
+                    f.snapshot.?.deinit();
+                    f.snapshot = null;
+                    manager.graph_metric_schedule_pin_mutex.lockUncancelable(io);
+                    f.guard_held = true;
+                    try std.testing.expectEqual(@as(usize, 0), manager.graph_metric_schedule_pins.load(.acquire));
+                },
+            }
+            f.future = try io.concurrent(F.run, .{&f});
+            try f.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            const Control = struct {
+                f: *F,
+                closer: *cpu.Execution,
+                mode: Mode,
+                begins: usize = 0,
+                ends: usize = 0,
+                fn lifetime(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.closer.checkLifetime();
+                    if (self.mode == .expired and self.begins != 0) return error.DeadlineExceeded;
+                }
+                fn checkpoint(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try lifetime(raw);
+                    if (self.f.slots.state(&self.closer.entry.?) != .running) return error.InvalidRunnableTransition;
+                }
+                fn deadline(raw: *anyopaque) !?u64 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.closer.entry.?.options.deadline_ns;
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.begins += 1;
+                    if (self.mode == .begin_failure) return error.NotFound;
+                    try self.closer.park(.resource_blocked);
+                    if (self.mode != .expired) self.f.release.set(self.f.io);
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    self.f.release.set(self.f.io);
+                    if (self.mode == .end_failure) return error.Canceled;
+                    try self.closer.enter(.query);
+                }
+            };
+            var control: Control = .{ .f = &f, .closer = &closer, .mode = mode };
+            var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+            const original = admission.Port.init(&payload);
+            const result = db.drainCloseDependenciesWithAdmission(original);
+            if (mode == .success) try result else {
+                try std.testing.expectError(switch (mode) {
+                    .begin_failure => error.NotFound,
+                    .end_failure => error.Canceled,
+                    .expired => error.DeadlineExceeded,
+                    else => unreachable,
+                }, result);
+                try std.testing.expect(!db.closed);
+                try std.testing.expect(manager.graph_metric_snapshot_closing.load(.acquire));
+                try std.testing.expectEqualStrings("pinned", manager.graph_indexes.items[0].config.name);
+                try std.testing.expectError(error.Canceled, manager.graphMetricWorkerSnapshotAlloc());
+                if (mode == .end_failure) try closer.enter(.query);
+                control.mode = .success;
+                try db.drainCloseDependenciesWithAdmission(original);
+            }
+            f.future.?.await(io);
+            f.future = null;
+            if (f.failure) |cause| return cause;
+            try std.testing.expectEqual(@as(usize, 0), manager.graph_metric_schedule_pins.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), f.child_runs.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), f.child_retired.load(.acquire));
+            try std.testing.expect(!f.child_failed.load(.acquire));
+            try std.testing.expect(control.begins != 0);
+            try std.testing.expectEqual(control.begins, control.ends + @as(usize, if (mode == .begin_failure) 1 else 0));
+            try std.testing.expectError(error.Canceled, manager.graphMetricWorkerSnapshotAlloc());
+            try std.testing.expectEqual(cpu.State.running, slots.state(&health.entry.?));
+            // Completed preflight retains the same index generation for
+            // physical destruction and cannot replay a retired snapshot.
+            try db.drainCloseDependenciesWithAdmission(original);
+            try std.testing.expect(!db.closed);
+        }
+    }
 }

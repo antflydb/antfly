@@ -102,7 +102,8 @@ const builtin = @import("builtin");
 // Durable drain leases own completion signals and pin their producing scope.
 // TTL and sparse maintenance retain exclusive controlled close state.
 // Graph metric owners use shared maintenance and exclusive controlled joins.
-pub const abi_version: u32 = 96;
+// Index managers permanently fence detached graph snapshots during controlled close.
+pub const abi_version: u32 = 97;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

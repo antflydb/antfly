@@ -24203,3 +24203,60 @@ next physical-close audit covers final status persistence, index destruction and
 primary backend close; these paths still need an explicit controlled retirement
 contract. Full GNU/Linux qualification remains waived; the full design is not
 complete.
+
+### Controlled detached-index pin retirement
+
+Physical index destruction waits for detached graph-worker snapshots that borrow
+inline graph-index entries. DB close preflight now drains these pins after derived
+finalization and before durable backend admission closes. Accepted pin users can
+still submit their dependent backend work, and they can acquire the CPU needed to
+retire while the original closer is parked. The same DB/index generation remains
+alive after a rejected handoff, lifetime or reentry check for exact retry.
+
+A permanent snapshot-admission flag is separate from restartable graph topology
+retirement and artifact-rebuild admission. New snapshot capture checks it before
+and under the catalog shared lock. Controlled close publishes the flag and takes
+an admitted exclusive catalog barrier, ensuring an earlier installer has published
+its pin before drainage observes the counter. That barrier is released before
+waiting for existing workers. Compatibility physical destruction uses the same
+catalog barrier under its existing quiesced-cleanup ownership.
+
+Readiness while CPU is parked observes only the atomic pin counter. After reentry,
+close acquires the pin-retirement mutex with the original finite control and
+rechecks zero. The last releaser decrements under that mutex before notifying and
+unlocking; counter zero alone cannot authorize destroying its still-used metadata.
+No original admission port is retained in the manager, snapshot or background job.
+Native ABI 97 and storage-owner ABI 157 fence the new index-manager layout and
+close-preflight dependency contract.
+
+Final status persistence, physical index/backend I/O and LSM generation-reader
+retirement still need controlled close contracts. Callback CPU/I/O adoption,
+remaining resource charging and broader original design requirements also remain
+unfinished. This change drains detached graph snapshot pins, not all physical
+index or storage ownership. The full goal remains active; full GNU/Linux
+qualification remains waived and Linux builds require pinned Nix/glibc Zig.
+
+Pinned Darwin Debug foundation receipt `index-pin-close-v2` passes all 68 build
+steps and 86 maintenance/execution-service tests. The identical native/schema
+inputs pass all 76 steps in `index-pin-close-v3`, including two fresh linked
+C-entry close tests and the qualified unchanged maintenance/archive cases. Simple
+runners pass 32 DB/finalization/cache/dependency cases, 45 named graph-runtime
+cases and 21 local-owner-close cases without skips, failures or leaks. Error ABI
+(45), released status ABI (1) and failure identity (8) pass in both receipts.
+
+The real DB pin matrix holds one ordinary CPU and a protected control execution.
+Across snapshot, catalog and zero-pin retirement-metadata contention, accepted
+workers need the ordinary CPU to release their resources and submit a dependent
+backend job. Twelve combinations cover success, rejected handoff, rejected
+reentry and lifetime expiration. Failure preserves the DB and exact pinned index
+configuration; retry drains without replay, late snapshots are refused, dependent
+backend admission remains open until pin retirement, and the protected control
+execution stays running. Counter-zero metadata contention verifies that physical
+retirement cannot race a releaser still using the mutex. The C-entry regression
+also verifies the index snapshot-admission fence after preflight.
+
+Both receipts' native/schema hashes and immutable log hashes match the final
+source. The first attempt records a test-only nested-type qualification fix.
+Final status sync, LSM generation-reader drainage and physical index/backend
+I/O still require controlled retirement; this is not full physical-close or full
+design qualification. Full GNU/Linux qualification remains waived.

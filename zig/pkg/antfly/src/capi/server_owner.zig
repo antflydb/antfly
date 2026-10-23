@@ -7151,6 +7151,7 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         try std.testing.expectError(error.Canceled, ttl.start());
         try std.testing.expectError(error.Canceled, sparse.start());
         try std.testing.expect(graph_metrics.joined.isSet() and graph_metrics.future == null);
+        try std.testing.expect(handle.db.core.index_manager.graph_metric_snapshot_closing.load(.acquire));
         try std.testing.expect(graph_metrics.stats().has_lease);
         try std.testing.expectError(error.Canceled, graph_metrics.start());
         try std.testing.expectError(error.Canceled, graph_metrics.runOnce());
