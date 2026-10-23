@@ -7,32 +7,12 @@ import type {
   QuantizationOption,
 } from "@/data/inference-models";
 import { useConnectedModels } from "@/hooks/use-connections";
-
-type InferenceTaskKey =
-  | "embedders"
-  | "rerankers"
-  | "chunkers"
-  | "generators"
-  | "extractors"
-  | "rewriters"
-  | "readers"
-  | "transcribers"
-  | "other";
-
-const TASK_TO_TYPE: Record<InferenceTaskKey, ModelType> = {
-  embedders: "embedder",
-  rerankers: "reranker",
-  chunkers: "chunker",
-  generators: "generator",
-  extractors: "extractor",
-  rewriters: "rewriter",
-  readers: "reader",
-  transcribers: "transcriber",
-  // OpenAI-compatible listing APIs generally do not report task metadata.
-  other: "generator",
-};
+import { INFERENCE_MODEL_GROUP_TYPES, INFERENCE_MODEL_GROUPS } from "@/lib/inference-model-tasks";
 
 const MODEL_TYPE_NAMES: Record<ModelType, string> = {
+  decider: "decision",
+  synthesizer: "synthesis",
+  predictor: "prediction",
   embedder: "embedding",
   reranker: "reranking",
   chunker: "chunking",
@@ -43,7 +23,7 @@ const MODEL_TYPE_NAMES: Record<ModelType, string> = {
   transcriber: "transcription",
 };
 
-const TASK_KEYS = Object.keys(TASK_TO_TYPE) as InferenceTaskKey[];
+const TASK_KEYS = INFERENCE_MODEL_GROUPS.filter((task) => task !== "rewriters");
 
 function modelId(type: ModelType, name: string): string {
   return `${type}-${name}`
@@ -58,6 +38,19 @@ function isHuggingFaceModelRef(name: string): boolean {
 
 // Static model type metadata (not provided by Antfly inference's model list)
 const MODEL_TYPES: ModelTypeInfo[] = [
+  {
+    type: "decider",
+    name: "Decider",
+    description: "Typed decisions and calibrated probabilities",
+    icon: "ListChecks",
+  },
+  { type: "synthesizer", name: "Synthesizer", description: "Text to speech", icon: "AudioLines" },
+  {
+    type: "predictor",
+    name: "Predictor",
+    description: "Schema-based ML predictions",
+    icon: "ChartLine",
+  },
   {
     type: "embedder",
     name: "Embedder",
@@ -82,13 +75,6 @@ const MODEL_TYPES: ModelTypeInfo[] = [
     name: "Extractor",
     description: "Entity extraction, relation extraction, and question answering",
     icon: "Tag",
-  },
-  {
-    type: "rewriter",
-    name: "Rewriter",
-    description:
-      "Sequence-to-sequence text transformation like paraphrasing and question generation",
-    icon: "RefreshCw",
   },
   {
     type: "generator",
@@ -165,14 +151,17 @@ export function transformConnectionModels(connections: Connection[]): InferenceM
     const connectionName = connection.display_name ?? connection.name;
 
     for (const task of TASK_KEYS) {
-      const type = TASK_TO_TYPE[task];
+      const kind = INFERENCE_MODEL_GROUP_TYPES[task];
+      const type: ModelType =
+        kind === "other" ? "generator" : kind === "classifier" ? "decider" : kind;
       for (const listed of inference.models[task] ?? []) {
         const id = modelId(type, `${connection.id}-${listed.name}`);
         if (seen.has(id)) continue;
         seen.add(id);
-        const sourceUrl = isHuggingFaceModelRef(listed.name)
-          ? `https://huggingface.co/${listed.name}`
-          : "";
+        const sourceUrl =
+          connection.id !== "named-inference" && isHuggingFaceModelRef(listed.name)
+            ? `https://huggingface.co/${listed.name}`
+            : "";
         models.push({
           id,
           name: listed.display_name ?? listed.name,
@@ -183,8 +172,13 @@ export function transformConnectionModels(connections: Connection[]): InferenceM
           sourceUrl,
           type,
           description: `${MODEL_TYPE_NAMES[type][0]?.toUpperCase()}${MODEL_TYPE_NAMES[type].slice(1)} model available through ${connectionName}.`,
+          capabilities: listed.capabilities,
+          inputs: listed.inputs,
+          allowDownloads: inference.provider === "antfly",
           variants: [],
-          inRegistry: connection.status === "connected",
+          inRegistry: connection.status === "connected" || connection.id === "named-inference",
+          availability: connection.id === "named-inference" ? "unknown" : connection.status,
+          freshness: connection.id === "named-inference" ? "configured" : "cached",
         });
       }
     }

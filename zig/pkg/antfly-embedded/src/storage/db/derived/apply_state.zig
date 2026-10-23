@@ -814,6 +814,18 @@ fn mergeSequenceMetadata(
     }
 }
 
+/// Read retained checkpoint metadata through its immutable storage capability.
+/// Remote/query views have virtual paths; host filesystem I/O is not authority.
+pub fn loadProjectionCheckpointFromStorage(alloc: Allocator, storage: lsm_backend.Storage, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
+    return loadProjectionCheckpointWithStorage(storage, alloc, .failing, path, index_name);
+}
+
+fn projectionCheckpointFromBytes(alloc: Allocator, raw: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
+    var checkpoint = try decodeCheckpoint(alloc, raw);
+    defer checkpoint.deinit(alloc);
+    return checkpoint.map.get(index_name);
+}
+
 fn loadProjectionCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
     return loadProjectionCheckpointWithStorage(null, alloc, io, path, index_name);
 }
@@ -1116,6 +1128,8 @@ fn loadCheckpoint(alloc: Allocator, io: std.Io, path: []const u8) !CheckpointMap
 fn loadCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8) !CheckpointMap {
     const raw = if (storage) |files|
         try files.readFileAlloc(alloc, path, checkpoint_max_bytes)
+    else if (comptime builtin.os.tag == .freestanding)
+        return error.UnsupportedPlatform
     else
         try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(checkpoint_max_bytes));
     defer alloc.free(raw);
@@ -1956,6 +1970,21 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
         try std.testing.expectEqual(@as(u64, @intCast(i + 1)), checkpoint.applied_sequence);
         try std.testing.expectEqual(ProjectionStatus.clean, checkpoint.status);
     }
+}
+
+test "logical value retained checkpoint decoding preserves identity and rejects corruption" {
+    const a = std.testing.allocator;
+    var checkpoint = CheckpointMap{};
+    defer checkpoint.deinit(a);
+    try checkpoint.putMax(a, "text", .{ .applied_sequence = 17, .config_hash = 123, .generation = 4 });
+    const raw = try encodeCheckpoint(a, &checkpoint);
+    defer a.free(raw);
+    const decoded = (try projectionCheckpointFromBytes(a, raw, "text")).?;
+    try std.testing.expectEqual(@as(u64, 17), decoded.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 123), decoded.config_hash);
+    try std.testing.expect(try projectionCheckpointFromBytes(a, raw, "other") == null);
+    raw[raw.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidDerivedApplyState, projectionCheckpointFromBytes(a, raw, "text"));
 }
 
 test "projection checkpoint external storage keeps shadow progress isolated (#1210)" {

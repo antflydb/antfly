@@ -29,6 +29,7 @@ pub const HttpMethod = enum(c_int) {
 pub const RequestBodyMode = enum(c_int) {
     none,
     buffered,
+    streaming_raw,
 };
 
 pub const CallbackStatus = enum(c_int) {

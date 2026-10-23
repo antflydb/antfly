@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Opaque internal ABI for staging `.aflite` and `.afb` inputs. The heavy Lite
 //! storage implementation lives in the storage codegen unit; the remote CLI
@@ -151,4 +151,29 @@ pub fn stageInputRestoreBackup(
         .snapshot_path = result.snapshot_path_ptr[0..result.snapshot_path_len],
         .table_name = result.table_name_ptr[0..result.table_name_len],
     };
+}
+
+/// The CLI sees only JSON across the existing storage codegen boundary.
+pub const InspectContext = extern struct {
+    input_ptr: [*]const u8,
+    input_len: usize,
+    destination_ptr: ?[*]const u8,
+    destination_len: usize,
+    max_input_bytes: u64,
+    max_expanded_bytes: u64,
+    result_ptr: *?[*]u8,
+    result_len: *usize,
+};
+extern fn antfly_backup_preflight(context: *const InspectContext) callconv(.c) c_int;
+extern fn antfly_backup_preflight_free(ptr: [*]u8, len: usize) callconv(.c) void;
+
+pub fn inspectInputJsonAlloc(allocator: std.mem.Allocator, input: []const u8, destination: ?[]const u8, max_input_bytes: u64, max_expanded_bytes: u64) ![]u8 {
+    if (comptime use_direct_implementation) return @import("backup_inspection.zig").inspectInputJsonAlloc(allocator, input, destination, .{ .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes });
+    var ptr: ?[*]u8 = null;
+    var len: usize = 0;
+    const status = antfly_backup_preflight(&.{ .input_ptr = input.ptr, .input_len = input.len, .destination_ptr = if (destination) |d| d.ptr else null, .destination_len = if (destination) |d| d.len else 0, .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes, .result_ptr = &ptr, .result_len = &len });
+    if (status != Status.ok) return if (status == Status.out_of_memory) error.OutOfMemory else error.InvalidPreflightRequest;
+    const bytes = (ptr orelse return error.InvalidPreflightResponse)[0..len];
+    defer antfly_backup_preflight_free(bytes.ptr, bytes.len);
+    return allocator.dupe(u8, bytes);
 }

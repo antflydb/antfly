@@ -5,4 +5,6 @@ content_type_overrides:
   # Treat the envelope as bytes while retaining its declared wire Content-Type.
   application/vnd.antfly.attachments.v1: application/octet-stream
   application/x-ndjson: application/octet-stream
+  audio/mpeg: application/octet-stream
+  audio/wav: application/octet-stream
 post_hooks: []

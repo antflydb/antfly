@@ -280,7 +280,7 @@ native index engine is being completed is an implementation detail and must not
 appear as the public index layout for native Lite files.
 
 The Apache Lite CLI and embedded engine provide local file and in-process
-operations. Database HTTP serving uses the ELv2 standalone binary:
+operations. Database HTTP serving uses the Apache-2.0 standalone binary:
 
 ```sh
 antfly standalone --storage-engine lite --storage-path app.aflite --config production.json
@@ -340,8 +340,20 @@ document-identity namespace of that future `default` table from creation, so
 adoption is O(1) rather than rewriting every live document; an identity mismatch
 fails closed. Subsequent standalone tables use isolated
 namespaces in the same artifact. This allows a file populated by `lite batch` to be served by standalone.
+Direct adoption currently accepts one embedded root table with full-text indexes
+and supported enrichments. Native dense, sparse, graph and algebraic indexes,
+resolver catalogs, and additional embedded tables fail before the alias is
+published; adoption does not silently remove or reinterpret their definitions.
+The shared catalog translator preserves full-text incarnations and enrichment
+configuration alongside stored artifacts.
+
 After that adoption, embedded data commands continue to address the `default`
-table through the persisted alias. A file created directly by standalone has
+table through the persisted alias. Catalog authority belongs to standalone:
+embedded schema, index, enrichment, resolver, range and table-definition changes
+are rejected, including SQL DDL. Use the standalone API for those changes.
+Document reads, writes and search remain available offline. Physical snapshots
+preserve the ownership marker, so returning a file to an embedded client and
+serving it again cannot introduce a second catalog authority. A file created directly by standalone has
 no unambiguous root table, so root-oriented `lite batch`, query, schema, index,
 enrichment, import, promote, and compact operations fail closed and direct the
 user to `standalone --storage-engine lite --storage-path` plus `/db/v1`. Artifact `status` and the physical `check`,
@@ -800,8 +812,7 @@ unexpectedly start sending data to a network provider.
 
 #### Local Embedded Inference
 
-Local inference is built in, not optional packaging: every `libantfly`/
-`antfly-lite` build links the inference runtime (see COMPILATION.md's
+Local inference is built in, not optional packaging: every `libantfly` and `antfly` build links the inference runtime (see COMPILATION.md's
 "C API composition" section). There is no separate base/full build distinction -- `zig build
 capi` always links the inference archive (2026-09-17 product decision: Lite
 hosts get local inference without a separate runtime, at the cost of a much
@@ -825,9 +836,8 @@ under `~/.antfly/inference/models/`.
 and Lite CLI enrichment explicitly sets `process_isolation: false`. All
 backends, including Metal, CUDA, ONNX, and PJRT, therefore run in the host
 process. `ANTFLY_INFERENCE_WORKER` is not used by this provider, and opening
-an embedded inference handle does not require a worker executable. The
-private worker bundled with the Apache Embedded archive serves CLI hosts;
-Python/npm packages omit it because library calls do not use it.
+an embedded inference handle does not require a worker executable. CLI hosts can re-execute `antfly` for isolated work; embedded archives and
+Python/npm packages carry no worker executable.
 
 Once a call enters a GPU driver, a deadline or close cannot interrupt it;
 cancellation takes effect after the call returns. A driver fault can
@@ -839,11 +849,9 @@ local inference in a replaceable child process when a compiled backend
 requires it; CPU models also run there in that configuration. This policy
 belongs to the server host, rather than the embedded database provider.
 The worker resolver uses `ANTFLY_INFERENCE_WORKER` as an explicit override,
-then the executable image itself for a statically linked CLI, or sibling
-`antfly-inference-worker` and `antfly-lite` executables for a shared library,
-then those Apache executable names on `PATH`. It does not automatically
-fall back to the ELv2 `antfly` executable. Library users do not need to ship
-an ELv2 server to use embedded inference.
+then the executable image itself for a statically linked CLI, or a sibling `antfly` executable for a shared library, then `antfly` on
+`PATH`. Library users do not need to ship
+a database server to use embedded inference.
 
 #### Manual Maintenance
 

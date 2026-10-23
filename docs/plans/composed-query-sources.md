@@ -144,7 +144,7 @@ Reads authorize the saved name and every leaf. Definitions permit literal union
 or overlay leaves only, preventing recursion. Drop/recreate changes the source ID
 and invalidates previous cursors; definitions do not freeze table contents.
 
-HTTP SQL SELECT requests accept `lake_visibility: "accepted"`; the default remains
+HTTP SQL SELECT requests accept `read_requirements: {visibility: "accepted"}`; the default remains
 `"committed"`. Idle statements and prepared execution outside a transaction take
 one statement cut. Inside an HTTP SQL session transaction, the first accepted
 read persists its visibility mode and binds each writable lake table once.
@@ -233,8 +233,8 @@ Outside a transaction, each accepted statement obtains its own cut. This is the
 implemented transaction contract; read-write serializable lake participation remains
 pending.
 
-Writable-lake search requests accept `lake_read` with `visibility: "accepted"` or
-`"published"`, an optional `through` receipt (`table_id`, `object_generation`,
+Writable-lake HTTP search requests accept `read_requirements` with `visibility: "accepted"` or
+`"published"`, an optional `after_write` receipt (`table_id`, `object_generation`,
 `wal_lsn`) and `wait_ms` from 0 to 60000. Change acceptance includes those receipt
 fields. Published reads explicitly select the archive publication and skip pending
 changes. A receipt requires its coverage and rejects a different incarnation.

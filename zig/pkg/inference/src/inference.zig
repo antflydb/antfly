@@ -255,6 +255,8 @@ test {
     _ = native_quantize;
     _ = kernel_jit_profile_output;
     _ = native_quant_kernel_codegen;
+    // Evidence serialization and policy tests also run without a CUDA device.
+    _ = cuda_microbench;
     _ = native_export_gguf;
     _ = gliner_boundary_export;
     _ = native_export_safetensors;
@@ -285,7 +287,6 @@ test {
     }
     if (build_options.enable_cuda) {
         _ = cuda_info;
-        _ = cuda_microbench;
         _ = cuda_attention_diff;
         _ = cuda_ffn_diff;
         _ = cuda_nvrtc;
@@ -405,4 +406,12 @@ test "embeddinggemma2 declarations compile" {
     std.testing.refAllDecls(embedding_gemma2_pipeline);
     _ = @import("architectures/embedding_gemma2_media_weights.zig");
     _ = server;
+}
+
+/// Shared CLI diagnostics for the public and development inference entry points.
+pub fn printMetalInfo() void {
+    std.debug.print("metal build_enabled={}\n", .{build_options.enable_metal});
+    if (comptime build_options.enable_metal) {
+        std.debug.print("metal device_available={}\n", .{metal_runtime.metalDeviceAvailable()});
+    }
 }

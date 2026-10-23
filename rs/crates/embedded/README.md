@@ -67,7 +67,7 @@ when the app runs. Crate tests/examples receive runtime search paths;
 downstream application binaries should install the library in the system
 loader path or set `LD_LIBRARY_PATH` (Linux) / `DYLD_LIBRARY_PATH` (macOS)
 to the archive's `lib` directory, or configure their own rpath.
-No ELv2 server package is required. See the sys crate README for discovery
+No database server package is required. See the sys crate README for discovery
 and cross-compilation details. Native archive targets are independent of the
 Python/npm package matrix, which currently covers Linux x86-64 and ARM64
 (glibc 2.28+) and macOS ARM64.

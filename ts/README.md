@@ -105,10 +105,10 @@ pnpm format
 
 ```bash
 # Run storybook for React components
-pnpm storybook
+pnpm --filter @antfly/components storybook
 
 # Build storybook
-pnpm build-storybook
+pnpm --filter @antfly/components build-storybook
 
 # Regenerate SDK types from OpenAPI spec
 pnpm --filter @antfly/sdk generate

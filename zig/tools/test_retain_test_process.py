@@ -57,8 +57,35 @@ class RetainTestProcess(unittest.TestCase):
             process = root / "proc/17"
             process.mkdir(parents=True)
             (process / "exe").symlink_to(root / "zig")
+            (process / "cmdline").write_bytes(b"zig\0build\0unit-test\0")
             self.assertFalse(retention.retain(17, root / "out", root / "proc"))
             self.assertFalse((root / "out").exists())
+
+    def test_retains_compiler_inputs_and_memory_without_copying_toolchain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = root / "proc/17"
+            process.mkdir(parents=True)
+            (process / "exe").symlink_to(root / "zig")
+            (process / "cwd").symlink_to(root)
+            args = root / "cache/args/hash"
+            args.parent.mkdir(parents=True)
+            args.write_text('-Mroot=pkg/owner.zig --test-filter "a test"')
+            (process / "cmdline").write_bytes(b"zig\0test\0@cache/args/hash\0")
+            (process / "status").write_text("VmHWM:\t1000 kB\nVmRSS:\t900 kB\n")
+            self.assertTrue(retention.retain(17, root / "out", root / "proc"))
+            output = root / "out/compiler-17"
+            self.assertEqual((output / "args-0.txt").read_text(), args.read_text())
+            self.assertEqual(
+                (output / "status").read_text(), (process / "status").read_text()
+            )
+            record = json.loads((output / "command.json").read_text())
+            self.assertEqual(record["argv"], ["zig", "test", "@cache/args/hash"])
+            self.assertEqual(record["cwd"], str(root))
+            self.assertEqual(
+                sorted(path.name for path in output.iterdir()),
+                ["args-0.txt", "command.json", "status"],
+            )
 
 
 if __name__ == "__main__":

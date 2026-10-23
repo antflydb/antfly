@@ -6,10 +6,10 @@ and compaction lifecycles, lock policy, background maintenance, and caching,
 plus the RocksDB/Pebble-influenced choices behind them. It grew out of a
 review of:
 
-- `pkg/antfly/src/storage/lsm_backend.zig`
-- `pkg/antfly/src/storage/lsm_backend/cache.zig`
-- `pkg/antfly/src/storage/lsm_backend/recovery.zig`
-- `pkg/antfly/src/storage/lsm_backend/storage_io.zig`
+- `zig/pkg/antfly-embedded/src/storage/lsm_backend.zig`
+- `zig/pkg/antfly-embedded/src/storage/lsm_backend/cache.zig`
+- `zig/pkg/antfly-embedded/src/storage/lsm_backend/recovery.zig`
+- `zig/pkg/antfly-embedded/src/storage/lsm_backend/storage_io.zig`
 
 The design pulls in the highest-leverage lessons from RocksDB and Pebble. The
 project is still unreleased, so clean table/WAL codec breaks are preferable to
@@ -1414,7 +1414,7 @@ Expected cost:
 
 Validated with:
 
-- `zig test pkg/antfly/src/storage/lsm_backend/storage_io.zig`
+- `zig test zig/pkg/antfly-embedded/src/storage/lsm_backend/storage_io.zig`
 - `zig build root-test -- --test-filter "lsm backend"`
 
 ## Benchmark Harness

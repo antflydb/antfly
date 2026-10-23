@@ -3,8 +3,18 @@
 
 pub const types = @import("types.zig");
 
+pub const CurationOrigin = types.CurationOrigin;
+pub const CurationProposal = types.CurationProposal;
+pub const CurationProposalDecisionRequest = types.CurationProposalDecisionRequest;
+pub const CurationProposalDecisionResult = types.CurationProposalDecisionResult;
+pub const CurationProposalOptions = types.CurationProposalOptions;
+pub const CurationProposalPage = types.CurationProposalPage;
+pub const CurationProposalRequest = types.CurationProposalRequest;
+pub const CurationSuppressionEntry = types.CurationSuppressionEntry;
 pub const EntityCurationResult = types.EntityCurationResult;
+pub const EntityDistinctRequest = types.EntityDistinctRequest;
 pub const EntityMergeRequest = types.EntityMergeRequest;
+pub const EntitySuppressRequest = types.EntitySuppressRequest;
 pub const ResolverAdjudicationEvidence = types.ResolverAdjudicationEvidence;
 pub const ResolverCurationState = types.ResolverCurationState;
 pub const ResolverDistinctPair = types.ResolverDistinctPair;
@@ -31,3 +41,4 @@ pub const ResolverSuppressionRequest = types.ResolverSuppressionRequest;
 pub const ResolverSuppressionSelection = types.ResolverSuppressionSelection;
 pub const ResolverUnmergeRequest = types.ResolverUnmergeRequest;
 pub const ResolverWait = types.ResolverWait;
+pub const RuntimeResolverSuppression = types.RuntimeResolverSuppression;

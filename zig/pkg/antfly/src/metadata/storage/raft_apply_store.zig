@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const hot_standby_write_gate_adapter = @import("../../storage/hot_standby/write_gate.zig");
 const hot_standby_publisher_adapter = @import("../../storage/hot_standby/db_commit.zig");
@@ -14546,6 +14546,57 @@ pub const RaftApplyStore = struct {
         return out;
     }
 
+    pub const InspectionCatalog = struct {
+        tables: []metadata.TableRecord,
+        ranges: []metadata.RangeRecord,
+    };
+
+    /// Offline inspection uses the normal record codecs, but bounds the whole
+    /// projection before copying/decoding each row. Never load an unbounded
+    /// catalog and only then discover that its inspection budget was exceeded.
+    pub fn captureInspectionCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, max_records: usize, max_bytes: usize, cancellation: @import("antfly_cancellation").CancellationToken) !InspectionCatalog {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var bytes_left = max_bytes;
+        var table_buf: [128]u8 = undefined;
+        const tables = try inspectionRows(metadata.TableRecord, alloc, &txn, try tablePrefixForGroup(&table_buf, group_id), max_records, &bytes_left, cancellation, decodeTableRecord, metadata_table_manager.freeTable);
+        errdefer self.freeTables(alloc, tables);
+        var range_buf: [128]u8 = undefined;
+        const ranges = try inspectionRows(metadata.RangeRecord, alloc, &txn, try rangePrefixForGroup(&range_buf, group_id), max_records, &bytes_left, cancellation, decodeRangeRecord, metadata_table_manager.freeRange);
+        errdefer self.freeRanges(alloc, ranges);
+        // Private FK owners have no public table/range projection yet. Until
+        // their source generations can be inventoried, do not certify them.
+        var private_buf: [160]u8 = undefined;
+        const private_prefix = try fk_generation_publication.initialPrefixForGroup(&private_buf, group_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        if (try cursor.seekAtOrAfter(private_prefix)) |kv| {
+            if (std.mem.startsWith(u8, kv.key, private_prefix)) return error.UnsupportedLiteInspectionLayout;
+        }
+        return .{ .tables = tables, .ranges = ranges };
+    }
+
+    fn inspectionRows(comptime Row: type, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, prefix: []const u8, max_records: usize, bytes_left: *usize, cancellation: @import("antfly_cancellation").CancellationToken, comptime decode: anytype, comptime free: anytype) ![]Row {
+        var rows: std.ArrayList(Row) = .empty;
+        errdefer {
+            for (rows.items) |row| free(alloc, row);
+            rows.deinit(alloc);
+        }
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cursor.next()) {
+            try cancellation.check();
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            if (rows.items.len >= max_records or kv.value.len > bytes_left.*) return error.PreflightLimitExceeded;
+            bytes_left.* -= kv.value.len;
+            const row = try decode(alloc, kv.value);
+            errdefer free(alloc, row);
+            try rows.append(alloc, row);
+        }
+        return rows.toOwnedSlice(alloc);
+    }
+
     /// Capture the table and range namespaces from one committed storage
     /// revision without acquiring either the apply or outer Raft runtime lock.
     pub fn captureCatalogProjection(
@@ -22884,6 +22935,8 @@ pub const RaftApplyStore = struct {
     fn resolverSourceCurationAllowedTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord, root: std.json.Value) !bool {
         const next = try resolver_curation.metadataFromValue(a, root);
         var previous: ?resolver_curation.Metadata = null;
+        var prior_names: std.StringHashMapUnmanaged(resolver_curation.MetadataIdentity) = .empty;
+        var destinations: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty;
         for (next.identities) |identity| {
             if (identity.dropped or identity.namespace_owned) continue;
             if (previous == null) {
@@ -22893,18 +22946,32 @@ pub const RaftApplyStore = struct {
                     const old = try decodeTableRecord(a, bytes);
                     if (old.indexes_json.len > 0) previous = try resolver_curation.metadataFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, old.indexes_json, .{}));
                 }
+                for (previous.?.identities) |prior| try prior_names.put(a, prior.name, prior);
             }
-            const unchanged = for (previous.?.identities) |prior| {
-                if (std.mem.eql(u8, prior.name, identity.name)) break std.mem.eql(u8, try std.json.Stringify.valueAlloc(a, prior, .{}), try std.json.Stringify.valueAlloc(a, identity, .{}));
-            } else false;
+            const unchanged = if (prior_names.get(identity.name)) |prior|
+                std.mem.eql(u8, try std.json.Stringify.valueAlloc(a, prior, .{}), try std.json.Stringify.valueAlloc(a, identity, .{}))
+            else
+                false;
             if (unchanged) continue;
-            const destination = (try self.resolverDestinationForRecordTxn(a, txn, group_id, identity.table, record)) orelse continue;
+            const entry = try destinations.getOrPut(a, identity.table);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(a, identity.key_template);
+        }
+        // Resolve and parse each destination once. Its catalog/evidence is
+        // released before the next destination; only query identities persist.
+        var targets = destinations.iterator();
+        while (targets.next()) |target| {
+            var scratch_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer scratch_arena.deinit();
+            const scratch = scratch_arena.allocator();
+            const destination = (try self.resolverDestinationForRecordTxn(scratch, txn, group_id, target.key_ptr.*, record)) orelse continue;
             if (destination.indexes_json.len == 0) continue;
-            const namespaces = try resolver_curation.namespacesFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, destination.indexes_json, .{}));
-            for (namespaces.namespaces) |namespace| if (std.mem.eql(u8, namespace.key_template, identity.key_template)) return false;
+            const ownership = try resolver_curation.Ownership.init(scratch, try std.json.parseFromSliceLeaky(std.json.Value, scratch, destination.indexes_json, .{}));
+            for (target.value_ptr.items) |template| if (ownership.owns(template)) return false;
         }
         return true;
     }
+
     fn admittedResolverProjectionTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord) !?metadata.TableRecord {
         if (record.indexes_json.len == 0) return record;
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, record.indexes_json, .{});
@@ -39442,4 +39509,48 @@ test "resolver curation namespace propagation rejects source edits racing adopti
     try std.testing.expect(identities.identities[0].namespace_owned);
     try std.testing.expectEqualStrings("concept/c", identities.identities[0].merges[0].target);
     try std.testing.expectEqualStrings(ordinary.schema_json, current.schema_json);
+}
+
+test "resolver curation namespace propagation rejects source edits racing proposals without losing receipts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/proposal-source-race", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = path });
+    defer store.deinit();
+    const group: u64 = 42;
+    const destination: metadata.TableRecord = .{ .table_id = 1, .name = "entities", .indexes_json = "{}" };
+    const source: metadata.TableRecord = .{ .table_id = 2, .name = "source", .indexes_json =
+        \\{"knowledge":{"type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","promote":false}]}}
+    };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = destination });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = source });
+    const plan = try resolver_curation.planMetadata(a, source.indexes_json, "concepts", .{ .action = .merge, .from = "concept/a", .to = "concept/b" });
+    var replacement = source;
+    replacement.indexes_json = plan.indexes_json;
+    try std.testing.expect(try store.resolverProjectionValid(a, group, replacement));
+    // Destination ownership wins after source admission but before its CAS;
+    // replay has not yet visited the source, so its expected bytes still match.
+    var adopted = destination;
+    const queue = try @import("antfly_resolver").curation.propose(a, .{}, &.{}, .{ .action = .suppress, .key = "concept/a" }, .{});
+    adopted.indexes_json = try std.json.Stringify.valueAlloc(a, .{ ._curation_proposals = queue.state }, .{});
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = destination, .replacement = adopted } });
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(source, (try store.getTable(a, group, 2)).?));
+    try std.testing.expect(!try store.resolverProjectionValid(a, group, replacement));
+    const command = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = source, .replacement = replacement } });
+    var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 9, .index = 1, .entry_type = .normal, .data = command }});
+    outcome.deinit();
+    try std.testing.expect(try store.resolverNamespaceReplacementRejected(a, group, 9, 1, source, replacement));
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(source, (try store.getTable(a, group, 2)).?));
+    // The same source-only CAS remains rejected when replicated again, while
+    // unrelated schema changes still commit without adopting resolver policy.
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = source, .replacement = replacement } });
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(source, (try store.getTable(a, group, 2)).?));
+    var ordinary = source;
+    ordinary.schema_json = "{\"type\":\"object\"}";
+    try std.testing.expect(try store.resolverProjectionValid(a, group, ordinary));
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = source, .replacement = ordinary } });
+    try std.testing.expectEqualStrings(ordinary.schema_json, (try store.getTable(a, group, 2)).?.schema_json);
 }

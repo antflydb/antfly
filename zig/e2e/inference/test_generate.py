@@ -574,6 +574,8 @@ def test_generate_rejects_invalid_tool_choice(api):
 
 def test_generate_with_tools_tool_model(api):
     model = _first_tool_generator_model(api)
+    # The first tool prompt includes schema preparation and a complete decode
+    # before non-streaming headers. Use the same cold-model budget as round-trip.
     r = api.post(
         "/generate",
         json={
@@ -605,6 +607,7 @@ def test_generate_with_tools_tool_model(api):
             ],
             "tool_choice": "required",
         },
+        timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
     _skip_unloadable_tool_model_response(r)
     r.raise_for_status()
@@ -803,11 +806,14 @@ def test_stream_generate_with_tools_tool_model(api):
             "tool_choice": "required",
         },
         stream=True,
+        timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
-    _skip_unloadable_tool_model_response(r)
-    r.raise_for_status()
-    body = r.text
-    r.close()
+    try:
+        _skip_unloadable_tool_model_response(r)
+        r.raise_for_status()
+        body = r.text
+    finally:
+        r.close()
 
     data_lines = [
         line[len("data: ") :] for line in body.splitlines() if line.startswith("data: ")

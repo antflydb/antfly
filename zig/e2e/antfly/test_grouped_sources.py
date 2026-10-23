@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Grouped generation, cross-shard fan-in, and finite prior-context replay."""
 
@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from uuid import uuid4
 
@@ -27,6 +28,59 @@ import pytest
 import requests
 
 from helpers import start_http_server, wait_until
+
+
+# Server ownership is dynamic/direct, outside static fixture inference.
+pytestmark = pytest.mark.e2e_resource("antfly_process")
+
+
+def _write_grouped_fixture(
+    api, table_name, *, inserts=None, deletes=None, sync_level=None, timeout_s=120.0
+):
+    """Retry only idempotent fixture rows until their visibility fence succeeds."""
+    deadline = time.monotonic() + timeout_s
+    observed = {}
+
+    def attempt():
+        nonlocal observed
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            observed = api.batch_write_with_timeout(
+                table_name,
+                inserts=inserts,
+                deletes=deletes,
+                sync_level=sync_level,
+                timeout_s=min(90.0, remaining),
+            )
+        except requests.HTTPError as error:
+            response = error.response
+            # Restarted owners can serve health checks before accepting writes.
+            # Replaying these fixed inserts/deletes is safe even if admission
+            # was ambiguous. Other errors retain the normal polling policy.
+            if (
+                response is not None
+                and response.status_code == 503
+                and response.text.strip() == "write unavailable"
+            ):
+                observed = {"status": "write unavailable"}
+                return False
+            raise
+        assert observed.get("status") != "committed_repair_required", (
+            observed,
+            api.debug_logs()[-16000:],
+        )
+        return (
+            observed.get("status") != "committed_pending"
+            and time.monotonic() <= deadline
+        )
+
+    assert wait_until(attempt, timeout_s=timeout_s, interval_s=0.1), (
+        observed,
+        api.debug_logs()[-16000:],
+    )
+    return observed
 
 
 @pytest.mark.parametrize(
@@ -318,26 +372,7 @@ def test_grouped_generation_orders_prior_context_and_bounds_replay(
             }
 
         def write(table_name, **kwargs):
-            # A committed 202 is an explicit pending visibility outcome. Retry
-            # this idempotent fixture mutation until its barrier is satisfied.
-            observed = {}
-
-            def attempt():
-                nonlocal observed
-                observed = api.batch_write_with_timeout(
-                    table_name, timeout_s=90, **kwargs
-                )
-                assert observed.get("status") != "committed_repair_required", (
-                    observed,
-                    api.debug_logs()[-16000:],
-                )
-                return observed.get("status") != "committed_pending"
-
-            assert wait_until(attempt, timeout_s=120, interval_s=0.1), (
-                observed,
-                api.debug_logs()[-16000:],
-            )
-            return observed
+            return _write_grouped_fixture(api, table_name, **kwargs)
 
         def matching(prefix):
             with lock:
@@ -350,7 +385,10 @@ def test_grouped_generation_orders_prior_context_and_bounds_replay(
             row("bad", "bad", "invalid"),
         ):
             with pytest.raises(requests.HTTPError) as rejected:
-                api.batch_write(table, inserts={"invalid": invalid}, sync_level="write")
+                # The owner may still be opening after DDL. Retry only that
+                # pre-admission unavailability; the first admitted attempt must
+                # reject malformed membership without a durable Raft entry.
+                write(table, inserts={"invalid": invalid}, sync_level="write")
             assert rejected.value.response.status_code == 400, rejected.value
 
         write(

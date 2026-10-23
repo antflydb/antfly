@@ -476,6 +476,10 @@ export interface paths {
          *     response containing details about which key conflicted.
          *
          *     If all versions match, writes are executed atomically via 2PC.
+         *     A 409 with diagnostic code `transaction_outcome_unknown` is different
+         *     from an aborted optimistic conflict: it may already have committed and
+         *     MUST NOT be replayed. A committed 202 result requires observation or
+         *     repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
          *
          *     Stateless clients manage their own read set. For server-managed
          *     read-modify-write workflows, use the transaction session endpoints.
@@ -4096,6 +4100,216 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/curation/proposals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** listCurationProposals */
+        get: operations["listCurationProposals"];
+        put?: never;
+        /** proposeCuration */
+        post: operations["proposeCuration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/curation/proposals/{proposalId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        /** getCurationProposal */
+        get: operations["getCurationProposal"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/curation/proposals/{proposalId}:accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** acceptCurationProposal */
+        post: operations["acceptCurationProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/curation/proposals/{proposalId}:reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** rejectCurationProposal */
+        post: operations["rejectCurationProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}:distinct": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** pinEntitiesDistinct */
+        post: operations["pinEntitiesDistinct"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** listCurationProposals */
+        get: operations["namespaceListCurationProposals"];
+        put?: never;
+        /** proposeCuration */
+        post: operations["namespaceProposeCuration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        /** getCurationProposal */
+        get: operations["namespaceGetCurationProposal"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** acceptCurationProposal */
+        post: operations["namespaceAcceptCurationProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** rejectCurationProposal */
+        post: operations["namespaceRejectCurationProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** pinEntitiesDistinct */
+        post: operations["namespacePinEntitiesDistinct"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/v1/me": {
         parameters: {
             query?: never;
@@ -5129,7 +5343,7 @@ export interface paths {
         put?: never;
         /**
          * Answer named decision questions
-         * @description Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
+         * @description Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items. Hosted typed deciders and qualified constrained generators accept text and images per batch item. Generated native models must support both images and constrained output. Native trained and embedding deciders require text. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
          */
         post: operations["decide"];
         delete?: never;
@@ -5167,6 +5381,50 @@ export interface paths {
          */
         post: operations["extract"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/models/instances": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List model instances
+         * @description Inspect this inference server's shared model cache without loading models or extending idle eviction deadlines. Each incarnation appears once, even when it supports multiple tasks.
+         */
+        get: operations["listModelInstances"];
+        put?: never;
+        /**
+         * Load a model instance
+         * @description Prepare the instance used by the requested task. Reuses an existing compatible instance. Normal idle eviction still applies; loading does not pin weights or guarantee device residency.
+         */
+        post: operations["loadModelInstance"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/models/instances/{instance_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Unload a model instance
+         * @description Evict one exact incarnation from the shared server cache. A stale ID is an idempotent miss and never evicts a replacement. Loading, busy, and startup-managed instances cannot be unloaded.
+         */
+        delete: operations["unloadModelInstance"];
         options?: never;
         head?: never;
         patch?: never;
@@ -5300,6 +5558,40 @@ export interface paths {
          *     predictors and their feature schemas.
          */
         post: operations["predict"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ml/v1/predictors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List predictor feature schemas through the gateway */
+        get: operations["listGatewayPredictors"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/synthesize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Synthesize speech using a named text-to-speech configuration */
+        post: operations["synthesizeSpeech"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5728,12 +6020,6 @@ export interface components {
          */
         SQLRequest: {
             read_requirements?: components["schemas"]["ReadRequirements"];
-            /**
-             * @deprecated
-             * @description Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable write transactions over external sources are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
-             * @enum {string}
-             */
-            lake_visibility?: "committed" | "accepted";
             /** @description A single SQL statement. */
             statement: string;
             /** @description Positional JSON parameter values, including null. */
@@ -6139,10 +6425,10 @@ export interface components {
              */
             retryable: true;
         };
-        /** @description A stable failure envelope for query embedding, reranking, and decision dependencies. */
+        /** @description A stable failure envelope for query execution policy and embedding, reranking, and decision dependencies. */
         QueryDependencyError: {
             /** @enum {string} */
-            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "decision_limit_exceeded" | "invalid_decision_evaluation" | "decision_provider_unavailable" | "decision_rate_limited" | "decision_upstream_failure" | "query_timeout";
+            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "decision_limit_exceeded" | "invalid_decision_evaluation" | "value_verification_requires_scan" | "value_verification_limit_exceeded" | "decision_provider_unavailable" | "decision_rate_limited" | "decision_upstream_failure" | "query_timeout";
             /** @description Legacy alias of code. Use code for programmatic handling. */
             error: string;
             message: string;
@@ -6693,6 +6979,8 @@ export interface components {
          *     }
          */
         EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+            /** @description This named embedder produces sparse index/value vectors. */
+            sparse?: boolean;
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["EmbedderProvider"];
             /**
@@ -6857,20 +7145,30 @@ export interface components {
          *     classify.
          * @enum {string}
          */
-        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "other";
+        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "decider" | "synthesizer" | "predictor" | "other";
         ConnectedModel: {
             /** @description Model identifier as reported by the provider. */
             name: string;
+            /** @description Canonical public gateway identity when available. */
+            id?: string;
+            /** @description Availability observation independent of capability support. */
+            availability?: string;
+            /** @description Whether metadata is configured, live, or cached. */
+            freshness?: string;
             /** @description Human-readable model name when the provider reports one. */
             display_name?: string;
             /** @description Embedding output dimension when known. */
             dimensions?: number;
             /** @description True when this model is referenced by a configured embedder, generator, reranker, or chunker. */
             configured?: boolean;
+            /** @description Inference capabilities advertised by the provider for this model and task. */
+            capabilities?: string[];
+            /** @description Input modalities accepted by the provider's resolved executor. */
+            inputs?: string[];
         };
         InferenceConnection: {
             provider: components["schemas"]["InferenceProviderType"];
-            /** @description Resolved endpoint URL when applicable. */
+            /** @description Transport endpoint. Omitted from public inference discovery to keep server-owned URLs private. */
             url?: string;
             /** @description Cloud region (Bedrock). */
             region?: string;
@@ -7984,11 +8282,44 @@ export interface components {
              */
             replication_sources?: components["schemas"]["ReplicationSource"][];
         };
-        /** @description Public field capability derived from Antfly schema mappings and observed dynamic field metadata. */
+        /**
+         * @description One public logical field with its supported value operations and nested
+         *     concrete representations. Queries name field; Antfly resolves compatible
+         *     representations. Unknown source associations remain explicit diagnostics.
+         */
         FieldCapability: {
+            /** @description Public source or reserved/computed field accepted by queries. Absent for pattern-only templates and unassociated index representations. */
+            field?: string;
+            /**
+             * @description Field origin. Unassociated entries do not assert a document source path.
+             * @enum {string}
+             */
+            kind: "source" | "reserved" | "computed" | "template" | "unassociated";
+            /**
+             * @description Supported logical query operations on field. Equals, contains and matches
+             *     verify original values; autocomplete performs analyzed bool-prefix matching. Availability does not
+             *     attest index coverage or authorize scans. Case sensitivity, execution
+             *     policy and work budgets apply. Reserved/computed/template/unassociated
+             *     entries do not advertise original-document value operations.
+             */
+            value_operations: ("equals" | "contains" | "matches" | "autocomplete")[];
+            /** @description Whether field resolves to one compatible sortable representation. Cold declared fields validate coverage on first exact-sort use; callers do not route through representation names. */
+            sortable: boolean;
+            /**
+             * @description Conservative cached lifecycle for the representation selected by the query resolver. Ambiguous or unavailable routing is unsupported.
+             * @enum {string}
+             */
+            sort_lifecycle_state: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";
+            /** @description True for query-computed score ordering, which requires a score-bearing query. This does not authorize ordering a non-scoring query by _score. */
+            sort_requires_scoring: boolean;
+            /** @description Concrete representations with analyzer, type, legacy query modes and readiness diagnostics. Multiple representations never require clients to reproduce Antfly routing. */
+            representations: components["schemas"]["FieldRepresentation"][];
+        };
+        /** @description Concrete index or reserved-field representation. Diagnostic targets and index-relative query modes are scoped to this representation. */
+        FieldRepresentation: {
             /** @description Mapping or dynamic-template name, when applicable. */
             name?: string;
-            /** @description Concrete query field path when known. Pattern-only dynamic templates may omit this. */
+            /** @description Concrete representation target for diagnostics and advanced index-relative queries. Pattern-only templates may omit this. */
             field?: string;
             /** @description Dynamic-template path_match pattern, when applicable. */
             path_pattern?: string;
@@ -7996,8 +8327,6 @@ export interface components {
             field_pattern?: string;
             /** @description Dynamic-template match_mapping_type, when applicable. */
             match_mapping_type?: string;
-            /** @description Physical emitted field name for schema-derived text fields, when different from the logical path. */
-            emitted_name?: string;
             /** @description Document schema that produced this capability, when applicable. */
             document_schema?: string;
             type: components["schemas"]["AntflyType"];
@@ -8006,7 +8335,7 @@ export interface components {
              *     Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and
              *     `search_as_you_type`; they are not separate schema toggles.
              */
-            query_modes: ("full_text" | "exact" | "range" | "geo" | "autocomplete")[];
+            query_modes: ("full_text" | "exact" | "range" | "geo" | "autocomplete" | "substring")[];
             /**
              * @description Whether this concrete field is declared sortable in the effective
              *     capability model. A cold declared field is validated on first
@@ -8034,6 +8363,10 @@ export interface components {
              * @enum {string}
              */
             index_sort_order?: "asc" | "desc";
+            /** @description Observed or declared doc-value coverage; declaration alone does not establish complete coverage. */
+            doc_value_coverage: string;
+            /** @description Cached execution/readiness state of this representation. Capability inspection does not initiate coverage scans. */
+            queryability_state: string;
         };
         /** @enum {string} */
         AntflyType: "search_as_you_type" | "substring" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
@@ -8057,10 +8390,10 @@ export interface components {
             /** @description PostgreSQL CDC replication sources configured for this table. */
             replication_sources?: components["schemas"]["ReplicationSource"][];
             /**
-             * @description Effective runtime field capabilities for this table. Clients can use this to discover
-             *     concrete field variants and their supported query modes, such as full_text, exact,
-             *     range, geo, and autocomplete. Public exact field sort is supported only for `_id`
-             *     or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
+             * @description Effective logical-field capabilities for this table. Queries use each
+             *     entry's field; concrete types, analyzers and index-relative query modes
+             *     are nested under representations. Declared sortable fields validate
+             *     coverage on first use. Computed _score ordering requires a score-bearing query.
              */
             field_capabilities?: components["schemas"]["FieldCapability"][];
         };
@@ -11344,7 +11677,7 @@ export interface components {
             /** Format: uint64 */
             wal_lsn: number;
         };
-        /** @description Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction snapshot never advances to satisfy a newer receipt. */
+        /** @description Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. A pinned transaction snapshot never advances to satisfy a newer receipt. */
         ReadRequirements: {
             /**
              * @description Accepted includes durable WAL writes; committed reads an Iceberg commit; published reads the search index generation. These are distinct visibility stages.
@@ -11358,32 +11691,42 @@ export interface components {
              */
             wait_ms?: number;
         };
-        LakeReadReceipt: {
-            /** Format: uint64 */
-            table_id: number;
-            /** Format: uint64 */
-            object_generation: number;
-            /** Format: uint64 */
-            wal_lsn: number;
+        /**
+         * @description Execution policy for logical string-value operations. Limits apply to
+         *     verification work per shard request, including repeated leaf evaluations.
+         *     Exhaustion fails explicitly; it never returns a successful partial result.
+         */
+        ValueVerification: {
+            /**
+             * @description Permit logical value verification without an indexed candidate constraint.
+             * @default false
+             */
+            allow_scan?: boolean;
+            /**
+             * Format: int64
+             * @default 100000
+             */
+            max_documents?: number;
+            /**
+             * Format: int64
+             * @default 67108864
+             */
+            max_bytes?: number;
+            /**
+             * Format: int64
+             * @description Bound on the sum of original string bytes multiplied by compiled regex states. Charged before regex evaluation; sensitive literals bypass this work.
+             * @default 100000000
+             */
+            max_regex_work?: number;
         };
-        LakeReadRequirement: {
-            /**
-             * @description Accepted requires current WAL visibility; vector/hybrid reads wait for matching publication. Published explicitly permits the retained archive generation. Applies to native writable Iceberg reads.
-             * @enum {string}
-             */
-            visibility?: "accepted" | "published";
-            through?: components["schemas"]["LakeReadReceipt"];
-            /**
-             * Format: uint32
-             * @description Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
-             */
-            wait_ms?: number;
+        /** @description Execution controls; these affect admitted work, never predicate meaning or read freshness. */
+        QueryExecution: {
+            value_verification?: components["schemas"]["ValueVerification"];
         };
         QueryRequest: {
+            execution?: components["schemas"]["QueryExecution"];
             read_requirements?: components["schemas"]["ReadRequirements"];
-            /** @deprecated */
-            lake_read?: components["schemas"]["LakeReadRequirement"];
-            /** @description Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. */
+            /** @description Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. Also supported when resuming hierarchy.children; its revision-bound ascending position cursor remains required. */
             remote_snapshot?: string;
             evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
@@ -12104,6 +12447,71 @@ export interface components {
          *     when the request sets `profile: true`.
          */
         QueryProfile: {
+            /** @description Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard. */
+            value_verification?: {
+                /** Format: int64 */
+                documents?: number;
+                /** Format: int64 */
+                bytes?: number;
+                /**
+                 * Format: int64
+                 * @description One when every participating shard supplied these verification counters; zero means aggregate coverage is incomplete.
+                 */
+                verification_metrics_version?: number;
+                /**
+                 * Format: int64
+                 * @description Sum of measured provider-read time in microseconds, including admitted source lookup work.
+                 */
+                source_read_us?: number;
+                /**
+                 * Format: int64
+                 * @description Sum of original-value parsing time in microseconds.
+                 */
+                source_parse_us?: number;
+                /**
+                 * Format: int64
+                 * @description Number of completed source read windows.
+                 */
+                source_batches?: number;
+                /**
+                 * Format: int64
+                 * @description Number of required individual source reads.
+                 */
+                source_scalar_reads?: number;
+                /**
+                 * Format: int64
+                 * @description Rows observed while considering projected reads, including rows that require a full-source fallback.
+                 */
+                projected_sources?: number;
+                /**
+                 * Format: int64
+                 * @description Rows actually verified from stored-field projections.
+                 */
+                stored_field_sources?: number;
+                /**
+                 * Format: int64
+                 * @description Source windows refused by allocation admission before bounded fallback.
+                 */
+                batch_refusals?: number;
+                /**
+                 * Format: int64
+                 * @description Largest admitted source-window allocation observed on any participating shard; not process RSS or a sum of concurrent allocations.
+                 */
+                batch_peak_bytes?: number;
+                plans?: {
+                    /** @enum {string} */
+                    operation?: "equals" | "contains" | "matches";
+                    field?: string;
+                    candidate_field?: string | null;
+                    index?: string | null;
+                    /**
+                     * @description Membership proof; lossless_keyword uses literal postings without source loading or synonym expansion. Retained immutable cuts may reuse previously verified original-value membership.
+                     * @enum {string}
+                     */
+                    verification?: "original_value" | "lossless_keyword";
+                    fallback_reason?: string | null;
+                }[];
+            };
             /** @description Shard-level execution statistics. */
             shards?: components["schemas"]["ShardsProfile"];
             /** @description Join execution statistics (present when query used a join). */
@@ -15566,6 +15974,11 @@ export interface components {
             max_rows?: number;
             /** @default 1000000 */
             max_input_tokens?: number;
+            /**
+             * Format: int64
+             * @description Provider/model upper bound on the input-token contribution of one image. Required when sending images through typed hosted or generated deciders, including native generators and image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Generated deciders apply the allowance to the selected generator's shared quota. Omit for text-only deciders.
+             */
+            max_image_input_tokens?: number;
             rate_limit?: components["schemas"]["RateLimitConfig"];
             /** @default 32 */
             batch_size?: number;
@@ -16478,7 +16891,7 @@ export interface components {
              *     and readiness are local to each owning shard, not client-writable.
              */
             relational_indexes?: components["schemas"]["RelationalIndexDefinition"][];
-            /** @description Default type to use from the document_types. */
+            /** @description Default type to use from the document_schemas. */
             default_type?: string;
             /**
              * @description Whether to enforce that documents must match one of the provided document types.
@@ -16573,6 +16986,8 @@ export interface components {
             provider: string;
             /** @description Configured provider model when applicable. */
             model?: string;
+            /** @description Pinned immutable embedding asset and recipe identity. */
+            model_identity?: string;
             models?: string[];
             project_id?: string;
             location?: string;
@@ -18908,6 +19323,64 @@ export interface components {
          * @default 1
          */
         Boost: number | null;
+        /**
+         * @description Whole string equality on the original logical field value.
+         *     No normalization is applied. Case-sensitive by default; case_sensitive=false
+         *     uses Unicode simple case folding, not locale-specific or multi-character folding.
+         *     Missing, null, and non-string values do not match. Arrays use any-element
+         *     semantics; a match never spans array elements. Indexes select conservative
+         *     candidates and original values are verified before counting and pagination.
+         */
+        EqualsQuery: {
+            equals: string;
+            /** @description Logical source field path, not a companion index name. */
+            field: string;
+            /** @default true */
+            case_sensitive?: boolean;
+            boost?: components["schemas"]["Boost"];
+        };
+        /**
+         * @description Contiguous substring search on the original logical field value, including whitespace and punctuation.
+         *     No normalization is applied. Case-sensitive by default; case_sensitive=false
+         *     uses Unicode simple case folding, not locale-specific or multi-character folding.
+         *     Missing, null, and non-string values do not match. Arrays use any-element
+         *     semantics; a match never spans array elements. Indexes select conservative
+         *     candidates and original values are verified before counting and pagination.
+         */
+        ContainsQuery: {
+            contains: string;
+            /** @description Logical source field path, not a companion index name. */
+            field: string;
+            /** @default true */
+            case_sensitive?: boolean;
+            boost?: components["schemas"]["Boost"];
+        };
+        /**
+         * @description Unanchored native Unicode regular expression search on the original logical field value. Anchors refer to each complete value; indexed-term regexp semantics are unchanged.
+         *     No normalization is applied. Case-sensitive by default; case_sensitive=false
+         *     uses Unicode simple case folding, not locale-specific or multi-character folding.
+         *     Missing, null, and non-string values do not match. Arrays use any-element
+         *     semantics; a match never spans array elements. Indexes select conservative
+         *     candidates and original values are verified before counting and pagination.
+         */
+        MatchesQuery: {
+            matches: string;
+            /** @description Logical source field path, not a companion index name. */
+            field: string;
+            /** @default true */
+            case_sensitive?: boolean;
+            boost?: components["schemas"]["Boost"];
+        };
+        /**
+         * @description Analyzed bool-prefix search on a logical field. The planner selects
+         *     declared search-as-you-type root, shingle and prefix representations.
+         *     Requires a compatible representation; never silently becomes raw prefix search.
+         */
+        AutocompleteQuery: {
+            autocomplete: string;
+            field: string;
+            boost?: components["schemas"]["Boost"];
+        };
         TermQuery: {
             term: string;
             field?: string;
@@ -19026,6 +19499,23 @@ export interface components {
             boost?: components["schemas"]["Boost"];
             datetime_parser?: string;
         };
+        BoolQueryClause: components["schemas"]["Query"] | components["schemas"]["Query"][];
+        BoolQueryBody: {
+            must?: components["schemas"]["BoolQueryClause"];
+            should?: components["schemas"]["BoolQueryClause"];
+            must_not?: components["schemas"]["BoolQueryClause"];
+            filter?: components["schemas"]["BoolQueryClause"];
+            /**
+             * Format: uint32
+             * @description Minimum optional clauses required; omission follows the runtime's required-clause defaults.
+             */
+            minimum_should_match?: number;
+            boost?: components["schemas"]["Boost"];
+        };
+        /** @description Canonical Boolean wrapper. Must clauses score; filter clauses constrain without scoring. */
+        BoolQuery: {
+            bool: components["schemas"]["BoolQueryBody"];
+        };
         ConjunctionQuery: {
             conjuncts: components["schemas"]["Query"][];
             boost?: components["schemas"]["Boost"];
@@ -19128,7 +19618,7 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
-        Query: components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
+        Query: components["schemas"]["EqualsQuery"] | components["schemas"]["ContainsQuery"] | components["schemas"]["MatchesQuery"] | components["schemas"]["AutocompleteQuery"] | components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BoolQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
         /**
          * @description Merge strategy for combining results from the semantic_search and full_text_search.
          *     rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
@@ -20261,18 +20751,47 @@ export interface components {
         IndexMaintenanceResponse: {
             acknowledged_groups: string[];
         };
+        /** @description Server-owned provenance. Clients supply actor and reason on writes. Zero time/revision denote legacy records whose creation is unknown. */
+        CurationOrigin: {
+            /** @enum {string} */
+            origin?: "manual" | "adjudicator" | "review" | "cascade" | "config";
+            /** @description UTF-8 client attribution, limited to 256 bytes. */
+            actor?: string;
+            /** @description UTF-8 explanation, limited to 4096 bytes. */
+            reason?: string;
+            /** Format: uint64 */
+            created_at_ms?: number;
+            /** Format: uint64 */
+            revision?: number;
+            proposal_id?: string | null;
+            cascade_from?: string | null;
+        };
         ResolverRedirect: {
             key: string;
             target: string;
+            origin?: components["schemas"]["CurationOrigin"];
+        };
+        CurationSuppressionEntry: {
+            key: string;
+            origin: components["schemas"]["CurationOrigin"];
+        };
+        RuntimeResolverSuppression: {
+            keys?: string[];
+            texts?: string[];
+            /** Format: uint32 */
+            min_text_chars?: number;
+            entries?: components["schemas"]["CurationSuppressionEntry"][];
+            text_entries?: components["schemas"]["CurationSuppressionEntry"][];
         };
         ResolverDistinctPair: {
             from: string;
             to: string;
+            origin?: components["schemas"]["CurationOrigin"];
         };
         ResolverCurationState: {
             /** @enum {integer} */
             version?: 1;
-            suppress?: components["schemas"]["GraphResolverSuppressionConfig"];
+            suppress?: components["schemas"]["RuntimeResolverSuppression"];
             distinct?: components["schemas"]["ResolverDistinctPair"][];
             /** @description Explicitly restored identities; declarative aliases and promotion tombstones cannot recreate the removed redirect. */
             removed_aliases?: string[];
@@ -20451,6 +20970,8 @@ export interface components {
             revision: number;
         };
         ResolverMergeRequest: {
+            actor?: string;
+            reason?: string;
             from: string;
             to: string;
             /** @default false */
@@ -20468,6 +20989,8 @@ export interface components {
             wait?: components["schemas"]["ResolverWait"];
         };
         ResolverUnmergeRequest: {
+            actor?: string;
+            reason?: string;
             /** @default false */
             pin_distinct?: boolean;
             /**
@@ -20479,7 +21002,7 @@ export interface components {
         };
         ResolverSuppressionList: {
             configured: components["schemas"]["GraphResolverSuppressionConfig"];
-            runtime: components["schemas"]["GraphResolverSuppressionConfig"];
+            runtime: components["schemas"]["RuntimeResolverSuppression"];
             /** Format: uint64 */
             revision: number;
         };
@@ -20489,6 +21012,8 @@ export interface components {
         };
         /** @description Add keys or normalized texts. The add/remove form updates both sets in one revision. Runtime removals do not override declarative suppression. */
         ResolverSuppressionRequest: {
+            actor?: string;
+            reason?: string;
             keys?: string[];
             texts?: string[];
             add?: components["schemas"]["ResolverSuppressionSelection"];
@@ -20520,6 +21045,8 @@ export interface components {
             next_cursor?: string | null;
         };
         ResolverReviewDecision: {
+            actor?: string;
+            reason?: string;
             /** @enum {string} */
             decision: "match" | "new" | "suppressed";
             key?: string;
@@ -20545,6 +21072,11 @@ export interface components {
                 };
                 /** Format: uint64 */
                 revision?: number;
+                absorbed?: {
+                    key: string;
+                    /** @enum {string} */
+                    disposition: "release" | "suppress";
+                }[];
                 changed?: boolean;
                 /** Format: uint64 */
                 replay_sequence?: number;
@@ -20558,12 +21090,157 @@ export interface components {
             }[];
         };
         EntityMergeRequest: {
+            /** Format: uint64 */
+            expected_revision?: number;
+            actor?: string;
+            reason?: string;
             into: string;
             /** @default false */
             replace?: boolean;
             /** @default false */
             pin_distinct?: boolean;
             wait?: components["schemas"]["ResolverWait"];
+        };
+        EntitySuppressRequest: {
+            /**
+             * @description Reject absorbed keys, release all transitive redirect sources, or suppress them with cascade provenance. Unsuppress never restores redirects.
+             * @default reject
+             * @enum {string}
+             */
+            absorbed?: "reject" | "release" | "suppress";
+            /**
+             * @description With absorbed=release, pin each released source distinct from the target.
+             * @default false
+             */
+            pin_distinct?: boolean;
+            actor?: string;
+            reason?: string;
+            /** Format: uint64 */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        CurationProposalOptions: {
+            /** @default false */
+            replace?: boolean;
+            /** @default false */
+            pin_distinct?: boolean;
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            absorbed?: "reject" | "release" | "suppress";
+        };
+        CurationProposalRequest: {
+            /** @enum {string} */
+            action: "merge" | "unmerge" | "suppress" | "unsuppress" | "distinct";
+            key: string;
+            into?: string | null;
+            options?: components["schemas"]["CurationProposalOptions"];
+            /** Format: double */
+            confidence?: number | null;
+            /** @description At most 16 KiB, 4096 values and depth 32. */
+            evidence?: {
+                [key: string]: unknown;
+            } | null;
+            actor?: string;
+            reason?: string;
+        };
+        CurationProposal: {
+            id: string;
+            /** @enum {string} */
+            action: "merge" | "unmerge" | "suppress" | "unsuppress" | "distinct";
+            key: string;
+            into?: string | null;
+            options?: components["schemas"]["CurationProposalOptions"];
+            /** Format: double */
+            confidence?: number | null;
+            evidence?: {
+                [key: string]: unknown;
+            } | null;
+            origin: components["schemas"]["CurationOrigin"];
+            /** @enum {string} */
+            state: "open" | "accepted" | "rejected" | "superseded";
+            decided?: components["schemas"]["CurationOrigin"] | null;
+        };
+        CurationProposalPage: {
+            proposals: components["schemas"]["CurationProposal"][];
+            next_cursor?: string | null;
+        };
+        CurationProposalDecisionRequest: {
+            options?: components["schemas"]["CurationProposalOptions"];
+            /**
+             * @description On rejection of a merge, pin the proposed pair distinct in the same commit.
+             * @default false
+             */
+            pin_distinct?: boolean;
+            actor?: string;
+            reason?: string;
+            /** Format: uint64 */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        CurationProposalDecisionResult: {
+            proposal?: components["schemas"]["CurationProposal"];
+            complete?: boolean;
+            changed?: boolean;
+            /** @enum {string} */
+            atomicity?: "namespace" | "resolver";
+            applied?: boolean;
+            results?: {
+                [key: string]: unknown;
+            }[];
+        };
+        EntityDistinctRequest: {
+            /** Format: uint64 */
+            expected_revision?: number;
+            into: string;
+            actor?: string;
+            reason?: string;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        /** @description One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private. */
+        InferenceModelInstance: {
+            /** @description Opaque incarnation identifier; changes after eviction and reload. */
+            id: string;
+            model: string;
+            tasks: components["schemas"]["InferenceModelKind"][];
+            /** @enum {string} */
+            state: "loading" | "loaded";
+            /**
+             * Format: int64
+             * @description Internal owners or loading waiters preventing eviction. This is not a count of HTTP requests.
+             */
+            active_handles: number;
+            startup_managed: boolean;
+            /** @description Whether an unload would be permitted at snapshot time; concurrent use can change this. */
+            unloadable: boolean;
+            /** @enum {string} */
+            unload_blocked_reason?: "loading" | "in_use" | "startup_managed";
+            /** @description Selected execution backend, when known. */
+            backend?: string;
+            /**
+             * @description Weight residency policy; loaded does not imply full device residency.
+             * @enum {string}
+             */
+            residency_mode: "backend_managed" | "streamed" | "resident";
+            /**
+             * Format: int64
+             * @description Elapsed milliseconds since last use, not a wall-clock timestamp.
+             */
+            idle_ms: number;
+        };
+        InferenceModelInstanceList: {
+            /** @enum {string} */
+            object: "list";
+            data: components["schemas"]["InferenceModelInstance"][];
+        };
+        InferenceModelInstanceLoadRequest: {
+            model: string;
+            task: components["schemas"]["InferenceModelKind"];
+        };
+        InferenceModelInstanceUnloadResponse: {
+            /** @enum {string} */
+            outcome: "unloaded" | "already_unloaded";
         };
         InferenceError: {
             /** @description Stable machine-readable error code */
@@ -20636,6 +21313,8 @@ export interface components {
             source_framework?: string;
         };
         InferencePredictorsResponse: {
+            /** @description Whether public inference execution is enabled on this deployment. */
+            public_inference_enabled?: boolean;
             /**
              * @description Response object type.
              * @enum {string}
@@ -20727,7 +21406,7 @@ export interface components {
             data: components["schemas"]["InferenceEmbeddingObject"][];
             /** @description Model used for embedding generation */
             model: string;
-            usage: components["schemas"]["InferenceEmbeddingUsage"];
+            usage?: components["schemas"]["InferenceEmbeddingUsage"];
             /** @description Indexed per-input failures. Only populated when request error_policy is per_item. */
             errors?: components["schemas"]["InferenceEmbeddingItemError"][];
             summary?: components["schemas"]["InferenceEmbeddingBatchSummary"];
@@ -20907,7 +21586,7 @@ export interface components {
             data: components["schemas"]["InferenceRerankObject"][];
             /** @description Name of model used for reranking */
             model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
         };
         InferenceRerankObject: {
             /** @enum {string} */
@@ -21034,7 +21713,7 @@ export interface components {
             data: components["schemas"]["InferenceReadObject"][];
             /** @description Name of model used for reading */
             model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
             /** @description Observed execution path. Omitted by older compatible servers. */
             execution?: components["schemas"]["InferenceBatchExecutionReport"];
         };
@@ -21060,6 +21739,8 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate). */
+            timestamps?: boolean;
             /** @description Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance. */
             diarization?: boolean;
         };
@@ -21073,7 +21754,7 @@ export interface components {
             data: components["schemas"]["InferenceTranscribeObject"][];
             /** @description Name of model used for transcription */
             model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
         };
         InferenceTranscribeObject: {
             /** @enum {string} */
@@ -21121,6 +21802,8 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate). */
+            timestamps?: boolean;
             /**
              * @description Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
              * @example ggml-org/gemma-4-E4B-it-GGUF
@@ -21185,7 +21868,7 @@ export interface components {
             transcript: components["schemas"]["InferenceDictationTranscript"];
             /** @description Cleaned text, or the raw transcript when no cleanup ran. */
             text: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
         };
         /**
          * @description One Server-Sent Event of a streaming dictation. `dictation.transcript`
@@ -21394,7 +22077,7 @@ export interface components {
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
             inputs?: string[];
         };
-        /** @description Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage. */
+        /** @description Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage including reported usage from failed items. Named gateway batches identify the configured model at the top level and resolved models per successful item. */
         InferenceDecideResponse: {
             model: string;
             model_identity?: string;
@@ -21404,6 +22087,8 @@ export interface components {
             usage: components["schemas"]["DecisionUsage"];
         };
         InferenceModelsResponse: {
+            /** @description Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
+            public_inference_enabled?: boolean;
             /**
              * @description OpenAI-compatible response object type.
              * @enum {string}
@@ -21756,7 +22441,8 @@ export interface components {
             model: string;
             /** @description List of completion choices (currently always 1) */
             choices: components["schemas"]["InferenceGenerateChoice"][];
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            /** @description Provider-reported token usage, or null when the provider does not supply it. */
+            usage?: components["schemas"]["InferenceGenerateUsage"] | null;
             speculation?: components["schemas"]["InferenceGenerateSpeculationStatus"] | null;
             context?: components["schemas"]["InferenceContextDiagnostics"];
             /**
@@ -22509,6 +23195,15 @@ export interface components {
             /** @description Total tokens used */
             total_tokens: number;
         };
+        InferenceSynthesisRequest: {
+            /** @description Canonical synthesizers/name target or qualified connection model. */
+            model: string;
+            text: string;
+            voice?: string;
+            /** @enum {string} */
+            format?: "mp3" | "wav" | "opus" | "aac" | "flac" | "pcm";
+            speed?: number;
+        };
         /** @enum {string} */
         PackageKind: "extension";
         /** @description Path-safe extension or package identifier. */
@@ -22835,9 +23530,36 @@ export interface components {
             object: "chunk.embedding.error";
             code: string;
         };
+        DecisionEvidenceText: {
+            /** @enum {string} */
+            type: "input_text";
+            text: string;
+        };
+        DecisionEvidenceImage: {
+            /** @enum {string} */
+            type: "input_image";
+            /** @description Base64 data URL (image/png, image/jpeg, image/webp, image/gif), or a public HTTP(S) URL for OpenAI. Antfly never fetches image URLs for decision adapters. */
+            image_url: string;
+            /**
+             * @default auto
+             * @enum {string}
+             */
+            detail?: "auto" | "low" | "high";
+        };
+        DecisionEvidenceMessage: {
+            /** @enum {string} */
+            type?: "message";
+            /** @enum {string} */
+            role: "user";
+            content: string | (components["schemas"]["DecisionEvidenceText"] | components["schemas"]["DecisionEvidenceImage"])[];
+        };
+        /** @description Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported. */
+        DecisionEvidence: string | components["schemas"]["DecisionEvidenceMessage"][];
         DecisionInput: {
             id?: string;
-            input: string;
+            input: components["schemas"]["DecisionEvidence"];
+            /** @description Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native trained and embedding deciders require text. Generated deciders accept image evidence when the selected generator supports images and constrained output. */
+            context_index?: number;
         };
         /** @description Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text. */
         InferenceDecideLongDocument: {
@@ -22904,12 +23626,19 @@ export interface components {
              */
             dimensions?: 768 | 512 | 256 | 128;
         };
-        /** @description Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
+        /** @description Supply exactly one of input (single evidence item) or inputs (ordered Antfly batch extension; hosted typed deciders also accept multimodal evidence per item). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
         InferenceDecideRequest: {
+            /**
+             * @description Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
+             * @enum {integer}
+             */
+            context_version?: 1;
+            /** @description Shared immutable context strings referenced by context_index. Requires context_version 1. Total expanded input bytes are limited to 16 MiB. */
+            contexts?: string[];
             model: string;
             /** @description Pin the exact EmbeddingGemma 2 assets and embedding recipe. */
             model_identity?: string;
-            input?: string;
+            input?: components["schemas"]["DecisionEvidence"];
             inputs?: components["schemas"]["DecisionInput"][];
             long_document?: components["schemas"]["InferenceDecideLongDocument"];
             questions: components["schemas"]["InferenceDecideQuestion"][];
@@ -22951,7 +23680,7 @@ export interface components {
             /** @enum {string} */
             decision_method: "generated";
             generator: components["schemas"]["GeneratorConfig"];
-            input?: string;
+            input?: components["schemas"]["DecisionEvidence"];
             inputs?: components["schemas"]["DecisionInput"][];
             questions: components["schemas"]["GeneratedDecideQuestion"][];
             instructions?: string;
@@ -23345,8 +24074,10 @@ export interface components {
         DecisionBatchItem: {
             input_index: number;
             id?: string;
-            /** @description Generated batches preserve valid siblings; a failed item has an empty answers array and this error code. */
+            /** @description Named gateway and generated batches preserve valid siblings; a failed item has an empty answers array and this error code. Invalid input or request budgets fail validation before dispatch. */
             error?: string;
+            /** @description Resolved model reported for a successful named gateway batch item. */
+            model?: string;
             answers: components["schemas"]["InferenceDecideAnswer"][];
         };
         DecisionUsage: {
@@ -23357,7 +24088,11 @@ export interface components {
         };
     };
     responses: {
-        /** @description Mutation committed with pending visibility or explicit repair debt */
+        /**
+         * @description Mutation committed with pending visibility or explicit repair debt.
+         *     This is a committed result: observe recovery/repair rather than replaying
+         *     the business mutation. See https://antfly.io/docs/reference/transaction-outcomes.
+         */
         CommittedMutationAccepted: {
             headers: {
                 [name: string]: unknown;
@@ -30871,7 +31606,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+                "application/json": components["schemas"]["EntitySuppressRequest"];
             };
         };
         responses: {
@@ -31990,7 +32725,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+                "application/json": components["schemas"]["EntitySuppressRequest"];
             };
         };
         responses: {
@@ -32116,6 +32851,506 @@ export interface operations {
                 };
                 content?: never;
             };
+        };
+    };
+    listCurationProposals: {
+        parameters: {
+            query?: {
+                state?: string;
+                action?: string;
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    proposeCuration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposal"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposal"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    acceptCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    rejectCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    pinEntitiesDistinct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EntityDistinctRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespaceListCurationProposals: {
+        parameters: {
+            query?: {
+                state?: string;
+                action?: string;
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespaceProposeCuration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposal"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespaceGetCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposal"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespaceAcceptCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespaceRejectCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespacePinEntitiesDistinct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EntityDistinctRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
         };
     };
     getCurrentUser: {
@@ -34846,6 +36081,155 @@ export interface operations {
             503: components["responses"]["TransientCapacity"];
         };
     };
+    listModelInstances: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Loaded and loading model instances */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstanceList"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    loadModelInstance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceModelInstanceLoadRequest"];
+            };
+        };
+        responses: {
+            /** @description Prepared model instance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstance"];
+                };
+            };
+            /** @description Invalid model or unsupported task */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    unloadModelInstance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                instance_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Instance unloaded or already absent */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceModelInstanceUnloadResponse"];
+                };
+            };
+            /** @description Malformed instance ID */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Instance is loading, has active owners, or is managed by startup configuration */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
     listModels: {
         parameters: {
             query?: never;
@@ -35103,6 +36487,101 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["InferenceError"];
                 };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    listGatewayPredictors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Predictor schemas keyed by callable model ID. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferencePredictorsResponse"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    synthesizeSpeech: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceSynthesisRequest"];
+            };
+        };
+        responses: {
+            /** @description Synthesized audio in the requested format; usage is reported only when supplied by the provider. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "audio/mpeg": string;
+                    "audio/wav": string;
+                };
+            };
+            /** @description Invalid or unsupported synthesis options */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Upstream synthesis failure */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {

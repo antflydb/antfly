@@ -7,6 +7,7 @@
     "zig/examples",
     "zig/pkg/antfly-embedded",
     "zig/pkg/antfly-client",
+    "zig/pkg/antfly-grep",
     "zig/pkg/antfly-server-api",
     "zig/pkg/inference",
     "zig/pkg/inference-client",
@@ -21,17 +22,14 @@
     "go/pkg/evalaf",
     "go/pkg/genkit",
     "go/pkg/memoryaf",
-    "go/pkg/operator",
-    "go/pkg/proxy",
     "go/pkg/sdk",
     "scripts",
     "tools",
     "specs",
     "bench",
-    "compat"
-  ],
-  "Elastic-2.0": [
+    "compat",
     "zig/pkg/antfly",
     "zig/e2e/antfly"
-  ]
+  ],
+  "Elastic-2.0": []
 }

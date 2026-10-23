@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Portable quickstart-style E2E tests for antfly-zig."""
 
@@ -2329,6 +2329,53 @@ def test_public_managed_antfly_embeddinggemma2_embedder_smoke(
         interval_s=0.5,
         until="complete",
     )
+
+
+@pytest.mark.real_model
+def test_embeddinggemma2_metadata_changes_preserve_loaded_identity(
+    embeddinggemma2_model_available, real_embeddinggemma2_backup_api
+):
+    """A ctime-only invalidation must revalidate once without poisoning serving."""
+    api = real_embeddinggemma2_backup_api
+    model_dir = embeddinggemma2_model_available
+    warm = api.inference_embed(EMBEDDINGGEMMA2_MODEL, "metadata identity probe")
+    identity = warm["model_identity"]
+    expected = warm["data"][0]["embedding"]
+    weights = model_dir / "model.safetensors"
+    before = weights.stat()
+    link = model_dir / f".identity-revalidation-{time.time_ns()}"
+    try:
+        os.link(weights, link)
+    finally:
+        link.unlink(missing_ok=True)
+    after = weights.stat()
+    assert (before.st_ino, before.st_size, before.st_mtime_ns) == (
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    assert before.st_ctime_ns != after.st_ctime_ns
+
+    # Use independent connections: the fixture's shared Session serializes
+    # callers and would hide concurrent snapshot revalidation failures.
+    def embed(_):
+        response = requests.post(
+            api.url.removesuffix("/db/v1") + "/ai/v1/embed",
+            json={
+                "model": EMBEDDINGGEMMA2_MODEL,
+                "model_identity": identity,
+                "input": "metadata identity probe",
+            },
+            timeout=120,
+        )
+        assert response.ok, (response.status_code, response.text, api.debug_logs())
+        value = response.json()
+        assert value["model_identity"] == identity
+        assert value["data"][0]["embedding"] == pytest.approx(expected)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(embed, range(4)))
+    embed(None)
 
 
 @pytest.mark.real_model

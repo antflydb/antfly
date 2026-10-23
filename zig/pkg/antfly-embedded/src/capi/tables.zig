@@ -18,9 +18,10 @@
 const h = @import("handles.zig");
 const api = @import("db.zig");
 const std = h.std;
-const catalog_key = "\x00antfly/embedded/tables/v1";
-const Record = struct { name: []const u8, id: u64 };
-const Catalog = struct { next_id: u64 = 2, tables: []const Record = &.{} };
+const catalog = @import("../storage/lite/embedded_catalog.zig");
+const catalog_key = catalog.key;
+const Record = catalog.Record;
+const Catalog = catalog.Catalog;
 pub const Table = struct { name: []u8, id: u64, namespace: []u8, db: h.db_mod.DB };
 
 fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
@@ -29,7 +30,7 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     errdefer alloc.destroy(table);
     const owned_name = try alloc.dupe(u8, name);
     errdefer alloc.free(owned_name);
-    const namespace = try std.fmt.allocPrint(alloc, "embedded/tables/{d}", .{id});
+    const namespace = try catalog.namespaceAlloc(alloc, id);
     errdefer alloc.free(namespace);
     const path = if (handle.owned_lite_backend != null)
         try alloc.dupe(u8, handle.embedded_path orelse return error.UnsupportedSqlExecution)
@@ -42,12 +43,17 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     options.identity_namespace = .{ .table_id = id, .shard_id = id, .range_id = id };
     options.prefer_existing_identity_namespace = false;
     options.online_source_authority = .native;
+    // The root restores this namespace's managed providers after open. Do not
+    // start a temporary providerless runtime against a persisted replay tail.
+    if (handle.embedded_native_providers) options.enrichment = null;
     if (handle.owned_lite_backend) |*backend| try backend.configureDbOpenOptionsForNamespace(&options, namespace);
     table.* = .{ .name = owned_name, .id = id, .namespace = namespace, .db = try h.db_mod.DB.open(alloc, path, options) };
     errdefer table.db.close();
+    if (handle.lite_scheduling_owner) |owner|
+        table.db.borrowed_group_source_state = try owner.groupSourceState(&table.db);
     @import("entity_sink.zig").attach(handle, &table.db);
     try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
-    if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startQuarantineRetryWorkerIfNeeded();
+    if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startResidentBackgroundWorkersIfNeeded();
     return table;
 }
 
@@ -199,6 +205,7 @@ pub fn get(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {
 }
 
 pub fn create(handle: *h.Handle, name: []const u8, schema: []const u8, if_not_exists: bool) !void {
+    try api.requireEmbeddedCatalogOwnership(handle);
     @import("sql_ddl.zig").invalidate(handle);
     try requireDatabase(handle);
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.SqlReadOnlyTransaction;
@@ -267,6 +274,7 @@ pub fn publishCreated(handle: *h.Handle) !void {
 }
 
 pub fn drop(handle: *h.Handle, name: []const u8, if_exists: bool) !void {
+    try api.requireEmbeddedCatalogOwnership(handle);
     try requireDatabase(handle);
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.SqlReadOnlyTransaction;
     try load(handle);

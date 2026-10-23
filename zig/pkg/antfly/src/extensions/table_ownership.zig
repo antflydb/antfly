@@ -1,19 +1,20 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
+const index_metadata = @import("antfly_local_sources").api_index_metadata;
 const extension_domain = @import("mod.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -74,7 +75,7 @@ fn collectEnrichmentByName(root: std.json.Value, name: []const u8, found: *?std.
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 try collectEnrichmentByName(entry.value_ptr.*, name, found);
             }
         },
@@ -199,4 +200,15 @@ test "relation mutation ownership streams semantic index checks and preserves sh
     var invalid = Fixture.after;
     invalid.indexes_json = "[]";
     try std.testing.expectError(error.InvalidTableIndexMetadata, DefinitionMutationGuard.init(std.testing.allocator, Fixture.before, invalid));
+}
+
+test "relation mutation ownership ignores opaque evidence enrichments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"_curation_proposals":{"enrichments":"invalid evidence"},"_resolver_curation":{"enrichments":[{"name":"live","field":"fake"}]},"_resolver_namespaces":{"enrichments":false},"index":{"enrichments":[{"name":"live","field":"body"}]}}
+    , .{});
+    const live = (try enrichmentByName(root, "live")).?;
+    try std.testing.expectEqualStrings("body", live.object.get("field").?.string);
 }

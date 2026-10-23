@@ -199,7 +199,8 @@ export async function streamAnswer(
   url: string,
   request: RetrievalAgentRequest,
   headers: Record<string, string> = {},
-  callbacks: AnswerCallbacks
+  callbacks: AnswerCallbacks,
+  options?: { signal?: AbortSignal }
 ): Promise<AbortController> {
   try {
     // Always create a fresh client with the base URL
@@ -259,10 +260,14 @@ export async function streamAnswer(
 
     // Call the retrieval agent endpoint
     if (sdkCallbacks) {
-      return await client.streamRetrievalAgent(retrievalRequest, sdkCallbacks);
+      return await client.streamRetrievalAgent(retrievalRequest, sdkCallbacks, options);
     }
 
-    const result: RetrievalAgentResult = await client.retrievalAgent(retrievalRequest);
+    const result: RetrievalAgentResult = await client.retrievalAgent(
+      retrievalRequest,
+      undefined,
+      options
+    );
     callbacks.onRetrievalAgentResult?.(result);
     callbacks.onComplete?.();
     return new AbortController();

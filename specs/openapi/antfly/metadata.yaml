@@ -1666,7 +1666,6 @@ components:
     SQLRequest:
       type: object
       additionalProperties: false
-      not: {required: [read_requirements, lake_visibility]}
       required: [statement]
       description: |
         Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...),
@@ -1680,11 +1679,6 @@ components:
       properties:
         read_requirements:
           $ref: '#/components/schemas/ReadRequirements'
-        lake_visibility:
-          deprecated: true
-          type: string
-          enum: [committed, accepted]
-          description: Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable write transactions over external sources are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
         statement:
           type: string
           minLength: 1
@@ -2245,7 +2239,7 @@ components:
     QueryDependencyError:
       type: object
       additionalProperties: false
-      description: A stable failure envelope for query embedding, reranking, and decision dependencies.
+      description: A stable failure envelope for query execution policy and embedding, reranking, and decision dependencies.
       required: [code, error, message, retryable]
       properties:
         code:
@@ -2260,6 +2254,8 @@ components:
             - reranker_upstream_failure
             - decision_limit_exceeded
             - invalid_decision_evaluation
+            - value_verification_requires_scan
+            - value_verification_limit_exceeded
             - decision_provider_unavailable
             - decision_rate_limited
             - decision_upstream_failure
@@ -2969,6 +2965,9 @@ components:
         - reader
         - transcriber
         - extractor
+        - decider
+        - synthesizer
+        - predictor
         - other
       description: |
         Model task type. Mirrors the inference registry taxonomy; "other" is
@@ -2982,6 +2981,15 @@ components:
         name:
           type: string
           description: Model identifier as reported by the provider.
+        id:
+          type: string
+          description: Canonical public gateway identity when available.
+        availability:
+          type: string
+          description: Availability observation independent of capability support.
+        freshness:
+          type: string
+          description: Whether metadata is configured, live, or cached.
         display_name:
           type: string
           description: Human-readable model name when the provider reports one.
@@ -2991,6 +2999,16 @@ components:
         configured:
           type: boolean
           description: True when this model is referenced by a configured embedder, generator, reranker, or chunker.
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: Inference capabilities advertised by the provider for this model and task.
+        inputs:
+          type: array
+          items:
+            type: string
+          description: Input modalities accepted by the provider's resolved executor.
     InferenceConnection:
       type: object
       required:
@@ -3000,7 +3018,7 @@ components:
           $ref: "#/components/schemas/InferenceProviderType"
         url:
           type: string
-          description: Resolved endpoint URL when applicable.
+          description: Transport endpoint. Omitted from public inference discovery to keep server-owned URLs private.
         region:
           type: string
           description: Cloud region (Bedrock).
@@ -4619,7 +4637,54 @@ components:
             Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
     FieldCapability:
       type: object
-      description: Public field capability derived from Antfly schema mappings and observed dynamic field metadata.
+      description: |
+        One public logical field with its supported value operations and nested
+        concrete representations. Queries name field; Antfly resolves compatible
+        representations. Unknown source associations remain explicit diagnostics.
+      required:
+        - kind
+        - value_operations
+        - sortable
+        - sort_lifecycle_state
+        - sort_requires_scoring
+        - representations
+      properties:
+        field:
+          type: string
+          description: Public source or reserved/computed field accepted by queries. Absent for pattern-only templates and unassociated index representations.
+        kind:
+          type: string
+          enum: [source, reserved, computed, template, unassociated]
+          description: Field origin. Unassociated entries do not assert a document source path.
+        value_operations:
+          type: array
+          items:
+            type: string
+            enum: [equals, contains, matches, autocomplete]
+          description: |
+            Supported logical query operations on field. Equals, contains and matches
+            verify original values; autocomplete performs analyzed bool-prefix matching. Availability does not
+            attest index coverage or authorize scans. Case sensitivity, execution
+            policy and work budgets apply. Reserved/computed/template/unassociated
+            entries do not advertise original-document value operations.
+        sortable:
+          type: boolean
+          description: Whether field resolves to one compatible sortable representation. Cold declared fields validate coverage on first exact-sort use; callers do not route through representation names.
+        sort_lifecycle_state:
+          type: string
+          enum: [unsupported, declared, indexed, covered, queryable, accelerated]
+          description: Conservative cached lifecycle for the representation selected by the query resolver. Ambiguous or unavailable routing is unsupported.
+        sort_requires_scoring:
+          type: boolean
+          description: True for query-computed score ordering, which requires a score-bearing query. This does not authorize ordering a non-scoring query by _score.
+        representations:
+          type: array
+          items:
+            $ref: "#/components/schemas/FieldRepresentation"
+          description: Concrete representations with analyzer, type, legacy query modes and readiness diagnostics. Multiple representations never require clients to reproduce Antfly routing.
+    FieldRepresentation:
+      type: object
+      description: Concrete index or reserved-field representation. Diagnostic targets and index-relative query modes are scoped to this representation.
       required:
         - type
         - query_modes
@@ -4627,13 +4692,15 @@ components:
         - provenance
         - missing_null_policy
         - sort_lifecycle_state
+        - doc_value_coverage
+        - queryability_state
       properties:
         name:
           type: string
           description: Mapping or dynamic-template name, when applicable.
         field:
           type: string
-          description: Concrete query field path when known. Pattern-only dynamic templates may omit this.
+          description: Concrete representation target for diagnostics and advanced index-relative queries. Pattern-only templates may omit this.
         path_pattern:
           type: string
           description: Dynamic-template path_match pattern, when applicable.
@@ -4643,9 +4710,6 @@ components:
         match_mapping_type:
           type: string
           description: Dynamic-template match_mapping_type, when applicable.
-        emitted_name:
-          type: string
-          description: Physical emitted field name for schema-derived text fields, when different from the logical path.
         document_schema:
           type: string
           description: Document schema that produced this capability, when applicable.
@@ -4655,7 +4719,7 @@ components:
           type: array
           items:
             type: string
-            enum: [full_text, exact, range, geo, autocomplete]
+            enum: [full_text, exact, range, geo, autocomplete, substring]
           description: |
             Query modes supported by this concrete field variant. These modes are derived from
             Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and
@@ -4689,6 +4753,12 @@ components:
             - asc
             - desc
           description: Sort direction in the table index_sort tuple when this field participates.
+        doc_value_coverage:
+          type: string
+          description: Observed or declared doc-value coverage; declaration alone does not establish complete coverage.
+        queryability_state:
+          type: string
+          description: Cached execution/readiness state of this representation. Capability inspection does not initiate coverage scans.
     AntflyType:
       rules:
         no-unused-components: off
@@ -4732,10 +4802,10 @@ components:
         field_capabilities:
           type: array
           description: |
-            Effective runtime field capabilities for this table. Clients can use this to discover
-            concrete field variants and their supported query modes, such as full_text, exact,
-            range, geo, and autocomplete. Public exact field sort is supported only for `_id`
-            or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
+            Effective logical-field capabilities for this table. Queries use each
+            entry's field; concrete types, analyzers and index-relative query modes
+            are nested under representations. Declared sortable fields validate
+            coverage on first use. Computed _score ordering requires a score-bearing query.
           items:
             $ref: "#/components/schemas/FieldCapability"
     TableMigration:
@@ -9433,7 +9503,7 @@ components:
     ReadRequirements:
       type: object
       additionalProperties: false
-      description: Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction snapshot never advances to satisfy a newer receipt.
+      description: Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. A pinned transaction snapshot never advances to satisfy a newer receipt.
       properties:
         visibility:
           type: string
@@ -9448,40 +9518,52 @@ components:
           minimum: 0
           maximum: 60000
           description: Readiness wait budget within the query or statement timeout. Defaults to 5000 ms when requirements are supplied; zero fails immediately if coverage is unavailable.
-    LakeReadReceipt:
+    ValueVerification:
       type: object
       additionalProperties: false
-      required: [table_id, object_generation, wal_lsn]
+      description: |
+        Execution policy for logical string-value operations. Limits apply to
+        verification work per shard request, including repeated leaf evaluations.
+        Exhaustion fails explicitly; it never returns a successful partial result.
       properties:
-        table_id: {type: integer, format: uint64}
-        object_generation: {type: integer, format: uint64}
-        wal_lsn: {type: integer, format: uint64}
-    LakeReadRequirement:
-      type: object
-      additionalProperties: false
-      properties:
-        visibility:
-          type: string
-          enum: [accepted, published]
-          description: Accepted requires current WAL visibility; vector/hybrid reads wait for matching publication. Published explicitly permits the retained archive generation. Applies to native writable Iceberg reads.
-        through:
-          $ref: '#/components/schemas/LakeReadReceipt'
-        wait_ms:
+        allow_scan:
+          type: boolean
+          default: false
+          description: Permit logical value verification without an indexed candidate constraint.
+        max_documents:
           type: integer
-          format: uint32
-          minimum: 0
-          maximum: 60000
-          description: Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
+          format: int64
+          minimum: 1
+          default: 100000
+        max_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 67108864
+        max_regex_work:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 100000000
+          description: Bound on the sum of original string bytes multiplied by compiled regex states. Charged before regex evaluation; sensitive literals bypass this work.
+    QueryExecution:
+      type: object
+      additionalProperties: false
+      description: Execution controls; these affect admitted work, never predicate meaning or read freshness.
+      properties:
+        value_verification:
+          $ref: '#/components/schemas/ValueVerification'
     QueryRequest: # Based on remoteindex.Query
       type: object
       not:
         anyOf:
-          - required: [read_requirements, lake_read]
+          - required: [lake_read]
+          - required: [lake_visibility]
+          - required: [value_search_execution]
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required: [hierarchy]
                 properties:
-
                   hierarchy:
                     required: [group_by]
               - not:
@@ -9582,16 +9664,15 @@ components:
                   - required: [evaluate]
                   - required: [join]
                   - required: [foreign_sources]
-                  - required: [remote_snapshot]
+                  - required: [execution]
       properties:
+        execution:
+          $ref: "#/components/schemas/QueryExecution"
         read_requirements:
           $ref: '#/components/schemas/ReadRequirements'
-        lake_read:
-          deprecated: true
-          $ref: '#/components/schemas/LakeReadRequirement'
         remote_snapshot:
           type: string
-          description: Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
+          description: Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. Also supported when resuming hierarchy.children; its revision-bound ascending position cursor remains required.
         evaluate:
           $ref: "#/components/schemas/QueryEvaluation"
         table_target:
@@ -10411,6 +10492,84 @@ components:
         Detailed execution profiling for a query. Present in the response
         when the request sets `profile: true`.
       properties:
+        value_verification:
+          type: object
+          description: Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard.
+          properties:
+            documents:
+              type: integer
+              format: int64
+            bytes:
+              type: integer
+              format: int64
+            verification_metrics_version:
+              type: integer
+              format: int64
+              minimum: 0
+              description: One when every participating shard supplied these verification counters; zero means aggregate coverage is incomplete.
+            source_read_us:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Sum of measured provider-read time in microseconds, including admitted source lookup work.
+            source_parse_us:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Sum of original-value parsing time in microseconds.
+            source_batches:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Number of completed source read windows.
+            source_scalar_reads:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Number of required individual source reads.
+            projected_sources:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Rows observed while considering projected reads, including rows that require a full-source fallback.
+            stored_field_sources:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Rows actually verified from stored-field projections.
+            batch_refusals:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Source windows refused by allocation admission before bounded fallback.
+            batch_peak_bytes:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Largest admitted source-window allocation observed on any participating shard; not process RSS or a sum of concurrent allocations.
+            plans:
+              type: array
+              items:
+                type: object
+                properties:
+                  operation:
+                    type: string
+                    enum: [equals, contains, matches]
+                  field:
+                    type: string
+                  candidate_field:
+                    type: string
+                    nullable: true
+                  index:
+                    type: string
+                    nullable: true
+                  verification:
+                    type: string
+                    description: Membership proof; lossless_keyword uses literal postings without source loading or synonym expansion. Retained immutable cuts may reuse previously verified original-value membership.
+                    enum: [original_value, lossless_keyword]
+                  fallback_reason:
+                    type: string
+                    nullable: true
         shards:
           $ref: "#/components/schemas/ShardsProfile"
           description: Shard-level execution statistics.
@@ -11764,7 +11923,10 @@ components:
             navigate into decoded JSONB columns.
   responses: # Add reusable responses
     CommittedMutationAccepted:
-      description: Mutation committed with pending visibility or explicit repair debt
+      description: |
+        Mutation committed with pending visibility or explicit repair debt.
+        This is a committed result: observe recovery/repair rather than replaying
+        the business mutation. See https://antfly.io/docs/reference/transaction-outcomes.
       content:
         application/json:
           schema:
@@ -12894,6 +13056,10 @@ paths:
         response containing details about which key conflicted.
 
         If all versions match, writes are executed atomically via 2PC.
+        A 409 with diagnostic code `transaction_outcome_unknown` is different
+        from an aborted optimistic conflict: it may already have committed and
+        MUST NOT be replayed. A committed 202 result requires observation or
+        repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
 
         Stateless clients manage their own read set. For server-managed
         read-modify-write workflows, use the transaction session endpoints.
@@ -19143,7 +19309,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+              $ref: "resolvers.yaml#/components/schemas/EntitySuppressRequest"
       responses:
         "200":
           description: Completed result
@@ -20117,7 +20283,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+              $ref: "resolvers.yaml#/components/schemas/EntitySuppressRequest"
       responses:
         "200":
           description: Completed result
@@ -20214,3 +20380,449 @@ paths:
           description: Resolver owner is busy; retry with backoff
         "503":
           description: Metadata or storage owner is unavailable; retry is safe
+
+  /tables/{tableName}/curation/proposals:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: proposeCuration
+      tags: [resolver_curation]
+      summary: proposeCuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposal"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    get:
+      operationId: listCurationProposals
+      tags: [resolver_curation]
+      summary: listCurationProposals
+      parameters:
+        - name: state
+          in: query
+          schema: {type: string}
+        - name: action
+          in: query
+          schema: {type: string}
+        - name: cursor
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/curation/proposals/{proposalId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: getCurationProposal
+      tags: [resolver_curation]
+      summary: getCurationProposal
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposal"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/curation/proposals/{proposalId}:accept:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: acceptCurationProposal
+      tags: [resolver_curation]
+      summary: acceptCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/curation/proposals/{proposalId}:reject:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: rejectCurationProposal
+      tags: [resolver_curation]
+      summary: rejectCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/entities/{key}:distinct:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: pinEntitiesDistinct
+      tags: [resolver_curation]
+      summary: pinEntitiesDistinct
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/EntityDistinctRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/EntityCurationResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/EntityCurationResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceProposeCuration
+      tags: [resolver_curation]
+      summary: proposeCuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposal"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    get:
+      operationId: namespaceListCurationProposals
+      tags: [resolver_curation]
+      summary: listCurationProposals
+      parameters:
+        - name: state
+          in: query
+          schema: {type: string}
+        - name: action
+          in: query
+          schema: {type: string}
+        - name: cursor
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: namespaceGetCurationProposal
+      tags: [resolver_curation]
+      summary: getCurationProposal
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposal"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceAcceptCurationProposal
+      tags: [resolver_curation]
+      summary: acceptCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceRejectCurationProposal
+      tags: [resolver_curation]
+      summary: rejectCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespacePinEntitiesDistinct
+      tags: [resolver_curation]
+      summary: pinEntitiesDistinct
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/EntityDistinctRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/EntityCurationResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/EntityCurationResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"

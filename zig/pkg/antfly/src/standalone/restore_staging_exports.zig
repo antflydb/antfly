@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const bridge = @import("restore_staging_bridge.zig");
@@ -62,4 +62,17 @@ pub fn destroy(handle: *anyopaque) callconv(.c) void {
     const allocator = state.allocator;
     state.staged.deinit(allocator);
     allocator.destroy(state);
+}
+
+pub fn inspect(context: *const bridge.InspectContext) callconv(.c) c_int {
+    context.result_ptr.* = null;
+    context.result_len.* = 0;
+    const destination = if (context.destination_ptr) |ptr| ptr[0..context.destination_len] else null;
+    const json = @import("backup_inspection.zig").inspectInputJsonAlloc(std.heap.c_allocator, context.input_ptr[0..context.input_len], destination, .{ .max_input_bytes = context.max_input_bytes, .max_expanded_bytes = context.max_expanded_bytes }) catch |err| return if (err == error.OutOfMemory) bridge.Status.out_of_memory else bridge.Status.invalid_arguments;
+    context.result_ptr.* = json.ptr;
+    context.result_len.* = json.len;
+    return bridge.Status.ok;
+}
+pub fn freeInspection(ptr: [*]u8, len: usize) callconv(.c) void {
+    std.heap.c_allocator.free(ptr[0..len]);
 }

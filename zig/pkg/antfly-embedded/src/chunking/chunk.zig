@@ -17,6 +17,45 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
+/// Borrowed model-chunker input. Parsing never reads a source or decodes the
+/// inline payload, so runtime execution and offline inspection share the same
+/// source-reference contract without allocating binary media.
+pub const ModelSource = union(enum) {
+    none,
+    text: []const u8,
+    source: @import("inference_chunker").SourceReference,
+    media: struct { mime_type: []const u8, data: []const u8 },
+};
+
+pub fn modelSourceFromValue(field: std.json.Value) !ModelSource {
+    if (field == .null) return .none;
+    if (field == .string) return .{ .text = field.string };
+    if (field != .object) return error.InvalidChunkSource;
+    const kind = field.object.get("type") orelse return error.InvalidChunkSource;
+    if (kind == .string and std.mem.eql(u8, kind.string, "source")) {
+        const uri = field.object.get("uri") orelse return error.InvalidChunkSource;
+        const mime = field.object.get("mime_type") orelse return error.InvalidChunkSource;
+        const version = field.object.get("version") orelse return error.InvalidChunkSource;
+        const length = field.object.get("length") orelse return error.InvalidChunkSource;
+        if (uri != .string or mime != .string or version != .string or length != .integer or length.integer <= 0 or mime.string.len == 0) return error.InvalidChunkSource;
+        var reference = @import("inference_chunker").SourceReference{ .uri = uri.string, .mime_type = mime.string, .version = version.string, .length = @intCast(length.integer) };
+        if (field.object.get("version_kind")) |value| {
+            if (value != .string) return error.InvalidChunkSource;
+            reference.version_kind = std.meta.stringToEnum(@TypeOf(reference.version_kind), value.string) orelse return error.InvalidChunkSource;
+        }
+        _ = try @import("antfly_source_reference").validateReference(reference.uri, reference.version, switch (reference.version_kind) {
+            .strong_etag => .strong_etag,
+            .s3_version_id => .s3_version_id,
+        }, reference.length);
+        return .{ .source = reference };
+    }
+    if (kind != .string or !std.mem.eql(u8, kind.string, "media")) return error.InvalidChunkSource;
+    const mime = field.object.get("mime_type") orelse return error.InvalidChunkSource;
+    const data = field.object.get("data") orelse return error.InvalidChunkSource;
+    if (mime != .string or data != .string or mime.string.len == 0) return error.InvalidChunkSource;
+    return .{ .media = .{ .mime_type = mime.string, .data = data.string } };
+}
+
 pub const Chunk = struct {
     chunk_id: u32,
     mime_type: []const u8 = "text/plain",

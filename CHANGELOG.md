@@ -32,6 +32,9 @@ All notable changes to Antfly will be documented in this file.
   overlapping paint sequences, already-grouped columns, and vertically separated
   layouts. Resolve indirect CCITT decode parameters, accept valid zero-filled
   Group 3 line markers, and correct PNG compression-buffer ownership.
+- **Symbolic Type1 PDF fonts** — fill missing one-byte Unicode mappings from an
+  embedded font's built-in encoding when the PDF has no explicit encoding.
+  Preserve explicit Unicode mappings and recognize TeX delimiter-size suffixes.
 - **Durable OCR grounding** — preserve compatible Reader regions as UTF-8 byte
   spans and page-space boxes, including rotated pages and CropBox offsets.
   Invalid regions no longer discard valid text or shift later repeated text

@@ -1,206 +1,133 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.antfly_type import AntflyType
-from ..models.field_capability_index_sort_order import FieldCapabilityIndexSortOrder
-from ..models.field_capability_query_modes_item import FieldCapabilityQueryModesItem
+from ..models.field_capability_kind import FieldCapabilityKind
 from ..models.field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
+from ..models.field_capability_value_operations_item import FieldCapabilityValueOperationsItem
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.field_representation import FieldRepresentation
+
 
 T = TypeVar("T", bound="FieldCapability")
 
 
 @_attrs_define
 class FieldCapability:
-    """Public field capability derived from Antfly schema mappings and observed dynamic field metadata.
+    """One public logical field with its supported value operations and nested
+    concrete representations. Queries name field; Antfly resolves compatible
+    representations. Unknown source associations remain explicit diagnostics.
 
-    Attributes:
-        type_ (AntflyType):
-        query_modes (list[FieldCapabilityQueryModesItem]): Query modes supported by this concrete field variant. These
-            modes are derived from
-            Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and
-            `search_as_you_type`; they are not separate schema toggles.
-        sortable (bool): Whether this concrete field is declared sortable in the effective
-            capability model. A cold declared field is validated on first
-            exact order_by use; clients do not need to poll lifecycle status.
-        provenance (str): Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
-        missing_null_policy (str): Current missing/null handling policy for this field.
-        sort_lifecycle_state (FieldCapabilitySortLifecycleState): Cached operational lifecycle state for exact sort use.
-            Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native
-            coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
-        name (str | Unset): Mapping or dynamic-template name, when applicable.
-        field (str | Unset): Concrete query field path when known. Pattern-only dynamic templates may omit this.
-        path_pattern (str | Unset): Dynamic-template path_match pattern, when applicable.
-        field_pattern (str | Unset): Dynamic-template match pattern, when applicable.
-        match_mapping_type (str | Unset): Dynamic-template match_mapping_type, when applicable.
-        emitted_name (str | Unset): Physical emitted field name for schema-derived text fields, when different from the
-            logical path.
-        document_schema (str | Unset): Document schema that produced this capability, when applicable.
-        analyzer (str | Unset): Analyzer name for text/searchable fields, when applicable.
-        index_sort_position (int | Unset): Zero-based position in the table index_sort tuple when this field
-            participates.
-        index_sort_order (FieldCapabilityIndexSortOrder | Unset): Sort direction in the table index_sort tuple when this
-            field participates.
+        Attributes:
+            kind (FieldCapabilityKind): Field origin. Unassociated entries do not assert a document source path.
+            value_operations (list[FieldCapabilityValueOperationsItem]): Supported logical query operations on field.
+                Equals, contains and matches
+                verify original values; autocomplete performs analyzed bool-prefix matching. Availability does not
+                attest index coverage or authorize scans. Case sensitivity, execution
+                policy and work budgets apply. Reserved/computed/template/unassociated
+                entries do not advertise original-document value operations.
+            sortable (bool): Whether field resolves to one compatible sortable representation. Cold declared fields validate
+                coverage on first exact-sort use; callers do not route through representation names.
+            sort_lifecycle_state (FieldCapabilitySortLifecycleState): Conservative cached lifecycle for the representation
+                selected by the query resolver. Ambiguous or unavailable routing is unsupported.
+            sort_requires_scoring (bool): True for query-computed score ordering, which requires a score-bearing query. This
+                does not authorize ordering a non-scoring query by _score.
+            representations (list[FieldRepresentation]): Concrete representations with analyzer, type, legacy query modes
+                and readiness diagnostics. Multiple representations never require clients to reproduce Antfly routing.
+            field (str | Unset): Public source or reserved/computed field accepted by queries. Absent for pattern-only
+                templates and unassociated index representations.
     """
 
-    type_: AntflyType
-    query_modes: list[FieldCapabilityQueryModesItem]
+    kind: FieldCapabilityKind
+    value_operations: list[FieldCapabilityValueOperationsItem]
     sortable: bool
-    provenance: str
-    missing_null_policy: str
     sort_lifecycle_state: FieldCapabilitySortLifecycleState
-    name: str | Unset = UNSET
+    sort_requires_scoring: bool
+    representations: list[FieldRepresentation]
     field: str | Unset = UNSET
-    path_pattern: str | Unset = UNSET
-    field_pattern: str | Unset = UNSET
-    match_mapping_type: str | Unset = UNSET
-    emitted_name: str | Unset = UNSET
-    document_schema: str | Unset = UNSET
-    analyzer: str | Unset = UNSET
-    index_sort_position: int | Unset = UNSET
-    index_sort_order: FieldCapabilityIndexSortOrder | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        type_ = self.type_.value
+        kind = self.kind.value
 
-        query_modes = []
-        for query_modes_item_data in self.query_modes:
-            query_modes_item = query_modes_item_data.value
-            query_modes.append(query_modes_item)
+        value_operations = []
+        for value_operations_item_data in self.value_operations:
+            value_operations_item = value_operations_item_data.value
+            value_operations.append(value_operations_item)
 
         sortable = self.sortable
 
-        provenance = self.provenance
-
-        missing_null_policy = self.missing_null_policy
-
         sort_lifecycle_state = self.sort_lifecycle_state.value
 
-        name = self.name
+        sort_requires_scoring = self.sort_requires_scoring
+
+        representations = []
+        for representations_item_data in self.representations:
+            representations_item = representations_item_data.to_dict()
+            representations.append(representations_item)
 
         field = self.field
-
-        path_pattern = self.path_pattern
-
-        field_pattern = self.field_pattern
-
-        match_mapping_type = self.match_mapping_type
-
-        emitted_name = self.emitted_name
-
-        document_schema = self.document_schema
-
-        analyzer = self.analyzer
-
-        index_sort_position = self.index_sort_position
-
-        index_sort_order: str | Unset = UNSET
-        if not isinstance(self.index_sort_order, Unset):
-            index_sort_order = self.index_sort_order.value
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "type": type_,
-                "query_modes": query_modes,
+                "kind": kind,
+                "value_operations": value_operations,
                 "sortable": sortable,
-                "provenance": provenance,
-                "missing_null_policy": missing_null_policy,
                 "sort_lifecycle_state": sort_lifecycle_state,
+                "sort_requires_scoring": sort_requires_scoring,
+                "representations": representations,
             }
         )
-        if name is not UNSET:
-            field_dict["name"] = name
         if field is not UNSET:
             field_dict["field"] = field
-        if path_pattern is not UNSET:
-            field_dict["path_pattern"] = path_pattern
-        if field_pattern is not UNSET:
-            field_dict["field_pattern"] = field_pattern
-        if match_mapping_type is not UNSET:
-            field_dict["match_mapping_type"] = match_mapping_type
-        if emitted_name is not UNSET:
-            field_dict["emitted_name"] = emitted_name
-        if document_schema is not UNSET:
-            field_dict["document_schema"] = document_schema
-        if analyzer is not UNSET:
-            field_dict["analyzer"] = analyzer
-        if index_sort_position is not UNSET:
-            field_dict["index_sort_position"] = index_sort_position
-        if index_sort_order is not UNSET:
-            field_dict["index_sort_order"] = index_sort_order
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.field_representation import FieldRepresentation
+
         d = dict(src_dict)
-        type_ = AntflyType(d.pop("type"))
+        kind = FieldCapabilityKind(d.pop("kind"))
 
-        query_modes = []
-        _query_modes = d.pop("query_modes")
-        for query_modes_item_data in _query_modes:
-            query_modes_item = FieldCapabilityQueryModesItem(query_modes_item_data)
+        value_operations = []
+        _value_operations = d.pop("value_operations")
+        for value_operations_item_data in _value_operations:
+            value_operations_item = FieldCapabilityValueOperationsItem(value_operations_item_data)
 
-            query_modes.append(query_modes_item)
+            value_operations.append(value_operations_item)
 
         sortable = d.pop("sortable")
 
-        provenance = d.pop("provenance")
-
-        missing_null_policy = d.pop("missing_null_policy")
-
         sort_lifecycle_state = FieldCapabilitySortLifecycleState(d.pop("sort_lifecycle_state"))
 
-        name = d.pop("name", UNSET)
+        sort_requires_scoring = d.pop("sort_requires_scoring")
+
+        representations = []
+        _representations = d.pop("representations")
+        for representations_item_data in _representations:
+            representations_item = FieldRepresentation.from_dict(representations_item_data)
+
+            representations.append(representations_item)
 
         field = d.pop("field", UNSET)
 
-        path_pattern = d.pop("path_pattern", UNSET)
-
-        field_pattern = d.pop("field_pattern", UNSET)
-
-        match_mapping_type = d.pop("match_mapping_type", UNSET)
-
-        emitted_name = d.pop("emitted_name", UNSET)
-
-        document_schema = d.pop("document_schema", UNSET)
-
-        analyzer = d.pop("analyzer", UNSET)
-
-        index_sort_position = d.pop("index_sort_position", UNSET)
-
-        _index_sort_order = d.pop("index_sort_order", UNSET)
-        index_sort_order: FieldCapabilityIndexSortOrder | Unset
-        if isinstance(_index_sort_order, Unset):
-            index_sort_order = UNSET
-        else:
-            index_sort_order = FieldCapabilityIndexSortOrder(_index_sort_order)
-
         field_capability = cls(
-            type_=type_,
-            query_modes=query_modes,
+            kind=kind,
+            value_operations=value_operations,
             sortable=sortable,
-            provenance=provenance,
-            missing_null_policy=missing_null_policy,
             sort_lifecycle_state=sort_lifecycle_state,
-            name=name,
+            sort_requires_scoring=sort_requires_scoring,
+            representations=representations,
             field=field,
-            path_pattern=path_pattern,
-            field_pattern=field_pattern,
-            match_mapping_type=match_mapping_type,
-            emitted_name=emitted_name,
-            document_schema=document_schema,
-            analyzer=analyzer,
-            index_sort_position=index_sort_position,
-            index_sort_order=index_sort_order,
         )
 
         field_capability.additional_properties = d

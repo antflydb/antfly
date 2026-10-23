@@ -642,3 +642,46 @@ test "linked incremental-only source is installed without a whole-body fallback"
     try std.testing.expect(request.body == null);
     try std.testing.expectError(error.BodySourceUnavailable, context.body());
 }
+
+test "runtime HTTP body source preserves incremental reads without materializing" {
+    const std = @import("std");
+    const Source = struct {
+        offset: usize = 0,
+        fn all(_: ?*anyopaque) !?[]const u8 {
+            return error.UnexpectedMaterialization;
+        }
+        fn read(raw: ?*anyopaque, dest: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const bytes = "audio";
+            const n = @min(dest.len, bytes.len - self.offset);
+            @memcpy(dest[0..n], bytes[self.offset..][0..n]);
+            self.offset += n;
+            return n;
+        }
+    };
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "http://localhost/stream");
+    defer request.deinit();
+    var outer = httpx.Context.init(a, std.testing.io, &request);
+    defer outer.deinit();
+    var source: Source = .{};
+    outer.body_delegate = .{ .ptr = &source, .read_all = Source.all, .read = Source.read, .streaming = true };
+    var transport = Outbound{ .context = &outer };
+    const body_source = transport.bodySource();
+    var inner_request = try httpx.Request.init(a, .POST, "http://localhost/stream");
+    defer inner_request.deinit();
+    var inner = httpx.Context.init(a, std.testing.io, &inner_request);
+    defer inner.deinit();
+    const cancellation: abi.CancellationView = .{};
+    const stream: abi.StreamSink = .{};
+    installInbound(&inner, &cancellation, &body_source, &stream);
+    try std.testing.expect(inner.hasStreamingRequestBody());
+    var reader = inner.requestBodyReader();
+    var bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try reader.read(&bytes));
+    try std.testing.expectEqualStrings("aud", &bytes);
+    try std.testing.expectEqual(@as(usize, 2), try reader.read(&bytes));
+    try std.testing.expectEqualStrings("io", bytes[0..2]);
+    try std.testing.expectEqual(@as(usize, 0), try reader.read(&bytes));
+    try std.testing.expect(inner.request.body == null);
+}

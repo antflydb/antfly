@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const httpx = @import("httpx");
@@ -247,7 +247,7 @@ test "audio runtime activates configured transcribing and synthesizing providers
     try std.testing.expect(synthesizing.getActiveRuntime() != prev_tts or prev_tts == null);
 }
 
-test "audio runtime rolls back globals when a later provider fails to load" {
+test "audio runtime rolls back globals when a later provider default is invalid" {
     const alloc = std.testing.allocator;
     var io = std.Io.Threaded.init(alloc, .{});
     defer io.deinit();
@@ -265,14 +265,17 @@ test "audio runtime rolls back globals when a later provider fails to load" {
         .api_url = "http://127.0.0.1:9090",
         .model = "vopr-stt",
     });
-    try cfg.text_to_speech.registerConfig("unsupported-later", .{
+    try cfg.text_to_speech.registerConfig("valid-later", .{
         .provider = .elevenlabs,
         .voice_id = "vopr-voice",
     });
 
+    // ElevenLabs is supported. Fail after both registries have loaded by
+    // selecting a missing default, without relying on provider support.
+    cfg.text_to_speech.default_provider = "missing-provider";
     const previous_stt = transcribing.getActiveRuntime();
     const previous_tts = synthesizing.getActiveRuntime();
-    try std.testing.expectError(error.UnsupportedSynthesizingProvider, ActiveRuntime.init(alloc, io.io(), &cfg));
+    try std.testing.expectError(error.UnknownSynthesizingProvider, ActiveRuntime.init(alloc, io.io(), &cfg));
     try std.testing.expect(transcribing.getActiveRuntime() == previous_stt);
     try std.testing.expect(synthesizing.getActiveRuntime() == previous_tts);
 }

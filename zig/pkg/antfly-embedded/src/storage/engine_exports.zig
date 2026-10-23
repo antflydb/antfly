@@ -154,6 +154,14 @@ fn finishBackgroundGraphReplacement(self: *DB, name: []const u8, generation: u64
     return .{ .value = self.finishBackgroundGraphReplacement(name, generation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn runUntilIdleWithGroupSourceState(self: *DB, state: *DB.GroupSourceMaintenanceState) engine.Outcome(void) {
+    return .{ .value = self.runUntilIdleWithGroupSourceState(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn runGroupSourceMaintenanceSlice(self: *DB, state: *DB.GroupSourceMaintenanceState) engine.Outcome(bool) {
+    return .{ .value = self.runGroupSourceMaintenanceSlice(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, shadow: bool) engine.Outcome(bool) {
     return .{ .value = self.runBackgroundTurnWithCancellation(cancellation, shadow) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -259,6 +267,11 @@ fn ensureTransactionRecoveryRuntime(self: *DB, cfg: @import("db/maintenance/tran
 
 fn activateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
     return .{ .value = self.activateResolverReplayRuntimes() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn deactivateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
+    self.deactivateResolverReplayRuntimes();
+    return .{ .value = {} };
 }
 
 fn batchPrepared(self: *DB.PreparedBatchOwner, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions, memo: *@import("db/execution_resources.zig").GeneratedEmbeddingMemo, allocator: *@import("db/execution_resources.zig").PreparedRowAllocator) engine.Outcome(void) {
@@ -2094,6 +2107,10 @@ const aggregation_descriptor: aggregation_contract.Descriptor = .{
 fn getAggregationDescriptor() callconv(.c) *const aggregation_contract.Descriptor {
     return &aggregation_descriptor;
 }
+fn getCAllocator() callconv(.c) ?*const Allocator {
+    if (comptime @import("builtin").link_libc) return &std.heap.c_allocator;
+    return null;
+}
 fn getDescriptor() callconv(.c) *const engine.Descriptor {
     return &descriptor;
 }
@@ -2112,4 +2129,5 @@ comptime {
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
     @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v28", .visibility = .hidden });
+    @export(&getCAllocator, .{ .name = "antfly_storage_engine_c_allocator_v1", .visibility = .hidden });
 }

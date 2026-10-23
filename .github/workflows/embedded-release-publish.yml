@@ -37,6 +37,7 @@ jobs:
       npm_tag: ${{ steps.identity.outputs.npm_tag }}
       tag: ${{ steps.identity.outputs.tag }}
       publish: ${{ steps.identity.outputs.publish }}
+      build_run_id: ${{ steps.producer.outputs.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -96,7 +97,7 @@ jobs:
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: ${{ steps.identity.outputs.publish == 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && steps.identity.outputs.publish == 'true' }}
         with:
           name: antfly-embedded-package-snapshot
           path: dist/lite-snapshot
@@ -104,7 +105,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: ${{ steps.identity.outputs.publish == 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && steps.identity.outputs.publish == 'true' }}
         with:
           pattern: antfly-zig-*
           merge-multiple: true
@@ -113,7 +114,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify hashes, product license, and archive equivalence
-        if: ${{ steps.identity.outputs.publish == 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && steps.identity.outputs.publish == 'true' }}
         run: |
           python scripts/release/lite_snapshot.py verify \
             --snapshot-dir dist/lite-snapshot \
@@ -132,16 +133,41 @@ jobs:
             --npm-tag "${{ steps.identity.outputs.npm_tag }}"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: ${{ steps.identity.outputs.publish == 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && steps.identity.outputs.publish == 'true' }}
         with:
           name: verified-antfly-embedded-snapshot
           path: dist/lite-snapshot/
           if-no-files-found: error
 
+  dispatch-publication:
+    name: Dispatch validated embedded publication
+    needs: prepare
+    # crates.io rejects OIDC tokens issued to workflow_run jobs. Handoff to a
+    # fresh main-branch workflow_dispatch after authenticating the build source.
+    if: ${{ github.event_name == 'workflow_run' && needs.prepare.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-github-cli
+      - name: Dispatch publisher on main with immutable inputs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          BUILD_RUN_ID: ${{ needs.prepare.outputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          gh workflow run embedded-release-publish.yml \
+            --repo "$GITHUB_REPOSITORY" --ref main \
+            -f "tag_name=$RELEASE_TAG" -f "build_run_id=$BUILD_RUN_ID"
+
   prepare-cargo:
     name: Build and preflight immutable embedded crates
     needs: prepare
-    if: ${{ needs.prepare.outputs.publish == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     outputs:
       has_packages: ${{ steps.packages.outputs.has_packages }}
@@ -187,7 +213,7 @@ jobs:
   publish-cargo:
     name: Publish embedded crates to crates.io
     needs: [prepare, prepare-cargo]
-    if: ${{ needs.prepare.outputs.publish == 'true' && needs.prepare-cargo.outputs.has_packages == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.publish == 'true' && needs.prepare-cargo.outputs.has_packages == 'true' }}
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
@@ -220,7 +246,7 @@ jobs:
   publish-pypi:
     name: Publish antfly-embedded wheels to PyPI
     needs: [prepare, prepare-cargo]
-    if: ${{ needs.prepare.outputs.publish == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -268,7 +294,7 @@ jobs:
   publish-npm:
     name: Publish @antfly/embedded packages to npm
     needs: [prepare, prepare-cargo]
-    if: ${{ needs.prepare.outputs.publish == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.publish == 'true' }}
     concurrency:
       group: embedded-npm-publication
       cancel-in-progress: false

@@ -99,15 +99,8 @@ pub const Control = struct {
     ptr: ?*anyopaque = null,
     check: ?*const fn (?*anyopaque) anyerror!void = null,
     event: ?*const fn (?*anyopaque, Payload) anyerror!void = null,
-    /// Invoked only on the caller's task, while call() owns the borrowed input.
-    /// The remote handler pulls at most one bounded chunk at a time.
+    /// Runs concurrently with event/check callbacks; must honor Io cancellation.
     read_body: ?*const fn (?*anyopaque, []u8) anyerror!usize = null,
-};
-
-const BodyRead = struct {
-    destination: []u8,
-    ready: std.Io.Event = .unset,
-    count: ?usize = null,
 };
 
 pub const Request = struct {
@@ -115,44 +108,56 @@ pub const Request = struct {
     id: u64,
     payload: OwnedPayload,
     cancelled: std.atomic.Value(bool) = .init(false),
-    body_read: ?*BodyRead = null,
+    body_ready: std.Io.Event = .unset,
+    body_waiting: bool = false,
     body_eof: bool = false,
+    body_received: bool = false,
+    body_failed: bool = false,
+    body_len: usize = 0,
+    body_buffer: [16384]u8 = undefined,
 
-    /// A pull-based body stream, independent of the ordinary buffered payload
-    /// limit. Callers must enforce their route's cumulative transfer ceiling.
-    pub fn readBody(self: *Request, destination: []u8) !usize {
-        if (destination.len == 0) return 0;
+    /// Pull one bounded upload chunk. At most one chunk can be in flight;
+    /// response events continue through the existing independently read pipe.
+    pub fn readBody(self: *Request, dest: []u8) !usize {
+        if (dest.len == 0) return 0;
         try check(self);
-        if (self.body_eof) return 0;
-        var read: BodyRead = .{ .destination = destination[0..@min(destination.len, max_frame_bytes)] };
-        self.endpoint.mutex.lockUncancelable(self.endpoint.io);
-        if (self.body_read != null) {
-            self.endpoint.mutex.unlock(self.endpoint.io);
-            return error.ConcurrentBodyRead;
+        const endpoint = self.endpoint;
+        endpoint.mutex.lockUncancelable(endpoint.io);
+        if (self.body_eof) {
+            endpoint.mutex.unlock(endpoint.io);
+            return 0;
         }
-        self.body_read = &read;
-        self.endpoint.mutex.unlock(self.endpoint.io);
+        if (self.body_waiting) {
+            endpoint.mutex.unlock(endpoint.io);
+            return error.InvalidWorkerFrame;
+        }
+        self.body_waiting = true;
+        self.body_received = false;
+        self.body_ready.reset();
+        endpoint.mutex.unlock(endpoint.io);
         defer {
-            self.endpoint.mutex.lockUncancelable(self.endpoint.io);
-            self.body_read = null;
-            self.endpoint.mutex.unlock(self.endpoint.io);
+            endpoint.mutex.lockUncancelable(endpoint.io);
+            self.body_waiting = false;
+            endpoint.mutex.unlock(endpoint.io);
         }
         var capacity: [4]u8 = undefined;
-        std.mem.writeInt(u32, &capacity, @intCast(read.destination.len), .little);
-        try self.endpoint.sendFrame(.body_read, self.id, &capacity);
+        std.mem.writeInt(u32, &capacity, @intCast(@min(dest.len, self.body_buffer.len)), .little);
+        try endpoint.sendFrame(.body_read, self.id, &capacity);
         while (true) {
             try check(self);
-            self.endpoint.mutex.lockUncancelable(self.endpoint.io);
-            const count = read.count;
-            const closed = self.endpoint.closed.load(.acquire);
-            if (count == null) read.ready.reset();
-            self.endpoint.mutex.unlock(self.endpoint.io);
-            if (closed) return error.InferenceWorkerUnavailable;
-            if (count) |n| {
-                self.body_eof = n == 0;
-                return n;
+            endpoint.mutex.lockUncancelable(endpoint.io);
+            if (self.body_received) {
+                defer endpoint.mutex.unlock(endpoint.io);
+                if (self.body_failed) return error.BodyReadFailed;
+                if (self.body_len > dest.len) return error.InvalidWorkerFrame;
+                @memcpy(dest[0..self.body_len], self.body_buffer[0..self.body_len]);
+                self.body_eof = self.body_len == 0;
+                return self.body_len;
             }
-            try self.endpoint.waitTick(&read.ready);
+            const closed = endpoint.closed.load(.acquire);
+            endpoint.mutex.unlock(endpoint.io);
+            if (closed) return error.InferenceWorkerUnavailable;
+            try endpoint.waitTick(&self.body_ready);
         }
     }
 
@@ -183,7 +188,6 @@ pub const Request = struct {
 const Message = struct { kind: MessageKind, payload: OwnedPayload };
 const Pending = struct {
     body_capacity: ?usize = null,
-    body_busy: bool = false,
     ready: std.Io.Event = .unset,
     terminal: ?Failure = null,
     messages: std.ArrayListUnmanaged(Message) = .empty,
@@ -193,6 +197,28 @@ const Offer = struct {
     accepted: bool = false,
 };
 const Assembly = struct { kind: MessageKind, request_id: u64, payload: OwnedPayload, received: usize = 0 };
+
+/// One request-scoped upload read. The dispatch loop remains responsive to
+/// deadlines, terminal replies and response events while the source is idle.
+/// Publication uses the endpoint mutex; cancellation always joins the reader
+/// before the caller releases its source or pending request storage.
+const BodyRead = struct {
+    group: std.Io.Group = .init,
+    active: bool = false,
+    result: ?anyerror!usize = null,
+    bytes: [16385]u8 = undefined,
+
+    fn run(self: *BodyRead, endpoint: *Endpoint, pending: *Pending, control: Control, capacity: usize) std.Io.Cancelable!void {
+        const result = if (control.read_body) |read|
+            read(control.ptr, self.bytes[1..][0..capacity])
+        else
+            error.BodySourceUnavailable;
+        endpoint.mutex.lockUncancelable(endpoint.io);
+        defer endpoint.mutex.unlock(endpoint.io);
+        self.result = if (result) |count| if (count <= capacity) count else error.InvalidBodyReadCount else |err| err;
+        pending.ready.set(endpoint.io);
+    }
+};
 
 pub const Endpoint = struct {
     alloc: std.mem.Allocator,
@@ -317,34 +343,40 @@ pub const Endpoint = struct {
             pending.messages.deinit(self.alloc);
             self.mutex.unlock(self.io);
         }
+        var body_read: BodyRead = .{};
+        defer body_read.group.cancel(self.io);
         errdefer self.sendFrame(.cancel, id, "") catch {};
         try self.sendMessage(.request, id, payload, control);
         while (true) {
             if (control.check) |check| try check(control.ptr);
             self.mutex.lockUncancelable(self.io);
+            // Terminal replies and response events take priority over upload
+            // progress, including a source that completed at the same instant.
             const message: ?Message = if (pending.messages.items.len > 0) pending.messages.orderedRemove(0) else null;
+            const body_result = if (message == null) body_read.result else null;
+            if (body_result != null) body_read.result = null;
             const closed = self.closed.load(.acquire);
             const terminal = pending.terminal;
-            const body_capacity = if (message == null) pending.body_capacity else null;
-            if (message == null) pending.body_capacity = null;
-            if (message == null and body_capacity == null) pending.ready.reset();
+            const body_capacity = if (message == null and body_result == null) pending.body_capacity else null;
+            if (body_capacity != null) pending.body_capacity = null;
+            if (message == null and body_capacity == null and body_result == null) pending.ready.reset();
             self.mutex.unlock(self.io);
-            if (body_capacity) |capacity| {
-                // The callback runs synchronously on the original caller. No
-                // background task can retain its HTTP reader after call exits.
+            if (message == null) {
+                if (terminal) |failure| return if (failure == .capacity) error.ResourceTemporarilyUnavailable else error.InferenceWorkerRequestFailed;
                 if (closed) return error.InferenceWorkerUnavailable;
-                if (terminal != null) return error.InferenceWorkerRequestFailed;
-                var buffer: [max_frame_bytes]u8 = undefined;
-                const read = control.read_body orelse return error.BodySourceUnavailable;
-                const count = try read(control.ptr, buffer[0..capacity]);
-                if (count > capacity) return error.InvalidBodyReadCount;
-                if (control.check) |check| try check(control.ptr);
-                self.mutex.lockUncancelable(self.io);
-                pending.body_busy = false;
-                self.mutex.unlock(self.io);
-                try self.sendFrame(.body_chunk, id, buffer[0..count]);
             }
-            if (message) |item| {
+            if (body_result) |result| {
+                try body_read.group.await(self.io);
+                body_read.active = false;
+                if (result) |count| {
+                    body_read.bytes[0] = 0;
+                    try self.sendFrame(.body_chunk, id, body_read.bytes[0 .. count + 1]);
+                } else |err| {
+                    // Preserve source errors (including upload ceilings) on the
+                    // caller and cancel only this request. The reader is joined.
+                    return err;
+                }
+            } else if (message) |item| {
                 switch (item.kind) {
                     .response => return item.payload,
                     .event => {
@@ -353,9 +385,11 @@ pub const Endpoint = struct {
                     },
                     .request => unreachable,
                 }
+            } else if (body_capacity) |capacity| {
+                if (body_read.active) return error.InvalidWorkerFrame;
+                body_read.active = true;
+                try body_read.group.concurrent(self.io, BodyRead.run, .{ &body_read, self, &pending, control, capacity });
             } else {
-                if (terminal) |failure| return if (failure == .capacity) error.ResourceTemporarilyUnavailable else error.InferenceWorkerRequestFailed;
-                if (closed) return error.InferenceWorkerUnavailable;
                 try self.waitTick(&pending.ready);
             }
         }
@@ -488,7 +522,7 @@ pub const Endpoint = struct {
         defer self.writer_mutex.unlock(self.io);
         if (self.closed.load(.acquire)) return error.InferenceWorkerUnavailable;
         var header: [header_len]u8 = undefined;
-        @memcpy(header[0..4], "AFW3");
+        @memcpy(header[0..4], "AFW4");
         header[4] = @backingInt(kind);
         std.mem.writeInt(u64, header[5..13], id, .little);
         std.mem.writeInt(u32, header[13..17], @intCast(payload.len), .little);
@@ -537,7 +571,7 @@ pub const Endpoint = struct {
         while (true) {
             var header: [header_len]u8 = undefined;
             try self.readExact(&header);
-            if (!std.mem.eql(u8, header[0..4], "AFW3")) return error.InvalidWorkerFrame;
+            if (!std.mem.eql(u8, header[0..4], "AFW4")) return error.InvalidWorkerFrame;
             const kind = std.enums.fromInt(Kind, header[4]) orelse return error.InvalidWorkerFrame;
             const id = std.mem.readInt(u64, header[5..13], .little);
             const length = std.mem.readInt(u32, header[13..17], .little);
@@ -550,27 +584,26 @@ pub const Endpoint = struct {
                 .body_read => {
                     if (length != 4) return error.InvalidWorkerFrame;
                     const capacity = std.mem.readInt(u32, bytes[0..4], .little);
-                    if (capacity == 0 or capacity > max_frame_bytes) return error.InvalidWorkerFrame;
+                    if (capacity == 0 or capacity > 16384) return error.InvalidWorkerFrame;
                     if (self.pending.get(id)) |pending| {
-                        if (pending.body_busy) return error.InvalidWorkerFrame;
-                        pending.body_busy = true;
+                        if (pending.body_capacity != null) return error.InvalidWorkerFrame;
                         pending.body_capacity = capacity;
                         pending.ready.set(self.io);
                     } else {
-                        // The caller may have canceled just before this pull.
                         try self.replyOffer(.cancel, id);
                     }
                 },
                 .body_chunk => {
+                    if (length == 0 or length > 16385 or bytes[0] > 1) return error.InvalidWorkerFrame;
                     if (self.active.get(id)) |request| {
                         if (request.cancelled.load(.acquire)) continue;
-                        const read = request.body_read orelse return error.InvalidWorkerFrame;
-                        if (read.count != null or length > read.destination.len) return error.InvalidWorkerFrame;
-                        @memcpy(read.destination[0..length], bytes);
-                        read.count = length;
-                        read.ready.set(self.io);
+                        if (!request.body_waiting or request.body_received) return error.InvalidWorkerFrame;
+                        request.body_len = bytes.len - 1;
+                        @memcpy(request.body_buffer[0..request.body_len], bytes[1..]);
+                        request.body_failed = bytes[0] != 0;
+                        request.body_received = true;
+                        request.body_ready.set(self.io);
                     }
-                    // A late chunk after request cancellation owns no storage.
                 },
                 .resource_request => {
                     if (self.resource_handler == null or length == 0 or length > max_resource_bytes)
@@ -754,6 +787,49 @@ const TestPair = struct {
     fn handle(raw: *anyopaque, request: *Request) !OwnedPayload {
         const self: *TestPair = @ptrCast(@alignCast(raw));
         _ = self.handled.fetchAdd(1, .monotonic);
+        if (std.mem.eql(u8, request.payload.view().body, "duplex")) {
+            try request.event(.{ .body = "opening" });
+            var chunk: [4]u8 = undefined;
+            const n = try request.readBody(&chunk);
+            try request.event(.{ .body = chunk[0..n] });
+            if (try request.readBody(&chunk) != 0) return error.InvalidWorkerFrame;
+            return request.endpoint.copyPayload(.{ .body = "complete" });
+        }
+        if (std.mem.eql(u8, request.payload.view().body, "idle-upload")) {
+            const Heartbeat = struct {
+                fn run(pair: *TestPair, req: *Request) std.Io.Cancelable!void {
+                    try pair.cancel_seen.wait(std.testing.io);
+                    req.event(.{ .body = "heartbeat" }) catch {};
+                }
+            };
+            var group: std.Io.Group = .init;
+            defer group.cancel(std.testing.io);
+            try group.concurrent(std.testing.io, Heartbeat.run, .{ self, request });
+            var chunk: [4]u8 = undefined;
+            _ = try request.readBody(&chunk);
+            try group.await(std.testing.io);
+            return request.endpoint.copyPayload(.{ .body = "complete" });
+        }
+        if (std.mem.eql(u8, request.payload.view().body, "early-upload")) {
+            const Reader = struct {
+                fn run(req: *Request) std.Io.Cancelable!void {
+                    var chunk: [4]u8 = undefined;
+                    _ = req.readBody(&chunk) catch {};
+                }
+            };
+            var group: std.Io.Group = .init;
+            defer group.cancel(std.testing.io);
+            try group.concurrent(std.testing.io, Reader.run, .{request});
+            try self.cancel_seen.wait(std.testing.io);
+            return request.endpoint.copyPayload(.{ .body = "early" });
+        }
+        if (std.mem.eql(u8, request.payload.view().body, "blocked-upload")) {
+            var chunk: [4]u8 = undefined;
+            _ = request.readBody(&chunk) catch |err| {
+                self.cancel_seen.set(std.testing.io);
+                return err;
+            };
+        }
         if (std.mem.eql(u8, request.payload.view().body, "nested"))
             return request.endpoint.call(.{ .body = "echo" }, .{});
         if (std.mem.eql(u8, request.payload.view().body, "cancel")) {
@@ -1218,17 +1294,17 @@ test "inference worker concurrent resource callbacks route replies by ID" {
 const PullFixture = struct {
     remaining: usize,
     sent: usize = 0,
-    reads: usize = 0,
+    reads: std.atomic.Value(usize) = .init(0),
     fail_at: usize = std.math.maxInt(usize),
     cancel_after: usize = std.math.maxInt(usize),
     oversized: bool = false,
 
     fn read(raw: ?*anyopaque, destination: []u8) !usize {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
-        if (self.reads == self.fail_at) return error.TestBodyReadFailed;
-        self.reads += 1;
+        if (self.reads.load(.acquire) == self.fail_at) return error.TestBodyReadFailed;
+        const reads = self.reads.fetchAdd(1, .acq_rel) + 1;
         if (self.oversized) return destination.len + 1;
-        const n = @min(self.remaining, destination.len, if (self.reads == 3) @as(usize, 7) else max_frame_bytes);
+        const n = @min(self.remaining, destination.len, if (reads == 3) @as(usize, 7) else max_frame_bytes);
         for (destination[0..n], 0..) |*byte, i| byte.* = @truncate((self.sent + i) *% 31);
         self.sent += n;
         self.remaining -= n;
@@ -1236,7 +1312,7 @@ const PullFixture = struct {
     }
     fn check(raw: ?*anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
-        if (self.reads >= self.cancel_after) return error.Cancelled;
+        if (self.reads.load(.acquire) >= self.cancel_after) return error.Cancelled;
     }
     fn handler(_: *anyopaque, request: *Request) !OwnedPayload {
         var buffer: [max_frame_bytes]u8 = undefined;
@@ -1268,7 +1344,7 @@ test "inference worker pull body exceeds buffered limit with bounded chunks and 
     defer response.deinit();
     try std.testing.expectEqual(@as(u64, size), std.mem.readInt(u64, response.view().body[0..8], .little));
     try std.testing.expectEqual(size, source.sent);
-    try std.testing.expect(source.reads > 1024);
+    try std.testing.expect(source.reads.load(.acquire) > 1024);
     pair.child.mutex.lockUncancelable(pair.child.io);
     const peak_retained_now = pair.child.retained_bytes;
     pair.child.mutex.unlock(pair.child.io);
@@ -1449,5 +1525,107 @@ test "inference worker streaming events wait for receive credit and remain cance
         try std.testing.expectEqual(@as(usize, 0), retained_bytes);
         try std.testing.expect(!pair.parent.closed.load(.acquire));
         try std.testing.expect(!pair.child.closed.load(.acquire));
+    }
+}
+
+test "inference worker RPC pulls bounded audio while response events remain incremental" {
+    const Capture = struct {
+        events: usize = 0,
+        reads: usize = 0,
+        fn event(raw: ?*anyopaque, payload: Payload) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqualStrings(if (self.events == 0) "opening" else "pcm!", payload.body);
+            self.events += 1;
+        }
+        fn read(raw: ?*anyopaque, dest: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(self.reads + 1, self.events);
+            self.reads += 1;
+            if (self.reads > 1) return 0;
+            try std.testing.expectEqual(@as(usize, 4), dest.len);
+            @memcpy(dest, "pcm!");
+            return dest.len;
+        }
+    };
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    var capture: Capture = .{};
+    const response = try pair.parent.call(.{ .body = "duplex" }, .{ .ptr = &capture, .event = Capture.event, .read_body = Capture.read });
+    defer response.deinit();
+    try std.testing.expectEqualStrings("complete", response.view().body);
+    try std.testing.expectEqual(@as(usize, 2), capture.events);
+    try std.testing.expectEqual(@as(usize, 2), capture.reads);
+}
+
+test "inference worker blocked upload honors deadline and joins source before returning" {
+    const Source = struct {
+        started: std.atomic.Value(i64) = .init(0),
+        stopped: std.atomic.Value(bool) = .init(false),
+        fn now() i64 {
+            return @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds);
+        }
+        fn read(raw: ?*anyopaque, _: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.started.store(now(), .release);
+            defer self.stopped.store(true, .release);
+            try std.testing.io.sleep(.fromSeconds(10), .awake);
+            return 0;
+        }
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const started = self.started.load(.acquire);
+            if (started != 0 and now() - started >= 50 * std.time.ns_per_ms) return error.Timeout;
+        }
+    };
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    var source: Source = .{};
+    try std.testing.expectError(error.Timeout, pair.parent.call(.{ .body = "blocked-upload" }, .{
+        .ptr = &source,
+        .check = Source.check,
+        .read_body = Source.read,
+    }));
+    try std.testing.expect(source.stopped.load(.acquire));
+    try std.testing.expect(Source.now() - source.started.load(.acquire) < std.time.ns_per_s);
+    try pair.cancel_seen.wait(std.testing.io);
+    const response = try pair.parent.call(.{ .body = "echo" }, .{});
+    defer response.deinit();
+    try std.testing.expectEqualStrings("echo", response.view().body);
+}
+
+test "inference worker idle uploads allow response events and early terminal replies" {
+    const Source = struct {
+        pair: *TestPair,
+        release: std.Io.Event = .unset,
+        stopped: std.atomic.Value(bool) = .init(false),
+        deadline: i64,
+        fn read(raw: ?*anyopaque, _: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            defer self.stopped.store(true, .release);
+            self.pair.cancel_seen.set(std.testing.io);
+            try self.release.wait(std.testing.io);
+            return 0;
+        }
+        fn event(raw: ?*anyopaque, payload: Payload) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqualStrings("heartbeat", payload.body);
+            self.release.set(std.testing.io);
+        }
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= self.deadline) return error.Timeout;
+        }
+    };
+    for ([_][]const u8{ "idle-upload", "early-upload" }) |operation| {
+        var pair: TestPair = undefined;
+        try pair.init();
+        defer pair.deinit();
+        var source: Source = .{ .pair = &pair, .deadline = @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds + std.time.ns_per_s) };
+        const response = try pair.parent.call(.{ .body = operation }, .{ .ptr = &source, .check = Source.check, .event = Source.event, .read_body = Source.read });
+        defer response.deinit();
+        try std.testing.expectEqualStrings(if (std.mem.eql(u8, operation, "idle-upload")) "complete" else "early", response.view().body);
+        try std.testing.expect(source.stopped.load(.acquire));
     }
 }

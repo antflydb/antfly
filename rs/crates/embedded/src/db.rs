@@ -617,6 +617,59 @@ impl Database {
         })
     }
 
+    /// Propose an entity correction; repeated action and keys retain the existing decision.
+    pub fn propose_curation_json(&self, table: &str, request: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+        self.with_input_output(request.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_propose_curation_json(h, borrow_slice(table.as_bytes()), input, out)
+        })
+    }
+
+    /// List the persistent entity review queue with bounded keyset pagination.
+    pub fn list_curation_proposals_json(
+        &self,
+        table: &str,
+        request: impl AsRef<[u8]>,
+    ) -> Result<Vec<u8>> {
+        self.with_input_output(request.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_list_curation_proposals_json(
+                h,
+                borrow_slice(table.as_bytes()),
+                input,
+                out,
+            )
+        })
+    }
+
+    /// Inspect a persistent proposal by its stable identifier.
+    pub fn get_curation_proposal_json(&self, table: &str, id: &str) -> Result<Vec<u8>> {
+        self.read_buffer(|h, out| unsafe {
+            sys::antfly_db_get_curation_proposal_json(
+                h,
+                borrow_slice(table.as_bytes()),
+                borrow_slice(id.as_bytes()),
+                out,
+            )
+        })
+    }
+
+    /// Accept or reject a proposal; retry incomplete fanout to resume durable receipts.
+    pub fn decide_curation_proposal_json(
+        &self,
+        table: &str,
+        id: &str,
+        request: impl AsRef<[u8]>,
+    ) -> Result<Vec<u8>> {
+        self.with_input_output(request.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_decide_curation_proposal_json(
+                h,
+                borrow_slice(table.as_bytes()),
+                borrow_slice(id.as_bytes()),
+                input,
+                out,
+            )
+        })
+    }
+
     /// Fan out a correction across resolver namespaces targeting this entity.
     pub fn curate_entity_json(
         &self,

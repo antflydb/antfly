@@ -1770,10 +1770,11 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, "\x00\x00__metadata__:indexes") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers") or
+        std.mem.eql(u8, key, @import("antfly_resolver").curation.proposal_store_key) or
         std.mem.eql(u8, key, resolver_catalog.minimum_reader_key) or
         std.mem.eql(u8, key, resolver_catalog.merge_catalog_key) or
         std.mem.eql(u8, key, @import("db/promotion_runtime.zig").source_identity_key) or
-        std.mem.startsWith(u8, key, @import("db/resolver_curation.zig").drop_marker_prefix);
+        std.mem.startsWith(u8, key, resolver_catalog.drop_marker_prefix);
 }
 
 /// True only for durable keys that a validated portable import may create.
@@ -2268,12 +2269,16 @@ fn PortableArchiveReader(comptime RawReader: type) type {
         }
 
         pub fn readBlock(self: *Self, alloc: Allocator) !backup_codec.Block {
+            return self.readBlockLimited(alloc, backup_codec.max_block_payload_bytes);
+        }
+
+        pub fn readBlockLimited(self: *Self, alloc: Allocator, max_bytes: usize) !backup_codec.Block {
             if (self.header.format_version == backup_codec.legacy_format_version)
-                return try self.raw.readBlock(alloc);
+                return try self.raw.readBlockLimited(alloc, max_bytes);
             if (self.done) return error.EndOfStream;
 
             if (self.manifest_pending) {
-                const manifest_block = try self.raw.readBlock(alloc);
+                const manifest_block = try self.raw.readBlockLimited(alloc, max_bytes);
                 errdefer alloc.free(manifest_block.payload);
                 if (manifest_block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
                 var manifest = try backup_bundle.parseManifest(alloc, manifest_block.payload);
@@ -2303,6 +2308,7 @@ fn PortableArchiveReader(comptime RawReader: type) type {
             const manifest = &(self.manifest orelse return error.InvalidBackupManifest).value;
             if (self.next_ordinal >= manifest.objects.len) return error.IncompleteBackupInventory;
             const descriptor = manifest.objects[self.next_ordinal];
+            if (descriptor.size_bytes > max_bytes) return error.BackupExpansionLimitExceeded;
             const blob_index = backup_bundle.blobIndex(manifest.blobs, descriptor.sha256) orelse
                 return error.IncompleteBackupInventory;
             try self.ensureIndex(alloc);
@@ -2876,8 +2882,11 @@ pub fn validatePortable(alloc: Allocator, data: []const u8) !void {
 }
 
 pub const FileInspectionOptions = struct {
+    metadata_first: bool = false,
     max_input_bytes: u64 = 64 * 1024 * 1024 * 1024,
     max_logical_bytes: u64 = 128 * 1024 * 1024 * 1024,
+    max_metadata_bytes: usize = std.math.maxInt(usize),
+    max_document_bytes: usize = std.math.maxInt(usize),
     cancellation: @import("antfly_cancellation").CancellationToken = .none,
 };
 
@@ -2887,6 +2896,48 @@ pub const FileInspection = struct {
     logical_bytes: u64,
     fingerprint: backup_codec.FileReader.Fingerprint,
 };
+
+/// Logical document decoding for read-only visitors. Uses the restore reader's
+/// bounded schema cache and spool, including historical relational row layouts.
+/// Only feed blocks authenticated by inspectPortableFileBlocks.
+pub const InspectionDocumentDecoder = struct {
+    archive: PortableArchiveValidation = .{ .format_version = 2, .min_afb_reader = backup_bundle.afb_reader_version },
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.archive.deinit(alloc);
+    }
+
+    pub fn metadataLimited(self: *@This(), alloc: Allocator, payload: []const u8, max_bytes: usize) !void {
+        const reader = try backup_codec.KeyValueBatchReader.init(payload);
+        try reader.checkEntryLimit(max_bytes);
+        try validateMetadataBatchPayload(alloc, payload, &self.archive);
+    }
+
+    /// Enforce the logical output budget before retaining document JSON.
+    pub fn documentJsonLimitedAlloc(self: *@This(), alloc: Allocator, entry: backup_codec.DocumentEntry, max_bytes: usize) ![]u8 {
+        if (entry.value_flags & backup_codec.doc_value_flag_relational_row != 0) {
+            const version = try relational_store.rowSchemaVersion(entry.value);
+            const layout = (try self.archive.layoutForVersion(version)) orelse return error.InvalidBackupRequest;
+            return relational_store.decodeValueForSchemaAndLayoutLimitedAlloc(alloc, entry.value, layout.schema.*, layout.physical, max_bytes);
+        }
+        if (entry.value_flags & backup_codec.doc_value_flag_compressed != 0)
+            return backup_codec.decompressZstdLimited(alloc, entry.value, max_bytes);
+        if (entry.value.len > max_bytes) return error.StreamTooLong;
+        return alloc.dupe(u8, entry.value);
+    }
+};
+
+/// Only asset/chunk payloads are materialized as documents. Vector and
+/// resolution artifacts keep their own format and block admission contracts.
+pub fn checkArtifactDocumentLimit(alloc: Allocator, payload: []const u8, max_bytes: usize) !void {
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| {
+        if (entry.value.len <= max_bytes) continue;
+        var ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer ref.deinit(alloc);
+        if (ref.kind == .asset or ref.kind == .chunk) return error.StreamTooLong;
+    }
+}
 
 /// Read-only seam for preparation and dependency inspectors. First validate
 /// every logical record with the restore reader, then visit the authenticated
@@ -2909,6 +2960,7 @@ pub fn inspectPortableFileBlocks(
     if (initial_stat.kind != .file) return error.InvalidBackupRequest;
     if (initial_stat.size > options.max_input_bytes) return error.BackupInputLimitExceeded;
     var raw = backup_codec.FileReader.init(io, file, initial_stat.size);
+    raw.max_block_bytes = std.math.cast(usize, options.max_logical_bytes) orelse std.math.maxInt(usize);
     var reader: InspectionReader = .{
         .inner = try PortableArchiveReader(backup_codec.FileReader).init(&raw),
         .options = options,
@@ -2917,11 +2969,22 @@ pub fn inspectPortableFileBlocks(
     try validatePortableImportReader(alloc, &reader, .{ .cancellation = options.cancellation });
     const fingerprint = try reader.verifiedFingerprint();
     try reader.reset(alloc);
+    if (options.metadata_first) {
+        _ = try reader.readHeader();
+        while (reader.hasRemaining()) {
+            const block = try reader.readBlock(alloc);
+            defer alloc.free(block.payload);
+            if (block.block_type == .metadata_batch) try visit(context, block.block_type, block.payload);
+        }
+        try reader.inner.verifyFingerprint(fingerprint);
+        try reader.reset(alloc);
+    }
     const header = try reader.readHeader();
     while (reader.hasRemaining()) {
         const block = try reader.readBlock(alloc);
         defer alloc.free(block.payload);
-        try visit(context, block.block_type, block.payload);
+        if (!options.metadata_first or block.block_type != .metadata_batch)
+            try visit(context, block.block_type, block.payload);
     }
     try reader.inner.verifyFingerprint(fingerprint);
     const final_stat = try file.stat(io);
@@ -2948,11 +3011,46 @@ const InspectionReader = struct {
 
     fn readBlock(self: *@This(), alloc: Allocator) !backup_codec.Block {
         try self.options.cancellation.check();
-        const block = try self.inner.readBlock(alloc);
+        const remaining_bytes = std.math.cast(usize, self.options.max_logical_bytes -| self.logical_bytes) orelse std.math.maxInt(usize);
+        const block = try self.inner.readBlockLimited(alloc, remaining_bytes);
         errdefer alloc.free(block.payload);
         if (block.payload.len > self.options.max_logical_bytes -| self.logical_bytes)
             return error.BackupExpansionLimitExceeded;
         self.logical_bytes += block.payload.len;
+        if (block.block_type == .metadata_batch) {
+            const metadata = try backup_codec.KeyValueBatchReader.init(block.payload);
+            metadata.checkEntryLimit(self.options.max_metadata_bytes) catch |err| switch (err) {
+                error.StreamTooLong => return error.BackupExpansionLimitExceeded,
+                else => return err,
+            };
+        }
+        if (block.block_type == .artifact_batch or block.block_type == .chunk_batch) {
+            checkArtifactDocumentLimit(alloc, block.payload, self.options.max_document_bytes) catch |err| switch (err) {
+                error.StreamTooLong => return error.BackupExpansionLimitExceeded,
+                else => return err,
+            };
+        }
+        // A document may be compressed inside an already decoded block. Charge
+        // its expansion on every inspection pass, before invoking any visitor.
+        if (block.block_type == .document_batch) {
+            const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, block.payload);
+            defer alloc.free(entries);
+            for (entries) |entry| {
+                if (entry.value_flags & backup_codec.doc_value_flag_compressed == 0) {
+                    if (entry.value_flags & backup_codec.doc_value_flag_relational_row == 0 and entry.value.len > self.options.max_document_bytes)
+                        return error.BackupExpansionLimitExceeded;
+                    continue;
+                }
+                try self.options.cancellation.check();
+                const remaining = self.options.max_logical_bytes - self.logical_bytes;
+                const limit = @min(self.options.max_document_bytes, std.math.cast(usize, remaining +| entry.value.len) orelse std.math.maxInt(usize));
+                const expanded_size = backup_codec.zstdExpandedSizeLimited(alloc, entry.value, limit) catch |err| switch (err) {
+                    error.StreamTooLong => return error.BackupExpansionLimitExceeded,
+                    else => return err,
+                };
+                self.logical_bytes += expanded_size -| entry.value.len;
+            }
+        }
         return block;
     }
 
@@ -3544,6 +3642,7 @@ const PortableArchiveValidation = struct {
     saw_resolver_catalog: bool = false,
     minimum_reader_version: ?u32 = null,
     saw_resolver_merges: bool = false,
+    saw_curation_proposals: bool = false,
     resolver_configs: ?[]resolver_catalog.ResolverConfig = null,
     resolver_merge_data: ?[]u8 = null,
 
@@ -3796,6 +3895,7 @@ const PortableArchiveValidation = struct {
     }
 
     fn finish(self: *PortableArchiveValidation, alloc: Allocator) !void {
+        if (self.saw_curation_proposals and (self.minimum_reader_version orelse 0) < resolver_catalog.scoped_curation_reader_version) return error.InvalidMetadataBatch;
         const resolver_bytes = try resolver_catalog.serializeCatalog(alloc, self.resolver_configs orelse &.{});
         defer alloc.free(resolver_bytes);
         if (self.minimum_reader_version) |version| {
@@ -4569,9 +4669,8 @@ fn validateIdentityBatchPayload(alloc: Allocator, payload: []const u8) !void {
 }
 
 fn validateMetadataBatchPayload(alloc: Allocator, payload: []const u8, archive: *PortableArchiveValidation) !void {
-    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
-    defer freeKeyValueEntries(alloc, entries);
-    return try validateMetadataEntries(alloc, entries, archive);
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| try validateMetadataEntries(alloc, &.{entry}, archive);
 }
 
 fn validateMetadataEntries(
@@ -4745,6 +4844,15 @@ fn validateMetadataEntries(
             };
             archive.resolver_configs = configs;
             archive.saw_resolver_catalog = true;
+        } else if (std.mem.eql(u8, entry.key, @import("antfly_resolver").curation.proposal_store_key)) {
+            if (archive.saw_curation_proposals) return error.InvalidMetadataBatch;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            _ = @import("antfly_resolver").curation.parseProposalManifest(arena.allocator(), entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            archive.saw_curation_proposals = true;
         } else if (std.mem.eql(u8, entry.key, resolver_catalog.minimum_reader_key)) {
             if (archive.minimum_reader_version != null) return error.InvalidMetadataBatch;
             const version = std.fmt.parseInt(u32, entry.value, 10) catch return error.InvalidMetadataBatch;
@@ -4787,9 +4895,8 @@ fn validatePortableArtifactEntry(alloc: Allocator, ref: db_types.ArtifactRef, va
 }
 
 fn validatePublicArtifactBatchPayload(alloc: Allocator, payload: []const u8, allowed_kind: db_types.ArtifactKind) !void {
-    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
-    defer freeKeyValueEntries(alloc, entries);
-    for (entries) |entry| {
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| {
         var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
         defer artifact_ref.deinit(alloc);
         try validatePortableArtifactEntry(alloc, artifact_ref, entry.value, allowed_kind);
@@ -4797,9 +4904,8 @@ fn validatePublicArtifactBatchPayload(alloc: Allocator, payload: []const u8, all
 }
 
 fn validateResolutionArtifactBatchPayload(alloc: Allocator, payload: []const u8) !void {
-    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
-    defer freeKeyValueEntries(alloc, entries);
-    for (entries) |entry| {
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| {
         var artifact_ref = (try decodeResolutionPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
         defer artifact_ref.deinit(alloc);
     }
@@ -7450,4 +7556,34 @@ test "resolver import cross checks merge catalog before publication" {
     defer orphan.deinit(alloc);
     try validateMetadataEntries(alloc, &.{.{ .key = resolver_catalog.merge_catalog_key, .value = cases[3].? }}, &orphan);
     try std.testing.expectError(error.InvalidMetadataBatch, orphan.finish(alloc));
+}
+
+test "portable backup curation proposal metadata validates identity and reader floor" {
+    const alloc = std.testing.allocator;
+    const pure = @import("antfly_resolver").curation;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plan = try pure.propose(a, .{ .receipt_scope = @splat('a') }, &.{}, .{ .action = .suppress, .key = "concept/noise", .actor = "screen" }, .{ .actor = "screen", .created_at_ms = 1 });
+    const bytes = try std.json.Stringify.valueAlloc(a, pure.ProposalManifest{ .queue = plan.state }, .{});
+    try std.testing.expect(isPortableMetadataKey(pure.proposal_store_key));
+    var archive: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+    defer archive.deinit(alloc);
+    try validateMetadataEntries(alloc, &.{.{ .key = pure.proposal_store_key, .value = bytes }}, &archive);
+    try std.testing.expect(archive.saw_curation_proposals);
+    try std.testing.expectError(error.InvalidMetadataBatch, archive.finish(alloc));
+    try validateMetadataEntries(alloc, &.{.{ .key = resolver_catalog.minimum_reader_key, .value = "10" }}, &archive);
+    try std.testing.expectError(error.InvalidMetadataBatch, archive.finish(alloc));
+    archive.minimum_reader_version = resolver_catalog.scoped_curation_reader_version;
+    try archive.finish(alloc);
+    try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, &.{.{ .key = pure.proposal_store_key, .value = bytes }}, &archive));
+    var invalid: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+    defer invalid.deinit(alloc);
+    try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, &.{.{ .key = pure.proposal_store_key, .value = "{\"pending_id\":\"orphan\"}" }}, &invalid));
+    const restored = try pure.parseProposalManifest(a, bytes);
+    try std.testing.expect(pure.sameReceiptScope(plan.state.receipt_scope, restored.queue.receipt_scope));
+    var unscoped = plan.state;
+    unscoped.receipt_scope = null;
+    const unscoped_bytes = try std.json.Stringify.valueAlloc(a, pure.ProposalManifest{ .queue = unscoped }, .{});
+    try std.testing.expectError(error.InvalidResolverCurationRequest, pure.parseProposalManifest(a, unscoped_bytes));
 }

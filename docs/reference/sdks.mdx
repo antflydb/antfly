@@ -32,7 +32,7 @@ database. Each language binding passes the shared conformance cases:
 Use an SDK to connect to a running Antfly service; use an embedded binding for
 local databases or in-process inference. Python and npm platform packages
 include `libantfly`; direct C and Go/Rust consumers can use the Apache Embedded
-release archive. The `.aflite` storage format and `antfly-lite` CLI keep their
+release archive. The `.aflite` storage format and `antfly lite` commands keep their
 Lite names.
 
 See the [Antfly Lite guide](/docs/guides/lite) for CLI and embedded
@@ -41,22 +41,45 @@ instance.
 
 ## Installation
 
+These examples target the development API at source revision `ddba6584b38b59c62e261ef63e0374dc1f711617`.
+Registry contents inspected on 2026-10-22: PyPI `0.0.2.dev2` lacks `query`;
+TestPyPI `0.0.1` lacks read-requirement helpers and media chunking; npm `0.0.14`
+lacks `readAfterWrite`, `read_requirements`, and media chunking. Use the pinned
+source routes below for these APIs until compatible network SDK releases are
+published. The Python source route requires Git and Python 3.11+; the TypeScript
+recipe requires the pinned Node/pnpm toolchain (or Volta). Registry installation
+alone does not select this development contract.
+
+For TypeScript, build and pack the SDK from the repository root:
+
+```bash
+git clone https://github.com/antflydb/antfly.git antfly-sdk-source
+cd antfly-sdk-source
+git checkout ddba6584b38b59c62e261ef63e0374dc1f711617
+cd ts
+node scripts/run-pinned-toolchain.mjs pnpm install --frozen-lockfile
+node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk build
+node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk pack --pack-destination /tmp
+# In your application:
+npm install /tmp/antfly-sdk-0.2.0.tgz
+```
+
 <CodeTabs persistKey="sdk-lang" samples={[
   {
     language: "Go",
-    code: `go get github.com/antflydb/antfly/go/pkg/sdk`
+    code: `go get github.com/antflydb/antfly/go/pkg/sdk@ddba6584b38b59c62e261ef63e0374dc1f711617`
   },
   {
     language: "TypeScript",
-    code: `npm install @antfly/sdk`
+    code: `npm install /tmp/antfly-sdk-0.2.0.tgz # built from the pinned source above`
   },
   {
     language: "Python",
-    code: `pip install antfly-sdk`
+    code: `pip install "antfly-sdk @ git+https://github.com/antflydb/antfly.git@ddba6584b38b59c62e261ef63e0374dc1f711617#subdirectory=py/packages/sdk"`
   },
   {
     language: "Rust",
-    code: `# Cargo.toml\n[dependencies]\nantfly-sdk = { git = "https://github.com/antflydb/antfly" }`
+    code: `# Cargo.toml\n[dependencies]\nantfly-sdk = { git = "https://github.com/antflydb/antfly", rev = "ddba6584b38b59c62e261ef63e0374dc1f711617" }`
   }
 ]} />
 
@@ -170,10 +193,11 @@ The bearer token is an API key encoded as `base64(key_id:key_secret)`, the same 
 ]} />
 
 Rust has no query sample. Its client is generated straight from the OpenAPI
-spec by progenitor, and the generated `QueryRequest` carries only `table`,
-`fields`, `hierarchy`, `limit`, and `timeout_ms`, so it cannot express
-`full_text_search` or `semantic_search`. Send search requests over HTTP
-directly until the generated request type covers them.
+spec by progenitor, and the generated `QueryRequest` cannot express
+`full_text_search` or `semantic_search`. It implements `Default`; deserializing
+JSON into it silently discards unknown fields. Send search requests over HTTP
+directly as shown in the [Rust SDK README](https://github.com/antflydb/antfly/blob/main/rs/crates/sdk/README.md#usage)
+until the generated request type covers them.
 
 ## React Components
 

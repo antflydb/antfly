@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-10-14
+Last updated: 2026-10-22
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -87,7 +87,7 @@ thin linked antfly executable
 │   ├── writes, transaction participation, WAL and local Raft apply
 │   ├── snapshots, restore, maintenance and Lite
 │   └── public C API and handle registry
-├── antfly-storage-kernel (ELv2)
+├── antfly-storage-kernel (Apache-2.0)
 │   └── server/Raft adapters over the compiled physical engine
 ├── antfly-runtime-distributed
 │   ├── data, metadata and hot-standby control
@@ -140,7 +140,7 @@ live in `api/query_execution_contract.zig` and `api/write_contract.zig`;
 physical resource setup lives under `storage/`.
 
 The Apache Lite executable links its local engine owner, enrichment, and
-inference without database server owners. The ELv2 standalone executable
+inference without database server owners. The Apache-2.0 standalone executable
 serves Lite files through `standalone --storage-engine lite --storage-path`.
 Storage never links back to a server entry point.
 Storage owner tests link the same production archives and are included in the
@@ -269,6 +269,56 @@ inside the existing 22 GiB aggregate budget, whereas the previous 20/16 GiB
 claims serialized them. This removes that admission bottleneck without
 increasing runner size or the deadline; a matched CI rerun must establish the
 resulting wall time.
+
+### Optimized HTTP inference for model E2E
+
+Full CPU model E2E builds `inference-http-server -Doptimize=ReleaseFast
+-Dcpu=baseline -Dstrip=true -Dcuda=false` and selects
+`zig-out/bin/antfly-inference-http-server` through
+`ANTFLY_INFERENCE_SERVER_BIN`. This existing production entry calls the same
+`runServer` as the CLI, without compiling offline training, benchmark and
+other CLI commands. `ANTFLY_BIN` continues selecting the Debug product for
+model pulls, CLI checks, storage/API and standalone process composition.
+Optimizing the serving graph covers attention and quantization as well as
+matrix multiplication; model assertions and request limits stay unchanged.
+
+The standalone inference development CLI (`antfly-inference-dev`) is a
+separate, heavier build profile. At PR #1264's `7c4df469bb`,
+its native x86_64 GNU, baseline CPU, unstripped ReleaseFast build measured
+10,717,630,464 bytes of compiler RSS and 49 minutes cold wall time. It used the
+exact Nix/glibc Zig derivation pinned in `scripts/ci/toolchain-policy.json`.
+The corresponding aarch64 Darwin-hosted Linux cross-build measured
+12,537,217,024 bytes. Reserve the measured peak plus 25%, rounded up to 64 MiB: 12,800 MiB
+native and 14,976 MiB cross-built. Scope these claims to the measured host,
+target, baseline CPU, accelerator-free, optimization and unstripped profiles;
+other profiles keep their existing claims. `-Dinference-compile-memory-mb`
+remains an explicit override.
+
+These claims do not change runner resources or model-process budgets. The
+native full CLI leaves 9.5 GiB for concurrent steps inside the existing
+22 GiB aggregate build budget. Model CI uses the HTTP target's independent
+reservation rather than inheriting this development-CLI claim.
+
+The root build forwards `strip` into its inference workflow context. The
+field is required so memory-profile selection stays consistent with the
+final graph's stripping policy. Regression probes audit both root and
+standalone declarations and reject a deliberately broken handoff.
+
+At `62475010b7`, the native x86_64 GNU HTTP-only compiler step succeeded in
+30 minutes (30:51.51 for the build, including helper steps) with a peak of
+3,100,064 KiB / 3,174,465,536 bytes / 2.96 GiB. It used the same pinned
+Nix/glibc Zig, baseline CPU, CPU-only ReleaseFast, and explicit stripping.
+The product compiler ran cold; generated assets were reused. GNU time
+reported 100% CPU and no swaps. Its 3,840 MiB / 3.75 GiB reservation is the
+peak plus 25%, rounded up to 64 MiB. Two 8 GiB steps plus this claim consume
+19.75 GiB of the existing 22 GiB budget, leaving 2.25 GiB for smaller steps.
+A subsequent real build admits under a 4 GiB budget and reuses the measured
+artifact after the context fix. The reduction applies only to the measured
+native Linux, baseline CPU, stripped ReleaseFast profile; other HTTP
+profiles keep their existing claims.
+
+The stripped HTTP executable also passes all 25 speech E2E cases locally;
+public CLI configuration contracts continue testing the Debug product.
 
 ### October macOS compile-memory follow-up
 
@@ -1082,7 +1132,7 @@ Native macOS/Linux aarch64/x86_64 products use the complete Apache compiled
 storage owner, including ordinal workers. Shared inference and storage are
 mandatory on these targets; source-only targets retain their target implementation. `antfly-storage-engine` compiles the public C API once
 and owns coarse DB lifecycle, batch, query (including leased reads), snapshot,
-schema/index and maintenance operations. The executable's ELv2 storage archive
+schema/index and maintenance operations. The executable's Apache-2.0 storage archive
 retains server/Raft adapters and calls this same compiled owner. The installed
 C library links the owner archive; it does not compile another public C API object.
 Per-record loops remain within operations.

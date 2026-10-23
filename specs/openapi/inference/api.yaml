@@ -6,6 +6,37 @@ info:
     Antfly inference is a local inference server for GGUF, safetensors, and ONNX models (ONNX graphs are
     parsed natively, without ONNX Runtime), running on CPU, Metal, or CUDA.
 
+    ## Named inference gateway
+
+    Database nodes also serve a gateway at `/ai/v1` independently of local model
+    availability. Select configured targets explicitly with canonical names such
+    as `generators/support`, `deciders/triage`, `embedders/dense`, and `readers/ocr`.
+    Bare names resolve within the endpoint task; a collision with a local model
+    fails explicitly. Use `local/owner/model` for an explicit local artifact or
+    `connections/name/models/owner/model` for an Antfly runtime connection.
+
+    Named targets cover generation and chains, typed decisions, embeddings,
+    reranking, chunking, OCR, extraction, rewriting, transcription, speech
+    synthesis and traditional ML. Existing task envelopes and feature schemas
+    are preserved. OpenAI-compatible chat adapters forward tool history,
+    supported structured output, usage and genuine incremental SSE.
+
+    Backend feature declarations in `inference_capabilities` are intersected
+    with adapter support. Unknown support cannot qualify a required feature.
+    Chains validate every candidate before execution, use at most eight total
+    attempts and share one deadline/cancellation chain. Fallback requires an
+    explicit condition on the failed link and is restricted to transient
+    upstream responses. Timeouts require `on_timeout`; refusals, invalid input,
+    authentication failures and committed responses never switch models.
+    Embedding and decision cross-model failover are disabled.
+
+    Session handles are credential-bound and pinned to a physical connection.
+    Multi-replica deployments must preserve gateway/proxy affinity using the
+    returned `X-Antfly-Inference-Affinity` handle. Unknown sessions fail closed.
+    Task capabilities are independent of catalog freshness and availability;
+    offline upstreams do not remove configured aliases. Request IDs and
+    per-attempt telemetry contain target identities and actual usage only.
+
     ## What is Antfly inference
 
     Antfly inference provides local ML inference with an OpenAI-compatible API:
@@ -1311,7 +1342,7 @@ paths:
     post:
       operationId: decide
       summary: Answer named decision questions
-      description: Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
+      description: Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items. Hosted typed deciders and qualified constrained generators accept text and images per batch item. Generated native models must support both images and constrained output. Native trained and embedding deciders require text. Embedding similarity supports choice and multi_choice;
         trained decision models support choice, score and predicate. Answer variants distinguish trained
         probabilities from raw cosine similarities.
       tags:
@@ -1427,6 +1458,82 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+  /models/instances:
+    get:
+      summary: List model instances
+      description: Inspect this inference server's shared model cache without loading models or extending idle eviction deadlines. Each incarnation appears once, even when it supports multiple tasks.
+      operationId: listModelInstances
+      tags: [Models]
+      responses:
+        '200':
+          description: Loaded and loading model instances
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInstanceList'
+    post:
+      summary: Load a model instance
+      description: Prepare the instance used by the requested task. Reuses an existing compatible instance. Normal idle eviction still applies; loading does not pin weights or guarantee device residency.
+      operationId: loadModelInstance
+      tags: [Models]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelInstanceLoadRequest'
+      responses:
+        '200':
+          description: Prepared model instance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInstance'
+        '400':
+          description: Invalid model or unsupported task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+  /models/instances/{instance_id}:
+    delete:
+      summary: Unload a model instance
+      description: Evict one exact incarnation from the shared server cache. A stale ID is an idempotent miss and never evicts a replacement. Loading, busy, and startup-managed instances cannot be unloaded.
+      operationId: unloadModelInstance
+      tags: [Models]
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Instance unloaded or already absent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInstanceUnloadResponse'
+        '400':
+          description: Malformed instance ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Instance is loading, has active owners, or is managed by startup configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /models:
     get:
       summary: List available models
@@ -1725,6 +1832,72 @@ components:
         preserved_heads:
           type: integer
           minimum: 0
+    ModelInstance:
+      type: object
+      description: One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private.
+      required: [id, model, tasks, state, active_handles, startup_managed, unloadable, residency_mode, idle_ms]
+      properties:
+        id:
+          type: string
+          description: Opaque incarnation identifier; changes after eviction and reload.
+        model:
+          type: string
+        tasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelKind'
+        state:
+          type: string
+          enum: [loading, loaded]
+        active_handles:
+          type: integer
+          format: int64
+          description: Internal owners or loading waiters preventing eviction. This is not a count of HTTP requests.
+        startup_managed:
+          type: boolean
+        unloadable:
+          type: boolean
+          description: Whether an unload would be permitted at snapshot time; concurrent use can change this.
+        unload_blocked_reason:
+          type: string
+          enum: [loading, in_use, startup_managed]
+        backend:
+          type: string
+          description: Selected execution backend, when known.
+        residency_mode:
+          type: string
+          enum: [backend_managed, streamed, resident]
+          description: Weight residency policy; loaded does not imply full device residency.
+        idle_ms:
+          type: integer
+          format: int64
+          description: Elapsed milliseconds since last use, not a wall-clock timestamp.
+    ModelInstanceList:
+      type: object
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelInstance'
+    ModelInstanceLoadRequest:
+      type: object
+      required: [model, task]
+      properties:
+        model:
+          type: string
+        task:
+          $ref: '#/components/schemas/ModelKind'
+    ModelInstanceUnloadResponse:
+      type: object
+      required: [outcome]
+      properties:
+        outcome:
+          type: string
+          enum: [unloaded, already_unloaded]
     Error:
       type: object
       required:
@@ -1856,6 +2029,10 @@ components:
       type: object
       required: [object, predictors]
       properties:
+        public_inference_enabled:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: Whether public inference execution is enabled on this deployment.
         object:
           type: string
           enum: [list]
@@ -2825,6 +3002,9 @@ components:
           type: string
           description: Force specific language for transcription (optional, model-dependent)
           example: en
+        timestamps:
+          type: boolean
+          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
         diarization:
           type: boolean
           description: Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
@@ -2917,6 +3097,9 @@ components:
           type: string
           description: Force the transcript language (ISO 639-1). Omit for automatic detection.
           example: en
+        timestamps:
+          type: boolean
+          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
         cleanup_model:
           type: string
           description: Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
@@ -3427,6 +3610,10 @@ components:
         - readers
         - transcribers
       properties:
+        public_inference_enabled:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
         object:
           type: string
           enum:
@@ -3902,7 +4089,11 @@ components:
             $ref: '#/components/schemas/GenerateChoice'
           description: List of completion choices (currently always 1)
         usage:
-          $ref: '#/components/schemas/GenerateUsage'
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          description: Provider-reported token usage, or null when the provider does not supply it.
+          allOf:
+            - $ref: '#/components/schemas/GenerateUsage'
         speculation:
           x-go-type-skip-optional-pointer: false
           nullable: true

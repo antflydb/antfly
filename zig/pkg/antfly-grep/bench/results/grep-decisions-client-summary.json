@@ -1,0 +1,200 @@
+{
+  "schema_version": 1,
+  "qualification": "Common Decisions client and transport fixtures",
+  "source": {
+    "parent_commit": "e433331614076e419472a5454e1682b8eff4b20f",
+    "merged_main": "3727e843094e08fc0f1830ed34a7ae8870f4e6b3",
+    "source_sha256": "fcc96f34b4b03faca7cd899e4e1af414bb702231f1e74f499c74421f179c7df3",
+    "framing": "sorted tracked .zig/.py paths under named CLI/shared-library directories, plus new predicate client; path NUL bytes NUL",
+    "directories": [
+      "zig/pkg/antfly-grep",
+      "zig/lib/decisions",
+      "zig/lib/encoding",
+      "zig/lib/hash",
+      "zig/lib/compress",
+      "zig/lib/syntax",
+      "zig/lib/regex",
+      "zig/lib/fst",
+      "zig/lib/httpx",
+      "zig/lib/json",
+      "zig/lib/tokenizer"
+    ],
+    "files": 304
+  },
+  "zig_version": "0.17.0",
+  "limitations": [
+    "Synthetic constant-score loopback fixtures; no live model, relevance, provider tokens or billing measured.",
+    "Same binary serves both comparison arms; this isolates protocol shape, not a runtime speedup over an older implementation.",
+    "Trials ran on shared macOS hardware and a two-CPU/1-GiB ARM64 Linux VM; no universal latency, CPU or RSS claim.",
+    "Windows is cross-compiled only; no Windows runtime conformance.",
+    "Existing postings/page performance qualification remains frozen at its previously recorded runtime revision. Cross-write source certificates and coordinator-wide grants remain unimplemented."
+  ],
+  "checks": {
+    "macos_cli": {
+      "total": 258,
+      "passed": 256,
+      "skipped": 2
+    },
+    "linux_cli_with_ripgrep": {
+      "total": 258,
+      "passed": 255,
+      "skipped": 3
+    },
+    "macos_units": "ReleaseFast and Debug passed; shared predicate decoder tests passed",
+    "linux_units": "107 passed, 3 skipped",
+    "tooling": [
+      "Apache boundary",
+      "compatibility matrix and raw-report policy",
+      "ruff",
+      "toolchain policy",
+      "packaged completions match CLI",
+      "native archive unit and distribution contents"
+    ],
+    "oracle": "ripgrep 15.2.0 / PCRE2 10.45",
+    "windows": "x86_64-windows-gnu ReleaseFast cross-compilation passed; not runtime tested"
+  },
+  "artifacts": {
+    "macos": {
+      "sha256": "a0c9297f1b9d0731b402442678ac2773864163600d7d37b2581aa8810815e322",
+      "bytes": 8081304
+    },
+    "linux": {
+      "sha256": "d8902a28073c388379478d6f2597baea844192d8a88900dc0489b813967b5084",
+      "bytes": 31055128
+    },
+    "windows": {
+      "sha256": "7f64c6ba4fc282198136ea8fcdbdaea6caae05a4310b339e9575fcbdf6e57678",
+      "bytes": 8557568
+    },
+    "macos_release": {
+      "sha256": "83d60f1668c7b1f5ce986a691eea72c3abfb0e819be89b6981a699904efa8004",
+      "contents_verified": true
+    }
+  },
+  "transport": {
+    "macos": {
+      "shared": {
+        "antfly-grep": {
+          "transport": "shared-v1",
+          "trials": 3,
+          "requests": 65,
+          "request_bytes": 1412265,
+          "questions": 513,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        },
+        "baseline": {
+          "transport": "antfly-batch",
+          "trials": 3,
+          "requests": 65,
+          "request_bytes": 10548999,
+          "questions": 513,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        }
+      },
+      "single": {
+        "antfly-grep": {
+          "transport": "single",
+          "trials": 3,
+          "requests": 513,
+          "request_bytes": 10699736,
+          "questions": 513,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        },
+        "baseline": {
+          "transport": "antfly-batch",
+          "trials": 3,
+          "requests": 65,
+          "request_bytes": 10548999,
+          "questions": 513,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        }
+      },
+      "cache": {
+        "antfly-grep": {
+          "transport": "shared-v1",
+          "trials": 3,
+          "requests": 0,
+          "request_bytes": 0,
+          "questions": 0,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        },
+        "baseline": {
+          "transport": "antfly-batch",
+          "trials": 3,
+          "requests": 0,
+          "request_bytes": 0,
+          "questions": 0,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        }
+      }
+    },
+    "linux": {
+      "shared": {
+        "antfly-grep": {
+          "transport": "shared-v1",
+          "trials": 3,
+          "requests": 65,
+          "request_bytes": 1412265,
+          "questions": 513,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        },
+        "baseline": {
+          "transport": "antfly-batch",
+          "trials": 3,
+          "requests": 65,
+          "request_bytes": 10548999,
+          "questions": 513,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        }
+      },
+      "single": {
+        "antfly-grep": {
+          "transport": "single",
+          "trials": 3,
+          "requests": 513,
+          "request_bytes": 10699736,
+          "questions": 513,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        },
+        "baseline": {
+          "transport": "antfly-batch",
+          "trials": 3,
+          "requests": 65,
+          "request_bytes": 10548999,
+          "questions": 513,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        }
+      },
+      "cache": {
+        "antfly-grep": {
+          "transport": "shared-v1",
+          "trials": 3,
+          "requests": 0,
+          "request_bytes": 0,
+          "questions": 0,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        },
+        "baseline": {
+          "transport": "antfly-batch",
+          "trials": 3,
+          "requests": 0,
+          "request_bytes": 0,
+          "questions": 0,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56"
+        }
+      }
+    }
+  },
+  "raw_artifact": {
+    "availability": "local only; unpublished",
+    "path": "output/grep-decisions/qualification-raw.tar.gz",
+    "sha256": "b28e1b1971426259c8ffdb68cc617119e7e59566140c9dcf3b3cf7f3796c1e1a"
+  },
+  "reproduction": [
+    "cd zig && zig build grep-test -Dgrep-only=true -Doptimize=ReleaseFast",
+    "cd zig && zig build grep-unit -Dgrep-only=true -Doptimize=Debug",
+    "Cross-build grep, grep-unit-build and grep-fixture-build for aarch64-linux-gnu; run CLI and unit fixtures in existing ARM64 VM with pinned rg on PATH.",
+    "python3 zig/pkg/antfly-grep/bench/decision_transport.py BINARY --baseline BINARY --transport shared-v1 --baseline-transport antfly-batch --lines 512 --jobs 4 --rounds 3 --keep-alive --output output/transport-shared.json",
+    "Repeat with --transport single, then --transport shared-v1 --cache."
+  ]
+}

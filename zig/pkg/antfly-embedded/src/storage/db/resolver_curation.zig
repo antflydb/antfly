@@ -16,6 +16,7 @@
 //! Shared resolver curation operations. Transports never reconstruct redirects
 //! themselves: one versioned catalog update owns state, fences and replay.
 const std = @import("std");
+const index_metadata = @import("../../api/index_metadata.zig");
 const resolver = @import("antfly_resolver");
 const catalog = @import("catalog/resolver_catalog.zig");
 pub const metadata_key = "_resolver_curation";
@@ -43,6 +44,50 @@ pub const Namespace = struct {
     state: resolver.curation.State = .{},
 };
 pub const Namespaces = struct { version: u32 = 1, namespaces: []const Namespace = &.{} };
+pub const proposals_key = "_curation_proposals";
+
+/// Borrow only authority identities from the parsed catalog. Evidence and
+/// attribution are irrelevant to ownership and never copied into this index.
+pub const Ownership = struct {
+    templates: std.StringHashMapUnmanaged(void) = .empty,
+    proposal_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    pub fn init(a: std.mem.Allocator, root: std.json.Value) !Ownership {
+        if (root != .object) return error.InvalidResolverCurationRequest;
+        var out: Ownership = .{};
+        if (root.object.get(namespaces_key)) |raw| {
+            if (raw != .object) return error.InvalidResolverCurationRequest;
+            if (raw.object.get("namespaces")) |items| {
+                if (items != .array or items.array.items.len > 4096) return error.InvalidResolverCurationRequest;
+                for (items.array.items) |item| {
+                    if (item != .object) return error.InvalidResolverCurationRequest;
+                    const template = item.object.get("key_template") orelse return error.InvalidResolverCurationRequest;
+                    if (template != .string) return error.InvalidResolverCurationRequest;
+                    try out.templates.put(a, template.string, {});
+                }
+            }
+        }
+        if (root.object.get(proposals_key)) |raw| {
+            if (raw != .object) return error.InvalidResolverCurationRequest;
+            if (raw.object.get("proposals")) |items| {
+                if (items != .array or items.array.items.len > 4096) return error.InvalidResolverCurationRequest;
+                for (items.array.items) |item| {
+                    if (item != .object) return error.InvalidResolverCurationRequest;
+                    const key = item.object.get("key") orelse return error.InvalidResolverCurationRequest;
+                    if (key != .string) return error.InvalidResolverCurationRequest;
+                    try out.proposal_keys.append(a, key.string);
+                }
+            }
+        }
+        return out;
+    }
+    pub fn owns(self: Ownership, template: []const u8) bool {
+        if (self.templates.contains(template)) return true;
+        for (self.proposal_keys.items) |key| if (keyInNamespace(template, key)) return true;
+        return false;
+    }
+};
+
 pub fn namespacesFromValue(a: std.mem.Allocator, root: std.json.Value) !Namespaces {
     const value = if (root == .object) root.object.get(namespaces_key) orelse return .{} else return .{};
     const result = try std.json.parseFromSliceLeaky(Namespaces, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{});
@@ -101,7 +146,16 @@ pub fn foldNamespace(a: std.mem.Allocator, current: Namespace, cfg: catalog.Reso
         if (!exists) try distinct.append(a, pair);
     }
     next.merges = merged;
-    next.state = .{ .suppress = .{ .keys = keys.keys(), .texts = texts.keys(), .min_text_chars = @max(current.state.suppress.min_text_chars, prior.suppress.min_text_chars) }, .removed_aliases = removed.keys(), .distinct = distinct.items };
+    var suppression_entries: std.StringArrayHashMapUnmanaged(resolver.curation.Entry) = .empty;
+    for (prior.suppress.entries) |entry| try suppression_entries.put(a, entry.key, entry);
+    for (current.state.suppress.entries) |entry| try suppression_entries.put(a, entry.key, entry);
+    var text_entries: std.StringArrayHashMapUnmanaged(resolver.curation.Entry) = .empty;
+    for (prior.suppress.text_entries) |entry| try text_entries.put(a, entry.key, entry);
+    for (current.state.suppress.text_entries) |entry| try text_entries.put(a, entry.key, entry);
+    var origins: std.StringArrayHashMapUnmanaged(resolver.curation.RedirectOrigin) = .empty;
+    for (prior.redirect_origins) |entry| try origins.put(a, entry.key, entry);
+    for (current.state.redirect_origins) |entry| try origins.put(a, entry.key, entry);
+    next.state = .{ .redirect_origins = origins.values(), .suppress = .{ .entries = suppression_entries.values(), .text_entries = text_entries.values(), .keys = keys.keys(), .texts = texts.keys(), .min_text_chars = @max(current.state.suppress.min_text_chars, prior.suppress.min_text_chars) }, .removed_aliases = removed.keys(), .distinct = distinct.items };
     var index = try resolver.curation.Index.init(a, "", try std.json.Stringify.valueAlloc(a, next.state, .{}));
     try index.bindRedirects(a, try resolver.curation.RedirectIndex.init(a, merged));
     for (merged) |item| if (index.keySuppressed(item.target) or try index.pinnedDistinct(a, item.key, item.target)) return error.ResolverNamespaceMigrationConflict;
@@ -152,7 +206,7 @@ pub fn planMetadataBatch(a: std.mem.Allocator, indexes_json: []const u8, request
         if (by_name.get(named.name)) |i| if (records.items[i].namespace_owned) return error.ResolverNamespaceCurationRequired;
         const request = named.request;
         if (request.expected_revision) |expected| if (expected != cfg.curation_revision) return error.ResolverCurationConflict;
-        const edit = try resolver.curation.plan(a, cfg.curation_json, cfg.merges, try cfg.effectiveAliasesAlloc(a), request);
+        const edit = try resolver.curation.planWithOrigin(a, cfg.curation_json, cfg.merges, try cfg.effectiveAliasesAlloc(a), request, manualOrigin(request, try std.math.add(u64, cfg.curation_revision, 1)));
         result.* = .{ .name = named.name, .changed = edit.changed, .revision = cfg.curation_revision, .config_generation = cfg.config_generation };
         if (!edit.changed) continue;
         var next = cfg;
@@ -223,6 +277,10 @@ pub fn replaceMetadata(a: std.mem.Allocator, root: *std.json.Value, identity: Me
     try root.object.put(a, metadata_key, try json(a, Metadata{ .identities = records.items }));
 }
 
+pub fn manualOrigin(request: resolver.curation.Request, revision: u64) resolver.curation.Origin {
+    return .{ .actor = request.actor, .reason = request.reason, .revision = revision, .created_at_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms };
+}
+
 pub fn mutate(db: anytype, a: std.mem.Allocator, name: []const u8, request_json: []const u8) ![]u8 {
     if (request_json.len > 4 * 1024 * 1024) return error.ResolverCurationLimitExceeded;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -234,7 +292,7 @@ pub fn mutate(db: anytype, a: std.mem.Allocator, name: []const u8, request_json:
         if (!std.mem.eql(u8, cfg.name, name)) continue;
         if (request.expected_revision) |expected| if (expected != cfg.curation_revision) return error.ResolverCurationConflict;
         const aliases = try cfg.effectiveAliasesAlloc(scratch);
-        const plan = try resolver.curation.plan(scratch, cfg.curation_json, cfg.merges, aliases, request);
+        const plan = try resolver.curation.planWithOrigin(scratch, cfg.curation_json, cfg.merges, aliases, request, manualOrigin(request, try std.math.add(u64, cfg.curation_revision, 1)));
         var next = cfg;
         if (plan.changed) {
             next.curation_json = try std.json.Stringify.valueAlloc(scratch, plan.state, .{});
@@ -250,6 +308,7 @@ pub fn mutate(db: anytype, a: std.mem.Allocator, name: []const u8, request_json:
         return std.json.Stringify.valueAlloc(a, .{
             .resolver = name,
             .changed = plan.changed,
+            .absorbed = plan.absorbed,
             .revision = next.curation_revision,
             .replay_sequence = db.core.store.lastReplaySequence(0),
             .applied = try applied(db, next),
@@ -257,6 +316,24 @@ pub fn mutate(db: anytype, a: std.mem.Allocator, name: []const u8, request_json:
         }, .{});
     }
     return error.ResolverNotFound;
+}
+
+/// Publish a prevalidated edit through the same catalog owner as direct
+/// curation. Proposal receipts live in this edit and commit with its policy.
+pub fn publishPlan(db: anytype, a: std.mem.Allocator, cfg: catalog.ResolverConfig, edit: resolver.curation.Plan) ![]u8 {
+    var next = cfg;
+    if (edit.changed) {
+        next.curation_json = try std.json.Stringify.valueAlloc(a, edit.state, .{});
+        next.curation_revision = try std.math.add(u64, cfg.curation_revision, 1);
+        next.merges = edit.merges;
+        if (cfg.merges.len > 0 or next.merges.len > 0) {
+            next.merge_generation = try std.math.add(u64, cfg.effectiveGeneration(), 1);
+            next.merge_state_version = if (next.merges.len == 0) 2 else 1;
+        }
+        try next.validate();
+        _ = try db.upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true });
+    }
+    return std.json.Stringify.valueAlloc(a, .{ .resolver = cfg.name, .changed = edit.changed, .absorbed = edit.absorbed, .revision = next.curation_revision, .accepted = true, .replay_sequence = db.core.store.lastReplaySequence(0), .replay_sequence_kind = "source_journal", .applied = try applied(db, next), .progress = db.pendingWorkStats() }, .{});
 }
 
 pub fn list(db: anytype, a: std.mem.Allocator, name: []const u8) ![]u8 {
@@ -269,7 +346,7 @@ pub fn list(db: anytype, a: std.mem.Allocator, name: []const u8) ![]u8 {
         if (name.len > 0 and !std.mem.eql(u8, cfg.name, name)) continue;
         const state = try resolver.curation.parseState(scratch, cfg.curation_json);
         var item = try cfg.publicValue(scratch);
-        try item.object.put(scratch, "redirects", try json(scratch, try cfg.effectiveAliasesAlloc(scratch)));
+        try item.object.put(scratch, "redirects", try json(scratch, try resolver.curation.redirectsWithOrigins(scratch, try cfg.effectiveAliasesAlloc(scratch), state, cfg.merges)));
         try item.object.put(scratch, "curation", try json(scratch, state));
         try item.object.put(scratch, "progress", try json(scratch, db.pendingWorkStats()));
         if (name.len > 0) return std.json.Stringify.valueAlloc(a, item, .{});
@@ -378,6 +455,13 @@ pub fn namespaceConfig(a: std.mem.Allocator, cfg: catalog.ResolverConfig, reques
     next.table = request.table;
     next.key_template = request.key_template;
     var state = try resolver.curation.parseState(a, cfg.curation_json);
+    // Receipts are scoped to the exact destination namespace. The table queue
+    // retains history; carrying receipts to another table could mistake that
+    // table's equal action/key proposal ID for an already applied decision.
+    if (!std.mem.eql(u8, cfg.table, request.table) or !std.mem.eql(u8, cfg.key_template, request.key_template)) {
+        state.proposals = &.{};
+        state.receipt_scope = null;
+    }
     var suppression = if (cfg.suppress_json.len > 0) try std.json.parseFromSliceLeaky(resolver.curation.Suppression, a, cfg.suppress_json, .{}) else resolver.curation.Suppression{};
     if (request.reset_merges and !request.reset_curation and (state.distinct.len > 0 or state.removed_aliases.len > 0 or state.suppress.keys.len > 0 or suppression.keys.len > 0)) return error.InvalidResolverCurationRequest;
     if (request.reset_merges) {
@@ -386,15 +470,29 @@ pub fn namespaceConfig(a: std.mem.Allocator, cfg: catalog.ResolverConfig, reques
         state.distinct = &.{};
         state.removed_aliases = &.{};
         state.suppress.keys = &.{};
+        state.suppress.entries = &.{};
+        state.redirect_origins = &.{};
         suppression.keys = &.{};
     } else {
         next.aliases = try Mapper.aliases(a, mapping, cfg.aliases);
         next.merges = try Mapper.aliases(a, mapping, cfg.merges);
         const pairs = try a.alloc(resolver.curation.Pair, state.distinct.len);
-        for (state.distinct, pairs) |old, *pair| pair.* = .{ .from = try Mapper.key(mapping, old.from), .to = try Mapper.key(mapping, old.to) };
+        for (state.distinct, pairs) |old, *pair| pair.* = .{ .from = try Mapper.key(mapping, old.from), .to = try Mapper.key(mapping, old.to), .origin = old.origin };
         state.distinct = pairs;
         state.removed_aliases = try Mapper.keys(a, mapping, state.removed_aliases);
         state.suppress.keys = try Mapper.keys(a, mapping, state.suppress.keys);
+        const entries = try a.dupe(resolver.curation.Entry, state.suppress.entries);
+        for (entries) |*entry| {
+            entry.key = try Mapper.key(mapping, entry.key);
+            if (entry.origin.cascade_from) |from| entry.origin.cascade_from = try Mapper.key(mapping, from);
+        }
+        state.suppress.entries = entries;
+        const origins = try a.dupe(resolver.curation.RedirectOrigin, state.redirect_origins);
+        for (origins) |*entry| {
+            entry.key = try Mapper.key(mapping, entry.key);
+            entry.target = try Mapper.key(mapping, entry.target);
+        }
+        state.redirect_origins = origins;
         suppression.keys = try Mapper.keys(a, mapping, suppression.keys);
     }
     if (cfg.suppress_json.len > 0) next.suppress_json = try std.json.Stringify.valueAlloc(a, suppression, .{});
@@ -444,7 +542,7 @@ pub fn planNamespaceMetadata(a: std.mem.Allocator, indexes_json: []const u8, nam
                         }
                     };
                     var it = object.iterator();
-                    while (it.next()) |entry| if (!std.mem.eql(u8, entry.key_ptr.*, metadata_key) and !std.mem.eql(u8, entry.key_ptr.*, "resolvers")) try walk(allocator, entry.value_ptr, definition);
+                    while (it.next()) |entry| if (!index_metadata.isOpaqueEntry(entry.key_ptr.*) and !std.mem.eql(u8, entry.key_ptr.*, "resolvers")) try walk(allocator, entry.value_ptr, definition);
                 },
                 .array => |*items| for (items.items) |*item| try walk(allocator, item, definition),
                 else => {},
@@ -493,7 +591,7 @@ pub fn progressReportAlloc(db: anytype, alloc: std.mem.Allocator) ![]u8 {
     return std.json.Stringify.valueAlloc(alloc, ProgressReport{ .resolvers = rows }, .{});
 }
 
-pub const ReviewRequest = struct { command: ?@import("resolver_review.zig").Command = null, expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null, operation: enum { reviews, review, prepare_review, review_status, progress }, resolver: []const u8 = "", cursor: ?[]const u8 = null, limit: u16 = 64, id: ?[]const u8 = null, decision: ?resolver.Decision = null, table: ?[]const u8 = null, key: ?[]const u8 = null };
+pub const ReviewRequest = struct { actor: []const u8 = "", reason: []const u8 = "", command: ?@import("resolver_review.zig").Command = null, expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null, operation: enum { reviews, review, prepare_review, review_status, progress }, resolver: []const u8 = "", cursor: ?[]const u8 = null, limit: u16 = 64, id: ?[]const u8 = null, decision: ?resolver.Decision = null, table: ?[]const u8 = null, key: ?[]const u8 = null };
 const ReviewToken = struct { doc_key: []const u8, local_id: []const u8, hash: []const u8 };
 const ReviewCursor = struct { after: ?[]const u8 = null, row: ?[]const u8 = null, offset: usize = 0 };
 pub fn encodeToken(a: std.mem.Allocator, value: anytype) ![]const u8 {
@@ -557,7 +655,9 @@ pub fn reviewOperation(db: anytype, alloc: std.mem.Allocator, body: []const u8) 
         var namespace: [24]u8 = undefined;
         @import("doc_identity.zig").encodeNamespace(&namespace, db.core.identity_namespace);
         const review = @import("resolver_review.zig");
-        const command = review.Command{ .namespace = namespace, .policy_digest = try review.policyDigest(a, db.core.store), .override_digest = try review.overrideDigest(a, db.core.store, token.doc_key, cfg.source_artifact, cfg.resolution_artifact), .resolver = cfg.name, .document = token.doc_key, .source_artifact = cfg.source_artifact, .resolution_artifact = cfg.resolution_artifact, .local_id = token.local_id, .expected_hash = token.hash, .config_generation = cfg.effectiveGeneration(), .curation_revision = input.expected_revision orelse cfg.curation_revision, .decision = decision, .table = table, .key = key };
+        var origin = manualOrigin(.{ .action = .suppress, .actor = input.actor, .reason = input.reason }, cfg.curation_revision);
+        origin.origin = .review;
+        const command = review.Command{ .origin = origin, .namespace = namespace, .policy_digest = try review.policyDigest(a, db.core.store), .override_digest = try review.overrideDigest(a, db.core.store, token.doc_key, cfg.source_artifact, cfg.resolution_artifact), .resolver = cfg.name, .document = token.doc_key, .source_artifact = cfg.source_artifact, .resolution_artifact = cfg.resolution_artifact, .local_id = token.local_id, .expected_hash = token.hash, .config_generation = cfg.effectiveGeneration(), .curation_revision = input.expected_revision orelse cfg.curation_revision, .decision = decision, .table = table, .key = key };
         if (input.operation == .prepare_review) {
             const prepared = try review.plan(a, db.core, command, true);
             if (!prepared.accepted) return error.ResolverCurationConflict;
@@ -639,7 +739,7 @@ pub fn keyInNamespace(template: []const u8, key: []const u8) bool {
     return key.len >= prefix.len + suffix.len and std.mem.startsWith(u8, key, prefix) and std.mem.endsWith(u8, key, suffix);
 }
 
-pub const drop_marker_prefix = "\x00\x00__metadata__:resolver_curation_drop:";
+pub const drop_marker_prefix = catalog.drop_marker_prefix;
 
 pub fn planDropMetadata(a: std.mem.Allocator, indexes_json: []const u8, name: []const u8) !MetadataPlan {
     var root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
@@ -755,6 +855,7 @@ pub fn retainRetiredMetadata(alloc: std.mem.Allocator, before: []const u8, after
     try reconcile.collectDesiredResolvers(a, prior, &old);
     try reconcile.collectDesiredResolvers(a, next, &desired);
     if (prior.object.get(namespaces_key)) |value| try next.object.put(a, namespaces_key, value);
+    if (prior.object.get("_curation_proposals")) |value| try next.object.put(a, "_curation_proposals", value);
     const metadata = try metadataFromValue(a, next);
     var retained: std.StringHashMapUnmanaged(void) = .empty;
     for (metadata.identities) |identity| try retained.put(a, identity.name, {});
@@ -911,4 +1012,50 @@ test "resolver curation namespace migration folds identical state and rejects co
     var conflicting = cfg;
     conflicting.merges = &.{.{ .key = "concept/a", .target = "concept/c" }};
     try std.testing.expectError(error.ResolverNamespaceMigrationConflict, foldNamespace(a, first, conflicting));
+}
+
+test "resolver curation proposal evidence cannot declare indexes or resolver identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(@import("../../api/indexes.zig").isReservedIndexMetadataEntry("_curation_proposals"));
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"_curation_proposals":{"proposals":[{"evidence":{"resolvers":[{"malformed":true}]}}]}}
+    , .{});
+    var out: std.ArrayListUnmanaged(catalog.ResolverConfig) = .empty;
+    try @import("../../metadata/index_reconcile.zig").collectDesiredResolvers(a, root, &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "resolver curation namespace changes cannot carry equal proposal receipts into another table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const proposed = try resolver.curation.propose(a, .{}, &.{}, .{ .action = .suppress, .key = "concept/noise" }, .{});
+    const accepted = try resolver.curation.decide(a, proposed.state, &.{}, &.{}, proposed.state.proposals[0].id, .{ .accept = true }, .{});
+    const cfg: catalog.ResolverConfig = .{ .name = "concepts", .table = "old", .key_template = "concept/{{uslug _entity.text}}", .source_artifact = "kg", .resolution_artifact = "resolved", .curation_json = try std.json.Stringify.valueAlloc(a, accepted.state, .{}), .curation_revision = 1 };
+    const moved = try namespaceConfig(a, cfg, .{ .table = "new", .key_template = cfg.key_template, .reset_merges = true, .reset_curation = true });
+    const next = try resolver.curation.parseState(a, moved.curation_json);
+    try std.testing.expectEqual(@as(usize, 0), next.proposals.len);
+    const same = try namespaceConfig(a, cfg, .{ .table = "old", .key_template = cfg.key_template, .reset_merges = true, .reset_curation = true });
+    try std.testing.expectEqual(@as(usize, 1), (try resolver.curation.parseState(a, same.curation_json)).proposals.len);
+}
+
+test "resolver curation ownership index borrows opaque proposal evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const evidence = try a.alloc(u8, 8192);
+    @memset(evidence, 'x');
+    const bytes = try std.json.Stringify.valueAlloc(a, .{
+        ._resolver_namespaces = .{ .namespaces = .{.{ .key_template = "other/{{uslug _entity.text}}" }} },
+        ._curation_proposals = .{ .proposals = .{.{ .key = "concept/x", .evidence = .{ .data = evidence } }} },
+    }, .{});
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    var memory: [1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    const index = try Ownership.init(fixed.allocator(), root);
+    try std.testing.expect(index.owns("concept/{{uslug _entity.text}}"));
+    try std.testing.expect(index.owns("other/{{uslug _entity.text}}"));
+    try std.testing.expect(!index.owns("person/{{uslug _entity.text}}"));
 }

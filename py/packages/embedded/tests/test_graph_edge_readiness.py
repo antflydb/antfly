@@ -640,7 +640,7 @@ def test_inline_resolver_ownership_and_table_scoped_identity(tmp_path, storage) 
             with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
                 alpha.add_index(invalid)
             alpha.run_until_idle()
-            # Partial registration must restore a previously retired identity.
+            # Conflicting declarations must fail before reactivating a retired identity.
             invalid = json.loads(json.dumps(configs["alpha"]))
             invalid["resolvers"].append({**invalid["resolvers"][0], "name": "conflicting"})
             with pytest.raises(antfly_embedded.InvalidArgumentError):
@@ -771,9 +771,10 @@ def test_index_upgrade_and_retired_identity_management(tmp_path, storage, order)
         db.merge_resolver_keys("concepts", "entity/ada", "entity/canonical")
         db.run_until_idle()
         reader_version = db.capabilities()["minimum_reader_version"]
-        # Durable curation uses the epoch-6 format; the fence
-        # must survive upgrades, retirement and reopening without weakening.
-        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 6
+        # Durable curation requires epoch 6. Newer persisted features may
+        # raise that fence; the observed fence must never weaken on upgrade.
+        assert reader_version >= 6
+        assert reader_version == db.status()["capabilities"]["minimum_reader_version"]
         with pytest.raises(antfly_embedded.InvalidArgumentError, match="retire"):
             db.drop_resolver_identity("concepts")
         upgraded = json.loads(json.dumps(config))
@@ -1399,7 +1400,9 @@ def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
 
 @pytest.mark.parametrize("promote", [False, True])
 @pytest.mark.parametrize("write_count", [1, 10])
-def test_inline_resolver_background_work_settles_after_writes(aflite_path, promote, write_count) -> None:
+def test_inline_resolver_background_work_settles_after_writes(
+    aflite_path, promote, write_count, background_progress_deadline
+) -> None:
     options = antfly_embedded.OpenOptions(
         profile=antfly_embedded.Profile.NATIVE, generated_enrichment_replay=True, busy_timeout=5.0
     )
@@ -1449,7 +1452,7 @@ def test_inline_resolver_background_work_settles_after_writes(aflite_path, promo
                     docs.add_index({**request, "name": graph_name, "replaces": "kg"})
                 if write_count > 1:
                     time.sleep(0.1)
-            deadline = time.monotonic() + 30
+            deadline = background_progress_deadline()
             while True:
                 stats = docs.pending_work_stats()
                 if (
@@ -1459,7 +1462,7 @@ def test_inline_resolver_background_work_settles_after_writes(aflite_path, promo
                     and graph_name in {index["name"] for index in docs.list_indexes()}
                 ):
                     break
-                if time.monotonic() >= deadline:
+                if deadline.expired(stats):
                     pytest.fail(f"background resolver work did not settle: {json.dumps(stats, sort_keys=True)}")
                 time.sleep(0.1)
             assert docs.edges(graph_name, "d0", "about", antfly_embedded.GraphDirection.OUT)
@@ -1508,3 +1511,69 @@ def test_native_child_replacement_replays_generated_artifacts_beside_idle_root(t
             assert [
                 base64.b64decode(edge["target_b64"]).decode() for edge in table.edges("new", "claim", "mentions", 0)
             ] == ["entity/ada"]
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_qualified_incoming_graph_starts_preserve_table_and_path(tmp_path, storage):
+    path = tmp_path / ("qualified.aflite" if storage == antfly_embedded.Storage.LITE else "qualified")
+    with _open_graph_test(path, antfly_embedded.OpenOptions(storage=storage)) as db:
+        db.add_index({"name": "graph", "kind": "graph", "config_json": "{}"})
+        db.batch_json(
+            {
+                "inserts": {"a": {}, "b": {}},
+                "graph_writes": [
+                    {
+                        "index_name": "graph",
+                        "source": "a",
+                        "target": "shared",
+                        "edge_type": "about",
+                        "metadata_json": '{"target_table":"concepts"}',
+                    },
+                    {
+                        "index_name": "graph",
+                        "source": "b",
+                        "target": "shared",
+                        "edge_type": "about",
+                        "metadata_json": '{"target_table":"other_concepts"}',
+                    },
+                ],
+                "sync_level": "full_index",
+            }
+        )
+        local = db.search(
+            {
+                "graph_queries": {
+                    "outgoing": {
+                        "index": "graph",
+                        "traverse": {
+                            "start": {"identities": [{"table": "docs", "key": "a"}]},
+                            "direction": "out",
+                            "edge_types": ["about"],
+                            "max_depth": 1,
+                        },
+                    }
+                }
+            }
+        )["responses"][0]["graph_results"]["outgoing"]["nodes"]
+        assert [(node["table"], node["key"]) for node in local] == [("concepts", "shared")]
+        for table, expected in (("concepts", ["a"]), ("other_concepts", ["b"]), ("unknown", [])):
+            result = db.search(
+                {
+                    "graph_queries": {
+                        "incoming": {
+                            "index": "graph",
+                            "traverse": {
+                                "start": {"identities": [{"table": table, "key": "shared"}]},
+                                "direction": "in",
+                                "edge_types": ["about"],
+                                "max_depth": 1,
+                                "include_paths": True,
+                            },
+                        }
+                    }
+                }
+            )
+            nodes = result["responses"][0]["graph_results"]["incoming"]["nodes"]
+            assert [node["key"] for node in nodes] == expected
+            if nodes:
+                assert nodes[0]["path"][0]["table"] == table

@@ -19,6 +19,7 @@ comptime {
 }
 const handles = @import("handles.zig");
 pub const testMaintenanceCaptureAdmission = @import("lite_connection.zig").testMaintenanceCaptureAdmission;
+pub const testPathReplacementAdmission = @import("lite_connection.zig").testPathReplacementAdmission;
 pub const std = handles.std;
 pub const builtin = handles.builtin;
 pub const local_write = handles.local_write;
@@ -345,33 +346,62 @@ pub const LiteCatalogRollback = struct {
 /// the last owner's removal retires execution but retains durable identity. `upsertResolver`
 /// is idempotent for an unchanged config; backfill is deferred to the
 /// resolver workers (or the next `antfly_db_run_until_idle`).
+/// Validate the whole declaration before starting any resolver worker. A later
+/// invalid declaration must not race replay started by an earlier registration,
+/// return Busy instead of its config error, or need to undo a partial activation.
+/// The caller owns an arena; parsed strings and normalized configs share it.
+fn parseLiteIndexResolvers(arena: Allocator, config_json: []const u8) ![]db_mod.ResolverConfig {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, config_json, .{});
+    if (parsed != .object) return error.InvalidIndexConfig;
+    const declarations = parsed.object.get("resolvers") orelse return &.{};
+    if (declarations != .array) return error.InvalidResolverConfig;
+    const configs = try arena.alloc(db_mod.ResolverConfig, declarations.array.items.len);
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    var artifacts: std.StringHashMapUnmanaged(void) = .empty;
+    for (declarations.array.items, configs, 0..) |item, *cfg, i| {
+        cfg.* = (try db_mod.ResolverConfig.parseValue(arena, item)).value;
+        // Curation belongs to the merge API, not an inline config replay.
+        cfg.merges = &.{};
+        cfg.merge_generation = 0;
+        cfg.merge_state_version = 0;
+        cfg.resolution_generation = 0;
+        cfg.namespace_generation = 0;
+        cfg.inline_managed = true;
+        cfg.retired = false;
+        cfg.replacement_index = "";
+        cfg.replacement_resolver = "";
+        try cfg.validate();
+        if ((try names.getOrPut(arena, cfg.name)).found_existing) return error.ResolverAlreadyExists;
+        if ((try artifacts.getOrPut(arena, cfg.resolution_artifact)).found_existing) return error.ResolverArtifactAlreadyExists;
+        // Match the catalog's label-routing rule, including overlapping kinds
+        // and unrestricted catch-all resolvers. This only scans declarations,
+        // never source rows or artifacts.
+        for (configs[0..i]) |previous| {
+            if (!std.mem.eql(u8, previous.source_artifact, cfg.source_artifact) or
+                !previous.source_artifact_kind.overlaps(cfg.source_artifact_kind)) continue;
+            for (previous.labels) |label| if (cfg.resolvesLabel(label)) {
+                if (cfg.labels.len != 0) return error.ResolverLabelRoutingConflict;
+            };
+        }
+    }
+    return configs;
+}
+
 pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, rollback: *LiteCatalogRollback) !void {
     var arena_impl = std.heap.ArenaAllocator.init(handle.alloc);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
-    var parsed = std.json.parseFromSlice(std.json.Value, arena, config_json, .{}) catch return;
-    if (parsed.value != .object) return;
-    const resolvers = parsed.value.object.get("resolvers") orelse return;
-    if (resolvers != .array) return;
-    for (resolvers.array.items) |item| {
-        if (item != .object) continue;
-        var cfg = try db_mod.ResolverConfig.parseValue(arena, item);
-        // Config replay may include catalog metadata read back by a caller.
-        // Curation is owned by the merge API and cannot be replaced inline.
-        cfg.value.merges = &.{};
-        cfg.value.merge_generation = 0;
-        cfg.value.merge_state_version = 0;
-        cfg.value.resolution_generation = 0;
-        cfg.value.namespace_generation = 0;
-        cfg.value.inline_managed = true;
-        cfg.value.retired = false;
-        cfg.value.replacement_index = "";
-        cfg.value.replacement_resolver = "";
+    const configs = try parseLiteIndexResolvers(arena, config_json);
+    try registerParsedLiteIndexResolvers(handle, configs, rollback);
+}
+
+fn registerParsedLiteIndexResolvers(handle: *Handle, configs: []const db_mod.ResolverConfig, rollback: *LiteCatalogRollback) !void {
+    for (configs) |cfg| {
         // Record the touch before mutating, so a mid-loop failure (an
         // invalid later resolver, a label conflict) still restores every
         // earlier insertion or replacement this call made.
-        try rollback.willTouchResolver(cfg.value.name);
-        _ = try handle.database().*.upsertResolverWithResultOptions(cfg.value, .{ .drain_backfill = false, .wait_for_activity = true });
+        try rollback.willTouchResolver(cfg.name);
+        _ = try handle.database().*.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
     }
 }
 
@@ -581,7 +611,8 @@ pub fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
 /// Reopened namespaces share the root's inference provider and replay options,
 /// but restore their own catalog's enrichment runtime before accepting writes.
 pub fn refreshLiteManagedEmbeddingRuntimeForDatabase(handle: *Handle, database: *db_mod.DB) !void {
-    if (handle.lite_profile != .native) return;
+    const root = handle.parent_handle orelse handle;
+    if (handle.lite_profile != .native and !root.embedded_native_providers) return;
     // A read-only/status-only handle has nothing to reconcile toward, and
     // `db.reconfigureEnrichmentRuntime` unconditionally fails with
     // `error.ReadOnly` on one -- before it even looks at whether there is
@@ -742,6 +773,8 @@ pub const HandleAccess = enum {
     /// Schema, index, enrichment, range, and restore changes. Waits for
     /// in-flight calls and blocks new ones until done.
     exclusive,
+    /// Catalog definitions require embedded ownership as well as an exclusive lock.
+    catalog,
 };
 
 /// Held for the duration of one export call; see `enterHandle`.
@@ -840,12 +873,28 @@ pub const HandleGuard = struct {
                 self.lock_handle.maintenance_mutex.unlock(io);
                 self.lock_handle.api_lock.unlockShared(io);
             },
-            .exclusive => self.lock_handle.api_lock.unlock(io),
+            .exclusive, .catalog => self.lock_handle.api_lock.unlock(io),
         }
         if (self.parent_slot) |slot| HandleRegistry.leave(slot);
         HandleRegistry.leave(self.slot);
     }
 };
+
+pub fn requireEmbeddedCatalogOwnership(handle: *Handle) !void {
+    const root = handle.parent_handle orelse handle;
+    if (root.owned_lite_backend) |*backend| try backend.requireEmbeddedCatalogOwnership();
+}
+
+pub fn requireEmbeddedSqlCatalogOwnership(handle: *Handle, statement: anytype) !void {
+    switch (statement) {
+        .create_table, .drop_table, .catalog_ddl, .policy_ddl => try requireEmbeddedCatalogOwnership(handle),
+        else => {},
+    }
+}
+
+fn catalogOwnershipError(err: anyerror) capi.ErrorCode {
+    return capi.mapErrorContext(err, "this Lite catalog is owned by standalone; use antfly standalone and the /db/v1 API for schema, index, enrichment and table changes");
+}
 
 /// Entry point for every export that takes a DB handle. Returns null for a
 /// null handle or one that is being closed. Must be taken exactly once per
@@ -909,6 +958,10 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
             handle.parent_handle = root;
             guard.handle = handle;
         }
+        if (access == .catalog) requireEmbeddedCatalogOwnership(guard.handle) catch |err| {
+            guard.entry_error = catalogOwnershipError(err);
+            return guard;
+        };
         if (!pinned) @import("sql_commit.zig").recover(root) catch |err| {
             guard.entry_error = capi.mapError(err);
         };
@@ -929,17 +982,21 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
             lock_handle.api_lock.lockSharedUncancelable(io);
             lock_handle.maintenance_mutex.lockUncancelable(io);
         },
-        .exclusive => lock_handle.api_lock.lockUncancelable(io),
+        .exclusive, .catalog => lock_handle.api_lock.lockUncancelable(io),
     }
-    const guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = effective_access };
+    var guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = effective_access };
+    if (access == .catalog) requireEmbeddedCatalogOwnership(handle) catch |err| {
+        guard.entry_error = catalogOwnershipError(err);
+        return guard;
+    };
     if (lock_handle.embedded_path != null) {
-        @import("sql_commit.zig").recover(lock_handle) catch {
-            guard.leave();
-            return null;
+        @import("sql_commit.zig").recover(lock_handle) catch |err| {
+            guard.entry_error = capi.mapError(err);
+            return guard;
         };
-        @import("sql_ddl.zig").recover(lock_handle) catch {
-            guard.leave();
-            return null;
+        @import("sql_ddl.zig").recover(lock_handle) catch |err| {
+            guard.entry_error = capi.mapError(err);
+            return guard;
         };
     }
     return guard;
@@ -2317,19 +2374,26 @@ pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
     errdefer @import("io_lifetime.zig").release();
     const alloc = std.heap.c_allocator;
     var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .prefer_existing_identity_namespace = true, .online_source_authority = .native });
-    errdefer db.close();
+    var handle_owns_db = false;
+    errdefer if (!handle_owns_db) db.close();
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
-    errdefer alloc.destroy(handle);
+    errdefer if (!handle_owns_db) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
         .io_lifetime_lease = true,
+        .embedded_native_providers = true,
         .db = db,
         .embedded_path = try alloc.dupe(u8, path),
     };
-    @import("tables.zig").loadCatalog(handle) catch |err| {
-        alloc.free(handle.embedded_path.?);
-        return err;
-    };
+    handle_owns_db = true;
+    errdefer {
+        handle.io_lifetime_lease = false; // the outer error path releases it
+        handle.lease_snapshot = true;
+        handles.closeHandle(handle);
+    }
+    @import("entity_sink.zig").attach(handle, &handle.db);
+    try refreshLiteManagedEmbeddingRuntime(handle);
+    try @import("tables.zig").loadCatalog(handle);
     handle.database().*.startResidentBackgroundWorkersIfNeeded();
     return handle;
 }
@@ -2826,22 +2890,33 @@ pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOpti
     var options = dbOpenOptionsFromResolved(resolved, false);
     options.identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 };
     options.prefer_existing_identity_namespace = true;
+    // Restore providers before any generated replay can start. Resolution and
+    // other optional runtimes may still be constructed by the ordinary open.
+    if (resolved.profile == .native) options.enrichment = null;
     var db = try db_mod.DB.open(alloc, path, options);
-    errdefer db.close();
+    var handle_owns_db = false;
+    errdefer if (!handle_owns_db) db.close();
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
-    errdefer alloc.destroy(handle);
+    errdefer if (!handle_owns_db) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
         .io_lifetime_lease = true,
+        .embedded_native_providers = resolved.profile == .native,
         .db = db,
         .open_mode = resolved.open_mode,
         .embedded_path = try alloc.dupe(u8, path),
         .embedded_open_options = options,
+        .lite_generated_enrichment_replay = resolved.generated_enrichment_replay,
     };
-    @import("tables.zig").loadCatalog(handle) catch |err| {
-        alloc.free(handle.embedded_path.?);
-        return err;
-    };
+    handle_owns_db = true;
+    errdefer {
+        handle.io_lifetime_lease = false; // the outer error path releases it
+        handle.lease_snapshot = true;
+        handles.closeHandle(handle);
+    }
+    @import("entity_sink.zig").attach(handle, &handle.db);
+    try refreshLiteManagedEmbeddingRuntime(handle);
+    try @import("tables.zig").loadCatalog(handle);
     handle.database().*.startResidentBackgroundWorkersIfNeeded();
     return handle;
 }
@@ -3123,7 +3198,7 @@ pub fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) call
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_import_backup), .{ .name = "antfly_db_import_backup" }), .{ handle_ptr, backup });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -3207,7 +3282,11 @@ pub fn antfly_restore_backup_json(
     defer io_impl.deinit();
 
     const restored = switch (resolved.storage_kind) {
-        .lite => restorePortableBackupToLiteFile(alloc, io_impl.io(), null, path, backup.bytes(), replace, null),
+        .lite => blk: {
+            const replacement = @import("lite_connection.zig").acquirePathReplacement(path) catch |err| break :blk err;
+            defer replacement.release();
+            break :blk restorePortableBackupToLiteFile(alloc, io_impl.io(), null, path, backup.bytes(), replace, null);
+        },
         .directory => restorePortableBackupToDirectory(alloc, io_impl.io(), path, backup.bytes(), replace),
     };
     restored catch |err| {
@@ -3239,7 +3318,11 @@ pub fn antfly_restore_backup_file_json(
     defer io_impl.deinit();
 
     const restored = switch (resolved.storage_kind) {
-        .lite => restorePortableBackupPathToLiteFile(alloc, io_impl.io(), destination, source, replace),
+        .lite => blk: {
+            const replacement = @import("lite_connection.zig").acquirePathReplacement(destination) catch |err| break :blk err;
+            defer replacement.release();
+            break :blk restorePortableBackupPathToLiteFile(alloc, io_impl.io(), destination, source, replace);
+        },
         .directory => restorePortableBackupPathToDirectory(alloc, io_impl.io(), destination, source, replace),
     };
     restored catch |err| {
@@ -4723,7 +4806,7 @@ pub fn antfly_db_set_schema_json(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_set_schema_json), .{ .name = "antfly_db_set_schema_json" }), .{ handle_ptr, schema_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4963,7 +5046,7 @@ pub fn antfly_db_update_range(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_update_range), .{ .name = "antfly_db_update_range" }), .{ handle_ptr, start, end });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5027,7 +5110,7 @@ pub fn antfly_db_set_split_state_json(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_set_split_state_json), .{ .name = "antfly_db_set_split_state_json" }), .{ handle_ptr, state_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5069,7 +5152,7 @@ pub fn antfly_db_clear_split_state(handle_ptr: ?*anyopaque) callconv(.c) capi.Er
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_clear_split_state), .{ .name = "antfly_db_clear_split_state" }), .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5123,7 +5206,7 @@ pub fn antfly_db_set_split_delta_final_seq(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_set_split_delta_final_seq), .{ .name = "antfly_db_set_split_delta_final_seq" }), .{ handle_ptr, seq });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5138,7 +5221,7 @@ pub fn antfly_db_clear_split_delta_final_seq(handle_ptr: ?*anyopaque) callconv(.
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_clear_split_delta_final_seq), .{ .name = "antfly_db_clear_split_delta_final_seq" }), .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5186,7 +5269,7 @@ pub fn antfly_db_clear_split_delta_entries(handle_ptr: ?*anyopaque) callconv(.c)
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_clear_split_delta_entries), .{ .name = "antfly_db_clear_split_delta_entries" }), .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5648,6 +5731,8 @@ pub fn searchPublicQueryJson(
         request_json.bytes(),
     ) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
+    owned.req.graph_owning_table = table_name;
+    owned.req.graph_index_complete_snapshot = true;
 
     const DbSearchQuery = struct {
         const Result = db_mod.types.SearchResult;
@@ -5733,6 +5818,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         return err;
     };
     defer compiled.deinit();
+    try requireEmbeddedSqlCatalogOwnership(handle, compiled.statement);
     // Allocate the fallback receipt before entering any commit path.
     var commit_receipt: ?[]u8 = switch (compiled.statement) {
         .insert, .update, .delete, .commit, .create_table, .drop_table, .catalog_ddl => try std.heap.c_allocator.alloc(u8, 512),
@@ -7469,10 +7555,65 @@ fn executeResolverCuration(handle: *Handle, name: []const u8, body: []const u8, 
     parsed.value.object.put(parsed.arena.allocator(), "action", .{ .string = effective_action }) catch |err| return capi.mapError(err);
     const request = std.json.Stringify.valueAlloc(handle.alloc, parsed.value, .{}) catch |err| return capi.mapError(err);
     defer handle.alloc.free(request);
-    const result = handle.database().curateResolverJsonAlloc(handle.alloc, name, request) catch |err| return capi.mapErrorContext(err, "curating resolver identity");
+    const result = curateResolverWithProposals(handle, name, request) catch |err| return capi.mapErrorContext(err, "curating resolver identity");
     defer handle.alloc.free(result);
     if (out) |buffer| buffer.* = copyJsonBuffer(result) catch |err| return capi.mapError(err);
     return .ok;
+}
+
+fn curateResolverWithProposals(handle: *Handle, name: []const u8, request_json: []const u8) ![]u8 {
+    if (request_json.len > 4 * 1024 * 1024) return error.ResolverCurationLimitExceeded;
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = handle.database();
+    const root = handle.parent_handle orelse handle;
+    const tables = @import("tables.zig");
+    try tables.loadCatalog(root);
+    const configs = try source.core.index_manager.listResolverIdentities(a);
+    const cfg = for (configs) |cfg| {
+        if (std.mem.eql(u8, cfg.name, name)) break cfg;
+    } else return error.ResolverNotFound;
+    // Resolver policy can precede creation of its destination table.
+    const destination = tables.get(root, cfg.table) catch |err| switch (err) {
+        error.UndefinedTable => return source.curateResolverJsonAlloc(handle.alloc, name, request_json),
+        else => return err,
+    };
+    var manifest = try proposalManifest(a, destination);
+    if (manifest.queue.proposals.len == 0) return source.curateResolverJsonAlloc(handle.alloc, name, request_json);
+    const was_dirty = manifest.refresh_required;
+    try refreshProposalManifest(root, a, cfg.table, &manifest);
+    if (manifest.pending_id != null) return error.ResolverCurationConflict;
+    const pure = @import("antfly_resolver").curation;
+    const owner = @import("../storage/db/resolver_curation.zig");
+    const intent = try std.json.parseFromSliceLeaky(pure.Request, a, request_json, .{});
+    if (intent.expected_revision) |expected| if (expected != cfg.curation_revision) return error.ResolverCurationConflict;
+    const origin = owner.manualOrigin(intent, try std.math.add(u64, cfg.curation_revision, 1));
+    const state = pure.bindReceiptScope(try pure.parseState(a, cfg.curation_json), manifest.queue.receipt_scope);
+    var edit = try pure.planWithOrigin(a, try std.json.Stringify.valueAlloc(a, state, .{}), cfg.merges, try cfg.effectiveAliasesAlloc(a), intent, origin);
+    _ = try pure.recordSupersessions(a, &edit, manifest.queue.proposals, intent, origin);
+    var next = cfg;
+    next.merges = edit.merges;
+    next.curation_json = try std.json.Stringify.valueAlloc(a, edit.state, .{});
+    try next.validate();
+    const prospective = try pure.projectReceipts(a, manifest.queue.proposals, edit.state.proposals);
+    const queue_changed = for (manifest.queue.proposals, prospective) |before, after| {
+        if (before.state != after.state) break true;
+    } else false;
+    if (!queue_changed) {
+        if (was_dirty) try saveProposalManifest(a, destination, manifest);
+        return handle.alloc.dupe(u8, try owner.publishPlan(source, a, cfg, edit));
+    }
+    var queue = manifest.queue;
+    queue.proposals = prospective;
+    _ = try pure.parseState(a, try std.json.Stringify.valueAlloc(a, queue, .{}));
+    manifest.refresh_required = true;
+    try saveProposalManifest(a, destination, manifest);
+    const response = try owner.publishPlan(source, a, cfg, edit);
+    manifest.queue = queue;
+    manifest.refresh_required = false;
+    try saveProposalManifest(a, destination, manifest);
+    return handle.alloc.dupe(u8, response);
 }
 
 /// Commit while holding writer admission, then observe detached replay while
@@ -7661,12 +7802,16 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     const a = arena.allocator();
     const curation = @import("../storage/db/resolver_curation.zig");
     const pure = @import("antfly_resolver");
-    const Input = struct { action: enum { redirects, merge, unmerge, suppress, unsuppress }, into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, wait: ?pure.curation.Wait = null };
+    const Input = struct { action: enum { redirects, merge, unmerge, suppress, unsuppress, distinct }, into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, absorbed: pure.curation.Absorbed = .reject, actor: []const u8 = "", reason: []const u8 = "", expected_revision: ?u64 = null, wait: ?pure.curation.Wait = null };
     const input = std.json.parseFromSliceLeaky(Input, a, request_json.bytes(), .{}) catch |err| return capi.mapError(err);
     const tables = @import("tables.zig");
     tables.load(handle) catch |err| return capi.mapError(err);
-    _ = tables.get(handle, entity_table.bytes()) catch |err| return capi.mapError(err);
-    const Pending = struct { db: *db_mod.DB, source: []const u8, cfg: db_mod.ResolverConfig, request: pure.curation.Request };
+    const entity_db = tables.get(handle, entity_table.bytes()) catch |err| return capi.mapError(err);
+    var manifest = proposalManifest(a, entity_db) catch |err| return capi.mapError(err);
+    const was_dirty = manifest.refresh_required;
+    refreshProposalManifest(handle, a, entity_table.bytes(), &manifest) catch |err| return capi.mapError(err);
+    if (input.action != .redirects and manifest.pending_id != null) return capi.mapError(error.ResolverCurationConflict);
+    const Pending = struct { db: *db_mod.DB, source: []const u8, cfg: db_mod.ResolverConfig, request: pure.curation.Request, edit: pure.curation.Plan };
     var pending: std.ArrayListUnmanaged(Pending) = .empty;
     var sources: std.ArrayListUnmanaged(struct { db: *db_mod.DB, name: []const u8 }) = .empty;
     sources.append(a, .{ .db = &handle.db, .name = "default" }) catch |err| return capi.mapError(err);
@@ -7682,7 +7827,7 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
                 const state = pure.curation.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err);
                 const aliases = cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err);
                 const scoped = pure.curation.entityState(a, state, aliases, entity_key.bytes()) catch |err| return capi.mapError(err);
-                const raw = std.json.Stringify.valueAlloc(a, .{ .source_table = source.name, .resolver = cfg.name, .revision = cfg.curation_revision, .redirects = scoped.redirects, .canonical_key = scoped.canonical_key, .curation = scoped.curation }, .{}) catch |err| return capi.mapError(err);
+                const raw = std.json.Stringify.valueAlloc(a, .{ .source_table = source.name, .resolver = cfg.name, .revision = cfg.curation_revision, .redirects = pure.curation.redirectsWithOrigins(a, scoped.redirects, scoped.curation, cfg.merges) catch |err| return capi.mapError(err), .canonical_key = scoped.canonical_key, .curation = scoped.curation }, .{}) catch |err| return capi.mapError(err);
                 results.append(std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch |err| return capi.mapError(err)) catch |err| return capi.mapError(err);
                 continue;
             }
@@ -7691,36 +7836,417 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
                 .unmerge => .unmerge,
                 .suppress => .suppress,
                 .unsuppress => .unsuppress,
+                .distinct => .distinct,
                 .redirects => unreachable,
             };
-            const intent: pure.curation.Request = .{ .action = action, .key = entity_key.bytes(), .to = input.into, .replace = input.replace, .pin_distinct = input.pin_distinct, .wait = input.wait, .expected_revision = cfg.curation_revision };
-            const edit = pure.curation.plan(a, cfg.curation_json, cfg.merges, cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err), intent) catch |err| return capi.mapError(err);
+            const intent: pure.curation.Request = .{ .action = action, .key = entity_key.bytes(), .to = input.into, .absorbed = input.absorbed, .actor = input.actor, .reason = input.reason, .replace = input.replace, .pin_distinct = input.pin_distinct, .wait = input.wait, .expected_revision = cfg.curation_revision };
+            if (input.expected_revision) |revision| if (revision != cfg.curation_revision) return capi.mapError(error.ResolverCurationConflict);
+            const stamp = curation.manualOrigin(intent, std.math.add(u64, cfg.curation_revision, 1) catch |err| return capi.mapError(err));
+            const state = pure.curation.bindReceiptScope(pure.curation.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err), manifest.queue.receipt_scope);
+            var edit = pure.curation.planWithOrigin(a, std.json.Stringify.valueAlloc(a, state, .{}) catch |err| return capi.mapError(err), cfg.merges, cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err), intent, stamp) catch |err| return capi.mapError(err);
+            _ = pure.curation.recordSupersessions(a, &edit, manifest.queue.proposals, intent, stamp) catch |err| return capi.mapError(err);
             var next = cfg;
             next.merges = edit.merges;
             next.curation_json = std.json.Stringify.valueAlloc(a, edit.state, .{}) catch |err| return capi.mapError(err);
             next.validate() catch |err| return capi.mapError(err);
-            pending.append(a, .{ .db = source.db, .source = source.name, .cfg = cfg, .request = intent }) catch |err| return capi.mapError(err);
+            pending.append(a, .{ .db = source.db, .source = source.name, .cfg = cfg, .request = intent, .edit = edit }) catch |err| return capi.mapError(err);
         }
     }
     if (input.action != .redirects and pending.items.len == 0) return capi.mapError(error.ResolverNotFound);
+    var prospective = manifest.queue;
+    for (pending.items) |item| prospective.proposals = pure.curation.projectReceipts(a, prospective.proposals, item.edit.state.proposals) catch |err| return capi.mapError(err);
+    _ = pure.curation.parseState(a, std.json.Stringify.valueAlloc(a, prospective, .{}) catch |err| return capi.mapError(err)) catch |err| return capi.mapError(err);
+    const queue_changed = for (manifest.queue.proposals, prospective.proposals) |before, after| {
+        if (before.state != after.state) break true;
+    } else false;
     var complete = true;
+    if (queue_changed) {
+        manifest.refresh_required = true;
+        saveProposalManifest(a, entity_db, manifest) catch |err| return capi.mapError(err);
+    } else if (was_dirty and input.action != .redirects) {
+        saveProposalManifest(a, entity_db, manifest) catch |err| return capi.mapError(err);
+    }
     for (pending.items) |item| {
-        const bytes = std.json.Stringify.valueAlloc(a, item.request, .{}) catch |err| return capi.mapError(err);
-        const raw = curation.mutate(item.db, a, item.cfg.name, bytes) catch |err| {
+        const raw = curation.publishPlan(item.db, a, item.cfg, item.edit) catch |err| {
             complete = false;
             const failed = std.json.Stringify.valueAlloc(a, .{ .source_table = item.source, .resolver = item.cfg.name, .accepted = false, .error_message = @errorName(err) }, .{}) catch |failure| return capi.mapError(failure);
             results.append(std.json.parseFromSliceLeaky(std.json.Value, a, failed, .{}) catch |failure| return capi.mapError(failure)) catch |failure| return capi.mapError(failure);
             continue;
         };
+        if (manifest.queue.proposals.len > 0) {
+            const records = a.dupe(pure.curation.Proposal, manifest.queue.proposals) catch |err| return capi.mapError(err);
+            for (records) |*proposal| if (proposal.state == .open) {
+                for (item.edit.state.proposals) |receipt| if (std.mem.eql(u8, proposal.id, receipt.id) and receipt.state == .superseded) {
+                    proposal.state = .superseded;
+                    proposal.decided = receipt.decided;
+                    break;
+                };
+            };
+            manifest.queue.proposals = records;
+        }
         var value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch |err| return capi.mapError(err);
         value.object.put(a, "source_table", .{ .string = item.source }) catch |err| return capi.mapError(err);
         results.append(value) catch |err| return capi.mapError(err);
+    }
+    if (queue_changed) {
+        manifest.refresh_required = !complete;
+        saveProposalManifest(a, entity_db, manifest) catch |err| return capi.mapError(err);
     }
     const response = std.json.Stringify.valueAlloc(a, .{ .entity_table = entity_table.bytes(), .key = entity_key.bytes(), .atomicity = "resolver", .complete = complete, .results = std.json.Value{ .array = results } }, .{}) catch |err| return capi.mapError(err);
     out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
     admitted = false;
     guard.leave();
     return waitResolverCurationResponse(handle_ptr, if (input.wait) |wait| wait.timeout_ms else 0, out);
+}
+
+/// Admission owns the handle's exclusive writer fence. Read only the two
+/// destination manifests; migration does not need a database-wide source scan.
+fn requireProposalQueueIdle(root: *Handle, a: std.mem.Allocator, table: []const u8) !void {
+    const db = @import("tables.zig").get(root, table) catch |err| switch (err) {
+        error.UndefinedTable => return,
+        else => return err,
+    };
+    var manifest = try proposalManifest(a, db);
+    if (manifest.pending_id != null) return error.ResolverCurationConflict;
+    // Publish recovered supersessions before migration can erase their only
+    // source receipt. Healthy queues do not scan any other source catalogs.
+    if (manifest.refresh_required) {
+        try refreshProposalManifest(root, a, table, &manifest);
+        try saveProposalManifest(a, db, manifest);
+    }
+}
+
+const proposal_store_key = @import("antfly_resolver").curation.proposal_store_key;
+const ProposalManifest = @import("antfly_resolver").curation.ProposalManifest;
+fn saveProposalManifest(a: std.mem.Allocator, db: *db_mod.DB, manifest: ProposalManifest) !void {
+    var lease = try db.local_execution.row_policy_gate.enterRaw();
+    defer lease.release();
+    if (try db.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
+    const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
+    const version = @max(catalog.scoped_curation_reader_version, db.core.index_manager.minimum_reader_version.load(.acquire));
+    _ = try @import("antfly_resolver").curation.parseState(a, try std.json.Stringify.valueAlloc(a, manifest.queue, .{}));
+    try @import("antfly_resolver").curation.validateProposalQueue(manifest.queue);
+    const bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
+    // Queue budgets exclude only the fixed pending-decision envelope.
+    if (bytes.len > @import("antfly_resolver").curation.max_manifest_bytes) return error.ResolverCurationLimitExceeded;
+    try db.core.store.putBatch(&.{ .{ .key = proposal_store_key, .value = bytes }, .{ .key = catalog.minimum_reader_key, .value = try catalog.readerVersionBytes(version) } }, &.{});
+    db.core.index_manager.minimum_reader_version.store(version, .release);
+}
+fn proposalManifest(a: std.mem.Allocator, db: *db_mod.DB) !ProposalManifest {
+    const bytes = db.core.store.get(a, proposal_store_key) catch |err| return if (err == error.NotFound) .{} else err;
+    return @import("antfly_resolver").curation.parseProposalManifest(a, bytes);
+}
+/// Reconcile every durable supersession before any subsequent queue write can
+/// clear the dirty marker. The open-ID index and output records are allocated
+/// once; resolver catalogs and evidence are released after each source scan.
+fn refreshProposalManifest(handle: *Handle, a: std.mem.Allocator, table: []const u8, manifest: *ProposalManifest) !void {
+    if (!manifest.refresh_required) return;
+    const pure = @import("antfly_resolver").curation;
+    const records = try a.dupe(pure.Proposal, manifest.queue.proposals);
+    var open_ids: std.StringHashMapUnmanaged(usize) = .empty;
+    for (records, 0..) |proposal, i| if (proposal.state == .open) try open_ids.put(a, proposal.id, i);
+    if (open_ids.count() > 0) {
+        try @import("tables.zig").load(handle);
+        var sources: std.ArrayListUnmanaged(*db_mod.DB) = .empty;
+        try sources.append(a, &handle.db);
+        var it = handle.embedded_tables.valueIterator();
+        while (it.next()) |entry| try sources.append(a, &entry.*.db);
+        for (sources.items) |source| {
+            var scratch_arena = std.heap.ArenaAllocator.init(handle.alloc);
+            defer scratch_arena.deinit();
+            const scratch = scratch_arena.allocator();
+            for (try source.core.index_manager.listResolverIdentities(scratch)) |cfg| {
+                if (!std.mem.eql(u8, cfg.table, table)) continue;
+                const state = try pure.parseState(scratch, cfg.curation_json);
+                if (!pure.sameReceiptScope(state.receipt_scope, manifest.queue.receipt_scope)) continue;
+                for (state.proposals) |receipt| if (receipt.state == .superseded) {
+                    if (open_ids.get(receipt.id)) |i| {
+                        records[i].state = .superseded;
+                        if (receipt.decided) |old| {
+                            var origin = old;
+                            origin.actor = try a.dupe(u8, old.actor);
+                            origin.reason = try a.dupe(u8, old.reason);
+                            origin.proposal_id = if (old.proposal_id) |value| try a.dupe(u8, value) else null;
+                            origin.cascade_from = if (old.cascade_from) |value| try a.dupe(u8, value) else null;
+                            records[i].decided = origin;
+                        }
+                        _ = open_ids.remove(receipt.id);
+                    }
+                };
+            }
+        }
+    }
+    manifest.queue.proposals = records;
+    manifest.refresh_required = false;
+}
+
+const ProposalObservation = struct { applied: bool, rows: std.json.Value };
+/// A retry observes receipts, never replays the accepted action. Current policy
+/// can contain later corrections, whose progress is a conservative wait floor.
+fn observeProposal(handle: *handles.Handle, a: std.mem.Allocator, table: []const u8, id: []const u8, scope: ?@import("antfly_resolver").curation.ReceiptScope) !ProposalObservation {
+    const pure = @import("antfly_resolver").curation;
+    const owner = @import("../storage/db/resolver_curation.zig");
+    var sources: std.ArrayListUnmanaged(struct { db: *db_mod.DB, name: []const u8 }) = .empty;
+    try sources.append(a, .{ .db = &handle.db, .name = "default" });
+    var it = handle.embedded_tables.iterator();
+    while (it.next()) |entry| try sources.append(a, .{ .db = &entry.value_ptr.*.db, .name = entry.key_ptr.* });
+    var rows = std.json.Array.init(a);
+    var applied = true;
+    for (sources.items) |source| {
+        const configs = source.db.core.index_manager.listResolverIdentities(a) catch |err| {
+            applied = false;
+            try rows.append(try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .source_table = source.name, .resolver = "", .accepted = true, .applied = false, .@"error" = @errorName(err) }, .{}), .{}));
+            continue;
+        };
+        for (configs) |cfg| {
+            if (!std.mem.eql(u8, cfg.table, table)) continue;
+            const state = try pure.parseState(a, cfg.curation_json);
+            if (!pure.sameReceiptScope(state.receipt_scope, scope)) continue;
+            const participant = for (state.proposals) |receipt| {
+                if (std.mem.eql(u8, receipt.id, id) and receipt.state != .open) break true;
+            } else false;
+            if (!participant) continue;
+            const done = owner.applied(source.db, cfg) catch false;
+            applied = applied and done;
+            try rows.append(try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .source_table = source.name, .resolver = cfg.name, .revision = cfg.curation_revision, .replay_sequence = cfg.curation_revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .applied = done }, .{}), .{}));
+        }
+    }
+    return .{ .applied = applied, .rows = .{ .array = rows } };
+}
+
+/// The root table owns queue admission. Accepted actions use per-resolver
+/// receipts, so a partial fanout can resume after process restart without
+/// applying an already accepted action again.
+fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice, request: capi.Slice, out_buf: ?*capi.Buffer, operation_name: enum { create, list, get, decide }) capi.ErrorCode {
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    if (request.len > 4 * 1024 * 1024) return capi.mapError(error.ResolverCurationLimitExceeded);
+    const guard = enterHandle(handle_ptr, if (operation_name == .list or operation_name == .get) .read else .exclusive) orelse return capi.mapError(error.InvalidArgument);
+    var admitted = true;
+    defer if (admitted) guard.leave();
+    if (guard.entry_error) |value| return capi.ensureError(value, @src().fn_name);
+    const handle = guard.handle.parent_handle orelse guard.handle;
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pure = @import("antfly_resolver").curation;
+    const owner = @import("../storage/db/resolver_curation.zig");
+    const tables = @import("tables.zig");
+    (if (operation_name == .list or operation_name == .get) tables.loadCatalog(handle) else tables.load(handle)) catch |err| return capi.mapError(err);
+    const db = tables.get(handle, table.bytes()) catch |err| return capi.mapError(err);
+    var policy_lease = (if (operation_name == .list or operation_name == .get) db.local_execution.row_policy_gate.enterRawRead() else db.local_execution.row_policy_gate.enterRaw()) catch |err| return capi.mapError(err);
+    defer policy_lease.release();
+    if (operation_name != .list and operation_name != .get) {
+        if (db.maintenanceRequiresOrderedApply() catch |err| return capi.mapError(err)) return capi.mapError(error.OrderedResolverReviewRequired);
+    }
+    var manifest = proposalManifest(a, db) catch |err| return capi.mapError(err);
+    refreshProposalManifest(handle, a, table.bytes(), &manifest) catch |err| return capi.mapError(err);
+    if (operation_name == .list) {
+        // JSON options are converted to the same keyset query used by HTTP.
+        const Query = struct { state: enum { open, accepted, rejected, superseded, all } = .open, action: ?pure.EntityAction = null, cursor: []const u8 = "", limit: u16 = 64 };
+        const query = std.json.parseFromSliceLeaky(Query, a, if (request.len == 0) "{}" else request.bytes(), .{}) catch |err| return capi.mapError(err);
+        const bytes = std.fmt.allocPrint(a, "state={s}&cursor={s}&limit={d}{s}", .{ @tagName(query.state), query.cursor, query.limit, if (query.action) |action| std.fmt.allocPrint(a, "&action={s}", .{@tagName(action)}) catch |err| return capi.mapError(err) else "" }) catch |err| return capi.mapError(err);
+        policy_lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) catch |err| return capi.mapError(err);
+        out.* = stringifyJson(pure.proposalPage(a, manifest.queue, bytes) catch |err| return capi.mapError(err)) catch |err| return capi.mapError(err);
+        return .ok;
+    }
+    var proposal_id = id.bytes();
+    var creation: ?pure.ProposalRequest = null;
+    if (operation_name == .create) {
+        const input = std.json.parseFromSliceLeaky(pure.ProposalRequest, a, request.bytes(), .{}) catch |err| return capi.mapError(err);
+        proposal_id = pure.proposalId(a, input) catch |err| return capi.mapError(err);
+        creation = input;
+    }
+    var selected: ?usize = null;
+    for (manifest.queue.proposals, 0..) |proposal, i| if (std.mem.eql(u8, proposal.id, proposal_id)) {
+        selected = i;
+        break;
+    };
+    if (operation_name == .get or (operation_name == .create and selected != null)) {
+        const proposal = manifest.queue.proposals[selected orelse return capi.mapError(error.NotFound)];
+        policy_lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) catch |err| return capi.mapError(err);
+        out.* = stringifyJson(proposal) catch |err| return capi.mapError(err);
+        return .ok;
+    }
+    if (manifest.pending_id) |pending| if (!std.mem.eql(u8, pending, proposal_id)) return capi.mapError(error.ResolverCurationConflict);
+    const input_decision = if (operation_name == .decide) std.json.parseFromSliceLeaky(pure.ProposalDecision, a, request.bytes(), .{}) catch |err| return capi.mapError(err) else pure.ProposalDecision{ .accept = false };
+    const proposal = if (selected) |i| manifest.queue.proposals[i] else if (creation) |input| blk: {
+        if (manifest.queue.proposals.len == 0 and manifest.queue.receipt_scope == null) {
+            var entropy: [16]u8 = undefined;
+            @import("antfly_platform").entropy.fill(handleLockIo(), &entropy) catch |err| return capi.mapError(err);
+            manifest.queue.receipt_scope = std.fmt.bytesToHex(entropy, .lower);
+        }
+        const plan = pure.propose(a, manifest.queue, &.{}, input, owner.manualOrigin(.{ .action = .suppress, .actor = input.actor, .reason = input.reason }, 0)) catch |err| return capi.mapError(err);
+        manifest.queue = plan.state;
+        selected = manifest.queue.proposals.len - 1;
+        break :blk manifest.queue.proposals[selected.?];
+    } else return capi.mapError(error.NotFound);
+    if (input_decision.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return capi.mapError(error.InvalidResolverCurationRequest);
+    if (operation_name == .decide and proposal.state != .open) {
+        const wanted: pure.ProposalState = if (input_decision.accept) .accepted else .rejected;
+        if (proposal.state != wanted) return capi.mapError(error.ResolverCurationConflict);
+        const observation = observeProposal(handle, a, table.bytes(), proposal.id, manifest.queue.receipt_scope) catch |err| return capi.mapError(err);
+        out.* = stringifyJson(.{ .proposal = proposal, .atomicity = "resolver", .changed = false, .complete = true, .applied = observation.applied, .results = observation.rows }) catch |err| return capi.mapError(err);
+        policy_lease.release();
+        admitted = false;
+        guard.leave();
+        return waitResolverCurationResponse(handle_ptr, if (input_decision.wait) |wait| wait.timeout_ms else 0, out);
+    }
+    if (!input_decision.accept and (input_decision.options != null or (input_decision.pin_distinct and proposal.action != .merge))) return capi.mapError(error.InvalidResolverCurationRequest);
+    if (input_decision.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return capi.mapError(error.InvalidResolverCurationRequest);
+    const decision = manifest.pending_decision orelse input_decision;
+    if (manifest.pending_decision) |old| {
+        if (input_decision.pin_distinct != old.pin_distinct) return capi.mapError(error.ResolverCurationConflict);
+        if (input_decision.options) |options| if (!std.meta.eql(options, old.options orelse proposal.options)) return capi.mapError(error.ResolverCurationConflict);
+    }
+    if (manifest.pending_decision != null and (input_decision.accept != decision.accept)) return capi.mapError(error.ResolverCurationConflict);
+    const stamp = manifest.pending_origin orelse owner.manualOrigin(.{ .action = .suppress, .actor = decision.actor, .reason = decision.reason }, 0);
+    stamp.validate() catch |err| return capi.mapError(err);
+    const Pending = struct { db: *db_mod.DB, source: []const u8, cfg: db_mod.ResolverConfig, edit: pure.Plan };
+    var pending: std.ArrayListUnmanaged(Pending) = .empty;
+    var sources: std.ArrayListUnmanaged(struct { db: *db_mod.DB, name: []const u8 }) = .empty;
+    sources.append(a, .{ .db = &handle.db, .name = "default" }) catch |err| return capi.mapError(err);
+    var it = handle.embedded_tables.iterator();
+    while (it.next()) |entry| sources.append(a, .{ .db = &entry.value_ptr.*.db, .name = entry.key_ptr.* }) catch |err| return capi.mapError(err);
+    for (sources.items) |source| {
+        const configs = source.db.core.index_manager.listResolverIdentities(a) catch |err| return capi.mapError(err);
+        for (configs) |cfg| {
+            if (!std.mem.eql(u8, cfg.table, table.bytes()) or !owner.keyInNamespace(cfg.key_template, proposal.key)) continue;
+            if (proposal.into) |into| if (!owner.keyInNamespace(cfg.key_template, into)) return capi.mapError(error.InvalidResolverCurationRequest);
+            if (operation_name == .create) {
+                pending.append(a, .{ .db = source.db, .source = source.name, .cfg = cfg, .edit = .{ .state = .{}, .merges = &.{}, .changed = false } }) catch |err| return capi.mapError(err);
+                continue;
+            }
+            if (!decision.accept and !decision.pin_distinct) continue;
+            var state = pure.bindReceiptScope(pure.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err), manifest.queue.receipt_scope);
+            // A receipt makes retries independent of subsequent direct edits.
+            var found = false;
+            for (state.proposals) |old| if (std.mem.eql(u8, old.id, proposal.id)) {
+                found = true;
+                break;
+            };
+            if (!found) {
+                const entries = a.alloc(pure.Proposal, state.proposals.len + 1) catch |err| return capi.mapError(err);
+                @memcpy(entries[0..state.proposals.len], state.proposals);
+                entries[state.proposals.len] = proposal;
+                entries[state.proposals.len].evidence = null;
+                state.proposals = entries;
+            }
+            const has_receipt = for (state.proposals) |old| {
+                if (std.mem.eql(u8, old.id, proposal.id) and old.state != .open) break true;
+            } else false;
+            if (!has_receipt) if (input_decision.expected_revision) |revision| if (revision != cfg.curation_revision) return capi.mapError(error.ResolverCurationConflict);
+            var origin = stamp;
+            origin.revision = std.math.add(u64, cfg.curation_revision, 1) catch |err| return capi.mapError(err);
+            if (source.db.maintenanceRequiresOrderedApply() catch |err| return capi.mapError(err)) return capi.mapError(error.OrderedResolverReviewRequired);
+            var edit = pure.decide(a, state, cfg.merges, cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err), proposal.id, decision, origin) catch |err| return capi.mapError(err);
+            var review_origin = origin;
+            review_origin.origin = .review;
+            review_origin.proposal_id = proposal.id;
+            _ = pure.recordSupersessions(a, &edit, manifest.queue.proposals, pure.decisionRequest(proposal, decision), review_origin) catch |err| return capi.mapError(err);
+            const receipts = a.dupe(pure.Proposal, edit.state.proposals) catch |err| return capi.mapError(err);
+            for (receipts) |*receipt| if (std.mem.eql(u8, receipt.id, proposal.id)) {
+                receipt.state = if (decision.accept) .accepted else .rejected;
+                receipt.decided = review_origin;
+            };
+            edit.state.proposals = receipts;
+            var next = cfg;
+            next.merges = edit.merges;
+            next.curation_json = std.json.Stringify.valueAlloc(a, edit.state, .{}) catch |err| return capi.mapError(err);
+            next.validate() catch |err| return capi.mapError(err);
+            pending.append(a, .{ .db = source.db, .source = source.name, .cfg = cfg, .edit = edit }) catch |err| return capi.mapError(err);
+        }
+    }
+    if ((operation_name == .create or decision.accept or decision.pin_distinct) and pending.items.len == 0) return capi.mapError(error.ResolverNotFound);
+    if (operation_name == .decide) {
+        var prospective = manifest.queue;
+        for (pending.items) |item| prospective.proposals = pure.projectReceipts(a, prospective.proposals, item.edit.state.proposals) catch |err| return capi.mapError(err);
+        const records = a.dupe(pure.Proposal, prospective.proposals) catch |err| return capi.mapError(err);
+        records[selected.?].state = if (decision.accept) .accepted else .rejected;
+        var origin = stamp;
+        origin.origin = .review;
+        origin.proposal_id = proposal.id;
+        records[selected.?].decided = origin;
+        prospective.proposals = records;
+        _ = pure.parseState(a, std.json.Stringify.valueAlloc(a, prospective, .{}) catch |err| return capi.mapError(err)) catch |err| return capi.mapError(err);
+    }
+    var results = std.json.Array.init(a);
+    var complete = true;
+    if (operation_name == .decide and (decision.accept or decision.pin_distinct)) {
+        manifest.refresh_required = true;
+        manifest.pending_id = proposal.id;
+        manifest.pending_decision = decision;
+        manifest.pending_origin = stamp;
+        saveProposalManifest(a, db, manifest) catch |err| return capi.mapError(err);
+        policy_lease.release();
+        for (pending.items) |item| {
+            const raw = owner.publishPlan(item.db, a, item.cfg, item.edit) catch |err| {
+                complete = false;
+                results.append(std.json.parseFromSliceLeaky(std.json.Value, a, std.json.Stringify.valueAlloc(a, .{ .source_table = item.source, .resolver = item.cfg.name, .accepted = false, .@"error" = @errorName(err) }, .{}) catch |failure| return capi.mapError(failure), .{}) catch |failure| return capi.mapError(failure)) catch |failure| return capi.mapError(failure);
+                continue;
+            };
+            const projected = a.dupe(pure.Proposal, manifest.queue.proposals) catch |err| return capi.mapError(err);
+            for (projected) |*record| if (record.state == .open and !std.mem.eql(u8, record.id, proposal.id)) {
+                for (item.edit.state.proposals) |receipt| if (receipt.state == .superseded and std.mem.eql(u8, record.id, receipt.id)) {
+                    record.state = .superseded;
+                    record.decided = receipt.decided;
+                    break;
+                };
+            };
+            manifest.queue.proposals = projected;
+            var value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch |err| return capi.mapError(err);
+            value.object.put(a, "source_table", .{ .string = item.source }) catch |err| return capi.mapError(err);
+            results.append(value) catch |err| return capi.mapError(err);
+        }
+    }
+    if (operation_name == .decide and complete) {
+        const entries = a.dupe(pure.Proposal, manifest.queue.proposals) catch |err| return capi.mapError(err);
+        entries[selected.?].state = if (decision.accept) .accepted else .rejected;
+        var origin = stamp;
+        origin.origin = .review;
+        origin.proposal_id = proposal.id;
+        entries[selected.?].decided = origin;
+        manifest.queue.proposals = entries;
+        manifest.refresh_required = false;
+        manifest.pending_id = null;
+        manifest.pending_decision = null;
+        manifest.pending_origin = null;
+    }
+    policy_lease.release();
+    policy_lease = db.local_execution.row_policy_gate.enterRaw() catch |err| return capi.mapError(err);
+    saveProposalManifest(a, db, manifest) catch |err| return capi.mapError(err);
+    var applied = complete;
+    for (results.items) |row| {
+        const observed = row.object.get("applied") orelse {
+            applied = false;
+            continue;
+        };
+        applied = applied and observed == .bool and observed.bool;
+    }
+    out.* = if (operation_name == .create) stringifyJson(manifest.queue.proposals[selected.?]) catch |err| return capi.mapError(err) else stringifyJson(.{ .proposal = manifest.queue.proposals[selected.?], .atomicity = "resolver", .complete = complete, .applied = applied, .results = std.json.Value{ .array = results } }) catch |err| return capi.mapError(err);
+    if (operation_name == .decide) {
+        policy_lease.release();
+        admitted = false;
+        guard.leave();
+        return waitResolverCurationResponse(handle_ptr, if (input_decision.wait) |wait| wait.timeout_ms else 0, out);
+    }
+    return .ok;
+}
+pub fn antfly_db_propose_curation_json(handle: ?*anyopaque, table: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled) return @call(.auto, @extern(*const @TypeOf(antfly_db_propose_curation_json), .{ .name = "antfly_db_propose_curation_json" }), .{ handle, table, request, out });
+    return proposalOperation(handle, table, .fromSlice(""), request, out, .create);
+}
+pub fn antfly_db_list_curation_proposals_json(handle: ?*anyopaque, table: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled) return @call(.auto, @extern(*const @TypeOf(antfly_db_list_curation_proposals_json), .{ .name = "antfly_db_list_curation_proposals_json" }), .{ handle, table, request, out });
+    return proposalOperation(handle, table, .fromSlice(""), request, out, .list);
+}
+pub fn antfly_db_get_curation_proposal_json(handle: ?*anyopaque, table: capi.Slice, id: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled) return @call(.auto, @extern(*const @TypeOf(antfly_db_get_curation_proposal_json), .{ .name = "antfly_db_get_curation_proposal_json" }), .{ handle, table, id, out });
+    return proposalOperation(handle, table, id, .fromSlice(""), out, .get);
+}
+pub fn antfly_db_decide_curation_proposal_json(handle: ?*anyopaque, table: capi.Slice, id: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled) return @call(.auto, @extern(*const @TypeOf(antfly_db_decide_curation_proposal_json), .{ .name = "antfly_db_decide_curation_proposal_json" }), .{ handle, table, id, request, out });
+    return proposalOperation(handle, table, id, request, out, .decide);
 }
 
 /// Bounded review page or revision-bound review decision; operation is part
@@ -7778,7 +8304,7 @@ pub fn antfly_db_drop_resolver_identity(handle_ptr: ?*anyopaque, name: capi.Slic
     capi.clearLastError();
     const out = out_deleted orelse return capi.mapError(error.InvalidArgument);
     out.* = false;
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapError(error.InvalidArgument);
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
     out.* = guard.handle.database().dropRetiredResolverIdentity(name.bytes()) catch |err| return capi.mapErrorContext(err, "retire all declaring indexes before dropping resolver identity");
@@ -7791,7 +8317,7 @@ pub fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_n
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_set_resolver_namespace_json), .{ .name = "antfly_db_set_resolver_namespace_json" }), .{ handle_ptr, resolver_name, request_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
     const handle = guard.handle;
@@ -7808,6 +8334,11 @@ pub fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_n
     }
     for (configs) |cfg| {
         if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
+        // Namespace changes can discard receipts or enroll a new queue. Fence
+        // both authorities before changing identity, including same-table resets.
+        const root = handle.parent_handle orelse handle;
+        requireProposalQueueIdle(root, arena.allocator(), cfg.table) catch |err| return capi.mapError(err);
+        if (!std.mem.eql(u8, cfg.table, request.table)) requireProposalQueueIdle(root, arena.allocator(), request.table) catch |err| return capi.mapError(err);
         // Validate the destination before publishing identity state.
         _ = @import("tables.zig").get(handle.parent_handle orelse handle, request.table) catch |err| return capi.mapErrorContext(if (err == error.UndefinedTable) error.NotFound else err, "resolver namespace destination table does not exist");
         const next = curation.namespaceConfig(arena.allocator(), cfg, request) catch |err| return capi.mapErrorContext(err, "mapping every inline alias endpoint and resolver policy key into the destination namespace");
@@ -7872,7 +8403,7 @@ fn addIndexJsonRegistered(
     generation: *u64,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7913,6 +8444,7 @@ fn addIndexJsonRegistered(
         }
         break :blk .dense_vector;
     } else std.meta.stringToEnum(db_mod.types.IndexKind, discriminator.string) orelse return capi.mapError(error.InvalidIndexType);
+    const inline_resolvers = if (kind == .graph) parseLiteIndexResolvers(a, normalized_config) catch |err| return capi.mapError(err) else &.{};
     // Validate command targets before registering any inline producers/resolvers.
     if (replacement) |old| {
         if (old != .string or old.string.len == 0 or std.mem.eql(u8, old.string, name.string))
@@ -7998,7 +8530,7 @@ fn addIndexJsonRegistered(
     // The undo buffer restores both active and retired state on failed admission.
     const shadow_replacement = !existing_index and replacement != null and handle.database().core.index_manager.get(replacement.?.string) != null;
     if (kind == .graph and !shadow_replacement) {
-        registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
+        registerParsedLiteIndexResolvers(handle, inline_resolvers, &rollback.?) catch |err| {
             rollback.?.restore();
             if (err == error.ResolverMergeNamespaceChange)
                 return capi.mapErrorContext(err, "changing a resolver table, key_template, or fenced inline aliases requires explicitly resetting or migrating its durable namespace");
@@ -8044,7 +8576,7 @@ pub fn antfly_db_cancel_replacement(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_cancel_replacement), .{ .name = "antfly_db_cancel_replacement" }), .{ handle_ptr, name, out_deleted });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8065,7 +8597,7 @@ pub fn antfly_db_delete_index(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_delete_index), .{ .name = "antfly_db_delete_index" }), .{ handle_ptr, name, out_deleted });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8085,7 +8617,7 @@ pub fn antfly_db_add_enrichment_json(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_add_enrichment_json), .{ .name = "antfly_db_add_enrichment_json" }), .{ handle_ptr, config_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8110,7 +8642,7 @@ pub fn antfly_db_delete_enrichment(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_delete_enrichment), .{ .name = "antfly_db_delete_enrichment" }), .{ handle_ptr, kind_slice, name, out_deleted });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8514,7 +9046,7 @@ pub fn antfly_db_create_shadow_index_manager(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_create_shadow_index_manager), .{ .name = "antfly_db_create_shadow_index_manager" }), .{ handle_ptr, split_key, original_range_end });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8592,7 +9124,7 @@ pub fn antfly_db_split(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_split), .{ .name = "antfly_db_split" }), .{ handle_ptr, curr_start, curr_end, split_key, dest_dir1, dest_dir2, prepare_only });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8620,7 +9152,7 @@ pub fn antfly_db_finalize_split(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_finalize_split), .{ .name = "antfly_db_finalize_split" }), .{ handle_ptr, new_start, new_end });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8822,6 +9354,46 @@ test "capi SQL contention diagnostics preserve busy and unknown outcomes" {
     }
 }
 
+test "capi resolver invalid inline declarations reject before replay activity or catalog mutation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("inline-resolver-preflight");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    const handle = try openLiteHandleAllocWithRuntime(a, path, .{ .no_sync = true, .profile = .hosted }, true, std.testing.io, runtime.ptr());
+    const id = try publishHandle(handle);
+    defer antfly_db_close(id);
+    const database = handle.database();
+    if (database.resolution_runtime == null) try database.initResolutionRuntime();
+    const mutex = &database.resolution_runtime.?.catch_up_mutex;
+    try std.testing.expect(mutex.tryLock());
+    defer mutex.unlock();
+    // Hold replay ownership deterministically. Validation must neither wait
+    // for this gate nor activate the first resolver before rejecting the next.
+    for ([_][]const u8{
+        \\{"name":"second","table":"default","source_artifact":"kg","resolution_artifact":"resolved","key_template":"entity/{{ uslug _entity.text }}"}
+        ,
+        \\{"name":"first","table":"default","source_artifact":"kg","resolution_artifact":"other","key_template":"entity/{{ uslug _entity.text }}"}
+        ,
+        \\{"name":"second","table":"default","source_artifact":"kg","resolution_artifact":"other","key_template":"entity/{{ uslug _entity.text }}","labels":["person"]}
+        ,
+        \\42
+        ,
+    }) |later| {
+        const request = try std.fmt.allocPrint(a,
+            \\{{"name":"graph","kind":"graph","resolvers":[{{"name":"first","table":"default","source_artifact":"kg","resolution_artifact":"resolved","key_template":"entity/{{{{ uslug _entity.text }}}}","labels":["person"]}},{s}]}}
+        , .{later});
+        defer a.free(request);
+        try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_add_index_json(id, .fromSlice(request)));
+        const identities = try database.listResolverIdentities(a);
+        defer a.free(identities);
+        try std.testing.expectEqual(@as(usize, 0), identities.len);
+    }
+}
+
 test "capi resolver replacement public waits retain admission generation across quanta" {
     const a = std.testing.allocator;
     for (0..4) |mode| {
@@ -8984,6 +9556,10 @@ comptime {
         "antfly_db_resolver_curation_json",
         "antfly_db_resolver_reviews_json",
         "antfly_db_curate_entity_json",
+        "antfly_db_propose_curation_json",
+        "antfly_db_list_curation_proposals_json",
+        "antfly_db_get_curation_proposal_json",
+        "antfly_db_decide_curation_proposal_json",
         "antfly_db_entity_merge_json",
         "antfly_db_entity_unmerge_json",
         "antfly_db_entity_suppress_json",
@@ -9053,4 +9629,56 @@ test "inline resolver replacement C API admits the same public name with fresh a
     }
     // Replaying the declarative config after activation remains idempotent.
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(next)));
+}
+
+test "capi lite standalone snapshots retain one catalog authority across embedded edits" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("standalone-catalog-authority");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const source = try std.fmt.allocPrintSentinel(alloc, "{s}/source.aflite", .{directory.path()}, 0);
+    defer alloc.free(source);
+    const snapshot = try std.fmt.allocPrintSentinel(alloc, "{s}/snapshot.aflite", .{directory.path()}, 0);
+    defer alloc.free(snapshot);
+    {
+        var lite = try antfly.lite.connection.Connection.create(alloc, source, true);
+        defer lite.close();
+        try lite.db.setSchemaJson(alloc, antfly.public_api.tables.default_schema_json);
+        try lite.backend.adoptEmbeddedRootAsNamespace("group-42/table-db");
+        try lite.backend.markStandaloneArtifact();
+        _ = try lite.backend.copyStableSnapshot(snapshot, false);
+    }
+    // Exercise the public connection/refresh path, including a snapshot reopen.
+    for ([_][:0]const u8{ source, snapshot }) |path| {
+        const handle = try openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .hosted }, false);
+        const id = try publishHandle(handle);
+        defer antfly_db_close(id);
+        const schema = "{\"version\":0}";
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_set_schema_json(id, .fromSlice(schema)));
+        try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "owned by standalone") != null);
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_add_index_json(id, .fromSlice("{\"name\":\"other\",\"type\":\"full_text\"}")));
+        var removed = false;
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_delete_index(id, .fromSlice("full_text_index_v0"), &removed));
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_add_enrichment_json(id, .fromSlice("{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":8}")));
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_delete_enrichment(id, .fromSlice("chunk"), .fromSlice("chunks"), &removed));
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, @import("tables.zig").antfly_db_create_table_json(id, .fromSlice("other"), .fromSlice(schema)));
+        var output: capi.Buffer = .{};
+        defer antfly_buffer_free(&output);
+        for ([_][]const u8{
+            "{\"statement\":\"CREATE TABLE other (n BIGINT)\"}",
+            "{\"statement\":\"DROP TABLE other\"}",
+        }) |request| {
+            try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(id, .fromSlice(request), &output));
+            antfly_buffer_free(&output);
+            var cursor: u64 = 0;
+            try std.testing.expectEqual(capi.ErrorCode.unsupported, @import("sql_cursor.zig").antfly_db_sql_open_cursor_json(id, .fromSlice(request), &cursor, &output));
+            try std.testing.expectEqual(@as(u64, 0), cursor);
+            antfly_buffer_free(&output);
+        }
+        const batch = "{\"inserts\":{\"edited-offline\":{\"body\":\"portable document edit\"}},\"sync_level\":\"write\"}";
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(id, .fromSlice(batch), &output));
+        antfly_buffer_free(&output);
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_schema_json(id, &output));
+        try std.testing.expectEqualStrings(antfly.public_api.tables.default_schema_json, output.ptr.?[0..output.len]);
+    }
 }

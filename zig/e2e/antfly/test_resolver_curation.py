@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Resolver curation admission, owner progress, and namespace routes over HTTP."""
 
@@ -19,6 +19,10 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import pytest
+
+
+# Server ownership is dynamic/direct, outside static fixture inference.
+pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 
 def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
@@ -115,6 +119,16 @@ def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
     decision = api.post(zeta + ":unmerge", {"pin_distinct": True, "wait": wait})
     assert decision["changed"], decision
     assert api.get(resolver + "/redirects")["redirects"] == []
+
+    proposals = f"/tables/{destination}/curation/proposals"
+    proposed = api.post(proposals, {"action": "suppress", "key": "concept/alpha"})
+    for prefix in ("", "/databases/default/namespaces/public"):
+        route = prefix + proposals
+        page = api.get(route + "?state=open&action=suppress&limit=1")
+        assert [item["id"] for item in page["proposals"]] == [proposed["id"]]
+        assert api.get(route + "?state=accepted&limit=1")["proposals"] == []
+        invalid = api._request("GET", route + "?limit=0")
+        assert invalid.status_code == 400, invalid.text
 
 
 @pytest.mark.parametrize("raft", [False, True], ids=["standalone", "raft"])
@@ -221,7 +235,7 @@ def test_curator_review_decisions_survive_restart(request, monkeypatch, raft, pr
         )
         reviews = []
 
-        def pending_review():
+        def pending_review(reviews=reviews):
             reviews[:] = all_reviews()
             return bool(reviews)
 
@@ -236,7 +250,30 @@ def test_curator_review_decisions_survive_restart(request, monkeypatch, raft, pr
         assert accepted["replay_sequence_kind"] == "source_journal", accepted
         assert accepted["replay_sequence"] > last_sequence, accepted
         last_sequence = accepted["replay_sequence"]
-        assert accepted["applied"], accepted
+
+        # The operation is durable even when its bounded HTTP observation
+        # returns 202. Await the exact journal cut on detached workers rather
+        # than assuming Raft, replay and catalog reads finish in five seconds.
+        def decision_applied(accepted=accepted):
+            progress = api.get(resolver)["progress"]
+            return bool(progress["shards"]) and all(
+                row["available"]
+                and row["fresh"]
+                and row["resolution"]["applied_sequence"] >= accepted["replay_sequence"]
+                and (
+                    not promote
+                    or row["promotion"]["applied_sequence"]
+                    >= accepted["replay_sequence"]
+                )
+                for row in progress["shards"]
+            )
+
+        assert accepted["applied"] or wait_until(
+            decision_applied, timeout_s=30, interval_s=0.1
+        ), (
+            json.dumps({"accepted": accepted, "resolver": api.get(resolver)})
+            + api.debug_logs()[-16000:]
+        )
         assert all_reviews() == []
     api.restart_server()
     assert all_reviews() == []
@@ -406,3 +443,215 @@ def test_entity_merge_adopts_matching_local_policy(request, monkeypatch, raft, p
                 {"text": "A", "label": "concept"},
             )
             assert rendered["key"] == "concept/b", rendered
+
+
+@pytest.mark.parametrize("action", ["merge", "suppress"])
+@pytest.mark.parametrize("raft", [False, True], ids=["standalone", "raft"])
+def test_runtime_entity_curation_preserves_future_promotion(
+    request, monkeypatch, action, raft
+):
+    """Curation before any destination row exists must retain a usable sink."""
+    import json
+
+    from helpers import wait_until
+
+    if raft:
+        monkeypatch.setenv("ANTFLY_E2E_STATEFUL_RAFT", "1")
+    api = request.getfixturevalue("stateful_api")
+    suffix = uuid4().hex[:8]
+    destination, source = f"live_entities_{suffix}", f"live_notes_{suffix}"
+    api.create_table(destination)
+    api.create_table(
+        source,
+        indexes={
+            "knowledge": {
+                "type": "graph",
+                "source": {
+                    "artifact": "kg",
+                    "format": "extraction_graph",
+                    "mention_edge_type": "mentions",
+                },
+                "artifact": {
+                    "name": "kg",
+                    "kind": "asset",
+                    "source": {"type": "field", "value": "kg"},
+                    "content_type": "application/json",
+                },
+                "edge_types": [{"name": "mentions"}],
+                "resolvers": [
+                    {
+                        "name": "concepts",
+                        "table": destination,
+                        "source_artifact": "kg",
+                        "resolution_artifact": "resolved",
+                        "key_template": "concept/{{uslug _entity.text}}",
+                    }
+                ],
+            }
+        },
+    )
+    path = f"/tables/{destination}/entities/{quote('concept/alpha', safe='')}:{action}"
+    decision = api.post(
+        path,
+        {
+            "wait": {"timeout_ms": 5000},
+            **({"into": "concept/canonical"} if action == "merge" else {}),
+        },
+    )
+    assert decision["complete"] and decision["applied"], decision
+    for i in range(2):
+        api.batch_write(
+            source,
+            inserts={
+                f"note-{i}": {
+                    "kg": {
+                        "entities": [
+                            {"id": "a", "text": "Alpha", "label": "concept"},
+                            {"id": "b", "text": f"Healthy {i}", "label": "concept"},
+                        ]
+                    }
+                }
+            },
+            sync_level="write",
+        )
+        expected = {f"concept/healthy_{n}" for n in range(i + 1)}
+        if action == "merge":
+            expected.add("concept/canonical")
+
+        def promoted(expected=expected):
+            response = api.query_table(
+                destination, {"query": {"match_all": {}}, "limit": 20}
+            )
+            hits = response["responses"][0]["hits"]["hits"]
+            ids = {hit["_id"] for hit in hits}
+            return expected <= ids and "concept/alpha" not in ids
+
+        assert wait_until(promoted, timeout_s=60), (
+            json.dumps(api.get(f"/tables/{source}/resolvers/concepts"), sort_keys=True)
+            + "\n"
+            + api.debug_logs()[-16000:]
+        )
+    assert (
+        "promotion catch-up failed: EntityCurationUnavailable"
+        not in api._server.debug_logs()
+    )
+
+    # Table qualification is accepted by server and embedded traversal. A bare
+    # incoming key on a resolver graph must not silently select the source table.
+    def traversal(start, deduplicate=True):
+        return api._request(
+            "POST",
+            f"/tables/{source}/query",
+            {
+                "graph_queries": {
+                    "incoming": {
+                        "index": "knowledge",
+                        "traverse": {
+                            "start": start,
+                            "direction": "in",
+                            "edge_types": ["mentions"],
+                            "max_depth": 1,
+                            "include_paths": True,
+                            "deduplicate_nodes": deduplicate,
+                        },
+                    }
+                }
+            },
+        )
+
+    seed = "concept/canonical" if action == "merge" else "concept/healthy_0"
+    for start in ({"keys": [seed]}, {"identities": [{"key": seed}]}):
+        bare = traversal(start)
+        assert bare.status_code == 422, bare.text
+        assert bare.json()["reason"] == "qualified_start_identity_required", bare.text
+    qualified = {"identities": [{"table": destination, "key": seed}]}
+    # A valid incoming query must not be blamed for a later query's missing
+    # qualification when the error crosses an independently compiled archive.
+    mixed = api._request(
+        "POST",
+        f"/tables/{source}/query",
+        {
+            "graph_queries": {
+                "valid": {
+                    "index": "knowledge",
+                    "traverse": {"start": qualified, "direction": "in", "max_depth": 1},
+                },
+                "invalid": {
+                    "index": "knowledge",
+                    "traverse": {
+                        "start": {"keys": [seed]},
+                        "direction": "in",
+                        "max_depth": 1,
+                    },
+                },
+            }
+        },
+    )
+    assert mixed.status_code == 422, mixed.text
+    assert mixed.json()["operation"] == "invalid", mixed.text
+    assert mixed.json()["reason"] == "qualified_start_identity_required", mixed.text
+
+    expected_nodes = {"note-0", "note-1"} if action == "merge" else {"note-0"}
+
+    def graph_published():
+        # Entity promotion and graph publication are independent consumers.
+        # A write-level acknowledgement plus promoted rows does not fence graph
+        # visibility, particularly with independently applied Raft publications.
+        reached = traversal(qualified)
+        assert reached.ok, reached.text
+        nodes = reached.json()["responses"][0]["graph_results"]["incoming"]["nodes"]
+        return nodes if {node["key"] for node in nodes} == expected_nodes else None
+
+    assert wait_until(graph_published, timeout_s=30), api.debug_logs()[-16000:]
+    multiple_seeds = {"identities": list(qualified["identities"])}
+    expected_paths = [(seed, "note-0")]
+    if action == "merge":
+        multiple_seeds["identities"].append(
+            {"table": destination, "key": "concept/healthy_0"}
+        )
+        expected_paths += [(seed, "note-1"), ("concept/healthy_0", "note-0")]
+    no_dedup = traversal(multiple_seeds, False)
+    if no_dedup.status_code == 422:
+        # A coordinator cannot retain per-seed paths through its deduplicated
+        # frontier. Report that constraint, never reject the incoming direction.
+        assert no_dedup.json()["reason"] == "deduplicate_nodes_must_be_true", (
+            no_dedup.text
+        )
+    else:
+        # Complete local execution supports this shape. Verify both paths to
+        # the shared document survive rather than silently deduplicating them.
+        assert no_dedup.ok, no_dedup.text
+        nodes = no_dedup.json()["responses"][0]["graph_results"]["incoming"]["nodes"]
+        assert sorted(
+            (node["path"][0]["key"], node["key"]) for node in nodes
+        ) == sorted(expected_paths), nodes
+
+    # Re-resolution must refresh accepted graph projections without a new
+    # foreground write or another provider invocation.
+    edited = api.post(
+        f"/tables/{destination}/entities/{quote('concept/healthy_0', safe='')}:merge",
+        {"into": "concept/healthy_1", "wait": {"timeout_ms": 5000}},
+    )
+    assert edited["complete"], edited
+    assert wait_until(
+        lambda: api.get(f"/tables/{source}/resolvers/concepts")["progress"]["applied"],
+        timeout_s=60,
+    ), api.get(f"/tables/{source}/resolvers/concepts")
+
+    def refreshed():
+        response = traversal(
+            {"identities": [{"table": destination, "key": "concept/healthy_1"}]}
+        )
+        assert response.ok, response.text
+        nodes = response.json()["responses"][0]["graph_results"]["incoming"]["nodes"]
+        return {node["key"] for node in nodes} == {"note-0", "note-1"}
+
+    assert wait_until(refreshed, timeout_s=30), api.debug_logs()[-16000:]
+
+    def graph_complete():
+        status = api.get(f"/tables/{source}/indexes/knowledge")["status"]
+        return status["readiness"]["complete"]
+
+    assert wait_until(graph_complete, timeout_s=30), api.get(
+        f"/tables/{source}/indexes/knowledge"
+    )

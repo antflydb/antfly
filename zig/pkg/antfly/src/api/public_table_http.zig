@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const ant_json = @import("antfly-json");
@@ -172,6 +172,8 @@ pub const TableApi = struct {
         GraphMetricQueryBudgetExceeded,
         QueryCandidateBudgetExceeded,
         DecisionLimitExceeded,
+        ValueSearchRequiresScan,
+        ValueSearchLimitExceeded,
         RerankerCandidateLimitExceeded,
         GraphWorkBudgetExceeded,
         GraphMinWeightDomainViolation,
@@ -181,6 +183,7 @@ pub const TableApi = struct {
         GraphAnchorFilterRequiresIndex,
         GraphMatchOperationLimitExceeded,
         GraphQueryModeUnsupported,
+        GraphStartIdentityRequired,
         GraphExternalAliasDocumentFilterUnsupported,
         GraphExternalAliasSourceUnsupported,
         GraphReverseVariablePathUnsupported,
@@ -1388,6 +1391,10 @@ fn graphQueryUnsupportedBodyForDiagnostic(
 }
 
 fn graphQueryUnsupportedMessage(reason: []const u8) []const u8 {
+    if (std.mem.eql(u8, reason, "qualified_start_identity_required"))
+        return "incoming traversal on a cross-table resolver graph requires start.identities with an explicit table and key; bare keys name source-table documents";
+    if (std.mem.eql(u8, reason, "deduplicate_nodes_must_be_true"))
+        return "coordinator graph traversal requires deduplicate_nodes=true; use one traversal per seed with include_paths=true to retain seed provenance";
     if (std.mem.eql(u8, reason, "expand_strategy_not_supported"))
         return "expand_strategy is a legacy graph_searches result-merging control; remove it when using graph_queries and consume the named typed graph_results directly";
     if (std.mem.eql(u8, reason, "legacy_graph_searches_not_supported"))
@@ -1431,18 +1438,18 @@ fn canonicalGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUn
         if (fallback == null) fallback = .{ .operation = operation_name, .feature = mode };
         const params = value.get(mode) orelse continue;
         if (params != .object) continue;
-        if (jsonString(params.object, "direction")) |direction| {
-            if (!std.mem.eql(u8, direction, "out")) return .{
-                .operation = operation_name,
-                .feature = mode,
-                .reason = "direction_must_be_out",
-            };
-        }
         if (std.mem.eql(u8, mode, "traverse") and jsonBool(params.object, "deduplicate_nodes") == false) {
             return .{
                 .operation = operation_name,
                 .feature = mode,
                 .reason = "deduplicate_nodes_must_be_true",
+            };
+        }
+        if (jsonString(params.object, "direction")) |direction| {
+            if (!std.mem.eql(u8, direction, "out")) return .{
+                .operation = operation_name,
+                .feature = mode,
+                .reason = "direction_must_be_out",
             };
         }
         if (params.object.get("start")) |selector| {
@@ -1467,6 +1474,11 @@ fn legacyGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUnsup
         if (fallback == null) fallback = .{ .operation = operation_name, .feature = mode };
         if (value.get("params")) |params| {
             if (params == .object) {
+                if (jsonBool(params.object, "deduplicate_nodes") == false) return .{
+                    .operation = operation_name,
+                    .feature = mode,
+                    .reason = "deduplicate_nodes_must_be_true",
+                };
                 if (jsonString(params.object, "direction")) |direction| {
                     if (!std.mem.eql(u8, direction, "out")) return .{
                         .operation = operation_name,
@@ -1474,11 +1486,6 @@ fn legacyGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUnsup
                         .reason = "direction_must_be_out",
                     };
                 }
-                if (jsonBool(params.object, "deduplicate_nodes") == false) return .{
-                    .operation = operation_name,
-                    .feature = mode,
-                    .reason = "deduplicate_nodes_must_be_true",
-                };
             }
         }
         if (value.get("start_nodes")) |selector| {
@@ -1985,6 +1992,9 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table graph MATCH operation limit exceeded table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphMatchOperationLimitExceededBody(alloc, body), .json = true };
             },
+            error.GraphStartIdentityRequired => {
+                return .{ .status = 422, .body = try graphQueryCapabilityUnsupportedBody(alloc, body, "qualified_start_identity_required"), .json = true };
+            },
             error.GraphQueryModeUnsupported => {
                 std.log.warn("public table graph mode lacks exact public execution table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphQueryUnsupportedBody(alloc, body), .json = true };
@@ -2036,6 +2046,8 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
                 return try queryDependencyErrorOwnedResponse(alloc, 502, "query_embedding_upstream_failure", "query embedding provider failed", false);
             },
+            error.ValueSearchRequiresScan => return try queryDependencyErrorOwnedResponse(alloc, 422, "value_verification_requires_scan", "no compatible indexed candidate plan; explicitly permit scans with execution.value_verification.allow_scan", false),
+            error.ValueSearchLimitExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "value_verification_limit_exceeded", "logical value search exceeded its verification budget", false),
             error.DecisionLimitExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "decision_limit_exceeded", "decision evaluation budget exceeded", false),
             error.RerankRateLimited => {
                 return try queryDependencyErrorOwnedResponse(alloc, 429, "reranker_rate_limited", "reranker rate limited", true);
@@ -5194,6 +5206,13 @@ test "unsupported graph diagnostics identify the rejected operation feature" {
         message: ?[]const u8 = null,
     };
     const cases = [_]Case{
+        .{
+            .body = "{\"graph_queries\":{\"incoming\":{\"index\":\"g\",\"traverse\":{\"start\":{\"identities\":[{\"table\":\"entities\",\"key\":\"concept/a\"}]},\"direction\":\"in\",\"deduplicate_nodes\":false}}}}",
+            .operation = "incoming",
+            .feature = "traverse",
+            .reason = "deduplicate_nodes_must_be_true",
+            .message = "coordinator graph traversal requires deduplicate_nodes=true; use one traversal per seed with include_paths=true to retain seed provenance",
+        },
         .{
             .body = "{\"expand_strategy\":\"union\",\"graph_queries\":{}}",
             .operation = "$request",

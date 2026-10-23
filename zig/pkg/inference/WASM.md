@@ -325,7 +325,7 @@ plan.
 ### WASM SIMD Foundation
 Phases 1–7 are fully implemented and working. The WASM SIMD backend runs BERT inference end-to-end in the browser.
 
-**Build**: `~/bin/zig build -Dwasm=true wasm` → `zig-out/bin/antfly-inference.wasm` (1.2 MB, ReleaseSafe)
+**Build**: `~/bin/zig build -Dwasm=true wasm` → `zig-out/bin/antfly-inference-dev.wasm` (1.2 MB, ReleaseSafe)
 
 **What was built:**
 
@@ -472,7 +472,7 @@ const gpu = new WebGPUOps();
 await gpu.init();
 
 const t = new InferenceWeb();
-await t.init('antfly-inference.wasm', { gpu, worker: true });
+await t.init('antfly-inference-dev.wasm', { gpu, worker: true });
 
 const model = await t.loadModel('model.gguf', config);
 const emb = await t.embed(model, ids, mask, 1, 128);  // async in worker mode
@@ -482,7 +482,7 @@ const emb = await t.embed(model, ids, mask, 1, 128);  // async in worker mode
 
 ```javascript
 const t = new InferenceWeb();
-await t.init('antfly-inference.wasm');  // no gpu, no worker — pure SIMD
+await t.init('antfly-inference-dev.wasm');  // no gpu, no worker — pure SIMD
 const emb = t.embed(model, ids, mask, 1, 128);  // sync
 ```
 
@@ -495,7 +495,7 @@ Multimodal text+image semantic search in the browser.
 
 **JS API:** `loadClipModel()`, `clipEmbedText()`, `clipEmbedImage()`, `preprocessImage()`
 
-**Image preprocessing:** `lib/image/processing.zig` handles resize (bilinear, SIMD-optimized) + normalize → CHW f32 in WASM. JS does decode only (Canvas API → RGBA bytes).
+**Image preprocessing:** `zig/lib/image/src/processing.zig` handles resize (bilinear, SIMD-optimized) + normalize → CHW f32 in WASM. JS does decode only (Canvas API → RGBA bytes).
 
 **E2E test:** `web/test-clip-wasm.mjs` — load model, text embedding, image embedding, cosine similarity.
 
@@ -888,7 +888,7 @@ Architecture code (`bert.zig`, `clip.zig`, `whisper.zig`, `clap.zig`, `florence.
 | `src/backends/tensor.zig` | Tensor/DType types |
 | `lib/tokenizer/` | HuggingFace tokenizer (WordPiece/BPE/Unigram, pure Zig) |
 | `lib/audio/` | WAV decode, resample, log-mel spectrogram (Whisper + CLAP configs) |
-| `lib/image/processing.zig` | SIMD-optimized bilinear resize + normalize → CHW f32 |
+| `zig/lib/image/src/processing.zig` | SIMD-optimized bilinear resize + normalize → CHW f32 |
 
 ## WASM Exports
 
@@ -1102,7 +1102,7 @@ Current status: `wasm32` remains the supported path, and `wasm64` target
 selection and shared profile plumbing are in place alongside it. The build
 emits profile-specific artifacts, `zig-out/bin/antfly-inference-wasm32.wasm`
 and `zig-out/bin/antfly-inference-wasm64.wasm`; the `wasm32` build also
-installs `zig-out/bin/antfly-inference.wasm` as a compatibility alias, and
+installs `zig-out/bin/antfly-inference-dev.wasm` as a compatibility alias, and
 both the JS host runtime and the Node test harness resolve those
 profile-specific names first before falling back to the legacy alias.
 Most of `src/wasm_entry.zig`'s model/tokenizer/task-specific logic has been
@@ -1230,7 +1230,7 @@ The current Electron shell is intentionally thin. It exists to give the existing
 
 ## Verification
 
-1. **Build**: `~/bin/zig build -Dwasm=true wasm` → `zig-out/bin/antfly-inference.wasm` (~1.2 MB, ReleaseSafe)
+1. **Build**: `~/bin/zig build -Dwasm=true wasm` → `zig-out/bin/antfly-inference-dev.wasm` (~1.2 MB, ReleaseSafe)
 2. **Build (WebGPU)**: `~/bin/zig build -Dwasm=true -Dwebgpu=true wasm`
 3. **Build (Experimental wasm64 target)**: `~/bin/zig build -Dwasm=true -Dwasm-memory-model=wasm64 wasm`
 4. **E2E tests** (all pass for the current wasm32 path):

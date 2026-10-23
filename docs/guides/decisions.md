@@ -4,13 +4,34 @@ Standalone decisions use `POST /decisions` (`/ai/v1/decisions` on the standalone
 server). Named question and answer arrays, `input`, `choices`, `levels` and
 predicate `probability` follow the [OpenAI Decisions conventions](https://developers.openai.com/api/docs/guides/decisions).
 Antfly adds embedding similarity answers, multi-choice selection and text
-batches. This is a text-only subset: choice values are strings and every
-question needs a unique name. See the [decision schema](../../specs/openapi/ai/decision.yaml).
+batches. Supported hosted providers also accept multimodal evidence; see the
+[gateway decision contract](../reference/inference-gateway.md#public-contracts)
+for provider and method restrictions. Native trained/embedding decisions and the
+browser surface retain their text restrictions. Choice values are strings and
+every question needs a unique name. See the [decision schema](../../specs/openapi/ai/decision.yaml).
 
 `/extract` retains entities, relations, attributes, structured records and
 ordinary classification. Standalone Laya, OpenDecider and EmbeddingGemma
 workflows use `/decisions`. The unreleased extraction decision output and
 Boolean and ordinal decision modes have been removed.
+
+For the v0.3.0 development source documented here, standalone public inference
+requires an explicit opt-in before calling `/ai/v1`. Save `antfly.json`:
+
+```json
+{"public_inference": {"enabled": true}}
+```
+
+```bash
+antfly standalone --config antfly.json
+```
+
+There is no enablement CLI flag. Without this setting, public execution returns
+HTTP 403 even when models are installed. See the
+[public execution policy](../reference/inference-gateway.md#public-execution-policy).
+This prerequisite applies to database API nodes on this source version; the
+independent `antfly inference run` listener and older stable releases have their
+own policies.
 
 ## Questions and answers
 
@@ -48,6 +69,37 @@ are shared; IDs and order are preserved. Limits: 128 inputs, 64 questions,
 2–64 choices or levels, 1 MiB per input and 16 MiB per request. Model and
 executor limits can be smaller.
 
+## Shared context batches
+
+Supporting Antfly servers accept the explicit `context_version: 1` transport
+extension. Send immutable context strings once and reference their zero-based
+indices from individual inputs:
+
+```json
+{
+  "model": "decision-model",
+  "context_version": 1,
+  "contexts": ["File: retry.py\nCONTEXT: def retry(): ..."],
+  "inputs": [
+    {"id": "line-1", "input": "TARGET: retry_count += 1", "context_index": 0},
+    {"id": "line-2", "input": "TARGET: return response", "context_index": 0}
+  ],
+  "questions": [{"name": "relevant", "type": "predicate", "instructions": "Does TARGET implement retry enforcement? Use CONTEXT only to interpret TARGET."}]
+}
+```
+
+Each referenced item is evaluated with exactly `context + "\n" + input`.
+Unreferenced items keep their original input. Answer IDs, indices, and question
+semantics are unchanged. Unknown versions, missing context arrays, invalid
+indices, and references without a version fail validation. Context arrays contain
+at most 128 nonempty UTF-8 strings; effective inputs remain limited to 1 MiB each
+and their combined expanded size is limited to 16 MiB before model admission.
+Model limits may reject smaller requests. Shared transport reduces request bytes;
+it does not imply shared model computation or lower billed token usage.
+
+`antfly-grep --decision-context shared-v1` opts into this format. Its default
+`legacy` transport remains compatible with existing endpoints.
+
 ## Embedding similarity and multi-choice
 
 [EmbeddingGemma 2](embeddinggemma2.md) advertises `embedding_similarity` and
@@ -83,7 +135,7 @@ set, and `abstained` means the boundary margin failed. These states are distinct
 ```sh
 curl --fail-with-body http://127.0.0.1:8080/ai/v1/decisions \
   -H 'Content-Type: application/json' --data-binary @decision.json
-antfly-inference decisions ./models --request decision.json --backend metal
+antfly inference decisions ./models --request decision.json --backend metal
 ```
 
 The inference listener serves `/decisions` directly (default port 8090).

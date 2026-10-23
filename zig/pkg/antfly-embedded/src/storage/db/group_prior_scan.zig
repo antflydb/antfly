@@ -58,7 +58,7 @@ pub fn collect(a: A, read: anytype, group: state.Group, current: prior.Position,
                 decoded_bytes += artifact.len;
                 if (decoded_bytes > 4 * 1024 * 1024) return error.GroupedPriorContextLimitExceeded;
                 const value = try @import("antfly-json").parseValueLosslessLeaky(a, artifact);
-                const collection = if (value == .object) value.object.get("items") orelse value else value;
+                const collection = prior.artifactCollection(value);
                 const items: []const std.json.Value = if (collection == .array) collection.array.items else (&collection)[0..1];
                 const fingerprint = groups.digest(artifact);
                 var item_index = items.len;

@@ -27,13 +27,14 @@ import CreateTablePage from "./pages/CreateTablePage";
 import EmbeddingPlaygroundPage from "./pages/EmbeddingPlaygroundPage";
 import EvalsPlaygroundPage from "./pages/EvalsPlaygroundPage";
 import ExtractionPlaygroundPage from "./pages/ExtractionPlaygroundPage";
+import InferenceGatewayPage from "./pages/InferenceGatewayPage";
 import KnowledgeGraphPlaygroundPage from "./pages/KnowledgeGraphPlaygroundPage";
 import { LoginPage } from "./pages/LoginPage";
 import ModelsPage from "./pages/ModelsPage";
-import RewritingPlaygroundPage from "./pages/QuestionPlaygroundPage";
 import RagPlaygroundPage from "./pages/RagPlaygroundPage";
 import ReaderPlaygroundPage from "./pages/ReaderPlaygroundPage";
 import RerankingPlaygroundPage from "./pages/RerankingPlaygroundPage";
+import RewritingUnavailablePage from "./pages/RewritingUnavailablePage";
 import { SecretsPage } from "./pages/SecretsPage";
 import SQLWorkbenchPage from "./pages/SQLWorkbenchPage";
 import TableDetailsPage from "./pages/TableDetailsPage";
@@ -119,7 +120,7 @@ function AppContent() {
               <SidebarInset>
                 <AppHeader />
                 <ConnectionStatusBanner />
-                <div className="af-app-content flex-1 px-6 pt-4 pb-6">
+                <div className="af-app-content flex-1 px-4 pt-4 pb-6 sm:px-6">
                   <Routes>
                     {/* Antfly routes */}
                     {isProductEnabled("antfly") && (
@@ -224,6 +225,7 @@ function AppContent() {
                     {isProductEnabled("inference") && (
                       <>
                         <Route path="/inference/models" element={<ModelsPage />} />
+                        <Route path="/inference/gateway" element={<InferenceGatewayPage />} />
                         <Route
                           path="/inference/playground/chunk"
                           element={<ChunkingPlaygroundPage />}
@@ -234,7 +236,7 @@ function AppContent() {
                         />
                         <Route
                           path="/inference/playground/rewrite"
-                          element={<RewritingPlaygroundPage />}
+                          element={<RewritingUnavailablePage />}
                         />
                         <Route
                           path="/inference/playground/rerank"
