@@ -128,6 +128,10 @@ pub const Router = struct {
         return self.addWithOptions(method, pattern, handler, null, null, .raw);
     }
 
+    pub fn addStreamingRawWithData(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, data: *anyopaque) !void {
+        return self.addWithOptions(method, pattern, handler, data, null, .raw);
+    }
+
     fn addWithOptions(
         self: *Self,
         method: types.Method,

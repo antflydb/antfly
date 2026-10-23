@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.choice_decision_question import ChoiceDecisionQuestion
+    from ..models.decision_evidence_message import DecisionEvidenceMessage
     from ..models.decision_input import DecisionInput
     from ..models.embedding_decision_options import EmbeddingDecisionOptions
     from ..models.inference_decide_long_document import InferenceDecideLongDocument
@@ -23,9 +24,10 @@ T = TypeVar("T", bound="InferenceDecideRequest")
 
 @_attrs_define
 class InferenceDecideRequest:
-    """Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single
-    text and named question arrays follow OpenAI Decisions conventions; local models support text input and string
-    choice values. Request bodies are bounded at 16 MiB.
+    """Supply exactly one of input (single evidence item) or inputs (ordered Antfly batch extension; hosted typed deciders
+    also accept multimodal evidence per item). Question names must be unique. Single text and named question arrays
+    follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are
+    bounded at 16 MiB.
 
         Attributes:
             model (str):
@@ -36,7 +38,12 @@ class InferenceDecideRequest:
             contexts (list[str] | Unset): Shared immutable context strings referenced by context_index. Requires
                 context_version 1. Total expanded input bytes are limited to 16 MiB.
             model_identity (str | Unset): Pin the exact EmbeddingGemma 2 assets and embedding recipe.
-            input_ (str | Unset):
+            input_ (list[DecisionEvidenceMessage] | str | Unset): Text or ordered user messages containing text and images.
+                Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a
+                model that supports both images and constrained output; native, Gemini, and Vertex generators require inline
+                images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of
+                serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public
+                HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
             inputs (list[DecisionInput] | Unset):
             long_document (InferenceDecideLongDocument | Unset): Explicit windowing for qualified boundary decision models.
                 Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text.
@@ -51,7 +58,7 @@ class InferenceDecideRequest:
     context_version: InferenceDecideRequestContextVersion | Unset = UNSET
     contexts: list[str] | Unset = UNSET
     model_identity: str | Unset = UNSET
-    input_: str | Unset = UNSET
+    input_: list[DecisionEvidenceMessage] | str | Unset = UNSET
     inputs: list[DecisionInput] | Unset = UNSET
     long_document: InferenceDecideLongDocument | Unset = UNSET
     embedding_options: EmbeddingDecisionOptions | Unset = UNSET
@@ -87,7 +94,19 @@ class InferenceDecideRequest:
 
         model_identity = self.model_identity
 
-        input_ = self.input_
+        input_: list[dict[str, Any]] | str | Unset
+        if isinstance(self.input_, Unset):
+            input_ = UNSET
+        elif isinstance(self.input_, list):
+            input_ = []
+            for componentsschemas_decision_evidence_type_1_item_data in self.input_:
+                componentsschemas_decision_evidence_type_1_item = (
+                    componentsschemas_decision_evidence_type_1_item_data.to_dict()
+                )
+                input_.append(componentsschemas_decision_evidence_type_1_item)
+
+        else:
+            input_ = self.input_
 
         inputs: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.inputs, Unset):
@@ -132,6 +151,7 @@ class InferenceDecideRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.choice_decision_question import ChoiceDecisionQuestion
+        from ..models.decision_evidence_message import DecisionEvidenceMessage
         from ..models.decision_input import DecisionInput
         from ..models.embedding_decision_options import EmbeddingDecisionOptions
         from ..models.inference_decide_long_document import InferenceDecideLongDocument
@@ -196,7 +216,27 @@ class InferenceDecideRequest:
 
         model_identity = d.pop("model_identity", UNSET)
 
-        input_ = d.pop("input", UNSET)
+        def _parse_input_(data: object) -> list[DecisionEvidenceMessage] | str | Unset:
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, list):
+                    raise TypeError()
+                componentsschemas_decision_evidence_type_1 = []
+                _componentsschemas_decision_evidence_type_1 = data
+                for componentsschemas_decision_evidence_type_1_item_data in _componentsschemas_decision_evidence_type_1:
+                    componentsschemas_decision_evidence_type_1_item = DecisionEvidenceMessage.from_dict(
+                        componentsschemas_decision_evidence_type_1_item_data
+                    )
+
+                    componentsschemas_decision_evidence_type_1.append(componentsschemas_decision_evidence_type_1_item)
+
+                return componentsschemas_decision_evidence_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(list[DecisionEvidenceMessage] | str | Unset, data)
+
+        input_ = _parse_input_(d.pop("input", UNSET))
 
         _inputs = d.pop("inputs", UNSET)
         inputs: list[DecisionInput] | Unset = UNSET

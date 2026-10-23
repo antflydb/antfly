@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Visibility-aware traversal of an immutable composed source graph.
 //! Adjacency stays in the leaf indexes. Only bounded frontier/path state and
@@ -45,7 +45,7 @@ const View = struct {
         try request.object.put(self.a, "remote_snapshot", .{ .string = self.leaves[leaf].token });
         if (self.read_options) |options| {
             if (options.object.get("read_requirements")) |selected| try request.object.put(self.a, "read_requirements", selected);
-            if (options.object.get("lake_read")) |selected| try request.object.put(self.a, "lake_read", selected);
+            if (options.object.get("execution")) |selected| try request.object.put(self.a, "execution", selected);
         }
         var response = try self.run(self.ptr, self.a, self.leaves[leaf].table, try std.json.Stringify.valueAlloc(self.a, request, .{}));
         defer response.deinit(self.a);

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Native pgwire adapter. No HTTP self-requests, durable SQL side catalog,
 //! password retention, or automatic mutation replay. Listener registration is
@@ -595,6 +595,7 @@ const OwnedRead = struct {
             if (state.metadata.isolation != .read_committed) self.native_adapter.range_reads = &self.range_guards;
         }
         self.decision_runtime = try self.native_adapter.decisionRuntime();
+        errdefer if (self.decision_runtime) |*active| active.deinit();
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard, .cleanup = &self.runnable };
         const parameters = if (request.parameter_cells != null) request.parameters else try normalizeParametersControlled(arena, request.parameters, request.parameter_types, &setup_owner);
@@ -991,6 +992,7 @@ const OwnedRead = struct {
             self.stream_live = false;
         }
         self.native_adapter.endReadFence();
+        if (self.decision_runtime) |*active| active.deinit();
         self.plan.release(self.adapter.server.sqlPlanCacheIo());
         // Retire invocation-owned buffers before releasing its retained root.
         // Portal identity/arena storage has a separate retained lifetime.

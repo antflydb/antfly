@@ -33,8 +33,9 @@ from create_reproducible_tar import create_archive
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
-from license_headers import ELV2_ROOTS, is_under  # noqa: E402
+from license_headers import is_under  # noqa: E402
 
+SERVER_ROOTS = ("zig/pkg/antfly", "zig/e2e/antfly")
 PACKAGE = "zig/pkg/antfly-embedded"
 MANIFEST = "embedded-zig-source.json"
 
@@ -76,7 +77,7 @@ SOURCE_OWNERS = (
 
 
 def selected(path: str) -> bool:
-    if is_under(path, ELV2_ROOTS) or path.startswith("LICENSES/Elastic-"):
+    if is_under(path, SERVER_ROOTS) or path.startswith("LICENSES/Elastic-"):
         return False
     if path in BUILD_INPUTS:
         return True
@@ -171,7 +172,7 @@ def stage(
             name
             for name in referenced_inputs(destination)
             if name in tracked
-            and not is_under(name, ELV2_ROOTS)
+            and not is_under(name, SERVER_ROOTS)
             and not (destination / name).exists()
         }
         if not missing:
@@ -179,7 +180,7 @@ def stage(
         for name in sorted(missing):
             if name not in tracked or (destination / name).exists():
                 continue
-            if is_under(name, ELV2_ROOTS):
+            if is_under(name, SERVER_ROOTS):
                 # Shared composition helpers also declare inactive server
                 # steps. They must not pull server inputs into the archive.
                 continue

@@ -949,11 +949,23 @@ pub fn optionalOwnedInferenceConnectionBytes(
 }
 
 pub fn invokeLocalInferenceConnectionFallible(context: *const inference_connection_abi.InvokeContext) !void {
-    return invokeLocalInferenceRoute(context, .post);
+    return invokeLocalInferenceRoute(context, context.method);
 }
 
 /// Dispatches `<method> /ai/v1/<operation>` to the runtime's HTTP handlers
 /// in memory. POST sends `context.body` as JSON; GET sends no body.
+fn inferenceRouteMatches(pattern: []const u8, path: []const u8) bool {
+    var expected = std.mem.splitScalar(u8, pattern, '/');
+    var actual = std.mem.splitScalar(u8, path, '/');
+    while (expected.next()) |segment| {
+        const value = actual.next() orelse return false;
+        if (std.mem.startsWith(u8, segment, ":") or std.mem.startsWith(u8, segment, "{")) {
+            if (value.len == 0) return false;
+        } else if (!std.mem.eql(u8, segment, value)) return false;
+    }
+    return actual.next() == null;
+}
+
 fn invokeLocalInferenceRoute(
     context: *const inference_connection_abi.InvokeContext,
     method: runtime_http_abi.HttpMethod,
@@ -988,7 +1000,7 @@ fn invokeLocalInferenceRoute(
         if (!status.isOk()) return inference_bridge.errorFromStatus(status);
     }
 
-    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ inference_bridge.ai_api_prefix, operation });
+    const path = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "/ml/v1/{s}", .{operation[3..]}) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ inference_bridge.ai_api_prefix, operation });
     defer alloc.free(path);
     const interactive_generate = isInteractiveGeneratePath(path);
     if (interactive_generate)
@@ -998,31 +1010,46 @@ fn invokeLocalInferenceRoute(
             _ = enrichment_types.interactive_generate_inflight.fetchSub(1, .monotonic);
     }
     const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
-    const route_handle = for (entries) |entry| {
-        if (entry.method == method and std.mem.eql(u8, entry.path.slice(), path))
-            break entry.route_handle;
+    const matched_route = for (entries) |entry| {
+        if (entry.method == method and inferenceRouteMatches(entry.path.slice(), path))
+            break entry;
     } else return error.UnsupportedInferenceOperation;
 
+    var params: std.ArrayList(runtime_http_abi.RouteParamView) = .empty;
+    defer params.deinit(alloc);
+    var pattern_segments = std.mem.splitScalar(u8, matched_route.path.slice(), '/');
+    var path_segments = std.mem.splitScalar(u8, path, '/');
+    while (pattern_segments.next()) |segment| {
+        const value = path_segments.next().?;
+        const name = if (std.mem.startsWith(u8, segment, ":")) segment[1..] else if (std.mem.startsWith(u8, segment, "{") and std.mem.endsWith(u8, segment, "}")) segment[1 .. segment.len - 1] else continue;
+        try params.append(alloc, .{ .name = .init(name), .value = .init(value) });
+    }
+
+    const content_type = context.content_type.slice() orelse "application/json";
     const headers = [_]runtime_http_abi.HeaderView{.{
         .name = runtime_http_abi.Bytes.init("Content-Type"),
-        .value = runtime_http_abi.Bytes.init("application/json"),
+        .value = runtime_http_abi.Bytes.init(content_type),
     }};
     const has_body = method != .get;
     const request = runtime_http_abi.HttpRequestView{
         .method = method,
         .path = runtime_http_abi.Bytes.init(path),
+        .query = context.query,
+        .params_ptr = params.items.ptr,
+        .params_len = params.items.len,
         .headers_ptr = if (has_body) &headers else null,
         .headers_len = if (has_body) headers.len else 0,
-        .body = if (has_body) runtime_http_abi.OptionalBytes.init(body) else .{},
-        .content_type = if (has_body) runtime_http_abi.OptionalBytes.init("application/json") else .{},
+        .body = if (has_body and context.body_source.read == null) runtime_http_abi.OptionalBytes.init(body) else .{},
+        .content_type = if (has_body) runtime_http_abi.OptionalBytes.init(content_type) else .{},
     };
     var response_handle: ?*anyopaque = null;
     var response_view: runtime_http_abi.HttpResponseView = undefined;
     const handle_context = inference_bridge.HttpHandleContext{
         .abi_version = inference_bridge.abi_version,
-        .route_handle = route_handle,
+        .route_handle = matched_route.route_handle,
         .request = &request,
         .cancellation = lifetime.cancellation(),
+        .body_source = context.body_source,
         .stream = context.stream,
         .out_response_handle = &response_handle,
         .out_response = &response_view,

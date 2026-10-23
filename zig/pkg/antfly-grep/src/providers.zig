@@ -13,22 +13,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Provider metadata is shared by setup and completions. Gateway routes use
-//! the same native TypeSafe state/question protocol as the direct provider.
+//! Destination profiles for the common Decisions contract. Jev routing belongs
+//! in the Antfly inference gateway, not in client-specific wire adapters.
 const std = @import("std");
-pub const Provider = struct { id: []const u8, label: []const u8, endpoint: []const u8, model: ?[]const u8 = null, protocol: enum { antfly, typesafe, local } };
+pub const Provider = struct { id: []const u8, label: []const u8, endpoint: []const u8, model: ?[]const u8 = null, protocol: enum { antfly, decisions, local } };
 pub const catalog = [_]Provider{
-    .{ .id = "antfly", .label = "Antfly", .endpoint = "http://127.0.0.1:8090/decisions", .protocol = .antfly },
-    .{ .id = "typesafe", .label = "TypeSafe", .endpoint = "https://api.typesafe.ai/v1/systemone", .model = "jev-1.13.0", .protocol = .typesafe },
-    .{ .id = "vercel", .label = "Vercel AI Gateway", .endpoint = "https://ai-gateway.vercel.sh/typesafe/v1/systemone", .model = "typesafe-ai/jev", .protocol = .typesafe },
-    .{ .id = "openrouter", .label = "OpenRouter", .endpoint = "https://openrouter.ai/api/v1/systemone", .model = "typesafe/jev-1.13", .protocol = .typesafe },
-    .{ .id = "opencode", .label = "OpenCode Zen", .endpoint = "https://opencode.ai/zen/v1/systemone", .model = "jev-1.13", .protocol = .typesafe },
+    .{ .id = "antfly", .label = "Antfly", .endpoint = "http://127.0.0.1:8080/ai/v1/decisions", .protocol = .antfly },
+    .{ .id = "openai", .label = "OpenAI", .endpoint = "https://api.openai.com/v1/decisions", .model = "gpt-6-luna", .protocol = .decisions },
     .{ .id = "local", .label = "Local inference", .endpoint = "", .protocol = .local },
-    .{ .id = "custom", .label = "Custom TypeSafe gateway", .endpoint = "", .protocol = .typesafe },
+    .{ .id = "custom", .label = "Custom Decisions endpoint", .endpoint = "", .protocol = .decisions },
 };
 pub fn get(id: []const u8) ?Provider {
     for (catalog) |provider| if (std.mem.eql(u8, id, provider.id)) return provider;
     return null;
+}
+pub fn removed(id: []const u8) bool {
+    for ([_][]const u8{ "typesafe", "vercel", "openrouter", "opencode" }) |old| if (std.mem.eql(u8, id, old)) return true;
+    return false;
 }
 pub fn validateCustom(endpoint: []const u8) !void {
     const uri = std.Uri.parse(endpoint) catch return error.InvalidProviderEndpoint;

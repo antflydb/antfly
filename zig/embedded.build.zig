@@ -51,35 +51,12 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
         .antfly_imports = shared.production_antfly_imports,
         .antfly_mod = local_module,
     });
-    const lite_module = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/lite_main.zig"),
-        .target = shared.target,
-        .optimize = shared.optimize,
-    });
-    shared.antfly_imports.configureEmbedded(b, lite_module, shared.link_libc);
-    lite_module.addImport("antfly-client", embedded.antfly_client_pkg_mod);
-    lite_module.addImport("antfly_inference_host", shared.antfly_imports.inference_host);
-    lite_module.addImport("antfly_inference_engine", shared.antfly_imports.inference_engine);
-    lite_module.linkLibrary(embedded.native_inference);
-    lite_module.linkLibrary(embedded.native_enrichment);
-    shared.build_info.link(lite_module);
-    const lite = b.addExecutable(.{
-        .name = "antfly-lite",
-        .root_module = lite_module,
-        .use_llvm = @import("build_support/embedded/shared_library.zig").llvmBackend(shared.target.result),
-        .max_rss = 12 * 1024 * 1024 * 1024,
-    });
-    const install_lite = b.addInstallArtifact(lite, .{});
-    const lite_step = b.step("lite", "Build the independent file-oriented Lite CLI and public C ABI");
-    lite_step.dependOn(&install_lite.step);
-    lite_step.dependOn(embedded.install_libantfly);
-    lite_step.dependOn(&embedded.install_capi_header.step);
-    lite_step.dependOn(&b.top_level_steps.get("licenses-antfly-lite").?.step);
-
-    b.getInstallStep().dependOn(&install_lite.step);
-    b.getInstallStep().dependOn(embedded.install_libantfly);
-    b.getInstallStep().dependOn(&embedded.install_capi_header.step);
-    b.default_step = lite_step;
+    const library_step = b.step("libantfly", "Build the embedding library, public header, and pkg-config metadata");
+    library_step.dependOn(embedded.install_libantfly);
+    library_step.dependOn(&embedded.install_capi_header.step);
+    library_step.dependOn(&b.top_level_steps.get("licenses-libantfly").?.step);
+    b.getInstallStep().dependOn(library_step);
+    b.default_step = library_step;
 
     const wasm = wasm_owner.add(b, shared.sentencepiece_proto_source);
     b.installArtifact(wasm.artifact);

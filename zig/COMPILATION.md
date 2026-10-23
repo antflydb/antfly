@@ -87,7 +87,7 @@ thin linked antfly executable
 │   ├── writes, transaction participation, WAL and local Raft apply
 │   ├── snapshots, restore, maintenance and Lite
 │   └── public C API and handle registry
-├── antfly-storage-kernel (ELv2)
+├── antfly-storage-kernel (Apache-2.0)
 │   └── server/Raft adapters over the compiled physical engine
 ├── antfly-runtime-distributed
 │   ├── data, metadata and hot-standby control
@@ -140,7 +140,7 @@ live in `api/query_execution_contract.zig` and `api/write_contract.zig`;
 physical resource setup lives under `storage/`.
 
 The Apache Lite executable links its local engine owner, enrichment, and
-inference without database server owners. The ELv2 standalone executable
+inference without database server owners. The Apache-2.0 standalone executable
 serves Lite files through `standalone --storage-engine lite --storage-path`.
 Storage never links back to a server entry point.
 Storage owner tests link the same production archives and are included in the
@@ -1114,7 +1114,7 @@ Native macOS/Linux aarch64/x86_64 products use the complete Apache compiled
 storage owner, including ordinal workers. Shared inference and storage are
 mandatory on these targets; source-only targets retain their target implementation. `antfly-storage-engine` compiles the public C API once
 and owns coarse DB lifecycle, batch, query (including leased reads), snapshot,
-schema/index and maintenance operations. The executable's ELv2 storage archive
+schema/index and maintenance operations. The executable's Apache-2.0 storage archive
 retains server/Raft adapters and calls this same compiled owner. The installed
 C library links the owner archive; it does not compile another public C API object.
 Per-record loops remain within operations.

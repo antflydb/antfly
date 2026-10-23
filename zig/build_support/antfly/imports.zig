@@ -82,6 +82,7 @@ pub const AntflyRootImports = struct {
     middleware_openapi: *std.Build.Module,
     scraping_openapi: *std.Build.Module,
     scraping: *std.Build.Module,
+    source_reference: *std.Build.Module,
     s3_openapi: *std.Build.Module,
     inference_config_openapi: *std.Build.Module,
     chunking_api_openapi: *std.Build.Module,
@@ -162,6 +163,7 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_middleware_openapi", .field = "middleware_openapi" },
         .{ .name = "antfly_scraping_openapi", .field = "scraping_openapi" },
         .{ .name = "antfly_scraping", .field = "scraping" },
+        .{ .name = "antfly_source_reference", .field = "source_reference" },
         .{ .name = "antfly_s3_openapi", .field = "s3_openapi" },
         .{ .name = "antfly_inference_config_openapi", .field = "inference_config_openapi" },
         .{ .name = "antfly_chunking_api_openapi", .field = "chunking_api_openapi" },
@@ -254,6 +256,7 @@ pub const AntflyRootImports = struct {
         options.addOption(bool, "bench_minimal_deps", false);
         mod.addOptions("build_options", options);
         mod.addImport("antfly_platform", self.platform);
+        mod.addImport("build_info", self.build_info.module);
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_cache_budget", self.cache_budget);
         mod.addImport("antfly_runtime_abi", self.runtime_abi);
@@ -316,9 +319,9 @@ pub const AntflyRootImports = struct {
             "json",             "jsonschema",         "structured",        "logging_openapi",
             "metadata_openapi", "objectstore",        "openai_api",        "pdf",
             "query_openapi",    "reader_config",      "readers",           "regex",
-            "reranking",        "scraping",           "synthesizing",      "transcribing",
-            "vector",           "fst",                "schema_openapi",    "sql_regex",
-            "resolver",
+            "reranking",        "scraping",           "source_reference",  "synthesizing",
+            "transcribing",     "vector",             "fst",               "schema_openapi",
+            "sql_regex",        "resolver",
         }) |field| self.addImport(mod, field);
     }
 

@@ -27,6 +27,17 @@ pub const InitialOwnerRange = struct {
     cancellation: @import("antfly_cancellation").CancellationToken = .none,
     deadline_ns: ?u64 = null,
 
+    /// Borrow both owner-open controls for operations that accept a token.
+    pub fn cancellationToken(self: *const @This()) @import("antfly_cancellation").CancellationToken {
+        const Adapter = struct {
+            fn check(raw: *const anyopaque) !void {
+                const initial: *const InitialOwnerRange = @ptrCast(@alignCast(raw));
+                try initial.check();
+            }
+        };
+        return .{ .ptr = self, .check_fn = Adapter.check };
+    }
+
     fn check(self: @This()) !void {
         try self.cancellation.check();
         if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;

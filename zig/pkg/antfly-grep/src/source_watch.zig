@@ -75,15 +75,20 @@ pub const Watch = struct {
     }
     fn open(self: *Watch) void {
         if (comptime !supported) return;
-        var quota: std.c.rlimit = undefined;
-        if (std.c.getrlimit(.NOFILE, &quota) == 0) self.limit = @min(self.limit, @as(usize, @intCast(quota.cur / 4)));
         if (comptime builtin.os.tag == .macos) {
+            var quota: std.c.rlimit = undefined;
+            if (std.c.getrlimit(.NOFILE, &quota) == 0) self.limit = @min(self.limit, @as(usize, @intCast(quota.cur / 4)));
             self.fd = std.c.kqueue();
             if (self.fd >= 0 and std.c.fcntl(self.fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) < 0) {
                 _ = std.c.close(self.fd);
                 self.fd = -1;
             }
-        } else self.fd = std.c.inotify_init1(std.os.linux.IN.NONBLOCK | std.os.linux.IN.CLOEXEC);
+        } else {
+            // inotify uses one descriptor for the entire witness table. Its
+            // per-UID watch quota is independent of RLIMIT_NOFILE; let actual
+            // registration failures trigger the existing exact fallback.
+            self.fd = std.c.inotify_init1(std.os.linux.IN.NONBLOCK | std.os.linux.IN.CLOEXEC);
+        }
     }
     pub fn deinit(self: *Watch) void {
         for (self.slots.items) |*slot| {

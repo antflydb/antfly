@@ -6,6 +6,44 @@ info:
 
 components:
   schemas:
+    InferenceTaskCapabilities:
+      type: object
+      additionalProperties: false
+      properties:
+        streaming:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
+        tools:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
+        structured_output:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
+        images:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
+        audio:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
+    RuntimeTaskBinding:
+      type: object
+      additionalProperties: false
+      required: [model]
+      properties:
+        model:
+          type: string
+          minLength: 1
+          description: Backend model identity, including any owner prefix.
+        connection:
+          type: string
+          minLength: 1
+          default: local-inference
+          description: Existing inference connection identity; credentials remain on the connection.
     DeciderConfig:
       type: object
       additionalProperties: false
@@ -76,6 +114,11 @@ components:
           type: integer
           minimum: 1
           default: 1000000
+        max_image_input_tokens:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Provider/model upper bound on the input-token contribution of one image. Required when sending images through typed hosted or generated deciders, including native generators and image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Generated deciders apply the allowance to the selected generator's shared quota. Omit for text-only deciders.
         rate_limit:
           $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
         batch_size:
@@ -275,6 +318,15 @@ components:
           $ref: "#/components/schemas/HotStandbyConfig"
         metadata:
           $ref: "#/components/schemas/MetadataInfo"
+        public_inference:
+          type: object
+          additionalProperties: false
+          description: Deployment policy for public inference APIs. Does not disable internal database inference.
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              description: Allow public inference execution, including named targets, direct connection invocation, batches, and sessions. Disabled by default for this release; deployments must explicitly opt in. Discovery remains available and reports this policy.
         inference:
           $ref: "../inference/config.yaml#/components/schemas/RuntimeConfig"
         tls:
@@ -342,7 +394,7 @@ components:
           x-go-type: uint64
         enable_auth:
           type: boolean
-          description: "Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal when enabled, but do not currently enforce per-model or per-operation inference RBAC."
+          description: "Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal and enforce inference:read or inference:write authorization when enabled. The inference resource remains '*'; per-model scopes are not supported."
           default: false
         disable_shard_alloc:
           type: boolean
@@ -545,6 +597,26 @@ components:
               - generator_config:
                   provider: openai
                   model: gpt-4.1
+        inference_capabilities:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/InferenceTaskCapabilities"
+          description: Backend capability declarations keyed by canonical target ID. Unknown support never qualifies a feature; declarations are intersected with the adapter contract.
+        predictors:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/RuntimeTaskBinding"
+          description: Named traditional ML predictors bound to an inference connection, preserving its feature schema.
+        extractors:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/RuntimeTaskBinding"
+          description: Named extraction targets served by existing inference connections.
+        rewriters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/RuntimeTaskBinding"
+          description: Named rewriting targets served by existing inference connections.
         deciders:
           type: object
           additionalProperties:
@@ -737,6 +809,11 @@ components:
         credentials_path:
           type: string
           description: Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        max_image_input_tokens:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Per-image input token upper bound for hosted decisions. Required to enable images; must cover every admitted decision model on this connection. Named deciders can specify tighter per-model bounds.
         names:
           type: array
           items:

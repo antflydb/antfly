@@ -8,7 +8,7 @@ The base client (`oapi/client.gen.go`) is generated with
 `openapi.yaml`:
 
 ```go
-//go:generate go tool oapi-codegen --config=cfg.yaml ../../../openapi.yaml
+//go:generate python3 ../../../scripts/generate_go_sdk.py --config=cfg.yaml ../../../openapi.yaml
 ```
 
 `sdk.Client`/`sdk.AntflyClient` wrap the generated `oapi.Client` with typed
@@ -106,9 +106,22 @@ func main() {
 ```
 
 `NewClient(Config)` builds a consolidated client exposing both `Antfly()` and
-`Inference()` from one `Config.BaseURL`. `NewAntflyClientWithOptions` and
-`NewAntflyClientWithToken` take `oapi.ClientOption`s (`WithBasicAuth`,
-`WithApiKey`, `WithToken`) for auth.
+`Inference()` from one `Config.BaseURL`.
+`NewAntflyClientWithToken(baseURL, httpClient, token)` takes an HTTP client and a
+token directly. `NewAntflyClientWithOptions` takes `oapi.ClientOption`s; wrap
+authentication helpers (which return `oapi.RequestEditorFn`) with
+`oapi.WithRequestEditorFn`:
+
+```go
+// Import "github.com/antflydb/antfly/go/pkg/sdk/oapi" as well as antfly.
+basic, err := antfly.NewAntflyClientWithOptions(baseURL,
+    oapi.WithRequestEditorFn(antfly.WithBasicAuth("admin", "password")))
+apiKey, err := antfly.NewAntflyClientWithOptions(baseURL,
+    oapi.WithRequestEditorFn(antfly.WithApiKey("key-id", "key-secret")))
+token, err := antfly.NewAntflyClientWithOptions(baseURL,
+    oapi.WithRequestEditorFn(antfly.WithToken("encoded-key")))
+// Handle err after each constructor in application code.
+```
 
 The shared gate is also available in the lightweight `admission` subpackage,
 which depends only on the standard library. The top-level SDK admission types

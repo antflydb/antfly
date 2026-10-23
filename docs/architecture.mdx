@@ -100,7 +100,7 @@ Standalone runs inference in-process, and managed enrichments call it directly i
 ## Consistency and Transactions
 
 - **Raft per shard.** Writes commit through the owning shard's Raft log, and each shard has its own leader. Only the active leader runs reconciliation, enrichment, and other background mutation work.
-- **Cross-shard writes.** These use coordinator-driven two-phase commit over write intents. The coordinator shard writes a transaction record and participants write intents that stay invisible until resolution. A recovery loop finishes resolution after a coordinator failure.
+- **Cross-shard writes.** These use coordinator-driven two-phase commit over write intents. The coordinator shard writes a transaction record and participants write intents that stay invisible until resolution. A recovery loop finishes resolution after a coordinator failure. See [transaction outcomes](/docs/reference/transaction-outcomes) to distinguish aborted conflicts, unknown outcomes, and committed 202 results before retrying.
 - **Optimistic concurrency.** `POST /transactions/commit` is stateless OCC: the client submits read versions (from `X-Antfly-Version`) with its writes, and a changed version aborts with `409`. Server-managed sessions under `/transactions/begin` add staged reads and writes, plus savepoints.
 - **Timestamps.** A committed key's visible version is the transaction's commit timestamp, not its intent timestamp. Batch predicates and transactional predicates compare against the same versioning model.
 
@@ -123,7 +123,7 @@ Memory is governed per process. `ResourceManager` owns the physical budget share
 
 - **Backups and restore.** Table and cluster backups go to local disk, S3, or GCS as content-addressed manifests and blobs, and incremental capture is supported. There is no point-in-time recovery or WAL archive; restore picks one backup manifest. Design: [BACKUPS.md](https://github.com/antflydb/antfly/blob/main/zig/BACKUPS.md), [HOT_STANDBY.md](https://github.com/antflydb/antfly/blob/main/zig/HOT_STANDBY.md).
 - **Shard split and merge.** Automatic split and merge on `max_shard_size_bytes` (default 64 MiB) is opt-in: set the top-level node config `disable_shard_alloc: false`. Design: [DB.md: Shard Split Contract](https://github.com/antflydb/antfly/blob/main/zig/DB.md#shard-split-contract), [SCALING.md](https://github.com/antflydb/antfly/blob/main/zig/SCALING.md).
-- **Autoscaling.** The Kubernetes [operator](/docs/operator) can scale data nodes on CPU and memory utilization within configured bounds, scaling down one node at a time. It is opt-in. InferencePools scale through a HorizontalPodAutoscaler. Design: [OPERATOR.md](https://github.com/antflydb/antfly/blob/main/go/pkg/operator/OPERATOR.md).
+- **Deployment automation.** Antfly exposes runtime and admin APIs for self-hosted automation. Hosted Kubernetes autoscaling and inference-pool orchestration are maintained in Colony.
 
 ## Upgrades
 

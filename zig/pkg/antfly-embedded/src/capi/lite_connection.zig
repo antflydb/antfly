@@ -422,6 +422,87 @@ const PathGate = struct {
 };
 var registry_mutex: std.Io.Mutex = .init;
 var gates: std.StringHashMapUnmanaged(*PathGate) = .empty;
+
+/// File replacement must join the same fair queue as foreground operations
+/// and maintenance before acquiring the cross-process writer lease. Retaining
+/// the gate also keeps its identity stable when the last connection closes.
+pub const PathReplacementGuard = struct {
+    gate: *PathGate,
+
+    pub fn release(self: PathReplacementGuard) void {
+        self.gate.mutex.unlock(h.handleLockIo());
+        releaseGate(self.gate);
+    }
+};
+
+pub fn acquirePathReplacement(path: []const u8) !PathReplacementGuard {
+    const io = h.handleLockIo();
+    const canonical = native.realPathAlloc(alloc, io, path) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            const parent = try native.realPathAlloc(alloc, io, std.fs.path.dirname(path) orelse ".");
+            defer alloc.free(parent);
+            break :blk try std.fs.path.join(alloc, &.{ parent, std.fs.path.basename(path) });
+        },
+        else => return err,
+    };
+    defer alloc.free(canonical);
+    const gate = try retainGate(canonical);
+    gate.mutex.lockUncancelable(io);
+    return .{ .gate = gate };
+}
+
+pub fn testPathReplacementAdmission() !void {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replacement.aflite", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const io = h.handleLockIo();
+    // Also exercise a destination that does not exist yet: creation and later
+    // replacement must use one canonical queue, including relative aliases.
+    const held = try acquirePathReplacement(path);
+    var held_live = true;
+    defer if (held_live) held.release();
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    file.close(io);
+    const canonical = try native.realPathAlloc(alloc, io, path);
+    defer alloc.free(canonical);
+    const Replacement = struct {
+        acquired: bool = false,
+        failure: ?anyerror = null,
+        finished: std.Io.Event = .unset,
+        fn run(self: *@This(), target: []const u8, expected: *PathGate) void {
+            defer self.finished.set(h.handleLockIo());
+            const replacement = acquirePathReplacement(target) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer replacement.release();
+            self.acquired = replacement.gate == expected;
+        }
+    };
+    var replacement: Replacement = .{};
+    const thread = try std.Thread.spawn(.{}, Replacement.run, .{ &replacement, canonical, held.gate });
+    defer thread.join();
+    while (true) {
+        held.gate.mutex.state.lockUncancelable(io);
+        const queued = held.gate.mutex.next == 2;
+        held.gate.mutex.state.unlock(io);
+        if (queued) break;
+        // A failed registration or a different canonical gate must fail the
+        // regression instead of leaving it waiting for an impossible ticket.
+        try std.testing.expect(!replacement.finished.isSet());
+        std.Thread.yield() catch {};
+    }
+    held.release();
+    held_live = false;
+    // The following foreground operation must queue behind replacement.
+    const next = try acquirePathReplacement(path);
+    defer next.release();
+    try std.testing.expect(replacement.failure == null);
+    try std.testing.expect(replacement.acquired);
+}
+
 fn retainGate(path: []const u8) !*PathGate {
     const io = h.handleLockIo();
     registry_mutex.lockUncancelable(io);
@@ -461,6 +542,10 @@ pub const Owner = struct {
     const MaintenanceSchedule = struct {
         shadow_next: bool = true,
         source_recovery_next: bool = true,
+        group_source_next: bool = true,
+        // Separately allocated: table admission can grow the schedule map
+        // while a visibility/idle drain borrows this state.
+        group_sources: ?*h.db_mod.DB.GroupSourceMaintenanceState = null,
         next_source_recovery_ns: i96 = 0,
         live: bool = true,
         ttl: h.db_mod.types.TTLCleanupStats = .{},
@@ -529,6 +614,7 @@ pub const Owner = struct {
     pub fn refresh(self: *Owner) !*h.Handle {
         var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
+            if (current.lite_scheduling_owner == null) try self.bindGroupSourceState(current);
             var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer probe.close();
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
@@ -555,6 +641,7 @@ pub const Owner = struct {
         if (known_maintenance orelse self.current) |verified| options.allocator_verification_owner = &verified.owned_lite_backend.?.native_docstore.?.file;
         const replacement = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, self.current);
         errdefer h.closeHandle(replacement);
+        try self.bindGroupSourceState(replacement);
         if (self.current) |previous| {
             if (known_maintenance) |snapshot| {
                 try replacement.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
@@ -640,6 +727,30 @@ pub const Owner = struct {
                 h.closeHandle(retired);
             }
         }
+    }
+
+    fn bindGroupSourceState(self: *Owner, root: *h.Handle) !void {
+        root.db.borrowed_group_source_state = try self.groupSourceState(&root.db);
+        var tables = root.embedded_tables.valueIterator();
+        while (tables.next()) |table|
+            table.*.db.borrowed_group_source_state = try self.groupSourceState(&table.*.db);
+        root.lite_scheduling_owner = self;
+    }
+
+    /// Called under the connection gate by explicit maintenance as well as the
+    /// background scheduler. The state outlives every refreshed DB wrapper.
+    pub fn groupSourceState(self: *Owner, database: *h.db_mod.DB) !*h.db_mod.DB.GroupSourceMaintenanceState {
+        const entry = try self.maintenance_schedules.getOrPut(alloc, .{
+            .table_id = database.core.identity_namespace.table_id,
+            .incarnation = database.root_incarnation,
+        });
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        if (entry.value_ptr.group_sources == null) {
+            const state = try alloc.create(h.db_mod.DB.GroupSourceMaintenanceState);
+            state.* = .{ .allocator = alloc };
+            entry.value_ptr.group_sources = state;
+        }
+        return entry.value_ptr.group_sources.?;
     }
 
     pub fn notifyMutation(self: *Owner) void {
@@ -920,6 +1031,10 @@ pub const Owner = struct {
         }
         var stale = self.maintenance_schedules.iterator();
         while (stale.next()) |entry| if (!entry.value_ptr.live) {
+            if (entry.value_ptr.group_sources) |state| {
+                state.deinit();
+                alloc.destroy(state);
+            }
             self.maintenance_schedules.removeByPtr(entry.key_ptr);
         };
         const count = foreground.embedded_tables.count() + 1;
@@ -931,6 +1046,7 @@ pub const Owner = struct {
             for (0..ordinal) |_| selected = tables.next().?.*;
             database = &selected.?.db;
         }
+        const group_state = try self.groupSourceState(database);
         const schedule_entry = try self.maintenance_schedules.getOrPut(alloc, .{
             .table_id = database.core.identity_namespace.table_id,
             .incarnation = database.root_incarnation,
@@ -962,6 +1078,17 @@ pub const Owner = struct {
             schedule.next_source_recovery_ns = now + std.time.ns_per_s;
         }
         schedule.source_recovery_next = true;
+        // Group fan-in is bounded control work on the current coordinator.
+        // Alternate it with detached provider replay per namespace so a busy
+        // root or a long backfill cannot starve a child or its consumers.
+        if (self.options.open_mode == .writer and schedule.group_source_next) {
+            if (try database.runGroupSourceMaintenanceSlice(group_state)) {
+                schedule.group_source_next = false;
+                self.notifyMutation();
+                return true;
+            }
+        }
+        schedule.group_source_next = true;
         var ttl_more = false;
         if (now >= schedule.next_ttl_ns) {
             // Each namespace owns its cleanup cadence. Failure still consumes
@@ -1148,6 +1275,15 @@ pub const Owner = struct {
         }
     }
 
+    fn deinitMaintenanceSchedules(self: *Owner) void {
+        var schedules = self.maintenance_schedules.valueIterator();
+        while (schedules.next()) |schedule| if (schedule.group_sources) |state| {
+            state.deinit();
+            alloc.destroy(state);
+        };
+        self.maintenance_schedules.deinit(alloc);
+    }
+
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
         if (self.maintenance_snapshot) |snapshot| closeMaintenanceSnapshot(snapshot);
@@ -1159,7 +1295,7 @@ pub const Owner = struct {
         }
         self.retired.deinit(alloc);
         self.connections.deinit(alloc);
-        self.maintenance_schedules.deinit(alloc);
+        self.deinitMaintenanceSchedules();
         if (self.owned_ttl_owner_id) |id| alloc.free(id);
         if (self.owned_models_dir) |directory| alloc.free(directory);
         alloc.destroy(self);
@@ -1384,6 +1520,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     if (existing == null) {
         owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir };
     }
+    errdefer if (existing == null) owner.deinitMaintenanceSchedules();
     try owner.connections.ensureUnusedCapacity(alloc, 1);
     errdefer if (existing == null) owner.connections.deinit(alloc);
     if (existing == null) {

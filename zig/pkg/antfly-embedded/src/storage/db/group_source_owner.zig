@@ -16,22 +16,35 @@
 const std = @import("std");
 const runtime = @import("../background_runtime.zig");
 const work = @import("group_source_worker.zig");
+/// Cursor/lease identity belongs to the scheduling owner, not a reopened DB.
+/// Native Lite keeps this state per table across foreground runtime refreshes.
+pub const State = struct {
+    slice_mutex: std.atomic.Mutex = .unlocked,
+    allocator: ?std.mem.Allocator = null,
+    worker: ?work.Worker = null,
+    next_definition: usize = 0,
+    idle_definitions: usize = 0,
+    submitted: u64 = 0,
+
+    pub fn deinit(self: *State) void {
+        if (self.worker) |*worker| worker.deinit();
+        self.worker = null;
+    }
+};
+
 /// Resident-only lifecycle. Stop joins the slice before releasing cursor state.
 pub const Owner = struct {
     pub const Port = struct { ptr: *anyopaque, runtime: *runtime.BackendRuntime, run: *const fn (*anyopaque) anyerror!bool };
     port: Port = undefined,
     registration: ?runtime.MaintenanceScheduler.Handle = null,
     mutex: std.atomic.Mutex = .unlocked,
-    slice_mutex: std.atomic.Mutex = .unlocked,
+    state: State = .{},
     stopping: std.atomic.Value(bool) = .init(false),
     stop_started: bool = false,
     joined: std.Io.Event = .unset,
     stop_progress: std.Io.Event = .unset,
     stop_generation: std.atomic.Value(u64) = .init(0),
     stop_waiters: std.atomic.Value(u32) = .init(0),
-    worker: ?work.Worker = null,
-    next_definition: usize = 0,
-    submitted: u64 = 0,
     pub fn start(self: *Owner, port: Port) void {
         while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
         defer self.mutex.unlock();
@@ -45,19 +58,18 @@ pub const Owner = struct {
     }
     pub fn stop(self: *Owner, io: ?std.Io) void {
         self.shutdown().stop(io, false);
-        while (!self.slice_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
-        defer self.slice_mutex.unlock();
+        while (!self.state.slice_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
+        defer self.state.slice_mutex.unlock();
         self.clearWorker();
     }
     pub fn stopWithAdmission(self: *Owner, io: ?std.Io, original: @import("../../common/read_admission.zig").Port) !void {
         try self.shutdown().stopWithAdmission(io, original);
-        try @import("../../common/cleanup_wait.zig").lockAtomic(&self.slice_mutex, io, original);
-        defer self.slice_mutex.unlock();
+        try @import("../../common/cleanup_wait.zig").lockAtomic(&self.state.slice_mutex, io, original);
+        defer self.state.slice_mutex.unlock();
         self.clearWorker();
     }
     fn clearWorker(self: *Owner) void {
-        if (self.worker) |*worker| worker.deinit();
-        self.worker = null;
+        self.state.deinit();
     }
     fn step(self: *Owner) ?u64 {
         if (self.stopping.load(.acquire)) return null;
@@ -77,8 +89,8 @@ test "maintenance runtime group source retirement retains cursor state after ori
         defer backend.deinit();
         const io = backend.ptr().io().?;
         var owner: Owner = .{};
-        owner.worker = .{ .allocator = std.testing.allocator, .identity = @splat(1) };
-        try owner.worker.?.scopes.put(std.testing.allocator, @splat(2), .{ .source = try std.testing.allocator.dupe(u8, "source"), .group = try std.testing.allocator.dupe(u8, "group") });
+        owner.state.worker = .{ .allocator = std.testing.allocator, .identity = @splat(1) };
+        try owner.state.worker.?.scopes.put(std.testing.allocator, @splat(2), .{ .source = try std.testing.allocator.dupe(u8, "source"), .group = try std.testing.allocator.dupe(u8, "group") });
         const F = struct {
             owner: *Owner,
             io: std.Io,
@@ -86,11 +98,11 @@ test "maintenance runtime group source retirement retains cursor state after ori
             release: std.Io.Event = .unset,
             fn run(raw: *anyopaque) !bool {
                 const self: *@This() = @ptrCast(@alignCast(raw));
-                while (!self.owner.slice_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
-                defer self.owner.slice_mutex.unlock();
+                while (!self.owner.state.slice_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
+                defer self.owner.state.slice_mutex.unlock();
                 self.entered.set(self.io);
                 self.release.waitUncancelable(self.io);
-                std.debug.assert(self.owner.worker != null);
+                std.debug.assert(self.owner.state.worker != null);
                 return false;
             }
         };
@@ -136,12 +148,12 @@ test "maintenance runtime group source retirement retains cursor state after ori
                 .lifetime_in_wait => error.DeadlineExceeded,
                 .success => unreachable,
             }, result);
-            try std.testing.expect(owner.registration != null and owner.worker != null);
-            try std.testing.expectEqual(@as(usize, 1), owner.worker.?.scopes.count());
+            try std.testing.expect(owner.registration != null and owner.state.worker != null);
+            try std.testing.expectEqual(@as(usize, 1), owner.state.worker.?.scopes.count());
             f.release.set(io);
             owner.stop(io);
         }
-        try std.testing.expect(owner.worker == null and owner.registration == null);
+        try std.testing.expect(owner.state.worker == null and owner.registration == null);
         try std.testing.expectEqual(@as(usize, 1), control.begins);
         try std.testing.expectEqual(@as(usize, if (case == .begin_failure) 0 else 1), control.ends);
     }

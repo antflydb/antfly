@@ -29,6 +29,7 @@ pub const HttpMethod = enum(c_int) {
 pub const RequestBodyMode = enum(c_int) {
     none,
     buffered,
+    streaming_raw,
 };
 
 pub const CallbackStatus = enum(c_int) {
@@ -114,6 +115,9 @@ pub const RequestBodySource = extern struct {
     context: ?*anyopaque = null,
     read_all: ?*const fn (?*anyopaque, *OptionalBytes) callconv(.c) CallbackStatus = null,
     streaming: u8 = 0,
+    /// Reads at most capacity bytes; zero bytes with .ok is EOF.
+    read: ?*const fn (?*anyopaque, [*]u8, usize, *usize) callconv(.c) CallbackStatus = null,
+    read_controlled: ?*const fn (?*anyopaque, [*]u8, usize, *usize, *const RequestControl) callconv(.c) CallbackStatus = null,
     read_all_controlled: ?*const fn (?*anyopaque, *OptionalBytes, *const RequestControl) callconv(.c) CallbackStatus = null,
 };
 

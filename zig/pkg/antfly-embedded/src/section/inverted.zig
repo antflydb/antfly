@@ -966,6 +966,14 @@ pub const InvertedIndexBuilder = struct {
 
     /// Add a document's term hits to the index.
     pub fn addDocument(self: *InvertedIndexBuilder, doc_num: u32, hits: []const TermHit) !void {
+        // Introducer hits are distinct within a field contribution. Reserve
+        // large fresh runs once: incremental hash growth otherwise retains
+        // both old and new tables alongside token scratch at peak admission.
+        // Existing vocabularies stay incremental to avoid reserving for terms
+        // already present in repetitive documents.
+        if (self.terms.count() == 0 and hits.len >= 4096) {
+            try self.terms.ensureTotalCapacity(self.alloc, std.math.cast(u32, hits.len) orelse return error.InvalidData);
+        }
         var field_len: u32 = 0;
         var doc_norm: u32 = 0;
         for (hits) |hit| {
@@ -978,7 +986,7 @@ pub const InvertedIndexBuilder = struct {
                 gop.key_ptr.* = try self.term_arena.allocator().dupe(u8, hit.term);
             }
             const before = gop.value_ptr.estimatedMemoryBytes();
-            try gop.value_ptr.add(self.alloc, doc_num, hit.freq, hit.norm, hit.positions);
+            try gop.value_ptr.addInline(self.alloc, doc_num, hit.freq, hit.norm, hit.positions);
             self.postings_capacity_bytes +|= gop.value_ptr.estimatedMemoryBytes() - before;
             field_len += hit.freq;
         }
@@ -996,7 +1004,7 @@ pub const InvertedIndexBuilder = struct {
             gop.key_ptr.* = try self.term_arena.allocator().dupe(u8, term);
         }
         const before = gop.value_ptr.estimatedMemoryBytes();
-        try gop.value_ptr.add(self.alloc, doc_num, freq, norm_val, &.{});
+        try gop.value_ptr.addInline(self.alloc, doc_num, freq, norm_val, &.{});
         self.postings_capacity_bytes +|= gop.value_ptr.estimatedMemoryBytes() - before;
         try self.recordDocNorm(doc_num, norm_val);
         self.total_field_len += freq;
@@ -1081,11 +1089,11 @@ pub const InvertedIndexBuilder = struct {
         for (sorted) |term| {
             const acc = self.terms.getPtr(term).?;
             const value = if (self.config.wireVersion() == wire_version_current and
-                self.config.postings_layout == .posting_count_v35 and acc.doc_ids.items.len > self.config.chunk_size)
+                self.config.postings_layout == .posting_count_v35 and acc.docIds().len > self.config.chunk_size)
             blk: {
                 var stream = AccumulatorStream{ .source = acc, .alloc = alloc };
                 var ignored_total: u64 = 0;
-                break :blk (try appendPostingStreamToSink(alloc, sink, start, &stream, acc.all_positions.items.len > 0, self.doc_norms.items, &ignored_total, self.config)).?;
+                break :blk (try appendPostingStreamToSink(alloc, sink, start, &stream, acc.positionData().len > 0, self.doc_norms.items, &ignored_total, self.config)).?;
             } else try appendMergedTermToSink(alloc, sink, start, &encoded, &scratch, acc, self.config, self.doc_count);
             try dictionary.add(term, value);
         }
@@ -1167,12 +1175,12 @@ pub const InvertedIndexBuilder = struct {
             }
 
             // 1-hit optimization: single doc, freq=1, no locs, no positions, docNum fits in 31 bits
-            if (acc.doc_ids.items.len == 1 and
-                acc.metas.items[0].freq == 1 and
-                acc.metas.items[0].position_count == 0 and
-                acc.doc_ids.items[0] <= mask_31_bits)
+            if (acc.docIds().len == 1 and
+                acc.postingMetas()[0].freq == 1 and
+                acc.postingMetas()[0].position_count == 0 and
+                acc.docIds()[0] <= mask_31_bits)
             {
-                const doc_num: u64 = acc.doc_ids.items[0];
+                const doc_num: u64 = acc.docIds()[0];
                 dict_value = fstValEncode1Hit(doc_num, 0);
             } else {
                 const postings_offset: u64 = @intCast(output.items.len - v7_header_size);
@@ -1948,35 +1956,81 @@ fn appendGroupedPositionsForChunk(
 
 /// Accumulates postings for a single term during index building.
 const PostingAccumulator = struct {
-    doc_ids: std.ArrayListUnmanaged(u32) = .empty,
-    metas: std.ArrayListUnmanaged(PostingMeta) = .empty,
-    /// Flat concatenation of all position lists.
-    all_positions: std.ArrayListUnmanaged(u32) = .empty,
+    storage: Storage = .{ .many = .{} },
+    const Many = struct {
+        doc_ids: std.ArrayListUnmanaged(u32) = .empty,
+        metas: std.ArrayListUnmanaged(PostingMeta) = .empty,
+        all_positions: std.ArrayListUnmanaged(u32) = .empty,
+    };
+    const Single = struct { docs: [1]u32, metadata: [1]PostingMeta, positions: [1]u32 };
+    const Storage = union(enum) { single: Single, many: Many };
+
+    fn docIds(self: *const @This()) []const u32 {
+        return switch (self.storage) {
+            .single => |*one| &one.docs,
+            .many => |*many| many.doc_ids.items,
+        };
+    }
+    fn postingMetas(self: *const @This()) []const PostingMeta {
+        return switch (self.storage) {
+            .single => |*one| &one.metadata,
+            .many => |*many| many.metas.items,
+        };
+    }
+    fn positionData(self: *const @This()) []const u32 {
+        return switch (self.storage) {
+            .single => |*one| one.positions[0..one.metadata[0].position_count],
+            .many => |*many| many.all_positions.items,
+        };
+    }
+    /// Most fresh terms have one occurrence. Accessors derive slices on demand;
+    /// rehashing never leaves interior pointers, and the union costs one tag
+    /// rather than storing both inline and heap-backed representations.
+    inline fn addInline(self: *@This(), alloc: Allocator, doc_num: u32, freq: u32, norm: u32, positions: []const u32) !void {
+        switch (self.storage) {
+            .single => |one| {
+                var replacement = PostingAccumulator.init();
+                errdefer replacement.deinit(alloc);
+                try replacement.add(alloc, one.docs[0], one.metadata[0].freq, one.metadata[0].norm, one.positions[0..one.metadata[0].position_count]);
+                self.* = replacement;
+            },
+            .many => |*many| {
+                if (many.doc_ids.capacity == 0 and positions.len <= 1) {
+                    std.debug.assert(many.metas.capacity == 0 and many.all_positions.capacity == 0);
+                    self.storage = .{ .single = .{ .docs = .{doc_num}, .metadata = .{.{ .freq = freq, .norm = norm, .position_count = @intCast(positions.len) }}, .positions = .{if (positions.len == 1) positions[0] else 0} } };
+                    return;
+                }
+            },
+        }
+        try self.add(alloc, doc_num, freq, norm, positions);
+    }
 
     fn init() PostingAccumulator {
         return .{};
     }
 
     pub fn deinit(self: *PostingAccumulator, alloc: Allocator) void {
-        self.doc_ids.deinit(alloc);
-        self.metas.deinit(alloc);
-        self.all_positions.deinit(alloc);
+        if (self.storage == .single) return;
+        self.storage.many.doc_ids.deinit(alloc);
+        self.storage.many.metas.deinit(alloc);
+        self.storage.many.all_positions.deinit(alloc);
     }
 
     pub fn estimatedMemoryBytes(self: *const PostingAccumulator) u64 {
-        return (@as(u64, @intCast(self.doc_ids.capacity)) * @sizeOf(u32)) +
-            (@as(u64, @intCast(self.metas.capacity)) * @sizeOf(PostingMeta)) +
-            (@as(u64, @intCast(self.all_positions.capacity)) * @sizeOf(u32));
+        if (self.storage == .single) return 0;
+        return (@as(u64, @intCast(self.storage.many.doc_ids.capacity)) * @sizeOf(u32)) +
+            (@as(u64, @intCast(self.storage.many.metas.capacity)) * @sizeOf(PostingMeta)) +
+            (@as(u64, @intCast(self.storage.many.all_positions.capacity)) * @sizeOf(u32));
     }
 
     fn add(self: *PostingAccumulator, alloc: Allocator, doc_num: u32, freq: u32, norm_val: u32, positions: []const u32) !void {
-        try self.doc_ids.append(alloc, doc_num);
-        try self.metas.append(alloc, .{
+        try self.storage.many.doc_ids.append(alloc, doc_num);
+        try self.storage.many.metas.append(alloc, .{
             .freq = freq,
             .norm = norm_val,
             .position_count = @intCast(positions.len),
         });
-        try self.all_positions.appendSlice(alloc, positions);
+        try self.storage.many.all_positions.appendSlice(alloc, positions);
     }
 
     const EncodedPostingChunk = struct { metadata: V7ChunkMeta, max_freq: u16, min_norm: u16 };
@@ -1994,8 +2048,8 @@ const PostingAccumulator = struct {
         var prev_doc: u32 = 0;
         var i = doc_start;
         while (i < doc_end) : (i += 1) {
-            const doc_id = self.doc_ids.items[i];
-            const meta = self.metas.items[i];
+            const doc_id = self.docIds()[i];
+            const meta = self.postingMetas()[i];
             scratch.doc_deltas.appendAssumeCapacity(if (i == doc_start)
                 (if (config.postings_layout == .posting_count_v35) doc_id else doc_id - chunk_id * config.chunk_size)
             else
@@ -2016,7 +2070,7 @@ const PostingAccumulator = struct {
                 try appendChunkFramedPositionsForDoc(
                     alloc,
                     &scratch.position_chunk,
-                    self.all_positions.items[pos_offset.*..][0..count],
+                    self.positionData()[pos_offset.*..][0..count],
                 );
             }
             pos_offset.* += count;
@@ -2026,8 +2080,8 @@ const PostingAccumulator = struct {
             try appendGroupedPositionsForChunk(
                 alloc,
                 &scratch.position_chunk,
-                self.metas.items[doc_start..doc_end],
-                self.all_positions.items[chunk_positions_start..pos_offset.*],
+                self.postingMetas()[doc_start..doc_end],
+                self.positionData()[chunk_positions_start..pos_offset.*],
                 &scratch.position_group_deltas,
             );
         }
@@ -2043,7 +2097,7 @@ const PostingAccumulator = struct {
             try appendPackedPostingChunk(alloc, &scratch.payload, scratch.doc_deltas.items, scratch.freq_values.items);
         const metadata = V7ChunkMeta{
             .chunk_id = chunk_id,
-            .max_doc = self.doc_ids.items[doc_end - 1],
+            .max_doc = self.docIds()[doc_end - 1],
             .doc_count = @intCast(doc_end - doc_start),
             .doc_ctrl_off = packed_chunk.off,
             .doc_ctrl_len = packed_chunk.len,
@@ -2066,7 +2120,7 @@ const PostingAccumulator = struct {
         config: IndexConfig,
     ) !void {
         scratch.reset();
-        const doc_freq: u32 = @intCast(self.doc_ids.items.len);
+        const doc_freq: u32 = @intCast(self.docIds().len);
         if (doc_freq == 0) return error.InvalidData;
         if (config.chunk_size == 0) return error.InvalidData;
         const posting_count_blocks = config.postings_layout == .posting_count_v35;
@@ -2081,19 +2135,19 @@ const PostingAccumulator = struct {
         // avoiding the eight-field term header, four chunk-metadata columns,
         // payload controls, and redundant impact record.
         if (usesInlineSingleDocPostings(config.wireVersion()) and doc_freq == 1) {
-            const meta = self.metas.items[0];
-            if (meta.position_count != self.all_positions.items.len) return error.InvalidData;
+            const meta = self.postingMetas()[0];
+            if (meta.position_count != self.positionData().len) return error.InvalidData;
             const has_locs = meta.position_count > 0;
             if (has_locs and meta.position_count != meta.freq) return error.InvalidData;
 
             try writeVarintU32(alloc, out, 0);
-            try writeVarintU32(alloc, out, self.doc_ids.items[0]);
+            try writeVarintU32(alloc, out, self.docIds()[0]);
             try writeVarintU32(alloc, out, @intCast(encodeFreqHasLocs(meta.freq, has_locs)));
             if (has_locs) {
                 scratch.position_group_deltas.clearRetainingCapacity();
-                try scratch.position_group_deltas.ensureTotalCapacity(alloc, self.all_positions.items.len);
+                try scratch.position_group_deltas.ensureTotalCapacity(alloc, self.positionData().len);
                 var previous: u32 = 0;
-                for (self.all_positions.items) |position| {
+                for (self.positionData()) |position| {
                     try scratch.position_group_deltas.append(alloc, if (position >= previous) position - previous else 0);
                     previous = position;
                 }
@@ -2112,7 +2166,7 @@ const PostingAccumulator = struct {
                 // document-range IDs or one record per crossed 1K range.
                 var impact_max_freq: u16 = 0;
                 var impact_min_norm: u16 = std.math.maxInt(u16);
-                for (self.metas.items) |meta| {
+                for (self.postingMetas()) |meta| {
                     const freq_u16: u16 = if (meta.freq > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(meta.freq);
                     const norm_u16: u16 = if (meta.norm > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(meta.norm);
                     impact_max_freq = @max(impact_max_freq, freq_u16);
@@ -2123,7 +2177,7 @@ const PostingAccumulator = struct {
                 var current_impact_chunk: ?u32 = null;
                 var impact_max_freq: u16 = 0;
                 var impact_min_norm: u16 = std.math.maxInt(u16);
-                for (self.doc_ids.items, self.metas.items) |doc_id, meta| {
+                for (self.docIds(), self.postingMetas()) |doc_id, meta| {
                     const chunk_id = doc_id / impact_range_doc_count;
                     if (current_impact_chunk != null and current_impact_chunk.? != chunk_id) {
                         try scratch.impact_chunk_ids.append(alloc, current_impact_chunk.?);
@@ -2146,18 +2200,18 @@ const PostingAccumulator = struct {
         }
 
         var pos_offset: usize = 0;
-        const store_positions = self.all_positions.items.len > 0;
+        const store_positions = self.positionData().len > 0;
         var doc_start: usize = 0;
-        while (doc_start < self.doc_ids.items.len) {
+        while (doc_start < self.docIds().len) {
             const chunk_id: u32 = if (posting_count_blocks)
                 @intCast(scratch.chunks.items.len)
             else
-                self.doc_ids.items[doc_start] / config.chunk_size;
+                self.docIds()[doc_start] / config.chunk_size;
             var doc_end = doc_start + 1;
             if (posting_count_blocks) {
-                doc_end = @min(self.doc_ids.items.len, doc_start + @as(usize, config.chunk_size));
+                doc_end = @min(self.docIds().len, doc_start + @as(usize, config.chunk_size));
             } else {
-                while (doc_end < self.doc_ids.items.len and self.doc_ids.items[doc_end] / config.chunk_size == chunk_id) : (doc_end += 1) {}
+                while (doc_end < self.docIds().len and self.docIds()[doc_end] / config.chunk_size == chunk_id) : (doc_end += 1) {}
             }
 
             const encoded = try self.appendEncodedChunk(alloc, scratch, config, doc_start, doc_end, chunk_id, &pos_offset, store_positions);
@@ -6236,7 +6290,7 @@ fn writeMappedInvertedSection(
                 if (std.mem.eql(u8, entry.term, merged_term.items)) current_entries[i] = try term_iters[i].next();
             }
 
-            if (acc.doc_ids.items.len == 0) continue;
+            if (acc.storage.many.doc_ids.items.len == 0) continue;
             try sortPostingAccumulatorByDocIdWithWorkspace(alloc, acc, &workspace);
             const dict_value = try appendMergedTermToSink(alloc, sink, section_start, term_postings, serialize_scratch, acc, config, merged_doc_count);
             try dict_builder.add(merged_term.items, dict_value);
@@ -6278,9 +6332,9 @@ fn sortPostingAccumulatorByDocId(alloc: Allocator, acc: *PostingAccumulator) !vo
 }
 
 fn sortPostingAccumulatorByDocIdWithWorkspace(alloc: Allocator, acc: *PostingAccumulator, workspace: *PostingMergeWorkspace) !void {
-    if (acc.doc_ids.items.len <= 1) return;
+    if (acc.storage.many.doc_ids.items.len <= 1) return;
     var ordered = true;
-    for (acc.doc_ids.items[1..], acc.doc_ids.items[0 .. acc.doc_ids.items.len - 1]) |next, previous| {
+    for (acc.storage.many.doc_ids.items[1..], acc.storage.many.doc_ids.items[0 .. acc.storage.many.doc_ids.items.len - 1]) |next, previous| {
         if (next < previous) {
             ordered = false;
             break;
@@ -6296,36 +6350,36 @@ fn sortPostingAccumulatorByDocIdWithWorkspace(alloc: Allocator, acc: *PostingAcc
         resetMergeBuffers(&workspace.sort_positions, alloc, &remaining);
     }
 
-    try workspace.sort_entries.ensureTotalCapacityPrecise(alloc, acc.doc_ids.items.len);
-    workspace.sort_entries.items.len = acc.doc_ids.items.len;
+    try workspace.sort_entries.ensureTotalCapacityPrecise(alloc, acc.storage.many.doc_ids.items.len);
+    workspace.sort_entries.items.len = acc.storage.many.doc_ids.items.len;
     const entries = workspace.sort_entries.items;
     var positions_start: usize = 0;
     for (entries, 0..) |*entry, i| {
         entry.* = .{
-            .doc_id = acc.doc_ids.items[i],
-            .meta = acc.metas.items[i],
+            .doc_id = acc.storage.many.doc_ids.items[i],
+            .meta = acc.storage.many.metas.items[i],
             .positions_start = positions_start,
         };
-        positions_start += acc.metas.items[i].position_count;
+        positions_start += acc.storage.many.metas.items[i].position_count;
     }
 
     std.mem.sort(PostingSortEntry, entries, {}, postingSortEntryLessThan);
 
-    try workspace.sort_positions.ensureTotalCapacityPrecise(alloc, acc.all_positions.items.len);
-    workspace.sort_positions.items.len = acc.all_positions.items.len;
+    try workspace.sort_positions.ensureTotalCapacityPrecise(alloc, acc.storage.many.all_positions.items.len);
+    workspace.sort_positions.items.len = acc.storage.many.all_positions.items.len;
     const sorted_positions = workspace.sort_positions.items;
     var sorted_positions_len: usize = 0;
     for (entries, 0..) |entry, i| {
-        acc.doc_ids.items[i] = entry.doc_id;
-        acc.metas.items[i] = entry.meta;
+        acc.storage.many.doc_ids.items[i] = entry.doc_id;
+        acc.storage.many.metas.items[i] = entry.meta;
         const position_count: usize = @intCast(entry.meta.position_count);
         if (position_count == 0) continue;
-        const positions = acc.all_positions.items[entry.positions_start..][0..position_count];
+        const positions = acc.storage.many.all_positions.items[entry.positions_start..][0..position_count];
         @memcpy(sorted_positions[sorted_positions_len..][0..position_count], positions);
         sorted_positions_len += position_count;
     }
-    if (sorted_positions_len != acc.all_positions.items.len) return error.InvalidData;
-    @memcpy(acc.all_positions.items, sorted_positions);
+    if (sorted_positions_len != acc.storage.many.all_positions.items.len) return error.InvalidData;
+    @memcpy(acc.storage.many.all_positions.items, sorted_positions);
 }
 
 fn nextTermIteratorEntry(term_iters: []TermIterator, idx: usize) !?TermIterator.Entry {
@@ -6446,8 +6500,8 @@ fn appendLookupResultToAccumulatorLimitedWithWorkspace(
 fn postingAccumulatorWouldSpill(acc: *const PostingAccumulator, positions: usize, byte_limit: ?usize) bool {
     const limit = byte_limit orelse return false;
     // Include the reorder copy and descriptors, not just compressed wire bytes.
-    const bytes = (acc.doc_ids.items.len +| 1) *| (@sizeOf(u32) + @sizeOf(PostingMeta) + @sizeOf(PostingSortEntry)) +|
-        (acc.all_positions.items.len +| positions) *| (2 * @sizeOf(u32));
+    const bytes = (acc.storage.many.doc_ids.items.len +| 1) *| (@sizeOf(u32) + @sizeOf(PostingMeta) + @sizeOf(PostingSortEntry)) +|
+        (acc.storage.many.all_positions.items.len +| positions) *| (2 * @sizeOf(u32));
     return bytes > limit;
 }
 
@@ -6542,12 +6596,12 @@ const ExternalPostingStream = struct {
         self.sorter.deinit();
     }
     pub fn packedBlock(self: *@This(), acc: *PostingAccumulator, views: *std.ArrayListUnmanaged(PackedPositionView), count: u32) !bool {
-        acc.doc_ids.clearRetainingCapacity();
-        acc.metas.clearRetainingCapacity();
-        acc.all_positions.clearRetainingCapacity();
+        acc.storage.many.doc_ids.clearRetainingCapacity();
+        acc.storage.many.metas.clearRetainingCapacity();
+        acc.storage.many.all_positions.clearRetainingCapacity();
         views.clearRetainingCapacity();
         if (self.cursor == null) return false;
-        while (acc.doc_ids.items.len < count) {
+        while (acc.storage.many.doc_ids.items.len < count) {
             const record = (try self.cursor.?.nextView()) orelse break;
             if (record.key >= std.math.maxInt(u32) or record.payload.length < 13) return error.InvalidData;
             const doc: u32 = @intCast(record.key);
@@ -6559,11 +6613,11 @@ const ExternalPostingStream = struct {
             const norm = std.mem.readInt(u32, header[4..8], .little);
             const length = std.mem.readInt(u32, header[8..12], .little);
             if (header[12] > 32 or packedU32ByteLen(length, header[12]) != record.payload.length - 13) return error.InvalidData;
-            try acc.doc_ids.append(self.allocator, doc);
-            try acc.metas.append(self.allocator, .{ .freq = frequency, .norm = norm, .position_count = length });
+            try acc.storage.many.doc_ids.append(self.allocator, doc);
+            try acc.storage.many.metas.append(self.allocator, .{ .freq = frequency, .norm = norm, .position_count = length });
             try views.append(self.allocator, .{ .range = try @import("../segment_source.zig").View.init(record.payload.source, record.payload.offset + 13, record.payload.length - 13), .count = length, .bits = header[12], .encoded_width = header[12], .read_cache = self.read_cache });
         }
-        return acc.doc_ids.items.len != 0;
+        return acc.storage.many.doc_ids.items.len != 0;
     }
     fn block(self: *@This(), acc: *PostingAccumulator, count: u32) !bool {
         var views = std.ArrayListUnmanaged(PackedPositionView).empty;
@@ -6572,7 +6626,7 @@ const ExternalPostingStream = struct {
         for (views.items) |view| {
             var cursor = try view.cursorAlloc(self.allocator);
             defer cursor.deinit();
-            while (try cursor.next()) |position| try acc.all_positions.append(self.allocator, position);
+            while (try cursor.next()) |position| try acc.storage.many.all_positions.append(self.allocator, position);
         }
         return true;
     }
@@ -6582,6 +6636,13 @@ const ExternalPostingStream = struct {
 // mark. Only owned lists are visited; source descriptors are cleared separately.
 fn resetMergeBuffers(value: anytype, alloc: Allocator, remaining: *usize) void {
     const T = @TypeOf(value.*);
+    if (comptime T == PostingAccumulator.Storage) {
+        switch (value.*) {
+            .single => value.* = .{ .many = .{} },
+            .many => resetMergeBuffers(&value.many, alloc, remaining),
+        }
+        return;
+    }
     if (@hasField(T, "capacity") and @hasField(T, "items")) {
         const bytes = value.capacity * @sizeOf(std.meta.Elem(@TypeOf(value.items)));
         if (bytes > remaining.*) {
@@ -6819,26 +6880,26 @@ fn MergedPostingStream(comptime Maps: type) type {
             };
         }
         pub fn packedBlock(self: *@This(), acc: *PostingAccumulator, views: *std.ArrayListUnmanaged(PackedPositionView), count: u32) !bool {
-            acc.doc_ids.clearRetainingCapacity();
-            acc.metas.clearRetainingCapacity();
-            acc.all_positions.clearRetainingCapacity();
+            acc.storage.many.doc_ids.clearRetainingCapacity();
+            acc.storage.many.metas.clearRetainingCapacity();
+            acc.storage.many.all_positions.clearRetainingCapacity();
             views.clearRetainingCapacity();
             self.dense_ready = true;
-            while (acc.doc_ids.items.len < count) {
+            while (acc.storage.many.doc_ids.items.len < count) {
                 const head = self.heap.pop() orelse break;
-                if (acc.doc_ids.items.len > 0 and acc.doc_ids.items[acc.doc_ids.items.len - 1] >= head.doc_id) return error.InvalidData;
-                try acc.doc_ids.append(self.allocator, head.doc_id);
-                try acc.metas.append(self.allocator, .{ .freq = head.frequency, .norm = head.norm, .position_count = @intCast(self.head_views[head.source].count) });
+                if (acc.storage.many.doc_ids.items.len > 0 and acc.storage.many.doc_ids.items[acc.storage.many.doc_ids.items.len - 1] >= head.doc_id) return error.InvalidData;
+                try acc.storage.many.doc_ids.append(self.allocator, head.doc_id);
+                try acc.storage.many.metas.append(self.allocator, .{ .freq = head.frequency, .norm = head.norm, .position_count = @intCast(self.head_views[head.source].count) });
                 const positions = self.decoded_heads[head.source];
-                if (self.dense_ready and positions.len == self.head_views[head.source].count and acc.all_positions.items.len + positions.len <= 32 * 1024) {
-                    try acc.all_positions.appendSlice(self.allocator, positions);
+                if (self.dense_ready and positions.len == self.head_views[head.source].count and acc.storage.many.all_positions.items.len + positions.len <= 32 * 1024) {
+                    try acc.storage.many.all_positions.appendSlice(self.allocator, positions);
                 } else {
                     if (self.dense_ready) {
                         // The bounded decoded prefix stays immutable after the
                         // crossover. Materialize its references only now.
                         var offset: usize = 0;
-                        for (acc.metas.items[0 .. acc.metas.items.len - 1]) |meta| {
-                            const prefix = acc.all_positions.items[offset..][0..meta.position_count];
+                        for (acc.storage.many.metas.items[0 .. acc.storage.many.metas.items.len - 1]) |meta| {
+                            const prefix = acc.storage.many.all_positions.items[offset..][0..meta.position_count];
                             try views.append(self.allocator, .{ .unpacked = prefix, .count = prefix.len, .bits = positionBits(prefix) });
                             offset += prefix.len;
                         }
@@ -6848,7 +6909,7 @@ fn MergedPostingStream(comptime Maps: type) type {
                 }
                 try self.advance(head.source);
             }
-            return acc.doc_ids.items.len > 0;
+            return acc.storage.many.doc_ids.items.len > 0;
         }
         pub fn densePositionsReady(self: *@This()) bool {
             return self.dense_ready;
@@ -6936,16 +6997,16 @@ const AccumulatorStream = struct {
     position: usize = 0,
 
     pub fn packedBlock(self: *@This(), out: *PostingAccumulator, views: *std.ArrayListUnmanaged(PackedPositionView), count: u32) !bool {
-        out.doc_ids.clearRetainingCapacity();
-        out.metas.clearRetainingCapacity();
-        out.all_positions.clearRetainingCapacity();
+        out.storage.many.doc_ids.clearRetainingCapacity();
+        out.storage.many.metas.clearRetainingCapacity();
+        out.storage.many.all_positions.clearRetainingCapacity();
         views.clearRetainingCapacity();
-        const end = @min(self.source.doc_ids.items.len, self.doc + count);
+        const end = @min(self.source.docIds().len, self.doc + count);
         if (self.doc == end) return false;
-        try out.doc_ids.appendSlice(self.alloc, self.source.doc_ids.items[self.doc..end]);
-        try out.metas.appendSlice(self.alloc, self.source.metas.items[self.doc..end]);
-        for (self.source.metas.items[self.doc..end]) |meta| {
-            const positions = self.source.all_positions.items[self.position..][0..meta.position_count];
+        try out.storage.many.doc_ids.appendSlice(self.alloc, self.source.docIds()[self.doc..end]);
+        try out.storage.many.metas.appendSlice(self.alloc, self.source.postingMetas()[self.doc..end]);
+        for (self.source.postingMetas()[self.doc..end]) |meta| {
+            const positions = self.source.positionData()[self.position..][0..meta.position_count];
             try views.append(self.alloc, .{ .unpacked = positions, .count = positions.len, .bits = positionBits(positions) });
             self.position += positions.len;
         }
@@ -6953,16 +7014,16 @@ const AccumulatorStream = struct {
         return true;
     }
     fn block(self: *@This(), out: *PostingAccumulator, count: u32) !bool {
-        if (self.doc == self.source.doc_ids.items.len) return false;
-        out.doc_ids.clearRetainingCapacity();
-        out.metas.clearRetainingCapacity();
-        out.all_positions.clearRetainingCapacity();
-        const end = @min(self.source.doc_ids.items.len, self.doc + count);
-        try out.doc_ids.appendSlice(self.alloc, self.source.doc_ids.items[self.doc..end]);
-        try out.metas.appendSlice(self.alloc, self.source.metas.items[self.doc..end]);
+        if (self.doc == self.source.docIds().len) return false;
+        out.storage.many.doc_ids.clearRetainingCapacity();
+        out.storage.many.metas.clearRetainingCapacity();
+        out.storage.many.all_positions.clearRetainingCapacity();
+        const end = @min(self.source.docIds().len, self.doc + count);
+        try out.storage.many.doc_ids.appendSlice(self.alloc, self.source.docIds()[self.doc..end]);
+        try out.storage.many.metas.appendSlice(self.alloc, self.source.postingMetas()[self.doc..end]);
         var positions: usize = 0;
-        for (self.source.metas.items[self.doc..end]) |meta| positions += meta.position_count;
-        try out.all_positions.appendSlice(self.alloc, self.source.all_positions.items[self.position..][0..positions]);
+        for (self.source.postingMetas()[self.doc..end]) |meta| positions += meta.position_count;
+        try out.storage.many.all_positions.appendSlice(self.alloc, self.source.positionData()[self.position..][0..positions]);
         self.doc = end;
         self.position += positions;
         return true;
@@ -7013,9 +7074,9 @@ fn appendPostingStreamToSinkWithWorkspace(
     var impact_min: u16 = std.math.maxInt(u16);
     if (config.chunk_size == 0) return error.InvalidData;
     while (if (comptime packed_stream) try stream.packedBlock(acc, position_views, config.chunk_size) else try stream.block(acc, config.chunk_size)) {
-        if (previous_doc) |last| if (last >= acc.doc_ids.items[0]) return error.InvalidData;
-        previous_doc = acc.doc_ids.items[acc.doc_ids.items.len - 1];
-        for (acc.doc_ids.items, acc.metas.items) |id, meta| {
+        if (previous_doc) |last| if (last >= acc.storage.many.doc_ids.items[0]) return error.InvalidData;
+        previous_doc = acc.storage.many.doc_ids.items[acc.storage.many.doc_ids.items.len - 1];
+        for (acc.storage.many.doc_ids.items, acc.storage.many.metas.items) |id, meta| {
             try updateMergedNorm(norms, id, meta.norm);
             total_field_len.* = try std.math.add(u64, total_field_len.*, meta.freq);
             const range = id / impact_range_doc_count;
@@ -7031,27 +7092,27 @@ fn appendPostingStreamToSinkWithWorkspace(
             impact_max = @max(impact_max, freq);
             impact_min = @min(impact_min, norm);
         }
-        doc_freq = try std.math.add(u32, doc_freq, @intCast(acc.doc_ids.items.len));
+        doc_freq = try std.math.add(u32, doc_freq, @intCast(acc.storage.many.doc_ids.items.len));
         block_scratch.reset();
         var small_position_block = false;
         if (packed_stream and has_positions) {
             const dense_ready = if (comptime @hasDecl(@TypeOf(stream.*), "densePositionsReady")) stream.densePositionsReady() else false;
-            var count: u64 = acc.all_positions.items.len;
+            var count: u64 = acc.storage.many.all_positions.items.len;
             if (!dense_ready) {
                 count = 0;
                 for (position_views.items) |view| count += view.count;
             }
             small_position_block = count <= 32 * 1024;
             if (small_position_block and !dense_ready) {
-                if (acc.all_positions.items.len == 0) {
-                    try acc.all_positions.ensureTotalCapacityPrecise(alloc, @intCast(count));
+                if (acc.storage.many.all_positions.items.len == 0) {
+                    try acc.storage.many.all_positions.ensureTotalCapacityPrecise(alloc, @intCast(count));
                     for (position_views.items) |view| {
-                        const begin = acc.all_positions.items.len;
-                        acc.all_positions.items.len += view.count;
-                        try view.decodeInto(alloc, acc.all_positions.items[begin..], position_bytes);
+                        const begin = acc.storage.many.all_positions.items.len;
+                        acc.storage.many.all_positions.items.len += view.count;
+                        try view.decodeInto(alloc, acc.storage.many.all_positions.items[begin..], position_bytes);
                     }
                 } else {
-                    // A crossover prefix borrows acc.all_positions. Decode
+                    // A crossover prefix borrows acc.storage.many.all_positions. Decode
                     // into bounded storage before replacing that array.
                     crossover_positions.clearRetainingCapacity();
                     try crossover_positions.ensureTotalCapacityPrecise(alloc, @intCast(count));
@@ -7060,7 +7121,7 @@ fn appendPostingStreamToSinkWithWorkspace(
                         crossover_positions.items.len += view.count;
                         try view.decodeInto(alloc, crossover_positions.items[begin..], position_bytes);
                     }
-                    std.mem.swap(std.ArrayListUnmanaged(u32), &acc.all_positions, crossover_positions);
+                    std.mem.swap(std.ArrayListUnmanaged(u32), &acc.storage.many.all_positions, crossover_positions);
                 }
             } else if (!small_position_block) {
                 for (position_views.items) |*view| if (view.encoded_width == null) {
@@ -7071,7 +7132,7 @@ fn appendPostingStreamToSinkWithWorkspace(
         var position_offset: usize = 0;
         // Size all position frames, including empty-location groups. If the
         // entire term has no positions, the positions stream is omitted.
-        const encoded = try acc.appendEncodedChunk(alloc, block_scratch, config, 0, acc.doc_ids.items.len, 0, &position_offset, has_positions and (!packed_stream or small_position_block));
+        const encoded = try acc.appendEncodedChunk(alloc, block_scratch, config, 0, acc.storage.many.doc_ids.items.len, 0, &position_offset, has_positions and (!packed_stream or small_position_block));
         var record: [streamed_record_size]u8 = undefined;
         std.mem.writeInt(u32, record[0..4], encoded.metadata.max_doc, .little);
         std.mem.writeInt(u32, record[4..8], encoded.metadata.doc_count, .little);
@@ -7124,12 +7185,12 @@ fn appendMergedTermToSink(
     config: IndexConfig,
     merged_doc_count: u32,
 ) !u64 {
-    if (acc.doc_ids.items.len == 1 and
-        acc.metas.items[0].freq == 1 and
-        acc.metas.items[0].position_count == 0 and
-        acc.doc_ids.items[0] <= mask_31_bits)
+    if (acc.docIds().len == 1 and
+        acc.postingMetas()[0].freq == 1 and
+        acc.postingMetas()[0].position_count == 0 and
+        acc.docIds()[0] <= mask_31_bits)
     {
-        const doc_num: u64 = acc.doc_ids.items[0];
+        const doc_num: u64 = acc.docIds()[0];
         return fstValEncode1Hit(doc_num, 0);
     }
 
@@ -10389,11 +10450,11 @@ test "packed spill preserves legacy and current positional sources with bounded 
         var docs: u32 = 0;
         while (try stream.block(&acc, 7)) {
             var offset: usize = 0;
-            for (acc.doc_ids.items, acc.metas.items) |doc, meta| {
+            for (acc.storage.many.doc_ids.items, acc.storage.many.metas.items) |doc, meta| {
                 try std.testing.expectEqual(docs, doc);
                 docs += 1;
                 try std.testing.expectEqual(@as(u32, 256), meta.position_count);
-                try std.testing.expectEqualSlices(u32, &positions, acc.all_positions.items[offset..][0..256]);
+                try std.testing.expectEqualSlices(u32, &positions, acc.storage.many.all_positions.items[offset..][0..256]);
                 offset += 256;
             }
         }
@@ -10686,11 +10747,11 @@ test "v23 positional merges and historical spills consume immutable packed recor
         var doc: u32 = 0;
         while (try stream.block(&acc, 8)) {
             var offset: usize = 0;
-            for (acc.doc_ids.items, acc.metas.items) |id, meta| {
+            for (acc.storage.many.doc_ids.items, acc.storage.many.metas.items) |id, meta| {
                 try std.testing.expectEqual(doc, id);
                 doc += 1;
                 try std.testing.expectEqual(@as(u32, positions_per_doc), meta.position_count);
-                try std.testing.expectEqualSlices(u32, &positions, acc.all_positions.items[offset..][0..positions_per_doc]);
+                try std.testing.expectEqualSlices(u32, &positions, acc.storage.many.all_positions.items[offset..][0..positions_per_doc]);
                 offset += positions_per_doc;
             }
         }
@@ -10931,11 +10992,11 @@ test "spill preparation reuses bounded iterator scratch across distinct terms" {
                 var doc: u32 = 0;
                 while (try stream.block(&acc, 8)) {
                     var offset: usize = 0;
-                    for (acc.doc_ids.items, acc.metas.items) |id, meta| {
+                    for (acc.storage.many.doc_ids.items, acc.storage.many.metas.items) |id, meta| {
                         try std.testing.expectEqual(doc, id);
                         doc += 1;
                         try std.testing.expectEqual(expected.len, meta.position_count);
-                        try std.testing.expectEqualSlices(u32, expected, acc.all_positions.items[offset..][0..expected.len]);
+                        try std.testing.expectEqualSlices(u32, expected, acc.storage.many.all_positions.items[offset..][0..expected.len]);
                         offset += expected.len;
                     }
                 }
@@ -11056,11 +11117,11 @@ test "merge filters deleted positions before decoding across current and legacy 
         var total: u64 = 0;
         try std.testing.expect(try appendLookupResultToAccumulatorLimitedWithWorkspace(a, &acc, result, @as([]const u32, &ids), &norms, &total, 256 * 1024, null));
         try std.testing.expectEqual(@as(u64, 24), total);
-        try std.testing.expectEqual(@as(usize, 8), acc.doc_ids.items.len);
-        for (acc.doc_ids.items, acc.metas.items, 0..) |doc, meta, index| {
+        try std.testing.expectEqual(@as(usize, 8), acc.storage.many.doc_ids.items.len);
+        for (acc.storage.many.doc_ids.items, acc.storage.many.metas.items, 0..) |doc, meta, index| {
             try std.testing.expectEqual(@as(u32, @intCast(index)), doc);
             try std.testing.expectEqual(@as(u32, 3), meta.position_count);
-            try std.testing.expectEqualSlices(u32, &short_positions, acc.all_positions.items[index * 3 ..][0..3]);
+            try std.testing.expectEqualSlices(u32, &short_positions, acc.storage.many.all_positions.items[index * 3 ..][0..3]);
         }
         const entries = [_]?TermIterator.Entry{.{ .term = "deleted", .result = result }};
         const maps = [_][]const u32{&ids};
@@ -11071,7 +11132,7 @@ test "merge filters deleted positions before decoding across current and legacy 
         var views = std.ArrayListUnmanaged(PackedPositionView).empty;
         defer views.deinit(a);
         try std.testing.expect(try stream.packedBlock(&acc, &views, 128));
-        try std.testing.expectEqual(@as(usize, 8), acc.doc_ids.items.len);
+        try std.testing.expectEqual(@as(usize, 8), acc.storage.many.doc_ids.items.len);
         try std.testing.expect(stream.densePositionsReady());
         try std.testing.expect(!try stream.packedBlock(&acc, &views, 128));
 
@@ -11085,10 +11146,10 @@ test "merge filters deleted positions before decoding across current and legacy 
         var spill = try ExternalPostingStream.initWithWorkspace(a, &entries, "deleted", &spill_maps, &workspace);
         defer spill.deinit();
         try std.testing.expect(try spill.block(&acc, 128));
-        try std.testing.expectEqual(@as(usize, 8), acc.doc_ids.items.len);
-        for (acc.doc_ids.items, 0..) |doc, index| {
+        try std.testing.expectEqual(@as(usize, 8), acc.storage.many.doc_ids.items.len);
+        for (acc.storage.many.doc_ids.items, 0..) |doc, index| {
             try std.testing.expectEqual(@as(u32, @intCast(index)), doc);
-            try std.testing.expectEqualSlices(u32, &short_positions, acc.all_positions.items[index * 3 ..][0..3]);
+            try std.testing.expectEqualSlices(u32, &short_positions, acc.storage.many.all_positions.items[index * 3 ..][0..3]);
         }
         try std.testing.expect(!try spill.block(&acc, 128));
     }
@@ -11490,4 +11551,91 @@ test "short term block ceilings preserve ordering and automaton pruning progress
     defer rejected.deinit();
     try std.testing.expect(try rejected.next() == null);
     try std.testing.expectEqual(@as(usize, 1), rejected.blocks_pruned);
+}
+
+test "logical value inline postings preserve bytes and promotion ownership" {
+    const a = std.testing.allocator;
+    var empty: [0]u8 = .{};
+    var no_alloc = std.heap.FixedBufferAllocator.init(&empty);
+    for ([_]bool{ false, true }) |with_position| {
+        var compact: PostingAccumulator = .{};
+        defer compact.deinit(a);
+        var ordinary: PostingAccumulator = .{};
+        defer ordinary.deinit(a);
+        const positions: []const u32 = if (with_position) &.{7} else &.{};
+        try compact.addInline(no_alloc.allocator(), 3, 1, 9, positions);
+        try ordinary.add(a, 3, 1, 9, positions);
+        try std.testing.expect(compact.storage == .single);
+        var before: std.ArrayListUnmanaged(u8) = .empty;
+        defer before.deinit(a);
+        var after: std.ArrayListUnmanaged(u8) = .empty;
+        defer after.deinit(a);
+        var scratch: PostingSerializeScratch = .{};
+        defer scratch.deinit(a);
+        try compact.serializeV9(a, &before, &scratch, productionIndexConfig());
+        try ordinary.serializeV9(a, &after, &scratch, productionIndexConfig());
+        try std.testing.expectEqualSlices(u8, before.items, after.items);
+        try compact.addInline(a, 8, 2, 12, &.{ 1, 5 });
+        try ordinary.add(a, 8, 2, 12, &.{ 1, 5 });
+        try std.testing.expect(compact.storage == .many);
+        before.clearRetainingCapacity();
+        after.clearRetainingCapacity();
+        try compact.serializeV9(a, &before, &scratch, productionIndexConfig());
+        try ordinary.serializeV9(a, &after, &scratch, productionIndexConfig());
+        try std.testing.expectEqualSlices(u8, before.items, after.items);
+    }
+    const Scenario = struct {
+        fn run(alloc: Allocator) !void {
+            var accumulator: PostingAccumulator = .{};
+            defer accumulator.deinit(alloc);
+            try accumulator.addInline(alloc, 0, 1, 1, &.{3});
+            try accumulator.addInline(alloc, 1, 2, 2, &.{ 5, 9 });
+            try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, accumulator.docIds());
+            try std.testing.expectEqualSlices(u32, &.{ 3, 5, 9 }, accumulator.positionData());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Scenario.run, .{});
+}
+
+test "logical value inline postings benchmark" {
+    if (@import("antfly_platform").env.getenv("ANTFLY_BENCH_INLINE_POSTINGS") == null) return error.SkipZigTest;
+    const Budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+    const a = std.testing.allocator;
+    const count = 10000;
+    for ([_]usize{ 0, 1, 4 }) |locations| {
+        for ([_]usize{ 1, 4 }) |occurrences| {
+            var expected: ?[32]u8 = null;
+            for (0..9) |trial| for (0..2) |order| {
+                const compact = (trial + order) % 2 == 0;
+                var budget: Budget = .{ .backing = a };
+                const alloc = budget.allocator();
+                const started = platform_time.monotonicNs();
+                const accumulators = try alloc.alloc(PostingAccumulator, count);
+                @memset(accumulators, .{});
+                var output: std.ArrayListUnmanaged(u8) = .empty;
+                var scratch: PostingSerializeScratch = .{};
+                var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                for (accumulators, 0..) |*accumulator, i| {
+                    for (0..occurrences) |j| {
+                        const positions: []const u32 = (&[_]u32{ 1, 3, 5, 7 })[0..locations];
+                        if (compact) try accumulator.addInline(alloc, @intCast(i + j * count), @intCast(@max(1, locations)), 12, positions) else try accumulator.add(alloc, @intCast(i + j * count), @intCast(@max(1, locations)), 12, positions);
+                    }
+                }
+                for (accumulators) |*accumulator| {
+                    output.clearRetainingCapacity();
+                    try accumulator.serializeV9(alloc, &output, &scratch, productionIndexConfig());
+                    hash.update(output.items);
+                    accumulator.deinit(alloc);
+                }
+                scratch.deinit(alloc);
+                output.deinit(alloc);
+                alloc.free(accumulators);
+                const elapsed = platform_time.monotonicNs() - started;
+                const digest = hash.finalResult();
+                if (expected) |previous| try std.testing.expectEqualSlices(u8, &previous, &digest) else expected = digest;
+                try std.testing.expectEqual(@as(usize, 0), budget.live);
+                std.debug.print("INLINE_POSTINGS_BENCH {{\"locations\":{d},\"occurrences\":{d},\"trial\":{d},\"compact\":{},\"terms\":{d},\"ns\":{d},\"peak_bytes\":{d},\"allocations\":{d}}}\n", .{ locations, occurrences, trial, compact, count, elapsed, budget.peak, budget.alloc_calls });
+            };
+        }
+    }
 }

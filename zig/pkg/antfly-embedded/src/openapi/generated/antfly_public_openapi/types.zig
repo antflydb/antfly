@@ -2954,19 +2954,34 @@ pub const ComposedTableSource = struct {
 pub const ConnectedModel = struct {
     /// Model identifier as reported by the provider.
     name: []const u8,
+    /// Canonical public gateway identity when available.
+    id: ?[]const u8 = null,
+    /// Availability observation independent of capability support.
+    availability: ?[]const u8 = null,
+    /// Whether metadata is configured, live, or cached.
+    freshness: ?[]const u8 = null,
     /// Human-readable model name when the provider reports one.
     display_name: ?[]const u8 = null,
     /// Embedding output dimension when known.
     dimensions: ?i64 = null,
     /// True when this model is referenced by a configured embedder, generator, reranker, or chunker.
     configured: ?bool = null,
+    /// Inference capabilities advertised by the provider for this model and task.
+    capabilities: ?[]const []const u8 = null,
+    /// Input modalities accepted by the provider's resolved executor.
+    inputs: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
+        .{ "id", "id", true },
+        .{ "availability", "availability", true },
+        .{ "freshness", "freshness", true },
         .{ "display_name", "display_name", true },
         .{ "dimensions", "dimensions", true },
         .{ "configured", "configured", true },
+        .{ "capabilities", "capabilities", true },
+        .{ "inputs", "inputs", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2981,6 +2996,18 @@ pub const ConnectedModel = struct {
         try jw.beginObject();
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.availability) |value| {
+            try jw.objectField("availability");
+            try jw.write(value);
+        }
+        if (self.freshness) |value| {
+            try jw.objectField("freshness");
+            try jw.write(value);
+        }
         if (self.display_name) |value| {
             try jw.objectField("display_name");
             try jw.write(value);
@@ -2991,6 +3018,14 @@ pub const ConnectedModel = struct {
         }
         if (self.configured) |value| {
             try jw.objectField("configured");
+            try jw.write(value);
+        }
+        if (self.capabilities) |value| {
+            try jw.objectField("capabilities");
+            try jw.write(value);
+        }
+        if (self.inputs) |value| {
+            try jw.objectField("inputs");
             try jw.write(value);
         }
         try jw.endObject();
@@ -3008,6 +3043,9 @@ pub const ConnectedModelType = enum {
     reader,
     transcriber,
     extractor,
+    decider,
+    synthesizer,
+    predictor,
     other,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -3021,6 +3059,9 @@ pub const ConnectedModelType = enum {
             .reader => "reader",
             .transcriber => "transcriber",
             .extractor => "extractor",
+            .decider => "decider",
+            .synthesizer => "synthesizer",
+            .predictor => "predictor",
             .other => "other",
         };
         try jw.write(s);
@@ -3041,6 +3082,9 @@ pub const ConnectedModelType = enum {
             .{ "reader", .reader },
             .{ "transcriber", .transcriber },
             .{ "extractor", .extractor },
+            .{ "decider", .decider },
+            .{ "synthesizer", .synthesizer },
+            .{ "predictor", .predictor },
             .{ "other", .other },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -4523,7 +4567,7 @@ pub const FieldCapability = struct {
     field: ?[]const u8 = null,
     /// Field origin. Unassociated entries do not assert a document source path.
     kind: []const u8,
-    /// Supported original-value operations on field. Availability does not attest index coverage or authorize scans. Case sensitivity, execution policy and work budgets apply. Reserved/computed/template/unassociated entries do not advertise original-document value operations.
+    /// Supported logical query operations on field. Equals, contains and matches verify original values; autocomplete performs analyzed bool-prefix matching. Availability does not attest index coverage or authorize scans. Case sensitivity, execution policy and work budgets apply. Reserved/computed/template/unassociated entries do not advertise original-document value operations.
     value_operations: []const []const u8,
     /// Whether field resolves to one compatible sortable representation. Cold declared fields validate coverage on first exact-sort use; callers do not route through representation names.
     sortable: bool,
@@ -4835,10 +4879,9 @@ pub const ForeignSource = struct {
 
 /// A stateful global query. Specify a table target or a composed source.
 pub const GlobalStatefulQueryRequest = struct {
-    value_search_execution: ?ValueSearchExecution = null,
+    execution: ?QueryExecution = null,
     read_requirements: ?ReadRequirements = null,
-    lake_read: ?LakeReadRequirement = null,
-    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. Also supported when resuming hierarchy.children; its revision-bound ascending position cursor remains required.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -4923,9 +4966,8 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "value_search_execution", "value_search_execution", true },
+        .{ "execution", "execution", true },
         .{ "read_requirements", "read_requirements", true },
-        .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
@@ -4982,16 +5024,12 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.value_search_execution) |value| {
-            try jw.objectField("value_search_execution");
+        if (self.execution) |value| {
+            try jw.objectField("execution");
             try jw.write(value);
         }
         if (self.read_requirements) |value| {
             try jw.objectField("read_requirements");
-            try jw.write(value);
-        }
-        if (self.lake_read) |value| {
-            try jw.objectField("lake_read");
             try jw.write(value);
         }
         if (self.remote_snapshot) |value| {
@@ -6111,7 +6149,7 @@ pub const InferenceCapacityError = struct {
 
 pub const InferenceConnection = struct {
     provider: InferenceProviderType,
-    /// Resolved endpoint URL when applicable.
+    /// Transport endpoint. Omitted from public inference discovery to keep server-owned URLs private.
     url: ?[]const u8 = null,
     /// Cloud region (Bedrock).
     region: ?[]const u8 = null,
@@ -6706,52 +6744,6 @@ pub const LakeCatalogResponse = struct {
         }
         if (self.searchable) |value| {
             try jw.objectField("searchable");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const LakeReadReceipt = struct {
-    table_id: u64,
-    object_generation: u64,
-    wal_lsn: u64,
-};
-
-pub const LakeReadRequirement = struct {
-    /// Accepted requires current WAL visibility; vector/hybrid reads wait for matching publication. Published explicitly permits the retained archive generation. Applies to native writable Iceberg reads.
-    visibility: ?[]const u8 = null,
-    through: ?LakeReadReceipt = null,
-    /// Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
-    wait_ms: ?u32 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "visibility", "visibility", true },
-        .{ "through", "through", true },
-        .{ "wait_ms", "wait_ms", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.visibility) |value| {
-            try jw.objectField("visibility");
-            try jw.write(value);
-        }
-        if (self.through) |value| {
-            try jw.objectField("through");
-            try jw.write(value);
-        }
-        if (self.wait_ms) |value| {
-            try jw.objectField("wait_ms");
             try jw.write(value);
         }
         try jw.endObject();
@@ -8219,6 +8211,33 @@ pub const QueryEvaluation = struct {
     }
 };
 
+/// Execution controls; these affect admitted work, never predicate meaning or read freshness.
+pub const QueryExecution = struct {
+    value_verification: ?ValueVerification = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "value_verification", "value_verification", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.value_verification) |value| {
+            try jw.objectField("value_verification");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Exactly one of literal, field, ref, or call. A call requires input and decider. ai_decide requires questions; ai_probability requires statement; ai_choice and ai_score require instructions and criteria. Named refs may select nested JSON members with dotted paths. Binding cycles are invalid.
 pub const QueryExpression = std.json.Value;
 
@@ -8620,7 +8639,7 @@ pub const QueryHitsTotal = struct {
 /// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
 pub const QueryProfile = struct {
     /// Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard.
-    value_search: ?std.json.Value = null,
+    value_verification: ?std.json.Value = null,
     /// Shard-level execution statistics.
     shards: ?ShardsProfile = null,
     /// Join execution statistics (present when query used a join).
@@ -8636,7 +8655,7 @@ pub const QueryProfile = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "value_search", "value_search", true },
+        .{ "value_verification", "value_verification", true },
         .{ "shards", "shards", true },
         .{ "join", "join", true },
         .{ "reranker", "reranker", true },
@@ -8655,8 +8674,8 @@ pub const QueryProfile = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.value_search) |value| {
-            try jw.objectField("value_search");
+        if (self.value_verification) |value| {
+            try jw.objectField("value_verification");
             try jw.write(value);
         }
         if (self.shards) |value| {
@@ -8688,10 +8707,9 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
-    value_search_execution: ?ValueSearchExecution = null,
+    execution: ?QueryExecution = null,
     read_requirements: ?ReadRequirements = null,
-    lake_read: ?LakeReadRequirement = null,
-    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. Also supported when resuming hierarchy.children; its revision-bound ascending position cursor remains required.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -8767,9 +8785,8 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "value_search_execution", "value_search_execution", true },
+        .{ "execution", "execution", true },
         .{ "read_requirements", "read_requirements", true },
-        .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
@@ -8821,16 +8838,12 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.value_search_execution) |value| {
-            try jw.objectField("value_search_execution");
+        if (self.execution) |value| {
+            try jw.objectField("execution");
             try jw.write(value);
         }
         if (self.read_requirements) |value| {
             try jw.objectField("read_requirements");
-            try jw.write(value);
-        }
-        if (self.lake_read) |value| {
-            try jw.objectField("lake_read");
             try jw.write(value);
         }
         if (self.remote_snapshot) |value| {
@@ -9534,7 +9547,7 @@ pub const ReadReceipt = struct {
     wal_lsn: u64,
 };
 
-/// Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction snapshot never advances to satisfy a newer receipt.
+/// Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. A pinned transaction snapshot never advances to satisfy a newer receipt.
 pub const ReadRequirements = struct {
     /// Accepted includes durable WAL writes; committed reads an Iceberg commit; published reads the search index generation. These are distinct visibility stages.
     visibility: ?[]const u8 = null,
@@ -13717,8 +13730,6 @@ pub const SQLPreparedResponse = struct {
 /// Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...), never interpolated into SQL text. To preserve integer precision in JavaScript clients, supply integers outside the exact JSON number range as decimal strings; binding coerces parameters to the expected type. The result limit is an admission bound, not an implicit SQL LIMIT: statements whose results exceed it fail instead of silently truncating. Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated memory, and encoded results to a 16 MiB allocation budget.
 pub const SQLRequest = struct {
     read_requirements: ?ReadRequirements = null,
-    /// Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable write transactions over external sources are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
-    lake_visibility: ?[]const u8 = null,
     /// A single SQL statement.
     statement: []const u8,
     /// Positional JSON parameter values, including null.
@@ -13737,7 +13748,6 @@ pub const SQLRequest = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "read_requirements", "read_requirements", true },
-        .{ "lake_visibility", "lake_visibility", true },
         .{ "statement", "statement", false },
         .{ "parameters", "parameters", true },
         .{ "database", "database", true },
@@ -13759,10 +13769,6 @@ pub const SQLRequest = struct {
         try jw.beginObject();
         if (self.read_requirements) |value| {
             try jw.objectField("read_requirements");
-            try jw.write(value);
-        }
-        if (self.lake_visibility) |value| {
-            try jw.objectField("lake_visibility");
             try jw.write(value);
         }
         try jw.objectField("statement");
@@ -14778,10 +14784,9 @@ pub const SqlSettingValue = std.json.Value;
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
-    value_search_execution: ?ValueSearchExecution = null,
+    execution: ?QueryExecution = null,
     read_requirements: ?ReadRequirements = null,
-    lake_read: ?LakeReadRequirement = null,
-    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. Also supported when resuming hierarchy.children; its revision-bound ascending position cursor remains required.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -14861,9 +14866,8 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "value_search_execution", "value_search_execution", true },
+        .{ "execution", "execution", true },
         .{ "read_requirements", "read_requirements", true },
-        .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
@@ -14917,16 +14921,12 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.value_search_execution) |value| {
-            try jw.objectField("value_search_execution");
+        if (self.execution) |value| {
+            try jw.objectField("execution");
             try jw.write(value);
         }
         if (self.read_requirements) |value| {
             try jw.objectField("read_requirements");
-            try jw.write(value);
-        }
-        if (self.lake_read) |value| {
-            try jw.objectField("lake_read");
             try jw.write(value);
         }
         if (self.remote_snapshot) |value| {
@@ -17466,7 +17466,7 @@ pub const User = struct {
 };
 
 /// Execution policy for logical string-value operations. Limits apply to verification work per shard request, including repeated leaf evaluations. Exhaustion fails explicitly; it never returns a successful partial result.
-pub const ValueSearchExecution = struct {
+pub const ValueVerification = struct {
     /// Permit logical value verification without an indexed candidate constraint.
     allow_scan: ?bool = null,
     max_documents: ?i64 = null,

@@ -23763,3 +23763,41 @@ Error ABI (43), released status ABI (1), and failure identity (7) pass. All 5,50
 native/schema hashes match `dense-execution-handoff-final` and its verified
 snapshots. Full GNU/Linux qualification remains waived; Linux requires pinned
 Nix/glibc Zig. The full design remains unfinished.
+
+### Integrate latest main with retained execution
+
+The same workload-scheduling branch incorporates `origin/main` at
+`871c143788` (unified Apache CLI/library and hosted-operation migration).
+Conflict resolution retains main's named native-library packaging, incremental
+uploads, visibility-completion ownership and logical-source certificates.
+Group-source cursor state follows main's persistent state object while keeping
+controlled shutdown and guard retirement. Portable publication begins its
+source-certificate replacement fence when claiming exclusion, and balances it
+on either cancellation or publication.
+
+Incremental HTTP reads now carry synchronous lifetime controls through the
+runtime body-source ABI and worker callbacks. Child upload waits poll their
+original controls; terminal failure cancels and physically joins the parent's
+source read before its stack controls retire. Concurrent upload I/O does not
+borrow output CPU callbacks. Duplex upload CPU lending remains unqualified.
+The merged fences are native ABI 90, storage-owner ABI 148, runnable ABI 20,
+API-kernel ABI 60, inference-host ABI 44, inference-connection ABI 6 and worker
+wire version 15 (frame protocol AFW7).
+
+SDK cancellation tests account for local admission and consume the actual
+wrapped response stream. TypeScript SDK typechecking and all 27 test files pass
+(555 tests, one existing skip). Apache-boundary tests (36) and embedded source
+packaging tests (7) pass. Native merged-source evidence follows below.
+
+Merged Darwin Debug validation passes all 112 build steps in
+`dense-execution-handoff-main-ready`, including both inference owner suites,
+worker RPC, HTTP lifetime/control, shared SQL, dense finish, close, shutdown and
+execution-service checks. Error ABI (45), released status ABI (1), and failure
+identity (8) pass. All 5,535 native/schema input hashes match that receipt.
+The focused duplex/streaming HTTP root executes three cases with zero skips,
+failures or leaks (`main-merge-duplex-selected`). A rejected-offer fixture now
+withdraws only its injected capacity instead of resetting a counter while an
+accepted request can still retire; the full 46-case worker RPC suite and 30
+focused repetitions pass. Qualification receipts retain the intermediate
+failures and final evidence. Full GNU/Linux qualification remains waived, and
+the full scheduling design remains unfinished.

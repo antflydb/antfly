@@ -39,17 +39,13 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "antfly-embedded", "antfly-inference" }) |name| {
         b.modules.put(b.allocator, name, composition.module(name)) catch @panic("OOM");
     }
-    for ([_][]const u8{ "lite", "capi", "capi-smoke", "embedded-package-test", "embedded-lake-test", "wasm", "wasm-test", "inference-wasm", "pkgconfig" }) |name| {
+    for ([_][]const u8{ "libantfly", "capi", "capi-smoke", "embedded-package-test", "embedded-lake-test", "wasm", "wasm-test", "inference-wasm", "pkgconfig" }) |name| {
         const step = composition.builder.top_level_steps.get(name) orelse @panic("missing composition step");
         b.step(name, step.description).dependOn(&step.step);
     }
-    // Mach-O uses a platform-owned link/install step rather than a Compile
-    // artifact. Preserve the existing artifact surface on other platforms.
-    if (target.result.ofmt != .macho) b.installArtifact(composition.artifact("antfly"));
-    for ([_][]const u8{ "antfly-lite", "antfly_wasm" }) |name| {
-        b.installArtifact(composition.artifact(name));
-    }
+    b.addNamedLazyPath("libantfly", composition.namedLazyPath("libantfly"));
+    b.installArtifact(composition.artifact("antfly_wasm"));
     // Importing a dependency never schedules its default step. Standalone
     // builds default to the native products; browser builds are explicit.
-    b.default_step = &b.top_level_steps.get("lite").?.step;
+    b.default_step = &b.top_level_steps.get("libantfly").?.step;
 }

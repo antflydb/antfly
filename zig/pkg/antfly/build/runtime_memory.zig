@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 
@@ -198,11 +198,9 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // scheduler can overlap whichever roots fit without forcing
         // callers to serialize the whole build.
         .inference => @as(usize, if (target.os.tag == .macos) 20 else 16) * 1024 * 1024 * 1024,
-        // Pinned Nix glibc Zig 0.17 native ARM64 GNU ReleaseSafe CLI peaked
-        // at 3,645,767,680 bytes. Five GiB provides >25% measured headroom.
-        // macOS retains its provisional four GiB claim; other Linux profiles
-        // retain their existing three GiB claim.
-        .cli => @as(usize, if (target.os.tag == .macos) 4 else if (native_gnu_arm64_safe) 5 else 3) * 1024 * 1024 * 1024,
+        // Native GNU ARM64 ReleaseSafe needs the measured five GiB claim.
+        // Other CLI targets retain main's four GiB headroom.
+        .cli => @as(usize, if (native_gnu_arm64_safe) 5 else 4) * 1024 * 1024 * 1024,
     };
 }
 

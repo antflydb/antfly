@@ -10380,50 +10380,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             mention_edge_type: []const u8,
             cfg: *const index_manager_mod.ResolverConfig,
         ) ![]types.GraphEdgeWrite {
-            var parsed_resolution = resolver_lib.parseResolution(alloc, resolution_raw) catch return try alloc.alloc(types.GraphEdgeWrite, 0);
-            defer parsed_resolution.deinit();
-            var parsed_extraction: ?resolver_lib.ParsedEntities = if (extraction_raw) |raw|
-                resolver_lib.parseExtractionEntities(alloc, raw) catch null
-            else
-                null;
-            defer if (parsed_extraction) |*parsed| parsed.deinit();
-
-            var aggregates = std.ArrayListUnmanaged(MentionEdgeAggregate).empty;
-            defer {
-                for (aggregates.items) |*aggregate| aggregate.deinit(alloc);
-                aggregates.deinit(alloc);
-            }
-            for (parsed_resolution.entities) |entity| {
-                if (!resolutionDecisionCreatesCanonicalEdge(entity.decision)) continue;
-                if (entity.doc_ref.key.len == 0) continue;
-                const mention_confidence = if (parsed_extraction) |parsed|
-                    extractionConfidenceForLocalId(parsed.entities, entity.local_id) orelse entity.confidence
-                else
-                    entity.confidence;
-                const mention_artifact_key = try resolutionMentionArtifactKeyAlloc(alloc, doc_key, cfg.source_artifact, cfg.resolution_artifact, entity.local_id);
-                var mention_key_owned = true;
-                errdefer if (mention_key_owned) alloc.free(mention_artifact_key);
-                const aggregate = try findOrAppendMentionEdgeAggregate(alloc, &aggregates, entity.doc_ref.key, entity.doc_ref.table);
-                try aggregate.appendMentionArtifactKey(alloc, mention_artifact_key);
-                mention_key_owned = false;
-                aggregate.mention_confidence = @max(aggregate.mention_confidence, mention_confidence);
-            }
-
-            var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
-            errdefer freeGraphWrites(alloc, writes.items);
-            for (aggregates.items) |aggregate| {
-                const metadata = try mentionEdgeMetadataJsonAlloc(alloc, aggregate);
-                errdefer alloc.free(metadata);
-                try writes.append(alloc, .{
-                    .index_name = try alloc.dupe(u8, index_name),
-                    .source = try alloc.dupe(u8, doc_key),
-                    .target = try alloc.dupe(u8, aggregate.target),
-                    .edge_type = try alloc.dupe(u8, mention_edge_type),
-                    .weight = cfg.fusedMentionWeight(aggregate.mention_confidence),
-                    .metadata_json = metadata,
-                });
-            }
-            return try writes.toOwnedSlice(alloc);
+            return @import("graph_mention_projection.zig").writesAlloc(alloc, index_name, doc_key, resolution_raw, extraction_raw, mention_edge_type, cfg, true);
         }
 
         pub fn mentionEvidencePayloadAlloc(

@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Independent Parquet -> public attachment -> HTTP/pgwire -> cold restart.
 
@@ -37,7 +37,11 @@ from conftest import (
 )
 from lake_encoded_fixtures import write_compact_parquet, write_null_compact_parquet
 
-pytestmark = pytest.mark.fresh_antfly_process
+pytestmark = [
+    pytest.mark.fresh_antfly_process,
+    # Directly constructed standalone servers also consume scheduler capacity.
+    pytest.mark.e2e_resource("antfly_process"),
+]
 
 
 def _request_with_idle_ddl_retry(server, method, path, body, *, retry_ddl=False):
@@ -879,7 +883,7 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
         assert response.ok, response.text
         assert response.json()["rows"] == [["3"]]
 
-        def contribution_ids(document):
+        def contribution_bindings(document):
             records = list(document.get("file_contributions", []))
             for page in document.get("contribution_pages", []):
                 candidates = (server.root / "artifacts").rglob(page["checksum"])
@@ -936,30 +940,56 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
 
             if document.get("contribution_index"):
                 contribution_tree(document["contribution_index"])
-            return {item["artifact"]["artifact_id"] for item in records}
+            # Identical payloads intentionally share a content address. Count
+            # recipe/file bindings, then verify each retained binding's artifact.
+            bindings = {
+                (tuple(item["file"]), tuple(item["recipe"]), item["name"]): item[
+                    "artifact"
+                ]["artifact_id"]
+                for item in records
+            }
+            assert len(bindings) == len(records), "Duplicate contribution binding"
+            return bindings
 
-        directory_found = False
-        old_contribution_ids = set()
-        for path in (server.root / "artifacts").rglob("*"):
-            if not path.is_file():
-                continue
-            data = path.read_bytes()
-            marker = data.find(b'"format":"native-lake-index-directory-v')
-            if marker >= 0:
-                document = json.loads(data[marker - 1 :])
-                if len(document["declarations"]) == 320:
-                    ids = contribution_ids(document)
-                    # Retained immutable objects include checkpoint directories
-                    # written before contribution publication completes.
-                    if len(ids) != 320:
+        def await_directory(declarations, minimum_contributions):
+            # Queryable checkpoints can precede the final contribution tree.
+            # Authenticate the immutable publication this test actually needs;
+            # inspect each content-addressed object only once while it arrives.
+            inspected = set()
+            deadline = time.monotonic() + 60
+            while True:
+                for path in (server.root / "artifacts").rglob("*"):
+                    # Only installed, content-addressed payloads are immutable.
+                    # Atomic staging files and upload journals can still change.
+                    if (
+                        path in inspected
+                        or len(path.name) not in (62, 64)
+                        or any(c not in "0123456789abcdef" for c in path.name)
+                        or not path.is_file()
+                    ):
                         continue
-                    directory_found = True
-                    old_contribution_ids = ids
-                    break
-        assert directory_found, (
-            "320 declarations were not published through an immutable directory"
-        )
-        assert len(old_contribution_ids) == 320
+                    try:
+                        data = path.read_bytes()
+                    except FileNotFoundError:
+                        continue  # An obsolete checkpoint was retired mid-scan.
+                    inspected.add(path)
+                    marker = data.find(b'"format":"native-lake-index-directory-v')
+                    if marker < 0:
+                        continue
+                    document = json.loads(data[marker - 1 :])
+                    if len(document["declarations"]) != declarations:
+                        continue
+                    ids = contribution_bindings(document)
+                    if len(ids) >= minimum_contributions:
+                        return ids
+                assert time.monotonic() < deadline, (
+                    f"No immutable directory for {declarations} declarations "
+                    f"and {minimum_contributions} contributions\n" + server.debug_logs()
+                )
+                time.sleep(0.1)
+
+        old_contributions = await_directory(320, 320)
+        assert len(old_contributions) == 320
         pq.write_table(pa.table({"amount": [4, 5]}), tmp_path / "append.parquet")
         appended = (tmp_path / "append.parquet").read_bytes()
         (objects / "part2.parquet").write_bytes(
@@ -1008,24 +1038,10 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
         )
         assert response.ok, response.text
         assert response.json()["rows"] == [["5"]]
-        reused = False
-        for path in (server.root / "artifacts").rglob("*"):
-            if not path.is_file():
-                continue
-            data = path.read_bytes()
-            marker = data.find(b'"format":"native-lake-index-directory-v')
-            if marker >= 0:
-                document = json.loads(data[marker - 1 :])
-                if len(document["declarations"]) == 321:
-                    ids = contribution_ids(document)
-                    # Both source files need every declaration. The immutable
-                    # index may also retain contributions from earlier views.
-                    if len(ids) < 2 * 321:
-                        continue
-                    assert old_contribution_ids <= ids
-                    reused = True
-                    break
-        assert reused, "Append rebuild did not retain unchanged file contributions"
+        ids = await_directory(321, 2 * 321)
+        assert old_contributions.items() <= ids.items(), (
+            "Append rebuild did not retain unchanged file contributions"
+        )
         failed = False
     finally:
         server.stop(test_failed=failed)

@@ -47,17 +47,17 @@ pub const Plan = struct {
     fallback_reason: ?[]const u8,
 };
 pub const Work = struct {
-    documents: std.atomic.Value(u64) = .init(0),
-    bytes: std.atomic.Value(u64) = .init(0),
-    regex_work: std.atomic.Value(u64) = .init(0),
+    documents: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    regex_work: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
-    source_read_ns: std.atomic.Value(u64) = .init(0),
-    source_parse_ns: std.atomic.Value(u64) = .init(0),
-    source_batches: std.atomic.Value(u64) = .init(0),
-    source_scalar_reads: std.atomic.Value(u64) = .init(0),
-    projected_sources: std.atomic.Value(u64) = .init(0),
-    stored_field_sources: std.atomic.Value(u64) = .init(0),
-    batch_refusals: std.atomic.Value(u64) = .init(0),
+    source_read_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    source_parse_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    source_batches: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    source_scalar_reads: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    projected_sources: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    stored_field_sources: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    batch_refusals: @import("antfly_platform").atomic.Value(u64) = .init(0),
     batch_peak_bytes: std.atomic.Value(usize) = .init(0),
     sources: Sources = .{},
     prepared_leaves: std.atomic.Value(u32) = .init(0),
@@ -92,7 +92,7 @@ pub const Work = struct {
         return try std.json.Stringify.valueAlloc(a, .{ .documents = self.documents.load(.monotonic), .bytes = self.bytes.load(.monotonic), .plans = self.plans.items, .verification_metrics_version = @as(u32, 1), .source_read_us = self.source_read_ns.load(.monotonic) / 1000, .source_parse_us = self.source_parse_ns.load(.monotonic) / 1000, .source_batches = self.source_batches.load(.monotonic), .source_scalar_reads = self.source_scalar_reads.load(.monotonic), .projected_sources = self.projected_sources.load(.monotonic), .stored_field_sources = self.stored_field_sources.load(.monotonic), .batch_refusals = self.batch_refusals.load(.monotonic), .batch_peak_bytes = self.batch_peak_bytes.load(.monotonic) }, .{});
     }
 
-    pub fn charge(counter: *std.atomic.Value(u64), amount: u64, maximum: u64) !void {
+    pub fn charge(counter: *@import("antfly_platform").atomic.Value(u64), amount: u64, maximum: u64) !void {
         var current = counter.load(.monotonic);
         while (true) {
             if (amount > maximum -| current) return error.ValueSearchLimitExceeded;

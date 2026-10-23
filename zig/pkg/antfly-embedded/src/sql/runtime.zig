@@ -4260,7 +4260,7 @@ test "SQL decisions execute batches across projection predicate aggregation and 
     const Fake = struct {
         calls: usize = 0,
         max_batch: usize = 0,
-        fn validate(_: *anyopaque, _: []const u8, questions: Json) !void {
+        fn validate(_: *anyopaque, _: []const u8, questions: Json, _: []const u8) !void {
             try d.validateQuestions(questions, d.capabilities(.jev));
         }
         fn evaluate(ptr: *anyopaque, a: std.mem.Allocator, requests: []const d.Request) ![]const Json {
@@ -4611,7 +4611,7 @@ const InsertDecisionFixture = struct {
         return error.UnexpectedScan;
     }
     fn checkpoint(_: *anyopaque) !void {}
-    fn validate(_: *anyopaque, _: []const u8, questions: Json) !void {
+    fn validate(_: *anyopaque, _: []const u8, questions: Json, _: []const u8) !void {
         try @import("../functions/decisions.zig").validateQuestions(questions, @import("../functions/decisions.zig").capabilities(.antfly));
     }
     fn batch(ptr: *anyopaque, a: std.mem.Allocator, requests: []const @import("../functions/decisions.zig").Request) ![]const Json {

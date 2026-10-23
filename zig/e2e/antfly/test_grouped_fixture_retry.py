@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Bounded startup retries preserve grouped replay's visibility assertions."""
 
@@ -81,6 +81,16 @@ def test_restart_admission_and_pending_visibility_require_success(clock):
     assert len(api.calls) == 3
     assert api.calls == [api.calls[0]] * 3
     assert api.calls[0][1]["sync_level"] == "enrichments"
+
+
+def test_startup_retry_preserves_invalid_membership_rejection(clock):
+    failure = http_error(400, "invalid batch request")
+    api = Api([http_error(503, "write unavailable"), failure])
+    with pytest.raises(requests.HTTPError) as rejected:
+        write(api)
+    assert rejected.value is failure
+    assert len(api.calls) == 2
+    assert api.calls[0] == api.calls[1]
 
 
 @pytest.mark.parametrize(

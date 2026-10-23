@@ -92,8 +92,11 @@ def sync_detailed(
 ) -> Response[InferenceDecideResponse | InferenceError | InferenceTransientCapacityError]:
     """Answer named decision questions
 
-     Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
-    trained decision models support choice, score and predicate. Answer variants distinguish trained
+     Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items.
+    Hosted typed deciders and qualified constrained generators accept text and images per batch item.
+    Generated native models must support both images and constrained output. Native trained and
+    embedding deciders require text. Embedding similarity supports choice and multi_choice; trained
+    decision models support choice, score and predicate. Answer variants distinguish trained
     probabilities from raw cosine similarities.
 
     Args:
@@ -126,8 +129,11 @@ def sync(
 ) -> InferenceDecideResponse | InferenceError | InferenceTransientCapacityError | None:
     """Answer named decision questions
 
-     Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
-    trained decision models support choice, score and predicate. Answer variants distinguish trained
+     Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items.
+    Hosted typed deciders and qualified constrained generators accept text and images per batch item.
+    Generated native models must support both images and constrained output. Native trained and
+    embedding deciders require text. Embedding similarity supports choice and multi_choice; trained
+    decision models support choice, score and predicate. Answer variants distinguish trained
     probabilities from raw cosine similarities.
 
     Args:
@@ -155,8 +161,11 @@ async def asyncio_detailed(
 ) -> Response[InferenceDecideResponse | InferenceError | InferenceTransientCapacityError]:
     """Answer named decision questions
 
-     Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
-    trained decision models support choice, score and predicate. Answer variants distinguish trained
+     Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items.
+    Hosted typed deciders and qualified constrained generators accept text and images per batch item.
+    Generated native models must support both images and constrained output. Native trained and
+    embedding deciders require text. Embedding similarity supports choice and multi_choice; trained
+    decision models support choice, score and predicate. Answer variants distinguish trained
     probabilities from raw cosine similarities.
 
     Args:
@@ -187,8 +196,11 @@ async def asyncio(
 ) -> InferenceDecideResponse | InferenceError | InferenceTransientCapacityError | None:
     """Answer named decision questions
 
-     Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
-    trained decision models support choice, score and predicate. Answer variants distinguish trained
+     Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items.
+    Hosted typed deciders and qualified constrained generators accept text and images per batch item.
+    Generated native models must support both images and constrained output. Native trained and
+    embedding deciders require text. Embedding similarity supports choice and multi_choice; trained
+    decision models support choice, score and predicate. Answer variants distinguish trained
     probabilities from raw cosine similarities.
 
     Args:

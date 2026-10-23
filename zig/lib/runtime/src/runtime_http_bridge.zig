@@ -128,6 +128,8 @@ pub const Outbound = struct {
             .context = self,
             .read_all = readAllBody,
             .read_all_controlled = readAllBodyControlled,
+            .read = readBodyChunk,
+            .read_controlled = readBodyChunkControlled,
             .streaming = @intFromBool(self.context.hasStreamingRequestBody()),
         };
     }
@@ -182,6 +184,23 @@ pub const Outbound = struct {
     fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
         const context: *const httpx.Context = @ptrCast(@alignCast(raw orelse return 0));
         return @intFromBool(context.isCancellationRequested());
+    }
+
+    fn readBodyChunk(raw: ?*anyopaque, dest: [*]u8, capacity: usize, out: *usize) callconv(.c) abi.CallbackStatus {
+        return readBodyChunkWithControl(raw, dest, capacity, out, null);
+    }
+    fn readBodyChunkControlled(raw: ?*anyopaque, dest: [*]u8, capacity: usize, out: *usize, incoming: *const abi.RequestControl) callconv(.c) abi.CallbackStatus {
+        return readBodyChunkWithControl(raw, dest, capacity, out, incoming);
+    }
+    fn readBodyChunkWithControl(raw: ?*anyopaque, dest: [*]u8, capacity: usize, out: *usize, incoming: ?*const abi.RequestControl) abi.CallbackStatus {
+        const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
+        if (self.context.isCancellationRequested()) return .canceled;
+        // Upload sources may run on a joined I/O worker while response events
+        // use the caller's execution. Borrow lifetime only; no output CPU hooks.
+        var control: CallControl = .{ .base = self.context.requestWriteControl(self.write_control), .incoming = incoming };
+        var reader = self.context.requestBodyReader();
+        out.* = reader.readControlled(dest[0..capacity], control.view()) catch |err| return callbackStatusAfterIo(self.context, err);
+        return .ok;
     }
 
     fn readAllBody(raw: ?*anyopaque, out: *abi.OptionalBytes) callconv(.c) abi.CallbackStatus {
@@ -289,6 +308,8 @@ pub fn installInbound(
             .ptr = @constCast(body_source),
             .read_all = inboundReadAllBody,
             .read_all_controlled = inboundReadAllBodyControlled,
+            .read = if (body_source.read != null) inboundReadBodyChunk else null,
+            .read_controlled = if (body_source.read_controlled != null) inboundReadBodyChunkControlled else null,
             .streaming = body_source.streaming != 0,
         };
     }
@@ -303,6 +324,27 @@ pub fn installInbound(
             .close_controlled = inboundCloseControlled,
         };
     }
+}
+
+fn inboundReadBodyChunk(raw: ?*anyopaque, dest: []u8) !usize {
+    const source: *const abi.RequestBodySource = @ptrCast(@alignCast(raw orelse return error.BodySourceUnavailable));
+    var count: usize = 0;
+    try callbackResult(source.read.?(source.context, dest.ptr, dest.len, &count));
+    if (count > dest.len) return error.BodyReadFailed;
+    return count;
+}
+
+fn inboundReadBodyChunkControlled(raw: ?*anyopaque, dest: []u8, control: WriteControl) !usize {
+    if (!control.active()) return inboundReadBodyChunk(raw, dest);
+    const source: *const abi.RequestBodySource = @ptrCast(@alignCast(raw orelse return error.BodySourceUnavailable));
+    const call = source.read_controlled orelse return error.RequestControlUnavailable;
+    var adapter: ExportControl = .{ .control = control };
+    const view = adapter.view();
+    var count: usize = 0;
+    try callbackResult(call(source.context, dest.ptr, dest.len, &count, &view));
+    try control.check();
+    if (count > dest.len) return error.BodyReadFailed;
+    return count;
 }
 
 fn inboundReadAllBody(raw: ?*anyopaque) !?[]const u8 {
@@ -1170,6 +1212,97 @@ test "opaque HTTP controls bound lazy H2 mailbox waits before returning borrowed
     inner.application_deadline_io = io;
     try std.testing.expectError(error.Timeout, inner.body());
     try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - started < 1000 * std.time.ns_per_ms);
+    try std.testing.expect(!reader.control.active());
+    try std.testing.expect(request.body == null);
+}
+
+test "runtime HTTP body source preserves incremental reads without materializing" {
+    const std = @import("std");
+    const Source = struct {
+        offset: usize = 0,
+        fn all(_: ?*anyopaque) !?[]const u8 {
+            return error.UnexpectedMaterialization;
+        }
+        fn read(raw: ?*anyopaque, dest: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const bytes = "audio";
+            const n = @min(dest.len, bytes.len - self.offset);
+            @memcpy(dest[0..n], bytes[self.offset..][0..n]);
+            self.offset += n;
+            return n;
+        }
+    };
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "http://localhost/stream");
+    defer request.deinit();
+    var outer = httpx.Context.init(a, std.testing.io, &request);
+    defer outer.deinit();
+    var source: Source = .{};
+    outer.body_delegate = .{ .ptr = &source, .read_all = Source.all, .read = Source.read, .streaming = true };
+    var transport = Outbound{ .context = &outer };
+    const body_source = transport.bodySource();
+    var inner_request = try httpx.Request.init(a, .POST, "http://localhost/stream");
+    defer inner_request.deinit();
+    var inner = httpx.Context.init(a, std.testing.io, &inner_request);
+    defer inner.deinit();
+    const cancellation: abi.CancellationView = .{};
+    const stream: abi.StreamSink = .{};
+    installInbound(&inner, &cancellation, &body_source, &stream);
+    try std.testing.expect(inner.hasStreamingRequestBody());
+    var reader = inner.requestBodyReader();
+    var bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try reader.read(&bytes));
+    try std.testing.expectEqualStrings("aud", &bytes);
+    try std.testing.expectEqual(@as(usize, 2), try reader.read(&bytes));
+    try std.testing.expectEqualStrings("io", bytes[0..2]);
+    try std.testing.expectEqual(@as(usize, 0), try reader.read(&bytes));
+    try std.testing.expect(inner.request.body == null);
+}
+
+test "opaque HTTP controls bound incremental H2 upload reads without borrowing output CPU hooks" {
+    const std = @import("std");
+    const io = std.testing.io;
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/upload");
+    defer request.deinit();
+    var outer = httpx.Context.init(std.testing.allocator, io, &request);
+    defer outer.deinit();
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    outer.application_deadline_io = io;
+    outer.application_deadline_ns = @intCast(started + 2000 * std.time.ns_per_ms);
+    var h2 = httpx.H2Connection.initServer(std.testing.allocator, io);
+    defer h2.deinit();
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    var data_event: std.Io.Event = .unset;
+    var reader: httpx.Context.H2StreamReader = .{
+        .io = io,
+        .h2_stream = stream,
+        .data_event = &data_event,
+        .deadline_ms = @intCast(@divTrunc(started, std.time.ns_per_ms) + 2000),
+    };
+    outer.h2_body_reader = &reader;
+    var outbound: Outbound = .{ .context = &outer };
+    const Hooks = struct {
+        calls: usize = 0,
+        fn begin(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return .failed;
+        }
+    };
+    var hooks: Hooks = .{};
+    outbound.execution_wait = .{ .context = &hooks, .begin = Hooks.begin, .end = Hooks.begin };
+    const source = outbound.bodySource();
+    var inner = httpx.Context.init(std.testing.allocator, io, &request);
+    defer inner.deinit();
+    installInbound(&inner, &.{}, &source, &.{});
+    inner.application_deadline_io = io;
+    inner.application_deadline_ns = @intCast(started + 100 * std.time.ns_per_ms);
+    var incremental = inner.requestBodyReader();
+    var byte: [1]u8 = undefined;
+    try std.testing.expectError(error.Timeout, incremental.read(&byte));
+    try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - started < 1000 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 0), hooks.calls);
     try std.testing.expect(!reader.control.active());
     try std.testing.expect(request.body == null);
 }

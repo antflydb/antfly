@@ -254,26 +254,59 @@ pipes terminate work. JSON emits per-file `begin`, `match`/`context`, `end`, and
 final `summary` records, with ripgrep-shaped `data` and Antfly extensions for
 probabilities and completion/request statistics. Invalid UTF-8 uses base64.
 
-Configure an Antfly decision endpoint or the TypeSafe provider explicitly:
+Decision search uses the OpenAI Decisions named-question contract, without a
+provider SDK or private Jev wire adapter:
 
 ```sh
-printf '%s' "$ANTFLY_GREP_TOKEN" | antfly-grep auth --provider antfly \
-  --endpoint http://127.0.0.1:8090/decisions --model MODEL --stdin
-printf '%s' "$TYPESAFE_API_KEY" | antfly-grep auth --provider typesafe --stdin
+export OPENAI_API_KEY=...  # inherited only by the canonical OpenAI destination
+antfly-grep ask 'Where are retries bounded?' --provider openai ./src
+# Antfly gateway routes to a configured decider (including provider: jev).
+export ANTFLY_API_KEY=...
+antfly-grep auth --provider antfly --base-url http://localhost:8080/ai/v1 \
+  --model deciders/triage
 antfly-grep doctor
 antfly-grep skill --agent codex
 ```
 
-Running `antfly-grep auth` in a terminal prompts for a provider, any required
-endpoint/model, and a hidden token. Presets include Antfly, TypeSafe, Vercel AI
-Gateway, OpenRouter, OpenCode Zen, local inference, and custom TypeSafe gateways.
-Custom gateways require HTTPS or loopback HTTP. Configuration is written atomically
-with owner-only permissions on POSIX. Terminal echo is restored after entry and
-on POSIX SIGINT/SIGTERM. Shell completions include value choices, file types,
-option arity, paths, and setup commands.
-`doctor` uses a synthetic request. Agent installation supports Codex, Claude,
-and OpenCode; `--global` chooses the home directory. Model inference can also
-use the monorepo native library described above. No model is downloaded implicitly.
+`--provider openai` defaults to `https://api.openai.com/v1/decisions` and
+`gpt-6-luna`; pass `--model` to choose a supported Decisions model explicitly.
+`ANTFLY_GREP_PROVIDER`, `ANTFLY_GREP_ENDPOINT`, and `ANTFLY_GREP_MODEL` configure
+nonsecret defaults. Explicit endpoint, model, and transport options override
+provider defaults regardless of argument order. A custom Decisions service uses `--provider custom --endpoint
+URL --model MODEL`; its key comes from `ANTFLY_GREP_TOKEN`. That explicitly
+supplied key is bound to the selected destination. OpenAI environment keys are
+never sent to custom endpoints; Antfly keys apply only to the Antfly profile.
+Changing a saved endpoint or provider clears its saved token. Redirects are
+not followed. HTTPS or loopback HTTP is required.
+
+The baseline sends one `input` with multiple questions. Requests share a persistent
+HTTP client and use bounded provider concurrency; `--decision-concurrency` controls
+lanes independently of file workers. `--batch-size` affects Antfly batches only.
+Antfly and local profiles retain the native batch capability. A custom service may
+explicitly opt into `--decision-transport antfly-batch`; `--decision-context
+shared-v1` additionally interns repeated contexts. Neither extension is probed by
+sending unsupported requests. Single-input mode rejects shared-v1. Successful
+cache hits require no provider request; request budgets count actual attempts,
+including retries and splits. Refusal, abstention, similarity/generated answers,
+and malformed/missing responses remain incomplete evidence (exit 2), never cached
+negative results. Typed predicates may omit Antfly's `decision_method` metadata.
+
+Antfly's public gateway requires `public_inference.enabled: true`; authenticated
+execution requires `inference:write`. Use its canonical `deciders/NAME` model ID.
+An unauthenticated local gateway needs only its URL and configured model. Direct
+TypeSafe/Vercel/OpenRouter/OpenCode presets were removed: configure Jev on the
+Antfly gateway and select its decider instead. No chat/Structured Outputs fallback
+manufactures probability scores. See [the gateway contract](../../../docs/reference/inference-gateway.md).
+
+`auth` saves nonsecret provider configuration atomically with owner-only permissions
+on POSIX. Keys come from the environment; `--stdin` returns
+`UseEnvironmentCredential` instead of persisting a new token. Old credential
+profiles can be read during migration; remove their `token` after exporting an
+appropriate environment key. `doctor` uses a synthetic request. Agent installation
+supports Codex, Claude, and OpenCode; `--global` chooses the home directory.
+Shell completions include provider/transport choices, file types, option arity,
+paths, and setup commands. Local inference needs the explicit model/library setup
+above. No model is downloaded implicitly.
 
 Table-backed searches use the same matcher, decision pipeline and renderers as
 local files. Configure an endpoint and tables using
@@ -390,7 +423,7 @@ zig build -Dgrep-only=true -Doptimize=ReleaseFast grep-bench -- \
   --output /tmp/antfly-grep-latency.json
 ```
 
-The [unified-search benchmark](bench/results/macos-arm64-unified-search.json)
+The [unified-search benchmark](bench/results/README.md)
 records five paired rounds over 4 MiB inputs, a 1,000-file synthetic repository,
 and the actual 29-file native source tree. Output hashes agree with ripgrep.
 Completed-file flushing reduced first-result latency in the 1,000-file case from
@@ -401,7 +434,7 @@ execution. Host load and every run are preserved; these are measurements on a
 busy shared host, not general performance guarantees. Explicit block buffering
 remains available for bulk-output workloads.
 
-The [labeled fixture report](bench/results/macos-arm64-relevance-fixtures.json)
+The [labeled fixture report](bench/results/README.md)
 records all five queries passing file and line precision/recall/nDCG, including
 the no-result query. It identified and guards against empty rejected files being
 reported as reading leads. The report explicitly identifies fixture scoring and
@@ -439,8 +472,8 @@ zig build -Dgrep-only=true -Doptimize=ReleaseFast grep-bench -- \
   --mib 32 --rounds 3 --output /tmp/antfly-grep-benchmark.json
 ```
 
-The [original macOS ARM64 baseline](bench/results/macos-arm64.json) and
-[full 32 MiB benchmark](bench/results/macos-arm64-final.json) preserve binary hashes,
+The [original macOS ARM64 baseline](bench/results/README.md) and
+[full 32 MiB benchmark](bench/results/README.md) preserve binary hashes,
 versions, sizes, host load, every timed run, child RSS/CPU/page faults, and output
 hashes checked against ripgrep outside the timed measurements. That full run
 uses a 32 MiB corpus and five measured runs after warmup:
@@ -470,7 +503,7 @@ before drawing conclusions about mmap itself. Regex patterns with different
 structure, larger repositories, cold storage, codecs, and model providers need
 separate measurements.
 
-The [verified 4 MiB follow-up](bench/results/macos-arm64-count-codec-verified.json)
+The [verified 4 MiB follow-up](bench/results/README.md)
 compares the installed binary, an earlier Antfly binary, and ripgrep in nine
 alternating rounds after our compiler and test jobs finished. Dense
 case-insensitive counts fell from 52.1 ms / 183.7 MiB RSS to 6.0 ms / 8.5 MiB;
@@ -480,12 +513,12 @@ versus ripgrep’s 29.2 ms, and incompressible data at 145.1 ms versus 171.4 ms.
 Host load remained elevated from other work; CPU times and all runs are preserved.
 These results describe those inputs, not general parity. Codec references launch
 external decoders; recorded RSS is child accounting rather than summed simultaneous
-process-tree memory. The separate [32 MiB bulk-CRC experiment](bench/results/macos-arm64-bzip-bulk.json)
+process-tree memory. The separate [32 MiB bulk-CRC experiment](bench/results/README.md)
 records 119 MiB/s for bzip2, compared with 88 MiB/s in the earlier full benchmark.
 Use `--extended`, repeatable `--case NAME`, and `--baseline PATH` to reproduce
 focused comparisons without rerunning unrelated search cases.
 
-The [native PCRE follow-up](bench/results/macos-arm64-native-pcre.json) records
+The [native PCRE follow-up](bench/results/README.md) records
 seven alternating rounds over 1 MiB inputs with output hashes checked against
 ripgrep. Compared with the earlier Antfly binary, single-predicate repeats fell
 from 32.3 to 5.7 ms, Unicode chains from 20.1 to 12.4 ms, and the simple-subroutine
@@ -495,7 +528,7 @@ these warm-cache cases establish specific improvements, not general JIT parity.
 Reproduce with `--extended --mib 1 --rounds 7 --case pcre-repeat --case
 pcre-unicode-chain --case pcre-subroutine --baseline PATH`.
 
-The [native grammar sample](bench/results/macos-arm64-native-grammars.json)
+The [native grammar sample](bench/results/README.md)
 records all 75 deterministically selected repository files parsing successfully
 in each of three rounds. It includes source/table hashes, parser work, elapsed
 time, and requested allocator peaks. The largest parser peak was approximately
@@ -554,7 +587,7 @@ zig build -Dgrep-only=true grep-harden
 # Each target is selected explicitly; otherwise the build fuzzer may run only
 # its first discovered fuzz test. Keep each campaign finite and retain reports.
 python3 pkg/antfly-grep/tests/fuzz.py --zig /path/to/zig --iterations 50000 \
-  --output pkg/antfly-grep/bench/results/macos-arm64-hardening.json
+  --output ../output/grep-hardening/macos-arm64-hardening.json
 ```
 
 `grep-profile` builds `antfly-grep-regex-profile`. It measures VM dispatch counts
@@ -590,10 +623,10 @@ platform-specific skips), all **1,500 live generated oracle comparisons** with n
 failures/timeouts, and **153,992 additional coverage fuzz executions** across the
 three targets. Windows x86_64 cross-compilation passed; runtime checks remain
 scoped to macOS/Linux. Reports retain executable identities and hardening source
-hashes: [live differential](bench/results/linux-x86_64-generated-differential.json),
-[fuzz campaigns](bench/results/macos-arm64-hardening.json).
+hashes: [live differential](bench/results/README.md),
+[fuzz campaigns](bench/results/README.md).
 
-The earlier [paired CLI measurements](bench/results/macos-arm64-profile-local.json)
+The earlier [paired CLI measurements](bench/results/README.md)
 compare the original PR binary with the updated binary, using seven alternating
 rounds. Times include startup and I/O. These warm-cache macOS ARM64 measurements
 record host load and raw runs; they establish gains for specific workloads.
@@ -608,19 +641,19 @@ record host load and raw runs; they establish gains for specific workloads.
 
 Capture/reset counts peak at approximately 3.3 MiB RSS. Startup, literal, and
 repository workloads remain broadly unchanged. The complete
-[monorepo run](bench/results/macos-arm64-profile-monorepo.json) covers 10,119 files
-and approximately 534 MiB; [Go SDK](bench/results/macos-arm64-profile-go-sdk.json)
-and [TypeScript SDK](bench/results/macos-arm64-profile-ts-sdk.json) runs cover
+[monorepo run](bench/results/README.md) covers 10,119 files
+and approximately 534 MiB; [Go SDK](bench/results/README.md)
+and [TypeScript SDK](bench/results/README.md) runs cover
 additional source trees. Those earlier measurements identified repository
 discovery/search and late-prefix reset search as the next bottlenecks; the
 optimization results below supersede them for those workloads.
 
-[VM/JIT kernel profiles](bench/results/macos-arm64-capture-jit.json) record dispatch
+[VM/JIT kernel profiles](bench/results/README.md) record dispatch
 mixes and matching result checksums. Raw CLI CPU traces accompany the
-[capture log](bench/results/macos-arm64-cli-capture-sample.json),
-[reset log before owned-frame reuse](bench/results/macos-arm64-cli-reset-before.json),
-[final reset log](bench/results/macos-arm64-cli-reset-sample.json), and
-[repository search](bench/results/macos-arm64-cli-monorepo-sample.json) reports.
+[capture log](bench/results/README.md),
+[reset log before owned-frame reuse](bench/results/README.md),
+[final reset log](bench/results/README.md), and
+[repository search](bench/results/README.md) reports.
 The repository trace exposes ignore/glob matching during discovery and parallel
 file scanning; further broad JIT expansion would not address that entire cost.
 The sampling adapter supports directories, count/file modes and the default or
@@ -666,11 +699,11 @@ without an extra copy. Single-literal misses fuse NUL detection and literal
 rejection in those windows; proofs expire at refill, and cross-window records
 stay on the normal matching path. Late-NUL classification windows remain unchanged.
 
-An intermediate [directory stack sample](bench/results/macos-arm64-discovery-speedups-sample.json)
-identified directory I/O and waiting; the [file-worker sweep](bench/results/macos-arm64-file-worker-tuning.json)
+An intermediate [directory stack sample](bench/results/README.md)
+identified directory I/O and waiting; the [file-worker sweep](bench/results/README.md)
 motivated the automatic scan-worker cap. Stack samples include blocked time.
 
-The [final paired run](bench/results/macos-arm64-search-speedups.json) compares
+The [final paired run](bench/results/README.md) compares
 pre-optimization commit `01d5749023`, this implementation, and ripgrep over eleven
 alternating rounds. All five original cases are faster than ripgrep on this
 macOS ARM64 host. Times include startup and I/O; output digests and exit codes
@@ -686,14 +719,14 @@ agree. The repository contains 10,133 files / 534.1 MiB.
 
 Repository search uses 28% less median total CPU time and 46% less peak
 recorded RSS than ripgrep (7.5 vs 14.0 MiB). Discovery also uses less CPU and
-RSS. The [128 MiB check](bench/results/macos-arm64-search-speedups-large.json)
+RSS. The [128 MiB check](bench/results/README.md)
 keeps literal-miss RSS near 3 MiB and records literal misses at
 13.82 vs 15.67 ms, capture/reset counts at
 171.15 vs 324.78 ms, and repeats at
 53.28 vs 133.06 ms.
 
-Seven-round [Go SDK](bench/results/macos-arm64-search-speedups-go-sdk.json) and
-[TypeScript SDK](bench/results/macos-arm64-search-speedups-ts-sdk.json) checks also
+Seven-round [Go SDK](bench/results/README.md) and
+[TypeScript SDK](bench/results/README.md) checks also
 beat ripgrep for discovery and file search. These are workload-specific warm-cache
 measurements, not universal performance parity. Reports retain binary/corpus
 hashes, versions, host load, first-result latency, CPU/RSS and individual runs.
@@ -705,10 +738,10 @@ options. They also cover directory-cache overflow, shared nested ignore scopes,
 wide frontiers, null-separated lists, finite output limits, line buffering,
 cancellation and broken-pipe cleanup.
 
-[Final validation](bench/results/search-speedups-validation.json) passes **118 CLI
+[Final validation](bench/results/README.md) passes **118 CLI
 tests on macOS and Linux** (two and one platform-specific skips), native unit
 properties, all **1,500 live pinned-oracle comparisons** with no failures/timeouts,
-and the Linux hardening suite. Three refreshed [coverage campaigns](bench/results/macos-arm64-search-speedups-hardening.json)
+and the Linux hardening suite. Three refreshed [coverage campaigns](bench/results/README.md)
 add **107,363 executions** across regex, parsers and dictionaries. Windows x86_64
 cross-compilation passes; runtime validation remains scoped to macOS/Linux.
 The validation report records source and executable hashes. Decision checks use
@@ -840,11 +873,11 @@ Fixture request bytes are recorded
 separately from provider token usage; fixture results do not establish model
 quality or actual provider cost.
 
-`bench/decision_transport.py` compares a saved baseline with the current binary
-using synthetic source and a local constant-score Typesafe fixture. The recorded
+The historical TypeSafe transport qualification used synthetic source and a
+local constant-score fixture. The recorded
 512-line case sends the same 513 questions in 65 requests and produces identical
 output, while request-body bytes fall from 10,719,928 to 1,609,144 (85% less).
-See `bench/results/followup-typesafe-transport.json`. The labeled repository
+See the archived `followup-typesafe-transport.json` report in the [historical results archive](bench/results/README.md). The labeled repository
 fixture separately reduces requests from 52 to 45 per question while preserving
 all 304 evaluated targets and expected results. These are transport/orchestration
 measurements, not provider token costs or model-quality evidence.
@@ -855,7 +888,7 @@ escapes before copying ordinary bytes in bulk. Randomized legacy blocks, CRCs,
 output limits and streaming backpressure retain their checked paths.
 
 The follow-up qualification and exact executable/source identities are in
-[`followup-validation.json`](bench/results/followup-validation.json). The native
+[`followup-validation.json`](bench/results/README.md). The native
 macOS runs below compare the saved pre-change binary, current binary, and pinned
 rg on the same corpus. Timings are milliseconds; each report retains all trials.
 
@@ -936,7 +969,7 @@ transport/cache/orchestration behavior, not live model quality or billed tokens.
 The five labeled repository fixtures retain precision/recall 1.0 with 304 target
 evaluations and 45 requests per question.
 
-`bench/results/next-review-validation.json` records the implementation commit,
+The archived `next-review-validation.json` report records the implementation commit,
 source hashes, and qualified macOS/Linux executable identities. Qualification
 includes 133 CLI tests on each platform (two macOS skips, one Linux skip), five
 real native-server indexed scenarios, 15 native decision-contract tests,
@@ -976,7 +1009,7 @@ measured benefit and equivalent results.
 
 
 The follow-up qualification records executable identities and source hashes in
-[`bounded-review-validation.json`](bench/results/bounded-review-validation.json).
+[`bounded-review-validation.json`](bench/results/README.md).
 All 137 CLI tests pass on macOS (two platform skips) and ARM64 Linux (one skip),
 alongside five existing real-server indexed tests, 15 decision-contract tests,
 the native preparation-equivalence fixture, 1,000 generated differential cases,
@@ -1061,7 +1094,7 @@ not measurements of model relevance, encoder speed or billed provider cost.
 
 
 The latest qualification compares the implementation with PR head `f36d2c4b47`.
-Paired medians and executable hashes are in `bench/results/stream-review-*.json`:
+Paired medians and executable hashes are in the archived `stream-review-*.json` reports:
 
 | Workload | Before | After | Additional evidence |
 |---|---:|---:|---|
@@ -1110,7 +1143,7 @@ same ARM64 Mac; they are not independent Linux hardware results. Filesystem
 caches were warm and unrelated builds were active. Full upstream PCRE2/ripgrep
 parity, independent-host cold-cache performance and live-provider quality remain
 outside this qualification. Source and executable identities are recorded in
-[`stream-review-validation.json`](bench/results/stream-review-validation.json).
+[`stream-review-validation.json`](bench/results/README.md).
 
 
 ### Cached-only execution and incremental preparation
@@ -1231,7 +1264,7 @@ The re-batching fixture sends 0 requests / 0 questions instead of 11 requests /
 of 8. Narrow indexed listing returns the same path using 261 response bytes
 instead of 4,981,035 bytes. These are fixture counts and wire sizes, not provider
 billing measurements. Raw source hashes and paired trials are retained in
-`bench/results/incremental-review-*.json`.
+the archived `incremental-review-*.json` reports.
 
 The dense-regex speedup does not establish that every path is faster: match-only
 regresses on both final runs, and discovery/color results are mixed. All runs use
@@ -1249,7 +1282,7 @@ with no differences, plus five labeled relevance fixtures. These fixtures retain
 expected results but do not measure real model relevance. License headers,
 the Apache boundary and all 35 boundary-checker tests pass. Exact source and
 executable identities are in
-[`incremental-review-validation.json`](bench/results/incremental-review-validation.json).
+[`incremental-review-validation.json`](bench/results/README.md).
 
 
 ### Associative cache and output qualification
@@ -1278,7 +1311,7 @@ waste capacity and cause avoidable model calls. The large fixture verifies zero
 warm inference calls as well as preparation reuse and output equivalence.
 
 Final paired results and binary/source identities are recorded in
-[`associative-review-validation.json`](bench/results/associative-review-validation.json).
+[`associative-review-validation.json`](bench/results/README.md).
 The output runs, repository-scale cache fixture, incremental HTTP fixture, and
 generated comparisons are recorded in the adjacent `associative-review-*.json`
 reports. The baseline is PR head `344de9822e`; these are warm-filesystem results
@@ -1347,13 +1380,13 @@ source case measured 11.0 ms versus 10.8 ms. These small workloads include start
 shared-host scheduling; the repository-scale cache gain is not a blanket latency
 guarantee.
 
-Evidence: [cache scaling](bench/results/bucket-review-cache-scale.json),
-[compact scaling](bench/results/bucket-review-compact-scale.json),
-[output matrix](bench/results/bucket-review-output.json),
-[compact output matrix](bench/results/bucket-review-compact-output.json), and
-[incremental checks](bench/results/bucket-review-incremental.json). Binary/source
+Evidence: [cache scaling](bench/results/README.md),
+[compact scaling](bench/results/README.md),
+[output matrix](bench/results/README.md),
+[compact output matrix](bench/results/README.md), and
+[incremental checks](bench/results/README.md). Binary/source
 identities and validation limits are in
-[bucket-review-validation.json](bench/results/bucket-review-validation.json).
+[bucket-review-validation.json](bench/results/README.md).
 
 
 ### Bounded top-K evidence and shared score shards
@@ -1428,12 +1461,12 @@ Regression fixtures cover ranking equivalence, ties/concurrency, bounded pending
 storage, searched-byte ownership, released-page provenance, output budgets,
 heading/color/context/trim parity, V9 migration and original score expiry.
 
-Evidence: [single-worker ranking](bench/results/topk-shards-2048-macos.json),
-[four-worker ranking](bench/results/topk-shards-parallel-macos.json),
-[unlimited ranking](bench/results/topk-shards-unlimited-macos.json),
-[escaped provenance](bench/results/topk-provenance-budget-macos.json),
-[dense output controls](bench/results/topk-output-macos.json), and
-[validation and source/binary identities](bench/results/topk-validation.json).
+Evidence: [single-worker ranking](bench/results/README.md),
+[four-worker ranking](bench/results/README.md),
+[unlimited ranking](bench/results/README.md),
+[escaped provenance](bench/results/README.md),
+[dense output controls](bench/results/README.md), and
+[validation and source/binary identities](bench/results/README.md).
 Reproduce ranking comparisons with `bench/cache_scale.py --top-k 15 --threads 1`
 or `--threads 4`, passing the candidate/baseline binaries and native fixture
 library; omit `--top-k` for unlimited output. `bench/provenance_budget.py` runs the
@@ -1519,16 +1552,16 @@ The small-file result is only a sub-millisecond difference and needs broader
 measurement. Dense-output controls are approximately flat: JSON 25.56 → 25.34 ms,
 color 11.95 → 12.08 ms, match-only 6.04 → 5.92 ms, regex color 12.64 → 12.42 ms.
 
-Evidence includes [single-worker ranking](bench/results/prepared-stream-topk-macos.json),
-[four-worker ranking](bench/results/prepared-stream-parallel-macos.json),
-[unlimited ranking](bench/results/prepared-stream-unlimited-macos.json),
-[line evidence](bench/results/prepared-stream-overview-macos.json),
-[small files](bench/results/prepared-stream-small-macos.json),
-[dense output controls](bench/results/prepared-stream-output-macos.json), and
-[the timing regression](bench/results/prepared-stream-timing.json). Reports retain
+Evidence includes [single-worker ranking](bench/results/README.md),
+[four-worker ranking](bench/results/README.md),
+[unlimited ranking](bench/results/README.md),
+[line evidence](bench/results/README.md),
+[small files](bench/results/README.md),
+[dense output controls](bench/results/README.md), and
+[the timing regression](bench/results/README.md). Reports retain
 binary/library hashes, versions, host details and per-run CPU/RSS observations.
 Source/binary identities and qualification limits are in
-[the validation record](bench/results/prepared-stream-validation.json).
+[the validation record](bench/results/README.md).
 
 Qualification: 175 CLI tests on each of macOS and Linux ARM64 (two/one skips),
 native unit/hardening/tooling checks, seven focused ReleaseSafe cache/sort tests,
@@ -1620,7 +1653,7 @@ The 128-file HTTP fixture uses eight file workers, two provider lanes, 20 ms per
 
 These are synthetic, warm-cache measurements on one shared macOS host. The provider fixture models request overhead and concurrency limits; it does not establish billed-token savings or live-model relevance.
 
-Evidence: [one-worker search](bench/results/coalesced-topk-macos.json), [four-worker search](bench/results/coalesced-parallel-macos.json), [unlimited ranking](bench/results/coalesced-unlimited-macos.json), [single-file control](bench/results/coalesced-small-macos.json), [overview control](bench/results/coalesced-overview-macos.json), [provider microbatches](bench/results/coalesced-decisions-macos.json), [generated comparisons](bench/results/coalesced-differential.json), and [source/binary hashes and validation](bench/results/coalesced-validation.json). Reports retain per-run timing, CPU, memory, cache allocation and/or request counts.
+Evidence: [one-worker search](bench/results/README.md), [four-worker search](bench/results/README.md), [unlimited ranking](bench/results/README.md), [single-file control](bench/results/README.md), [overview control](bench/results/README.md), [provider microbatches](bench/results/README.md), [generated comparisons](bench/results/README.md), and [source/binary hashes and validation](bench/results/README.md). Reports retain per-run timing, CPU, memory, cache allocation and/or request counts.
 
 Qualification: 180 CLI tests each on macOS and Linux ARM64 (two/one skips), native unit/hardening/tooling checks, four focused ReleaseSafe artifact tests, six Linux hardening tests, 1,000 generated comparisons without mismatches or timeouts, Windows cross-compilation, packaging, Apache boundaries, staged license checks and formatting. Linux correctness uses a two-CPU VM on this Mac. Independent Linux hardware/cold-cache performance, Windows runtime, live providers and full upstream PCRE2/JIT/CLI parity remain unqualified; existing real-server scenarios were not rerun in this follow-up.
 
@@ -1728,18 +1761,18 @@ mounts do not provide those same contracts. Independent Linux hardware,
 cold-storage performance, Windows runtime, live-model relevance and billed
 cost remain unqualified. Repository CI still requires human approval.
 
-Evidence: [one-worker search](bench/results/dense-topk-macos.json),
-[four-worker search](bench/results/dense-parallel-macos.json),
-[unlimited ranking](bench/results/dense-unlimited-macos.json),
-[single-file control](bench/results/dense-small-macos.json),
-[overview control](bench/results/dense-overview-macos.json),
-[local lexical/regex controls](bench/results/dense-local-macos.json),
-[ranked HTTP control](bench/results/dense-decisions-macos.json),
-[provider tuning and first-output trials](bench/results/dense-provider-tuning.json),
-[shared transport](bench/results/dense-shared-transport.json),
-[generated comparisons](bench/results/dense-differential.json),
-[oracle build differences](bench/results/dense-oracle-variants.json), and
-[validation and hashes](bench/results/dense-validation.json).
+Evidence: [one-worker search](bench/results/README.md),
+[four-worker search](bench/results/README.md),
+[unlimited ranking](bench/results/README.md),
+[single-file control](bench/results/README.md),
+[overview control](bench/results/README.md),
+[local lexical/regex controls](bench/results/README.md),
+[ranked HTTP control](bench/results/README.md),
+[provider tuning and first-output trials](bench/results/README.md),
+[shared transport](bench/results/README.md),
+[generated comparisons](bench/results/README.md),
+[oracle build differences](bench/results/README.md), and
+[validation and hashes](bench/results/README.md).
 
 ### Budgeted batching and pinned workspace sessions
 
@@ -1876,15 +1909,15 @@ SDK process sample are retained; no new JIT coverage was added. Independent
 Linux hardware/cold-storage performance, Windows runtime, automatic OS watcher
 integration, live-model relevance and billed cost remain unqualified.
 
-Evidence: [default-budget previews](bench/results/workspace-previews-macos.json),
-[unranked decisions](bench/results/workspace-unranked-macos.json),
-[synthetic sessions](bench/results/workspace-session-macos.json),
-[SDK sessions](bench/results/workspace-sdk-macos.json),
-[exact production-binary sample](bench/results/workspace-sdk-profile.sample.txt),
-[local controls](bench/results/workspace-local-macos.json),
-[generated comparisons](bench/results/workspace-differential.json),
-[release archives](bench/results/workspace-archives.json), and
-[validation/source hashes](bench/results/workspace-validation.json).
+Evidence: [default-budget previews](bench/results/README.md),
+[unranked decisions](bench/results/README.md),
+[synthetic sessions](bench/results/README.md),
+[SDK sessions](bench/results/README.md),
+[exact production-binary sample](bench/results/README.md),
+[local controls](bench/results/README.md),
+[generated comparisons](bench/results/README.md),
+[release archives](bench/results/README.md), and
+[validation/source hashes](bench/results/README.md).
 
 ### Workspace resource reuse
 
@@ -1960,12 +1993,12 @@ python3 pkg/antfly-grep/bench/session_compare.py BASELINE CANDIDATE \
   --output sdk-paired.json
 ```
 
-Evidence: [paired SDK](bench/results/session-sdk-paired-macos.json),
-[paired synthetic](bench/results/session-synthetic-paired-macos.json),
-[baseline sample](bench/results/session-sdk-baseline-profile.sample.txt),
-[candidate sample](bench/results/session-sdk-profile.sample.txt),
-[local controls](bench/results/session-local-macos.json),
-and [generated differential cases](bench/results/session-differential.json).
+Evidence: [paired SDK](bench/results/README.md),
+[paired synthetic](bench/results/README.md),
+[baseline sample](bench/results/README.md),
+[candidate sample](bench/results/README.md),
+[local controls](bench/results/README.md),
+and [generated differential cases](bench/results/README.md).
 
 Final qualification: **199 CLI tests on macOS** (two skips) and **199 on ARM64
 Linux** (one skip), native unit/hardening/tooling checks, 1,000 generated pinned
@@ -1974,7 +2007,7 @@ cross-compilation, three real target archive/hash checks, packaging, license
 boundaries, generated compatibility and formatting. Linux runtime checks use
 an isolated two-CPU Docker VM; independent hardware performance, Windows runtime
 and live-provider quality remain outside this qualification. The source/binary
-identities and scope limits are in [validation](bench/results/session-validation.json).
+identities and scope limits are in [validation](bench/results/README.md).
 
 
 ### Complete-query and per-file decision reuse
@@ -2123,13 +2156,13 @@ more memory than that older baseline. Source/index retention is approximately
 14.47 MB in this SDK capture. These samples do not establish cross-host or cold-
 capture memory guarantees.
 
-Evidence: [paired SDK](bench/results/reuse-sdk-paired-macos.json),
-[paired selected output](bench/results/reuse-synthetic-paired-macos.json),
-[budget admission](bench/results/reuse-budget-macos.json),
-[profile campaign](bench/results/reuse-sdk-profile-macos.json),
-[active sample](bench/results/reuse-sdk-profile.sample.txt),
-[trimmed sample](bench/results/reuse-sdk-trimmed.sample.txt), and
-[generated comparisons](bench/results/reuse-differential.json).
+Evidence: [paired SDK](bench/results/README.md),
+[paired selected output](bench/results/README.md),
+[budget admission](bench/results/README.md),
+[profile campaign](bench/results/README.md),
+[active sample](bench/results/README.md),
+[trimmed sample](bench/results/README.md), and
+[generated comparisons](bench/results/README.md).
 
 
 Final qualification passes 204 CLI tests on macOS (two skips) and ARM64 Linux
@@ -2138,8 +2171,8 @@ without mismatches/timeouts, Windows x86-64 cross-compilation, license boundarie
 formatting and three actual release archive/hash checks. Linux runs in a two-CPU
 isolated Docker VM; Windows runtime, independent Linux hardware performance and
 live-model relevance/billing remain unqualified. See
-[validation/source hashes](bench/results/reuse-validation.json) and
-[release archive contents/hashes](bench/results/reuse-archives.json).
+[validation/source hashes](bench/results/README.md) and
+[release archive contents/hashes](bench/results/README.md).
 
 
 ### Conditional replay qualification
@@ -2176,13 +2209,13 @@ on a shared macOS host and are not performance guarantees. The exact production
 binary sample reports **13.3 MB** physical footprint for the separate synthetic
 1024-file profile; no cross-workload RSS improvement is claimed.
 
-Evidence: [paired full replay](bench/results/replay-synthetic-paired-macos.json),
-[conditional/presentation/refresh](bench/results/replay-protocol-macos.json),
-[production-binary profile campaign](bench/results/replay-profile-macos.json),
-[sample](bench/results/replay-profile.sample.txt),
-[generated comparisons](bench/results/replay-differential.json),
-[validation/source hashes](bench/results/replay-validation.json), and
-[release archives](bench/results/replay-archives.json).
+Evidence: [paired full replay](bench/results/README.md),
+[conditional/presentation/refresh](bench/results/README.md),
+[production-binary profile campaign](bench/results/README.md),
+[sample](bench/results/README.md),
+[generated comparisons](bench/results/README.md),
+[validation/source hashes](bench/results/README.md), and
+[release archives](bench/results/README.md).
 
 
 ### Registered queries and exact incremental delivery
@@ -2301,11 +2334,11 @@ for literal misses (antfly-grep/ripgrep), 6.78/9.71 ms for SDK file discovery, a
 universal win over ripgrep. No new JIT optimization or provider billing reduction
 is inferred from the registered-query fixture.
 
-Evidence: [paired protocol trials](bench/results/handles-protocol-macos.json),
-[local controls](bench/results/handles-local-controls-macos.json),
-[differential results](bench/results/handles-differential.json),
-[validation and source identities](bench/results/handles-validation.json), and
-[verified release archives](bench/results/handles-archives.json).
+Evidence: [paired protocol trials](bench/results/README.md),
+[local controls](bench/results/README.md),
+[differential results](bench/results/README.md),
+[validation and source identities](bench/results/README.md), and
+[verified release archives](bench/results/README.md).
 
 
 ### Incremental refresh and shared evidence follow-up
@@ -2394,13 +2427,13 @@ services in the 15-winner fixture; retained state and allocator behavior still c
 memory. No live-model cost, relevance, universal ripgrep-speed or literal zero-cost
 claim follows from these shared-host synthetic measurements.
 
-Evidence: [paired startup/refresh](bench/results/review-refresh-macos.json),
-[paired selected-file edits](bench/results/review-incremental-paired-macos.json),
-[15-winner delivery](bench/results/review-protocol-macos.json),
-[128-winner delivery](bench/results/review-protocol-large-macos.json),
-[differential](bench/results/review-refresh-differential.json),
-[validation/source identities](bench/results/refresh-validation.json), and
-[release archives](bench/results/refresh-archives.json).
+Evidence: [paired startup/refresh](bench/results/README.md),
+[paired selected-file edits](bench/results/README.md),
+[15-winner delivery](bench/results/README.md),
+[128-winner delivery](bench/results/README.md),
+[differential](bench/results/README.md),
+[validation/source identities](bench/results/README.md), and
+[release archives](bench/results/README.md).
 
 
 ### Strict refresh and active evidence follow-up
@@ -2468,11 +2501,11 @@ fixture evaluation per edit and reconstruct identical results. The deterministic
 128-winner ownership regression requires new shared-query metadata below 32 KiB,
 including its admission-owned path lookup, under the unchanged physical cache cap.
 
-Evidence: [refresh controls](bench/results/directory-events-macos.json),
-[selected-file controls](bench/results/directory-incremental-macos.json),
-[differential replay](bench/results/directory-differential.json),
-[validation/source identities](bench/results/directory-validation.json), and
-[release archives](bench/results/directory-archives.json).
+Evidence: [refresh controls](bench/results/README.md),
+[selected-file controls](bench/results/README.md),
+[differential replay](bench/results/README.md),
+[validation/source identities](bench/results/README.md), and
+[release archives](bench/results/README.md).
 
 ### Incremental membership and payload-free delta reuse
 
@@ -2555,11 +2588,11 @@ count can indicate missing oracle coverage. Run package unit executables from
 local VM storage rather than a host bind mount. Native fixtures establish
 orchestration, not real model quality or cost.
 
-Evidence: [macOS controls](bench/results/membership-refresh-macos.json),
-[Linux controls](bench/results/membership-refresh-linux.json),
-[wide-directory controls](bench/results/membership-wide-linux.json),
-[differential replay](bench/results/membership-differential.json), and
-[source/binary/archive identities](bench/results/membership-validation.json).
+Evidence: [macOS controls](bench/results/README.md),
+[Linux controls](bench/results/README.md),
+[wide-directory controls](bench/results/README.md),
+[differential replay](bench/results/README.md), and
+[source/binary/archive identities](bench/results/README.md).
 
 
 ### Startup allocation and hashing qualification
@@ -2598,12 +2631,12 @@ still reads every eligible source: validation, changed content and native watch
 subscriptions have real CPU, I/O and memory costs even when provider calls are
 zero.
 
-Evidence: [paired macOS startup](bench/results/startup-macos.json),
-[paired Linux startup](bench/results/startup-linux.json),
-[macOS refresh controls](bench/results/startup-refresh-macos.json),
-[Linux refresh controls](bench/results/startup-refresh-linux.json),
-[differential replay](bench/results/startup-differential.json), and
-[qualification identities](bench/results/startup-validation.json).
+Evidence: [paired macOS startup](bench/results/README.md),
+[paired Linux startup](bench/results/README.md),
+[macOS refresh controls](bench/results/README.md),
+[Linux refresh controls](bench/results/README.md),
+[differential replay](bench/results/README.md), and
+[qualification identities](bench/results/README.md).
 
 
 ### Compact captures, bounded readers and restart preparation reuse
@@ -2689,12 +2722,12 @@ differential comparisons without mismatches/timeouts, license boundaries and thr
 release archives are qualified. Windows runtime and live-provider testing remain
 outside this qualification.
 
-Evidence: [Linux capture](bench/results/compact-capture-linux.json),
-[Linux I/O](bench/results/compact-io-linux.json),
-[isolated workers](bench/results/compact-workers-linux.json),
-[restart queries](bench/results/compact-restart-linux.json),
-[macOS capture](bench/results/compact-capture-macos.json), and
-[all source/binary/report/archive identities](bench/results/compact-validation.json).
+Evidence: [Linux capture](bench/results/README.md),
+[Linux I/O](bench/results/README.md),
+[isolated workers](bench/results/README.md),
+[restart queries](bench/results/README.md),
+[macOS capture](bench/results/README.md), and
+[all source/binary/report/archive identities](bench/results/README.md).
 
 ### Lexical completion certificates and bounded file reuse (qualification at b261a10f84)
 
@@ -2795,12 +2828,12 @@ notice/completion/man-page identities, license boundaries and release checks pas
 Full PR CI still requires repository admission; native Linux hardware, Windows
 runtime and live-model quality/billing remain unqualified.
 
-Evidence: [Linux lexical reuse](bench/results/certificates-lexical-linux.json),
-[tiny-file controls](bench/results/certificates-tiny-linux.json),
-[Linux capture](bench/results/certificates-capture-linux.json),
-[preparation controls](bench/results/certificates-preparation-linux.json),
-[macOS lexical reuse](bench/results/certificates-lexical-macos.json), and
-[all source/binary/report/archive identities](bench/results/certificates-validation.json).
+Evidence: [Linux lexical reuse](bench/results/README.md),
+[tiny-file controls](bench/results/README.md),
+[Linux capture](bench/results/README.md),
+[preparation controls](bench/results/README.md),
+[macOS lexical reuse](bench/results/README.md), and
+[all source/binary/report/archive identities](bench/results/README.md).
 Reproduce lexical controls with `python3 bench/lexical_reuse.py CURRENT BASELINE
 OUTPUT`; use `bench/restart.py` with `--prewarm-both --padding-bytes=65536` and a
 local fixture library to isolate preparation work across cache-key versions.
@@ -2941,15 +2974,15 @@ fallback. Windows x86_64 cross-compilation and release contents are qualified;
 Windows runtime, independent Linux hardware and live-provider quality remain
 outside this fixture qualification. Full PR CI remains subject to admission.
 
-Evidence: [Linux deltas](bench/results/typed-delta-linux.json),
-[Linux full delivery](bench/results/typed-lexical-linux.json),
-[dense controls](bench/results/typed-tiny-linux.json),
-[Linux capture](bench/results/typed-capture-linux.json),
-[preparation controls](bench/results/typed-preparation-linux.json),
-[refresh controls](bench/results/typed-refresh-linux.json),
-[macOS deltas](bench/results/typed-delta-macos.json),
-[macOS capture](bench/results/typed-capture-macos.json), and
-[source/binary/report/archive identities](bench/results/typed-validation.json).
+Evidence: [Linux deltas](bench/results/README.md),
+[Linux full delivery](bench/results/README.md),
+[dense controls](bench/results/README.md),
+[Linux capture](bench/results/README.md),
+[preparation controls](bench/results/README.md),
+[refresh controls](bench/results/README.md),
+[macOS deltas](bench/results/README.md),
+[macOS capture](bench/results/README.md), and
+[source/binary/report/archive identities](bench/results/README.md).
 
 ### Admission backoff, minimal acknowledgements and retained clients
 
@@ -3098,16 +3131,16 @@ format/compatibility checks and verified release contents. Providers remain loca
 fixtures. Independent native Linux hardware, cold storage, Windows runtime and
 live-provider quality/billing remain unqualified; full PR CI requires admission.
 
-Evidence: [macOS CPU/output](bench/results/overhead-macos.json),
-[Linux CPU/output](bench/results/overhead-linux.json),
-[macOS capture](bench/results/overhead-capture-macos.json),
-[Linux capture](bench/results/overhead-capture-linux.json),
-[macOS deltas](bench/results/overhead-delta-macos.json),
-[Linux deltas](bench/results/overhead-delta-linux.json),
-[Linux delta CPU probe](bench/results/overhead-delta-scheduler-linux.json),
-[large-file reuse](bench/results/overhead-lexical-linux.json),
-[oracle results](bench/results/overhead-differential.json), and
-[source/binary/report/archive identities](bench/results/overhead-validation.json).
+Evidence: [macOS CPU/output](bench/results/README.md),
+[Linux CPU/output](bench/results/README.md),
+[macOS capture](bench/results/README.md),
+[Linux capture](bench/results/README.md),
+[macOS deltas](bench/results/README.md),
+[Linux deltas](bench/results/README.md),
+[Linux delta CPU probe](bench/results/README.md),
+[large-file reuse](bench/results/README.md),
+[oracle results](bench/results/README.md), and
+[source/binary/report/archive identities](bench/results/README.md).
 
 ### Incremental admission recovery and streaming view consumption
 
@@ -3196,18 +3229,18 @@ timeouts, Windows cross-compilation, and release/license/toolchain/compatibility
 checks. Decision providers remain local fixtures. The rejected transport build
 has separate 244-case diagnostic logs and is not the distributed product.
 
-Evidence: [qualification and source/binary/archive identities](bench/results/recovery-validation.json),
-[macOS CPU/output](bench/results/recovery-overhead-macos.json),
-[Linux CPU/output](bench/results/recovery-overhead-linux.json),
-[macOS capture repeat](bench/results/recovery-capture-macos-repeat.json),
-[Linux capture](bench/results/recovery-capture-linux.json),
-[macOS consumer](bench/results/recovery-consumer-macos.json),
-[Linux consumer](bench/results/recovery-consumer-linux.json),
-[paired macOS deltas](bench/results/recovery-paired-delta-macos.json),
-[paired Linux deltas](bench/results/recovery-paired-delta-linux.json),
-[older-reference Linux deltas](bench/results/recovery-reference-delta-linux.json),
-[oracle results](bench/results/recovery-differential.json), and
-[pre-optimization diagnostic stacks and driver](bench/results/recovery-profile.json).
+Evidence: [qualification and source/binary/archive identities](bench/results/README.md),
+[macOS CPU/output](bench/results/README.md),
+[Linux CPU/output](bench/results/README.md),
+[macOS capture repeat](bench/results/README.md),
+[Linux capture](bench/results/README.md),
+[macOS consumer](bench/results/README.md),
+[Linux consumer](bench/results/README.md),
+[paired macOS deltas](bench/results/README.md),
+[paired Linux deltas](bench/results/README.md),
+[older-reference Linux deltas](bench/results/README.md),
+[oracle results](bench/results/README.md), and
+[pre-optimization diagnostic stacks and driver](bench/results/README.md).
 
 ### Bounded capture metadata and dense consumer staging
 
@@ -3309,19 +3342,19 @@ builds are separate from all distributed/tested performance binaries. Pinned
 retained reads still omit requests; freshness checks, changed output and retained
 RAM retain their inherent costs. Provider checks remain local fixtures.
 
-Evidence: [source/binary/report/archive qualification](bench/results/bounded-validation.json),
-[dense macOS consumer](bench/results/bounded-consumer-dense-macos.json),
-[dense Linux consumer](bench/results/bounded-consumer-dense-linux.json),
-[macOS deltas](bench/results/bounded-delta-macos.json),
-[Linux deltas and CPU](bench/results/bounded-delta-linux.json),
-[default macOS capture](bench/results/bounded-capture-macos.json),
-[default Linux capture](bench/results/bounded-capture-linux.json),
-[opt-in macOS metadata capture](bench/results/bounded-parallel-macos.json),
-[opt-in Linux metadata capture](bench/results/bounded-parallel-linux.json),
-[rejected automatic prototype](bench/results/bounded-parallel-prototype-macos.json),
-[pre-optimization macOS phases](bench/results/bounded-phases-preopt-macos.json),
-[final diagnostic Linux phases](bench/results/bounded-phases-linux.json), and
-[generated oracle results](bench/results/bounded-differential.json).
+Evidence: [source/binary/report/archive qualification](bench/results/README.md),
+[dense macOS consumer](bench/results/README.md),
+[dense Linux consumer](bench/results/README.md),
+[macOS deltas](bench/results/README.md),
+[Linux deltas and CPU](bench/results/README.md),
+[default macOS capture](bench/results/README.md),
+[default Linux capture](bench/results/README.md),
+[opt-in macOS metadata capture](bench/results/README.md),
+[opt-in Linux metadata capture](bench/results/README.md),
+[rejected automatic prototype](bench/results/README.md),
+[pre-optimization macOS phases](bench/results/README.md),
+[final diagnostic Linux phases](bench/results/README.md), and
+[generated oracle results](bench/results/README.md).
 
 ### Bounded workspace transport and larger strict witness coverage
 
@@ -3439,11 +3472,11 @@ collect, including the new JSON projection regression; they were not executed
 locally. Provider checks remain local fixtures. JSON candidate pruning still
 requires the accounting/validation contract described above.
 
-Evidence: [final source/binary/report/archive qualification](bench/results/transport-validation.json),
-[macOS paired trials](bench/results/transport-macos.json),
-[Linux paired trials](bench/results/transport-linux.json),
-[historical Linux witness experiment](bench/results/transport-linux-expanded-witness-prototype.json), and
-[generated oracle comparisons](bench/results/transport-differential.json).
+Evidence: [final source/binary/report/archive qualification](bench/results/README.md),
+[macOS paired trials](bench/results/README.md),
+[Linux paired trials](bench/results/README.md),
+[historical Linux witness experiment](bench/results/README.md), and
+[generated oracle comparisons](bench/results/README.md).
 
 ### Linear framing and bounded encoder/capture work
 
@@ -3531,12 +3564,12 @@ expired snapshots or incompatible options require a full exact scan or an
 explicit error. This pass preserves the existing guard; it adds no server
 protocol or indexed-pruning performance claim.
 
-Evidence: [qualification and release identities](bench/results/linear-validation.json),
-[macOS transport/profiles](bench/results/linear-macos.json),
-[Linux transport/profiles](bench/results/linear-linux.json),
-[macOS native encoding](bench/results/linear-encoding-macos.json),
-[Linux native encoding](bench/results/linear-encoding-linux.json), and
-[fragmented reader controls](bench/results/linear-framing.json).
+Evidence: [qualification and release identities](bench/results/README.md),
+[macOS transport/profiles](bench/results/README.md),
+[Linux transport/profiles](bench/results/README.md),
+[macOS native encoding](bench/results/README.md),
+[Linux native encoding](bench/results/README.md), and
+[fragmented reader controls](bench/results/README.md).
 
 
 ## Dynamic namespace coverage and tuple delivery
@@ -3590,7 +3623,7 @@ The CLI sends proven necessary literals as ordinary logical `contains` queries o
 `grep.content`. Antfly chooses compatible indexed representations and verifies
 original values before pagination. Mapping the content field with
 `"x-antfly-types": ["text", "substring"]` enables indexed candidate selection.
-The CLI explicitly permits scan fallback; optional `value_search_execution` in
+The CLI explicitly permits scan fallback; optional `execution.value_verification` in
 the table configuration controls `allow_scan`, `max_documents`, `max_bytes`, and
 `max_regex_work`. Server verification budgets apply and
 failures are reported. See the [shared logical-field query design](../../../docs/design/logical-field-queries.md).
@@ -3600,11 +3633,11 @@ branches, unsafe encodings, inversion and modes requiring nonmatching documents
 retain exhaustive query traversal. JSON/statistics retain their existing
 file/byte totals. The older raw-trigram `candidate_index` remains compatible.
 
-[Historical query-planning validation](bench/results/query-planning-validation.json)
+[Historical query-planning validation](bench/results/README.md)
 records the earlier companion-routing binary and its exact validation results;
 it is not qualification of the logical-field server planner.
 
-[Initial logical-field qualification](bench/results/logical-field-validation.json) records
+[Initial logical-field qualification](bench/results/README.md) records
 its implementation commit, source and artifact hashes, and macOS checks:
 253 CLI cases (two skipped), 21 native logical-query checks without leaks,
 143 existing query contracts, compiled error identities, generated SDKs, and 11
@@ -3647,7 +3680,7 @@ charged against the same 16 MiB allocation budget. Verification skips tombstoned
 while advancing over deleted runs. Query output hydration still has its own work;
 zero verification loads does not imply a zero-cost API request.
 
-The [reuse qualification report](bench/results/logical-reuse-validation.json)
+The [reuse qualification report](bench/results/README.md)
 records the exact source and binary identities, before/after workload records,
 validation commands, and measured verification work. Qualification passes 31
 native logical/storage checks without leaks, 143 query contracts, 14 real-server
@@ -3683,7 +3716,7 @@ before eviction. Retired pinned entries and in-flight construction stay within
 the same 16 MiB allocation cap. Named autocomplete uses whole query tokens for
 both built-in analyzer aliases rather than matching shared short index prefixes.
 
-The [streaming qualification](bench/results/logical-stream-validation.json)
+The [streaming qualification](bench/results/README.md)
 compares seven trials per workload/binary over 4,096 documents / 16.9 MB of
 canonical source. All results have exact counts and matching corpus identities.
 
@@ -3743,13 +3776,13 @@ per-round ratios of 0.965–1.048. Both reports are retained. No additional
 regex/JIT path was justified. Native
 Windows runtime and independent storage/CPU qualification remain future work.
 
-Evidence: [macOS namespace](bench/results/namespace-macos.json),
-[Linux namespace](bench/results/namespace-linux.json),
-[macOS tuple delivery/profiles](bench/results/tuple-macos.json),
-[Linux tuple delivery/profiles](bench/results/tuple-linux.json),
-[macOS native encoding control](bench/results/namespace-encoding-macos.json),
-[Linux native encoding control](bench/results/namespace-encoding-linux.json),
-[Linux nine-round repeat](bench/results/namespace-encoding-linux-repeat.json).
+Evidence: [macOS namespace](bench/results/README.md),
+[Linux namespace](bench/results/README.md),
+[macOS tuple delivery/profiles](bench/results/README.md),
+[Linux tuple delivery/profiles](bench/results/README.md),
+[macOS native encoding control](bench/results/README.md),
+[Linux native encoding control](bench/results/README.md),
+[Linux nine-round repeat](bench/results/README.md).
 
 ### Scaling original-value verification
 
@@ -3798,7 +3831,7 @@ These are internal benchmark controls, not public query or CLI options. The
 [design](../../../docs/design/logical-field-queries.md) specifies ownership,
 admission and profile-metric coverage.
 
-The [scalable verification report](bench/results/logical-scalable-validation.json)
+The [scalable verification report](bench/results/README.md)
 pins the implementation, compiler, both optimized server binaries, driver, baseline
 patch and every trial. Protocol 3 records process-CPU quiescence before timing,
 with elapsed-time and Linux CPU-tick tolerance. Earlier observations and the
@@ -3879,7 +3912,7 @@ dataflow contracts, including requirements for a future versioned stored-field
 layout that could avoid validating unrelated source bytes.
 
 
-The [follow-up qualification report](bench/results/logical-cost-validation.json)
+The [follow-up qualification report](bench/results/README.md)
 pins the merged implementation, compiler, source and final binary hashes. It
 retains all 16 primary configurations, a paired Linux repeat, initial variable
 observations, an idle-threshold rejection, all timed trials and CPU/memory data.
@@ -3978,7 +4011,7 @@ I/O. It leaves global caches alone; advice and restart do not guarantee cold
 storage, and startup can warm data again. Use this with the concurrent or both
 suites, including inside CPU/memory constrained Linux containers.
 
-The [source-reader qualification](bench/results/logical-source-validation.json)
+The [source-reader qualification](bench/results/README.md)
 pins implementation `cf71262234`, merged main `f322acc4de`, compiler and binary
 identities, all 60 final configurations, and the preceding diagnostic runs.
 Each scalable comparison below combines 18 warm HTTP trials across two rounds
@@ -4055,7 +4088,7 @@ seeds its size estimate from the first required payload, and skips clock reads
 for rows already buffered. Projection admission, snapshot ownership, work budgets
 and adaptive-window limits retain their existing contracts.
 
-The [substring/startup report](bench/results/substring-bootstrap-validation.json)
+The [substring/startup report](bench/results/README.md)
 records production code at `34091b088b`, following the merge of main
 `dd49f55102`. Its component benchmark rotates the old owned accumulator, current
 owned control and borrowed stream over nine trials on three 180 KiB corpora.
@@ -4111,3 +4144,451 @@ For native ARM64 Linux, add `-Dtarget=aarch64-linux-musl -Dmetal=false
 -Dsystem-blas=false`, then run the resulting executable on Linux. The build-only
 target installs the implementation test partition after its imports finalize;
 installing only the consumer test binary would omit named-dependency tests.
+
+
+The incremental-execution follow-up adds a separate ingestion workload to the
+logical-source benchmark driver. It exercises repetitive text, source-like text
+and seeded distinct words through the real substring index. Requests and typed
+profiles use `execution.value_verification` and `profile.value_verification`.
+For frozen binaries from before that API cleanup, the benchmark-only adapter
+translates those two wire spellings; functional tests always use the public API.
+
+```sh
+python3 zig/pkg/antfly-grep/bench/logical_sources.py \
+  --baseline /path/to/frozen-antfly --candidate /path/to/current-antfly \
+  --grep /path/to/current-antfly-grep --output output/new-qualification \
+  --suite all --rounds 2 --baseline-legacy-value-wire
+```
+
+Use a new output directory for each qualification. The report records artifact
+hashes, fixture hashes, raw HTTP trials, ingestion CPU and wall time, and
+source-reader work. Process restarts do not establish cold-storage performance.
+The execution design and cache-proof limitations are recorded in
+[logical field queries](../../../docs/design/logical-field-queries.md).
+
+
+The [incremental execution qualification](bench/results/README.md)
+records the frozen baseline and candidate binaries, raw trials, source hashes,
+work counters, integration checks and unsuccessful admission attempts. Both
+servers pass 19 integration/upgrade cases, with five opt-in profiling cases
+skipped during correctness runs. Linux correctness and verification/concurrency
+profiles use a 1 GiB limit. The CLI suites run 253 cases on each platform, with
+two macOS skips and 32 Linux platform skips. Debug and ReleaseFast each pass 75
+logical-query and 144 query-contract tests.
+
+These are warm-filesystem measurements on one shared Apple Silicon host; Linux
+runs native ARM64 instructions in a VM. Two alternating rounds retain 18 fresh
+verification trials per corpus and 18/72 request samples for one/four clients.
+HTTP medians in milliseconds are:
+
+| Workload | macOS baseline → candidate | Linux, two CPUs/1 GiB, baseline → candidate |
+|---|---:|---:|
+| Tiny values | 9.42 → 9.73 | 8.99 → 8.44 |
+| Selected 4 KiB values | 11.47 → 11.79 | 13.34 → 13.46 |
+| Dominant selected 16 KiB values | 7.84 → 8.16 | 7.68 → 7.91 |
+| Unselected escaped arrays | 9.41 → 9.41 | 8.56 → 7.68 |
+| Nested source contract | 10.37 → 7.63 | 9.06 → 9.86 |
+| One concurrent client | 6.35 → 5.89 | 9.47 → 9.42 |
+| Four concurrent clients | 9.24 → 8.43 | 39.43 → 38.86 |
+
+The one-CPU Linux control changes one/four-client medians from 9.57/89.05 to
+9.84/88.04 ms. These results are mixed; they do not establish a general latency
+win. Required source-reader exploration is bounded to ten completed provider
+calls under stable caps, and scalar read counts fall from about 16 to 3–4 in
+these workloads. Refused/truncated reads remain untrained, and later probes
+continue to adapt. Direct warm retained counts consume an immutable bitmap lease
+and subtract deletions without allocating a result bitmap or reading sources;
+zero-byte allocator tests and HTTP verification counters cover this component,
+not complete request cost.
+
+For 180 KiB high-distinctness input, matched streamed-token construction changes
+from 9.35 to 8.65 ms on macOS and 11.91 to 11.00 ms on Linux. Maximum tracked
+construction allocation changes from 24.32 to 22.65 MB and 24.18 to 23.48 MB,
+respectively. Other construction cases change little. Every variant preserves
+identical postings digests. These construction-only counters exclude the rest
+of index publication and are distinct from process RSS.
+
+Full substring ingestion remains mixed: macOS repetitive/source-like/distinct
+HTTP medians change from 136.78/119.93/1181.88 to 131.23/122.64/1174.97 ms;
+Linux changes from 204.54/208.57/1418.74 to 231.94/228.53/1467.42 ms.
+The Linux ingestion stress comparison uses equal 8 GiB node envelopes. The
+frozen baseline exhausted its default full-text build slice at 1 and 2 GiB;
+the candidate also failed that stress case at 1 GiB. Both small-node envelopes
+keep this slice at its 128 MiB floor. Raising the node envelope admits a larger
+build slice for timing; it does not establish that the process requires 8 GiB
+RSS or fix low-memory ingestion admission. All failed attempts remain recorded.
+
+The API review retains `remote_snapshot`, including hierarchy-child resumption,
+and `autocomplete`. Verification controls now use `execution.value_verification`
+and profiles use `profile.value_verification`; freshness uses `read_requirements`.
+Removed public lake aliases and `value_search_execution` are rejected. SDKs and
+MCP schemas are regenerated. Complete cached predicate facts remain memory-only;
+validated whole-generation owner proofs allow reuse across equivalent cuts.
+Writes invalidate those proofs. Finer reuse across writes requires maintained
+per-segment source-binding certificates.
+
+
+### Review follow-up: bounded counts and prepared indexing
+
+The [review follow-up qualification](bench/results/grep-review-followup-summary.json)
+supersedes the preceding qualification for the server fixes below. It records
+frozen artifacts, paired trials, exact build commands, source hashes, unsuccessful
+diagnostic attempts, and remaining limits. Raw trials and logs are local ignored
+artifacts, not published downloads. The reference server is unstripped and the
+candidate is stripped; these comparisons do not isolate algorithm-only latency,
+executable-size, or RSS changes.
+
+The Python SDK preserves closed query variants through union decoding, including
+nested Boolean predicates and explicit `minimum_should_match` values. Public
+Boolean lowering preserves those thresholds through distributed execution.
+Supported complete cached Boolean counts borrow immutable membership facts and
+avoid allocating result bitmaps. Sparse negation uses cached cardinality and
+exceptions instead of traversing absent document words: the maximum-domain
+regression falls from 67,108,864 word-program steps to zero for one input and
+three for the nested example. This is bounded component work, not zero request
+cost. Authorization, query parsing, read-cut validation, and requested output
+still run.
+
+Lookup expiry maintenance retires at most eight heap entries plus the requested
+expired key, and frees retired ownership after releasing the cache mutex.
+Optional admission bounds its eviction search. Provider timing hints have a fixed
+capacity and TTL, influence batching only, and never certify predicate membership.
+The distinct-predicate fixture requires source verification on every request.
+
+Prepared text publication now enables the same private postings spill path as
+direct sink construction. Repeated physical-field contributions are grouped in
+stable order, analyzed one group at a time, and spilled before the next group.
+An explicit reclaiming scratch allocator owns transient maps and position
+vectors; encoded results retain separate ownership. The native preparation
+regression uses about 62.6 MiB of tracked build allocation in ReleaseFast under
+a 128 MiB allowance. Its opaque-region allocator regression reduces tracked
+construction peak from 36.8 to 21.6 MiB. These counters exclude process RSS and
+the rest of publication. Private runs use temporary disk scratch; no persistent
+query-result cache is added.
+
+The final server passes 21 integration/upgrade cases on each platform, with six
+opt-in skips. Debug and ReleaseFast each pass 84 logical-query, 144 query-contract,
+and 44 introducer cases plus the focused preparation regression, with no leaks;
+667 SDK tests and generation consistency pass. Linux additionally passes the
+actual ingestion fixture with two CPUs, 1 GiB RAM and swap disabled. That resolves
+the small-node admission failure recorded in the preceding qualification.
+
+Two alternating warm-filesystem rounds on this shared Apple Silicon host produce
+these HTTP medians in milliseconds. Linux uses native ARM64 instructions in the
+VM, two CPUs and 1 GiB for retrieval/concurrency; paired ingestion uses equal
+8 GiB envelopes. The separate 1 GiB check establishes candidate admission, not
+performance equivalence under the smaller envelope.
+
+| Workload | macOS reference → candidate | Linux reference → candidate |
+|---|---:|---:|
+| Tiny values | 7.65 → 6.93 | 9.22 → 9.76 |
+| Selected 4 KiB values | 9.50 → 9.76 | 14.97 → 15.45 |
+| Dominant selected 16 KiB values | 5.95 → 5.87 | 7.72 → 7.79 |
+| Unselected escaped arrays | 6.71 → 7.98 | 9.10 → 8.41 |
+| Nested source contract | 7.49 → 7.92 | 10.79 → 9.84 |
+| One concurrent client | 5.11 → 5.27 | 11.38 → 12.21 |
+| Four concurrent clients | 9.56 → 9.88 | 47.16 → 49.09 |
+| Repetitive ingestion | 148.20 → 146.21 | 363.70 → 358.85 |
+| Source-like ingestion | 133.68 → 140.83 | 388.94 → 384.64 |
+| Distinct-word ingestion | 1390.44 → 1572.54 | 1935.62 → 2113.11 |
+
+Results are mixed. Bounded spill fixes admission and reduces scratch retention,
+but distinct-word ingestion takes about 13% longer on macOS and 9% longer on
+Linux in this comparison. These trials establish neither a general latency win
+nor an RSS reduction. Process restarts and fixture-file cache advice do not
+establish cold-device performance.
+
+The broader cost target still requires coordinator-owned request-wide verification
+grants and maintained per-segment source-binding certificates. Current budgets
+remain per shard request, and writes invalidate whole-generation proofs. The
+[execution design](../../../docs/design/logical-field-queries.md) records ownership,
+fallback behavior, and the required fences for those remaining changes.
+
+### Postings runs and retained result pages
+
+The [postings/page qualification](bench/results/grep-postings-pages-summary.json)
+compares matched ReleaseFast, stripped server builds with the same compiler.
+It supersedes the preceding server qualification for these changes; the
+standalone CLI and its dependency sources are unchanged. Raw trials and logs
+remain local ignored artifacts. These measurements use a warm filesystem on
+one shared Apple Silicon host and its ARM64 Linux VM.
+
+Default postings runs retain the 8 MiB trigger on small managed build slices.
+Larger slices can use up to 64 MiB, based on advisory live headroom; ordinary
+resource admission still governs allocations. Pressure spills the largest fields
+first and retains tiny companions. The private run's lazy read cache increases
+from 64 to 512 KiB, with four-way lookup. The sixteen-cursor component regression
+performs 2,048 logical reads with 32 physical reads. This work bound is separate
+from end-to-end ingestion performance. Runs remain temporary disk scratch,
+unlinked while open on POSIX; query membership facts remain memory-only.
+
+Complete immutable memberships remain borrowed through constant-score pages,
+ranked include/exclude gates, and native sorted pagination. Captured deletion
+masks are subtracted word by word; sparse iteration seeks over unrelated mask
+ranges, and dense deletion skips check cancellation. Misses and unsupported
+Boolean shapes retain owned execution. Consumers still allocate requested
+output and capture deletion state. This removes avoidable bitmap copies, not
+the cost of parsing, authorization, read-cut validation, and presentation.
+
+Source windows use their already-leased segment reader for identity lookup.
+Separate opt-in diagnostic runs attribute key lookup, provider work, revision
+lookup, directory reads/planning, selected ranges, reconstruction, and fallback.
+For reproduction, pass frozen server binaries to the benchmark driver:
+
+```sh
+python3 zig/pkg/antfly-grep/bench/logical_sources.py \
+  --baseline /path/to/reference/antfly --candidate /path/to/candidate/antfly \
+  --grep /path/to/antfly-grep --suite all --rounds 2 \
+  --output output/grep-postings-paired
+python3 zig/pkg/antfly-grep/bench/logical_sources.py \
+  --baseline /path/to/reference/antfly --candidate /path/to/candidate/antfly \
+  --grep /path/to/antfly-grep --suite hints --source-phases --rounds 1 \
+  --output output/grep-postings-phase-diagnostic
+```
+
+Use a separate directory for each run; the driver refuses to overwrite evidence.
+Run the `pages` diagnostic suite separately to inspect membership ownership.
+Ordinary benchmark requests enable the public query profile, including the
+top-level lookup/ownership counters. Extra physical-source phase clocks and log
+capture are opt-in; those diagnostic timings are not pooled with ordinary
+latency trials. The
+retained-page fixture covers early, middle, and final dense/sparse pages over
+16,384 documents and requires zero source re-verification on measured pages.
+
+Maintained source-binding certificates across writes and coordinator-owned
+verification grants remain unimplemented. Existing whole-generation proofs and
+per-shard request budgets remain authoritative. The
+[execution design](../../../docs/design/logical-field-queries.md) records the
+publication, mutation, repair, restart, capacity, and lifetime fences needed for
+those changes.
+
+Qualification passes 21 integration/upgrade cases on each platform (seven opt-in
+skips), 215 selected search/storage tests in both Debug and ReleaseFast (one
+skip), 89 logical-query and 144 query-contract cases in Debug, and 46 introducer
+cases in both modes. Allocation-failure and ownership checks report no leaks.
+The separate Linux ingestion check passes with two CPUs, 1 GiB RAM and swap
+disabled. Paired Linux retrieval uses two CPUs/1 GiB; paired ingestion uses equal
+8 GiB envelopes with swap disabled.
+
+Two alternating primary rounds produce these HTTP medians in milliseconds:
+
+| Workload | macOS reference → candidate | Linux reference → candidate |
+|---|---:|---:|
+| Tiny values | 11.74 → 12.49 | 12.73 → 13.63 |
+| Selected 4 KiB values | 14.71 → 19.68 | 24.13 → 23.86 |
+| Dominant selected values | 8.94 → 10.36 | 10.41 → 14.59 |
+| Unselected escaped arrays | 11.47 → 11.24 | 14.70 → 12.05 |
+| Nested source | 11.78 → 12.64 | 15.90 → 15.24 |
+| One concurrent client | 8.35 → 8.23 | 15.34 → 15.25 |
+| Four concurrent clients | 18.13 → 16.30 | 69.91 → 67.85 |
+| Fresh distinct predicates | 82.12 → 69.00 | 85.45 → 78.85 |
+| Repetitive ingestion | 259.29 → 184.80 | 1093.69 → 728.92 |
+| Source-like ingestion | 213.83 → 197.79 | 1561.50 → 846.28 |
+| Distinct-word ingestion | 2522.38 → 2118.94 | 7344.83 → 3470.95 |
+
+Linux distinct-word ingestion reduces process read characters from 205.9 to
+128.4 MB and process write bytes from 96.6 to 75.3 MB (about 38% and 22%). Its
+process CPU median falls from 3.71 to 2.95 seconds. These are process I/O
+counters on a warm filesystem, not cold-device bandwidth measurements.
+Ingestion improves in these trials; retrieval remains mixed, including slower
+selected-value cases. No general latency or RSS improvement is established.
+
+The primary cached-page trials were also mixed and showed some larger macOS
+slowdowns. A post-hoc four-round page repeat, kept separate from those primary
+trials, produced the following HTTP medians. It did not reproduce the large
+late-page slowdown, and it does not establish a consistent page-latency win.
+
+| Cached page | macOS reference → candidate | Linux reference → candidate |
+|---|---:|---:|
+| Dense, first | 153.86 → 169.17 | 216.30 → 218.55 |
+| Dense, middle | 162.54 → 162.55 | 225.58 → 219.74 |
+| Dense, final | 154.98 → 152.31 | 218.20 → 222.35 |
+| Sparse, first | 23.51 → 27.37 | 20.20 → 19.31 |
+| Sparse, middle | 24.15 → 22.86 | 20.33 → 20.41 |
+| Sparse, final | 24.63 → 25.82 | 19.14 → 20.24 |
+
+On each platform, the candidate page diagnostics record 90 successful segment
+borrows across 18 page requests, zero membership copies, and zero source
+re-verification. This establishes the ownership/work bound independently of
+latency. Dense-deletion regressions check a million-document domain, wordwise
+skipping, cancellation, sparse seeks and upper-bound clipping.
+
+Fresh-predicate diagnostics identify revision lookup (median component times
+27.3–27.5 ms) and selected-range reads (15.8–18.1 ms) as the main source costs in
+that fixture. Identity lookup is only 30–51 μs; directory reads take 6.3–6.7 ms.
+These component medians are diagnostic observations, not additive attribution
+of every workload. Batched revision/source validation and maintained binding
+certificates are better next targets than enlarging an identity cache.
+
+
+### Decisions transport qualification
+
+`bench/decision_transport.py` now compares the public single-input Decisions
+contract, native Antfly batches, and versioned shared contexts. It uses local
+constant-score fixtures, alternating trial order, binary/source hashes, and
+output equivalence; it never contacts a model. Use `--transport single` or
+`--transport shared-v1`, with `--baseline-transport antfly-batch`. To isolate
+transport from code changes, pass the same binary as candidate and baseline.
+`--cache` measures warmed decision caches; `--keep-alive` enables persistent
+fixture connections. Write raw JSON under ignored `output/`, not this directory.
+Protocol compatibility, fewer bytes or requests, and cache hits do not establish
+model quality, provider token charges, or a universal latency advantage.
+
+
+The [Decisions client qualification](bench/results/grep-decisions-client-summary.json)
+records artifact hashes, conformance checks, and three alternating trials per
+transport on macOS and the ARM64 Linux VM. In the 512-line constant-score fixture,
+all modes preserve 513 evaluations and identical output. Shared contexts reduce
+request bodies from 10,548,999 to 1,412,265 bytes (86.6%) with 65 requests;
+common single-input Decisions needs 513 requests. Warmed caches require zero
+provider requests in both protocols. These are protocol byte/request measurements,
+not provider token costs or a claim that complete searches are free.
+
+
+## Visual decision search
+
+Use the same Decisions endpoint and credentials with explicit image mode:
+
+```sh
+antfly-grep --provider antfly --model VISION_DECIDER \
+  --media images --ask 'Does this show a failed checkout?' --json ./screenshots
+antfly-grep --provider antfly --model VISION_DECIDER \
+  --media images --ask 'Which slide shows declining revenue?' --table-config tables.json
+```
+
+Local PNG/JPEG/WebP/GIF files are whole-image units. Indexed
+[document v2](schema/document-v2.json) adds page/slide/image manifests and
+revision-bound inline image fields on the same parent row. The configured
+`document_field` selects v1 or v2 sources; text mode remains the default. DocsAF
+`ToEvidenceRecord` can construct v2 source records with explicit ACL metadata.
+PDF/slide rendering and Cloud Drive synchronization belong to ingestion.
+
+Visual mode sends one ordered text/image evidence message per unit, with multiple
+questions sharing that image. JSON evidence records identify the unit, page/slide,
+source revision, image digest and recipe; they contain no invented line numbers
+or bounding boxes. Counts refer to matching visual units. The provider must
+support image Decisions; native text-only models, lexical prefilters, triage,
+stdin and workspace media are rejected. Antfly multimodal batches and shared text
+contexts preserve images; explicit single-input transport remains available for
+custom services.
+
+Default image limits are 512 KiB and 16,777,216 pixels. Adjust
+`--max-image-bytes SIZE` (maximum 768 KiB) / `--max-image-pixels N`; the 1 MiB
+serialized Decisions evidence cap still applies. Images are inspected without
+raster decoding. Budget errors retain completed partial results and exit 2.
+Cached scores avoid repeat inference; indexed media is freshly authorized and
+validated before every cache lookup. Grep never fetches arbitrary provider URLs.
+See the [design](../../../docs/design/antfly-grep.md#multimodal-source-evidence-and-cloud-boundary-2026-10-21)
+and [Cloud delivery issue](https://github.com/antflydb/colony/issues/790) for the
+private asset, ACL and connector lifecycle requirements. Cloud connector work is
+not included in this CLI implementation; fixture tests do not establish visual
+model quality.
+
+
+Visual evaluations use waves capped at 16 units and 8 MiB conservative evidence.
+Indexed waves fetch distinct same-parent image fields together with one fresh
+authorized ID query; these point reads create no pagination snapshots. The
+manifest scan keeps its retained snapshot and ascending-ID order. Identical asset
+references share validated bytes within a wave, and successful siblings survive
+refusal, malformed item answers and oversized-batch partition failures. Warm
+scores still require current asset authorization, revision and digest validation.
+Local `--max-filesize` filtering and hard `--max-file-size` limits apply before
+inference. Quiet mode respects file selection, including `--files-without-match`.
+
+The [visual batching qualification](bench/results/grep-visual-batching-summary.json)
+compares the prior PR binary with this implementation using eight distinct
+same-parent images, five alternating trials and 20 ms artificial delay per HTTP
+request. Cold requests drop from 17 to 3 (8 to 1 Decisions; 9 to 2 index queries),
+and warm requests from 9 to 2 with no inference. Median elapsed time was
+468 to 108 ms cold / 232 to 66 ms warm on macOS, and 389 to 78 ms cold /
+224 to 49 ms warm in the two-CPU, 1-GiB ARM64 Linux VM. These synthetic delays
+measure transport shape, not live-provider speed or model-token savings.
+That historical qualification uses one parent. The follow-up below adds
+cross-parent scheduling. Reproduce with `bench/visual_batches.py --help`; raw trial reports remain in ignored `output/`.
+
+
+Cross-parent visual search now groups up to eight equal-shape parent projections,
+coalesces Decisions across bounded worker lanes, and retains ordered output and
+per-parent authorization/revision/digest checks. Asset-size rejection falls back
+to individual parents; oversized per-parent field groups split adaptively. A
+borrowed asset page covers one evaluation wave, then later waves authorize again.
+Explicit finite budgets and early-selection modes retain serial admission; the
+default request safety cap remains shared across every HTTP attempt. Active
+parents can increase RSS: concurrency is a latency/throughput tradeoff, not a
+claim that every workload uses less memory.
+
+`bench/visual_batches.py --parents 8 --units 1` measures separate documents;
+`--parents 20 --units 8` crosses pages and windows, and `--image-bytes 262144`
+adds valid PNG payloads to exercise larger transfers. Five alternating paired
+trials record exact output equivalence, HTTP counts, child CPU/wall time, first
+stdout and peak RSS. Use pinned baseline/current binaries and write raw reports
+to ignored `output/`. Live model tokens, prices and relevance remain unmeasured.
+
+The [cross-parent qualification](bench/results/grep-cross-parent-summary.json)
+records the final binaries and all four workload shapes. For eight separate
+documents, total requests fall from 17 to 3 cold and 9 to 2 warm:
+
+| Host | Cold median, baseline → current | Warm median, baseline → current |
+|---|---:|---:|
+| macOS ARM64 | 454 → 110 ms | 234 → 68 ms |
+| Linux ARM64 VM, 2 CPUs / 1 GiB | 418 → 78 ms | 224 → 53 ms |
+
+These are loopback fixtures with 20 ms artificial delay per HTTP request. With
+256 KiB images, peak RSS rises from 7.8 to 16.9 MiB on macOS and 8.5 to 18.8 MiB
+in the Linux VM. Cold tiny-input CPU time also rises from 11 to 29 ms in that VM.
+Unranked first-output latency is similar or slightly worse despite lower total
+time; results still arrive before later provider work finishes. The report
+includes CPU, RSS and first-output figures rather than implying universal cost
+or latency improvements. Live provider cost and relevance remain unmeasured.
+
+The scalar source-proof cache now admits one cold entry with CLOCK eviction
+instead of clearing all 4,096 entries, retaining 4,095 existing facts. Proof
+lookup and registration take one lock per bounded window of up to 64 rows.
+Epoch, owner and publication checks still fence reuse; a cached fact never
+authorizes an asset or substitutes for a complete predicate certificate.
+
+
+Cross-parent workers now refill as each lane completes, with a fixed 16-slot
+ordered completion buffer and the existing global pending-output quota. Shared
+asset responses retire after their last wave borrower. Ordinary parsed strings
+borrow their retained response, removing a second base64-string allocation;
+response bytes count toward the page memory limit. Image-wave scratch has a
+shared 64 MiB conservative admission budget, separate from cumulative source
+bytes and provider concurrency. This is an admission estimate, not an RSS cap.
+
+Fallback asset reads use the invocation's request counter and cancellation token.
+The default 1,000-request cap applies to all index and provider attempts across
+lanes. Default-budget image searches can overlap a manifest page only when
+conservative current-page retry/split headroom remains; explicit finite budgets
+and text-stage searches keep serial metadata admission. Server-owned conditional
+source identities remain [future API work](../../../docs/design/antfly-grep.md#future-generic-conditional-source-projection); warm images still receive full byte validation.
+
+The [rolling-evidence qualification](bench/results/grep-rolling-evidence-summary.json)
+compares this implementation with the preceding cross-parent binary. In a
+128-image workload (eight parents, sixteen 256 KiB images each), both use 17
+index requests. Cold peak RSS falls from 154.4 to 58.6 MiB on macOS and 150.9 to
+92.8 MiB in the two-CPU/1-GiB Linux VM. Warm peak RSS falls from 98.7 to 24.3 MiB
+and 122.9 to 41.1 MiB respectively. Cold elapsed medians are 420→436 ms on macOS
+and 489→432 ms in the VM; warm medians rise from 181→210 ms and 202→235 ms.
+Memory admission therefore trades some warm latency for a smaller working set.
+The slow-parent fixture improves cold elapsed time by about 6% on both hosts;
+ordinary workloads and CPU/first-output metrics do not improve uniformly.
+These fixtures impose 20 ms HTTP delays and synthetic constant scores; they
+establish no live-provider token savings or universal performance guarantee.
+
+Final validation passed 282/284 CLI cases on macOS and 281/284 in the Linux VM
+(two/three platform skips), 24 media regressions, 25 real-server cases (seven
+opt-in benchmark skips), package units, 31 packaging tests, 35 boundary-checker
+regressions and Windows cross-compilation. The server integration uses the
+previously frozen native server. Raw trials remain in ignored local output;
+the compact report records binary hashes, CPU, RSS, first output and limitations.
+
+Main was subsequently merged through `eb5145c3b5` (#1259). After that merge and
+the additional failed-drain lifetime regression, the rebuilt final CLI passed
+283/285 cases on macOS and 282/285 in Linux (two/three platform skips), including
+25 media cases and Linux's wide-repository watcher under a 256-descriptor limit.
+The merged native DB suite passed four tests with zero leaks; all five registry
+cases and Windows cross-compilation passed. The report records these final
+validation hashes separately; its performance measurements remain pinned to the
+earlier measured binaries. Failed deferred drains join and discard remaining
+borrowers before retiring any manifest page, including failures inside cleanup.

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 pub const split_bench_root = "pkg/antfly/src/split_bench_root.zig";
 pub const wal_bench_root = "pkg/antfly/src/wal_bench_root.zig";
@@ -41,6 +41,8 @@ pub const AddBenchmarksOptions = struct {
     antfly_test_mod: *std.Build.Module,
     run_lib_ha_compat_tests: *std.Build.Step.Run,
     compiled_recall_tests: *std.Build.Step.Compile,
+    conformance_fetch: bool,
+    conformance_fixtures: []const u8,
 };
 pub const AddBenchmarksResult = struct {
     recall_ci_test_step: *std.Build.Step,
@@ -952,22 +954,51 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     // release-scale regressions, then reuse the cached artifact for the recall
     // phase instead of paying its compile cost on the recall critical path.
 
+    // Recall datasets are hash-pinned in testdata/vectorsets.manifest.json and
+    // fetched into the shared conformance fixture cache instead of living in
+    // every checkout. -Dconformance-fetch=false makes missing files fail.
+    const vectorsets_dir = b.pathJoin(&.{ options.conformance_fixtures, "antfly-vectorsets" });
+    const fetch_vectorsets = b.addSystemCommand(&.{"python3"});
+    fetch_vectorsets.setName("fetch hash-pinned recall vectorsets");
+    fetch_vectorsets.addFileArg2(b.path("tools/fetch_vectorsets.py"), .{ .make_absolute = true });
+    fetch_vectorsets.addArg("--manifest");
+    fetch_vectorsets.addFileArg2(b.path("testdata/vectorsets.manifest.json"), .{ .make_absolute = true });
+    fetch_vectorsets.addArgs(&.{ "--dest", vectorsets_dir });
+    if (!options.conformance_fetch) fetch_vectorsets.addArg("--no-fetch");
+    // Re-verify the cache on every run; hashing 140 MB is cheap and keeps a
+    // corrupted or partially deleted cache from passing.
+    fetch_vectorsets.has_side_effects = true;
+    fetch_vectorsets.stdio = .inherit;
+
+    // RaBitQ parity lives in lib/vector, whose ordinary test binary is filtered
+    // to cancellation checks; run it here against the same datasets.
+    const quantizer_recall_tests = b.addTest(.{
+        .name = "vector-quantizer-recall-test",
+        .root_module = vector_mod,
+        .filters = &.{"RaBitQuantizer recall matches Go fixture subset"},
+    });
+
     const run_recall_checks = b.addSystemCommand(&.{"python3"});
-    run_recall_checks.setName("run storage and per-metric recall checks concurrently");
+    run_recall_checks.setName("run storage, quantizer, and per-metric recall checks concurrently");
     run_recall_checks.addFileArg2(b.path("tools/run_recall_checks.py"), .{ .make_absolute = true });
     run_recall_checks.addArg("--test-executable");
     run_recall_checks.addArtifactArg2(compiled_recall_tests, .{ .make_absolute = true });
+    run_recall_checks.addArg("--quantizer-test-executable");
+    run_recall_checks.addArtifactArg2(quantizer_recall_tests, .{ .make_absolute = true });
     run_recall_checks.addArg("--harness-executable");
     run_recall_checks.addArtifactArg2(recall_harness, .{ .make_absolute = true });
-    run_recall_checks.addArg("--dataset-dir");
-    run_recall_checks.addDirectoryArg2(b.path("testdata/vectorsets"), .{ .make_absolute = true });
+    run_recall_checks.addArgs(&.{ "--dataset-dir", vectorsets_dir });
+    run_recall_checks.has_side_effects = true;
+    run_recall_checks.step.dependOn(&fetch_vectorsets.step);
     run_recall_checks.stdio = .inherit;
     run_recall_checks.step.max_rss = 12 * 1024 * 1024 * 1024;
     const recall_ci_test_step = b.step(
-        "antfly-recall-test",
-        "Run storage-backed and per-metric recall checks concurrently",
+        "antfly-recall-conformance",
+        "Fetch hash-pinned vectorsets and run storage, quantizer, and per-metric recall checks",
     );
     recall_ci_test_step.dependOn(&run_recall_checks.step);
+    // Deprecated name kept so in-flight scripts and branches keep working.
+    b.step("antfly-recall-test", "Deprecated alias for antfly-recall-conformance").dependOn(recall_ci_test_step);
 
     return .{
         .recall_ci_test_step = recall_ci_test_step,

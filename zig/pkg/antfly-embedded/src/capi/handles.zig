@@ -68,6 +68,8 @@ pub const Handle = struct {
     maintenance_references: usize = 0,
     maintenance_publication: ?*@import("lite_connection.zig").PreparedPublication = null,
     maintenance_owner: ?*@import("lite_connection.zig").Owner = null,
+    /// Live coordinator only; detached provider snapshots never drive groups.
+    lite_scheduling_owner: ?*@import("lite_connection.zig").Owner = null,
     maintenance_writer_lease: ?lite_backend.native.PathWriterLock = null,
     maintenance_writer_references: usize = 0,
     maintenance_admission_mutex: std.Io.Mutex = .init,
@@ -94,6 +96,9 @@ pub const Handle = struct {
     owned_lite_runtime: ?db_mod.background_runtime.BackendRuntimeHandle = null,
     owned_lite_resource_manager: @FieldType(db_mod.OpenOptions, "resource_manager") = null,
     lite_profile: ?lite_backend.Profile = null,
+    /// Directory-backed native handles also restore managed remote providers.
+    /// Hosted handles retain their explicitly supplied execution surface.
+    embedded_native_providers: bool = false,
     lite_inference_status: ?lite_backend.InferenceStatus = null,
     storage_owner_path: ?[]u8 = null,
     storage_owner_managed_config: local_write.OwnerManagedConfig = .{},
@@ -133,7 +138,7 @@ pub const Handle = struct {
     api_lock: std.Io.RwLock = .init,
     write_mutex: std.Io.Mutex = .init,
     maintenance_mutex: std.Io.Mutex = .init,
-    promotion_commit_mutex: std.Io.Mutex = .init,
+    sql_commit_mutex: std.Io.Mutex = .init,
 
     pub fn database(self: *Handle) *db_mod.DB {
         return self.selected_db orelse &self.db;
@@ -231,6 +236,23 @@ pub fn invalidateQueryProducer(handle: *Handle) void {
 pub fn closeHandle(handle: *Handle) void {
     const io_lifetime_lease = handle.io_lifetime_lease;
     defer if (io_lifetime_lease) @import("io_lifetime.zig").release();
+    if (handle.lite_connection == null and handle.parent_id == null and handle.db_live) {
+        handle.db.deactivateResolverReplayRuntimes();
+        // Each worker can resolve/open another table while joining. Select
+        // under the catalog mutex and restart after every join; never retain
+        // an iterator across a callback that can grow the table map.
+        while (true) {
+            handle.embedded_table_open_mutex.lockUncancelable(handleLockIo());
+            var pending: ?*db_mod.DB = null;
+            var tables = handle.embedded_tables.valueIterator();
+            while (tables.next()) |table| if (table.*.db.resolver_workers_enabled) {
+                pending = &table.*.db;
+                break;
+            };
+            handle.embedded_table_open_mutex.unlock(handleLockIo());
+            if (pending) |database| database.deactivateResolverReplayRuntimes() else break;
+        }
+    }
     invalidateQueryProducer(handle);
     if (handle.lite_connection) |connection| {
         connection.close();

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // GET /connections — configured external connections.
 //
@@ -38,6 +38,7 @@ const runtime_memory_abi = @import("runtime_memory_abi");
 const backups_api = @import("backups.zig");
 
 const Allocator = std.mem.Allocator;
+const RequestContext = @import("antfly_inference_execution_context").RequestContext;
 
 pub const ConnectionKind = enum {
     inference,
@@ -65,6 +66,12 @@ pub const ConnectedModel = struct {
     display_name: ?[]const u8 = null,
     dimensions: ?u32 = null,
     configured: ?bool = null,
+    capabilities: ?[]const []const u8 = null,
+    inputs: ?[]const []const u8 = null,
+    /// Canonical public gateway identity, independent of physical transport.
+    id: ?[]const u8 = null,
+    availability: []const u8 = "unknown",
+    freshness: []const u8 = "cached",
 };
 
 pub const InferenceConnection = struct {
@@ -200,6 +207,7 @@ pub const LocalInferenceConnectionTarget = inference_connection_abi.Target;
 const RemoteInferenceConnection = struct {
     url: []const u8,
     api_key: ?[]const u8,
+    preserve_api_path: bool = false,
 };
 
 const ResolvedInferenceConnection = union(enum) {
@@ -236,6 +244,49 @@ pub fn invokeInferenceConnection(
     deadline_ns: u64,
     stream: runtime_http_abi.StreamSink,
 ) !InvokeResult {
+    return invokeInferenceConnectionWithMethod(alloc, http, node_config, local_target, secret_store, connection_id, operation, body, cancellation, deadline_ns, stream, .post);
+}
+
+/// Request transport metadata is separate from operation identity and JSON.
+pub const InvocationRequest = struct {
+    attempt_observer: ?httpx.AttemptObserver = null,
+    content_type: []const u8 = "application/json",
+    query: ?[]const u8 = null,
+    body_source: runtime_http_abi.RequestBodySource = .{},
+};
+
+pub fn invokeInferenceConnectionWithMethod(
+    alloc: Allocator,
+    http: ?*httpx.Client,
+    node_config: ?*const common_config.Config,
+    local_target: ?LocalInferenceConnectionTarget,
+    secret_store: ?*common_secrets.FileStore,
+    connection_id: []const u8,
+    operation: []const u8,
+    body: []const u8,
+    cancellation: ?httpx.CancellationToken,
+    deadline_ns: u64,
+    stream: runtime_http_abi.StreamSink,
+    method: runtime_http_abi.HttpMethod,
+) !InvokeResult {
+    return invokeInferenceConnectionWithRequest(alloc, http, node_config, local_target, secret_store, connection_id, operation, body, cancellation, deadline_ns, stream, method, .{});
+}
+
+pub fn invokeInferenceConnectionWithRequest(
+    alloc: Allocator,
+    http: ?*httpx.Client,
+    node_config: ?*const common_config.Config,
+    local_target: ?LocalInferenceConnectionTarget,
+    secret_store: ?*common_secrets.FileStore,
+    connection_id: []const u8,
+    operation: []const u8,
+    body: []const u8,
+    cancellation: ?httpx.CancellationToken,
+    deadline_ns: u64,
+    stream: runtime_http_abi.StreamSink,
+    method: runtime_http_abi.HttpMethod,
+    request: InvocationRequest,
+) !InvokeResult {
     const resolved = try resolveInferenceConnection(node_config, local_target, connection_id, operation);
     if (resolved == .local) {
         const target = resolved.local;
@@ -263,6 +314,10 @@ pub fn invokeInferenceConnection(
             .deadline_ns = deadline_ns,
             .stream = stream,
             .out_response = &response,
+            .method = method,
+            .query = .init(request.query),
+            .content_type = .init(request.content_type),
+            .body_source = request.body_source,
         });
         if (!status.isOk()) {
             response.deinit(&abi_alloc);
@@ -285,26 +340,64 @@ pub fn invokeInferenceConnection(
     const remote = resolved.remote;
     const raw_url = remote.url;
     const base = std.mem.trimEnd(u8, raw_url, "/");
-    const prefix = if (std.mem.endsWith(u8, base, "/ai/v1")) base else try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{base});
-    defer if (prefix.ptr != base.ptr) alloc.free(prefix);
-    const url = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
+    const prefix = try inferenceApiBaseAlloc(alloc, remote);
+    defer alloc.free(prefix);
+    const operation_url = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "{s}/ml/v1/{s}", .{ std.mem.trimEnd(u8, base[0 .. base.len - (if (std.mem.endsWith(u8, base, "/ai/v1")) @as(usize, 6) else 0)], "/"), operation[3..] }) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
+    defer alloc.free(operation_url);
+    const url = if (request.query) |query| try std.fmt.allocPrint(alloc, "{s}?{s}", .{ operation_url, query }) else try alloc.dupe(u8, operation_url);
     defer alloc.free(url);
 
     const resolved_key = try resolveInferenceApiKey(alloc, secret_store, remote.api_key);
     defer if (resolved_key) |key| alloc.free(key);
     const auth = if (resolved_key) |key| try std.fmt.allocPrint(alloc, "Bearer {s}", .{key}) else null;
     defer if (auth) |value| alloc.free(value);
+    const timeout_ms = try remainingInferenceInvocationMs(deadline_ns, platform_time.monotonicNs());
+    const timeout_header = try std.fmt.allocPrint(alloc, "{d}", .{timeout_ms});
+    defer alloc.free(timeout_header);
     const headers = if (auth) |value| &[_][2][]const u8{
         .{ "Authorization", value },
-        .{ "Content-Type", "application/json" },
-    } else &[_][2][]const u8{.{ "Content-Type", "application/json" }};
-
-    const timeout_ms = try remainingInferenceInvocationMs(deadline_ns, platform_time.monotonicNs());
-    var response = try (http orelse return error.InferenceTransportUnavailable).request(.POST, url, .{
+        .{ "Content-Type", request.content_type },
+        .{ "X-Antfly-Inference-Attempts-Remaining", "1" },
+        .{ "X-Antfly-Inference-Timeout-Ms", timeout_header },
+    } else &[_][2][]const u8{ .{ "Content-Type", request.content_type }, .{ "X-Antfly-Inference-Attempts-Remaining", "1" }, .{ "X-Antfly-Inference-Timeout-Ms", timeout_header } };
+    if (stream.start != null and stream.write != null and stream.close != null) {
+        var writer = @import("antfly_local_sources").common_provider_registry.tasks.StreamWriter{ .sink = stream };
+        var response = try (http orelse return error.InferenceTransportUnavailable).requestToWriter(switch (method) {
+            .get => .GET,
+            .post => .POST,
+            .put => .PUT,
+            .delete => .DELETE,
+            .patch => .PATCH,
+        }, url, .{
+            .headers = headers,
+            .attempt_observer = request.attempt_observer,
+            .borrowed_body = if (request.body_source.read == null) body else null,
+            .body_stream = if (request.body_source.read != null) .{ .context = @constCast(&request.body_source), .read = readInvocationBody } else null,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
+        }, &writer, null, null);
+        defer response.deinit();
+        try writer.close();
+        return .{ .status = response.status.code, .body = try alloc.dupe(u8, "") };
+    }
+    var response = try (http orelse return error.InferenceTransportUnavailable).request(switch (method) {
+        .get => .GET,
+        .post => .POST,
+        .put => .PUT,
+        .delete => .DELETE,
+        .patch => .PATCH,
+    }, url, .{
         .headers = headers,
+        .attempt_observer = request.attempt_observer,
         .body = body,
         .timeout_ms = timeout_ms,
         .cancellation = cancellation,
+        .max_retries = 0,
+        .follow_redirects = false,
+        .cookies_enabled = false,
     });
     defer response.deinit();
     const response_body = try alloc.dupe(u8, response.body orelse "");
@@ -324,6 +417,22 @@ pub fn invokeInferenceConnection(
         .retry_after = retry_after,
         .content_type = content_type,
     };
+}
+
+fn readInvocationBody(raw: *anyopaque, dest: []u8) !usize {
+    const source: *const runtime_http_abi.RequestBodySource = @ptrCast(@alignCast(raw));
+    var count: usize = 0;
+    switch (source.read.?(source.context, dest.ptr, dest.len, &count)) {
+        .ok => {},
+        .canceled => return error.Canceled,
+        .timeout => return error.Timeout,
+        .body_too_large => return error.BodyTooLarge,
+        .body_capacity_exceeded => return error.BodyCapacityExceeded,
+        .end_of_stream => return 0,
+        .failed => return error.BodyReadFailed,
+    }
+    if (count > dest.len) return error.BodyReadFailed;
+    return count;
 }
 
 pub fn inferenceInvocationDeadlineNs() u64 {
@@ -349,6 +458,22 @@ fn resolveInferenceConnection(
     }
 
     const config = node_config orelse return error.ConnectionNotFound;
+    if (std.mem.startsWith(u8, connection_id, "transcribers/")) {
+        const cfg = config.transcribers.getConfig(connection_id["transcribers/".len..]) catch return error.ConnectionNotFound;
+        if (cfg.provider != .antfly) return error.ProviderNotAntflyCompatible;
+        // Preserve the alias identity even when it inherits the runtime URL.
+        // Only the actual process-local target delegates admission locally.
+        const uses_default = cfg.resolvedUrl() == null;
+        if (uses_default) if (local_target) |target| return .{ .local = target };
+        const url = cfg.resolvedUrl() orelse config.inference.api_url orelse return error.ConnectionURLMissing;
+        if (!validInferenceURL(url)) return error.InvalidConnectionURL;
+        return .{ .remote = .{ .url = url, .api_key = cfg.bearer_token orelse cfg.api_key orelse (if (uses_default) config.inference.api_key else null), .preserve_api_path = !uses_default } };
+    }
+    if (std.mem.eql(u8, connection_id, common_config.default_inference_connection_id)) {
+        const url = config.inference.api_url orelse return error.ConnectionNotFound;
+        if (!validInferenceURL(url)) return error.InvalidConnectionURL;
+        return .{ .remote = .{ .url = url, .api_key = config.inference.api_key } };
+    }
     const connection = config.connections.get(connection_id) orelse return error.ConnectionNotFound;
     if (connection.kind != .inference) return error.ConnectionNotInference;
     try requireInferenceCapability(connection.capabilities, required_capability);
@@ -369,8 +494,13 @@ fn resolveInferenceConnection(
 }
 
 fn inferenceCapability(operation: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, operation, "transcription/sessions")) return "models.transcribe";
+    if (std.mem.startsWith(u8, operation, "ml/")) return "models.predict";
     inline for (&.{
         .{ "embed", "models.embed" },
+        .{ "embeddings", "models.embed" },
+        .{ "chat/completions", "models.generate" },
+        .{ "decisions", "models.decide" },
         .{ "generate", "models.generate" },
         .{ "rerank", "models.rerank" },
         .{ "chunk", "models.chunk" },
@@ -378,10 +508,22 @@ fn inferenceCapability(operation: []const u8) ?[]const u8 {
         .{ "rewrite", "models.rewrite" },
         .{ "read", "models.read" },
         .{ "transcribe", "models.transcribe" },
+        .{ "dictate", "models.transcribe" },
+        .{ "synthesize", "models.synthesize" },
+        .{ "predict", "models.predict" },
     }) |mapping| {
         if (std.mem.eql(u8, operation, mapping[0])) return mapping[1];
     }
     return null;
+}
+
+// Named transcription URLs are API bases; a configured custom path must not
+// acquire another /ai/v1 suffix when sharing the connection transport.
+fn inferenceApiBaseAlloc(alloc: Allocator, remote: RemoteInferenceConnection) ![]u8 {
+    if (remote.preserve_api_path) return @import("antfly_local_sources").common_provider_registry.gateway.apiBaseAlloc(alloc, remote.url);
+    const base = std.mem.trimEnd(u8, remote.url, "/");
+    if (std.mem.endsWith(u8, base, "/ai/v1")) return alloc.dupe(u8, base);
+    return std.fmt.allocPrint(alloc, "{s}/ai/v1", .{base});
 }
 
 fn resolveInferenceApiKey(
@@ -392,7 +534,7 @@ fn resolveInferenceApiKey(
     return if (raw) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null;
 }
 
-fn requireInferenceCapability(capabilities: []const []const u8, required: []const u8) !void {
+pub fn requireInferenceCapability(capabilities: []const []const u8, required: []const u8) !void {
     if (!containsString(capabilities, required)) return error.ConnectionCapabilityMissing;
 }
 
@@ -421,6 +563,8 @@ pub const Sources = struct {
 };
 
 pub const BuildOptions = struct {
+    /// One caller-owned lifetime covers cache waits and every model-list job.
+    request_context: ?RequestContext = null,
     include_models: bool = false,
     refresh: bool = false,
     cached_err_name: ?[]const u8 = null,
@@ -450,10 +594,7 @@ pub const Cache = struct {
 
         pub fn deinitOwned(self: *Entry, alloc: Allocator) void {
             if (self.err_name.len > 0) alloc.free(self.err_name);
-            for (self.models) |*model| {
-                alloc.free(model.name);
-                if (model.display_name) |value| alloc.free(value);
-            }
+            for (self.models) |*model| model.deinit(alloc);
             if (self.models.len > 0) alloc.free(self.models);
             self.* = undefined;
         }
@@ -517,18 +658,21 @@ pub const Cache = struct {
         var copied: usize = 0;
         errdefer {
             for (models[0..copied]) |*model| {
-                alloc.free(model.name);
-                if (model.display_name) |value| alloc.free(value);
+                model.deinit(alloc);
             }
             alloc.free(models);
         }
         for (entry.models, 0..) |model, i| {
-            models[i] = .{
+            var copied_model: list_models.ListedModel = .{
                 .name = try alloc.dupe(u8, model.name),
-                .display_name = if (model.display_name) |value| try alloc.dupe(u8, value) else null,
                 .kind = model.kind,
                 .dimensions = model.dimensions,
             };
+            errdefer copied_model.deinit(alloc);
+            copied_model.display_name = if (model.display_name) |value| try alloc.dupe(u8, value) else null;
+            copied_model.capabilities = try dupeStringList(alloc, model.capabilities);
+            copied_model.inputs = try dupeStringList(alloc, model.inputs);
+            models[i] = copied_model;
             copied = i + 1;
         }
         return .{
@@ -539,6 +683,26 @@ pub const Cache = struct {
         };
     }
 };
+
+fn dupeStringList(alloc: Allocator, values: []const []const u8) ![][]u8 {
+    if (values.len == 0) return &.{};
+    const owned = try alloc.alloc([]u8, values.len);
+    var copied: usize = 0;
+    errdefer {
+        for (owned[0..copied]) |value| alloc.free(value);
+        alloc.free(owned);
+    }
+    for (values, owned) |value, *destination| {
+        destination.* = try alloc.dupe(u8, value);
+        copied += 1;
+    }
+    return owned;
+}
+
+fn dupeStringListConst(alloc: Allocator, values: []const []const u8) ![]const []const u8 {
+    const owned = try dupeStringList(alloc, values);
+    return owned;
+}
 
 /// Deduped inference provider instance gathered from configs.
 const Instance = struct {
@@ -582,15 +746,41 @@ const ModelsJob = struct {
     refresh: bool = false,
     cached_err_name: ?[]const u8 = null,
     io: ?std.Io = null,
+    request_context: ?RequestContext = null,
 
     fn run(job: *ModelsJob) std.Io.Cancelable!void {
+        job.runControlled() catch |err| {
+            job.err = err;
+        };
+    }
+
+    fn check(job: *const ModelsJob) !void {
+        if (job.request_context) |context| try context.check();
+    }
+
+    fn cancelled(raw: *const anyopaque) bool {
+        const job: *const ModelsJob = @ptrCast(@alignCast(raw));
+        job.check() catch return true;
+        return false;
+    }
+
+    fn runControlled(job: *ModelsJob) !void {
+        try job.check();
         const alloc = job.arena_state.allocator();
         const key_lock = if (job.io) |io|
             if (job.cache) |cache| .{ .lock = cache.keyLock(job.cache_key), .io = io } else null
         else
             null;
-        if (key_lock) |guard| guard.lock.lockUncancelable(guard.io);
+        if (key_lock) |guard| {
+            if (job.request_context != null) {
+                while (!guard.lock.tryLock()) {
+                    try job.check();
+                    try guard.io.sleep(.fromMilliseconds(5), .awake);
+                }
+            } else try guard.lock.lock(guard.io);
+        }
         defer if (key_lock) |guard| guard.lock.unlock(guard.io);
+        try job.check();
         if (job.cache) |cache| {
             const now = platform_time.monotonicNs();
             if (cache.lookupCopy(alloc, job.cache_key, now, job.ttl_ns) catch null) |entry| {
@@ -608,9 +798,16 @@ const ModelsJob = struct {
         var fallback_io_impl: ?std.Io.Threaded = if (job.io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
         defer if (fallback_io_impl) |*io_impl| io_impl.deinit();
         const io = job.io orelse fallback_io_impl.?.io();
-        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        var client = httpx.Client.initWithConfig(alloc, io, .{
+            .keep_alive = false,
+            .retry_policy = .{ .max_retries = 0 },
+            .request_cancellation = if (job.request_context != null) httpx.CancellationToken.fromCallback(job, cancelled) else null,
+        });
         defer client.deinit();
-        job.result = list_models.listModels(alloc, &client, job.ep, job.timeout_ms) catch |err| {
+        const timeout_ms = if (job.request_context) |context| @min(if (job.timeout_ms == 0) @as(u64, 5000) else job.timeout_ms, (try context.remainingTimeoutMs()) orelse job.timeout_ms) else job.timeout_ms;
+        job.result = list_models.listModels(alloc, &client, job.ep, timeout_ms) catch |err| {
+            // A caller deadline/cancellation says nothing about provider health.
+            try job.check();
             job.err = err;
             if (job.cache) |cache| cache.store(job.cache_key, .{
                 .captured_at_ns = platform_time.monotonicNs(),
@@ -619,6 +816,7 @@ const ModelsJob = struct {
             }) catch {};
             return;
         };
+        try job.check();
         if (job.cache) |cache| cache.store(job.cache_key, .{
             .captured_at_ns = platform_time.monotonicNs(),
             .ok = true,
@@ -634,6 +832,7 @@ pub fn buildConnectionsResponse(
     cache: ?*Cache,
     opts: BuildOptions,
 ) !ConnectionsResponse {
+    if (opts.request_context) |context| try context.check();
     var kinds: std.EnumSet(ConnectionKind) = .full;
     if (opts.types_filter) |filter| kinds = parseKindFilter(filter);
     const effective_opts = opts;
@@ -660,6 +859,35 @@ pub fn buildConnectionsResponse(
         }
     }
 
+    if (kinds.contains(.inference)) if (sources.node_config) |config| {
+        const registry = @import("antfly_local_sources").common_provider_registry;
+        const view = registry.gateway.View{ .providers = &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
+        const targets = try view.catalog(arena);
+        if (targets.len > 0) {
+            var models = std.json.ArrayHashMap([]const ConnectedModel){};
+            if (opts.include_models) {
+                inline for (std.meta.tags(registry.gateway.Task)) |task| {
+                    var items: std.ArrayList(ConnectedModel) = .empty;
+                    for (targets) |target| {
+                        if (target.configured.task != task) continue;
+                        const id = try target.idAlloc(arena);
+                        try items.append(arena, .{ .name = id, .id = id, .display_name = target.configured.name, .configured = true, .freshness = "configured" });
+                    }
+                    if (items.items.len > 0) try models.map.put(arena, task.namespace(), items.items);
+                }
+            }
+            try connections.append(arena, .{
+                .id = "named-inference",
+                .name = "named-inference",
+                .display_name = "Configured inference",
+                .kind = .inference,
+                .status = .configured,
+                .sources = &.{"config:registry"},
+                .inference = .{ .provider = .antfly, .models = if (opts.include_models) models else null },
+            });
+        }
+    };
+    if (opts.request_context) |context| try context.check();
     return .{ .connections = connections.items };
 }
 
@@ -808,7 +1036,7 @@ fn appendConfiguredInferenceConnection(
         .sources = try sourcesSlice(arena, "config:connections/{s}", id),
         .inference = .{
             .provider = provider,
-            .url = inference_cfg.url,
+            .url = null,
             .region = inference_cfg.region,
             .project_id = inference_cfg.project_id,
             .location = inference_cfg.location,
@@ -1066,6 +1294,8 @@ fn modelsMapAlloc(arena: Allocator, models: []const list_models.ListedModel, ins
             .display_name = if (model.display_name) |value| try arena.dupe(u8, value) else null,
             .dimensions = model.dimensions,
             .configured = if (instance.configured_models.contains(model.name)) true else null,
+            .capabilities = if (model.capabilities.len > 0) try dupeStringListConst(arena, model.capabilities) else null,
+            .inputs = if (model.inputs.len > 0) try dupeStringListConst(arena, model.inputs) else null,
         });
     }
     var map = std.json.ArrayHashMap([]const ConnectedModel){};
@@ -1098,6 +1328,7 @@ fn resolveModels(
     defer for (pending.items) |item| item.job.arena_state.deinit();
 
     for (instances, 0..) |instance, i| {
+        if (opts.request_context) |context| try context.check();
         if (instance.provider == .mock) {
             const result = try list_models.listModels(arena, undefined, .{ .provider = .mock }, opts.timeout_ms);
             outcomes[i] = .{ .ok = true, .models = result.models };
@@ -1164,6 +1395,7 @@ fn resolveModels(
             .ttl_ns = opts.ttl_ns,
             .refresh = opts.refresh,
             .io = sources.network_io,
+            .request_context = opts.request_context,
         };
         try pending.append(arena, .{ .index = i, .job = job });
     }
@@ -1175,9 +1407,11 @@ fn resolveModels(
     const max_workers = @min(@max(opts.max_workers, 1), 64);
     var offset: usize = 0;
     while (offset < pending.items.len) {
+        if (opts.request_context) |context| try context.check();
         const end = @min(pending.items.len, offset + max_workers);
         if (sources.network_io) |io| {
             var group: std.Io.Group = .init;
+            defer group.cancel(io);
             for (pending.items[offset..end]) |item| {
                 group.concurrent(io, ModelsJob.run, .{item.job}) catch |err| {
                     item.job.err = err;
@@ -1191,9 +1425,9 @@ fn resolveModels(
         }
         offset = end;
     }
+    if (opts.request_context) |context| try context.check();
 
     for (pending.items) |item| {
-        const instance = instances[item.index];
         var outcome: ModelsOutcome = undefined;
         if (item.job.result) |result| {
             // Copy out of the job arena into the response arena.
@@ -1211,17 +1445,6 @@ fn resolveModels(
             outcome = .{ .ok = false, .err_name = item.job.cached_err_name orelse @errorName(item.job.err orelse error.Unknown) };
         }
         outcomes[item.index] = outcome;
-
-        if (cache) |c| {
-            c.store(instance.key, .{
-                .captured_at_ns = now_ns,
-                .ok = outcome.ok,
-                .err_name = @constCast(outcome.err_name),
-                .models = @constCast(outcome.models),
-            }) catch |err| {
-                std.log.warn("connections: cache store failed err={}", .{err});
-            };
-        }
     }
 
     return outcomes;
@@ -1672,21 +1895,47 @@ test "connection filesystem probes use the explicit filesystem authority" {
 test "connection cache remains valid across every allocation failure" {
     const Runner = struct {
         fn run(alloc: std.mem.Allocator) !void {
+            var source = try list_models.parseAntflyModels(alloc,
+                \\{ "allow_downloads": false, "embedders": { "owner/model": {
+                \\  "dimensions": 768, "capabilities": ["dense", "sparse"],
+                \\  "inputs": ["text", "image"], "qualified_limits": { "max_tokens": 256 }
+                \\} } }
+            );
+            defer source.deinit(alloc);
+            source.models[0].display_name = try alloc.dupe(u8, "Model");
             var cache = Cache.init(alloc);
             defer cache.deinit();
             try cache.store("provider", .{
                 .captured_at_ns = 1,
                 .ok = false,
                 .err_name = @constCast("first failure"),
+                .models = source.models,
             });
             try cache.store("provider", .{
                 .captured_at_ns = 2,
                 .ok = true,
+                .models = source.models,
             });
-            const entry = (try cache.lookupCopy(alloc, "provider", 2, 1)).?;
-            var owned = entry;
+            var owned = (try cache.lookupCopy(alloc, "provider", 2, 1)).?;
             defer owned.deinitOwned(alloc);
             try std.testing.expect(owned.ok);
+            try std.testing.expectEqual(@as(usize, 1), owned.models.len);
+            const model = owned.models[0];
+            try std.testing.expectEqualStrings("Model", model.display_name.?);
+            try std.testing.expectEqualStrings("dense", model.capabilities[0]);
+            try std.testing.expectEqualStrings("image", model.inputs[1]);
+
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const models = try modelsMapAlloc(arena.allocator(), owned.models, &.{ .provider = .antfly });
+            const json = try std.json.Stringify.valueAlloc(alloc, models, .{ .emit_null_optional_fields = false });
+            defer alloc.free(json);
+            try std.testing.expect(std.mem.indexOf(u8, json, "\"capabilities\":[\"dense\",\"sparse\"]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, json, "\"inputs\":[\"text\",\"image\"]") != null);
+            // Artifact qualification and download policy are inference details,
+            // not fields of the provider-neutral connection model contract.
+            try std.testing.expect(std.mem.indexOf(u8, json, "qualified_limits") == null);
+            try std.testing.expect(std.mem.indexOf(u8, json, "allow_downloads") == null);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
@@ -2262,4 +2511,110 @@ test "include param parsing" {
     try std.testing.expect(includeHasStatus("models, status"));
     try std.testing.expect(!includeHasStatus(null));
     try std.testing.expect(!includeHasStatus("statuses"));
+}
+
+test "httpx inference gateway transcription API bases retain explicit mount paths" {
+    const a = std.testing.allocator;
+    const Case = struct { url: []const u8, preserve: bool, expected: []const u8 };
+    for ([_]Case{
+        .{ .url = "https://runtime", .preserve = true, .expected = "https://runtime/ai/v1" },
+        .{ .url = "https://runtime/ai/v1/", .preserve = true, .expected = "https://runtime/ai/v1" },
+        .{ .url = "https://runtime/custom/api/", .preserve = true, .expected = "https://runtime/custom/api" },
+        .{ .url = "https://runtime/custom", .preserve = false, .expected = "https://runtime/custom/ai/v1" },
+    }) |case| {
+        const base = try inferenceApiBaseAlloc(a, .{ .url = case.url, .api_key = null, .preserve_api_path = case.preserve });
+        defer a.free(base);
+        try std.testing.expectEqualStrings(case.expected, base);
+    }
+}
+
+test "httpx inference gateway discovery lock waits honor caller lifetime without poisoning cache" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const lock = cache.keyLock("deadline-test");
+    try lock.lock(io);
+    defer lock.unlock(io);
+    var job: ModelsJob = .{
+        .ep = .{ .provider = .mock },
+        .timeout_ms = 5000,
+        .arena_state = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .cache = &cache,
+        .cache_key = "deadline-test",
+        .io = io,
+        .request_context = .{ .io = io, .deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_ms },
+    };
+    defer job.arena_state.deinit();
+    try std.testing.expectError(error.Timeout, job.runControlled());
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+    job.request_context.?.deadline_ns = null;
+    job.request_context.?.cancellation = .{ .ptr = &job, .is_cancelled_fn = struct {
+        fn cancelled(_: *const anyopaque) bool {
+            return true;
+        }
+    }.cancelled };
+    try std.testing.expectError(error.Cancelled, job.runControlled());
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+    // Vertex performs credential discovery before its model GET. The shared
+    // cancellation must reach that phase too, before reading credentials.
+    var cancelled = std.atomic.Value(bool).init(true);
+    var client = httpx.Client.initWithConfig(std.testing.allocator, io, .{ .request_cancellation = httpx.CancellationToken.fromAtomic(&cancelled) });
+    defer client.deinit();
+    try std.testing.expectError(error.Cancelled, list_models.listModels(std.testing.allocator, &client, .{
+        .provider = .vertex,
+        .project_id = "test-project",
+        .credentials_path = "/missing/discovery-credentials.json",
+    }, 5000));
+}
+
+test "httpx inference gateway native decision inventory retains its task independently of classifiers" {
+    var result = try list_models.parseAntflyModels(std.testing.allocator,
+        \\{"deciders":{"shared":{}},"classifiers":{"shared":{}},"embedders":{"embedding":{"dimensions":32}}}
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), result.models.len);
+    var deciders: usize = 0;
+    var classifiers: usize = 0;
+    for (result.models) |model| {
+        if (model.kind == .decider) {
+            try std.testing.expectEqualStrings("deciders", model.kind.groupKey());
+            try std.testing.expectEqualStrings("shared", model.name);
+            deciders += 1;
+        }
+        if (model.kind == .classifier) classifiers += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), deciders);
+    try std.testing.expectEqual(@as(usize, 1), classifiers);
+}
+
+test "httpx inference gateway remote dimension metadata cannot overflow its public type" {
+    var result = try list_models.parseAntflyModels(std.testing.allocator,
+        \\{"embedders":{"valid":{"dimensions":32},"max":{"dimensions":4294967295},"overflow":{"dimensions":4294967296},"huge":{"dimensions":9223372036854775807},"zero":{"dimensions":0},"negative":{"dimensions":-1}}}
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 6), result.models.len);
+    for (result.models) |model| {
+        if (std.mem.eql(u8, model.name, "valid")) {
+            try std.testing.expectEqual(@as(?u32, 32), model.dimensions);
+        } else if (std.mem.eql(u8, model.name, "max")) {
+            try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), model.dimensions);
+        } else try std.testing.expectEqual(@as(?u32, null), model.dimensions);
+    }
+}
+
+test "httpx inference gateway discovers remote chains synthesis and data only task roles" {
+    var result = try list_models.parseAntflyModels(std.testing.allocator,
+        \\{"chains":{"chains/fallback":{}},"synthesizers":{"synthesizers/voice":{}},
+        \\ "data":[{"id":"chains/fallback","task":"generate"},
+        \\ {"id":"synthesizers/voice","task":"synthesize"},
+        \\ {"id":"multi","tasks":["generate","embed"]}]}
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), result.models.len);
+    try std.testing.expectEqualStrings("chains", result.models[0].kind.groupKey());
+    try std.testing.expectEqualStrings("synthesizers", result.models[1].kind.groupKey());
+    try std.testing.expectEqualStrings("generators", result.models[2].kind.groupKey());
+    try std.testing.expectEqualStrings("embedders", result.models[3].kind.groupKey());
 }

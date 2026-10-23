@@ -1919,6 +1919,14 @@ pub const NativeKeyPredicate = struct {
     }
 };
 
+/// Borrowed request-owned diagnostics. The callback crosses native runtime
+/// archives without depending on their independent thread-local bindings.
+/// Execution must finish before the request releases the callback context.
+pub const GraphQueryDiagnosticSink = struct {
+    ptr: *anyopaque,
+    record_fn: *const fn (*anyopaque, []const u8, []const u8, []const u8) void,
+};
+
 pub const SearchRequest = struct {
     pub fn hasHitEvaluation(self: @This()) bool {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
@@ -2089,6 +2097,8 @@ pub const SearchRequest = struct {
     /// never serialized to a shard worker; it resolves the target table to a
     /// trusted internal row predicate before owner-routed admission.
     graph_table_read_authorizer: ?GraphTableReadAuthorizer = null,
+    /// Local-only, never serialized to remote shard workers.
+    graph_query_diagnostic_sink: ?GraphQueryDiagnosticSink = null,
     identity_read_generation: ?u64 = null,
     execution_deadline_ns: ?u64 = null,
     /// Borrowed listener lifecycle signal. It is request-local and must never
@@ -2156,6 +2166,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "execution_runnable",
     "execution_remote_query",
     "cancellation",
+    "graph_query_diagnostic_sink",
     "graph_execution_limits",
     "graph_physical_scan_observation",
     "graph_owning_table",

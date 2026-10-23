@@ -164,7 +164,8 @@ func NewAntflyClientWithToken(baseURL string, httpClient *http.Client, token str
 }
 
 // NewAntflyClientWithOptions creates a new Antfly client with variadic options.
-// Use with WithBasicAuth, WithApiKey, or WithToken for authentication.
+// For authentication, wrap WithBasicAuth, WithApiKey, or WithToken with
+// oapi.WithRequestEditorFn; these helpers return request editors, not client options.
 func NewAntflyClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*AntflyClient, error) {
 	var admission *BoundedHTTPClient
 	opts = append(append([]oapi.ClientOption(nil), opts...), withRequestAdmission(&admission))

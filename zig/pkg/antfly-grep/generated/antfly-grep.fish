@@ -5,7 +5,7 @@ complete -c antfly-grep -l after-context -r
 complete -c antfly-grep -l agent -r -f -a 'codex claude-code opencode'
 complete -c antfly-grep -l ask -r
 complete -c antfly-grep -l auto-hybrid-regex
-complete -c antfly-grep -l backend -r -f -a 'http antfly typesafe local'
+complete -c antfly-grep -l backend -r -f -a 'http antfly local'
 complete -c antfly-grep -l base-url -r
 complete -c antfly-grep -l batch-size -r
 complete -c antfly-grep -l before-context -r
@@ -32,6 +32,7 @@ complete -c antfly-grep -l debug
 complete -c antfly-grep -l decision-batch-wait-ms -r
 complete -c antfly-grep -l decision-concurrency -r
 complete -c antfly-grep -l decision-context -r -f -a 'legacy shared-v1'
+complete -c antfly-grep -l decision-transport -r -f -a 'single antfly-batch'
 complete -c antfly-grep -l dfa-size-limit -r
 complete -c antfly-grep -l dictionary -r
 complete -c antfly-grep -l dictionary-format -r -f -a 'auto raw brotli brotli-google'
@@ -88,6 +89,8 @@ complete -c antfly-grep -l max-dictionary-size -r
 complete -c antfly-grep -l max-file-size -r
 complete -c antfly-grep -l max-files -r
 complete -c antfly-grep -l max-filesize -r
+complete -c antfly-grep -l max-image-bytes -r
+complete -c antfly-grep -l max-image-pixels -r
 complete -c antfly-grep -l max-index-documents -r
 complete -c antfly-grep -l max-output-bytes -r
 complete -c antfly-grep -l max-pending-output -r
@@ -96,6 +99,7 @@ complete -c antfly-grep -l max-requests -r -f -a 'unlimited'
 complete -c antfly-grep -l max-result-files -r
 complete -c antfly-grep -l max-source-bytes -r
 complete -c antfly-grep -l max-spill-bytes -r
+complete -c antfly-grep -l media -r -f -a 'text images'
 complete -c antfly-grep -l messages
 complete -c antfly-grep -l mmap
 complete -c antfly-grep -l model -r
@@ -146,7 +150,7 @@ complete -c antfly-grep -l pcre2-version
 complete -c antfly-grep -l pre -r
 complete -c antfly-grep -l pre-glob -r
 complete -c antfly-grep -l pretty
-complete -c antfly-grep -l provider -r -f -a 'antfly typesafe vercel openrouter opencode local custom'
+complete -c antfly-grep -l provider -r -f -a 'antfly openai local custom'
 complete -c antfly-grep -l query -r
 complete -c antfly-grep -l quiet
 complete -c antfly-grep -l refine

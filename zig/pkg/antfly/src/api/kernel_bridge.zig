@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Internal compiled boundary for the public API/storage server. Production
 //! runtime units own only opaque handles; test builds retain the direct server
@@ -555,10 +555,7 @@ const OpaqueHttpxHandler = struct {
         for (entries) |entry| {
             const path = entry.path.slice();
             const is_probe = std.mem.eql(u8, path, "/healthz") or std.mem.eql(u8, path, "/readyz");
-            const is_generated = std.mem.eql(u8, path, "/db/v1") or
-                std.mem.startsWith(u8, path, "/db/v1/") or
-                std.mem.eql(u8, path, "/auth/v1") or
-                std.mem.startsWith(u8, path, "/auth/v1/");
+            const is_generated = isGeneratedPublicPath(path);
             switch (selection) {
                 .all => {},
                 .all_without_probes => if (is_probe) continue,
@@ -581,6 +578,10 @@ const OpaqueHttpxHandler = struct {
                 .delete => .DELETE,
                 .patch => .PATCH,
             };
+            if (entry.request_body == .streaming_raw) {
+                try server.routeStreamingRawWithData(method, path, runtimeApiHttpHandler, route);
+                continue;
+            }
             if (method == .POST) {
                 if (@import("http_routes.zig").postBodyLimit(path)) |limit| {
                     try server.routeWithDataAndBodyLimit(method, path, runtimeApiHttpHandler, route, limit);
@@ -655,7 +656,7 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     };
     var transport = runtime_http_bridge.Outbound{ .context = context };
     const borrowed_io = context.io;
-    const body_source = if (route.request_body == .buffered) transport.bodySource() else abi.RequestBodySource{};
+    const body_source = if (route.request_body != .none) transport.bodySource() else abi.RequestBodySource{};
     try callError(route.functions.handler_handle_http(&.{
         .abi_version = abi.abi_version,
         .route_handle = route.kernel_route_handle,
@@ -1458,4 +1459,17 @@ test "runnable metrics service opaque bridge checks owner prefix and preserves v
     try std.testing.expect(!(try server.runnableSchedulingStatsChecked()).service.available);
     fixture.service.version = 0;
     try std.testing.expectError(error.UnsupportedVersion, server.runnableSchedulingStatsChecked());
+}
+
+fn isGeneratedPublicPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/db/v1") or std.mem.startsWith(u8, path, "/db/v1/") or
+        std.mem.eql(u8, path, "/auth/v1") or std.mem.startsWith(u8, path, "/auth/v1/") or
+        @import("inference_gateway.zig").ownsPath(path);
+}
+
+test "api kernel includes inference gateway in generated public route selection" {
+    for (@import("inference_gateway.zig").public_paths) |path| try std.testing.expect(isGeneratedPublicPath(path));
+    try std.testing.expect(isGeneratedPublicPath("/db/v1/query"));
+    try std.testing.expect(!isGeneratedPublicPath("/ai/v1/models/load"));
+    try std.testing.expect(!isGeneratedPublicPath("/internal/groups/1"));
 }

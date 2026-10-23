@@ -96,8 +96,13 @@ const help =
     \\      --triage              Enable model-based directory pruning
     \\      --max-requests N      Request budget: N or unlimited (default 1000)
     \\      --model MODEL         Decision model (or ANTFLY_GREP_MODEL)
+    \\      --media text|images   Text regions or whole image/page/slide evidence
+    \\      --max-image-bytes N   Encoded image bytes (512K; maximum 768K)
+    \\      --max-image-pixels N  Image pixel admission (16777216)
+    \\      --provider NAME       antfly, openai, custom, local
+    \\      --decision-transport single|antfly-batch  Provider capability
     \\      --endpoint URL        Full URL (or ANTFLY_GREP_ENDPOINT)
-    \\                            Default: http://127.0.0.1:8090/decisions
+    \\                            Default: http://127.0.0.1:8080/ai/v1/decisions
     \\      --threshold P         Predicate cutoff [0,1] (default 0.5)
     \\      --chunk-lines N       Maximum target lines per region (default 80)
     \\      --unit line|block     'line' sets chunk-lines=1
@@ -106,7 +111,7 @@ const help =
     \\      --batch-size N        Inputs per request, 1..128 (default 8)
     \\      --max-regions N       Evaluation budget; exhaustion exits 2
     \\      --timeout-ms N        Request deadline (default 60000)
-    \\                            Bearer token: ANTFLY_GREP_TOKEN environment
+    \\                            Keys: OPENAI_API_KEY, ANTFLY_API_KEY, or ANTFLY_GREP_TOKEN
     \\  -I, --no-filename          Omit filename prefixes
     \\  -h, --help                 Show help
     \\      --version             Show version
@@ -120,7 +125,11 @@ const help =
 ;
 pub fn main(init: std.process.Init) void {
     const code = run(init) catch |err| {
-        if (err != error.BrokenPipe) std.debug.print("antfly-grep: {s} (see --help)\n", .{@errorName(err)});
+        if (err != error.BrokenPipe) {
+            std.debug.print("antfly-grep: {s} (see --help)\n", .{@errorName(err)});
+            if (err == error.JevRequiresAntflyGateway) std.debug.print("Configure Jev as an Antfly gateway decider; use --provider antfly --model deciders/NAME.\n", .{});
+            if (err == error.UseEnvironmentCredential) std.debug.print("Export OPENAI_API_KEY, ANTFLY_API_KEY, or ANTFLY_GREP_TOKEN; auth saves a profile without tokens.\n", .{});
+        }
         std.process.exit(if (err == error.BrokenPipe) 0 else 2);
     };
     std.process.exit(code);
@@ -159,9 +168,10 @@ fn run(init: std.process.Init) !u8 {
     try setup.load(persistent, init.io, init.environ_map, &o);
     o.table_token = init.environ_map.get("ANTFLY_GREP_TABLE_TOKEN");
     if (init.environ_map.get("ANTFLY_GREP_TABLE_CONFIG")) |path| o.table_config = path;
+    if (init.environ_map.get("ANTFLY_GREP_PROVIDER")) |provider| try o.selectProvider(provider);
     if (init.environ_map.get("ANTFLY_GREP_MODEL")) |model| o.model = model;
-    if (init.environ_map.get("ANTFLY_GREP_ENDPOINT")) |endpoint| o.endpoint = endpoint;
-    if (init.environ_map.get("ANTFLY_GREP_TOKEN")) |token| o.token = token;
+    if (init.environ_map.get("ANTFLY_GREP_ENDPOINT")) |endpoint| o.setEndpoint(endpoint);
+    o.explicit_token = init.environ_map.get("ANTFLY_GREP_TOKEN");
     if (init.environ_map.get("ANTFLY_GREP_LIBRARY")) |library| o.library_path = library;
     if (init.environ_map.get("ANTFLY_GREP_MODELS_DIR") orelse init.environ_map.get("ANTFLY_INFERENCE_MODELS_DIR")) |models| o.models_dir = models;
     const global_ignore = if (init.environ_map.get("XDG_CONFIG_HOME")) |config| try std.fs.path.join(a, &.{ config, "git", "ignore" }) else if (init.environ_map.get("HOME")) |home| try std.fs.path.join(a, &.{ home, ".config", "git", "ignore" }) else null;
@@ -255,7 +265,8 @@ fn run(init: std.process.Init) !u8 {
         }
         if (std.mem.eql(u8, path, "-") and o.paths.items.len == 0) try o.paths.append(a, ".");
     }
-    o.typesafe_api_key = init.environ_map.get("TYPESAFE_API_KEY");
+    o.openai_api_key = init.environ_map.get("OPENAI_API_KEY");
+    o.antfly_api_key = init.environ_map.get("ANTFLY_API_KEY");
     try o.finalizeProvider(persistent);
     if (o.generate) |kind| {
         const output = try grep.tooling.generate(a, kind, help);
@@ -299,6 +310,7 @@ fn run(init: std.process.Init) !u8 {
         var glob = try grep.discovery.glob(a, if (std.mem.startsWith(u8, raw, "!")) raw[1..] else raw);
         glob.deinit();
     }
+    if (workspace_service and o.media != .text) return error.UnsupportedWorkspaceMedia;
     if (workspace_service) return grep.workspace.serve(grep.Search, a, init.io, &o);
     var search = try grep.Search.init(a, init.io, &o);
     defer search.deinit();

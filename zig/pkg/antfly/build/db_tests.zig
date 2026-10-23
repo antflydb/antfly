@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const addRuntimeTestFilters = @import("../../../build_support/antfly/test_support.zig").addRuntimeTestFilters;
@@ -744,11 +744,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addCuratedTestRunArtifact(b, parent_match_all_tests, &parent_match_all_filters).step);
     const logical_db_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "logical query primary", "logical query sort" },
+        .filters = &.{ "logical query primary", "logical query sort", "logical source certificates" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("logical-field-db-test", "Run logical-field native primary and indexed query contracts")
-        .dependOn(&addFilteredTestRunArtifact(b, logical_db_tests).step);
+    const logical_db_step = b.step("logical-field-db-test", "Run logical-field native primary and indexed query contracts");
+    logical_db_step.dependOn(&addFilteredTestRunArtifact(b, logical_db_tests).step);
+    const source_proof_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_proof_registry.zig"),
+        .target = antfly_test_mod.resolved_target,
+        .optimize = antfly_test_mod.optimize,
+    }) });
+    const source_proof_run = b.addRunArtifact(source_proof_tests);
+    logical_db_step.dependOn(&source_proof_run.step);
+    b.step("source-proof-test", "Run bounded source certificate ownership and race tests").dependOn(&source_proof_run.step);
 
     const lib_db_query_step = b.step("antfly-storage-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);

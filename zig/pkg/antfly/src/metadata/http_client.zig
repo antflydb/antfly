@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const snapshot_transfer = @import("snapshot_transfer.zig");
@@ -3548,6 +3548,7 @@ fn consumerTests() type {
 
         test "metadata http client preserves extension ownership across forwarding" {
             const ExtensionOwnedExecutor = struct {
+                outcome: []const u8,
                 fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !http_common.Header {
                     const owned_name = try alloc.dupe(u8, name);
                     errdefer alloc.free(owned_name);
@@ -3561,7 +3562,8 @@ fn consumerTests() type {
                     return .{ .ptr = self, .vtable = &.{ .execute = execute } };
                 }
 
-                fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
                     const headers = try alloc.alloc(http_common.Header, 2);
                     var initialized: usize = 0;
                     errdefer {
@@ -3571,7 +3573,7 @@ fn consumerTests() type {
                     headers[initialized] = try ownedHeader(
                         alloc,
                         routes.Routes.raft_mutation_outcome_header,
-                        routes.Routes.raft_mutation_outcome_unknown,
+                        self.outcome,
                     );
                     initialized += 1;
                     headers[initialized] = try ownedHeader(
@@ -3584,12 +3586,21 @@ fn consumerTests() type {
                 }
             };
 
-            var executor = ExtensionOwnedExecutor{};
-            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-            try std.testing.expectError(
-                error.ExtensionOwnedObject,
-                client.dropTableForwarded("http://127.0.0.1:9000", "memories"),
-            );
+            for ([_][]const u8{
+                routes.Routes.raft_mutation_outcome_not_proposed,
+                routes.Routes.raft_mutation_outcome_unknown,
+            }) |outcome| {
+                var executor = ExtensionOwnedExecutor{ .outcome = outcome };
+                var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+                // A domain error cannot override an ambiguous admission result.
+                try std.testing.expectError(
+                    if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed))
+                        error.ExtensionOwnedObject
+                    else
+                        error.MetadataMutationOutcomeUnknown,
+                    client.dropTableForwarded("http://127.0.0.1:9000", "memories"),
+                );
+            }
         }
 
         test "metadata http client preserves unrecognized server outcomes for forwarded table mutations" {

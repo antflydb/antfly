@@ -512,6 +512,8 @@ pub const DocStore = struct {
     /// metadata/graph/enrichment commits which need not append source replay.
     /// Increment before attempting commit: ambiguous backend outcomes invalidate.
     query_generation_revision: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    source_certificates: @import("source_proof_registry.zig").Registry(@import("document_mutation_revision.zig").Content) = .{},
+    source_bulk_fences: std.atomic.Value(usize) = .init(0),
     // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
     // this before its commit; an aborted admission merely leaves a safe probe.
     retained_effects_cache: std.atomic.Value(u8) = .init(0),
@@ -677,6 +679,9 @@ pub const DocStore = struct {
             }
             const reader_owner = self.portable_import_reader_owner;
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
+            const source_owner = self.columnar_owner;
+            if (source_owner) |owner| owner.source_certificates.begin(&self.document_revisions.documents);
+            defer if (source_owner) |owner| owner.source_certificates.end();
             const payload_session = self.payload_session;
             if (payload_session) |session| try session.stageReferenceEpoch(self);
             try self.publication_backlog.stage(self);
@@ -1481,6 +1486,9 @@ pub const DocStore = struct {
                 try self.artifact_inventory.stage(self.asTxn(), if (self.columnar_owner) |owner| &owner.runtime_store else null);
             }
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
+            const source_owner = self.columnar_owner;
+            if (source_owner) |owner| owner.source_certificates.begin(&self.document_revisions.documents);
+            defer if (source_owner) |owner| owner.source_certificates.end();
             const payload_session = self.payload_session;
             if (payload_session) |session| try session.stageReferenceEpoch(self);
             try self.publication_backlog.stage(self.asTxn());
@@ -1628,6 +1636,7 @@ pub const DocStore = struct {
     }
 
     pub fn close(self: *DocStore) void {
+        self.source_certificates.deinit(self.alloc);
         if (self.owns_runtime_store) self.runtime_store.deinit();
         if (self.owned_lsm_backend) |*backend| backend.close();
         self.* = undefined;
@@ -2745,21 +2754,44 @@ pub const DocStore = struct {
 
     pub fn beginBulkIngestSession(self: *DocStore) !void {
         try self.ensurePortableImportOperational();
+        self.source_certificates.beginReplacement();
+        errdefer self.source_certificates.end();
         try self.runtime_store.beginBulkIngestSession();
+        _ = self.source_bulk_fences.fetchAdd(1, .monotonic);
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DocStore, options: backend_types.BulkIngestFinishOptions) !void {
         try self.ensurePortableImportOperational();
+        self.source_certificates.beginReplacement();
+        defer self.source_certificates.end();
         try self.runtime_store.finishBulkIngestSessionWithOptions(options);
+        self.releaseSourceBulkFence();
     }
 
     pub fn flushBufferedWritesWithOptions(self: *DocStore, options: backend_types.BulkIngestFinishOptions) !void {
         try self.ensurePortableImportOperational();
+        self.source_certificates.beginReplacement();
+        defer self.source_certificates.end();
         try self.runtime_store.flushBufferedWritesWithOptions(options);
     }
 
     pub fn abortBulkIngestSession(self: *DocStore) void {
         self.runtime_store.abortBulkIngestSession();
+        self.releaseSourceBulkFence();
+    }
+
+    fn releaseSourceBulkFence(self: *DocStore) void {
+        // Backends allow nested/concurrent bulk sessions. Retire exactly one
+        // admission fence per completed or aborted session.
+        var remaining = self.source_bulk_fences.load(.monotonic);
+        while (remaining > 0) {
+            if (self.source_bulk_fences.cmpxchgWeak(remaining, remaining - 1, .monotonic, .monotonic)) |actual| {
+                remaining = actual;
+            } else {
+                self.source_certificates.end();
+                return;
+            }
+        }
     }
 
     fn ensurePortableImportOperational(self: *const DocStore) !void {
@@ -2830,6 +2862,7 @@ pub const DocStore = struct {
                 .acquire,
             ) orelse break;
         }
+        self.source_certificates.beginReplacement();
         errdefer self.cancelPortableImportPublication();
         if (controls) |original| try original.lifetime.check();
     }
@@ -2840,6 +2873,7 @@ pub const DocStore = struct {
 
     /// Withdraw only the caller-owned exclusion bit. Never retire live readers.
     pub fn cancelPortableImportPublication(self: *DocStore) void {
+        self.source_certificates.end();
         const prior = self.portable_import_reader_state.fetchAnd(portable_import_reader_count_mask, .acq_rel);
         std.debug.assert(prior & portable_import_publication_bit != 0);
     }
@@ -2871,6 +2905,7 @@ pub const DocStore = struct {
     }
 
     pub fn finishPortableImportPublication(self: *DocStore) void {
+        self.source_certificates.end();
         self.retained_effects_cache.store(0, .release);
         std.debug.assert(self.portable_import_reader_state.load(.monotonic) == portable_import_publication_bit);
         const revision = self.portable_import_revision.load(.monotonic);
@@ -9368,4 +9403,62 @@ test "docstore replay claim has one winner for concurrent candidates" {
     try std.testing.expectEqual(@as(usize, 1), winners);
     try std.testing.expectEqual(@as(u64, 2), store.nextReplaySequence(1));
     try std.testing.expectEqual(@as(u64, 0), store.lastReplaySequence(0));
+}
+
+test "logical source certificates invalidate transaction and batch mutations including delete recreate" {
+    const a = std.testing.allocator;
+    const revision = @import("document_mutation_revision.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const x = try internal_keys.documentKeyAlloc(a, "x");
+    defer a.free(x);
+    const y = try internal_keys.documentKeyAlloc(a, "y");
+    defer a.free(y);
+    const key = revision.keyForPhysical(x).?;
+    const identity = key[key.len - 32 ..].*;
+    var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    try store.put(x, "first");
+    var captured = try store.beginReadTxn();
+    defer captured.abort();
+    const proof = (try revision.loadContent(&captured, x)).?;
+    const initial = store.source_certificates.capture();
+    store.source_certificates.put(a, initial, identity, .{ .content = proof, .timestamp = 0 });
+    try store.put(y, "unrelated");
+    try std.testing.expect(store.source_certificates.get(store.source_certificates.capture(), identity) != null);
+    {
+        var aborted = try store.beginWriteTxn();
+        defer aborted.abort();
+        try aborted.put(x, "aborted");
+    }
+    try std.testing.expect(store.source_certificates.get(store.source_certificates.capture(), identity) != null);
+    {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.asTxn().appendPut(x, "second");
+        try batch.commit();
+    }
+    try std.testing.expect(store.source_certificates.get(store.source_certificates.capture(), identity) == null);
+    store.source_certificates.put(a, initial, identity, .{ .content = proof, .timestamp = 0 });
+    try std.testing.expect(store.source_certificates.get(store.source_certificates.capture(), identity) == null);
+    {
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        store.source_certificates.put(a, store.source_certificates.capture(), identity, .{ .content = (try revision.loadContent(&current, x)).?, .timestamp = 0 });
+    }
+    try store.delete(x);
+    try store.put(x, "third");
+    try std.testing.expect(store.source_certificates.get(store.source_certificates.capture(), identity) == null);
+    try std.testing.expectEqualStrings("first", try captured.get(x));
+    try store.beginBulkIngestSession();
+    try store.beginBulkIngestSession();
+    try std.testing.expect(store.source_certificates.capture() == null);
+    store.abortBulkIngestSession();
+    try std.testing.expect(store.source_certificates.capture() == null);
+    try store.finishBulkIngestSessionWithOptions(.{});
+    try std.testing.expect(store.source_certificates.capture() != null);
 }

@@ -17,7 +17,7 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
 
-pub const version: u32 = 14;
+pub const version: u32 = 15;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
@@ -333,6 +333,7 @@ pub const ProviderOutput = struct {
 };
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Http = struct {
+    streaming_body: bool = false,
     route: []const u8,
     method: http.HttpMethod,
     path: []const u8,

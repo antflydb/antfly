@@ -532,6 +532,10 @@ pub const Context = struct {
         pub fn read(self: *@This(), dest: []u8) !usize {
             return self.context.readBodyChunk(dest);
         }
+
+        pub fn readControlled(self: *@This(), dest: []u8, control: RequestControl) !usize {
+            return self.context.readBodyChunkControlled(dest, control);
+        }
     };
 
     /// Creates a new context for a request.
@@ -1139,7 +1143,12 @@ pub const Context = struct {
     }
 
     fn readBodyChunk(self: *Self, dest: []u8) !usize {
-        try self.requestWriteControl(.{}).check();
+        return self.readBodyChunkControlled(dest, .{});
+    }
+
+    fn readBodyChunkControlled(self: *Self, dest: []u8, incoming: RequestControl) !usize {
+        const control = self.requestWriteControl(incoming);
+        try control.check();
         try self.constrainBodyDeadline();
         if (dest.len == 0) return 0;
         if (self.request.body) |body_bytes| {
@@ -1150,19 +1159,18 @@ pub const Context = struct {
             return n;
         }
         if (self.body_delegate) |delegate| {
-            const control = self.requestWriteControl(.{});
             if (delegate.read_controlled) |read| return read(delegate.ptr, dest, control);
             if (delegate.read) |read| {
                 if (control.active()) return error.RequestControlUnavailable;
                 return read(delegate.ptr, dest);
             }
-            const data = (try delegate.readAllWithControl(self.requestWriteControl(.{}))) orelse return 0;
+            const data = (try delegate.readAllWithControl(control)) orelse return 0;
             self.request.body = data;
             self.request.body_owned = false;
             self.body_delegate = null;
-            return self.readBodyChunk(dest);
+            return self.readBodyChunkControlled(dest, incoming);
         }
-        if (self.h2_body_reader) |reader| return reader.readControlled(dest, self.requestWriteControl(.{}));
+        if (self.h2_body_reader) |reader| return reader.readControlled(dest, control);
         return 0;
     }
 
@@ -1995,6 +2003,10 @@ pub const Server = struct {
     /// exchange (chunked upload in, chunked response out).
     pub fn routeStreamingRaw(self: *Self, method: types.Method, path: []const u8, handler: anytype) !void {
         try self.router.addStreamingRaw(method, path, handler);
+    }
+
+    pub fn routeStreamingRawWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
+        try self.router.addStreamingRawWithData(method, path, handler, data);
     }
 
     /// Registers a route with borrowed opaque data copied into Context.

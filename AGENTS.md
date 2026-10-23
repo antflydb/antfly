@@ -21,4 +21,5 @@ Zig and Cargo never evict build output; one throwaway Zig cache reached 150 GB.
 - Use the worktree's own caches: `.zig-cache/` and `zig-out/` for Zig, `rs/target/` for Rust. Never point `--cache-dir`, `ZIG_LOCAL_CACHE_DIR`, or `CARGO_TARGET_DIR` outside the worktree.
 - Never create a temporary cache directory (`mktemp`, `~/.cache/antfly-*`, `/tmp/...`) for builds or tests. If a task needs an isolated cache, put it inside the worktree and delete it before finishing.
 - Reuse one `zig-out` prefix instead of accumulating `zig-out-<variant>` directories.
+- External conformance and recall fixtures are the one shared exception: they are immutable, hash-verified downloads cached once under `~/.cache/antfly/conformance-fixtures` (the `-Dconformance-fixtures` default). Don't redirect them into `/tmp` or a per-task directory.
 - Run `make gc` after long build or test sessions and whenever disk space is low (`make gc DRY_RUN=1` previews). It cleans every worktree plus the Zig, Go, uv, and Node caches but skips anything a running build wrote in the last 30 minutes; see `scripts/cache_gc.sh` for the rules.

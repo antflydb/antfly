@@ -2384,7 +2384,9 @@ const Binder = struct {
                         const actual = try self.infer(arg, depth + 1);
                         if (i > 0 and !statementConstant(arg)) return error.UnsupportedSqlShape;
                         const schema_arg = (function == .ai_decide and i == 1) or ((function == .ai_choice or function == .ai_score) and i == 2);
-                        if (actual.kind != null and actual.kind != .string and !(schema_arg and actual.kind == .json)) return error.SqlTypeMismatch;
+                        // Evidence may be JSONB messages; question schemas retain
+                        // their existing JSON overload. Other arguments stay text.
+                        if (actual.kind != null and actual.kind != .string and !((i == 0 or schema_arg) and actual.kind == .json)) return error.SqlTypeMismatch;
                     }
                     break :blk .{ .kind = switch (desc.result) {
                         .json => .json,

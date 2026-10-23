@@ -26,8 +26,9 @@ class FieldCapability:
 
         Attributes:
             kind (FieldCapabilityKind): Field origin. Unassociated entries do not assert a document source path.
-            value_operations (list[FieldCapabilityValueOperationsItem]): Supported original-value operations on field.
-                Availability does not
+            value_operations (list[FieldCapabilityValueOperationsItem]): Supported logical query operations on field.
+                Equals, contains and matches
+                verify original values; autocomplete performs analyzed bool-prefix matching. Availability does not
                 attest index coverage or authorize scans. Case sensitivity, execution
                 policy and work budgets apply. Reserved/computed/template/unassociated
                 entries do not advertise original-document value operations.

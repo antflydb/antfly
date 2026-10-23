@@ -40,6 +40,8 @@ const ForwardControl = struct {
     deadline_ns: ?u64 = null,
     progress: bridge.ProgressView = .{},
     stream: http.StreamSink = .{},
+    stream_started: bool = false,
+    body_source: http.RequestBodySource = .{},
     output: Output = .{},
     phase_handoff: bool = false,
     output_waits_owned: bool = false,
@@ -102,8 +104,25 @@ const ForwardControl = struct {
         }
     }
 
+    fn readBody(raw: ?*anyopaque, dest: []u8) !usize {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try check(raw);
+        var count: usize = 0;
+        var control: HttpControl.Parent = .{ .original_ptr = self, .original_check = check, .original_deadline_ns = self.deadline_ns, .event_deadline_ns = null, .event = .{} };
+        const view_control = control.view();
+        const status = if (self.body_source.read_controlled) |read|
+            read(self.body_source.context, dest.ptr, dest.len, &count, &view_control)
+        else if (!control.active())
+            (self.body_source.read orelse return error.BodySourceUnavailable)(self.body_source.context, dest.ptr, dest.len, &count)
+        else
+            return error.StreamingUnavailable;
+        try callbackResult(status);
+        try check(raw);
+        if (count > dest.len) return error.BodyReadFailed;
+        return count;
+    }
     fn view(self: *@This()) rpc.Control {
-        return .{ .ptr = self, .check = check, .event = event, .event_controlled = eventControlled, .phase = if (self.phase_handoff) phase else null, .fence_on_error = self.phase_handoff, .event_owns_waits = self.output_waits_owned };
+        return .{ .ptr = self, .check = check, .event = event, .read_body = if (self.body_source.read != null) readBody else null, .event_controlled = eventControlled, .phase = if (self.phase_handoff) phase else null, .fence_on_error = self.phase_handoff, .event_owns_waits = self.output_waits_owned };
     }
 };
 
@@ -226,6 +245,7 @@ fn invokeHttpOwned(client: *Client, route: []const u8, context: *const bridge.Ht
         .alloc = result_alloc,
         .cancellation = context.cancellation,
         .stream = context.stream,
+        .body_source = context.body_source,
         .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null,
         .phase_handoff = context.runnable != null,
     };
@@ -244,7 +264,10 @@ fn invokeHttpOwned(client: *Client, route: []const u8, context: *const bridge.Ht
         _ = control.stream.set_execution_wait.?(control.stream.context, null);
     };
     var body = context.request.body;
-    if (body.slice() == null) if (context.body_source.read_all) |read| {
+    const streaming_body = context.body_source.streaming != 0 and context.body_source.read != null and
+        std.mem.endsWith(u8, context.request.path.slice(), "/stream") and
+        std.mem.indexOf(u8, context.request.path.slice(), "/transcription/sessions/") != null;
+    if (!streaming_body and body.slice() == null) if (context.body_source.read_all) |read| {
         if (control.phase_handoff and context.body_source.streaming != 0 and !control.output_waits_owned) return error.UnsupportedWorkerPhase;
         var lifetime: HttpControl.Parent = .{ .original_ptr = &control, .original_check = ForwardControl.check, .original_deadline_ns = control.deadline_ns, .event_deadline_ns = null, .event = .{} };
         const view_control = lifetime.view();
@@ -273,6 +296,7 @@ fn invokeHttpOwned(client: *Client, route: []const u8, context: *const bridge.Ht
         .deadline_ns = control.deadline_ns,
         .admitted_cpu_slots = cpu_slots,
         .phase_handoff = control.phase_handoff,
+        .streaming_body = streaming_body,
     }, .{});
     const result = client.invoke(.http, data, body.slice() orelse "", control.view()) catch |err| {
         if (control.output.started) return err;
@@ -287,7 +311,7 @@ fn invokeHttpOwned(client: *Client, route: []const u8, context: *const bridge.Ht
             var response = try initHttpResponse(result_alloc, 503);
             errdefer response.deinit();
             try response.headers.append("content-type", "application/json");
-            response.body = "{\"error\":\"inference worker executable not configured; set ANTFLY_INFERENCE_WORKER to an antfly-inference-worker or antfly-lite executable\",\"code\":\"InferenceWorkerExecutableNotConfigured\"}";
+            response.body = "{\"error\":\"inference worker executable not configured; set ANTFLY_INFERENCE_WORKER to an antfly executable\",\"code\":\"InferenceWorkerExecutableNotConfigured\"}";
             return response;
         }
         if (err == error.InferenceWorkerUnavailable or err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) {
@@ -461,7 +485,7 @@ pub const Client = struct {
             .environ_map = &self.environment,
             .inherit_files = if (fence != null) &inherited else &.{},
         }) catch |err| {
-            std.log.warn("could not start inference worker executable={s} err={s}; set {s} to an executable antfly-inference-worker or antfly-lite binary", .{ executable, @errorName(err), worker_executable_env });
+            std.log.warn("could not start inference worker executable={s} err={s}; set {s} to an executable antfly binary", .{ executable, @errorName(err), worker_executable_env });
             return switch (err) {
                 error.FileNotFound, error.AccessDenied, error.InvalidExe => error.InferenceWorkerExecutableNotConfigured,
                 else => err,
@@ -582,9 +606,7 @@ fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []c
 /// Explicit override for the worker executable. Takes priority over every
 /// other resolution step; see `resolveWorkerExecutable`.
 const worker_executable_env = "ANTFLY_INFERENCE_WORKER";
-const inference_worker_binary_name = if (builtin.target.os.tag == .windows) "antfly-inference-worker.exe" else "antfly-inference-worker";
-const lite_binary_name = if (builtin.target.os.tag == .windows) "antfly-lite.exe" else "antfly-lite";
-const worker_binary_names = [_][]const u8{ inference_worker_binary_name, lite_binary_name };
+const worker_binary_names = [_][]const u8{if (builtin.target.os.tag == .windows) "antfly.exe" else "antfly"};
 
 /// Layout shared by glibc, musl, and Darwin's libc; sufficient to recover the
 /// path of the image an address was loaded from.
@@ -646,8 +668,8 @@ fn findOnPathAlloc(alloc: std.mem.Allocator, io: std.Io, name: []const u8) !?[]u
 ///  2. The image this code was loaded from, via `dladdr`: for the statically
 ///     linked `antfly` binary this resolves to itself (unchanged behavior);
 ///     for a shared `libantfly`, it resolves to the `.dylib`/`.so`, next to
-///     which we look for a sibling Apache worker or Lite binary.
-///  3. An Apache worker or Lite binary on `PATH`.
+///     which we look for a sibling antfly binary.
+///  3. An antfly binary on `PATH`.
 fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
     if (platform.env.getenvSlice(worker_executable_env)) |override| {
         if (override.len == 0) return error.InferenceWorkerExecutableNotConfigured;
@@ -669,7 +691,7 @@ fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
     }
     std.log.err(
         "no inference worker executable found for the embedded runtime; set {s} to the path " ++
-            "of an `antfly-inference-worker` or `antfly-lite` executable next to the loaded libantfly or on PATH",
+            "of an `antfly` executable next to the loaded libantfly or on PATH",
         .{worker_executable_env},
     );
     return error.InferenceWorkerExecutableNotConfigured;
@@ -1037,6 +1059,7 @@ const Child = struct {
                     .route_handle = route_handle,
                     .request = &view,
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
+                    .body_source = if (incoming.streaming_body) .{ .context = request, .streaming = 1, .read = readBody, .read_controlled = readBodyControlled, .read_all = readAllBody } else .{},
                     .stream = .{ .context = request, .start = streamStart, .write = streamWrite, .close = streamClose, .start_controlled = streamStartControlled, .write_controlled = streamWriteControlled, .close_controlled = streamCloseControlled },
                     .out_response_handle = &response_handle,
                     .out_response = &response,
@@ -1056,6 +1079,24 @@ const Child = struct {
             },
             else => return error.UnsupportedOperation,
         }
+    }
+
+    fn readBody(raw: ?*anyopaque, dest: [*]u8, capacity: usize, out: *usize) callconv(.c) http.CallbackStatus {
+        const request: *rpc.Request = @ptrCast(@alignCast(raw orelse return .failed));
+        out.* = request.readBody(dest[0..capacity]) catch |err| return switch (err) {
+            error.Canceled, error.Cancelled => .canceled,
+            else => .failed,
+        };
+        return .ok;
+    }
+    fn readBodyControlled(raw: ?*anyopaque, dest: [*]u8, capacity: usize, out: *usize, incoming: *const http.RequestControl) callconv(.c) http.CallbackStatus {
+        const request: *rpc.Request = @ptrCast(@alignCast(raw orelse return .failed));
+        var control: HttpControl.Child = .{ .incoming = incoming };
+        out.* = request.readBodyWithControl(dest[0..capacity], control.view()) catch |err| return HttpControl.status(err);
+        return .ok;
+    }
+    fn readAllBody(_: ?*anyopaque, _: *http.OptionalBytes) callconv(.c) http.CallbackStatus {
+        return .failed;
     }
 
     fn cancelled(raw: ?*const anyopaque) callconv(.c) u8 {
@@ -2720,4 +2761,67 @@ test "inference worker batch transfer needs no publication allocation and joined
     try std.testing.expect(budget.amounts[0] == null and budget.amounts[1] == null);
     try std.testing.expectEqual(@as(usize, 0), worker.leases.count());
     worker.releaseResources();
+}
+
+test "runnable execution worker budget carries controlled incremental uploads through production callbacks" {
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |stalled| {
+        var pair: rpc.TestPair = undefined;
+        try pair.init();
+        defer pair.deinit();
+        const Handler = struct {
+            stalled: bool,
+            rejected: bool = false,
+            fn check(_: ?*anyopaque) !void {}
+            fn run(raw: *anyopaque, request: *rpc.Request) !rpc.OwnedPayload {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                var authority: HttpControl.Parent = .{ .original_ptr = null, .original_check = check, .original_deadline_ns = platform.time.monotonicNs() + 100 * std.time.ns_per_ms, .event_deadline_ns = null, .event = .{} };
+                const view = authority.view();
+                var bytes: [4]u8 = undefined;
+                var count: usize = 0;
+                const result = Child.readBodyControlled(request, &bytes, bytes.len, &count, &view);
+                if (self.stalled) {
+                    try std.testing.expectEqual(http.CallbackStatus.timeout, result);
+                    self.rejected = true;
+                    return error.Timeout;
+                }
+                try HttpControl.result(result);
+                try std.testing.expectEqual(@as(usize, 4), count);
+                try std.testing.expectEqualStrings("pcm!", &bytes);
+                try HttpControl.result(Child.readBodyControlled(request, &bytes, bytes.len, &count, &view));
+                try std.testing.expectEqual(@as(usize, 0), count);
+                return request.endpoint.copyPayload(.{ .body = "complete" });
+            }
+        };
+        var handler: Handler = .{ .stalled = stalled };
+        pair.child.context = &handler;
+        pair.child.handler = Handler.run;
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "/upload");
+        defer request.deinit();
+        if (!stalled) request.body = "pcm!";
+        var context = httpx.Context.init(std.testing.allocator, io, &request);
+        defer context.deinit();
+        var h2 = httpx.H2Connection.initServer(std.testing.allocator, io);
+        defer h2.deinit();
+        const stream = try h2.stream_manager.getOrCreateStream(1);
+        stream.state = .open;
+        var event: std.Io.Event = .unset;
+        var reader: httpx.Context.H2StreamReader = .{ .h2_stream = stream, .io = io, .data_event = &event };
+        if (stalled) context.h2_body_reader = &reader;
+        var outbound: @import("antfly_runtime_abi").http_bridge.Outbound = .{ .context = &context };
+        var control: ForwardControl = .{ .alloc = std.testing.allocator, .cancellation = .{}, .deadline_ns = platform.time.monotonicNs() + 2000 * std.time.ns_per_ms, .body_source = outbound.bodySource() };
+        const started = platform.time.monotonicNs();
+        if (stalled) {
+            try std.testing.expectError(error.InferenceWorkerRequestFailed, pair.parent.call(.{ .body = "upload" }, control.view()));
+            try std.testing.expect(handler.rejected);
+            // The parent must cancel and physically join its source read before
+            // releasing the callback's stack controls or the request context.
+            try std.testing.expect(!reader.control.active());
+            try std.testing.expect(platform.time.monotonicNs() - started < std.time.ns_per_s);
+        } else {
+            const response = try pair.parent.call(.{ .body = "upload" }, control.view());
+            defer response.deinit();
+            try std.testing.expectEqualStrings("complete", response.view().body);
+        }
+    }
 }

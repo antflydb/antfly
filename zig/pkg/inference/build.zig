@@ -133,6 +133,7 @@ pub fn build(b: *std.Build) void {
 
     // Backend options
     const enable_wasm = b.option(bool, "wasm", "Build WASM+SIMD module for browser inference") orelse false;
+    const allow_downloads = b.option(bool, "allow-downloads", "Advertise support for model acquisition") orelse true;
     const enable_webgpu = b.option(bool, "webgpu", "Enable WebGPU acceleration for WASM builds") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly inference targets against libc") orelse !enable_wasm;
     const wasm_memory_model = b.option([]const u8, "wasm-memory-model", "WASM linear memory model for browser inference: wasm32 or wasm64") orelse "wasm32";
@@ -224,6 +225,7 @@ pub fn build(b: *std.Build) void {
         },
         .register_public_modules = true,
         .backend = .{
+            .allow_downloads = allow_downloads,
             .enable_metal = enable_metal,
             .enable_cuda = enable_cuda,
             .cuda_artifacts = cuda_artifacts,

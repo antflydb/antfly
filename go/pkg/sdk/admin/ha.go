@@ -4016,7 +4016,7 @@ func (c *StandbyClient) ReseedRejoin(ctx context.Context, body RejoinAssessReque
 //
 // The identifiers below are pre-rename HA* names for the Standby*
 // canonical names defined above. They exist only so that code built
-// against the pre-rename API (notably go/pkg/operator, which keeps
+// against the pre-rename API (notably hosted Kubernetes automation, which keeps
 // calling the legacy /admin/v1/ha paths via PathStyleLegacy for this
 // release) keeps compiling unchanged. All are removed after 0.4.
 // -----------------------------------------------------------------

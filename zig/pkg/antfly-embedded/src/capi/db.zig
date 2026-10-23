@@ -19,6 +19,7 @@ comptime {
 }
 const handles = @import("handles.zig");
 pub const testMaintenanceCaptureAdmission = @import("lite_connection.zig").testMaintenanceCaptureAdmission;
+pub const testPathReplacementAdmission = @import("lite_connection.zig").testPathReplacementAdmission;
 pub const std = handles.std;
 pub const builtin = handles.builtin;
 pub const local_write = handles.local_write;
@@ -345,33 +346,62 @@ pub const LiteCatalogRollback = struct {
 /// the last owner's removal retires execution but retains durable identity. `upsertResolver`
 /// is idempotent for an unchanged config; backfill is deferred to the
 /// resolver workers (or the next `antfly_db_run_until_idle`).
+/// Validate the whole declaration before starting any resolver worker. A later
+/// invalid declaration must not race replay started by an earlier registration,
+/// return Busy instead of its config error, or need to undo a partial activation.
+/// The caller owns an arena; parsed strings and normalized configs share it.
+fn parseLiteIndexResolvers(arena: Allocator, config_json: []const u8) ![]db_mod.ResolverConfig {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, config_json, .{});
+    if (parsed != .object) return error.InvalidIndexConfig;
+    const declarations = parsed.object.get("resolvers") orelse return &.{};
+    if (declarations != .array) return error.InvalidResolverConfig;
+    const configs = try arena.alloc(db_mod.ResolverConfig, declarations.array.items.len);
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    var artifacts: std.StringHashMapUnmanaged(void) = .empty;
+    for (declarations.array.items, configs, 0..) |item, *cfg, i| {
+        cfg.* = (try db_mod.ResolverConfig.parseValue(arena, item)).value;
+        // Curation belongs to the merge API, not an inline config replay.
+        cfg.merges = &.{};
+        cfg.merge_generation = 0;
+        cfg.merge_state_version = 0;
+        cfg.resolution_generation = 0;
+        cfg.namespace_generation = 0;
+        cfg.inline_managed = true;
+        cfg.retired = false;
+        cfg.replacement_index = "";
+        cfg.replacement_resolver = "";
+        try cfg.validate();
+        if ((try names.getOrPut(arena, cfg.name)).found_existing) return error.ResolverAlreadyExists;
+        if ((try artifacts.getOrPut(arena, cfg.resolution_artifact)).found_existing) return error.ResolverArtifactAlreadyExists;
+        // Match the catalog's label-routing rule, including overlapping kinds
+        // and unrestricted catch-all resolvers. This only scans declarations,
+        // never source rows or artifacts.
+        for (configs[0..i]) |previous| {
+            if (!std.mem.eql(u8, previous.source_artifact, cfg.source_artifact) or
+                !previous.source_artifact_kind.overlaps(cfg.source_artifact_kind)) continue;
+            for (previous.labels) |label| if (cfg.resolvesLabel(label)) {
+                if (cfg.labels.len != 0) return error.ResolverLabelRoutingConflict;
+            };
+        }
+    }
+    return configs;
+}
+
 pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, rollback: *LiteCatalogRollback) !void {
     var arena_impl = std.heap.ArenaAllocator.init(handle.alloc);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
-    var parsed = std.json.parseFromSlice(std.json.Value, arena, config_json, .{}) catch return;
-    if (parsed.value != .object) return;
-    const resolvers = parsed.value.object.get("resolvers") orelse return;
-    if (resolvers != .array) return;
-    for (resolvers.array.items) |item| {
-        if (item != .object) continue;
-        var cfg = try db_mod.ResolverConfig.parseValue(arena, item);
-        // Config replay may include catalog metadata read back by a caller.
-        // Curation is owned by the merge API and cannot be replaced inline.
-        cfg.value.merges = &.{};
-        cfg.value.merge_generation = 0;
-        cfg.value.merge_state_version = 0;
-        cfg.value.resolution_generation = 0;
-        cfg.value.namespace_generation = 0;
-        cfg.value.inline_managed = true;
-        cfg.value.retired = false;
-        cfg.value.replacement_index = "";
-        cfg.value.replacement_resolver = "";
+    const configs = try parseLiteIndexResolvers(arena, config_json);
+    try registerParsedLiteIndexResolvers(handle, configs, rollback);
+}
+
+fn registerParsedLiteIndexResolvers(handle: *Handle, configs: []const db_mod.ResolverConfig, rollback: *LiteCatalogRollback) !void {
+    for (configs) |cfg| {
         // Record the touch before mutating, so a mid-loop failure (an
         // invalid later resolver, a label conflict) still restores every
         // earlier insertion or replacement this call made.
-        try rollback.willTouchResolver(cfg.value.name);
-        _ = try handle.database().*.upsertResolverWithResultOptions(cfg.value, .{ .drain_backfill = false, .wait_for_activity = true });
+        try rollback.willTouchResolver(cfg.name);
+        _ = try handle.database().*.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
     }
 }
 
@@ -581,7 +611,8 @@ pub fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
 /// Reopened namespaces share the root's inference provider and replay options,
 /// but restore their own catalog's enrichment runtime before accepting writes.
 pub fn refreshLiteManagedEmbeddingRuntimeForDatabase(handle: *Handle, database: *db_mod.DB) !void {
-    if (handle.lite_profile != .native) return;
+    const root = handle.parent_handle orelse handle;
+    if (handle.lite_profile != .native and !root.embedded_native_providers) return;
     // A read-only/status-only handle has nothing to reconcile toward, and
     // `db.reconfigureEnrichmentRuntime` unconditionally fails with
     // `error.ReadOnly` on one -- before it even looks at whether there is
@@ -960,13 +991,13 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
         return guard;
     };
     if (lock_handle.embedded_path != null) {
-        @import("sql_commit.zig").recover(lock_handle) catch {
-            guard.leave();
-            return null;
+        @import("sql_commit.zig").recover(lock_handle) catch |err| {
+            guard.entry_error = capi.mapError(err);
+            return guard;
         };
-        @import("sql_ddl.zig").recover(lock_handle) catch {
-            guard.leave();
-            return null;
+        @import("sql_ddl.zig").recover(lock_handle) catch |err| {
+            guard.entry_error = capi.mapError(err);
+            return guard;
         };
     }
     return guard;
@@ -2344,19 +2375,26 @@ pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
     errdefer @import("io_lifetime.zig").release();
     const alloc = std.heap.c_allocator;
     var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .prefer_existing_identity_namespace = true, .online_source_authority = .native });
-    errdefer db.close();
+    var handle_owns_db = false;
+    errdefer if (!handle_owns_db) db.close();
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
-    errdefer alloc.destroy(handle);
+    errdefer if (!handle_owns_db) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
         .io_lifetime_lease = true,
+        .embedded_native_providers = true,
         .db = db,
         .embedded_path = try alloc.dupe(u8, path),
     };
-    @import("tables.zig").loadCatalog(handle) catch |err| {
-        alloc.free(handle.embedded_path.?);
-        return err;
-    };
+    handle_owns_db = true;
+    errdefer {
+        handle.io_lifetime_lease = false; // the outer error path releases it
+        handle.lease_snapshot = true;
+        handles.closeHandle(handle);
+    }
+    @import("entity_sink.zig").attach(handle, &handle.db);
+    try refreshLiteManagedEmbeddingRuntime(handle);
+    try @import("tables.zig").loadCatalog(handle);
     handle.database().*.startResidentBackgroundWorkersIfNeeded();
     return handle;
 }
@@ -2864,22 +2902,33 @@ pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOpti
     var options = dbOpenOptionsFromResolved(resolved, false);
     options.identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 };
     options.prefer_existing_identity_namespace = true;
+    // Restore providers before any generated replay can start. Resolution and
+    // other optional runtimes may still be constructed by the ordinary open.
+    if (resolved.profile == .native) options.enrichment = null;
     var db = try db_mod.DB.open(alloc, path, options);
-    errdefer db.close();
+    var handle_owns_db = false;
+    errdefer if (!handle_owns_db) db.close();
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
-    errdefer alloc.destroy(handle);
+    errdefer if (!handle_owns_db) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
         .io_lifetime_lease = true,
+        .embedded_native_providers = resolved.profile == .native,
         .db = db,
         .open_mode = resolved.open_mode,
         .embedded_path = try alloc.dupe(u8, path),
         .embedded_open_options = options,
+        .lite_generated_enrichment_replay = resolved.generated_enrichment_replay,
     };
-    @import("tables.zig").loadCatalog(handle) catch |err| {
-        alloc.free(handle.embedded_path.?);
-        return err;
-    };
+    handle_owns_db = true;
+    errdefer {
+        handle.io_lifetime_lease = false; // the outer error path releases it
+        handle.lease_snapshot = true;
+        handles.closeHandle(handle);
+    }
+    @import("entity_sink.zig").attach(handle, &handle.db);
+    try refreshLiteManagedEmbeddingRuntime(handle);
+    try @import("tables.zig").loadCatalog(handle);
     handle.database().*.startResidentBackgroundWorkersIfNeeded();
     return handle;
 }
@@ -3245,7 +3294,11 @@ pub fn antfly_restore_backup_json(
     defer io_impl.deinit();
 
     const restored = switch (resolved.storage_kind) {
-        .lite => restorePortableBackupToLiteFile(alloc, io_impl.io(), null, path, backup.bytes(), replace, null),
+        .lite => blk: {
+            const replacement = @import("lite_connection.zig").acquirePathReplacement(path) catch |err| break :blk err;
+            defer replacement.release();
+            break :blk restorePortableBackupToLiteFile(alloc, io_impl.io(), null, path, backup.bytes(), replace, null);
+        },
         .directory => restorePortableBackupToDirectory(alloc, io_impl.io(), path, backup.bytes(), replace),
     };
     restored catch |err| {
@@ -3277,7 +3330,11 @@ pub fn antfly_restore_backup_file_json(
     defer io_impl.deinit();
 
     const restored = switch (resolved.storage_kind) {
-        .lite => restorePortableBackupPathToLiteFile(alloc, io_impl.io(), destination, source, replace),
+        .lite => blk: {
+            const replacement = @import("lite_connection.zig").acquirePathReplacement(destination) catch |err| break :blk err;
+            defer replacement.release();
+            break :blk restorePortableBackupPathToLiteFile(alloc, io_impl.io(), destination, source, replace);
+        },
         .directory => restorePortableBackupPathToDirectory(alloc, io_impl.io(), destination, source, replace),
     };
     restored catch |err| {
@@ -5687,6 +5744,8 @@ pub fn searchPublicQueryJson(
         request_json.bytes(),
     ) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
+    owned.req.graph_owning_table = table_name;
+    owned.req.graph_index_complete_snapshot = true;
 
     const DbSearchQuery = struct {
         const Result = db_mod.types.SearchResult;
@@ -8398,6 +8457,7 @@ fn addIndexJsonRegistered(
         }
         break :blk .dense_vector;
     } else std.meta.stringToEnum(db_mod.types.IndexKind, discriminator.string) orelse return capi.mapError(error.InvalidIndexType);
+    const inline_resolvers = if (kind == .graph) parseLiteIndexResolvers(a, normalized_config) catch |err| return capi.mapError(err) else &.{};
     // Validate command targets before registering any inline producers/resolvers.
     if (replacement) |old| {
         if (old != .string or old.string.len == 0 or std.mem.eql(u8, old.string, name.string))
@@ -8483,7 +8543,7 @@ fn addIndexJsonRegistered(
     // The undo buffer restores both active and retired state on failed admission.
     const shadow_replacement = !existing_index and replacement != null and handle.database().core.index_manager.get(replacement.?.string) != null;
     if (kind == .graph and !shadow_replacement) {
-        registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
+        registerParsedLiteIndexResolvers(handle, inline_resolvers, &rollback.?) catch |err| {
             rollback.?.restore();
             if (err == error.ResolverMergeNamespaceChange)
                 return capi.mapErrorContext(err, "changing a resolver table, key_template, or fenced inline aliases requires explicitly resetting or migrating its durable namespace");
@@ -9304,6 +9364,46 @@ test "capi SQL contention diagnostics preserve busy and unknown outcomes" {
         const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.ptr.?[0..output.len], .{});
         defer parsed.deinit();
         try std.testing.expectEqualStrings(case.state, parsed.value.object.get("error").?.object.get("code").?.string);
+    }
+}
+
+test "capi resolver invalid inline declarations reject before replay activity or catalog mutation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("inline-resolver-preflight");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    const handle = try openLiteHandleAllocWithRuntime(a, path, .{ .no_sync = true, .profile = .hosted }, true, std.testing.io, runtime.ptr());
+    const id = try publishHandle(handle);
+    defer antfly_db_close(id);
+    const database = handle.database();
+    if (database.resolution_runtime == null) try database.initResolutionRuntime();
+    const mutex = &database.resolution_runtime.?.catch_up_mutex;
+    try std.testing.expect(mutex.tryLock());
+    defer mutex.unlock();
+    // Hold replay ownership deterministically. Validation must neither wait
+    // for this gate nor activate the first resolver before rejecting the next.
+    for ([_][]const u8{
+        \\{"name":"second","table":"default","source_artifact":"kg","resolution_artifact":"resolved","key_template":"entity/{{ uslug _entity.text }}"}
+        ,
+        \\{"name":"first","table":"default","source_artifact":"kg","resolution_artifact":"other","key_template":"entity/{{ uslug _entity.text }}"}
+        ,
+        \\{"name":"second","table":"default","source_artifact":"kg","resolution_artifact":"other","key_template":"entity/{{ uslug _entity.text }}","labels":["person"]}
+        ,
+        \\42
+        ,
+    }) |later| {
+        const request = try std.fmt.allocPrint(a,
+            \\{{"name":"graph","kind":"graph","resolvers":[{{"name":"first","table":"default","source_artifact":"kg","resolution_artifact":"resolved","key_template":"entity/{{{{ uslug _entity.text }}}}","labels":["person"]}},{s}]}}
+        , .{later});
+        defer a.free(request);
+        try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_add_index_json(id, .fromSlice(request)));
+        const identities = try database.listResolverIdentities(a);
+        defer a.free(identities);
+        try std.testing.expectEqual(@as(usize, 0), identities.len);
     }
 }
 

@@ -43,14 +43,13 @@ and `blas-root` control CPU acceleration; `cuda-artifacts` selects the CUDA
 bundle format. These options are passed to the shared composition rather
 than requiring files to be added to the fetched package cache.
 
-The package exposes `antfly-lite` and `antfly_wasm` compile artifacts. Its
-`capi` build step installs the native `libantfly` shared library, including the
-platform-specific link procedure. The browser artifact contains both embedded
-database and inference APIs. Use `dependency.artifact(...)` with
-`b.addInstallArtifact` for the compile artifacts. On non-Mach-O targets,
-`antfly` also remains available as a shared-library compile artifact. Standalone source
-package commands include `zig build lite`, `capi`, `wasm`, and `wasm-test`;
-the default builds native Lite and its C API. `zig build inference-wasm`
+The package exposes the final native shared library through
+`dependency.namedLazyPath("libantfly")`, including the custom-linked macOS
+library, and the browser artifact through `dependency.artifact("antfly_wasm")`.
+The browser artifact contains both embedded database and inference APIs.
+Standalone source
+package commands include `zig build libantfly`, `capi`, `wasm`, and `wasm-test`;
+the default builds the native library and its C API. `zig build inference-wasm`
 builds database-free browser inference, with `-Dwasm-memory-model=wasm64`
 selecting memory64 (the default is wasm32). `wasm` builds the combined
 embedded database/inference wasm32 bundle. Both browser owners reuse their
@@ -61,8 +60,7 @@ must be supplied by the consumer.
 
 The source archive includes the complete first-party Apache composition and
 shared runtime sources, generated contracts, pinned dependency manifests,
-source provenance, and third-party notices. It contains no ELv2 server or
-server test sources. Repository-wide corpora, benchmarks and CI tooling are
+source provenance, and third-party notices. It contains no server implementations or server test sources. Repository-wide corpora, benchmarks and CI tooling are
 excluded; compile-time embedded assets are included individually. Optional
 backend artifacts remain available for consumers enabling acceleration.
 Third-party dependencies retain their own licenses.

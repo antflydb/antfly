@@ -434,7 +434,7 @@ Table restore jobs are visible to administrators of that table; cluster restore
 jobs require cluster administration. Cancellation is observed at table-publication
 boundaries.
 
-The ELv2 standalone server serves Lite database files:
+The Apache-2.0 standalone server serves Lite database files:
 
 ```console
 antfly standalone --storage-engine lite --storage-path ./data.antfly.aflite

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const runnable_fanout = @import("runnable_fanout_owner.zig");
@@ -11333,6 +11333,54 @@ fn makeGraphExpandRequestWithAlgebraicModeAndTargetConstraints(
     };
 }
 
+/// Bare keys name the queried table. An incoming resolver graph also has
+/// foreign target namespaces, so require an explicit namespace rather than
+/// silently interpreting a concept key as a source-document key.
+pub fn validateIncomingStartIdentities(a: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, req: db_mod.types.SearchRequest) !void {
+    var needs_validation = false;
+    for (req.graph_queries) |named| {
+        if (named.query.params.direction != .out and selectorHasUnqualifiedIdentity(named.query.start_nodes)) needs_validation = true;
+    }
+    if (!needs_validation) return;
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return;
+    for (req.graph_queries) |named| {
+        if (named.query.params.direction == .out or !selectorHasUnqualifiedIdentity(named.query.start_nodes)) continue;
+        var lookup = (try indexes_api.lookupSingleIndexConfig(a, table.indexes_json, named.query.index_name)) orelse continue;
+        defer lookup.deinit();
+        if (!graphConfigHasForeignResolver(lookup.config, table_name, req.response_table_name)) continue;
+        graph_query_diagnostic.recordForRequest(req, named.name, graph_query_diagnostic.feature(named.query), .qualified_start_identity_required);
+        return error.GraphStartIdentityRequired;
+    }
+}
+
+fn selectorHasUnqualifiedIdentity(selector: graph_query_mod.NodeSelector) bool {
+    return switch (selector) {
+        .keys => |keys| keys.len != 0,
+        .identities => |identities| for (identities) |identity| {
+            if (identity.table == null) break true;
+        } else false,
+        .result_ref => false,
+    };
+}
+
+fn graphConfigHasForeignResolver(config: std.json.Value, source: []const u8, logical_source: ?[]const u8) bool {
+    if (config != .object) return false;
+    const resolvers = config.object.get("resolvers") orelse return false;
+    if (resolvers != .array) return false;
+    for (resolvers.array.items) |resolver| {
+        if (resolver != .object) continue;
+        const table = resolver.object.get("table") orelse continue;
+        if (table != .string or std.mem.eql(u8, table.string, source)) continue;
+        // HTTP binds the response label to this physical table before calling
+        // the source. A resolver may retain that same logical table name.
+        if (logical_source) |name| if (std.mem.eql(u8, table.string, name)) continue;
+        return true;
+    }
+    return false;
+}
+
 fn catalogGraphIndexEnablesAlgebraicSemiring(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -18450,4 +18498,13 @@ test "public graph metric borrowed wire partial cursor preserves binary keys and
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{wire});
     const invalid = "{\"edges\":[],\"scanned_rows\":1,\"key_offsets\":[0],\"key_scanned_rows\":[],\"partial_key\":0,\"resume_cursor\":{\"direction\":\"out\",\"type_index\":0,\"edge_type\":\"R\",\"adjacent_key\":\"\",\"physical_resume_key_hex\":\"zz\"}}";
     try std.testing.expectError(error.UnexpectedToken, parseGraphEdgesResponse(a, invalid));
+}
+
+test "incoming resolver qualification recognizes the owning logical table" {
+    const a = std.testing.allocator;
+    var local_config = try std.json.parseFromSlice(std.json.Value, a, "{\"resolvers\":[{\"table\":\"docs\"}]}", .{});
+    defer local_config.deinit();
+    try std.testing.expect(!graphConfigHasForeignResolver(local_config.value, "docs", null));
+    try std.testing.expect(!graphConfigHasForeignResolver(local_config.value, "table:7", "docs"));
+    try std.testing.expect(graphConfigHasForeignResolver(local_config.value, "table:8", "other"));
 }

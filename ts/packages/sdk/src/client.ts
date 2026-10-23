@@ -810,6 +810,34 @@ export class AntflyClient {
     return data;
   }
 
+  /** Named inference uses the same authentication as database requests.
+   * Mutations are issued once; callers control retry policy and cancellation.
+   * A streamed Response remains owned by its caller until consumed/canceled.
+   */
+  inference = {
+    models: async (signal?: AbortSignal): Promise<InferenceGatewayCatalog> => {
+      const response = await fetch(this.url("/ai/v1/models"), {
+        headers: this.requestHeaders({ Accept: "application/json" }),
+        signal,
+      });
+      if (!response.ok) throw new Error(`Inference catalog failed (${response.status})`);
+      const { text, truncated } = await readLimitedResponseText(response, 16 << 20);
+      if (truncated) throw new Error("Inference catalog exceeded its size limit");
+      return JSON.parse(text) as InferenceGatewayCatalog;
+    },
+    invoke: (
+      operation: InferenceGatewayOperation,
+      body: Record<string, unknown>,
+      signal?: AbortSignal
+    ): Promise<Response> =>
+      fetch(this.url(operation === "predict" ? "/ml/v1/predict" : `/ai/v1/${operation}`), {
+        method: "POST",
+        headers: this.requestHeaders(),
+        body: JSON.stringify(body),
+        signal,
+      }),
+  };
+
   connections = {
     /**
      * List configured external connections (inference providers, web search,
@@ -1108,8 +1136,10 @@ export class AntflyClient {
    */
   private async performRetrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks?: RetrievalAgentStreamCallbacks
+    callbacks?: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<RetrievalAgentResult | AbortController> {
+    options?.signal?.throwIfAborted();
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Accept: "text/event-stream, application/json",
@@ -1125,13 +1155,16 @@ export class AntflyClient {
     Object.assign(headers, this.config.headers);
 
     const abortController = new AbortController();
+    const signal = options?.signal
+      ? AbortSignal.any([abortController.signal, options.signal])
+      : abortController.signal;
     const response = await this.admission.fetch(
       `${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/retrieval`,
       {
         method: "POST",
         headers,
         body: JSON.stringify(request),
-        signal: abortController.signal,
+        signal,
       }
     );
 
@@ -1157,6 +1190,7 @@ export class AntflyClient {
     // Handle JSON response (non-streaming)
     if (isJSON) {
       const result = (await response.json()) as RetrievalAgentResult;
+      signal.throwIfAborted();
       return result;
     }
 
@@ -1177,7 +1211,7 @@ export class AntflyClient {
     void (async () => {
       try {
         for await (const frame of parseSSEFrames(stream, "Retrieval agent")) {
-          if (abortController.signal.aborted) return;
+          if (signal.aborted) return;
           switch (frame.event) {
             case "classification":
               callbacks.onClassification?.(JSON.parse(frame.data));
@@ -1239,7 +1273,7 @@ export class AntflyClient {
         }
         throw new Error("Retrieval agent stream ended before done");
       } catch (error) {
-        if (!abortController.signal.aborted) {
+        if (!signal.aborted) {
           const detail = error instanceof Error ? error : new Error(String(error));
           callbacks.onErrorDetail?.(detail);
           callbacks.onError?.(detail.message);
@@ -1256,21 +1290,31 @@ export class AntflyClient {
    * Use streamRetrievalAgent when incremental events are required. Keeping the
    * two response modes separate avoids runtime shape checks on the result.
    */
-  async retrievalAgent(request: RetrievalAgentRequest): Promise<RetrievalAgentResult>;
+  async retrievalAgent(
+    request: RetrievalAgentRequest,
+    callbacks?: undefined,
+    options?: QueryExecutionOptions
+  ): Promise<RetrievalAgentResult>;
   /**
    * @deprecated Use streamRetrievalAgent(request, callbacks). This overload is
    * retained for source compatibility and will be removed in a future major release.
    */
   async retrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks: RetrievalAgentStreamCallbacks
+    callbacks: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<AbortController>;
   async retrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks?: RetrievalAgentStreamCallbacks
+    callbacks?: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<RetrievalAgentResult | AbortController> {
-    if (callbacks) return this.streamRetrievalAgent(request, callbacks);
-    const result = await this.performRetrievalAgent({ ...request, stream: false });
+    if (callbacks) return this.streamRetrievalAgent(request, callbacks, options);
+    const result = await this.performRetrievalAgent(
+      { ...request, stream: false },
+      undefined,
+      options
+    );
     if (result instanceof AbortController) {
       result.abort();
       throw new Error("Retrieval agent returned a stream for a JSON request");
@@ -1281,9 +1325,14 @@ export class AntflyClient {
   /** Run the retrieval agent as an SSE stream. */
   async streamRetrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks: RetrievalAgentStreamCallbacks
+    callbacks: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<AbortController> {
-    const result = await this.performRetrievalAgent({ ...request, stream: true }, callbacks);
+    const result = await this.performRetrievalAgent(
+      { ...request, stream: true },
+      callbacks,
+      options
+    );
     if (result instanceof AbortController) return result;
 
     // A proxy or older server may still answer with JSON. Preserve the complete
@@ -3642,4 +3691,40 @@ export class ChatGPTConnectionError extends Error {
     super(code);
     this.name = "ChatGPTConnectionError";
   }
+}
+
+export type InferenceGatewayOperation =
+  | "chat/completions"
+  | "decisions"
+  | "embeddings"
+  | "embed"
+  | "rerank"
+  | "chunk"
+  | "read"
+  | "extract"
+  | "rewrite"
+  | "transcribe"
+  | "dictate"
+  | "synthesize"
+  | "predict"
+  | "generate"
+  | "generate/batch";
+export interface InferenceGatewayModel {
+  id: string;
+  object: "model";
+  task?: string;
+  /** Known supported tasks; task is omitted when discovery is ambiguous. */
+  tasks?: string[];
+  connection?: string;
+  backend_model?: string;
+  availability?: string;
+  freshness?: string;
+  gateway_capabilities?: Record<string, "supported" | "unsupported" | "unknown">;
+}
+export interface InferenceGatewayCatalog {
+  /** Deployment policy; omitted by servers predating public inference controls. */
+  public_inference_enabled?: boolean;
+  object: "list";
+  data: InferenceGatewayModel[];
+  [group: string]: unknown;
 }
