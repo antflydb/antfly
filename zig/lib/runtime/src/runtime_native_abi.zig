@@ -106,8 +106,8 @@ const builtin = @import("builtin");
 // Physical sync operations retain native state and descriptor admission through controlled retries.
 // Bounded control-file read owners retain physical buffers through durability retries.
 // Storage durability grants retain reusable worker, descriptor and buffer ownership.
-// Durability grants can own frozen append bytes before publication acquisition.
-pub const abi_version: u32 = 102;
+// Durability grants include bounded atomic control replacement and directory creation.
+pub const abi_version: u32 = 103;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

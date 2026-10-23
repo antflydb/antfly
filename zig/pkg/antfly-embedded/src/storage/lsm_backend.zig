@@ -2211,6 +2211,77 @@ pub const Backend = struct {
         }
     }
 
+    /// Payload owns a prepared bounded CPU publication and its credits. It
+    /// provides publish(AppendResult), requireRecovery() and release(). The
+    /// caller fences all same-backend writers/readers/maintenance and retains
+    /// the backend until operation retirement, just as for QuiescedWalSync.
+    pub fn QuiescedWalAppend(comptime Payload: type) type {
+        return wal_mod.CurrentStateAppend(struct {
+            backend: *Backend,
+            guard: WalOperationLock,
+            payload: Payload,
+            entries: u32,
+            pub fn publish(self: *@This(), result: wal_mod.AppendResult) void {
+                self.payload.publish(result);
+                // Invalidate scalar cache generations without scanning or
+                // allocating while this prepared publication is adopted.
+                self.backend.wal_retention.invalidateAll();
+                self.backend.noteMutableWalSegment(result.segment);
+                self.backend.write_stats.wal_append_records += 1;
+                self.backend.write_stats.wal_append_entries += self.entries;
+                self.backend.write_stats.wal_append_bytes += result.bytes;
+                self.backend.write_stats.wal_segment_syncs += result.segment_syncs;
+                self.backend.write_stats.wal_index_syncs += result.index_syncs;
+                self.backend.write_stats.wal_sync_records += 1;
+            }
+            pub fn requireRecovery(self: *@This()) void {
+                self.backend.manifest_recovery_required = true;
+                self.backend.wal_retention.invalidateAll();
+                self.payload.requireRecovery();
+            }
+            pub fn release(self: *@This()) void {
+                self.payload.release();
+                self.guard.release();
+            }
+        });
+    }
+
+    /// A failed try/initial dispatch leaves Payload with the caller. Prepared
+    /// append bytes and descriptor/worker credit precede publication acquisition;
+    /// a busy guard releases the entire tentative grant before waiting.
+    pub fn tryBeginQuiescedWalAppendWithAdmission(self: *Backend, record: []const u8, payload: anytype, original: read_admission.Port) !?QuiescedWalAppend(@TypeOf(payload)) {
+        try original.checkpoint();
+        if (self.options.backend.read_only) return error.ReadOnly;
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (!self.options.wal_enabled or self.root_dir == null or self.storage == null or
+            !self.storage.?.supportsNativePathLocks() or self.root_lock_state == null or self.wal_operation_lock_file == null)
+            return error.ExecutionWaitUnsupported;
+        const entries = try wal_mod.validateStateRecordWithAdmission(record, original);
+        if (entries == 0) return error.ResourceBudgetExceeded;
+        var operation = try QuiescedWalAppend(@TypeOf(payload)).prepare(self.root_dir.?, record.len, .{ .segment_bytes = self.options.wal_segment_bytes });
+        var resources = (try self.storage.?.tryPrepareAppendWithAdmission(record, original)) orelse return null;
+        var guard = (self.tryAcquireWalOperationLockImpl(.exclusive, false) catch |cause| {
+            resources.deinit();
+            return cause;
+        }) orelse {
+            resources.deinit();
+            return null;
+        };
+        operation.start(resources, .{ .backend = self, .guard = guard, .payload = payload, .entries = entries }, original) catch |cause| {
+            guard.release();
+            resources.deinit();
+            return cause;
+        };
+        return operation;
+    }
+
+    pub fn beginQuiescedWalAppendWithAdmission(self: *Backend, io: std.Io, record: []const u8, payload: anytype, original: read_admission.Port) !QuiescedWalAppend(@TypeOf(payload)) {
+        while (true) {
+            if (try self.tryBeginQuiescedWalAppendWithAdmission(record, payload, original)) |operation| return operation;
+            try @import("../common/cleanup_wait.zig").waitForRetry(io, original);
+        }
+    }
+
     fn resolveBackgroundExecutor(configured: ?*const BackgroundExecutor) BackgroundExecutor {
         return if (configured) |executor| executor.* else BackgroundExecutor.initInline(0);
     }
@@ -29315,4 +29386,107 @@ test "controlled physical sync WAL retirement keeps peer publication blocked unt
     try std.testing.expectEqual(before, pool.snapshotStats().fd_admitted_descriptors);
     var acquired = (try peer.tryAcquireWalOperationLock(.shared)) orelse return error.TestUnexpectedResult;
     acquired.release();
+}
+
+test "controlled physical sync backend WAL append owns actual publication and a prepared mutable successor" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Mode = enum { publish, abandon, partial_failure };
+    const admission = @import("../common/read_admission.zig");
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    for (std.enums.values(Mode)) |mode| {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 16);
+        defer pool.deinit();
+        var backend = try Backend.open(a, root, .{ .native_storage_pool = &pool });
+        defer backend.close();
+        var marker: u8 = 0;
+        const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &marker, .begin = Control.begin, .end = Control.end } };
+        const original = admission.Port.init(&payload);
+        var incoming: ActiveMemTable = .{ .ordered_enabled = false };
+        defer incoming.deinit(a);
+        try incoming.upsert(a, .{ .name = "docs" }, "final", "status", false);
+        var candidate = try backend.mutable.preparePublication(a, &incoming);
+        defer candidate.deinit(a);
+        const record = try wal_mod.prepareStateRecordWithAdmission(a, &incoming, original);
+        defer a.free(record);
+        var published = false;
+        var recover = false;
+        var releases: usize = 0;
+        const Publication = struct {
+            backend: *Backend,
+            candidate: *ActiveMemTable,
+            published: *bool,
+            recover: *bool,
+            releases: *usize,
+            pub fn publish(self: *@This(), _: wal_mod.AppendResult) void {
+                std.debug.assert(!self.published.*);
+                self.backend.invalidateMutableReadSnapshot();
+                self.backend.mutable.publishPrepared(self.candidate);
+                self.published.* = true;
+            }
+            pub fn requireRecovery(self: *@This()) void {
+                self.recover.* = true;
+            }
+            pub fn release(self: *@This()) void {
+                self.releases.* += 1;
+            }
+        };
+        const publication: Publication = .{ .backend = &backend, .candidate = &candidate, .published = &published, .recover = &recover, .releases = &releases };
+        const baseline_fds = pool.snapshotStats().fd_admitted_descriptors;
+        var held = try backend.acquireWalOperationLock(.exclusive);
+        var held_live = true;
+        defer if (held_live) held.release();
+        try std.testing.expect(try backend.tryBeginQuiescedWalAppendWithAdmission(record, publication, original) == null);
+        try std.testing.expectEqual(baseline_fds, pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expect(!published and releases == 0);
+        try std.testing.expectError(error.CorruptLsmWal, backend.tryBeginQuiescedWalAppendWithAdmission("bad", publication, original));
+        held.release();
+        held_live = false;
+        const before_records = backend.write_stats.wal_append_records;
+        const before_entries = backend.write_stats.wal_append_entries;
+        if (mode == .partial_failure) storage_io.NativeSyncTestControl.append_failure_after.store(3, .release);
+        defer storage_io.NativeSyncTestControl.append_failure_after.store(std.math.maxInt(usize), .release);
+        var operation = try backend.beginQuiescedWalAppendWithAdmission(std.testing.io, record, publication, original);
+        var live = true;
+        defer if (live) operation.deinit();
+        try std.testing.expect(try backend.tryAcquireWalOperationLock(.shared) == null);
+        try std.testing.expect(backend.mu.tryLock());
+        backend.mu.unlock();
+        if (mode == .partial_failure) {
+            try std.testing.expectError(error.NoSpaceLeft, operation.publishWithAdmission(original));
+            try std.testing.expect(!published and recover and releases == 1);
+        } else {
+            _ = try operation.waitWithAdmission(original);
+            try std.testing.expect(try backend.tryAcquireWalOperationLock(.shared) == null);
+            try std.testing.expectError(error.NotFound, backend.mutable.get(.{ .name = "docs" }, "final"));
+            if (mode == .publish) {
+                _ = try operation.publishWithAdmission(original);
+                _ = try operation.publishWithAdmission(original);
+                try std.testing.expect(published and !recover and releases == 1);
+                try std.testing.expectEqualStrings("status", try backend.mutable.get(.{ .name = "docs" }, "final"));
+                try std.testing.expectEqual(before_records + 1, backend.write_stats.wal_append_records);
+                try std.testing.expectEqual(before_entries + 1, backend.write_stats.wal_append_entries);
+            } else {
+                operation.deinit();
+                live = false;
+                try std.testing.expect(!published and recover and releases == 1);
+                try std.testing.expectError(error.NotFound, backend.mutable.get(.{ .name = "docs" }, "final"));
+            }
+        }
+        try std.testing.expectEqual(mode != .publish, backend.manifest_recovery_required);
+        if (mode != .publish) try std.testing.expectError(error.RecoveryRequired, backend.tryBeginQuiescedWalAppendWithAdmission(record, publication, original));
+        var shared = (try backend.tryAcquireWalOperationLock(.shared)) orelse return error.TestUnexpectedResult;
+        shared.release();
+    }
 }

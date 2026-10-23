@@ -48,8 +48,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Storage durability providers return owning physical sync operations.
 // Storage durability metadata uses owning bounded read operations.
 // Storage durability grants retain reusable worker, descriptor and buffer ownership.
-// Durability grants can own frozen append bytes before publication acquisition.
-pub const abi_version: u32 = 162;
+// Durability grants include bounded atomic control replacement and directory creation.
+pub const abi_version: u32 = 163;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

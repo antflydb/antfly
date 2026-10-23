@@ -362,6 +362,8 @@ pub const DurabilityResources = struct {
         begin_sync: *const fn (*anyopaque, []const u8, bool, read_admission.Port) anyerror!SyncOperation,
         deinit: *const fn (*anyopaque) void,
         begin_append: ?*const fn (*anyopaque, []const u8, bool, read_admission.Port) anyerror!SyncOperation = null,
+        begin_control_replace: ?*const fn (*anyopaque, []const u8, []const u8, read_admission.Port) anyerror!SyncOperation = null,
+        begin_create_directory: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!SyncOperation = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     /// Appends the frozen bytes prepared with this grant. The caller holds
@@ -373,6 +375,21 @@ pub const DurabilityResources = struct {
         try original.checkpoint();
         const begin = self.vtable.begin_append orelse return error.ExecutionWaitUnsupported;
         return BoundaryAbi.call("begin_append", self.boundary_dispatch, begin, .{ self.ptr, path, create_if_missing, original });
+    }
+    /// Small metadata is copied into the grant's fixed scratch on caller CPU.
+    /// The caller serializes this reserved sibling temporary path with its
+    /// publication guard. Completion includes file sync, rename and parent sync.
+    pub fn beginControlReplace(self: *DurabilityResources, path: []const u8, bytes: []const u8, original: read_admission.Port) !SyncOperation {
+        try original.checkpoint();
+        const begin = self.vtable.begin_control_replace orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("begin_control_replace", self.boundary_dispatch, begin, .{ self.ptr, path, bytes, original });
+    }
+    /// Create a single child of an existing parent, with no recursive fallback.
+    /// Namespace durability is a separately ordered beginSyncParent phase.
+    pub fn beginCreateDirectory(self: *DurabilityResources, path: []const u8, original: read_admission.Port) !SyncOperation {
+        try original.checkpoint();
+        const begin = self.vtable.begin_create_directory orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("begin_create_directory", self.boundary_dispatch, begin, .{ self.ptr, path, original });
     }
     pub fn beginControlRead(self: *DurabilityResources, path: []const u8, limit: usize, original: read_admission.Port) !ControlFileReadOperation {
         return BoundaryAbi.call("begin_read", self.boundary_dispatch, self.vtable.begin_read, .{ self.ptr, path, limit, original });
@@ -1560,6 +1577,7 @@ const FdCache = if (!supports_posix_fd_cache)
         }
 
         pub fn invalidatePath(_: *FdCache, _: u64, _: []const u8) void {}
+        pub fn fencePathRetainingEntries(_: *FdCache, _: u64, _: std.Io, _: []const u8, _: ?read_admission.Port) !void {}
         pub fn invalidateTree(_: *FdCache, _: u64, _: []const u8) void {}
         pub fn invalidateRename(_: *FdCache, _: u64, _: []const u8, _: []const u8) void {}
         pub fn invalidateNamespace(_: *FdCache, _: u64) void {}
@@ -1794,6 +1812,24 @@ else
             errdefer allocator.free(out);
             try readAllAtOffset(entry.fd, out, size - len);
             return .{ .bytes = out, .file_size = size };
+        }
+
+        /// Caller CPU fences cached inode identities without retiring a file
+        /// descriptor or freeing metadata under this guard. The bucket walk is
+        /// bounded by the shared descriptor ceiling; hash collisions may retire
+        /// cache eligibility conservatively. Existing read pins remain valid.
+        fn fencePathRetainingEntries(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, original: ?read_admission.Port) !void {
+            const hash = namespacedPathHash(namespace, path);
+            const shard = self.shardForHash(hash);
+            if (original) |control| {
+                try @import("../../common/cleanup_wait.zig").lockAtomic(&shard.mutex, io, control);
+            } else _ = lockAtomic(&shard.mutex);
+            defer shard.mutex.unlock();
+            shard.invalidation_epoch +%= 1;
+            if (shard.entries.getPtr(hash)) |bucket|
+                for (bucket.items) |entry| {
+                    entry.invalidated = true;
+                };
         }
 
         fn invalidatePath(self: *FdCache, namespace: u64, path: []const u8) void {
@@ -2977,6 +3013,8 @@ pub const NativeSyncTestControl = struct {
     pub var calls: std.atomic.Value(usize) = .init(0);
     pub var reads: std.atomic.Value(usize) = .init(0);
     pub var appends: std.atomic.Value(usize) = .init(0);
+    pub var metadata: std.atomic.Value(usize) = .init(0);
+    pub var control_failure_after_rename: std.atomic.Value(bool) = .init(false);
     pub var append_failure_after: std.atomic.Value(usize) = .init(std.math.maxInt(usize));
     pub var sync_path_hashes: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
     fn observe(read: bool, path: []const u8) void {
@@ -3117,7 +3155,7 @@ const NativePhysicalOperation = if (!supports_native_storage or builtin.os.tag =
 /// control callback. Callers prepare inputs and observe results on admitted CPU.
 const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag == .freestanding) struct {} else struct {
     const Phase = enum(u8) { idle, queued, completed, stopping };
-    const Kind = enum { control_read, contents, directory, append };
+    const Kind = enum { control_read, contents, directory, append, control_replace, create_directory };
     allocator: Allocator,
     permit: NativeFdPermit,
     future: std.Io.Future(void) = undefined,
@@ -3127,14 +3165,17 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     kind: Kind = .contents,
     path: [std.fs.max_path_bytes]u8 = undefined,
     path_len: usize = 0,
+    temporary: [std.fs.max_path_bytes]u8 = undefined,
+    temporary_len: usize = 0,
     buffer: [max_control_file_bytes]u8 = undefined,
     limit: usize = 0,
     result: ControlFileResult = .{ .file_size = 0, .bytes = &.{} },
     failure: ?anyerror = null,
     append_bytes: ?[]u8 = null,
     append_create: bool = false,
+    invalidation_pending: bool = false,
 
-    const vtable: DurabilityResources.VTable = .{ .begin_read = beginRead, .begin_sync = beginSync, .deinit = deinit, .begin_append = beginAppend };
+    const vtable: DurabilityResources.VTable = .{ .begin_read = beginRead, .begin_sync = beginSync, .deinit = deinit, .begin_append = beginAppend, .begin_control_replace = beginControlReplace, .begin_create_directory = beginCreateDirectory };
     const sync_vtable: SyncOperation.VTable = .{ .wait_with_admission = wait, .deinit = retireOperation };
     const read_vtable: ControlFileReadOperation.VTable = .{ .wait_with_admission = waitRead, .deinit = retireOperation };
 
@@ -3182,7 +3223,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    fn begin(self: *NativeDurabilityResources, path: []const u8, kind: Kind, limit: usize, create_if_missing: bool, original: read_admission.Port) !void {
+    fn prepareCommand(self: *NativeDurabilityResources, path: []const u8, kind: Kind, limit: usize, create_if_missing: bool, original: read_admission.Port) !void {
         try requireControl(original);
         if (self.active) return error.ResourceBudgetExceeded;
         if (path.len >= self.path.len) return error.NameTooLong;
@@ -3193,11 +3234,75 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
         self.kind = kind;
         self.limit = limit;
         self.append_create = create_if_missing;
+        self.invalidation_pending = false;
         self.failure = null;
         self.result = .{ .file_size = 0, .bytes = &.{} };
         self.active = true;
+    }
+
+    fn submit(self: *NativeDurabilityResources) void {
         self.phase.store(.queued, .release);
         self.wake.set(self.permit.io);
+    }
+
+    fn begin(self: *NativeDurabilityResources, path: []const u8, kind: Kind, limit: usize, create_if_missing: bool, original: read_admission.Port) !void {
+        try self.prepareCommand(path, kind, limit, create_if_missing, original);
+        self.submit();
+    }
+
+    fn beginControlReplace(raw: *anyopaque, path: []const u8, bytes: []const u8, original: read_admission.Port) !SyncOperation {
+        const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
+        if (bytes.len > self.buffer.len) return error.ResourceBudgetExceeded;
+        // Reserved to the publication owner; a stale crash temporary is safe
+        // to replace under that same exclusive filesystem publication lock.
+        var temporary: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp = std.fmt.bufPrint(&temporary, "{s}.admitted-tmp", .{path}) catch return error.NameTooLong;
+        try self.permit.cache.fencePathRetainingEntries(self.permit.state.cache_namespace, self.permit.io, path, original);
+        try self.prepareCommand(path, .control_replace, bytes.len, false, original);
+        @memcpy(self.buffer[0..bytes.len], bytes);
+        @memcpy(self.temporary[0..tmp.len], tmp);
+        self.temporary_len = tmp.len;
+        self.invalidation_pending = true;
+        self.submit();
+        return .{ .ptr = self, .vtable = &sync_vtable };
+    }
+
+    fn beginCreateDirectory(raw: *anyopaque, path: []const u8, original: read_admission.Port) !SyncOperation {
+        const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
+        try self.begin(path, .create_directory, 0, false, original);
+        return .{ .ptr = self, .vtable = &sync_vtable };
+    }
+
+    fn replaceControl(self: *NativeDurabilityResources, path: []const u8) !void {
+        const io = self.permit.io;
+        const temporary = self.temporary[0..self.temporary_len];
+        // A reserved stale crash temporary may be removed under publication.
+        // Exclusive creation avoids following a replacement symlink.
+        deleteFilePathWithIo(io, temporary) catch |cause| {
+            if (cause != error.FileNotFound) return cause;
+        };
+        errdefer deleteFilePathWithIo(io, temporary) catch {};
+        {
+            const file = try openFilePathForWriteWithIo(io, temporary, .{ .exclusive = true });
+            defer file.close(io);
+            var writer = file.writer(io, &.{});
+            writer.interface.writeAll(self.buffer[0..self.limit]) catch |cause| return writer.err orelse cause;
+            writer.end() catch |cause| return writer.err orelse cause;
+            try file.sync(io);
+        }
+        try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), path, io);
+        if (builtin.is_test and NativeSyncTestControl.control_failure_after_rename.load(.acquire)) return error.InputOutput;
+        const parent = std.fs.path.dirname(path) orelse ".";
+        try fs_paths.syncDirPortable(io, parent);
+    }
+
+    fn createDirectory(self: *NativeDurabilityResources, path: []const u8) !void {
+        const io = self.permit.io;
+        std.Io.Dir.cwd().createDir(io, path, .default_dir) catch |cause| {
+            if (cause != error.PathAlreadyExists) return cause;
+            var directory = try std.Io.Dir.cwd().openDir(io, path, .{});
+            directory.close(io);
+        };
     }
 
     fn beginRead(raw: *anyopaque, path: []const u8, limit: usize, original: read_admission.Port) !ControlFileReadOperation {
@@ -3263,6 +3368,8 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
             if (builtin.is_test) {
                 if (self.kind == .append) {
                     _ = NativeSyncTestControl.appends.fetchAdd(1, .release);
+                } else if (self.kind == .control_replace or self.kind == .create_directory) {
+                    _ = NativeSyncTestControl.metadata.fetchAdd(1, .release);
                 } else NativeSyncTestControl.observe(self.kind == .control_read, path);
             }
             const result = switch (self.kind) {
@@ -3270,6 +3377,8 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
                 .directory => fs_paths.syncDirPortable(io, path),
                 .control_read => self.readControl(path),
                 .append => self.appendPrepared(path),
+                .control_replace => self.replaceControl(path),
+                .create_directory => self.createDirectory(path),
             };
             result catch |cause| {
                 self.failure = cause;
@@ -3302,6 +3411,10 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
         std.debug.assert(self.active);
         // Only the atomic completion bit is inspected while CPU is parked.
         try @import("../../common/cleanup_wait.zig").until(self.permit.io, original, self, ready, null);
+        if (self.invalidation_pending) {
+            try self.permit.cache.fencePathRetainingEntries(self.permit.state.cache_namespace, self.permit.io, self.path[0..self.path_len], original);
+            self.invalidation_pending = false;
+        }
         if (self.failure) |cause| return cause;
     }
 
@@ -3318,6 +3431,10 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
         // mailbox worker first: an accepted request must run to completion.
         while (self.phase.load(.acquire) != .completed)
             self.permit.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        if (self.invalidation_pending) {
+            self.permit.cache.fencePathRetainingEntries(self.permit.state.cache_namespace, self.permit.io, self.path[0..self.path_len], null) catch unreachable;
+            self.invalidation_pending = false;
+        }
         self.active = false;
         self.phase.store(.idle, .release);
     }
@@ -8176,4 +8293,65 @@ test "controlled physical sync prepared append preserves an ambiguous partial wr
     const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(100));
     defer a.free(actual);
     try std.testing.expectEqualStrings("prefix:rec", actual);
+}
+
+test "controlled physical sync control replacement fences cached inodes with admitted retry and retained readers" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var pool = NativeStoragePool.initWithCapacityForTest(a, 16);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(a, .threaded, &pool);
+    defer native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/control", .{tmp.sub_path});
+    defer a.free(path);
+    try native.storage().writeFileAbsolute(path, "old");
+    const cache = native.state.fdCache();
+    const pinned = try cache.retain(native.state.cache_namespace, std.testing.io, path);
+    defer cache.release(std.testing.io, pinned);
+    const shard = cache.shardForHash(namespacedPathHash(native.state.cache_namespace, path));
+    const Control = struct {
+        implementation: ?*NativeDurabilityResources = null,
+        mutex: *std.atomic.Mutex,
+        block: bool = true,
+        held: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.implementation) |impl| if (self.block and impl.phase.load(.acquire) == .completed and !self.held) {
+                if (!self.mutex.tryLock()) return error.TestUnexpectedResult;
+                self.held = true;
+            };
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.held) return error.NotFound;
+        }
+        fn end(_: *anyopaque) !void {}
+    };
+    var control: Control = .{ .mutex = &shard.mutex };
+    const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = read_admission.Port.init(&payload);
+    var grant = (try native.storage().tryPrepareDurabilityWithAdmission(original)).?;
+    defer grant.deinit();
+    control.implementation = @ptrCast(@alignCast(grant.ptr));
+    var operation = try grant.beginControlReplace(path, "new", original);
+    defer operation.deinit();
+    // Release an injected guard before either mandatory owner retirement.
+    defer if (control.held) control.mutex.unlock();
+    try std.testing.expectError(error.NotFound, operation.waitWithAdmission(original));
+    try std.testing.expect(control.held and control.implementation.?.invalidation_pending);
+    control.mutex.unlock();
+    control.held = false;
+    control.block = false;
+    try operation.waitWithAdmission(original);
+    try std.testing.expect(!control.implementation.?.invalidation_pending);
+    var fresh: [3]u8 = undefined;
+    try native.storage().readFileRangeInto(a, path, 0, &fresh);
+    try std.testing.expectEqualStrings("new", &fresh);
+    try readAllAtOffset(pinned.fd, &fresh, 0);
+    try std.testing.expectEqualStrings("old", &fresh);
 }

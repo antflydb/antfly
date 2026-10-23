@@ -566,3 +566,86 @@ test "executor archive boundary prepared append owns bytes after producer and in
     defer a.free(actual);
     try std.testing.expectEqualStrings("prefix:owned-record", actual);
 }
+
+test "executor archive boundary WAL append bootstraps metadata and retains publication through rejected adoption" {
+    const os = @import("builtin").os.tag;
+    if (os == .windows or os == .wasi or os == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const abi = @import("antfly_runtime_abi");
+    const sources = @import("antfly_local_sources");
+    const wal = sources.storage_lsm_backend_wal;
+    const admission = sources.common_read_admission;
+    const Control = struct {
+        reject: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.SessionLeaseLost;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    const Publication = struct {
+        held: *bool,
+        published: *usize,
+        recover: *bool,
+        pub fn publish(self: *@This(), _: wal.AppendResult) void {
+            self.published.* += 1;
+        }
+        pub fn requireRecovery(self: *@This()) void {
+            self.recover.* = true;
+        }
+        pub fn release(self: *@This()) void {
+            self.held.* = false;
+        }
+    };
+    var lease: retained_io.Storage.Lease = undefined;
+    var owner: ?*anyopaque = null;
+    defer if (owner) |context| runtime_io_abi_test_durability_owner_close(context);
+    const contract = abi.native_abi.TypeContract.of(retained_io.Storage.Lease);
+    const status = runtime_io_abi_test_durability_storage(&contract, &lease, &owner);
+    if (!status.isOk()) return abi.error_abi.errorFromStatus(status);
+    var leased = true;
+    defer if (leased) lease.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    var state: sources.storage_lsm_backend_state.State = .{};
+    defer state.deinit(a);
+    try state.upsert(a, .{ .name = "docs" }, "final", "status", false);
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    const record = try wal.prepareStateRecordWithAdmission(a, &state, original);
+    defer a.free(record);
+    var held = true;
+    var published: usize = 0;
+    var recover = false;
+    var operation = try wal.CurrentStateAppend(Publication).prepare(root, record.len, .{});
+    var resources = (try lease.view.tryPrepareAppendWithAdmission(record, original)).?;
+    operation.start(resources, .{ .held = &held, .published = &published, .recover = &recover }, original) catch |cause| {
+        resources.deinit();
+        return cause;
+    };
+    defer operation.deinit();
+    control.reject = true;
+    try std.testing.expectError(error.SessionLeaseLost, operation.waitWithAdmission(original));
+    runtime_io_abi_test_durability_owner_close(owner.?);
+    owner = null;
+    lease.deinit();
+    leased = false;
+    control.reject = false;
+    const result = try operation.waitWithAdmission(original);
+    try std.testing.expectEqual(@as(u64, 2), result.index_syncs);
+    try std.testing.expect(held and published == 0);
+    control.reject = true;
+    try std.testing.expectError(error.SessionLeaseLost, operation.publishWithAdmission(original));
+    try std.testing.expect(held and published == 0);
+    control.reject = false;
+    _ = try operation.publishWithAdmission(original);
+    _ = try operation.publishWithAdmission(original);
+    try std.testing.expect(!held and !recover and published == 1);
+}

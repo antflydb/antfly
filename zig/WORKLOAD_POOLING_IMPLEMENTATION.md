@@ -24654,3 +24654,82 @@ owners before resuming a rejected write and its subsequent sync. Source/log
 hashes match the final inputs. The v1 receipt records a corrected target name;
 v2 qualifies the foundation before the added ambiguous-write test. The full
 goal remains active; full GNU qualification remains waived.
+
+### Owning canonical WAL append and publication
+
+`prepareStateRecordWithAdmission` encodes the existing canonical state-record
+format on caller CPU, with checked sizes and checkpoints between entries, 16 KiB
+copy quanta and streaming checksum quanta. Preparation rejection frees its
+speculative bytes before any publication acquisition or physical dispatch. The
+backend validates framing, checksum, entry lengths and count on admitted CPU
+before preparing an append grant.
+
+`CurrentStateAppend(Publication)` owns actual CURRENT observation, bootstrap,
+segment-size observation, rotation, bounded metadata replacement, one frozen
+append and its ordered durability barriers. CURRENT's advisory size never
+substitutes for the actual segment size. An existing CURRENT cannot fabricate a
+missing referenced segment. Orphan checkpoints, nonempty unclaimed segments,
+corrupt metadata and segment-number overflow fail closed. Bootstrap creates only
+the WAL child of an existing root, syncs its namespace, atomically persists
+CURRENT and the initial checkpoint, appends once and syncs the new segment and
+its directory. Rotation persists the new CURRENT and preserves prior retention
+history; steady append performs no redundant metadata replacement.
+
+The reusable durability grant now supports small atomic metadata replacement
+and single-directory creation, with fixed buffers and no new allocation,
+descriptor admission or dispatch during physical phases. Replacement owns a
+reserved sibling temporary under exclusive filesystem publication, exclusively
+creates it after removing a stale reserved temporary, syncs and closes it,
+renames it and syncs its parent. Native ABI 103 and storage-owner ABI 163 cover
+the additional callbacks. Unsupported providers fail closed.
+
+Metadata replacement fences the inode cache on admitted caller CPU before
+submission and after physical observation, including ambiguous physical failure.
+The fence marks entries without closing descriptors or freeing memory under the
+cache guard; existing read pins remain valid. The metadata bucket walk is
+bounded by the shared descriptor ceiling. Rejection while acquiring a cache
+guard retains the completed physical operation and its pending fence. Mandatory
+quiesced retirement applies any outstanding fence before publication release.
+The worker performs no cache bookkeeping. A warmed-CURRENT rotation regression
+and a held-cache-guard regression prove fresh inode lookup alongside retained
+old readers.
+
+Successful WAL I/O retains publication until `publishWithAdmission` adopts an
+already-prepared mutable successor through a bounded infallible CPU callback.
+No reentry checkpoint splits that adoption from its once-only receipt and
+publication release. Original handoff/lifetime/reentry rejection retains each
+accepted phase without replay. A fatal physical failure, possible partial tail,
+or quiesced destruction after accepted mutation but before adoption requests
+recovery before releasing publication. Destruction joins accepted work only;
+it never issues unstarted barriers or adopts caller state.
+
+The backend compound acquisition prepares frozen record/worker/descriptor
+resources before trying its real process/native WAL guards. Busy acquisition
+drops every tentative resource before the original waits; the caller still owns
+its prepared publication payload until the initial read is accepted. Successful
+adoption updates fixed WAL counters/ranges and invalidates retention caches.
+Abandoned possible writes poison backend mutation until recovery. No backend
+mutex spans physical waits. The caller must already fence serving, writers and
+maintenance and retain the backend and prepared publication through retirement.
+
+Final receipt `wal-append-coordinator-v3` passes all 68 build steps, 26 named
+physical/WAL cases, 32 storage-read cases, all 16 independently compiled archive
+cases and 45/1/8 identity cases without skips, failures or leaks. The bootstrap
+matrix injects all three original wait failures at every physical phase under
+exhausted allocator/dispatch/descriptor capacity, verifies control progress,
+retains publication across rejected adoption and replays exactly one canonical
+record. Additional cases cover rotation, empty and missing segments, orphaned
+metadata, checksum/format errors, partial append, failure after metadata rename,
+and abandoned publication. Mandatory join and real-backend successor tests prove
+publication retention, fixed CPU adoption and recovery poisoning. The new
+archive case completes bootstrap after producer-owner/lease destruction and
+retains consumer publication across rejected adoption. Final source/log hashes
+match; v1/v2 retain the intermediate fixture and cache-fence corrections.
+
+Default DB close adoption remains unfinished. Its final status commit must own
+bounded mutable/capture preparation and credits, use this publication protocol,
+then compose with admitted backend flush and physical retirement. A final
+barrier cannot precede later writes or be followed by duplicate legacy sync.
+Equivalent Lite/object provider adoption also remains open. The complete goal
+remains active; full GNU qualification remains waived and Linux builds require
+the pinned Nix/glibc toolchain.
