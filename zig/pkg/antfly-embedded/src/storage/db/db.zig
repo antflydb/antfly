@@ -142249,7 +142249,9 @@ test "grouped sources production yields across producer replacement and resumes 
         .source = .{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" },
     });
     const Probe = struct {
+        var called: bool = false;
         fn run(live: *DB) !void {
+            called = true;
             const before = live.group_source_owner.state.submitted;
             try std.testing.expect(!try live.runGroupSourceSlice());
             try std.testing.expectEqual(before, live.group_source_owner.state.submitted);
@@ -142259,9 +142261,11 @@ test "grouped sources production yields across producer replacement and resumes 
     // The replacement hook runs after constructing the new producer while
     // still owning the old one. The old implementation entered a group
     // mutation here, leaving a runtime borrow racing its eventual destruction.
+    Probe.called = false;
     DB.test_enrichment_reconfigure_after_detached_hook = Probe.run;
     defer DB.test_enrichment_reconfigure_after_detached_hook = null;
     try db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
+    try std.testing.expect(Probe.called);
     try std.testing.expect(try db.runGroupSourceSlice());
     try std.testing.expect(db.group_source_owner.state.submitted > 0);
 }
