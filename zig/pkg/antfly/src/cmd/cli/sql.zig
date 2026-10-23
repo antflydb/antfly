@@ -26,6 +26,9 @@ const Options = struct {
     namespace: ?[]const u8 = null,
     limit: ?i64 = null,
     interactive: bool = false,
+    explain: bool = false,
+    analyze: bool = false,
+    estimate: bool = false,
 };
 
 fn parse(args: *std.process.Args.Iterator) !Options {
@@ -34,6 +37,15 @@ fn parse(args: *std.process.Args.Iterator) !Options {
         if (std.mem.eql(u8, flag, "--interactive")) {
             if (options.interactive) return error.DuplicateSqlOption;
             options.interactive = true;
+        } else if (std.mem.eql(u8, flag, "--explain")) {
+            if (options.explain) return error.DuplicateSqlOption;
+            options.explain = true;
+        } else if (std.mem.eql(u8, flag, "--analyze")) {
+            if (options.analyze) return error.DuplicateSqlOption;
+            options.analyze = true;
+        } else if (std.mem.eql(u8, flag, "--estimate")) {
+            if (options.estimate) return error.DuplicateSqlOption;
+            options.estimate = true;
         } else if (std.mem.eql(u8, flag, "--limit")) {
             if (options.limit != null) return error.DuplicateSqlOption;
             const raw = args.next() orelse return error.MissingSqlOptionValue;
@@ -46,8 +58,10 @@ fn parse(args: *std.process.Args.Iterator) !Options {
             slot.* = args.next() orelse return error.MissingSqlOptionValue;
         }
     }
+    if (options.analyze and options.estimate) return error.AmbiguousSqlMode;
+    if (options.analyze or options.estimate) options.explain = true;
     if (options.interactive) {
-        if (options.statement != null) return error.AmbiguousSqlMode;
+        if (options.statement != null or options.explain) return error.AmbiguousSqlMode;
         return options;
     }
     const statement = options.statement orelse return error.SqlStatementRequired;
@@ -59,10 +73,13 @@ fn parse(args: *std.process.Args.Iterator) !Options {
 
 pub fn run(alloc: std.mem.Allocator, io: std.Io, client: *client_mod.AntflyClient, args: *std.process.Args.Iterator) !void {
     const options = parse(args) catch |err| {
-        std.debug.print("SQL arguments: {s}\n", .{@errorName(err)});
+        if (cli.isAgent()) return cli.output.argumentFailure(err);
+        cli.output.notice("SQL arguments: {s}\n", .{@errorName(err)});
         cli.printCommandUsage("sql");
         return error.InvalidArguments;
     };
+    if (options.interactive and cli.output.execution_bounded) return cli.output.argumentFailure(error.ExecutionBudgetsRequireOneShotSql);
+    if (options.interactive and cli.isAgent()) return cli.output.argumentFailure(error.AgentModeRequiresOneShotSql);
     if (options.interactive) return interactive(alloc, io, client, options);
     _ = try execute(alloc, io, client, options, null, null);
 }
@@ -72,13 +89,15 @@ fn execute(alloc: std.mem.Allocator, io: std.Io, client: *client_mod.AntflyClien
     // JSON numbers stay lexical until server-side column binding. Passing an
     // integer through f64 here would corrupt bigint parameters before SQL ran.
     var parameters = std.json.parseFromSlice([]const std.json.Value, alloc, options.parameters orelse "[]", .{ .parse_numbers = false }) catch {
-        std.debug.print("SQL --parameters must be a JSON array\n", .{});
-        return error.InvalidArguments;
+        if (!cli.isAgent()) cli.output.notice("SQL --parameters must be a JSON array\n", .{});
+        return cli.output.argumentFailure(error.InvalidArguments);
     };
     defer parameters.deinit();
-    if (parameters.value.len > 1024) return error.SqlParameterLimitExceeded;
+    if (parameters.value.len > 1024) return cli.output.argumentFailure(error.SqlParameterLimitExceeded);
+    const statement = if (options.explain) try std.fmt.allocPrint(alloc, "EXPLAIN (FORMAT JSON{s}) {s}", .{ if (options.analyze) ", ANALYZE ON" else if (options.estimate) ", COSTS ON" else "", options.statement.? }) else options.statement.?;
+    defer if (options.explain) alloc.free(statement);
     var response = try client.executeSQL(.{
-        .statement = options.statement.?,
+        .statement = statement,
         .parameters = parameters.value,
         .database = options.database orelse defaults.database,
         .namespace = options.namespace orelse defaults.namespace,
@@ -89,7 +108,7 @@ fn execute(alloc: std.mem.Allocator, io: std.Io, client: *client_mod.AntflyClien
     if (response.status_code < 200 or response.status_code >= 300) {
         // Preserve the SQLSTATE, transaction receipt and retryability exactly;
         // do not flatten an ambiguous commit into a generic request failure.
-        std.debug.print("SQL HTTP {d}: {s}\n", .{ response.status_code, response.err_body orelse "no diagnostic body" });
+        if (cli.isAgent()) cli.output.httpDiagnostic(response.status_code, response.err_body) else cli.output.notice("SQL HTTP {d}: {s}\n", .{ response.status_code, response.err_body orelse "no diagnostic body" });
         if (response.err_body) |body| {
             var diagnostic = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.SqlExecutionFailed;
             defer diagnostic.deinit();
@@ -108,7 +127,21 @@ fn execute(alloc: std.mem.Allocator, io: std.Io, client: *client_mod.AntflyClien
         return error.SqlExecutionFailed;
     }
     const data = response.data orelse return error.InvalidApiResponse;
-    try cli.writeJson(alloc, io, data.value);
+    cli.output.context = .{ .scope = if (options.explain) .plan else .sql, .execution = .complete, .planning_only = if (options.explain) !options.analyze else null };
+    if (options.explain and cli.output.policy.enveloped()) {
+        if (data.value.rows.len != 1 or data.value.rows[0].len != 1 or data.value.rows[0][0] != .string) return error.InvalidApiResponse;
+        var plan = try std.json.parseFromSlice(std.json.Value, alloc, data.value.rows[0][0].string, .{ .parse_numbers = false });
+        defer plan.deinit();
+        if (plan.value == .object) if (plan.value.object.get("runtime")) |measured| {
+            if (measured == .object) cli.output.progressStats(io, .{
+                .elapsed_ns = measured.object.get("elapsed_ns"),
+                .result_rows = measured.object.get("result_rows"),
+                .retained_peak_bytes = measured.object.get("retained_peak_bytes"),
+                .spill_written_bytes = measured.object.get("spill_written_bytes"),
+            });
+        };
+        try cli.writeJson(alloc, io, .{ .plan = plan.value, .planning_only = !options.analyze, .command_tag = data.value.command_tag });
+    } else try cli.writeJson(alloc, io, data.value);
     if (data.value.session_id) |id| {
         if (id.len != 32) return error.InvalidApiResponse;
         return id[0..32].*;
@@ -123,9 +156,9 @@ fn interactive(alloc: std.mem.Allocator, io: std.Io, client: *client_mod.AntflyC
     defer alloc.free(buffer);
     var reader = std.Io.File.stdin().readerStreaming(io, buffer);
     var session_id: ?[32]u8 = null;
-    std.debug.print("SQL: one statement per line; \\q exits and rolls back an active session. No automatic retries.\n", .{});
+    cli.output.notice("SQL: one statement per line; \\q exits and rolls back an active session. No automatic retries.\n", .{});
     while (true) {
-        std.debug.print("sql{s}> ", .{if (session_id != null) "[transaction]" else ""});
+        cli.output.notice("sql{s}> ", .{if (session_id != null) "[transaction]" else ""});
         const raw = try reader.interface.takeDelimiter('\n') orelse break;
         const line = std.mem.trim(u8, raw, " \t\r");
         if (std.mem.eql(u8, line, "\\q")) break;
@@ -139,8 +172,8 @@ fn interactive(alloc: std.mem.Allocator, io: std.Io, client: *client_mod.AntflyC
                 continue;
             },
             else => {
-                if (session_id) |id| std.debug.print("Session receipt: {s}\n", .{id});
-                std.debug.print("Execution response is unconfirmed; reconcile before submitting another mutation. No command was retried.\n", .{});
+                if (session_id) |id| cli.output.notice("Session receipt: {s}\n", .{id});
+                cli.output.notice("Execution response is unconfirmed; reconcile before submitting another mutation. No command was retried.\n", .{});
                 return err;
             },
         };
@@ -150,7 +183,7 @@ fn interactive(alloc: std.mem.Allocator, io: std.Io, client: *client_mod.AntflyC
         rollback.statement = "ROLLBACK";
         rollback.parameters = null;
         _ = execute(alloc, io, client, rollback, &id, null) catch |err| {
-            std.debug.print("Rollback unconfirmed for session {s}; reconcile through the native transaction API.\n", .{id});
+            cli.output.notice("Rollback unconfirmed for session {s}; reconcile through the native transaction API.\n", .{id});
             return err;
         };
     }

@@ -254,6 +254,33 @@ jobs:
           bash scripts/packaging/test_homebrew_install.sh \
             dist/antfly.rb dist/release-archives "$version"
 
+      - name: Qualify in-place upgrade from released v0.2.5 data
+        if: ${{ inputs.release_line == '0.3' || inputs.release_line == 'nightly' }}
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/v02-upgrade"
+          mkdir -p "$stage/old" "$stage/new"
+          curl --fail --location --retry 3 \
+            https://github.com/antflydb/antfly/releases/download/v0.2.5/antfly_0.2.5_Darwin_arm64.tar.gz \
+            -o "$stage/old.tar.gz"
+          echo "4fc5a948be9e14cefc8393de22ce1ea6e35b927aa79cc35b7d80bef55b712ac8  $stage/old.tar.gz" | shasum -a 256 --check --strict
+          tar -xzf "$stage/old.tar.gz" -C "$stage/old"
+          tar -xzf "dist/release-archives/antfly_${RELEASE_TAG#v}_Darwin_arm64.tar.gz" -C "$stage/new"
+          python3 scripts/ci/qualify-v02-server-upgrade.py \
+            --old-bin "v0.2.5=$stage/old/antfly" \
+            --new-bin "$stage/new/antfly" \
+            --work-dir "$stage/evidence"
+
+      - name: Upload in-place upgrade evidence
+        if: ${{ always() && (inputs.release_line == '0.3' || inputs.release_line == 'nightly') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-v02-upgrade-evidence
+          path: ${{ runner.temp }}/v02-upgrade/evidence
+          if-no-files-found: warn
+
   package-cli-artifacts:
     name: Build immutable CLI package snapshot
     needs:

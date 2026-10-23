@@ -164,6 +164,21 @@ def _json_request(
     return response.json()
 
 
+def test_standalone_inference_fixture_opts_in_to_public_writes(
+    standalone_lifecycle_server: EmbeddedInferenceStandaloneServer,
+):
+    # Verify the real standalone policy gate before model initialization. A
+    # fixture that forgot its explicit opt-in returns 403 here, masking resource
+    # composition coverage before any model can be warmed.
+    response = requests.post(
+        f"{standalone_lifecycle_server.inference_api_url}/generate",
+        data="not-json",
+        headers={"Content-Type": "application/json"},
+        timeout=30,
+    )
+    assert response.status_code == 400, response.text
+
+
 def test_standalone_drop_drains_pending_enrichment_work(
     standalone_lifecycle_server: EmbeddedInferenceStandaloneServer,
     rate_limited_openai_embedder,

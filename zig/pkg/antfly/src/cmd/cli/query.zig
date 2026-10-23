@@ -26,7 +26,7 @@ fn shouldRunSemanticReadinessAdvisory(
     // With implicit selection only the server knows which index actually ran;
     // warning about every table index creates false positives. The query
     // response remains authoritative in that case.
-    return semantic_search != null and indexes != null;
+    return !cli.isAgent() and semantic_search != null and indexes != null;
 }
 
 const SemanticReadinessAdvisory = struct {
@@ -176,16 +176,16 @@ fn parseQueryOptions(iterator: std.process.Args.Iterator) QueryParseResult {
 
 fn fatalQueryParseIssue(issue: QueryParseIssue) noreturn {
     switch (issue) {
-        .missing_value => |flag| cli.fatal("{s} requires a value", .{flag}),
-        .duplicate => |flag| cli.fatal("{s} may only be provided once", .{flag}),
-        .unknown => |flag| cli.fatal("unknown query flag: {s}", .{flag}),
-        .invalid_integer => |value| cli.fatal("invalid integer for {s}: {s}", .{ value.flag, value.value }),
-        .non_positive => |value| cli.fatal("{s} must be greater than zero: {s}", .{ value.flag, value.value }),
-        .negative => |value| cli.fatal("{s} must not be negative: {s}", .{ value.flag, value.value }),
-        .too_large => |value| cli.fatal("{s} exceeds the supported maximum: {s}", .{ value.flag, value.value }),
-        .conflicting_search => cli.fatal("only one of --full-text-search or --full-text-search-json may be provided", .{}),
-        .semantic_offset => cli.fatal("--offset is not supported with --semantic-search", .{}),
-        .missing_table => cli.fatal("--table is required", .{}),
+        .missing_value => |flag| cli.argumentError("{s} requires a value", .{flag}),
+        .duplicate => |flag| cli.argumentError("{s} may only be provided once", .{flag}),
+        .unknown => |flag| cli.argumentError("unknown query flag: {s}", .{flag}),
+        .invalid_integer => |value| cli.argumentError("invalid integer for {s}: {s}", .{ value.flag, value.value }),
+        .non_positive => |value| cli.argumentError("{s} must be greater than zero: {s}", .{ value.flag, value.value }),
+        .negative => |value| cli.argumentError("{s} must not be negative: {s}", .{ value.flag, value.value }),
+        .too_large => |value| cli.argumentError("{s} exceeds the supported maximum: {s}", .{ value.flag, value.value }),
+        .conflicting_search => cli.argumentError("only one of --full-text-search or --full-text-search-json may be provided", .{}),
+        .semantic_offset => cli.argumentError("--offset is not supported with --semantic-search", .{}),
+        .missing_table => cli.argumentError("--table is required", .{}),
     }
 }
 
@@ -258,13 +258,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
         .aggregations = if (aggregations_value) |*parsed| parsed.value else null,
         .reranker = if (reranker_value) |*parsed| parsed.value else null,
         .pruner = if (pruner_value) |*parsed| parsed.value else null,
+        .profile = if (cli.isAgent() and cli.output.progress_enabled) true else null,
     };
 
     if (table_name) |tbl| {
         if (options.wait_ready_ms) |timeout_ms| {
             var response = try @import("query_wait.zig").wait(io, client, tbl, body, timeout_ms);
             defer response.deinit();
-            try cli.writeJson(allocator, io, response.data.?.value);
+            try writeQueryResult(allocator, io, response.data.?.value);
             return;
         }
         // Readiness is diagnostic, so overlap it with the data-plane request
@@ -283,7 +284,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
             // the query. With implicit selection, defer the lookup until the
             // query actually fails: successful requests keep the fast path,
             // while failures still explain an empty table index catalog.
-            if (!advisory.awaitOnQueryFailure(io) and semantic_search != null) {
+            if (!cli.isAgent() and !advisory.awaitOnQueryFailure(io) and semantic_search != null) {
                 index_readiness.warnIfSemanticIndexesAreNotReady(client, tbl, indexes);
             }
             return err;
@@ -291,13 +292,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
         advisory.cancel(io);
         defer resp.deinit();
         if (resp.data) |data| {
-            try cli.writeJson(allocator, io, data.value);
+            try writeQueryResult(allocator, io, data.value);
         }
     } else {
         var resp = try client.query(body);
         defer resp.deinit();
         if (resp.data) |data| {
-            try cli.writeJson(allocator, io, data.value);
+            try writeQueryResult(allocator, io, data.value);
         }
     }
 }
@@ -558,10 +559,10 @@ fn parseLookupOptions(iterator: std.process.Args.Iterator) LookupParseResult {
 
 fn fatalLookupParseIssue(issue: LookupParseIssue) noreturn {
     switch (issue) {
-        .missing_value => |flag| cli.fatal("{s} requires a value", .{flag}),
-        .duplicate => |flag| cli.fatal("{s} may only be provided once", .{flag}),
-        .unknown => |flag| cli.fatal("unknown lookup option: {s}", .{flag}),
-        .invalid_read_consistency => |value| cli.fatal("invalid --read-consistency {s}; expected read_index or stale", .{value}),
+        .missing_value => |flag| cli.argumentError("{s} requires a value", .{flag}),
+        .duplicate => |flag| cli.argumentError("{s} may only be provided once", .{flag}),
+        .unknown => |flag| cli.argumentError("unknown lookup option: {s}", .{flag}),
+        .invalid_read_consistency => |value| cli.argumentError("invalid --read-consistency {s}; expected read_index or stale", .{value}),
     }
 }
 
@@ -571,14 +572,35 @@ pub fn lookup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
         .issue => |issue| fatalLookupParseIssue(issue),
     };
 
-    const tbl = options.table_name orelse cli.fatal("--table is required", .{});
-    const k = options.key orelse cli.fatal("--key is required", .{});
+    const tbl = options.table_name orelse cli.argumentError("--table is required", .{});
+    const k = options.key orelse cli.argumentError("--key is required", .{});
 
     var resp = try client.lookupKey(tbl, k, .{ .consistency = options.read_consistency });
     defer resp.deinit();
+    cli.expectHttpSuccess(resp);
+    cli.output.context = .{ .scope = .lookup, .execution = .complete };
     if (resp.data) |data| {
         try cli.writeJson(allocator, io, data.value);
-    }
+    } else return error.InvalidApiResponse;
+}
+
+fn writeQueryResult(allocator: std.mem.Allocator, io: std.Io, value: antfly_client.types.QueryResponses) !void {
+    var failed = false;
+    if (value.responses) |responses| for (responses) |response| {
+        if (response.status < 200 or response.status >= 300 or response.@"error" != null) failed = true;
+        if (response.profile) |profile| {
+            cli.output.progressStats(io, .{ .took_ms = response.took, .profile = profile });
+            if (profile == .object) if (profile.object.get("shards")) |shards| {
+                if (shards == .object) if (shards.object.get("failed")) |count| {
+                    if (count == .integer and count.integer > 0) failed = true;
+                    if (count == .number_string and (std.fmt.parseInt(u64, count.number_string, 10) catch 0) > 0) failed = true;
+                };
+            };
+        }
+    };
+    cli.output.context = .{ .scope = .search, .execution = if (failed) .partial else if (value.responses != null) .complete else .unknown };
+    try cli.writeJson(allocator, io, value);
+    if (failed) return error.PartialQueryExecution;
 }
 
 test "lookup parser accepts read consistency and rejects invalid options" {
@@ -623,7 +645,7 @@ fn parseJsonArg(comptime T: type, allocator: std.mem.Allocator, flag: []const u8
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
     }) catch |err| {
-        cli.fatal("invalid JSON for {s}: {}", .{ flag, err });
+        cli.argumentError("invalid JSON for {s}: {}", .{ flag, err });
     };
 }
 

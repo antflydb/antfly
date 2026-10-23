@@ -19,18 +19,23 @@ class PrefixQuery:
 
         Attributes:
             prefix (str):
+            case_insensitive (bool | Unset): Fold ASCII letter case when matching indexed terms, without stemming the
+                pattern. Default: False.
             field (str | Unset):
             boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
                 query.
     """
 
     prefix: str
+    case_insensitive: bool | Unset = False
     field: str | Unset = UNSET
     boost: float | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         prefix = self.prefix
+
+        case_insensitive = self.case_insensitive
 
         field = self.field
 
@@ -47,6 +52,8 @@ class PrefixQuery:
                 "prefix": prefix,
             }
         )
+        if case_insensitive is not UNSET:
+            field_dict["case_insensitive"] = case_insensitive
         if field is not UNSET:
             field_dict["field"] = field
         if boost is not UNSET:
@@ -58,6 +65,8 @@ class PrefixQuery:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
         prefix = d.pop("prefix")
+
+        case_insensitive = d.pop("case_insensitive", UNSET)
 
         field = d.pop("field", UNSET)
 
@@ -72,6 +81,7 @@ class PrefixQuery:
 
         prefix_query = cls(
             prefix=prefix,
+            case_insensitive=case_insensitive,
             field=field,
             boost=boost,
         )

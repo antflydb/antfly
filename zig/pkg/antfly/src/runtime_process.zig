@@ -46,6 +46,7 @@ pub fn runtimeEntry(
     const command = context.command.slice();
 
     run(process.processInit(), command, &args) catch |err| {
+        if (err == error.CliDiagnosticReported) return 1;
         // Credential validation already emits an actionable operator diagnostic.
         // Symbolizing an expected rejection can take seconds in a large Debug
         // image and obscures the normal, successfully unwound startup failure.

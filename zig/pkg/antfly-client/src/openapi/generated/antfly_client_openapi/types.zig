@@ -34960,12 +34960,15 @@ pub const PredicateDecisionQuestion = struct {
 
 /// Match terms that start with the given bytes. On a `substring` companion field the prefix is lowercased and matched as a contained substring, exactly like `match` on that field.
 pub const PrefixQuery = struct {
+    /// Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+    case_insensitive: ?bool = null,
     prefix: []const u8,
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "case_insensitive", "case_insensitive", true },
         .{ "prefix", "prefix", false },
         .{ "field", "field", true },
         .{ "boost", "boost", false },
@@ -34981,6 +34984,10 @@ pub const PrefixQuery = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.case_insensitive) |value| {
+            try jw.objectField("case_insensitive");
+            try jw.write(value);
+        }
         try jw.objectField("prefix");
         try jw.write(self.prefix);
         if (self.field) |value| {
@@ -35172,6 +35179,10 @@ pub const Query = union(enum) {
     matches_query: *MatchesQuery,
     multi_phrase_query: *MultiPhraseQuery,
     phrase_query: *PhraseQuery,
+    prefix_query: *PrefixQuery,
+    regexp_query: *RegexpQuery,
+    term_query: *TermQuery,
+    wildcard_query: *WildcardQuery,
     autocomplete_query: *AutocompleteQuery,
     bool_field_query: *BoolFieldQuery,
     bool_query: *BoolQuery,
@@ -35183,11 +35194,7 @@ pub const Query = union(enum) {
     match_all_query: *MatchAllQuery,
     match_none_query: *MatchNoneQuery,
     multi_match_query: *MultiMatchQuery,
-    prefix_query: *PrefixQuery,
     query_string_query: *QueryStringQuery,
-    regexp_query: *RegexpQuery,
-    term_query: *TermQuery,
-    wildcard_query: *WildcardQuery,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
         const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
@@ -35317,6 +35324,30 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(PhraseQuery, allocator, source, options)) |parsed| return .{ .phrase_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "case_insensitive",
+            "prefix",
+        })) {
+            if (try parseStructuralVariant(PrefixQuery, allocator, source, options)) |parsed| return .{ .prefix_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "case_insensitive",
+            "regexp",
+        })) {
+            if (try parseStructuralVariant(RegexpQuery, allocator, source, options)) |parsed| return .{ .regexp_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "case_insensitive",
+            "term",
+        })) {
+            if (try parseStructuralVariant(TermQuery, allocator, source, options)) |parsed| return .{ .term_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "case_insensitive",
+            "wildcard",
+        })) {
+            if (try parseStructuralVariant(WildcardQuery, allocator, source, options)) |parsed| return .{ .wildcard_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
             "autocomplete",
         })) {
             if (try parseStructuralVariant(AutocompleteQuery, allocator, source, options)) |parsed| return .{ .autocomplete_query = parsed };
@@ -35372,29 +35403,9 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(MultiMatchQuery, allocator, source, options)) |parsed| return .{ .multi_match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "prefix",
-        })) {
-            if (try parseStructuralVariant(PrefixQuery, allocator, source, options)) |parsed| return .{ .prefix_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
             "query",
         })) {
             if (try parseStructuralVariant(QueryStringQuery, allocator, source, options)) |parsed| return .{ .query_string_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "regexp",
-        })) {
-            if (try parseStructuralVariant(RegexpQuery, allocator, source, options)) |parsed| return .{ .regexp_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "term",
-        })) {
-            if (try parseStructuralVariant(TermQuery, allocator, source, options)) |parsed| return .{ .term_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "wildcard",
-        })) {
-            if (try parseStructuralVariant(WildcardQuery, allocator, source, options)) |parsed| return .{ .wildcard_query = parsed };
         }
         return error.UnexpectedToken;
     }
@@ -35416,6 +35427,10 @@ pub const Query = union(enum) {
             .matches_query => |v| try jw.write(v.*),
             .multi_phrase_query => |v| try jw.write(v.*),
             .phrase_query => |v| try jw.write(v.*),
+            .prefix_query => |v| try jw.write(v.*),
+            .regexp_query => |v| try jw.write(v.*),
+            .term_query => |v| try jw.write(v.*),
+            .wildcard_query => |v| try jw.write(v.*),
             .autocomplete_query => |v| try jw.write(v.*),
             .bool_field_query => |v| try jw.write(v.*),
             .bool_query => |v| try jw.write(v.*),
@@ -35427,11 +35442,7 @@ pub const Query = union(enum) {
             .match_all_query => |v| try jw.write(v.*),
             .match_none_query => |v| try jw.write(v.*),
             .multi_match_query => |v| try jw.write(v.*),
-            .prefix_query => |v| try jw.write(v.*),
             .query_string_query => |v| try jw.write(v.*),
-            .regexp_query => |v| try jw.write(v.*),
-            .term_query => |v| try jw.write(v.*),
-            .wildcard_query => |v| try jw.write(v.*),
         }
     }
 };
@@ -37310,13 +37321,17 @@ pub const ReadRequirements = struct {
     }
 };
 
+/// Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed natural-language input.
 pub const RegexpQuery = struct {
+    /// Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+    case_insensitive: ?bool = null,
     regexp: []const u8,
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "case_insensitive", "case_insensitive", true },
         .{ "regexp", "regexp", false },
         .{ "field", "field", true },
         .{ "boost", "boost", false },
@@ -37332,6 +37347,10 @@ pub const RegexpQuery = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.case_insensitive) |value| {
+            try jw.objectField("case_insensitive");
+            try jw.write(value);
+        }
         try jw.objectField("regexp");
         try jw.write(self.regexp);
         if (self.field) |value| {
@@ -47450,13 +47469,17 @@ pub const TemplateFieldMapping = struct {
     }
 };
 
+/// Match an indexed post-analysis term exactly. Use match for analyzed natural-language input.
 pub const TermQuery = struct {
+    /// Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+    case_insensitive: ?bool = null,
     term: []const u8,
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "case_insensitive", "case_insensitive", true },
         .{ "term", "term", false },
         .{ "field", "field", true },
         .{ "boost", "boost", false },
@@ -47472,6 +47495,10 @@ pub const TermQuery = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.case_insensitive) |value| {
+            try jw.objectField("case_insensitive");
+            try jw.write(value);
+        }
         try jw.objectField("term");
         try jw.write(self.term);
         if (self.field) |value| {
@@ -50775,13 +50802,17 @@ pub const WebSearchProviderConfig = union(enum) {
     }
 };
 
+/// Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed natural-language input.
 pub const WildcardQuery = struct {
+    /// Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+    case_insensitive: ?bool = null,
     wildcard: []const u8,
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "case_insensitive", "case_insensitive", true },
         .{ "wildcard", "wildcard", false },
         .{ "field", "field", true },
         .{ "boost", "boost", false },
@@ -50797,6 +50828,10 @@ pub const WildcardQuery = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.case_insensitive) |value| {
+            try jw.objectField("case_insensitive");
+            try jw.write(value);
+        }
         try jw.objectField("wildcard");
         try jw.write(self.wildcard);
         if (self.field) |value| {

@@ -27,24 +27,26 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     if (std.mem.eql(u8, subcommand, "clear-tablespace")) return clearNamespaceTablespace(allocator, io, client, args);
 
     if (std.mem.eql(u8, subcommand, "rename")) {
-        const database = args.next() orelse cli.fatal("database name is required", .{});
-        const name = args.next() orelse cli.fatal("namespace name is required", .{});
-        const new_name = args.next() orelse cli.fatal("new name is required", .{});
-        if (args.next() != null) cli.fatal("unexpected rename argument", .{});
+        const database = args.next() orelse cli.argumentError("database name is required", .{});
+        const name = args.next() orelse cli.argumentError("namespace name is required", .{});
+        const new_name = args.next() orelse cli.argumentError("new name is required", .{});
+        if (args.next() != null) cli.argumentError("unexpected rename argument", .{});
         var response = try client.inner.renameNamespace(database, name, .{ .name = new_name });
         defer response.deinit();
-        if (response.status_code != 204) cli.fatal("rename failed with HTTP {d}", .{response.status_code});
+        cli.expectHttpSuccess(response);
+        if (response.status_code != 204) return error.InvalidApiResponse;
         return;
     }
 
-    cli.fatal("unknown namespace subcommand: {s}", .{subcommand});
+    cli.argumentError("unknown namespace subcommand: {s}", .{subcommand});
 }
 
 pub fn listNamespaces(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+    cli.output.context = .{ .scope = .discovery, .execution = .complete };
     const parsed = parseNamespaceArgs(args, .{ .require_name = false });
     var resp = try client.inner.listNamespaces(parsed.database_name);
     defer resp.deinit();
-    if (resp.status_code < 200 or resp.status_code >= 300) cli.fatal("catalog request failed with HTTP {d}", .{resp.status_code});
+    cli.expectHttpSuccess(resp);
     if (resp.data) |data| {
         try cli.writeJson(allocator, io, data.value);
     }
@@ -54,7 +56,7 @@ pub fn createNamespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly
     const parsed = parseNamespaceArgs(args, .{ .require_name = true });
     var resp = try client.inner.createNamespace(parsed.database_name, parsed.namespace_name.?);
     defer resp.deinit();
-    if (resp.status_code < 200 or resp.status_code >= 300) cli.fatal("catalog request failed with HTTP {d}", .{resp.status_code});
+    cli.expectHttpSuccess(resp);
     if (resp.data) |data| {
         try cli.writeJson(allocator, io, data.value);
     }
@@ -64,7 +66,7 @@ pub fn dropNamespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_c
     const parsed = parseNamespaceArgs(args, .{ .require_name = true });
     var resp = try client.inner.dropNamespace(parsed.database_name, parsed.namespace_name.?);
     defer resp.deinit();
-    if (resp.status_code < 200 or resp.status_code >= 300) cli.fatal("catalog request failed with HTTP {d}", .{resp.status_code});
+    cli.expectHttpSuccess(resp);
     if (resp.data) |data| {
         try cli.writeJson(allocator, io, data.value);
     }
@@ -74,7 +76,7 @@ pub fn setNamespaceTablespace(allocator: std.mem.Allocator, io: std.Io, client: 
     const parsed = parseNamespaceTablespaceArgs(args);
     var resp = try client.inner.setNamespaceTablespace(parsed.database_name, parsed.namespace_name, .{ .tablespace_name = parsed.tablespace_name });
     defer resp.deinit();
-    if (resp.status_code < 200 or resp.status_code >= 300) cli.fatal("catalog request failed with HTTP {d}", .{resp.status_code});
+    cli.expectHttpSuccess(resp);
     if (resp.data) |data| {
         try cli.writeJson(allocator, io, data.value);
     }
@@ -84,7 +86,7 @@ pub fn clearNamespaceTablespace(allocator: std.mem.Allocator, io: std.Io, client
     const parsed = parseNamespaceArgs(args, .{ .require_name = true });
     var resp = try client.inner.clearNamespaceTablespace(parsed.database_name, parsed.namespace_name.?);
     defer resp.deinit();
-    if (resp.status_code < 200 or resp.status_code >= 300) cli.fatal("catalog request failed with HTTP {d}", .{resp.status_code});
+    cli.expectHttpSuccess(resp);
     if (resp.data) |data| {
         try cli.writeJson(allocator, io, data.value);
     }
@@ -112,11 +114,11 @@ fn parseNamespaceTablespaceArgs(args: *std.process.Args.Iterator) NamespaceTable
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--database") or std.mem.eql(u8, arg, "-d")) {
-            database_name = args.next() orelse cli.fatal("--database requires a value", .{});
+            database_name = args.next() orelse cli.argumentError("--database requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--namespace") or std.mem.eql(u8, arg, "-n")) {
-            namespace_name = args.next() orelse cli.fatal("--namespace requires a value", .{});
+            namespace_name = args.next() orelse cli.argumentError("--namespace requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--tablespace")) {
-            tablespace_name = args.next() orelse cli.fatal("--tablespace requires a value", .{});
+            tablespace_name = args.next() orelse cli.argumentError("--tablespace requires a value", .{});
         } else if (!std.mem.startsWith(u8, arg, "--") and namespace_name == null) {
             namespace_name = arg;
         } else if (!std.mem.startsWith(u8, arg, "--") and tablespace_name == null) {
@@ -126,9 +128,9 @@ fn parseNamespaceTablespaceArgs(args: *std.process.Args.Iterator) NamespaceTable
 
     const defaults = cli.CatalogFlags.defaultsFromEnv();
     return .{
-        .database_name = database_name orelse defaults.database orelse cli.fatal("--database is required or ANTFLY_DATABASE must be configured", .{}),
-        .namespace_name = namespace_name orelse cli.fatal("namespace name is required", .{}),
-        .tablespace_name = tablespace_name orelse cli.fatal("tablespace name is required", .{}),
+        .database_name = database_name orelse defaults.database orelse cli.argumentError("--database is required or ANTFLY_DATABASE must be configured", .{}),
+        .namespace_name = namespace_name orelse cli.argumentError("namespace name is required", .{}),
+        .tablespace_name = tablespace_name orelse cli.argumentError("tablespace name is required", .{}),
     };
 }
 
@@ -138,9 +140,9 @@ fn parseNamespaceArgs(args: *std.process.Args.Iterator, options: NamespaceArgsOp
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--database") or std.mem.eql(u8, arg, "-d")) {
-            database_name = args.next() orelse cli.fatal("--database requires a value", .{});
+            database_name = args.next() orelse cli.argumentError("--database requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--namespace") or std.mem.eql(u8, arg, "-n")) {
-            namespace_name = args.next() orelse cli.fatal("--namespace requires a value", .{});
+            namespace_name = args.next() orelse cli.argumentError("--namespace requires a value", .{});
         } else if (!std.mem.startsWith(u8, arg, "--") and namespace_name == null) {
             namespace_name = arg;
         }
@@ -148,8 +150,8 @@ fn parseNamespaceArgs(args: *std.process.Args.Iterator, options: NamespaceArgsOp
 
     const defaults = cli.CatalogFlags.defaultsFromEnv();
     return .{
-        .database_name = database_name orelse defaults.database orelse cli.fatal("--database is required or ANTFLY_DATABASE must be configured", .{}),
-        .namespace_name = if (options.require_name) namespace_name orelse cli.fatal("namespace name is required", .{}) else namespace_name,
+        .database_name = database_name orelse defaults.database orelse cli.argumentError("--database is required or ANTFLY_DATABASE must be configured", .{}),
+        .namespace_name = if (options.require_name) namespace_name orelse cli.argumentError("namespace name is required", .{}) else namespace_name,
     };
 }
 

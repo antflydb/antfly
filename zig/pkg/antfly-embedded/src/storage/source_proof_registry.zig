@@ -18,7 +18,7 @@
 //! retire it after success OR ambiguous failure. Unrelated writes retain facts;
 //! old read cuts cannot register facts in a newer owner generation.
 const std = @import("std");
-var nonces: std.atomic.Value(u64) = .init(1);
+var nonces: @import("antfly_platform").atomic.Value(u64) = .init(1);
 pub const Token = struct { owner: usize, nonce: u64, epoch: u64 };
 pub fn Registry(comptime Content: type) type {
     return struct {

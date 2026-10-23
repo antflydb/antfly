@@ -419,12 +419,8 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 	indexes[corpusTextIndex].(map[string]any)["analysis_config"] = map[string]any{
 		"field_analyzers": map[string]any{"text": "simple", "_all": "simple"},
 	}
-	apiURL, err := inferenceMLBaseURL(inferenceURL)
-	if err != nil {
-		return nil, err
-	}
 	if semantic {
-		indexes[DefaultEmbeddingIndex] = map[string]any{"type": "embeddings", "field": "embedding", "dimension": DefaultEmbeddingDims, "distance_metric": "cosine", "embedding_name": "document_dense_v1", "source_artifact_name": corpusChunks, "embedder": map[string]any{"provider": "antfly", "model": embeddingModel, "api_url": apiURL}, "enrichments": []any{map[string]any{"name": "document_dense_v1", "kind": "embedding", "field": "text", "source_artifact_name": corpusChunks, "expected_dims": DefaultEmbeddingDims}}}
+		indexes[DefaultEmbeddingIndex] = map[string]any{"type": "embeddings", "field": "embedding", "dimension": DefaultEmbeddingDims, "distance_metric": "cosine", "embedding_name": "document_dense_v1", "source_artifact_name": corpusChunks, "embedder": map[string]any{"provider": "antfly", "model": embeddingModel}, "enrichments": []any{map[string]any{"name": "document_dense_v1", "kind": "embedding", "field": "text", "source_artifact_name": corpusChunks, "expected_dims": DefaultEmbeddingDims}}}
 		// Graph units and revision markers intentionally have no document
 		// extraction input. Settle those skips, while keeping provider failures
 		// and unfinished extraction visible as incomplete coverage.
@@ -521,7 +517,7 @@ func corpusLoadCmd(args []string) error {
 	batchSize := flags.Int("batch-size", 100, "Records per durable upsert (native workers manage OCR/transcription admission)")
 	semantic := flags.Bool("semantic", true, "Create semantic index (requires embedding inference)")
 	graph := flags.Bool("graph", false, "Create relation graph; run corpus graph after extraction (requires extractor inference)")
-	inference := flags.String("inference-url", "http://localhost:8080", "Antfly inference URL")
+	inference := flags.String("inference-url", "http://localhost:8080", "Antfly inference URL for the optional relation graph")
 	model := flags.String("embedding-model", DefaultEmbeddingModel, "Embedding model, with 512 dimensions")
 	extractorModel := flags.String("artifact-extractor-model", DefaultAutographModel, "Registered inference model for relation extraction")
 	language := flags.String("language", "en-US", "Apple OCR and transcription locale")

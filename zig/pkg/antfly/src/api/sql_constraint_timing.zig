@@ -83,8 +83,9 @@ const Validation = struct {
         if (!try self.server.transactionRequestAuthorized(self.identity, candidate.*)) return error.Forbidden;
         var snapshot = (try self.server.source.adminSnapshot()) orelse return error.IntegrityCatalogUnavailable;
         defer self.server.source.freeAdminSnapshot(&snapshot);
-        const requests = try candidate.distributedTables(alloc);
-        defer alloc.free(requests);
+        const requests_view = try candidate.distributedTables(alloc);
+        defer requests_view.deinit();
+        const requests = requests_view.tables;
         var checked = try integrity.validateConstraintTiming(alloc, self.server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, requests, self.context, candidate.constraint_timing.items);
         defer checked.deinit();
         // Retain original row observations discovered by retroactive checks.

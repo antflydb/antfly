@@ -3000,6 +3000,7 @@ const SortedSourceSpans = struct {
         if (span.count < 3) return;
         if (self.run == null) if (self.scratch) |scratch| {
             self.run = try Run.createWithResources(self.allocator, scratch.io, scratch.directory, scratch.resource_manager);
+            self.run.?.preferSequentialReads();
         };
         if (self.run) |run| {
             var bytes: [20]u8 = undefined;
@@ -3186,8 +3187,10 @@ const FileSortedPlan = struct {
         const self = try allocator.create(@This());
         errdefer allocator.destroy(self);
         const records = try Run.createWithResources(allocator, scratch.io, scratch.directory, scratch.resource_manager);
+        records.preferSequentialReads();
         errdefer records.deinit();
         const mapping = try Run.createWithResources(allocator, scratch.io, scratch.directory, scratch.resource_manager);
+        mapping.preferSequentialReads();
         errdefer mapping.deinit();
         const rows = try allocator.alloc(Row, inputs.len);
         errdefer allocator.free(rows);
@@ -4799,6 +4802,7 @@ fn buildExternalSortedMergePlan(alloc: Allocator, inputs: []const MergeInput, fi
     errdefer file.deinit();
     try file.enableUnordered();
     const spool = try FileSortedPlan.Run.createWithResources(alloc, scratch.io, scratch.directory, scratch.resource_manager);
+    spool.preferSequentialReads();
     defer spool.deinit();
     var reads = TypedReadScope.init(alloc);
     defer reads.deinit();
@@ -4834,9 +4838,14 @@ fn buildExternalSortedMergePlan(alloc: Allocator, inputs: []const MergeInput, fi
         }
     }
     try sorter.push(chunk.items);
-    chunk.clearRetainingCapacity();
+    // The final merge reads sealed runs. Release input decoding and chunk
+    // storage before allocating merge cursors and output buffers.
+    chunk.deinit(alloc);
+    chunk = .empty;
     chunk_payloads.deinit();
     chunk_payloads = @import("segment_source.zig").Scratch.init(alloc, scratch.external_sort_chunk_bytes);
+    reads.deinit();
+    reads = TypedReadScope.init(alloc);
     const range = try sorter.finish();
     var first: []SegmentSortValue = &.{};
     errdefer deinitSortKeys(alloc, first);
@@ -5741,6 +5750,35 @@ const OrdinalReader = struct {
         const count = std.mem.readInt(u32, header[1..5], .big);
         if (view.length != 5 + @as(u64, count) * 4) return error.InvalidSegment;
         return .{ .view = view, .count = count };
+    }
+};
+
+/// Request-owned bounded ordinal window. The segment reader and its query
+/// capability must outlive this cursor; no borrowed source escapes the lease.
+/// Sequential projections read one window instead of two metadata-cache probes
+/// per document. Zero and absent ordinals retain the scalar reader's semantics.
+pub const DocOrdinalCursor = struct {
+    reader: OrdinalReader,
+    bytes: [4096]u8 = undefined,
+    first: u32 = 0,
+    cached_count: u32 = 0,
+
+    pub fn init(reader: *const SegmentReader) !DocOrdinalCursor {
+        return .{ .reader = try OrdinalReader.init(reader) };
+    }
+
+    pub fn get(self: *DocOrdinalCursor, doc: u32) !?u32 {
+        if (doc >= self.reader.count) return null;
+        if (doc < self.first or doc - self.first >= self.cached_count) {
+            const count: usize = @min(self.bytes.len / 4, self.reader.count - doc);
+            self.cached_count = 0;
+            try self.reader.view.?.readInto(5 + @as(u64, doc) * 4, self.bytes[0 .. count * 4]);
+            self.first = doc;
+            self.cached_count = @intCast(count);
+        }
+        const offset = @as(usize, doc - self.first) * 4;
+        const ordinal = std.mem.readInt(u32, self.bytes[offset..][0..4], .big);
+        return if (ordinal == 0) null else ordinal;
     }
 };
 
@@ -12242,4 +12280,116 @@ test "external lake lazy routing binds physical field order by identity" {
     var missing = try SegmentReader.initRouting(a, 1, &wrong_name, SegmentReader.initSource);
     defer missing.deinit();
     try std.testing.expectError(error.InvalidSegment, missing.bindSource(a, .{ .contiguous = bytes }));
+}
+
+test "ordinal cursor bounds native metadata probes and preserves missing and zero ordinals" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    var ordinals: [3077]u32 = undefined;
+    for (&ordinals, 0..) |*ordinal, i| {
+        ordinal.* = if (i % 7 == 0) 0 else @intCast(5000 - i);
+        try writer.addStoredDoc("id", "{}");
+    }
+    try writer.addDocOrdinals(&ordinals);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var native = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer native.deinit();
+    var heap = try SegmentReader.init(a, bytes);
+    defer heap.deinit();
+    const cache = &native.native.?.metadata_cache.?;
+    const before = cache.cache.clock;
+    var cursor = try DocOrdinalCursor.init(&native);
+    var heap_cursor = try DocOrdinalCursor.init(&heap);
+    for (ordinals, 0..) |ordinal, i| {
+        const expected: ?u32 = if (ordinal == 0) null else ordinal;
+        try std.testing.expectEqual(expected, try cursor.get(@intCast(i)));
+        try std.testing.expectEqual(expected, try heap_cursor.get(@intCast(i)));
+    }
+    const probes = cache.cache.clock - before;
+    // Includes opening/validating the section plus four bounded windows.
+    try std.testing.expect(probes <= 16);
+    try std.testing.expectEqual(@as(?u32, null), try cursor.get(ordinals.len));
+    // Backward and sparse access must invalidate only the private window.
+    for ([_]u32{ 1023, 1, 3076, 1024, 0, 2048 }) |i| {
+        try std.testing.expectEqual(try native.docOrdinal(i), try cursor.get(i));
+    }
+    var legacy_writer = SegmentWriter.init(a);
+    defer legacy_writer.deinit();
+    try legacy_writer.addStoredDoc("legacy", "{}");
+    const legacy_bytes = try legacy_writer.build();
+    defer a.free(legacy_bytes);
+    var legacy = try SegmentReader.initSource(a, .{ .contiguous = legacy_bytes });
+    defer legacy.deinit();
+    var legacy_cursor = try DocOrdinalCursor.init(&legacy);
+    try std.testing.expectEqual(@as(?u32, null), try legacy_cursor.get(0));
+    std.debug.print("ORDINAL_CURSOR docs={d} metadata_probes={d} window_bytes={d}\n", .{ ordinals.len, probes, cursor.bytes.len });
+}
+
+test "ordinal cursor discards its old window after a partial source failure" {
+    var bytes: [5 + 1028 * 4]u8 = undefined;
+    bytes[0] = 1;
+    std.mem.writeInt(u32, bytes[1..5], 1028, .big);
+    for (0..1028) |i| std.mem.writeInt(u32, bytes[5 + i * 4 ..][0..4], @intCast(i + 1), .big);
+    const State = struct {
+        bytes: []const u8,
+        fail: bool = false,
+        fn close(_: *anyopaque) void {}
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) {
+                self.fail = false;
+                @memset(out[0..@min(out.len, 4)], 0xff);
+                return error.ReadFailed;
+            }
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+    };
+    var state = State{ .bytes = &bytes };
+    const View = @import("segment_source.zig").View;
+    var cursor = DocOrdinalCursor{ .reader = .{ .view = try View.init(.{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } }, 0, bytes.len), .count = 1028 } };
+    try std.testing.expectEqual(@as(?u32, 1), try cursor.get(0));
+    state.fail = true;
+    try std.testing.expectError(error.ReadFailed, cursor.get(1024));
+    try std.testing.expectEqual(@as(?u32, 1), try cursor.get(0));
+    try std.testing.expectEqual(@as(?u32, 1025), try cursor.get(1024));
+}
+
+test "postings run read cache preserves four warm pages under tight budgets" {
+    if (@import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const Run = @import("postings_run.zig").Run;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    const payload = try a.alloc(u8, 256 * 1024);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i ^ (i >> 14));
+    const Budget = @import("storage/lite/test_allocator.zig").BudgetAllocator;
+    for ([_]usize{ 96 * 1024, 1024 * 1024, 1024 * 1024 }, 0..) |limit, variant| {
+        var budget = Budget{ .backing = a, .limit = limit };
+        {
+            const run = try Run.create(budget.allocator(), std.testing.io, directory);
+            defer run.deinit();
+            if (variant == 2) run.preferSequentialReads();
+            try run.appendSlice(payload);
+            try run.seal(0);
+            const view = try run.view();
+            try std.testing.expectEqual(@as(usize, 0), run.read_buffer.len);
+            for (0..2) |_| {
+                for (0..4) |page| {
+                    const offset = page * 16 * 1024;
+                    var bytes: [32]u8 = undefined;
+                    try view.readInto(offset, &bytes);
+                    try std.testing.expectEqualSlices(u8, payload[offset..][0..bytes.len], &bytes);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 4), run.read_calls);
+            const expected: usize = if (limit < 512 * 1024 or variant == 2) 64 * 1024 else 512 * 1024;
+            try std.testing.expectEqual(expected, run.read_buffer.len);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
 }

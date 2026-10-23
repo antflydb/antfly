@@ -5846,12 +5846,13 @@ pub const ApiHttpServer = struct {
                     }) orelse continue;
                 },
                 .commit => |*commit| {
-                    const distributed_tables = commit.request.distributedTables(self.alloc) catch |err| {
+                    const distributed_view = commit.request.distributedTables(self.alloc) catch |err| {
                         std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                         _ = self.txn_sessions.remove(self.alloc, txn_id);
                         continue;
                     };
-                    defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
+                    defer distributed_view.deinit();
+                    const distributed_tables = distributed_view.tables;
                     var execution_plan = if (commit.execution_plan) |bytes| transactions_api.parseExecutionPlan(self.alloc, bytes) catch |err| {
                         // A damaged durable plan is not permission to re-plan
                         // or discard a potentially committed transaction.
@@ -16775,6 +16776,7 @@ pub const ApiHttpServer = struct {
             error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
             error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
                 std.log.err("public create index normalization failed table={s} index={s} err={}", .{ table_name, index_name, err });
@@ -16793,6 +16795,7 @@ pub const ApiHttpServer = struct {
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
                 std.log.err("public create index validation failed table={s} index={s} err={}", .{ table_name, index_name, err });
@@ -16847,6 +16850,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
@@ -16870,6 +16874,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.InvalidCreateTableRequest => return error.InvalidIndexRequest,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
@@ -21433,6 +21438,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
             error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
+            error.InferenceEndpointAccessDenied => try contextualJsonResponse(self.alloc, 400, .{ .@"error" = "invalid_index_request", .message = public_table_http.inference_endpoint_access_denied_message, .retryable = false }),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
             error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
             error.EmbeddingArtifactDimensionRequired => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment must declare positive expected_dims"),
@@ -21458,6 +21464,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
             error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
+            error.InferenceEndpointAccessDenied => try contextualJsonResponse(self.alloc, 400, .{ .@"error" = "invalid_index_request", .message = public_table_http.inference_endpoint_access_denied_message, .retryable = false }),
             error.InvalidCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
             error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
             error.MissingEmbeddingArtifactProducer => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment has no producer configuration"),

@@ -533,6 +533,7 @@ func createAutoschemaKnowledgeGraphIndex(model, glinerModel, inferenceURL string
 		},
 	}
 	if glinerEnabled {
+		minConfidence := 0.5
 		cfg.Resolvers = append(cfg.Resolvers, oapi.GraphResolverConfig{
 			// kg_gliner_v1's schema pins a closed entity-label set; the same
 			// entityKeyTemplate makes GLiNER mentions converge on the SAME
@@ -548,7 +549,7 @@ func createAutoschemaKnowledgeGraphIndex(model, glinerModel, inferenceURL string
 			// GLiNER asserts a score per mention; drop the low-confidence
 			// junk (identifiers, mislabeled fragments) before it mints
 			// entity nodes.
-			MinConfidence:    0.5,
+			MinConfidence:    &minConfidence,
 			ConfigGeneration: 1,
 		})
 		cfg.EdgeTypes = append(cfg.EdgeTypes,

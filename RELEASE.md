@@ -394,6 +394,15 @@ logs, memory summaries, and linker maps are uploaded on failure as separate
 diagnostic artifacts, without compiler caches. macOS cross builds resolve the
 versioned LLVM linker directory and check linker/nm availability before compiling.
 
+The immutable 0.3 and nightly build also runs the released v0.2.5 writer and
+`scripts/ci/qualify-v02-server-upgrade.py` against the newly built Darwin server
+archive. This gates publication on in-place data reopen, updates/deletes, crash
+recovery, the rollback gate, and portable/native restore. It is separate from
+the Homebrew package upgrade check. The old archive has a pinned SHA-256, and
+the fixture directories and server logs are retained as release artifacts.
+This gate covers v0.2.5; other 0.2 patches and the harness's optional managed,
+swarm, HA, and schema suites still require separate qualification.
+
 All archive targets use the bounded runner's detected memory budget (80% of the
 container limit by default), including Linux on the larger release builders.
 Project objects share the checkout's `.zig-cache/release` across server, embedded,

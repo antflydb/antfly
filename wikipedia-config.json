@@ -1,7 +1,6 @@
 {
   "indexes": {
     "title_body": {
-      "name": "title_body",
       "type": "embeddings",
       "template": "{{title}} {{body}}",
       "embedder": {
@@ -17,7 +16,6 @@
       }
     },
     "thumbnail": {
-      "name": "thumbnail",
       "type": "embeddings",
       "template": "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
       "embedder": {

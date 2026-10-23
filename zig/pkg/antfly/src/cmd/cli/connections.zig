@@ -146,9 +146,9 @@ fn login(allocator: std.mem.Allocator, io: std.Io, client: *AntflyClient, option
     try requireData(begin);
     const attempt = begin.data.?.value;
     try validateAuthorizationUrl(attempt.authorization_url);
-    std.debug.print("Continue with ChatGPT in your local browser:\n{s}\n", .{attempt.authorization_url});
+    cli.output.notice("Continue with ChatGPT in your local browser:\n{s}\n", .{attempt.authorization_url});
     if (!options.no_browser) openBrowser(io, attempt.authorization_url) catch {
-        std.debug.print("Open the URL above manually; waiting for authorization.\n", .{});
+        cli.output.notice("Open the URL above manually; waiting for authorization.\n", .{});
     };
     const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i128, options.timeout_seconds) * std.time.ns_per_s;
     const id = try waitForConnection(allocator, io, client, attempt.attempt_id, deadline, 60_000);

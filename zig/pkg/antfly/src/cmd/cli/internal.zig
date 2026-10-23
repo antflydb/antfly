@@ -19,21 +19,21 @@ const cli = @import("mod.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const subcommand = args.next() orelse {
-        cli.fatal("internal requires a subcommand: metadata or store-root", .{});
+        cli.argumentError("internal requires a subcommand: metadata or store-root", .{});
     };
 
     if (std.mem.eql(u8, subcommand, "metadata")) return metadata(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "store-root")) return storeRoot(allocator, io, client, args);
 
-    cli.fatal("unknown internal subcommand: {s}", .{subcommand});
+    cli.argumentError("unknown internal subcommand: {s}", .{subcommand});
 }
 
 fn storeRoot(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    const action = args.next() orelse cli.fatal("store-root requires proof, enroll, or status", .{});
+    const action = args.next() orelse cli.argumentError("store-root requires proof, enroll, or status", .{});
     if (std.mem.eql(u8, action, "proof")) return storeRootProof(allocator, io, args);
     if (std.mem.eql(u8, action, "enroll")) return storeRootEnroll(allocator, io, client, args);
     if (std.mem.eql(u8, action, "status")) return storeRootStatus(allocator, io, client, args);
-    cli.fatal("unknown store-root action: {s}", .{action});
+    cli.argumentError("unknown store-root action: {s}", .{action});
 }
 
 /// Run on the data node with permission to read its private signing checkpoint.
@@ -45,18 +45,18 @@ fn storeRootProof(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
     var node_id_raw: ?[]const u8 = null;
     var store_id_raw: ?[]const u8 = null;
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--replica-root-dir")) cli.takeUniqueValue(args, &root_dir, arg) else if (std.mem.eql(u8, arg, "--metadata-incarnation")) cli.takeUniqueValue(args, &metadata_incarnation, arg) else if (std.mem.eql(u8, arg, "--node-id")) cli.takeUniqueValue(args, &node_id_raw, arg) else if (std.mem.eql(u8, arg, "--store-id")) cli.takeUniqueValue(args, &store_id_raw, arg) else cli.fatal("unknown store-root proof option: {s}", .{arg});
+        if (std.mem.eql(u8, arg, "--replica-root-dir")) cli.takeUniqueValue(args, &root_dir, arg) else if (std.mem.eql(u8, arg, "--metadata-incarnation")) cli.takeUniqueValue(args, &metadata_incarnation, arg) else if (std.mem.eql(u8, arg, "--node-id")) cli.takeUniqueValue(args, &node_id_raw, arg) else if (std.mem.eql(u8, arg, "--store-id")) cli.takeUniqueValue(args, &store_id_raw, arg) else cli.argumentError("unknown store-root proof option: {s}", .{arg});
     }
-    const incarnation = metadata_incarnation orelse cli.fatal("--metadata-incarnation is required; use the target metadata cluster's canonical identity", .{});
+    const incarnation = metadata_incarnation orelse cli.argumentError("--metadata-incarnation is required; use the target metadata cluster's canonical identity", .{});
     if (incarnation.len != 32) return error.InvalidMetadataIncarnation;
     var incarnation_bytes: [32]u8 = undefined;
     @memcpy(&incarnation_bytes, incarnation);
-    const node_id = try std.fmt.parseInt(u64, node_id_raw orelse cli.fatal("--node-id is required", .{}), 10);
-    const store_id = try std.fmt.parseInt(u64, store_id_raw orelse cli.fatal("--store-id is required", .{}), 10);
+    const node_id = try std.fmt.parseInt(u64, node_id_raw orelse cli.argumentError("--node-id is required", .{}), 10);
+    const store_id = try std.fmt.parseInt(u64, store_id_raw orelse cli.argumentError("--store-id is required", .{}), 10);
     const signing = try @import("antfly_local_sources").storage_db_root_signing_identity.load(
         allocator,
         io,
-        root_dir orelse cli.fatal("--replica-root-dir is required", .{}),
+        root_dir orelse cli.argumentError("--replica-root-dir is required", .{}),
     );
     const request = try @import("../../metadata/store_root_enrollment.zig").Request.sign(.{
         .metadata_incarnation = incarnation_bytes,
@@ -67,16 +67,15 @@ fn storeRootProof(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
     }, signing.seed);
     const encoded = try @import("../../api/store_root_enrollment_http.zig").encodeAlloc(allocator, request);
     defer allocator.free(encoded);
-    cli.writeStdout(io, encoded);
-    cli.writeStdout(io, "\n");
+    try cli.output.writeJsonArtifact(allocator, io, encoded);
 }
 
 fn storeRootEnroll(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var path: ?[]const u8 = null;
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--file")) cli.takeUniqueValue(args, &path, arg) else cli.fatal("unknown store-root enroll option: {s}", .{arg});
+        if (std.mem.eql(u8, arg, "--file")) cli.takeUniqueValue(args, &path, arg) else cli.argumentError("unknown store-root enroll option: {s}", .{arg});
     }
-    const bytes = try cli.readFileAlloc(io, allocator, path orelse cli.fatal("--file is required", .{}), @import("../../api/store_root_enrollment_http.zig").max_body_bytes);
+    const bytes = try cli.readFileAlloc(io, allocator, path orelse cli.argumentError("--file is required", .{}), @import("../../api/store_root_enrollment_http.zig").max_body_bytes);
     defer allocator.free(bytes);
     const proof_http = @import("../../api/store_root_enrollment_http.zig");
     var parsed = try std.json.parseFromSlice(proof_http.Request, allocator, bytes, .{ .ignore_unknown_fields = false });
@@ -102,10 +101,10 @@ fn storeRootEnroll(allocator: std.mem.Allocator, io: std.Io, client: *antfly_cli
 fn storeRootStatus(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var path: ?[]const u8 = null;
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--file")) cli.takeUniqueValue(args, &path, arg) else cli.fatal("unknown store-root status option: {s}", .{arg});
+        if (std.mem.eql(u8, arg, "--file")) cli.takeUniqueValue(args, &path, arg) else cli.argumentError("unknown store-root status option: {s}", .{arg});
     }
     const proof_http = @import("../../api/store_root_enrollment_http.zig");
-    const bytes = try cli.readFileAlloc(io, allocator, path orelse cli.fatal("--file is required", .{}), proof_http.max_body_bytes);
+    const bytes = try cli.readFileAlloc(io, allocator, path orelse cli.argumentError("--file is required", .{}), proof_http.max_body_bytes);
     defer allocator.free(bytes);
     var parsed = try std.json.parseFromSlice(proof_http.Request, allocator, bytes, .{ .ignore_unknown_fields = false });
     defer parsed.deinit();
@@ -134,7 +133,7 @@ fn metadata(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
         return metadataStatus(allocator, io, client);
     }
 
-    cli.fatal("unknown internal metadata subcommand: {s}", .{subcommand});
+    cli.argumentError("unknown internal metadata subcommand: {s}", .{subcommand});
 }
 
 pub fn metadataStatus(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {

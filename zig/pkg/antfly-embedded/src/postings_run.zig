@@ -61,12 +61,14 @@ pub const Run = if (@import("builtin").os.tag == .freestanding) struct {
     pub fn sealedView(_: *@This()) !source.View {
         return error.NativePostingsRunsUnavailable;
     }
+    pub fn preferSequentialReads(_: *@This()) void {}
 } else NativeRun;
 
 const NativeRun = struct {
     // A merge has up to sixteen interleaved cursors, each visiting dictionary
     // and postings pages. Four global slots thrash even on warm file caches.
-    // Four ways keep lookup work constant; the lazy payload stays at 512 KiB.
+    // Four ways keep lookup work constant. Prefer 512 KiB, falling back to
+    // the original 64 KiB cache when a bounded allocator cannot admit it.
     const read_sets = 8;
     const read_ways = 4;
     const read_page_bytes = 16 * 1024;
@@ -88,6 +90,7 @@ const NativeRun = struct {
     live_bytes: usize = 0,
     dead_extents: usize = 0,
     read_buffer: []u8 = &.{},
+    read_set_count: usize = read_sets,
     read_pages: [read_sets * read_ways]struct { offset: usize = 0, length: usize = 0 } = @splat(.{}),
     next_read_page: [read_sets]u2 = @splat(0),
     read_calls: usize = 0,
@@ -261,6 +264,12 @@ const NativeRun = struct {
     pub fn sealedView(self: *Run) !source.View {
         return source.View.init(.{ .ranges = .{ .ptr = self, .length = self.length, .read_into = read, .close = close } }, 0, self.length);
     }
+    /// Coordinate and span streams advance sequentially; a fan-in postings
+    /// cache only retains redundant pages and competes with their output buffers.
+    pub fn preferSequentialReads(self: *Run) void {
+        std.debug.assert(self.read_buffer.len == 0);
+        self.read_set_count = 1;
+    }
     fn read(raw: *anyopaque, offset: u64, bytes: []u8) !void {
         const self: *Run = @ptrCast(@alignCast(raw));
         const extent = self.findExtent(offset) orelse return error.EndOfStream;
@@ -273,13 +282,17 @@ const NativeRun = struct {
             if (try self.file.readPositionalAll(self.io, bytes, physical) != bytes.len) return error.EndOfStream;
             return;
         }
-        if (self.read_buffer.len == 0) self.read_buffer = try self.allocator.alloc(u8, read_sets * read_ways * read_page_bytes);
+        if (self.read_buffer.len == 0) {
+            self.read_buffer = self.allocator.alloc(u8, self.read_set_count * read_ways * read_page_bytes) catch
+                try self.allocator.alloc(u8, read_ways * read_page_bytes);
+            self.read_set_count = self.read_buffer.len / (read_ways * read_page_bytes);
+        }
         var copied: usize = 0;
         while (copied < bytes.len) {
             const position = physical + copied;
             const page_offset = position / read_page_bytes * read_page_bytes;
             const page_number = page_offset / read_page_bytes;
-            const set = (page_number ^ (page_number >> 3) ^ (page_number >> 6) ^ (page_number >> 9)) % read_sets;
+            const set = (page_number ^ (page_number >> 3) ^ (page_number >> 6) ^ (page_number >> 9)) % self.read_set_count;
             const first = set * read_ways;
             const in_page = position - page_offset;
             const take = @min(bytes.len - copied, 16 * 1024 - in_page);

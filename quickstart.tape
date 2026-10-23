@@ -13,7 +13,7 @@ Set Padding 20
 Set TypingSpeed 50ms
 
 Hide
-Type `export PATH="/Users/ajroetker/go/src/github.com/antflydb/antfly:$PATH"`
+Type `export PATH="$(pwd):$PATH" ANTFLY_AGENT_MODE=0`
 Enter
 Sleep 500ms
 # Colored prompt + input text via zsh preexec/precmd
@@ -37,19 +37,22 @@ Show
 
 Type@75ms `antfly table create -t wikipedia -f wikipedia-config.json`
 Enter
-Sleep 2s
+Wait+Screen@60s /Create table command successful\./
+Sleep 1s
 
 # --- Load data ---
 
 Type@75ms `antfly load -t wikipedia -f wiki-articles.jsonl --id-field title --sync-level full_text`
 Enter
-Sleep 2s
+Wait+Screen@120s /Bulk load command successful\./
+Sleep 1s
 
 # Wait for a meaningful, query-visible slice of the embedding corpus. The
 # remaining source documents continue indexing after the threshold is reached.
 Type@75ms `antfly index wait -t wikipedia -i title_body --until source-covered=10% --timeout 45m`
 Enter
-Wait@2700s /reached source-covered=10%:/
+# Follow the prompt after a long scrolling wait; VHS Screen matching reads old scrollback.
+Wait@2700s /❯/
 Sleep 1s
 
 # --- Full-text search ---

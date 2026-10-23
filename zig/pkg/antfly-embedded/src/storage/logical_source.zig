@@ -24,7 +24,7 @@ const ranges_mod = @import("value_ranges.zig");
 /// Opt-in benchmark accounting. No document bytes, keys or capabilities are
 /// emitted. A null profile adds no clocks or counter updates to normal reads.
 pub const ReadProfile = struct {
-    const Counter = std.atomic.Value(u64);
+    const Counter = @import("antfly_platform").atomic.Value(u64);
     calls: Counter = .init(0),
     total_ns: Counter = .init(0),
     revision_ns: Counter = .init(0),

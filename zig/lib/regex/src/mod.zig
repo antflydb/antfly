@@ -985,3 +985,22 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
     };
     return &result;
 }
+
+test "ASCII insensitive FST regex preserves ranges negation escapes and anchored verification" {
+    const a = std.testing.allocator;
+    for ([_]struct { pattern: []const u8, yes: []const u8, no: []const u8 }{
+        .{ .pattern = "(?i)^Maxwell$", .yes = "mAxWeLl", .no = "xMaxwell" },
+        .{ .pattern = "(?i)^[A-C]+$", .yes = "aBc", .no = "d" },
+        .{ .pattern = "(?i)^[^A-C]+$", .yes = "Def", .no = "a" },
+        .{ .pattern = "(?i)^Ghisl.*", .yes = "GHISLAINE", .no = "gopher" },
+        .{ .pattern = "(?i)^a\\+b$", .yes = "A+B", .no = "AB" },
+    }) |case| {
+        var compiled = try compile(a, case.pattern);
+        defer compiled.deinit();
+        try std.testing.expect(matchesCompiled(case.pattern, &compiled, case.yes));
+        try std.testing.expect(!matchesCompiled(case.pattern, &compiled, case.no));
+        var forked = compiled.fork(a);
+        defer forked.deinit();
+        try std.testing.expect(matchesCompiled(case.pattern, &forked, case.yes));
+    }
+}

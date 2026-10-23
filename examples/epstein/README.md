@@ -572,6 +572,11 @@ Preparation completes every page window for a PDF before writing that source's
 manifest rows. PDFs rejected during validation or splitting are recorded in
 `skipped.ndjson`; filesystem failures still stop preparation. Server warmup
 reports unreadable PDF windows and continues preparing other sources.
+`corpus load --semantic` uses the server's local Antfly embedder with
+`provider: antfly` and the selected `--embedding-model`, without `api_url`.
+It works with the default server configuration, where the HTTP inference
+endpoint is disabled. `--inference-url` selects the optional relation graph's
+inference service; it does not route corpus embeddings back through HTTP.
 The relation extractor defaults to the registered model ID `antflydb/gliner2-base-v1`;
 its installed bundle selects the quantized weights. Use `--artifact-extractor-model`
 on both corpus load commands to select another registered extractor. Inspect

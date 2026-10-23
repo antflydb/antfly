@@ -183,6 +183,10 @@ misleading empty result. Distributed traversal requires `deduplicate_nodes=true`
 an unsupported false value reports `deduplicate_nodes_must_be_true`, including
 for incoming queries. Use separate queries per seed with `include_paths=true`
 when separate seed provenance is required.
+Capability admission records the rejected operation and reason in the request's
+diagnostic sink. Earlier supported incoming operations cannot redirect that
+diagnostic when several named operations share one request. Planning probes
+do not publish diagnostics.
 
 Native shortest-path and Yen searches preserve qualified node identity in every
 returned node, spur seed, root exclusion, and joined candidate. Native callers can specify

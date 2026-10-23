@@ -18,6 +18,15 @@ const types = @import("antfly_local_sources").storage_db_types;
 const graph_query = @import("antfly_local_sources").graph_query;
 
 pub const Reason = enum {
+    expand_strategy_not_supported,
+    deduplicate_nodes_must_be_true,
+    start_selector_not_supported,
+    target_selector_not_supported,
+    weight_mode_must_be_min_hops,
+    target_required,
+    k_must_equal_one,
+    k_must_be_positive,
+    pattern_required,
     qualified_start_identity_required,
     legacy_graph_searches_not_supported,
     request_control_not_supported,
