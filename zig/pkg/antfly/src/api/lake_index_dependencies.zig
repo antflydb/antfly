@@ -22,7 +22,7 @@ const V = std.json.Value;
 /// `null` means the complete row (templates, source retention or uncaptured
 /// dependencies). Source/version authority is independently bound by publication.
 pub fn project(a: A, bytes: []const u8, columns: ?[]const []const u8) ![]const u8 {
-    var arena = std.heap.ArenaAllocator.init(a);
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(a));
     defer arena.deinit();
     const ca = arena.allocator();
     var value = try std.json.parseFromSliceLeaky(V, ca, bytes, .{});
@@ -179,4 +179,29 @@ test "external lake dependency contracts preserve nested nullability and unknown
     try std.testing.expect(!std.mem.eql(u8, try project(a, optional, &.{"body"}), try project(a, selected_required, &.{"body"})));
     const composed = try std.mem.replaceOwned(u8, a, optional, "\"properties\":", "\"allOf\":[{}],\"properties\":");
     try std.testing.expectEqualStrings(try project(a, composed, null), try project(a, composed, &.{"body"}));
+}
+
+test "external lake dependency contracts reclaim schema workspace behind retained output arenas" {
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try bytes.appendSlice(a, "{\"document_schemas\":{\"row\":{\"schema\":{\"properties\":{\"body\":{\"type\":\"string\"}");
+    const description: [512]u8 = @splat('x');
+    for (0..128) |i| {
+        var name: [96]u8 = undefined;
+        try bytes.appendSlice(a, try std.fmt.bufPrint(&name, ",\"unused{d}\":{{\"type\":\"string\",\"description\":\"", .{i}));
+        try bytes.appendSlice(a, &description);
+        try bytes.appendSlice(a, "\"}");
+    }
+    try bytes.appendSlice(a, "}}}}}");
+    var budget: @import("antfly_local_sources").sql_memory_budget = .{ .backing = a, .limit = 1024 * 1024 };
+    {
+        var output = std.heap.ArenaAllocator.init(budget.allocator());
+        defer output.deinit();
+        for (0..32) |_| {
+            const contract = try project(output.allocator(), bytes.items, &.{"body"});
+            try std.testing.expect(contract.len < 512);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
 }

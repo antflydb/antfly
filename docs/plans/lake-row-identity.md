@@ -450,11 +450,17 @@ They are not copied into every row-input contract.
 Whole-row text/source retention and templates bind the complete row contract.
 Uncaptured enrichments remain ineligible for row-input reuse. Unknown paths,
 references, schema composition and conditional dependencies conservatively retain
-the full schema. Adding an unrelated nullable table column therefore preserves
+the full schema. Temporary parsing/canonicalization uses reclaimable workspace
+under the enclosing quotas; retained metadata arenas keep only the output
+contracts, rather than every prior schema parse. Adding an unrelated nullable
+table column therefore preserves
 selected text/vector/sparse cohorts; changing a selected field's type or analysis
 requires new evidence. This does not remove the physical inventory schema
 fingerprint from file identity, or permit reuse across an unverified source
-rewrite. Older protocol publications reconcile before serving the new contracts.
+rewrite. Iceberg declarations still require a matching field in the pinned
+Iceberg schema; the real-file regression exposes an existing nullable source
+field while retaining unrelated native indexes. Older protocol publications
+reconcile before serving the new contracts.
 
 Compact row translation batches both dictionary proofs (file digest to slot,
 then slot to exact filename), translation keys, canonical rank keys, and output

@@ -70,7 +70,8 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                 *[
                     NestedField(i, name, StringType(), required=False)
                     for i, name in enumerate(
-                        ("body", "label", "dense_native", "sparse_native"), start=2
+                        ("body", "label", "dense_native", "sparse_native", "extra"),
+                        start=2,
                     )
                 ],
             ),
@@ -93,6 +94,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                 "label": f"updated-{i}" if step == 5 else f"row-{i}",
                 "dense_native": json.dumps([1, i / count]),
                 "sparse_native": json.dumps({"1": (i + 1) ** 2}),
+                "extra": f"source-extra-{i}",
             }
             for i in order
         ]
@@ -106,6 +108,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     "label": f"row-{count}",
                     "dense_native": json.dumps([1, 1]),
                     "sparse_native": json.dumps({"1": (count + 1) ** 2}),
+                    "extra": f"source-extra-{count}",
                 }
             ]
         if iceberg is not None:
@@ -536,21 +539,31 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
         assert normalize(
             call("POST", "/tables/logical/query", label_query)
         ) == normalize(expected)
-        # Adding an unrelated nullable field keeps selected input cohorts and
-        # their native coordinate spaces, while whole-row consumers reverify.
+        # Exposing an existing nullable source field keeps selected input cohorts
+        # and native coordinate spaces, while whole-row consumers reverify.
+        # Iceberg column identity remains authoritative in its source schema.
         revision = ready("logical")
         before = states()[-1]
         reused_before = {item["name"]: item["space"] for item in before["reused"]}
-        schema = call("GET", "/tables/logical")["schema"]
-        schema["document_schemas"]["row"]["schema"]["properties"]["extra"] = {
-            "type": "string"
-        }
-        call("PUT", "/tables/logical/schema", schema)
+        call(
+            "PATCH",
+            "/tables/logical/schema",
+            {
+                "document_schemas": {
+                    "row": {"schema": {"properties": {"extra": {"type": "string"}}}}
+                }
+            },
+        )
         ready("logical", revision)
         after = states()[-1]
         reused_after = {item["name"]: item["space"] for item in after["reused"]}
         for name in ("text", "label_text", "dense_native", "sparse_native"):
             assert reused_after[name] == reused_before[name], name
+        assert call(
+            "POST",
+            "/sql",
+            {"statement": "SELECT id, extra FROM logical ORDER BY id LIMIT 1"},
+        )["rows"] == [[str(base), "source-extra-0"]]
         assert normalize(call("POST", "/tables/logical/query", label_query)) == normalize(
             expected
         )
