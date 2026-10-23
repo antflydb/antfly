@@ -24612,3 +24612,45 @@ changes after compilation. The build's error/status/failure-identity checks pass
 45/1/8. This supersedes the previous unresolved protocol qualification. Final
 status commit, backend flush, final durability and retirement admission remain
 open; the full design is not complete. Full GNU qualification remains waived.
+
+### Prepared owning physical append resources
+
+Final status commit cannot safely park the entire legacy batch commit: that
+callback combines CPU preparation/publication with physical WAL operations.
+The durability provider now offers a prepared append grant as a prerequisite to
+separating those phases. Preparation freezes encoded input in the retained native
+state's allocator with checkpoints between 16 KiB copy quanta, reserves one
+shared descriptor and starts one reusable mailbox worker before publication is
+acquired. Error or descriptor refusal transfers no grant and performs no write.
+Partial-copy, allocation and dispatch failures roll back buffers and capacity.
+
+An accepted append owns its immutable bytes, descriptor and worker through
+handoff, lifetime and reentry rejection, including destruction of the storage
+owner and lease. Retrying the wait observes the same accepted operation; it does
+not append again. Append, control read, content sync and parent sync share the
+same serial grant. Physical execution adds no allocator/worker/descriptor
+admission. Append does not imply fsync, directory creation or permission to
+fabricate a missing referenced segment. Creation is explicit. A physical failure
+can leave a partial tail; the future WAL publication owner must recover that
+ambiguity rather than resubmit the record. Mandatory retirement joins accepted
+work before freeing its frozen bytes and releasing the descriptor/runtime.
+
+Native ABI 102 and storage-owner ABI 162 cover the additional storage/resource
+callbacks. Providers without this capability fail closed. Default close has not
+yet adopted the append primitive: the next owning WAL append coordinator must
+retain publication, decode actual CURRENT and plan segment transitions on CPU,
+append prepared bytes, publish mutable state exactly once, and order its final
+barriers before releasing publication. Status commit and final backend flush
+must then compose with it without later writes or duplicate legacy sync.
+
+Receipt `prepared-append-v3` passes all 65 build steps, all 20 physical cases,
+all 15 independently compiled archive cases and 45/1/8 identity cases. New cases
+exercise a 128 KiB frozen record under exhausted heap/descriptor/dispatch
+capacity and every controlled wait rejection, protected control progress,
+mandatory append join, explicit creation/missing parents, partial-copy rollback,
+unsupported providers and an actual partial append followed by stable failures
+without replay. The new archive case destroys both original input and producer
+owners before resuming a rejected write and its subsequent sync. Source/log
+hashes match the final inputs. The v1 receipt records a corrected target name;
+v2 qualifies the foundation before the added ambiguous-write test. The full
+goal remains active; full GNU qualification remains waived.

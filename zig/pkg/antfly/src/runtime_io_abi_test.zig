@@ -502,3 +502,67 @@ test "executor archive boundary WAL sync distinguishes original missing-file rej
     _ = try operation.waitWithAdmission(original);
     try std.testing.expectEqual(@as(usize, 2), Shim.calls);
 }
+
+test "executor archive boundary prepared append owns bytes after producer and input retirement" {
+    const os = @import("builtin").os.tag;
+    if (os == .windows or os == .wasi or os == .freestanding) return error.SkipZigTest;
+    const abi = @import("antfly_runtime_abi");
+    const admission = @import("antfly_local_sources").common_read_admission;
+    const Control = struct {
+        rejected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.rejected) return error.SessionLeaseLost;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var lease: retained_io.Storage.Lease = undefined;
+    var owner: ?*anyopaque = null;
+    defer if (owner) |context| runtime_io_abi_test_durability_owner_close(context);
+    const contract = abi.native_abi.TypeContract.of(retained_io.Storage.Lease);
+    const status = runtime_io_abi_test_durability_storage(&contract, &lease, &owner);
+    if (!status.isOk()) return abi.error_abi.errorFromStatus(status);
+    var leased = true;
+    defer if (leased) lease.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/append", .{tmp.sub_path});
+    defer a.free(path);
+    try lease.view.writeFileAbsolute(path, "prefix:");
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    const input = try a.dupe(u8, "owned-record");
+    var input_live = true;
+    defer if (input_live) a.free(input);
+    var grant = (try lease.view.tryPrepareAppendWithAdmission(input, original)) orelse return error.TestUnexpectedResult;
+    defer grant.deinit();
+    @memset(input, 'x');
+    a.free(input);
+    input_live = false;
+    var write = try grant.beginPreparedAppend(path, false, original);
+    var write_live = true;
+    defer if (write_live) write.deinit();
+    control.rejected = true;
+    try std.testing.expectError(error.SessionLeaseLost, write.waitWithAdmission(original));
+    runtime_io_abi_test_durability_owner_close(owner.?);
+    owner = null;
+    lease.deinit();
+    leased = false;
+    control.rejected = false;
+    try write.waitWithAdmission(original);
+    try write.waitWithAdmission(original);
+    write.deinit();
+    write_live = false;
+    var sync = try grant.beginSyncContents(path, original);
+    try sync.waitWithAdmission(original);
+    sync.deinit();
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(100));
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("prefix:owned-record", actual);
+}
