@@ -245,7 +245,7 @@ pub const SegmentShared = struct {
             if (self.residency_manager) |previous| std.debug.assert(previous == owner);
             self.residency_manager = owner;
         }
-        if (self.residency_manager) |owner| owner.observeUsage(.full_text_segment_residency, &self.residency_accounted, if (self.mapped_residency_state.load(.acquire) == mapped_residency_cold) 0 else self.mapping_bytes);
+        if (self.residency_manager) |owner| owner.observeUsageWithHostCharge(.full_text_segment_residency, &self.residency_accounted, if (self.mapped_residency_state.load(.acquire) == mapped_residency_cold) 0 else self.mapping_bytes, 0);
     }
 
     fn noteMappedAccess(self: *SegmentShared) void {
@@ -619,7 +619,7 @@ pub const SegmentEntry = struct {
     }
 
     fn destroyShared(alloc: Allocator, shared: *SegmentShared) void {
-        if (shared.residency_manager) |manager| manager.observeUsage(.full_text_segment_residency, &shared.residency_accounted, 0);
+        if (shared.residency_manager) |manager| manager.observeUsageWithHostCharge(.full_text_segment_residency, &shared.residency_accounted, 0, 0);
         if (shared.deleted) |*deleted| deleted.deinit();
         freeTypedDocValuesCoverage(alloc, shared.typed_doc_values_coverage);
         alloc.destroy(shared);
@@ -3530,6 +3530,7 @@ test "external lake shared immutable mapped segments have one residency owner ac
     var fork = try writer.forkImmutable();
     fork.attachResourceManager(&manager);
     try std.testing.expectEqual(@as(u64, @intCast(bytes.len)), manager.sliceStats(.full_text_segment_residency).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     writer.deinit();
     try std.testing.expectEqual(@as(u64, @intCast(bytes.len)), manager.sliceStats(.full_text_segment_residency).used_bytes);
     fork.deinit();

@@ -2586,3 +2586,72 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(
         indent=2,
         sort_keys=True,
     )
+
+
+def test_unreachable_pdf_error_identity_and_successful_repair_clear_debt(stateful_api):
+    """Exercise the released server's fetch/error/publication boundaries."""
+    import socket
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        closed_port = listener.getsockname()[1]
+    table = f"document_fetch_error_{time.time_ns()}"
+    stateful_api.post(
+        f"/tables/{table}",
+        {"num_shards": 1, "indexes": {"units": _document_units_index_config()}},
+    )
+    document = {
+        "filename": "unreachable.pdf",
+        "mime_type": "application/pdf",
+        "version": "1",
+        "url": f"http://127.0.0.1:{closed_port}/sources/unreachable.pdf",
+    }
+    stateful_api.batch_write(table, inserts={"broken": document}, sync_level="write")
+    artifact_path = _document_artifact_path(table, "broken", DOCUMENT_UNITS_ARTIFACT)
+
+    def failed_manifest():
+        response = requests.get(
+            stateful_api.url + artifact_path, params={"detail": "raw"}, timeout=10
+        )
+        if response.status_code != 200:
+            return None
+        manifest = response.json()
+        return manifest if manifest.get("route_type") == "error" else None
+
+    failed = wait_until(failed_manifest, timeout_s=90, interval_s=0.5)
+    assert failed is not None
+    assert "ConnectionRefused" in json.dumps(failed["manifest_json"]), failed
+    issues_path = f"/tables/{table}/repair/issues"
+    asset_issues = stateful_api.post(issues_path, {"kind": "asset", "limit": 100})
+    assert asset_issues["issues"], asset_issues
+    assert (
+        stateful_api.post(issues_path, {"kind": "embedding", "limit": 100})["issues"]
+        == []
+    )
+    wrong_filter = requests.post(
+        stateful_api.url + issues_path, json={"artifact_kind": "embedding"}, timeout=10
+    )
+    assert wrong_filter.status_code == 400, wrong_filter.text
+
+    document.update(
+        filename="recovered.txt",
+        mime_type="text/plain",
+        version="2",
+        url="data:text/plain;base64,YWxwaGEgYmV0YQ==",
+    )
+    stateful_api.batch_write(
+        table, inserts={"broken": document}, sync_level="full_index"
+    )
+    recovered = wait_until(
+        lambda: _manifest_ready(stateful_api, table, "broken"),
+        timeout_s=60,
+        interval_s=0.5,
+    )
+    assert recovered is not None
+    assert recovered["route_type"] == "text"
+
+    def cleared():
+        result = stateful_api.post(issues_path, {"kind": "asset", "limit": 100})
+        return result if not result["issues"] else None
+
+    assert wait_until(cleared, timeout_s=60, interval_s=0.5) is not None

@@ -132,3 +132,26 @@ export fn runtime_io_abi_test_consume_inference_control(control: *const Inferenc
     control.check() catch |err| return @import("antfly_runtime_abi").error_abi.statusFromError(err);
     return .ok;
 }
+
+const RemoteConfig = @import("antfly_scraping").RemoteContentConfig;
+var remote_failure: RemoteConfig.RemoteContentRuntime.AcquireStatus = .ok;
+var remote_config: RemoteConfig = .{};
+fn remoteSnapshot(_: *anyopaque, output: *RemoteConfig.Snapshot) callconv(.c) RemoteConfig.RemoteContentRuntime.AcquireStatus {
+    if (remote_failure == .ok) output.* = .{ .config = &remote_config };
+    return remote_failure;
+}
+export fn runtime_io_abi_test_remote_snapshot(output: *RemoteConfig.RemoteContentRuntime, failure: u8) callconv(.c) void {
+    remote_failure = @fromBackingInt(@intCast(failure));
+    output.* = .{ .context = &remote_failure, .acquire_fn = remoteSnapshot };
+}
+
+export fn runtime_io_abi_test_remote_fetch(borrow: *const bridge.Borrow, url: [*]const u8, url_len: usize) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+    const errors = @import("antfly_runtime_abi").error_abi;
+    var receiver = borrow.receive() catch |err| return errors.statusFromError(err);
+    const scraping = @import("antfly_scraping");
+    var hosts = [_][]u8{@constCast("127.0.0.1")};
+    const security: scraping.ContentSecurityConfig = .{ .block_private_ips = false, .allowed_hosts = &hosts, .max_download_size_bytes = 1024 };
+    var outcome = scraping.downloadContentOutcomeAllocWithHeadersAndContext(std.heap.page_allocator, .{ .io = receiver.io(), .timeout_ms = 1000 }, url[0..url_len], &security, null, null) catch |err| return errors.statusFromError(err);
+    if (outcome == .ok) outcome.ok.deinit(std.heap.page_allocator);
+    return .{};
+}

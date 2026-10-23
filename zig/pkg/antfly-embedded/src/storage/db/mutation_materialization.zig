@@ -3597,6 +3597,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     std.debug.assert(replan_suffix);
                 }
                 std.debug.assert(applied_first_chunk and write_start == collected.docs.items.len);
+                if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_ns, apply_start_ns);
                 return;
             }
@@ -3998,6 +3999,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, batch, .{ .mode = .bulk_ingest });
                 },
             }
+            if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
+        }
+
+        pub fn clearPublishedAssetArtifactRepairIssuesContext(ctx: *const AsyncContext, index_name: []const u8, keys: []const []const u8, sequence: u64) !void {
+            return clearPublishedArtifactRepairIssuesContext(ctx, .asset, index_name, keys, sequence);
         }
 
         pub fn applyGraphArtifactMutationPages(
@@ -4795,9 +4801,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             artifact_key: []const u8,
             published_sequence: u64,
         ) !void {
+            return clearPublishedArtifactRepairIssueContext(ctx, .embedding, index_name, artifact_key, published_sequence);
+        }
+
+        fn clearPublishedArtifactRepairIssueContext(
+            ctx: *const AsyncContext,
+            kind: types.ArtifactRepairKind,
+            index_name: []const u8,
+            artifact_key: []const u8,
+            published_sequence: u64,
+        ) !void {
+            const kind_name = @tagName(kind);
             const artifact_key_hex = try bytesToHexAlloc(ctx.alloc, artifact_key);
             defer ctx.alloc.free(artifact_key_hex);
-            const issue_key = try internal_keys.artifactRepairIssueKeyAlloc(ctx.alloc, index_name, "embedding", artifact_key_hex);
+            const issue_key = try internal_keys.artifactRepairIssueKeyAlloc(ctx.alloc, index_name, kind_name, artifact_key_hex);
             defer ctx.alloc.free(issue_key);
 
             const mutable_ctx = @constCast(ctx);
@@ -4808,30 +4825,57 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var issue = loaded;
             defer issue.deinit(ctx.alloc);
             if (issue.sequence > published_sequence) return;
+            if (kind == .asset) {
+                // Failed extraction retains older children. Their presence
+                // alone is no proof of repair; require a healthy publication.
+                const raw = ctx.store.get(ctx.alloc, artifact_key) catch |err| switch (err) {
+                    error.NotFound => return,
+                    else => return err,
+                };
+                defer ctx.alloc.free(raw);
+                var manifest = std.json.parseFromSlice(std.json.Value, ctx.alloc, raw, .{}) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return,
+                };
+                defer manifest.deinit();
+                if (manifest.value != .object) return;
+                const route = manifest.value.object.get("route_type") orelse return;
+                if (route != .string or route.string.len == 0) return;
+                if (try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(ctx.alloc, raw)) return;
+                // Partial OCR may retain valid older units. A non-empty
+                // artifact is not sufficient to settle a terminal repair.
+                if (manifest.value.object.get("ocr_failed_count")) |count| {
+                    if (count != .integer or count.integer != 0) return;
+                }
+                if (manifest.value.object.get("ocr_failed_page_numbers")) |pages| {
+                    if (pages != .array or pages.array.items.len != 0) return;
+                }
+                if (manifest.value.object.get("merge")) |merge| {
+                    if (merge != .object) return;
+                    const state = merge.object.get("status") orelse return;
+                    if (state != .string or !std.mem.eql(u8, state.string, "converged")) return;
+                }
+            }
 
             var completion_key: ?[]u8 = null;
             defer if (completion_key) |key| ctx.alloc.free(key);
             var completion: ArtifactRepairCompletionState = .{};
             var encoded_completion: [artifact_repair_completion_state_len]u8 = undefined;
             if (issue.reason == .enrichment_failed) {
-                if (ctx.index_manager.denseIndex(index_name) == null and
-                    ctx.index_manager.sparseIndex(index_name) == null)
-                {
-                    return;
+                if (kind == .embedding) {
+                    if (ctx.index_manager.denseIndex(index_name) == null and ctx.index_manager.sparseIndex(index_name) == null) return;
+                    const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return;
+                    const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(ctx.alloc, index_name, generation, issue.doc_key);
+                    defer ctx.alloc.free(marker_key);
+                    const raw_outcome = ctx.store.get(ctx.alloc, marker_key) catch |err| switch (err) {
+                        error.NotFound => return,
+                        else => return err,
+                    };
+                    defer ctx.alloc.free(raw_outcome);
+                    const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, raw_outcome) orelse return error.InvalidDerivedCoverageOutcome;
+                    if (outcome != .produced and outcome != .skipped) return;
                 }
-                const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return;
-                const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(ctx.alloc, index_name, generation, issue.doc_key);
-                defer ctx.alloc.free(marker_key);
-                const raw_outcome = ctx.store.get(ctx.alloc, marker_key) catch |err| switch (err) {
-                    error.NotFound => return,
-                    else => return err,
-                };
-                defer ctx.alloc.free(raw_outcome);
-                const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, raw_outcome) orelse
-                    return error.InvalidDerivedCoverageOutcome;
-                if (outcome != .produced and outcome != .skipped) return;
-
-                completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(ctx.alloc, "embedding", artifact_key_hex);
+                completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(ctx.alloc, kind_name, artifact_key_hex);
                 completion = (try loadArtifactRepairCompletionStateFromStore(ctx.alloc, ctx.store, completion_key.?)) orelse .{};
                 completion.completed_sequence = @max(completion.completed_sequence, published_sequence);
                 completion.pending_issues -|= 1;
@@ -4884,6 +4928,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             writes: anytype,
             published_sequence: u64,
         ) !void {
+            return clearPublishedArtifactRepairIssuesContext(ctx, .embedding, index_name, writes, published_sequence);
+        }
+
+        fn clearPublishedArtifactRepairIssuesContext(
+            ctx: *const AsyncContext,
+            comptime kind: types.ArtifactRepairKind,
+            index_name: []const u8,
+            items: anytype,
+            published_sequence: u64,
+        ) !void {
             const ArtifactRepairProbe = struct {
                 issue_key: []u8,
                 artifact_key: []const u8,
@@ -4898,11 +4952,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (probes.items) |probe| ctx.alloc.free(probe.issue_key);
                 probes.deinit(ctx.alloc);
             }
-            for (writes) |write| {
-                const artifact_key = write.artifact_key orelse continue;
+            for (items) |item| {
+                const artifact_key = if (kind == .asset) item else item.artifact_key orelse continue;
+                if (kind == .asset and !internal_keys.isAssetArtifactKey(artifact_key)) continue;
                 const artifact_key_hex = try bytesToHexAlloc(ctx.alloc, artifact_key);
                 defer ctx.alloc.free(artifact_key_hex);
-                const issue_key = try internal_keys.artifactRepairIssueKeyAlloc(ctx.alloc, index_name, "embedding", artifact_key_hex);
+                const issue_key = try internal_keys.artifactRepairIssueKeyAlloc(ctx.alloc, index_name, @tagName(kind), artifact_key_hex);
                 errdefer ctx.alloc.free(issue_key);
                 try probes.append(ctx.alloc, .{ .issue_key = issue_key, .artifact_key = artifact_key });
             }
@@ -4930,7 +4985,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             for (existing_artifacts.items) |artifact_key| {
-                try clearPublishedEmbeddingArtifactRepairIssueContext(ctx, index_name, artifact_key, published_sequence);
+                try clearPublishedArtifactRepairIssueContext(ctx, kind, index_name, artifact_key, published_sequence);
             }
         }
 

@@ -216,6 +216,14 @@ antfly-lite lite import restored.aflite --from app.afb --replace
 
 ## Moving Between Lite and a Normal Instance
 
+Directory tables using `dense_embeddings: vector_store` support native and
+portable cohort backups once storage migration has finished. Native backups
+retain the exact source-vector generation with the primary checkpoint;
+portable backups resolve those references into inline vectors. Restoring a
+portable backup therefore provides a path back to `primary_lsm` storage without
+recomputing embeddings. Backups are rejected while a migration is active so a
+restore cannot mix physical generations.
+
 Both directions are logical backup and restore. The portable stream carries documents and keys, schemas, index definitions, enrichment definitions and persisted state, caller-supplied vectors and artifacts that are already query-visible, and enough metadata to rebuild query-visible indexes. Storage-engine files (text indexes, dense vector segments, sparse postings, graph reverse indexes, checkpoints, free-space metadata) are rebuilt on the target, not copied.
 
 **Lite into a running instance.** `promote` opens the `.aflite` read-only, stages a portable backup, restores it into the target table, and leaves the Lite file in place:
