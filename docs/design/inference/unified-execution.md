@@ -1257,6 +1257,22 @@ p50/p95 budgets across 32 balanced arms (warmup 25, measured 201); p50 ratios
 range from 0.9925 to 1.0037. Receipts are in `next-bulk/cuda-host/`.
 Symbol lifecycle consolidation and final composition remain separate gates.
 
+### Q4_K and optimizer arithmetic checkpoint
+
+N11 shares the exact eight-element Q4_K two-projection decode/dot leaf across
+three paired linear/activation exports. The two-row scalar accumulator schedule
+and four-row array schedule retain their original scratch layout, reduction
+order and store type. N32 shares AdamW arithmetic through a compile-time storage
+and nonfinite-publication policy; in-place gradient clearing and out-of-place
+transaction publication remain explicit.
+
+These two owners remove **2348 authored Metal bytes** after replacement helpers.
+All 64 safe/fast direct cases pass bytes, guards, resources and timing across 32
+balanced arms / 2,000 dispatches. Finite cases also pass independent Q4_K dot
+and AdamW references; nonfinite optimizer cases verify baseline behavior and
+flag publication. Fixtures include empty/tail outputs, both storage policies
+and multiple projection shapes. Receipts: `next-bulk/metal-leaves/`.
+
 ### Six implementation waves
 
 1. **Ownership and contracts — N01–N04.** Freeze the source/images/executables;
