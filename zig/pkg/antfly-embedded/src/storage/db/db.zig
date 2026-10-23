@@ -40974,6 +40974,7 @@ pub const DB = struct {
         session.reader = try self.beginRelationalRowsAtSnapshot(alloc, .{
             .index = parsed.value.index,
             .auto_index = parsed.value.auto_index,
+            .reverse = parsed.value.reverse,
             .include_primary_digest = opts.include_content_hashes,
             .include_cursor = parsed.value.index != null or parsed.value.auto_index,
             .after = parsed.value.after,

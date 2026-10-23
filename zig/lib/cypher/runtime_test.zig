@@ -7960,4 +7960,26 @@ test "coarse RPC prefixes refine owner ties and bound partial DISTINCT across wi
                         const control = try std.fmt.allocPrint(a, "MATCH (n:Document) {s}RETURN {s} ORDER BY CASE WHEN true THEN n.rank ELSE n.rank END {s} SKIP {d} LIMIT {d}", .{ stage, projection, direction, skip, limit });
                         try std.testing.expectEqualStrings(try F.run(a, set.backend(), control), try F.run(a, set.backend(), query));
                     };
+    for ([_][]const u8{ "", "WITH DISTINCT n ", "WITH n AS m WITH m AS n " }) |stage| {
+        for ([_][]const u8{ "", "WHERE n.rank IS NULL ", "WHERE false " }) |predicate| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const query = try std.fmt.allocPrint(a, "MATCH (n:Document) {s}{s}RETURN min(n.rank) AS lo,max(n.rank) AS hi", .{ predicate, stage });
+            const control = try std.fmt.allocPrint(a, "MATCH (n:Document) {s}{s}RETURN min(CASE WHEN true THEN n.rank ELSE n.rank END) AS lo,max(n.rank) AS hi", .{ predicate, stage });
+            try std.testing.expectEqualStrings(try F.run(a, set.backend(), control), try F.run(a, set.backend(), query));
+        }
+    }
+    for ([_]struct { query: []const u8, depth: usize }{
+        .{ .query = "MATCH (n:Document) RETURN min(n.rank),max(n.rank)", .depth = 1 },
+        .{ .query = "MATCH (n:Document) WITH n WITH n RETURN min(n.rank),max(n.rank)", .depth = 3 },
+    }) |case| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, set.backend(), g, &compiled, &.{}, .{ .recursion_depth = case.depth });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i128, 0), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i128, 2), result.rows[0][1].integer);
+    }
 }

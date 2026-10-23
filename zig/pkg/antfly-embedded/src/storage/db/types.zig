@@ -1542,6 +1542,7 @@ pub const RelationalRowQuery = struct {
     /// pinned catalog snapshot. This is deliberately a hint: no usable index
     /// is a correct primary-key fallback.
     auto_index: bool = false,
+    reverse: bool = false,
     after: ?[]const u8 = null,
     lower: ?Bound = null,
     upper: ?Bound = null,

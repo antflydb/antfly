@@ -1176,6 +1176,8 @@ const NodeOrder = struct {
     encounter_key: ?[]const u8 = null,
     refill: usize = 1,
     previous_total: ?usize = null,
+    seek_value: ?v.Value = null,
+    seek_index: usize = 0,
     primary: bool = false,
     primary_fallback: bool = false,
     primary_index: bool = false,
@@ -7434,6 +7436,9 @@ const Engine = struct {
         return true;
     }
     fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer) anyerror!?[]const Row {
+        if (continuation == null and consumer == null and (input_weights == null or (input_weights.?.len == 1 and input_weights.?[0].isOne()))) {
+            if (try self.indexedExtrema(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
+        }
         return self.streamMatchProjectionAttempt(input, input_weights, operation, projection, original_middle, match_span, projection_span, continuation, consumer, true) catch |err| {
             if (err != error.CypherGroupWindowDeclined) return err;
             // Only a read-only fold with no downstream observer can request a
@@ -7441,6 +7446,68 @@ const Engine = struct {
             // Keep already charged work; never repeat writes or refund budgets.
             return self.streamMatchProjectionAttempt(input, input_weights, operation, projection, original_middle, match_span, projection_span, continuation, consumer, false);
         };
+    }
+    /// Negotiate all observers before consuming any source. Every admitted
+    /// extremum uses the normal total, authorized ordered-window executor.
+    fn indexedExtrema(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
+        if (!self.read_only or input.len != 1 or projection.items.len == 0 or projection.wildcard or projection.predicate != null or projection.order.len != 0 or projection.skip != null or projection.limit != null) return null;
+        // The synthetic non-NULL stage needs one additional pipeline frame.
+        // A legal original fold must remain available at the caller's ceiling.
+        if (middle.len >= self.limits.recursion_depth -| self.recursion) return null;
+        const read = self.backend.vtable.scan_ordered orelse return null;
+        const plans = try self.a.alloc(ast.Projection, projection.items.len);
+        const stages = try self.a.alloc([]const ast.Clause, projection.items.len);
+        for (projection.items, plans, stages, 0..) |item, *plan, *pipeline, position| {
+            const previous = for (projection.items[0..position], 0..) |earlier, index| {
+                if (@import("expressions.zig").same(earlier.expression, item.expression)) break index;
+            } else null;
+            if (previous) |index| {
+                plan.* = plans[index];
+                pipeline.* = stages[index];
+                continue;
+            }
+            if (item.expression.value != .call) return null;
+            const call_value = item.expression.value.call;
+            const maximum = std.ascii.eqlIgnoreCase(call_value.name, "max");
+            if ((!maximum and !std.ascii.eqlIgnoreCase(call_value.name, "min")) or call_value.star or call_value.args.len != 1) return null;
+            const argument = call_value.args[0];
+            const nonnull = try self.a.create(ast.Expr);
+            nonnull.* = .{ .span = argument.span, .value = .{ .unary = .{ .op = .is_not_null, .operand = argument } } };
+            const clauses = try self.a.alloc(ast.Clause, middle.len + 1);
+            @memcpy(clauses[0..middle.len], middle);
+            clauses[middle.len] = .{ .span = projection_span, .operation = .{ .project = .{ .final = false, .value = .{ .items = &.{}, .wildcard = true, .predicate = nonnull } } } };
+            pipeline.* = clauses;
+            const one = try self.a.create(ast.Expr);
+            one.* = .{ .span = .{}, .value = .{ .literal = .{ .integer = 1 } } };
+            const items = try self.a.alloc(ast.Item, 1);
+            items[0] = .{ .expression = argument, .alias = "__antfly_extremum" };
+            const orders = try self.a.alloc(ast.Order, 1);
+            orders[0] = .{ .expression = argument, .descending = maximum, .execution_nonnull = true };
+            plan.* = .{ .items = items, .distinct = true, .order = orders, .limit = one };
+            const proof = (try self.planNodeOrder(input, operation, plan.*, clauses, false)) orelse return null;
+            if (proof.declined or proof.primary or proof.fields.len != 1) return null;
+            const page = (try read(self.backend.ptr, self.a, proof.table, proof.filters, proof.fields, null, 0, 0)) orelse return null;
+            if (page.items.len != 0 or (page.examined orelse 0) != 0 or page.next == null) return error.CypherInvalidBackendPage;
+        }
+        const row = try self.a.alloc(v.Entry, projection.items.len);
+        const columns = try self.a.alloc([]const u8, row.len);
+        for (projection.items, plans, stages, row, columns, 0..) |item, plan, pipeline, *out, *column, position| {
+            const previous = for (projection.items[0..position], 0..) |earlier, index| {
+                if (@import("expressions.zig").same(earlier.expression, item.expression)) break index;
+            } else null;
+            const value = if (previous) |index| row[index].value else value: {
+                const scope = PatternScope.enter(self);
+                defer scope.leave(self);
+                const rows = (try self.streamMatchProjectionAttempt(input, null, operation, plan, pipeline, match_span, projection_span, null, null, true)) orelse return error.CypherInvalidBackendPage;
+                break :value if (rows.len == 0) v.Value.null else rows[0][0].value;
+            };
+            const name = item.alias orelse try self.expressionName(item.expression);
+            out.* = .{ .name = name, .value = value };
+            column.* = name;
+        }
+        self.columns = columns;
+        try self.stages.append(self.a, .{ .operation = "index_extrema", .span = projection_span, .input_rows = input.len, .output_rows = 1 });
+        return try self.a.dupe(Row, &.{row});
     }
     fn streamMatchProjectionAttempt(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer, allow_group_window: bool) anyerror!?[]const Row {
         // The row pipeline nests only within the statement's stack allowance.
@@ -10001,7 +10068,8 @@ const Engine = struct {
             };
         }
         var fields: std.ArrayList(backend_mod.PropertyOrder) = .empty;
-        for (projection.order) |order| {
+        var seek_index: usize = 0;
+        for (projection.order, 0..) |order, order_index| {
             const origin = self.nodeOrigin(order.expression, projected) orelse return hinted;
             if (origin.constant != null) continue;
             const name = origin.property orelse return hinted;
@@ -10009,9 +10077,13 @@ const Engine = struct {
             const repeated = for (fields.items) |field| {
                 if (std.mem.eql(u8, field.property, name)) break true;
             } else false;
-            if (!repeated) try fields.append(self.a, .{ .property = name, .descending = order.descending });
+            if (!repeated) {
+                if (fields.items.len == 0) seek_index = order_index;
+                try fields.append(self.a, .{ .property = name, .descending = order.descending, .exclude_null = order.execution_nonnull });
+            }
         }
         var result: NodeOrder = .{ .table = table orelse return null, .alias = alias, .fields = fields.items, .filters = filters.items, .unique_stages = unique_stages.items, .primary = projection.order.len != 0 and fields.items.len == 0, .declined = projection.order.len == 0 or (fields.items.len != 0 and self.backend.vtable.scan_ordered == null) };
+        result.seek_index = seek_index;
         if (projection.distinct and projection.order.len != 0) distinct: {
             var properties: std.StringHashMapUnmanaged(void) = .empty;
             var unique = false;
@@ -10087,7 +10159,14 @@ const Engine = struct {
             }
             const read = self.backend.vtable.scan_ordered orelse return error.CypherInvalidBackendPage;
             const filters = order.filters;
-            if (try read(self.backend.ptr, self.a, table, filters, order.fields, cursor orelse order.initial_cursor, @max(1, wanted), self.limits.scanned_anchors -| self.stats.scanned_anchors)) |page| {
+            var sought: [1]backend_mod.PropertyOrder = undefined;
+            const fields = if (order.seek_value) |after| fields: {
+                if (order.fields.len != 1) return error.CypherInvalidBackendPage;
+                sought[0] = order.fields[0];
+                sought[0].after = after;
+                break :fields &sought;
+            } else order.fields;
+            if (try read(self.backend.ptr, self.a, table, filters, fields, cursor orelse order.initial_cursor, @max(1, wanted), self.limits.scanned_anchors -| self.stats.scanned_anchors)) |page| {
                 if (order.active and order.coarse == page.stable_ties) return error.CypherInvalidBackendPage;
                 order.coarse = !page.stable_ties;
                 order.active = true;
@@ -15504,10 +15583,12 @@ const Engine = struct {
         capacity: usize,
         sequence: usize = 0,
         total: usize = 0,
+        dropped: usize = 0,
         picks: std.ArrayList(Pick) = .empty,
         columns: std.ArrayList([]const u8) = .empty,
         distinct_arena: ?std.heap.ArenaAllocator = null,
         distinct_previous: ?Row = null,
+        seek_arena: ?std.heap.ArenaAllocator = null,
         hashed_distinct: bool = false,
         distinct_heads: std.AutoHashMapUnmanaged(u64, *DistinctPick) = .{},
         fn init(engine: *Engine, projection: ast.Projection, first: Row) !TopK {
@@ -15526,6 +15607,7 @@ const Engine = struct {
         }
         fn deinit(self: *TopK) void {
             if (self.distinct_arena) |*arena| arena.deinit();
+            if (self.seek_arena) |*arena| arena.deinit();
             for (self.picks.items) |*pick| {
                 if (pick.distinct) |entry| self.engine.scratch_allocator.destroy(entry);
                 pick.arena.deinit();
@@ -15557,6 +15639,16 @@ const Engine = struct {
                 self.distinct_previous = try cloneRow(arena.allocator(), row.items);
             }
             const order = engine.node_order;
+            if (order) |proof| if (proof.active and proof.distinct == .adjacent and proof.fields.len == 1) {
+                if (self.seek_arena == null) self.seek_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                _ = self.seek_arena.?.reset(.free_all);
+                var copies: v.CloneContext = .{ .a = self.seek_arena.?.allocator(), .scratch = engine.scratch_allocator };
+                // Only key/constant projections have the adjacent proof. Once
+                // a row qualifies, all remaining rows in this key group project
+                // identically. Tuple bounds also handle NULL without inventing
+                // a three-valued Cypher comparison.
+                proof.seek_value = try copies.clone(keys[proof.seek_index]);
+            };
             const coarse = if (order) |proof| proof.active and proof.coarse else false;
             const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .tie_owner = if (coarse) order.?.encounter_owner else 0, .tie_key = if (coarse) order.?.encounter_key orelse return error.CypherInvalidBackendPage else null, .sequence = self.sequence, .weight = @intCast(weight.cap(self.capacity)), .multiplicity = if (self.projection.limit == null) weight else null };
             // A coarse source can stop only beyond the complete boundary key
@@ -15581,6 +15673,22 @@ const Engine = struct {
         fn acceptProjected(self: *TopK, candidate: Projected) !void {
             const engine = self.engine;
             if (self.capacity == 0 or candidate.weight == 0) return;
+            // Certified encounter order needs no selection heap. Evaluate the
+            // normal row pipeline, then retire the offset immediately. total
+            // still counts the complete logical window for demand/termination.
+            if (self.projection.limit != null and self.projection.order.len != 0 and !self.hashed_distinct) if (engine.node_order) |order| if (order.active and !order.coarse) {
+                const weight = @min(candidate.weight, self.capacity - self.total);
+                const discard = @min(self.skip - self.dropped, weight);
+                self.dropped += discard;
+                self.total += weight;
+                if (discard == weight) return;
+                var retained = candidate;
+                retained.weight = weight - discard;
+                var pick = try engine.clonePick(retained);
+                errdefer pick.arena.deinit();
+                try self.picks.append(self.retained, pick);
+                return;
+            };
             const hash = if (self.hashed_distinct) try engine.rowHash(candidate.row) else null;
             if (hash) |key| {
                 var current = self.distinct_heads.get(key);
@@ -15661,7 +15769,7 @@ const Engine = struct {
                     return left.sequence < right.sequence;
                 }
             }.less) else if (self.projection.order.len != 0) try engine.sort(projected, self.projection.order);
-            var skip = @min(self.skip, self.total);
+            var skip = @min(self.skip - self.dropped, self.total - self.dropped);
             if (engine.retain_windows) {
                 var rows: std.ArrayList(Row) = .empty;
                 var weights: std.ArrayList(Count) = .empty;
@@ -15676,7 +15784,7 @@ const Engine = struct {
                 if (final) engine.columns = try self.columns.toOwnedSlice(retained);
                 return rows.items;
             }
-            const output = try retained.alloc(Row, self.total - skip);
+            const output = try retained.alloc(Row, self.total - self.dropped - skip);
             var position: usize = 0;
             for (projected) |item| {
                 const discarded = @min(skip, item.weight);

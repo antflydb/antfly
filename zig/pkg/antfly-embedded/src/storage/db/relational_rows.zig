@@ -54,6 +54,7 @@ pub const RowFilter = struct {
     }
 };
 pub const Request = struct {
+    reverse: bool = false,
     include_primary_digest: bool = false,
     /// Stateful internal readers already retain a cursor; public stateless
     /// pages opt in to owned external continuation tokens.
@@ -149,6 +150,7 @@ pub const Reader = struct {
     authenticated: bool,
     include_primary_digest: bool,
     include_cursor: bool,
+    reverse: bool,
     cursor_identity: ?[row_cursor_codec.identity_len]u8,
     row_filter: ?RowFilter,
     index_only: bool = false,
@@ -252,7 +254,7 @@ pub const Reader = struct {
                 if (std.mem.eql(u8, index.name, name)) break index;
             } else return error.IndexNotFound;
             if ((try jobs.status(&read, selected_index.?)).state != .ready) return error.RelationalIndexNotReady;
-            if (request.include_cursor or request.after != null) cursor_identity = row_cursor_codec.identity(active_view.version(), selected_index.?.name, selected_index.?.tuple.fingerprint);
+            if (request.include_cursor or request.after != null) cursor_identity = row_cursor_codec.orderedIdentity(active_view.version(), selected_index.?.name, selected_index.?.tuple.fingerprint, request.reverse);
             const prefix = try records.forwardPrefix(selected_index.?.id());
             lower = try owned.dupe(u8, &prefix);
             upper = (try internal.nextPrefixAlloc(owned, &prefix)).?;
@@ -264,8 +266,12 @@ pub const Reader = struct {
                 const suffix = try row_cursor_codec.decode(owned, encoded, cursor_identity.?);
                 const key = try std.mem.concat(owned, u8, &.{ &prefix, suffix });
                 _ = records.parseForward(key, index) catch return error.InvalidRelationalRowsRequest;
-                const requested = (try internal.nextPrefixAlloc(owned, key)) orelse return error.InvalidRelationalRowsRequest;
-                if (std.mem.order(u8, requested, lower) == .gt) lower = requested;
+                if (request.reverse) {
+                    if (std.mem.order(u8, key, upper) == .lt) upper = key;
+                } else {
+                    const requested = (try internal.nextPrefixAlloc(owned, key)) orelse return error.InvalidRelationalRowsRequest;
+                    if (std.mem.order(u8, requested, lower) == .gt) lower = requested;
+                }
             }
         }
         const conditions = try alloc.alloc(predicates.Plan, request.conditions.len);
@@ -433,8 +439,9 @@ pub const Reader = struct {
                 };
             } else index_only = false;
         }
+        if (request.reverse and selected_index == null) return error.InvalidRelationalRowsRequest;
         if (selected_index) |index| if (request.include_cursor) {
-            cursor_identity = row_cursor_codec.identity(active_view.version(), index.name, index.tuple.fingerprint);
+            cursor_identity = row_cursor_codec.orderedIdentity(active_view.version(), index.name, index.tuple.fingerprint, request.reverse);
         };
         return .{
             .alloc = alloc,
@@ -454,6 +461,7 @@ pub const Reader = struct {
             .authenticated = authenticated,
             .include_primary_digest = request.include_primary_digest,
             .include_cursor = request.include_cursor and selected_index != null,
+            .reverse = request.reverse,
             .cursor_identity = cursor_identity,
             .row_filter = request.row_filter,
             .index_only = index_only,
@@ -873,15 +881,21 @@ pub const Reader = struct {
         defer successor.deinit(alloc);
         var cursor = try self.read.openCursor();
         defer cursor.close();
-        cursor.setUpperBound(self.upper);
-        const start = if (self.after.items.len == 0) self.lower else if (self.index != null) self.after.items else try internal.documentPrefixSuccessor(alloc, &successor, self.after.items);
-        var entry = try cursor.seekAtOrAfter(start);
+        if (!self.reverse) cursor.setUpperBound(self.upper);
+        const start = if (self.after.items.len == 0) (if (self.reverse) self.upper else self.lower) else if (self.index != null) self.after.items else try internal.documentPrefixSuccessor(alloc, &successor, self.after.items);
+        var entry = if (self.reverse) try cursor.seekAtOrBefore(start) else try cursor.seekAtOrAfter(start);
         var exhausted = true;
         const started = time.monotonicNs();
-        while (entry) |kv| : (entry = if (self.index != null) try cursor.next() else try cursor.seekAtOrAfter(try internal.documentPrefixSuccessor(alloc, &successor, continuation.items))) {
+        while (entry) |kv| : (entry = if (self.reverse) try cursor.prev() else if (self.index != null) try cursor.next() else try cursor.seekAtOrAfter(try internal.documentPrefixSuccessor(alloc, &successor, continuation.items))) {
             if (io) |runtime_io| try runtime_io.checkCancel();
-            if (self.after.items.len != 0 and std.mem.order(u8, kv.key, self.after.items) != .gt) continue;
-            if (std.mem.order(u8, kv.key, self.upper) != .lt) break;
+            if (self.reverse) {
+                if (std.mem.order(u8, kv.key, self.upper) != .lt) continue;
+                if (self.after.items.len != 0 and std.mem.order(u8, kv.key, self.after.items) != .lt) continue;
+                if (std.mem.order(u8, kv.key, self.lower) == .lt) break;
+            } else {
+                if (self.after.items.len != 0 and std.mem.order(u8, kv.key, self.after.items) != .gt) continue;
+                if (std.mem.order(u8, kv.key, self.upper) != .lt) break;
+            }
             result.records_examined += 1;
             var scratch = std.heap.ArenaAllocator.init(alloc);
             defer scratch.deinit();
@@ -1025,8 +1039,8 @@ pub const Reader = struct {
         // an unconsumed candidate. Byte-limited rows retain their old cursor.
         if (!exhausted and self.index != null) if (entry) |last| {
             if (std.mem.eql(u8, last.key, continuation.items)) {
-                const peek = try cursor.next();
-                exhausted = if (peek) |next| std.mem.order(u8, next.key, self.upper) != .lt else true;
+                const peek = if (self.reverse) try cursor.prev() else try cursor.next();
+                exhausted = if (peek) |next| (if (self.reverse) std.mem.order(u8, next.key, self.lower) == .lt else std.mem.order(u8, next.key, self.upper) != .lt) else true;
             }
         };
         if (!exhausted and self.include_cursor and self.index != null) {

@@ -33,7 +33,7 @@ pub const Request = struct {
     relationship: []const u8 = "",
     direction: ast.Direction = .out,
     filters: []const struct { property: []const u8, value: std.json.Value, op: b.FilterOp = .eq } = &.{},
-    order: []const b.PropertyOrder = &.{},
+    order: []const struct { property: []const u8, descending: bool = false, exclude_null: bool = false, after: ?struct { value: std.json.Value } = null } = &.{},
     after: ?[]const u8 = null,
     limit: usize = 128,
     search: ?std.json.Value = null,
@@ -165,7 +165,9 @@ pub const Client = struct {
         defer scratch.deinit();
         const temporary = scratch.allocator();
         const encoded_filters = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, try std.json.Stringify.valueAlloc(temporary, filters, .{}), .{ .parse_numbers = false });
-        const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .order = order, .operation = .scan_ordered, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = after, .limit = limit, .max_examined = max_examined });
+        const encoded_order = try temporary.alloc(@typeInfo(@FieldType(Request, "order")).pointer.child, order.len);
+        for (order, encoded_order) |input, *out| out.* = .{ .property = input.property, .descending = input.descending, .exclude_null = input.exclude_null, .after = if (input.after) |key| .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, key, .{}), .{ .parse_numbers = false }) } else null };
+        const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .order = encoded_order, .operation = .scan_ordered, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = after, .limit = limit, .max_examined = max_examined });
         if (!reply.ordered) {
             if (reply.values.len != 0 or reply.cursors != null or reply.next != null or after != null) return error.CypherInvalidBackendPage;
             return null;
@@ -325,7 +327,9 @@ pub const Owner = struct {
                 if (!self.permitsTable(request.table) or request.order.len > 32) return error.Forbidden;
                 const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
                 for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op };
-                const page = if (self.backend.vtable.scan_ordered) |read| try read(self.backend.ptr, scratch, request.table, filters, request.order, request.after, request.limit, request.max_examined) else null;
+                const order = try scratch.alloc(b.PropertyOrder, request.order.len);
+                for (request.order, order) |input, *out| out.* = .{ .property = input.property, .descending = input.descending, .exclude_null = input.exclude_null, .after = if (input.after) |key| try v.Value.fromJson(scratch, key.value) else null };
+                const page = if (self.backend.vtable.scan_ordered) |read| try read(self.backend.ptr, scratch, request.table, filters, order, request.after, request.limit, request.max_examined) else null;
                 if (page) |ordered| {
                     for (ordered.items) |node| try values.append(scratch, .{ .value = .{ .node = node } });
                     return std.json.Stringify.valueAlloc(a, .{ .ordered = true, .stable_ties = ordered.stable_ties, .encounter_owners = ordered.encounter_owners, .values = values.items, .cursors = ordered.cursors, .next = ordered.next, .examined = ordered.examined, .work = meter.units }, .{});

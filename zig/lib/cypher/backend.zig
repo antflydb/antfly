@@ -53,7 +53,15 @@ pub fn Page(comptime T: type) type {
 }
 pub const FilterOp = enum { eq, lt, lte, gt, gte, in };
 pub const PropertyFilter = struct { property: []const u8, value: v.Value, op: FilterOp = .eq };
-pub const PropertyOrder = struct { property: []const u8, descending: bool = false };
+pub const PropertyOrder = struct {
+    property: []const u8,
+    descending: bool = false,
+    /// A consumer-confirmed complete key group can be excluded on refill.
+    /// This is an index tuple bound, including NULL, not a Cypher comparison.
+    /// Only a single varying key may currently carry this hint.
+    after: ?v.Value = null,
+    exclude_null: bool = false,
+};
 pub const Seed = struct { node: *const v.Node, score: f64 };
 pub const SearchInput = struct { parameters: v.Value, prepared_json: []const u8 = "", max_examined: usize = 1_000_000 };
 pub const SearchPage = struct { seeds: []const Seed, examined: usize = 0, approximate: bool = false };

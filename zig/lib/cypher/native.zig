@@ -251,7 +251,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             }
             return strength;
         }
-        const OrderedCursor = struct { coarse: bool = false, index: []const u8, after: ?[]const u8 = null, schema_version: u32 };
+        const OrderedCursor = struct { reverse: bool = false, coarse: bool = false, index: []const u8, after: ?[]const u8 = null, schema_version: u32 };
         const OrderedPartition = struct {
             parent: *Self,
             filters: []const b.PropertyFilter,
@@ -359,12 +359,12 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             if (page) |*value| value.encounter_owners = null;
             return page;
         }
-        fn orderedIndexPrefix(self: *Self, schema: anytype, index: anytype, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, coarse: bool) !?usize {
+        fn orderedIndexPrefix(self: *Self, schema: anytype, index: anytype, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, coarse: bool, reverse: bool) !?usize {
             if (index.predicate != null or index.tuple.keys.len == 0 or index.tuple.keys.len < order.len or (coarse and order.len == 0)) return null;
             const last = index.tuple.keys.len - order.len;
             var prefix: usize = if (coarse) 0 else last;
             candidates: while (prefix <= last) : (prefix += 1) {
-                if (coarse and prefix == last) break;
+                if (coarse and !reverse and prefix == last) break;
                 for (index.tuple.keys[0..prefix]) |key| {
                     switch (key.column_type) {
                         .integer, .string, .boolean => {},
@@ -376,7 +376,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 }
                 for (index.tuple.keys[prefix..][0..order.len], order) |key, requested| {
                     if (self.work) |work| try work.charge(work.ptr, 1);
-                    if (key.expression != null or key.fold_ascii or key.descending != requested.descending or key.nulls_first != requested.descending) continue :candidates;
+                    if (key.expression != null or key.fold_ascii or key.descending != (requested.descending != reverse) or key.nulls_first != (requested.descending != reverse)) continue :candidates;
                     if (!std.mem.eql(u8, schema.tableSchema().relational_columns[key.ordinal].name, requested.property)) continue :candidates;
                     switch (key.column_type) {
                         .integer, .string, .boolean => {},
@@ -406,9 +406,12 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             defer indexes.deinit();
             if (indexes.plan.schemaView().epoch != schema.epoch) return error.CatalogGenerationChanged;
             const cursor = if (encoded) |bytes| try std.json.parseFromSliceLeaky(OrderedCursor, temporary, bytes, .{}) else null;
-            for ([_]bool{ false, true }) |coarse| candidates: for (indexes.plan.boundIndexes()) |index| {
-                if (cursor) |position| if (!std.mem.eql(u8, position.index, index.name) or position.coarse != coarse) continue;
-                const prefix = (try self.orderedIndexPrefix(schema, index, filters, order, coarse)) orelse continue;
+            const modes = [_]struct { coarse: bool, reverse: bool }{ .{ .coarse = false, .reverse = false }, .{ .coarse = true, .reverse = false }, .{ .coarse = true, .reverse = true } };
+            for (modes) |mode| candidates: for (indexes.plan.boundIndexes()) |index| {
+                const coarse = mode.coarse;
+                const reverse = mode.reverse;
+                if (cursor) |position| if (!std.mem.eql(u8, position.index, index.name) or position.coarse != coarse or position.reverse != reverse) continue;
+                const prefix = (try self.orderedIndexPrefix(schema, index, filters, order, coarse, reverse)) orelse continue;
                 if (cursor == null) {
                     const leading = index.tuple.keys[0];
                     const strength = try self.filterStrength(filters, schema.tableSchema().relational_columns[leading.ordinal].name, leading.column_type);
@@ -467,6 +470,26 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 opts.relational_query.?.conditions = conditions.items;
                 opts.relational_query.?.index = index.name;
                 opts.relational_query.?.auto_index = true;
+                opts.relational_query.?.reverse = reverse;
+                if (order.len == 1) if (order[0].after orelse (if (order[0].exclude_null) @as(?v.Value, .null) else null)) |after| {
+                    const values = try temporary.alloc(std.json.Value, prefix + 1);
+                    for (index.tuple.keys[0..prefix], values[0..prefix]) |key, *out| {
+                        const name = schema.tableSchema().relational_columns[key.ordinal].name;
+                        const fixed = for (filters) |filter| {
+                            if (filter.op == .eq and std.mem.eql(u8, filter.property, name)) break filter.value;
+                        } else return error.CypherInvalidBackendPage;
+                        out.* = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, fixed, .{}), .{ .parse_numbers = false });
+                    }
+                    values[prefix] = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, after, .{}), .{ .parse_numbers = false });
+                    if (order[0].exclude_null) {
+                        const nonnull = try temporary.dupe(std.json.Value, values);
+                        nonnull[prefix] = .null;
+                        if (index.tuple.keys[prefix].nulls_first) opts.relational_query.?.lower = .{ .values = nonnull, .inclusive = false } else opts.relational_query.?.upper = .{ .values = nonnull, .inclusive = false };
+                    }
+                    if (order[0].after != null) {
+                        if (!reverse) opts.relational_query.?.lower = .{ .values = values, .inclusive = false } else opts.relational_query.?.upper = .{ .values = values, .inclusive = false };
+                    }
+                };
                 opts.relational_query.?.after = if (cursor) |position| position.after else null;
                 opts.relational_query.?.schema_version = if (cursor) |position| position.schema_version else schema.version();
                 const session = db.openRelationalReadSession(temporary, "", "", opts) catch |err| switch (err) {
@@ -487,16 +510,16 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 defer session.deinit();
                 session.reader.now_ns = self.ttl_now_ns;
                 try session.checkpoint();
-                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .stable_ties = !coarse, .next = try std.json.Stringify.valueAlloc(a, OrderedCursor{ .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = if (cursor) |position| position.after else null }, .{}) };
+                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .stable_ties = !coarse, .next = try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = if (cursor) |position| position.after else null }, .{}) };
                 var page = try session.reader.nextPage(temporary, null, .{ .rows = @min(limit, 1024), .records = @min(@min(@max(limit, 128), max_examined), 1024), .output_bytes = 16 << 20 });
                 defer page.deinit();
                 var nodes: std.ArrayList(*const v.Node) = .empty;
                 var cursors: std.ArrayList(?[]const u8) = .empty;
                 for (page.rows) |row| if (try self.node(a, table, row.key, row.json)) |node_value| if (node_value.labels.len != 0) {
                     try nodes.append(a, node_value);
-                    try cursors.append(a, try std.json.Stringify.valueAlloc(a, OrderedCursor{ .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = row.cursor orelse return error.CypherInvalidBackendCursor }, .{}));
+                    try cursors.append(a, try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = row.cursor orelse return error.CypherInvalidBackendCursor }, .{}));
                 };
-                const next = if (page.more) try std.json.Stringify.valueAlloc(a, OrderedCursor{ .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else null;
+                const next = if (page.more) try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else null;
                 if (cursors.items.len != 0) cursors.items[cursors.items.len - 1] = next;
                 try checkpoint(ptr);
                 return .{ .items = try nodes.toOwnedSlice(a), .cursors = try cursors.toOwnedSlice(a), .examined = page.records_examined, .stable_ties = !coarse, .next = next };

@@ -2855,3 +2855,58 @@ five anchors and uses 164 states. The previous paths read all 13,000 anchors.
 A leading duplicate run completes in 77 anchors and 3,813 states. A composite
 prefix with a 64-row boundary tie completes in 68 anchors; its full-node query
 uses 3,521 states. These bounds include charged lookahead records.
+
+### Ordered offsets, reverse traversal, extrema, and distinct-key seeks
+
+An exact ordered source retires qualifying SKIP rows as they pass through the
+normal projection pipeline. Its logical consumed count still includes that
+prefix for demand and termination, but retained picks contain only LIMIT rows.
+This removes the offset-sized heap and its comparisons, clones, and final sort.
+Coarse order retains the boundary heap because primary encounter ties still need
+refinement. Partial DISTINCT retains its membership proof and selected window.
+
+Native ordered reads consider exact forward order, coarse forward prefixes, then
+reverse traversal. Every varying requested direction and NULL placement must
+match the corresponding physical direction after reversal; omitted leading keys
+still require enforced equality. Reverse iteration is bounded on both sides and
+uses an exclusive continuation. Both native and row cursors fence direction as
+well as index/schema identity. Reverse traversal certifies coarse ties because
+physical reversal also reverses primary keys; the normal bounded refinement
+restores catalog owner and primary encounter order.
+
+A scalar MIN/MAX projection negotiates all of its observers before reading
+candidates. Total single-source lineage can carry through the same safe WITH
+stages as ordered windows. Each supported observer executes an authorized,
+non-NULL ordered window; identical aggregate expressions share one result.
+Unsupported observers or fallible expressions retain the ordinary aggregate
+fold. Typed NULL tuple bounds complement the authoritative runtime non-NULL
+predicate. Empty and all-NULL inputs still produce one NULL aggregate row.
+Internal window, multiplicity, and profile state stays scoped to each observer;
+the outer physical plan reports index_extrema. Subsequent weighted stages receive
+the ordinary one-row aggregate result.
+
+For an adjacent scalar DISTINCT with one varying physical key, a qualifying row
+confirms that its entire key group projects identically. Refills may then exclude
+that group using an exclusive typed tuple bound, including a NULL key. A rejected
+candidate never grants this hint. The native reader combines the group boundary
+with equality prefixes, original residual bounds, immutable schema generation,
+retained authorization, and any non-NULL bound. Opaque owner continuations remain
+positions rather than documents. The private RPC encodes a present NULL boundary
+separately from an absent hint. Providers that do not support key-group seeks may
+ignore the hint and retain normal monotone iteration and duplicate suppression.
+
+The extrema rewrite reserves its additional filter frame before probing. At a
+caller's stage/recursion ceiling it declines early, preserving the legal original
+aggregate fold and its result. Regression cases exercise both a zero-stage
+window allowance and an identity pipeline exactly at that allowance.
+
+On both 13,000-document public backends, SKIP 12000 LIMIT 5 now completes in
+180,217 states and 852,376 bytes; the former heap exceeded the default state
+ceiling and a 2 MiB memory ceiling. Opposite-direction top-five ordering examines
+six anchors and uses 193 states, including tie-boundary lookahead, instead of
+13,000 anchors and 247,049 states. A matching-direction scalar MIN or MAX examines
+one anchor and uses 40 states instead of 13,000 anchors and 169,001 states. The
+12,000-row duplicate-prefix scalar DISTINCT examines nine anchors in 273 states,
+down from 12,045 anchors and 384,234 states. Tests also enforce bounded reads for
+Unicode strings, booleans, leading/trailing NULL runs, equality-fixed prefixes,
+coarse reverse ties, filtered candidates, and repeated extremum observers.
