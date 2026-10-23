@@ -3965,6 +3965,7 @@ pub const ApiHttpServer = struct {
     index_installation_reserved_slots: usize = 0,
     index_installation_next_generation: u64 = 1,
     index_installation_cursor: usize = 0,
+    lake_index_repairs: @import("lake_index_repairs.zig").Repairs = .{},
     lake_index_recovery_cursor: usize = 0,
     lake_index_recovery_after_ns: u64 = 0,
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
@@ -16389,6 +16390,16 @@ pub const ApiHttpServer = struct {
         self.activateLakeCommit(&prepared);
     }
 
+    /// Keep derived read failures bound to the exact publication generation.
+    pub fn attachLakeRepairHint(self: *ApiHttpServer, source: *@import("antfly_local_sources").serverless_query_lake_serving.ServingSource) void {
+        source.repair_hint = .{ .ptr = self, .report = struct {
+            fn report(raw: *anyopaque, table: u64, generation: u64, token: [16]u8) void {
+                const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
+                server.lake_index_repairs.report(table, generation, token);
+            }
+        }.report };
+    }
+
     /// Read-side freshness checks can observe an external commit before the
     /// periodic inventory sweep. Coalesce that hint without resetting an active
     /// build's generation, failure count, or retry deadline on every poll.
@@ -16676,7 +16687,12 @@ pub const ApiHttpServer = struct {
                 context = reader_lease.?.readContext();
             }
         }
-        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace, .read = Hooks.read }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
+        var repair_state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
+        defer repair_state.deinit();
+        const repair_publication = repair_state.value.published;
+        const force_rebuild = if (repair_publication) |ready| self.lake_index_repairs.contains(table.table_id, ready) else false;
+        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace, .read = Hooks.read }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .force_rebuild = force_rebuild, .identity_spill_bytes = if (self.cfg.node_config) |node| node.lake_indexes.row_identity.max_spill_bytes else 1024 * 1024 * 1024, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
+        if (repair_publication) |ready| self.lake_index_repairs.forget(table.table_id, ready);
         @import("lake_index_navigation_warming.zig").warmPublication(a, self, table) catch |err| {
             std.log.debug("native lake startup navigation warming deferred table={s} err={s}", .{ table.name, @errorName(err) });
         };

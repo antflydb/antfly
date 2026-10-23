@@ -197,6 +197,8 @@ pub const Slice = enum(u8) {
     /// Decoder scratch and uncached decoded payload leases. Appended to keep
     /// existing resource IDs stable and separate reads from mutable admission.
     lsm_read_working_set,
+    /// Concurrent SQL execution and retained delivery state share host admission.
+    sql_execution_working_set,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -235,6 +237,7 @@ pub const Slice = enum(u8) {
             .dense_source_payload_state => "dense.source_payload_state",
             .lake_range_cache_queue => "lake.range_cache_queue",
             .lsm_read_working_set => "lsm.read_working_set",
+            .sql_execution_working_set => "sql.execution_working_set",
         };
     }
 };
@@ -473,6 +476,7 @@ pub const Options = struct {
             .relational_preparation_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .lake_range_cache_queue = .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
             .lsm_read_working_set = .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
+            .sql_execution_working_set = .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
         }).values;
     }
 
@@ -514,6 +518,7 @@ pub const Options = struct {
             .relational_preparation_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
             .lake_range_cache_queue = .{ .soft_action = .report, .hard_action = .reject_work },
             .lsm_read_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .sql_execution_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
         }).values;
     }
 };
