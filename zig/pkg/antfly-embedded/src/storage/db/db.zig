@@ -7491,6 +7491,14 @@ pub const DB = struct {
     fn runGroupSourceSliceWithState(self: *DB, state: *GroupSourceMaintenanceState) !bool {
         if (!state.slice_mutex.tryLock()) return false;
         defer state.slice_mutex.unlock();
+        // The resident scheduler runs independently of foreground index DDL.
+        // A slice borrows the current producer through batchContext as well
+        // as the final wake. Keep that entire bounded, inference-free turn
+        // inside the replacement fence so no borrowed runtime can be freed.
+        // Yield during reconfiguration rather than blocking the scheduler;
+        // durable group queues retain every pending command for the next turn.
+        if (!self.enrichment_owner.replacement_mutex.tryLock()) return false;
+        defer self.enrichment_owner.replacement_mutex.unlock();
         return self.runGroupSourceSliceLocked(state);
     }
     fn runGroupSourceSliceLocked(self: *DB, state: *GroupSourceMaintenanceState) !bool {
@@ -145828,6 +145836,42 @@ test "logical query readiness distinguishes unrelated replay from unapplied text
     try std.testing.expectEqual(@as(u32, 0), empty.total_hits);
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"content\":\"needle\"}" }}, .sync_level = .write });
     try std.testing.expectError(error.IndexRebuilding, db.search(a, request));
+}
+
+test "grouped sources production yields across producer replacement and resumes durable work" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("grouped-producer-replacement");
+    defer tmp.cleanup();
+    const db = try DB.openOwned(a, std.mem.span(tmp.path().ptr), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.closeOwned();
+    try db.addEnrichment(.{
+        .name = "turns",
+        .kind = .group,
+        .source = .{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" },
+    });
+    const Probe = struct {
+        var called: bool = false;
+        fn run(live: *DB) !void {
+            called = true;
+            const before = live.group_source_owner.state.submitted;
+            try std.testing.expect(!try live.runGroupSourceSlice());
+            try std.testing.expectEqual(before, live.group_source_owner.state.submitted);
+            try std.testing.expect(live.group_source_owner.state.worker == null);
+        }
+    };
+    // The replacement hook runs after constructing the new producer while
+    // still owning the old one. The old implementation entered a group
+    // mutation here, leaving a runtime borrow racing its eventual destruction.
+    Probe.called = false;
+    DB.test_enrichment_reconfigure_after_detached_hook = Probe.run;
+    defer DB.test_enrichment_reconfigure_after_detached_hook = null;
+    try db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
+    try std.testing.expect(Probe.called);
+    try std.testing.expect(try db.runGroupSourceSlice());
+    try std.testing.expect(db.group_source_owner.state.submitted > 0);
 }
 
 test "grouped sources production publishes private units incrementally across delete and reopen" {

@@ -113,10 +113,10 @@ class BoundedZigBuildTest(unittest.TestCase):
         for cap in caps:
             self.assertGreaterEqual(int(cap), required)
 
-        # A sufficient CLI cap is not enough: ARC injects a smaller default
-        # ANTFLY_ZIG_MAX_RSS, which detect_max_rss respects before applying the
-        # cap. Check each compiling job's explicit override, including the E2E
-        # builders that do not pass --max-rss-cap at all.
+        # Check the effective job budget, not just the command-line cap. Match
+        # ARC's 20 GiB budget and retain 4 GiB inside the 24 GiB pod. The former
+        # 22 GiB override allowed the unit build to OOM-kill the whole runner.
+        # Include E2E builders that do not pass --max-rss-cap at all.
         jobs = dict(
             re.findall(
                 r"^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:|\Z)",
@@ -147,11 +147,15 @@ class BoundedZigBuildTest(unittest.TestCase):
                     jobs[job],
                     re.MULTILINE,
                 )
-                self.assertIsNotNone(budget, "override ARC's inherited 20 GiB budget")
+                self.assertIsNotNone(budget, "declare ARC's 20 GiB compiler budget")
                 configured = budget.group(1)
-                # Heavy pods have a 24 GiB limit; reserve at least 2 GiB for
-                # the driver/runner rather than admitting all pod memory.
-                self.assertLessEqual(int(configured), 22 * 1024**3)
+                # Keep driver, fixture pages and runtime tests inside the pod
+                # envelope while admitting two 8 GiB compiler steps together.
+                self.assertEqual(int(configured), 20 * 1024**3)
+                self.assertGreaterEqual(int(configured), 2 * 8 * 1024**3)
+                # The observed OOM overlapped three default 7 GiB compiles,
+                # whose combined physical RSS exceeded the 24 GiB pod limit.
+                self.assertLess(int(configured), 3 * 7 * 1024**3)
                 with mock.patch.dict(
                     os.environ, {launcher.MAX_RSS_ENV: configured}, clear=True
                 ):

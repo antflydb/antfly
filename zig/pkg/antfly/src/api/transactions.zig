@@ -82,13 +82,11 @@ pub const TableCommitRequest = struct {
     relational_schema_version: ?u32 = null,
     batch: batch_api.OwnedBatchRequest = .{},
     predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
-    txn_writes: []db_mod.types.TransactionWrite = &.{},
 
     pub fn deinit(self: *TableCommitRequest, alloc: std.mem.Allocator) void {
         if (self.conflict_guards) |*guards| guards.deinit();
         if (self.range_guards) |*guards| guards.deinit();
         alloc.free(self.table_name);
-        if (self.txn_writes.len > 0) alloc.free(self.txn_writes);
         for (self.predicates.items) |predicate| alloc.free(@constCast(predicate.key));
         self.predicates.deinit(alloc);
         self.batch.deinit(alloc);
@@ -120,7 +118,7 @@ pub const TableCommitRequest = struct {
         try appendBatchDeletes(alloc, &self.batch, other.batch.deletes);
         try appendBatchTransforms(alloc, &self.batch, other.batch.transforms);
         try appendPredicates(alloc, &self.predicates, other.predicates.items);
-        syncAndClear(self, alloc);
+        syncTableBatch(self);
     }
 
     pub fn mergeConflictGuards(self: *TableCommitRequest, alloc: std.mem.Allocator, incoming: ConflictGuards) !void {
@@ -158,18 +156,6 @@ pub const TableCommitRequest = struct {
         const merged = try @import("antfly_local_sources").api_range_read_guards.merge(alloc, if (self.range_guards) |guards| guards.value else &.{}, incoming);
         if (self.range_guards) |*guards| guards.deinit();
         self.range_guards = merged;
-    }
-
-    pub fn prepareWrites(self: *TableCommitRequest, alloc: std.mem.Allocator) !void {
-        if (self.txn_writes.len > 0) return;
-        self.txn_writes = try alloc.alloc(db_mod.types.TransactionWrite, self.batch.writes.len);
-        for (self.batch.writes, 0..) |write, i| {
-            self.txn_writes[i] = .{
-                .key = write.key,
-                .value = write.value,
-                .json_null_fields = write.json_null_fields,
-            };
-        }
     }
 
     pub fn result(self: TableCommitRequest) batch_api.BatchResult {
@@ -299,10 +285,35 @@ pub const OwnedTransactionCommitRequest = struct {
         }
     }
 
-    pub fn distributedTables(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator) ![]distributed_txn.TableCommitRequest {
-        for (self.tables) |*table| try table.prepareWrites(alloc);
-        var out = try alloc.alloc(distributed_txn.TableCommitRequest, self.tables.len);
-        for (self.tables, 0..) |*table, i| {
+    /// Caller-owned descriptors borrowing this request's payloads. The request
+    /// must remain alive and unchanged until the view is released. In particular,
+    /// statement scratch must never become an allocation owned by the request.
+    pub const DistributedTables = struct {
+        tables: []distributed_txn.TableCommitRequest,
+        writes: []db_mod.types.TransactionWrite,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: DistributedTables) void {
+            self.allocator.free(self.writes);
+            self.allocator.free(self.tables);
+        }
+    };
+
+    pub fn distributedTables(self: *const OwnedTransactionCommitRequest, alloc: std.mem.Allocator) !DistributedTables {
+        var write_count: usize = 0;
+        for (self.tables) |table| write_count = std.math.add(usize, write_count, table.batch.writes.len) catch return error.TransactionTooLarge;
+        const out = try alloc.alloc(distributed_txn.TableCommitRequest, self.tables.len);
+        errdefer alloc.free(out);
+        const writes = try alloc.alloc(db_mod.types.TransactionWrite, write_count);
+        var offset: usize = 0;
+        for (self.tables, 0..) |table, i| {
+            const table_writes = writes[offset..][0..table.batch.writes.len];
+            for (table.batch.writes, table_writes) |write, *converted| converted.* = .{
+                .key = write.key,
+                .value = write.value,
+                .json_null_fields = write.json_null_fields,
+            };
+            offset += table_writes.len;
             out[i] = .{
                 .table_name = self.physicalName(table.table_name),
                 .schema_version = table.schema_version,
@@ -310,13 +321,13 @@ pub const OwnedTransactionCommitRequest = struct {
                 .relational_integrity_generation_set = if (table.conflict_guards) |guards| guards.value.generation_set else null,
                 .integrity_commands = if (table.conflict_guards) |guards| guards.value.commands else &.{},
                 .range_guards = if (table.range_guards) |guards| guards.value else &.{},
-                .writes = table.txn_writes,
+                .writes = table_writes,
                 .deletes = table.batch.deletes,
                 .transforms = table.batch.transforms,
                 .predicates = table.predicates.items,
             };
         }
-        return out;
+        return .{ .tables = out, .writes = writes, .allocator = alloc };
     }
 
     /// Rollback undoes staged mutations, not observations already exposed to
@@ -2152,7 +2163,6 @@ pub const SessionRegistry = struct {
             syncBatchReq(&replacement);
             target.batch.deinit(alloc);
             target.batch = replacement;
-            clearPreparedWrites(target, alloc);
         }
     }
 
@@ -2478,9 +2488,10 @@ pub const SessionRegistry = struct {
         // Older executing document sessions already chose their participant
         // request. Preserve it rather than introduce fresh planning on retry.
         if (!candidate.commit_execution_started) return null;
-        var staged = if (candidate.staged) |*value| value else return error.InvalidTransactionSessionRecord;
-        const tables = try staged.distributedTables(alloc);
-        defer alloc.free(tables);
+        const staged = if (candidate.staged) |*value| value else return error.InvalidTransactionSessionRecord;
+        const tables_view = try staged.distributedTables(alloc);
+        defer tables_view.deinit();
+        const tables = tables_view.tables;
         const bytes = try encodeExecutionPlan(alloc, tables);
         defer alloc.free(bytes);
         return try parseExecutionPlan(alloc, bytes);
@@ -2502,8 +2513,8 @@ pub const SessionRegistry = struct {
         }
         // An old executing record cannot be upgraded to a new plan.
         const selected = if (candidate.commit_execution_started) try candidate.staged.?.distributedTables(alloc) else null;
-        defer if (selected) |value| alloc.free(value);
-        candidate.execution_plan = try encodeExecutionPlan(alloc, selected orelse tables);
+        defer if (selected) |value| value.deinit();
+        candidate.execution_plan = try encodeExecutionPlan(alloc, if (selected) |value| value.tables else tables);
         candidate.participant_plan_required = !candidate.commit_execution_started;
         var result = try parseExecutionPlan(alloc, candidate.execution_plan.?);
         errdefer result.deinit();
@@ -4811,13 +4822,6 @@ fn appendTable(
     req.tables = next;
 }
 
-fn clearPreparedWrites(table: *TableCommitRequest, alloc: std.mem.Allocator) void {
-    if (table.txn_writes.len > 0) {
-        alloc.free(table.txn_writes);
-        table.txn_writes = &.{};
-    }
-}
-
 fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
     if (fields.len == 0) return &.{};
     const copy = try alloc.alloc([]const u8, fields.len);
@@ -4984,11 +4988,6 @@ fn appendPredicates(
 
 fn syncTableBatch(table: *TableCommitRequest) void {
     syncBatchReq(&table.batch);
-}
-
-fn syncAndClear(table: *TableCommitRequest, alloc: std.mem.Allocator) void {
-    clearPreparedWrites(table, alloc);
-    syncTableBatch(table);
 }
 
 pub fn isEmptySessionCommitBody(body: []const u8) bool {
@@ -6178,8 +6177,9 @@ test "distributed txn public commit JSON cannot supply internal execution author
         \\{"read_set":[],"execution_plan":"forged","commit_execution_started":true,"tables":{"docs":{"inserts":{"a":{"id":1}},"relational_integrity_generation_set":[255],"integrity_commands":[]}}}
     );
     defer request.deinit(alloc);
-    const tables = try request.distributedTables(alloc);
-    defer alloc.free(tables);
+    const tables_view = try request.distributedTables(alloc);
+    defer tables_view.deinit();
+    const tables = tables_view.tables;
     try std.testing.expect(tables[0].relational_integrity_generation_set == null);
     try std.testing.expectEqual(@as(usize, 0), tables[0].integrity_commands.len);
     var registry = SessionRegistry.init(null);
@@ -7074,8 +7074,9 @@ test "SQL session metadata and schema fences survive durable records" {
     defer restored.deinit(alloc);
     try std.testing.expectEqual(@as(?u32, 7), restored.tables[0].relational_schema_version);
     try std.testing.expectEqual(@as(?u32, 7), restored.tables[0].schema_version);
-    const tables = try restored.distributedTables(alloc);
-    defer alloc.free(tables);
+    const tables_view = try restored.distributedTables(alloc);
+    defer tables_view.deinit();
+    const tables = tables_view.tables;
     try std.testing.expectEqual(@as(?u32, 7), tables[0].relational_schema_version);
     try std.testing.expectEqual(@as(?u32, 7), tables[0].schema_version);
 }
@@ -7115,8 +7116,9 @@ test "distributed txn SQL range guards survive durability and savepoint rollback
             defer parsed.deinit();
             var durable = try parseStoredCommitValue(alloc, parsed.value);
             defer durable.deinit(alloc);
-            const routed = try durable.distributedTables(alloc);
-            defer alloc.free(routed);
+            const routed_view = try durable.distributedTables(alloc);
+            defer routed_view.deinit();
+            const routed = routed_view.tables;
             try std.testing.expectEqual(@as(u64, 5), routed[0].range_guards[0].fence.route.group_id);
             try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), routed[0].range_guards[0].proofs[0].generation);
             try std.testing.expectEqual(@as(u64, 7), routed[1].range_guards[0].fence.route.group_id);
@@ -7128,12 +7130,54 @@ test "distributed txn SQL range guards survive durability and savepoint rollback
             try std.testing.expect(std.mem.indexOf(u8, public, "range_guards") == null);
         }
     };
-    // Reallocation can succeed in place depending on the backing heap's
-    // current layout. Force growth/shrink to allocate so failure enumeration
-    // visits a deterministic set of allocation points on every invocation.
-    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
-    try std.testing.checkAllAllocationFailures(stable.allocator(), Case.run, .{});
-    try std.testing.expectEqual(stable.allocated_bytes, stable.freed_bytes);
+
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "distributed txn table views isolate statement scratch from request ownership" {
+    const alloc = std.testing.allocator;
+    var budget: @import("../pgwire/budget.zig").Budget = .{ .child = alloc, .limit = 1024 * 1024 };
+    {
+        var request = try parseCommitRequest(budget.allocator(),
+            \\{"read_set":[],"tables":{"a":{"inserts":{"k1":{"n":1},"k2":{"n":2}}},"b":{"inserts":{"k3":{"n":3}}}}}
+        );
+        defer request.deinit(budget.allocator());
+        request.tables[0].batch.writes[0].json_null_fields = try cloneJsonNullFields(budget.allocator(), &.{"nullable"});
+        const owned_bytes = budget.used;
+        // The SQL executor's conflict lookup receives an arena allocator even
+        // though the staged request belongs to the connection budget. Destroy
+        // that arena between lookups, then clean up the request via its owner.
+        for (0..2) |_| {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const view = try request.distributedTables(scratch.allocator());
+            defer view.deinit();
+            try std.testing.expectEqual(owned_bytes, budget.used);
+            try std.testing.expectEqual(@as(usize, 2), view.tables.len);
+            for (request.tables, view.tables) |source, table| {
+                try std.testing.expectEqual(source.batch.writes.len, table.writes.len);
+                for (source.batch.writes, table.writes) |write, converted| {
+                    try std.testing.expectEqual(write.key.ptr, converted.key.ptr);
+                    try std.testing.expectEqual(write.value.ptr, converted.value.ptr);
+                    try std.testing.expectEqualSlices([]const u8, write.json_null_fields, converted.json_null_fields);
+                }
+            }
+        }
+        const Harness = struct {
+            fn run(a: std.mem.Allocator, value: *const OwnedTransactionCommitRequest) !void {
+                const view = try value.distributedTables(a);
+                defer view.deinit();
+                try std.testing.expectEqual(@as(usize, 2), view.tables.len);
+            }
+        };
+        try std.testing.checkAllAllocationFailures(alloc, Harness.run, .{&request});
+        try std.testing.expectEqual(owned_bytes, budget.used);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.used);
+    const empty: OwnedTransactionCommitRequest = .{};
+    const view = try empty.distributedTables(alloc);
+    defer view.deinit();
+    try std.testing.expectEqual(@as(usize, 0), view.tables.len);
 }
 
 test "distributed txn SQL conflict guards retain first native observation through clone and durable round trip" {
@@ -7164,8 +7208,9 @@ test "distributed txn SQL conflict guards retain first native observation throug
             defer parsed.deinit();
             var restored = try parseStoredCommitValue(alloc, parsed.value);
             defer restored.deinit(alloc);
-            const tables = try restored.distributedTables(alloc);
-            defer alloc.free(tables);
+            const tables_view = try restored.distributedTables(alloc);
+            defer tables_view.deinit();
+            const tables = tables_view.tables;
             try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(255))), &tables[0].relational_integrity_generation_set.?);
             try std.testing.expectEqualDeep(address, tables[0].integrity_commands[0].address);
             try std.testing.expect(tables[0].integrity_commands[0].operation.compare_claim == null);
@@ -7528,8 +7573,9 @@ test "SQL JSON null metadata survives stage clone savepoint persistence and reco
     var restored = try parseStoredCommitValue(alloc, parsed.value);
     defer restored.deinit(alloc);
     try std.testing.expectEqualStrings("j", restored.tables[0].batch.writes[0].json_null_fields[0]);
-    try restored.tables[0].prepareWrites(alloc);
-    try std.testing.expectEqualStrings("j", restored.tables[0].txn_writes[0].json_null_fields[0]);
+    const view = try restored.distributedTables(alloc);
+    defer view.deinit();
+    try std.testing.expectEqualStrings("j", view.tables[0].writes[0].json_null_fields[0]);
     // Public JSON cannot forge the private persisted typing envelope.
     var public = try parseCommitRequest(alloc, stored);
     defer public.deinit(alloc);

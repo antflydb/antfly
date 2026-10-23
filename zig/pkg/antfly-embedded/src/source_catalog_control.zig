@@ -634,6 +634,7 @@ pub const storage_shard = @import("storage/shard.zig");
 pub const storage_sim_fixture = @import("storage/sim_fixture.zig");
 pub const storage_sim_runtime = @import("storage/sim_runtime.zig");
 pub const storage_source_authority = @import("storage/source_authority.zig");
+pub const storage_source_proof_registry = @import("storage/source_proof_registry.zig");
 pub const storage_source_pin_state = @import("storage/source_pin_state.zig");
 pub const storage_source_snapshot = @import("storage/source_snapshot.zig");
 pub const storage_statement_read_fence = @import("storage/statement_read_fence.zig");
