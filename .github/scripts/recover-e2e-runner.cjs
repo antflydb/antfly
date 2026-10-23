@@ -6,17 +6,29 @@ function interruptedE2e(job, log) {
   if (job.conclusion !== 'failure') return false;
   const build = job.name === 'e2e-full / build';
   if (!build && !/^e2e-full \/ (inference-(generation|speech|embedding)|antfly)$/.test(job.name)) return false;
-  // Runner loss marks the executing step cancelled even when the enclosing
-  // job fails. A deliberately cancelled job is excluded above.
+  // Runner loss can cancel the executing step or interrupt its shell with
+  // SIGINT/SIGTERM. A deliberately cancelled job is excluded above.
   const failed = (job.steps || []).filter(step => ['failure', 'cancelled'].includes(step.conclusion));
-  if (failed.length !== 1) return false;
-  if (build) {
-    if (failed[0].conclusion !== 'cancelled' ||
-        !/^Build (E2E executable once|optimized model E2E executable)$/.test(failed[0].name)) return false;
-  } else if (!/^Run Antfly (inference )?full E2E$/.test(failed[0].name)) return false;
+  const executing = failed.filter(step => build
+    ? /^Build (E2E executable once|optimized model E2E executable)$/.test(step.name)
+    : /^Run Antfly (inference )?full E2E$/.test(step.name));
+  if (executing.length !== 1) return false;
+  const active = executing[0];
+  // Cleanup may start under always() before the runner finishes shutting down.
+  // Only cancelled teardown after the interrupted build is incidental; failed
+  // setup, independent failures and failed cleanup must remain failures.
+  if (failed.some(step => step !== active && !(build && step.conclusion === 'cancelled' &&
+      Number.isInteger(active.number) && step.number > active.number &&
+      (step.name === 'Release completed E2E build scratch' || step.name.startsWith('Post '))))) return false;
   const shutdown = log.indexOf(SHUTDOWN);
   if (shutdown < 0 || /exceeded the maximum execution time/.test(log)) return false;
   const before = log.slice(0, shutdown);
+  if (build) {
+    // A failed shell needs an explicit interruption status. Ordinary nonzero
+    // exits (including OOM/137) are not evidence of external interruption.
+    if (active.conclusion === 'failure' &&
+        !/##\[error\]Process completed with exit code (?:130|143)\./.test(before)) return false;
+  }
   // Rebuild only externally interrupted compilers. A compiler/smoke failure
   // already present before shutdown must remain visible. The job-specific
   // rerun also schedules its dependent artifact consumers, preserving the
