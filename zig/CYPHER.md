@@ -2834,9 +2834,10 @@ large tied groups are serialized into continuations, and no group replay is
 needed. Refills grow to bounded native pages when a tie or duplicate run makes
 progress stall; every lookahead and speculative record is charged.
 
-Consumers that require a fully stable streaming cursor, including the current SQL
-GRAPH_TABLE cursor, decline a coarse-only metadata probe and retain the ordinary
-sort path. They never advertise a stronger order than the provider supplied.
+Consumers that require a fully stable, unbounded streaming cursor decline a
+coarse-only metadata probe. SQL GRAPH_TABLE can separately negotiate a licensed
+finite prefix, described below; an advisory row goal alone cannot truncate its
+relation. Neither capability advertises a stronger order than its executor supplies.
 Regression coverage includes partial DISTINCT with duplicates, redundant identity
 stages, boundary ties ordered differently by trailing index keys, a whole-table
 tie under a small memory ceiling, and two authenticated owners whose catalog
@@ -2885,10 +2886,13 @@ Internal window, multiplicity, and profile state stays scoped to each observer;
 the outer physical plan reports index_extrema. Subsequent weighted stages receive
 the ordinary one-row aggregate result.
 
-For an adjacent scalar DISTINCT with one varying physical key, a qualifying row
-confirms that its entire key group projects identically. Refills may then exclude
-that group using an exclusive typed tuple bound, including a NULL key. A rejected
-candidate never grants this hint. The native reader combines the group boundary
+For an adjacent scalar DISTINCT over one or more varying physical keys, a
+qualifying row confirms that its entire key tuple projects identically. Refills
+may then exclude that group using an exclusive typed tuple bound, including NULL
+components. Every varying field carries its component of the same boundary;
+constant and equality-fixed leading fields are reconstructed from enforced
+filters. Mixed directions and reverse traversal use physical tuple comparison.
+A rejected candidate never grants this hint. The native reader combines the group boundary
 with equality prefixes, original residual bounds, immutable schema generation,
 retained authorization, and any non-NULL bound. Opaque owner continuations remain
 positions rather than documents. The private RPC encodes a present NULL boundary
@@ -2910,3 +2914,80 @@ one anchor and uses 40 states instead of 13,000 anchors and 169,001 states. The
 down from 12,045 anchors and 384,234 states. Tests also enforce bounded reads for
 Unicode strings, booleans, leading/trailing NULL runs, equality-fixed prefixes,
 coarse reverse ties, filtered candidates, and repeated extremum observers.
+
+
+### Constant domains, group-directed observers, and licensed SQL prefixes
+
+A finite, adjacent DISTINCT whose projected keys are all constant or fixed by
+source equality needs only an existence witness. It stops after the first
+qualifying row, including when LIMIT exceeds one or SKIP removes the sole
+result. Empty inputs remain empty. This singleton proof also applies without
+ORDER BY. Property results retain the ordinary filtered source's first
+representative; only literal-result domains may push later total filters across
+that source without depending on encounter order. MIN/MAX over a constant or
+equality-fixed argument uses the same existence path. Logical singleton status is
+independent of the physical keys retained for an indexed access path, so the last
+allowed witness does not require a subsequent EOF read. A closed NULL argument
+returns NULL without reading candidates after the complete source pipeline passes
+the totality proof.
+Fallible predicates, projections, and stages retain their normal execution.
+
+Ordered grouped COUNT/MIN/MAX with a finite window first negotiates an adjacent
+group-key proof and every observer's domain. It discovers only the requested
+group keys, seeking past duplicate tuples, then evaluates observers over each
+selected equality domain. COUNT consumes the complete selected domain; standalone
+extrema may seek its non-NULL boundaries. Mixed observers use the ordinary
+streaming aggregate fold for each domain. This avoids reading unselected groups
+without claiming that a COUNT can ignore members of a selected group. Each group
+owns a recyclable planning/evaluation arena; only result values escape to the
+statement arena. Invocation memoization resets before arena reuse. Sharing-aware
+clone contexts preserve compact value graphs while taking ownership of those
+results, and immutable literal/parameter grouping keys need no equality recheck.
+This bounds observer metadata by one active group, including broad result windows.
+
+The rewrite carries total, single-node lineage through safe identity and
+projection stages. It requires grouping keys to be covered by the requested
+order, and requires MIN/MAX and DISTINCT COUNT arguments to have a certified
+scalar domain. An ORDER BY reference to an aggregate output alias retains the
+original fold, including when that alias shadows a grouping key, a WITH binding,
+or the source node. Removing observer outputs must never expose an older binding
+to the discovery sort. Unsupported aggregates, HAVING, fallible expressions,
+incomplete order, and stage ceilings also retain the original fold. Internal
+equality parameters are immutable, invocation-scoped, collision-free with user
+bindings, and never
+enter the public JSON contract. NULL groups use an internal IS NULL filter rather
+than equality with NULL. Source authorization, owner snapshots, budgets, and
+runtime predicates remain authoritative. The physical plan reports index_groups.
+
+SQL scans distinguish an advisory row_goal from an ordered_window capability.
+The planner licenses OFFSET+LIMIT only for a finite, row-preserving graph scan
+through identity projections with total outer column/literal outputs. Residual
+filters, joins, aggregates, windows, ordinals, scalar-cardinality observers,
+fallible projections, and unbounded consumers cannot license a truncated source.
+Transaction/lake overlays clear the capability when they clear physical ordering.
+
+A graph cursor first attempts a full stable-order certificate. If that declines,
+an explicitly licensed window can use the shared Cypher bounded-order executor
+to refine coarse index ties into an exact prefix. The cursor retains that finite
+prefix in its owned arena and pages it normally; it does not expose an exact
+full-relation count or accept weighted/cardinality plans. Providers may decline
+the capability and return their ordinary complete relation. The enclosing SQL
+executor still applies its own OFFSET and LIMIT. Ordinary graph cursors and SQL
+requests carrying only row_goal continue to return the complete source relation.
+
+On both public embedded storage backends with 13,000 documents:
+
+| Query shape | Original anchors | Final anchors | Original states | Final states |
+| --- | ---: | ---: | ---: | ---: |
+| Tuple DISTINCT | 12,045 | 9 | 696,383 | 473 |
+| Equality-fixed DISTINCT | 13,000 | 1 | 619,994 | 42 |
+| Equality-fixed MIN/MAX | 12,000 | 2 | 480,007 | 150 |
+| Literal DISTINCT | 13,000 | 1 | 285,990 | 12 |
+| Ordered grouped COUNT | 13,000 | 12 | 221,117 | 369 |
+| Ordered grouped MAX | 13,000 | 12 | 312,117 | 631 |
+
+A 3,000-group MAX window completes in 4,440,766 bytes on both backends; its
+regression enforces a 16 MiB ceiling. Group observer ownership also preserves
+shared containers under a 2 MiB native budget. The SQL cursor tests distinguish
+advisory goals from licensed prefixes and exercise coarse ties, ordinary full
+relations, OFFSET, derived projections, NULL ordering, and source ordinals.

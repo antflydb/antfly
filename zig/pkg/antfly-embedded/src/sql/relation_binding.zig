@@ -2190,6 +2190,22 @@ pub fn scanColumn(node_: *const Node, position_: usize) ?ScanColumn {
     return null;
 }
 
+/// Exact row-preserving identity lineage. Selection and every cardinality,
+/// effect, or invocation boundary decline the finite-prefix capability.
+pub fn rowPreservingScan(original: *const Node) ?usize {
+    var node = original;
+    for (0..32) |_| switch (node.operation) {
+        .scan => |scan| return scan.index,
+        .query => |query| {
+            if (query.statement.predicate != null or query.binding.scalars.predicate != null or query.statement.limit != null or query.statement.offset != null or query.statement.scalar_cardinality_limit or query.binding.aggregate != null or query.binding.window != null or query.binding.order_keys.len != 0 or query.constant_refs.len != 0) return null;
+            for (query.binding.scalars.projections) |program| if (program) |value| if (JoinPlanning.identity(value) == null) return null;
+            node = query.source;
+        },
+        else => return null,
+    };
+    return null;
+}
+
 /// Snapshot-local estimates guide bounded left-deep enumeration. Unknown
 /// estimates decline reordering; estimates never become execution row limits.
 pub const JoinPlanning = struct {

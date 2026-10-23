@@ -117,6 +117,10 @@ pub const NodeCursor = struct {
     started: bool = false,
     done: bool = false,
     exact_count: ?u64 = null,
+    window_projection: ?ast.Projection = null,
+    window_rows: []const Row = &.{},
+    window_position: usize = 0,
+    window_loaded: bool = false,
     interior_anchors: []const usize = &.{},
     frames: std.ArrayList(*PathFrame) = .empty,
     weighted: bool = false,
@@ -140,7 +144,7 @@ pub const NodeCursor = struct {
     /// Plan a projected endpoint bag without advancing or rebinding the read
     /// cut. Plans and their AST storage belong to this cursor.
     pub fn planWeightFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity) !?WeightPlan {
-        if (self.started or self.done or self.exact_count != null) return null;
+        if (self.started or self.done or self.exact_count != null or self.window_projection != null) return null;
         const operation = self.original_match;
         if (!self.componentCursorSafe(operation)) return null;
         if (operation.paths.len == 1 and self.interior_anchors[0] != 0) return null;
@@ -305,6 +309,7 @@ pub const NodeCursor = struct {
     /// Serial aggregate passes share every quota, backend capability and raw
     /// adjacency page. Exhaust the preceding pass before changing its shape.
     pub fn startWeightPlan(self: *NodeCursor, plan: WeightPlan) !void {
+        if (self.window_projection != null) return error.CypherInvalidBackendPage;
         if (self.started and !self.done) return error.CypherInvalidBackendPage;
         if (self.frames.items.len != 0) return error.CypherInvalidBackendPage;
         if (self.weighted_seeds) |*seeds| if (seeds.arena) |*arena| arena.deinit();
@@ -340,7 +345,7 @@ pub const NodeCursor = struct {
     /// Negotiate endpoint bags before the first pull. Route-observing queries
     /// retain the ordinary cursor; every declined per-anchor proof does too.
     pub fn enableWeights(self: *NodeCursor, multiplicity: Multiplicity) !bool {
-        if (self.started or self.done or self.exact_count != null) return false;
+        if (self.started or self.done or self.exact_count != null or self.window_projection != null) return false;
         const operation = self.original_match;
         if (!self.componentCursorSafe(operation)) return false;
         if (operation.paths.len == 1 and self.interior_anchors[0] != 0) return false;
@@ -561,7 +566,7 @@ pub const NodeCursor = struct {
     /// Negotiate immutable node order before the first pull. This does not
     /// truncate the relation: SQL retains its residuals and row-goal policy.
     pub fn certifyOrder(self: *NodeCursor, requested: []const backend_mod.PropertyOrder) !bool {
-        if (self.started or self.done or self.weighted or self.engine.node_order != null or requested.len == 0) return false;
+        if (self.started or self.done or self.weighted or self.window_projection != null or self.engine.node_order != null or requested.len == 0) return false;
         const e = self.engine;
         const backend = e.backend;
         const read = backend.vtable.scan_ordered orelse return false;
@@ -592,10 +597,40 @@ pub const NodeCursor = struct {
         e.node_order = retained;
         return true;
     }
+    /// A distinct capability from a full streaming order. The caller licenses
+    /// an exact finite prefix after proving its own cardinality/error barriers.
+    pub noinline fn certifyWindow(self: *NodeCursor, requested: []const backend_mod.PropertyOrder, maximum: u64) !bool {
+        if (self.started or self.done or self.weighted or self.exact_count != null or self.window_projection != null or self.engine.node_order != null or requested.len == 0 or maximum == 0 or maximum > std.math.maxInt(i64)) return false;
+        const e = self.engine;
+        const backend = e.backend;
+        const read = backend.vtable.scan_ordered orelse return false;
+        if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
+        defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
+        if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.fields);
+        defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
+        var projection = self.query.clauses[1].operation.project.value;
+        const orders = try e.a.alloc(ast.Order, requested.len);
+        for (requested, orders) |request, *order| {
+            const expression = for (projection.items) |item| {
+                if (std.mem.eql(u8, item.alias orelse try e.expressionName(item.expression), request.property)) break item.expression;
+            } else return false;
+            order.* = .{ .expression = expression, .descending = request.descending };
+        }
+        const limit = try e.a.create(ast.Expr);
+        limit.* = .{ .span = .{}, .value = .{ .literal = .{ .integer = @intCast(maximum) } } };
+        projection.order = orders;
+        projection.limit = limit;
+        const planned = (try e.planNodeOrder(&.{&.{}}, self.original_match, projection, &.{}, false)) orelse return false;
+        if (planned.declined or planned.primary) return false;
+        const proof = (try read(backend.ptr, e.a, planned.table, planned.filters, planned.fields, null, 0, 0)) orelse return false;
+        if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
+        self.window_projection = projection;
+        return true;
+    }
     pub fn next(self: *NodeCursor, a: A, demand: usize) ![]const Row {
         return self.pull(a, demand) catch |err| return if (self.budget.exhausted) error.CypherMemoryBudgetExceeded else err;
     }
-    fn pull(self: *NodeCursor, a: A, demand: usize) ![]const Row {
+    noinline fn pull(self: *NodeCursor, a: A, demand: usize) ![]const Row {
         if (demand == 0 or demand > 4096) return error.InvalidCypherLimit;
         if (self.done) return &.{};
         const e = self.engine;
@@ -605,6 +640,19 @@ pub const NodeCursor = struct {
         defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
         if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.fields);
         defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
+        if (self.window_projection) |projection| {
+            if (!self.window_loaded) {
+                self.started = true;
+                self.window_rows = (try e.streamMatchProjectionAttempt(&.{&.{}}, null, self.original_match, projection, &.{}, self.query.clauses[0].span, self.query.clauses[1].span, null, null, true)) orelse return error.CypherInvalidBackendPage;
+                self.window_loaded = true;
+            }
+            const end = @min(self.window_rows.len, self.window_position + demand);
+            const rows = try a.alloc(Row, end - self.window_position);
+            for (self.window_rows[self.window_position..end], rows) |row, *out| out.* = try cloneRow(a, row);
+            self.window_position = end;
+            self.done = end == self.window_rows.len;
+            return rows;
+        }
         var output: std.ArrayList(Row) = .empty;
         self.last_weights = .empty;
         self.last_counts = .empty;
@@ -996,7 +1044,7 @@ pub const NodeCursor = struct {
         }
     }
     pub fn countRows(self: *NodeCursor) !?u64 {
-        if (self.started or self.query.clauses[1].operation.project.value.predicate != null) return null;
+        if (self.started or self.window_projection != null or self.query.clauses[1].operation.project.value.predicate != null) return null;
         if (self.exact_count) |count| return count;
         const e = self.engine;
         const backend = e.backend;
@@ -1176,8 +1224,10 @@ const NodeOrder = struct {
     encounter_key: ?[]const u8 = null,
     refill: usize = 1,
     previous_total: ?usize = null,
-    seek_value: ?v.Value = null,
-    seek_index: usize = 0,
+    seek_values: ?[]const v.Value = null,
+    seek_indexes: []const usize = &.{},
+    singleton: bool = false,
+    witness_filters: []const backend_mod.PropertyFilter = &.{},
     primary: bool = false,
     primary_fallback: bool = false,
     primary_index: bool = false,
@@ -1221,6 +1271,7 @@ const Engine = struct {
     graph: catalog.Graph,
     source: []const u8,
     parameters: []const v.Entry,
+    private_parameters: []const v.Entry = &.{},
     limits: Limits,
     stats: Stats = .{},
     startup_accounted: backend_mod.StartupWork = .{},
@@ -3322,7 +3373,7 @@ const Engine = struct {
             .literal => .primitive,
             .variable => |name| types.get(name),
             .parameter => |name| blk: {
-                const value = lookup(self.parameters, name) orelse break :blk null;
+                const value = self.parameterValue(name) orelse break :blk null;
                 if (primitive(value)) break :blk .primitive;
                 // Carry a lazy source certificate. Most UNWINDs never need to
                 // elide element reads: do not scan their lists just to plan a
@@ -4148,7 +4199,7 @@ const Engine = struct {
             .variable => |name| if (std.mem.eql(u8, name, alias)) Affine.column(0).bounded(interval) else return null,
             .literal => |value| if (value == .integer) Affine.literal(value.integer) else return null,
             .parameter => |name| blk: {
-                const value = lookup(self.parameters, name) orelse return null;
+                const value = self.parameterValue(name) orelse return null;
                 break :blk if (value == .integer) Affine.literal(value.integer) else return null;
             },
             .unary => |u| blk: {
@@ -6170,6 +6221,8 @@ const Engine = struct {
             if (fold.top.*) |*top| {
                 try top.addWeighted(row, fold.weight);
                 const ordered_input = if (engine.node_order) |order| order.active and !order.coarse and engine.stream_fold == fold else false;
+                const singleton = if (engine.node_order) |order| order.active and order.singleton and engine.stream_fold == fold else false;
+                if (top.capacity != 0 and singleton and top.total != 0) return error.CypherStreamComplete;
                 if (fold.projection.limit != null and (fold.projection.order.len == 0 or ordered_input) and top.capacity != 0 and top.total == top.capacity) return error.CypherStreamComplete;
                 return;
             }
@@ -6713,7 +6766,7 @@ const Engine = struct {
         return switch (expression.value) {
             .literal => true,
             .variable => |name| lookup(shape, name) != null,
-            .parameter => |name| lookup(self.parameters, name) != null,
+            .parameter => |name| self.parameterValue(name) != null,
             .property => |p| p.base.value == .variable and blk: {
                 const known = lookup(shape, p.base.value.variable) orelse break :blk false;
                 break :blk known == .boolean and known.boolean;
@@ -6745,7 +6798,7 @@ const Engine = struct {
             .list => |items| for (items) |item| {
                 if (!self.totalExpression(item, shape)) break false;
             } else true,
-            .parameter => |name| if (lookup(self.parameters, name)) |value| value == .list or value == .null else false,
+            .parameter => |name| if (self.parameterValue(name)) |value| value == .list or value == .null else false,
             .literal => |value| value == .null,
             else => false,
         };
@@ -6754,7 +6807,7 @@ const Engine = struct {
         return switch (expression.value) {
             .literal => |value| value == .boolean or value == .null,
             .parameter => |name| blk: {
-                const value = lookup(self.parameters, name) orelse break :blk false;
+                const value = self.parameterValue(name) orelse break :blk false;
                 break :blk value == .boolean or value == .null;
             },
             .binary, .comparison, .unary => self.totalExpression(expression, shape),
@@ -7435,8 +7488,9 @@ const Engine = struct {
         fold.ordered_index = 1;
         return true;
     }
-    fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer) anyerror!?[]const Row {
+    noinline fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer) anyerror!?[]const Row {
         if (continuation == null and consumer == null and (input_weights == null or (input_weights.?.len == 1 and input_weights.?[0].isOne()))) {
+            if (try self.indexedGroups(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
             if (try self.indexedExtrema(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
         }
         return self.streamMatchProjectionAttempt(input, input_weights, operation, projection, original_middle, match_span, projection_span, continuation, consumer, true) catch |err| {
@@ -7447,14 +7501,173 @@ const Engine = struct {
             return self.streamMatchProjectionAttempt(input, input_weights, operation, projection, original_middle, match_span, projection_span, continuation, consumer, false);
         };
     }
+    /// Discover only the requested group keys, then observe each selected
+    /// equality domain once. Native tuple seeks bound discovery independently
+    /// of group size; COUNT consumes the complete domain and extrema may seek.
+    noinline fn indexedGroups(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
+        if (!self.read_only or input.len != 1 or projection.wildcard or projection.distinct or projection.predicate != null or projection.limit == null or projection.order.len == 0 or middle.len + 2 > self.limits.recursion_depth -| self.recursion or self.limits.scanned_anchors > std.math.maxInt(i64)) return null;
+        const read = self.backend.vtable.scan_ordered orelse return null;
+        var keys: std.ArrayList(ast.Item) = .empty;
+        var observers: std.ArrayList(ast.Item) = .empty;
+        for (projection.items) |item| {
+            if (!aggregates(item.expression)) {
+                try keys.append(self.a, item);
+                continue;
+            }
+            if (item.expression.value != .call) return null;
+            const observer = item.expression.value.call;
+            const is_count = std.ascii.eqlIgnoreCase(observer.name, "count");
+            if (!is_count and !std.ascii.eqlIgnoreCase(observer.name, "min") and !std.ascii.eqlIgnoreCase(observer.name, "max")) return null;
+            if ((!observer.star and observer.args.len != 1) or (observer.star and (!is_count or observer.distinct))) return null;
+            try observers.append(self.a, item);
+        }
+        if (keys.items.len == 0 or observers.items.len == 0) return null;
+        // Removing observers must not expose an older source/key binding to
+        // ORDER BY. Its original projected scope gives aggregate aliases priority.
+        for (observers.items) |item| {
+            const name = item.alias orelse try self.expressionName(item.expression);
+            for (projection.order) |order| {
+                try self.state();
+                if (@import("expressions.zig").references(order.expression, name)) return null;
+            }
+        }
+        var discovery = projection;
+        discovery.items = keys.items;
+        discovery.distinct = true;
+        const proof = (try self.planNodeOrder(input, operation, discovery, middle, false)) orelse return null;
+        if (proof.declined or proof.primary or proof.distinct != .adjacent) return null;
+        if (!proof.primary) {
+            const page = (try read(self.backend.ptr, self.a, proof.table, proof.filters, proof.fields, null, 0, 0)) orelse return null;
+            if (page.items.len != 0 or (page.examined orelse 0) != 0 or page.next == null) return error.CypherInvalidBackendPage;
+        }
+        // Non-DISTINCT counts only observe nullness. MIN/MAX and DISTINCT
+        // counts also need an attested total key domain for their argument.
+        for (observers.items) |item| {
+            const observer = item.expression.value.call;
+            if (observer.star) continue;
+            const argument = observer.args[0];
+            const is_count = std.ascii.eqlIgnoreCase(observer.name, "count");
+            const domain_items = try self.a.alloc(ast.Item, keys.items.len + 1);
+            @memcpy(domain_items[0..keys.items.len], keys.items);
+            domain_items[keys.items.len] = .{ .expression = argument, .alias = "__antfly_group_observer" };
+            var domain = discovery;
+            domain.items = domain_items;
+            domain.distinct = false;
+            domain.skip = null;
+            var certified = false;
+            for ([_]bool{ true, false }) |descending| {
+                const needs_order = !is_count or observer.distinct;
+                const orders = try self.a.alloc(ast.Order, projection.order.len + @intFromBool(needs_order));
+                @memcpy(orders[0..projection.order.len], projection.order);
+                if (needs_order) orders[orders.len - 1] = .{ .expression = argument, .descending = descending };
+                domain.order = orders;
+                const certificate = (try self.planNodeOrder(input, operation, domain, middle, false)) orelse continue;
+                if (certificate.declined) continue;
+                if (needs_order and certificate.fields.len == proof.fields.len) {
+                    const grouped = for (keys.items) |key| {
+                        if (@import("expressions.zig").same(key.expression, argument)) break true;
+                    } else false;
+                    const closed = self.constant(argument, input[0]);
+                    const is_primitive = if (closed) |value| switch (value) {
+                        .null, .integer, .number, .string, .boolean => true,
+                        else => false,
+                    } else false;
+                    if (!grouped and !is_primitive) continue;
+                }
+                if (!certificate.primary) {
+                    const page = (try read(self.backend.ptr, self.a, certificate.table, certificate.filters, certificate.fields, null, 0, 0)) orelse continue;
+                    if (page.items.len != 0 or (page.examined orelse 0) != 0 or page.next == null) return error.CypherInvalidBackendPage;
+                }
+                certified = true;
+                break;
+            }
+            if (!certified) return null;
+        }
+        const groups = groups: {
+            const scope = PatternScope.enter(self);
+            defer scope.leave(self);
+            break :groups (try self.streamMatchProjectionAttempt(input, null, operation, discovery, middle, match_span, projection_span, null, null, true)) orelse return error.CypherInvalidBackendPage;
+        };
+        const saved_private = self.private_parameters;
+        const retained = self.a;
+        var reduction = projection;
+        reduction.items = observers.items;
+        reduction.order = &.{};
+        reduction.skip = null;
+        reduction.limit = null;
+        const rows = try retained.alloc(Row, groups.len);
+        const columns = try retained.alloc([]const u8, projection.items.len);
+        for (projection.items, columns) |item, *column| column.* = item.alias orelse try self.expressionName(item.expression);
+        var observer_arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer observer_arena.deinit();
+        for (groups, rows, 0..) |group, *out, group_index| {
+            // Query ASTs, invocation bindings and fold state are one-group work.
+            // Only owned observer values may escape this recyclable epoch.
+            _ = observer_arena.reset(.retain_capacity);
+            const evaluation = EvalScope.enter(self, observer_arena.allocator());
+            defer evaluation.leave(self);
+            self.private_parameters = saved_private;
+            defer self.private_parameters = saved_private;
+            const pipeline = try self.a.alloc(ast.Clause, middle.len + 1);
+            @memcpy(pipeline[0..middle.len], middle);
+            const parameters = try self.a.alloc(v.Entry, saved_private.len + keys.items.len);
+            @memcpy(parameters[0..saved_private.len], saved_private);
+            for (group, parameters[saved_private.len..], 0..) |entry, *parameter, key_index| {
+                var name = try std.fmt.allocPrint(self.a, "__antfly_group_{d}_{d}", .{ group_index, key_index });
+                while (self.parameterValue(name) != null) name = try std.fmt.allocPrint(self.a, "_{s}", .{name});
+                parameter.* = .{ .name = name, .value = entry.value };
+            }
+            self.private_parameters = parameters;
+            var predicate: ?*const ast.Expr = null;
+            for (keys.items, group, 0..) |key, value, key_index| {
+                // Literals and parameters cannot be shadowed by WITH. They
+                // already describe one domain and need no equality recheck.
+                if (key.expression.value == .literal or key.expression.value == .parameter) continue;
+                const operand = try self.a.create(ast.Expr);
+                operand.* = .{ .span = .{}, .value = .{ .parameter = parameters[saved_private.len + key_index].name } };
+                const expression = try self.a.create(ast.Expr);
+                expression.* = if (value.value == .null) .{ .span = .{}, .value = .{ .unary = .{ .op = .is_null, .operand = key.expression } } } else .{ .span = .{}, .value = .{ .binary = .{ .op = .eq, .left = key.expression, .right = operand } } };
+                if (predicate) |previous| {
+                    const combined = try self.a.create(ast.Expr);
+                    combined.* = .{ .span = .{}, .value = .{ .binary = .{ .op = .@"and", .left = previous, .right = expression } } };
+                    predicate = combined;
+                } else predicate = expression;
+            }
+            pipeline[middle.len] = .{ .span = projection_span, .operation = .{ .project = .{ .final = false, .value = .{ .items = &.{}, .wildcard = true, .predicate = predicate } } } };
+            const result = result: {
+                const scope = PatternScope.enter(self);
+                defer scope.leave(self);
+                break :result (try self.streamMatchProjectionInto(input, null, operation, reduction, pipeline, match_span, projection_span, null, null)) orelse return error.CypherInvalidBackendPage;
+            };
+            if (result.len != 1) return error.CypherInvalidBackendPage;
+            const row = try retained.alloc(v.Entry, projection.items.len);
+            var key_index: usize = 0;
+            var observer_index: usize = 0;
+            var copies: v.CloneContext = .{ .a = retained, .scratch = self.a };
+            for (projection.items, row, columns) |item, *entry, name| {
+                const source = if (aggregates(item.expression)) value: {
+                    defer observer_index += 1;
+                    break :value try copies.clone(result[0][observer_index].value);
+                } else value: {
+                    defer key_index += 1;
+                    break :value group[key_index].value;
+                };
+                entry.* = .{ .name = name, .value = source };
+            }
+            out.* = row;
+        }
+        self.columns = columns;
+        try self.stages.append(self.a, .{ .operation = "index_groups", .span = projection_span, .input_rows = input.len, .output_rows = rows.len });
+        return rows;
+    }
     /// Negotiate all observers before consuming any source. Every admitted
     /// extremum uses the normal total, authorized ordered-window executor.
-    fn indexedExtrema(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
+    noinline fn indexedExtrema(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
         if (!self.read_only or input.len != 1 or projection.items.len == 0 or projection.wildcard or projection.predicate != null or projection.order.len != 0 or projection.skip != null or projection.limit != null) return null;
         // The synthetic non-NULL stage needs one additional pipeline frame.
         // A legal original fold must remain available at the caller's ceiling.
         if (middle.len >= self.limits.recursion_depth -| self.recursion) return null;
-        const read = self.backend.vtable.scan_ordered orelse return null;
+        const read = self.backend.vtable.scan_ordered;
         const plans = try self.a.alloc(ast.Projection, projection.items.len);
         const stages = try self.a.alloc([]const ast.Clause, projection.items.len);
         for (projection.items, plans, stages, 0..) |item, *plan, *pipeline, position| {
@@ -7482,12 +7695,16 @@ const Engine = struct {
             const items = try self.a.alloc(ast.Item, 1);
             items[0] = .{ .expression = argument, .alias = "__antfly_extremum" };
             const orders = try self.a.alloc(ast.Order, 1);
-            orders[0] = .{ .expression = argument, .descending = maximum, .execution_nonnull = true };
+            orders[0] = .{ .expression = argument, .descending = maximum, .execution_nonnull = true, .execution_fixed = true };
             plan.* = .{ .items = items, .distinct = true, .order = orders, .limit = one };
             const proof = (try self.planNodeOrder(input, operation, plan.*, clauses, false)) orelse return null;
-            if (proof.declined or proof.primary or proof.fields.len != 1) return null;
-            const page = (try read(self.backend.ptr, self.a, proof.table, proof.filters, proof.fields, null, 0, 0)) orelse return null;
-            if (page.items.len != 0 or (page.examined orelse 0) != 0 or page.next == null) return error.CypherInvalidBackendPage;
+            if (proof.declined) return null;
+            if (!proof.primary) {
+                if (proof.fields.len != 1) return null;
+                const ordered = read orelse return null;
+                const page = (try ordered(self.backend.ptr, self.a, proof.table, proof.filters, proof.fields, null, 0, 0)) orelse return null;
+                if (page.items.len != 0 or (page.examined orelse 0) != 0 or page.next == null) return error.CypherInvalidBackendPage;
+            }
         }
         const row = try self.a.alloc(v.Entry, projection.items.len);
         const columns = try self.a.alloc([]const u8, row.len);
@@ -7495,7 +7712,8 @@ const Engine = struct {
             const previous = for (projection.items[0..position], 0..) |earlier, index| {
                 if (@import("expressions.zig").same(earlier.expression, item.expression)) break index;
             } else null;
-            const value = if (previous) |index| row[index].value else value: {
+            const closed = self.constant(item.expression.value.call.args[0], input[0]);
+            const value = if (closed != null and closed.? == .null) v.Value.null else if (previous) |index| row[index].value else value: {
                 const scope = PatternScope.enter(self);
                 defer scope.leave(self);
                 const rows = (try self.streamMatchProjectionAttempt(input, null, operation, plan, pipeline, match_span, projection_span, null, null, true)) orelse return error.CypherInvalidBackendPage;
@@ -7509,7 +7727,7 @@ const Engine = struct {
         try self.stages.append(self.a, .{ .operation = "index_extrema", .span = projection_span, .input_rows = input.len, .output_rows = 1 });
         return try self.a.dupe(Row, &.{row});
     }
-    fn streamMatchProjectionAttempt(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer, allow_group_window: bool) anyerror!?[]const Row {
+    noinline fn streamMatchProjectionAttempt(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer, allow_group_window: bool) anyerror!?[]const Row {
         // The row pipeline nests only within the statement's stack allowance.
         // Longer clause sequences retain the iterative general executor.
         if (original_middle.len > self.limits.recursion_depth -| self.recursion) return null;
@@ -9764,6 +9982,9 @@ const Engine = struct {
         defer self.join = previous;
         try self.matchPath(input, operation.paths[index], operation.mode, operation.predicate, output);
     }
+    fn parameterValue(self: *Engine, name: []const u8) ?v.Value {
+        return lookup(self.private_parameters, name) orelse lookup(self.parameters, name);
+    }
     fn constant(self: *Engine, expression: *const ast.Expr, row: Row) ?v.Value {
         var remaining: usize = 128;
         return self.constantBounded(expression, row, &remaining, 0);
@@ -9797,7 +10018,7 @@ const Engine = struct {
                 break :blk self.binary(binary_expression.op, left, right) catch null;
             },
             .property => |property| if (self.read_only) if (self.constantBounded(property.base, row, remaining, depth + 1)) |base| base.property(property.name) else null else null,
-            .parameter => |name| lookup(self.parameters, name),
+            .parameter => |name| self.parameterValue(name),
             .variable => |name| lookup(row, name),
             .literal => |value| switch (value) {
                 .null => blk: {
@@ -9840,6 +10061,12 @@ const Engine = struct {
         };
     }
     fn predicateFilters(self: *Engine, expression: *const ast.Expr, alias: []const u8, row: Row, filters: *std.ArrayList(backend_mod.PropertyFilter)) !void {
+        if (self.private_parameters.len != 0 and expression.value == .unary and expression.value.unary.op == .is_null) {
+            const operand = expression.value.unary.operand;
+            if (operand.value == .property and operand.value.property.base.value == .variable and std.mem.eql(u8, operand.value.property.base.value.variable, alias))
+                try filters.append(self.a, .{ .property = operand.value.property.name, .op = .is_null, .value = .null });
+            return;
+        }
         if (expression.value == .binary and expression.value.binary.op == .@"and") {
             try self.predicateFilters(expression.value.binary.left, alias, row, filters);
             return self.predicateFilters(expression.value.binary.right, alias, row, filters);
@@ -9917,6 +10144,11 @@ const Engine = struct {
     /// in their lexical stages. Unknown conjuncts never imply an OR restriction.
     fn lineageFilters(self: *Engine, expression: *const ast.Expr, lineage: std.StringHashMapUnmanaged(NodeOrigin), filters: *std.ArrayList(backend_mod.PropertyFilter)) anyerror!void {
         try self.state();
+        if (self.private_parameters.len != 0 and expression.value == .unary and expression.value.unary.op == .is_null) {
+            const origin = self.nodeOrigin(expression.value.unary.operand, lineage) orelse return;
+            if (origin.property) |property| try filters.append(self.a, .{ .property = property, .op = .is_null, .value = .null });
+            return;
+        }
         if (expression.value == .binary and expression.value.binary.op == .@"and") {
             try self.lineageFilters(expression.value.binary.left, lineage, filters);
             return self.lineageFilters(expression.value.binary.right, lineage, filters);
@@ -9976,11 +10208,14 @@ const Engine = struct {
             } });
         }
     }
-    fn planNodeOrder(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, external_order: bool) !?NodeOrder {
+    // Share the planner across cursors and observer rewrites. Inlining this
+    // proof walk into every recursive execution entry inflates optimized builds.
+    noinline fn planNodeOrder(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, external_order: bool) !?NodeOrder {
         // An ordinary empty scan may finish without spending an anchor. A
         // certificate cannot assume a zero-budget source is nonempty.
         if (self.stats.scanned_anchors >= self.limits.scanned_anchors) return null;
-        if (!self.read_only or input.len != 1 or operation.optional or operation.paths.len != 1 or (projection.order.len == 0 and middle.len == 0)) return null;
+        const unordered_singleton = projection.distinct and projection.limit != null and projection.order.len == 0;
+        if (!self.read_only or input.len != 1 or operation.optional or operation.paths.len != 1 or (projection.order.len == 0 and middle.len == 0 and !unordered_singleton)) return null;
         const path = operation.paths[0];
         if (path.edges.len != 0 or path.alias != null or path.selector != .all) return null;
         const node = path.nodes[0];
@@ -10049,7 +10284,7 @@ const Engine = struct {
             .{ .table = table orelse return null, .alias = alias, .fields = &.{}, .filters = filters.items, .unique_stages = unique_stages.items, .declined = true }
         else
             null;
-        if ((!external_order and projection.limit == null) or projection.wildcard or projection.predicate != null or projection.order.len == 0 or projection.order.len > 32) return hinted;
+        if ((!external_order and projection.limit == null) or projection.wildcard or projection.predicate != null or (projection.order.len == 0 and !unordered_singleton) or projection.order.len > 32) return hinted;
         // ORDER BY evaluates in the projected scope; a shadow may replace the
         // source receiver. Preserve the conservative certificate boundary.
         for (projection.items) |item| if (item.alias) |name| if (std.mem.eql(u8, name, alias)) return hinted;
@@ -10062,29 +10297,29 @@ const Engine = struct {
         var fixed: std.StringHashMapUnmanaged(void) = .empty;
         for (filters.items) |filter| {
             try self.state();
-            if (filter.op == .eq) switch (filter.value) {
+            if (filter.op == .is_null) try fixed.put(self.a, filter.property, {}) else if (filter.op == .eq) switch (filter.value) {
                 .integer, .string, .boolean => try fixed.put(self.a, filter.property, {}),
                 else => {},
             };
         }
         var fields: std.ArrayList(backend_mod.PropertyOrder) = .empty;
-        var seek_index: usize = 0;
+        var seek_indexes: std.ArrayList(usize) = .empty;
         for (projection.order, 0..) |order, order_index| {
             const origin = self.nodeOrigin(order.expression, projected) orelse return hinted;
             if (origin.constant != null) continue;
             const name = origin.property orelse return hinted;
-            if (fixed.contains(name)) continue;
+            if (fixed.contains(name) and !order.execution_fixed) continue;
             const repeated = for (fields.items) |field| {
                 if (std.mem.eql(u8, field.property, name)) break true;
             } else false;
             if (!repeated) {
-                if (fields.items.len == 0) seek_index = order_index;
+                try seek_indexes.append(self.a, order_index);
                 try fields.append(self.a, .{ .property = name, .descending = order.descending, .exclude_null = order.execution_nonnull });
             }
         }
-        var result: NodeOrder = .{ .table = table orelse return null, .alias = alias, .fields = fields.items, .filters = filters.items, .unique_stages = unique_stages.items, .primary = projection.order.len != 0 and fields.items.len == 0, .declined = projection.order.len == 0 or (fields.items.len != 0 and self.backend.vtable.scan_ordered == null) };
-        result.seek_index = seek_index;
-        if (projection.distinct and projection.order.len != 0) distinct: {
+        var result: NodeOrder = .{ .table = table orelse return null, .alias = alias, .fields = fields.items, .filters = filters.items, .unique_stages = unique_stages.items, .primary = fields.items.len == 0, .declined = fields.items.len != 0 and self.backend.vtable.scan_ordered == null };
+        result.seek_indexes = seek_indexes.items;
+        if (projection.distinct) distinct: {
             var properties: std.StringHashMapUnmanaged(void) = .empty;
             var unique = false;
             var adjacent = true;
@@ -10117,6 +10352,19 @@ const Engine = struct {
         // Without a DISTINCT proof, source order must remain unchanged: a
         // nonprojected sort key belongs to the first encountered representative.
         if (projection.distinct and result.distinct == .none) return null;
+        if (unordered_singleton and result.distinct != .adjacent) return null;
+        result.singleton = result.distinct == .adjacent and for (result.fields) |field| {
+            if (!fixed.contains(field.property)) break false;
+        } else true;
+        if (result.singleton) {
+            const constant_row = for (projection.items) |item| {
+                const origin = self.nodeOrigin(item.expression, lineage) orelse break false;
+                if (origin.constant == null) break false;
+            } else true;
+            // Preserve the ordinary filtered source's first representative.
+            // Only a closed row may also push later filters across that source.
+            result.witness_filters = if (constant_row) filters.items else filters.items[0..original_filters];
+        }
         return result;
     }
     fn nodeFilters(self: *Engine, first: ast.Node, predicate: ?*const ast.Expr, row: Row) ![]const backend_mod.PropertyFilter {
@@ -10131,7 +10379,7 @@ const Engine = struct {
         if (self.lookup) |lookup_plan| if (lookup_plan.complete and std.mem.eql(u8, lookup_plan.table, table)) return lookup_plan.cachedPage(self, cursor, bounded_demand);
         if (self.node_order) |order| if (!order.declined and std.mem.eql(u8, order.table, table) and first.alias != null and std.mem.eql(u8, order.alias, first.alias.?)) {
             const wanted = if (self.stream_fold) |fold| if (fold.top.*) |top| wanted: {
-                const remaining = top.capacity -| top.total;
+                const remaining = (if (order.singleton) @as(usize, 1) else top.capacity) -| top.total;
                 const stalled = order.previous_total != null and order.previous_total.? == top.total;
                 if (order.coarse or (order.distinct != .none and stalled)) {
                     const quantum = order.refill;
@@ -10145,6 +10393,11 @@ const Engine = struct {
             } else bounded_demand else bounded_demand;
             if (order.primary) {
                 order.active = true;
+                if (order.singleton) {
+                    if (order.witness_filters.len != 0) if (self.backend.vtable.scan_where) |filtered|
+                        return filtered(self.backend.ptr, self.a, table, order.witness_filters, cursor, @max(1, wanted));
+                    return self.backend.vtable.scan(self.backend.ptr, self.a, table, cursor, @max(1, wanted));
+                }
                 if (!order.primary_fallback and order.filters.len != 0) {
                     if (self.backend.vtable.scan_ordered) |read| {
                         if (try read(self.backend.ptr, self.a, table, order.filters, &.{}, cursor, @max(1, wanted), self.limits.scanned_anchors -| self.stats.scanned_anchors)) |page| {
@@ -10159,12 +10412,14 @@ const Engine = struct {
             }
             const read = self.backend.vtable.scan_ordered orelse return error.CypherInvalidBackendPage;
             const filters = order.filters;
-            var sought: [1]backend_mod.PropertyOrder = undefined;
-            const fields = if (order.seek_value) |after| fields: {
-                if (order.fields.len != 1) return error.CypherInvalidBackendPage;
-                sought[0] = order.fields[0];
-                sought[0].after = after;
-                break :fields &sought;
+            var sought: [32]backend_mod.PropertyOrder = undefined;
+            const fields = if (order.seek_values) |after| fields: {
+                if (order.fields.len == 0 or order.fields.len > sought.len or after.len != order.fields.len) return error.CypherInvalidBackendPage;
+                for (order.fields, after, sought[0..after.len]) |field, key, *out| {
+                    out.* = field;
+                    out.after = key;
+                }
+                break :fields sought[0..after.len];
             } else order.fields;
             if (try read(self.backend.ptr, self.a, table, filters, fields, cursor orelse order.initial_cursor, @max(1, wanted), self.limits.scanned_anchors -| self.stats.scanned_anchors)) |page| {
                 if (order.active and order.coarse == page.stable_ties) return error.CypherInvalidBackendPage;
@@ -10535,7 +10790,7 @@ const Engine = struct {
     fn statisticArgument(self: *Engine, expression: *const ast.Expr, names: StatisticNames, dimensions: usize) anyerror!?Statistic.Form {
         return switch (expression.value) {
             .variable => |name| if (names.get(name)) |form| form else if (lookup(self.moment_input, name)) |value| (if (value == .integer) try Statistic.Form.literal(self.a, value.integer, dimensions) else null) else null,
-            .parameter => |name| if (lookup(self.parameters, name)) |value| (if (value == .integer) try Statistic.Form.literal(self.a, value.integer, dimensions) else null) else null,
+            .parameter => |name| if (self.parameterValue(name)) |value| (if (value == .integer) try Statistic.Form.literal(self.a, value.integer, dimensions) else null) else null,
             .literal => |value| if (value == .integer) try Statistic.Form.literal(self.a, value.integer, dimensions) else null,
             .unary => |u| blk: {
                 const operand = (try self.statisticArgument(u.operand, names, dimensions)) orelse break :blk null;
@@ -10780,7 +11035,7 @@ const Engine = struct {
     fn momentArgument(self: *Engine, expression: *const ast.Expr, names: MomentNames) anyerror!?Affine {
         return switch (expression.value) {
             .variable => |name| if (names.get(name)) |binding| (if (binding == .scalar) binding.scalar else null) else if (lookup(self.moment_input, name)) |value| momentLiteral(value) else null,
-            .parameter => |name| if (lookup(self.parameters, name)) |value| momentLiteral(value) else null,
+            .parameter => |name| if (self.parameterValue(name)) |value| momentLiteral(value) else null,
             .property => |property| if (self.momentEntity(property.base, names) != null) Affine.invariant() else null,
             .literal => |value| switch (value) {
                 .integer => |n| momentLiteral(.{ .integer = n }),
@@ -14712,7 +14967,7 @@ const Engine = struct {
                 .string => |x| .{ .string = x },
             },
             .variable => |name| try self.readValue(lookup(row, name) orelse return error.UnboundCypherVariable),
-            .parameter => |name| lookup(self.parameters, name) orelse error.MissingCypherParameter,
+            .parameter => |name| self.parameterValue(name) orelse error.MissingCypherParameter,
             .property => |p| blk: {
                 const value = try self.eval(p.base, row, group);
                 try self.requireLiveContents(value);
@@ -15636,18 +15891,22 @@ const Engine = struct {
             if (self.distinct_arena) |*arena| {
                 if (self.distinct_previous) |previous| if (try engine.rowEqual(previous, row.items)) return;
                 _ = arena.reset(.free_all);
-                self.distinct_previous = try cloneRow(arena.allocator(), row.items);
+                var copies: v.CloneContext = .{ .a = arena.allocator(), .scratch = arena.allocator() };
+                self.distinct_previous = try cloneRowContext(row.items, &copies);
             }
             const order = engine.node_order;
-            if (order) |proof| if (proof.active and proof.distinct == .adjacent and proof.fields.len == 1) {
+            if (order) |proof| if (proof.active and proof.distinct == .adjacent and proof.fields.len != 0) {
                 if (self.seek_arena == null) self.seek_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
                 _ = self.seek_arena.?.reset(.free_all);
                 var copies: v.CloneContext = .{ .a = self.seek_arena.?.allocator(), .scratch = engine.scratch_allocator };
+                defer copies.memo.deinit(engine.scratch_allocator);
                 // Only key/constant projections have the adjacent proof. Once
                 // a row qualifies, all remaining rows in this key group project
                 // identically. Tuple bounds also handle NULL without inventing
                 // a three-valued Cypher comparison.
-                proof.seek_value = try copies.clone(keys[proof.seek_index]);
+                const after = try self.seek_arena.?.allocator().alloc(v.Value, proof.seek_indexes.len);
+                for (after, proof.seek_indexes) |*key, index| key.* = try copies.clone(keys[index]);
+                proof.seek_values = after;
             };
             const coarse = if (order) |proof| proof.active and proof.coarse else false;
             const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .tie_owner = if (coarse) order.?.encounter_owner else 0, .tie_key = if (coarse) order.?.encounter_key orelse return error.CypherInvalidBackendPage else null, .sequence = self.sequence, .weight = @intCast(weight.cap(self.capacity)), .multiplicity = if (self.projection.limit == null) weight else null };

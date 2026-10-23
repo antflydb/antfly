@@ -369,7 +369,12 @@ pub const Cursor = struct {
                 }
                 try order.append(owned, .{ .property = key.column, .descending = key.descending });
             }
-            if (compatible) ordered = try cursor.certifyOrder(order.items);
+            if (compatible) {
+                ordered = try cursor.certifyOrder(order.items);
+                if (!ordered and request.primary_key == null and request.after == null and request.conditions.len == 0 and request.graph_conditions.len == 0 and request.graph_predicates.len == 0 and request.graph_filters.len == 0) if (request.ordered_window) |maximum| {
+                    ordered = try cursor.certifyWindow(order.items, maximum);
+                };
+            }
         };
         if (ordered_resume and !ordered) return error.InvalidSqlBackendResponse;
         var result: ?cypher.runtime.Result = if (!empty and stream == null) try cypher.runtime.execute(a, backend, binding.graph, &compiled, parameters, limits) else null;
@@ -617,6 +622,11 @@ test "SQL GRAPH_TABLE dependency partitions share quotas and resume narrow pages
             for (out, start..) |*node, index| node.* = &nodes[if (order[0].descending) nodes.len - 1 - index else index];
             return .{ .items = out, .examined = out.len, .next = if (end < nodes.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
         }
+        fn coarse(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, order: []const cypher.backend.PropertyOrder, after: ?[]const u8, limit: usize, maximum: usize) !?cypher.backend.Page(*const cypher.value.Node) {
+            var page = (try ordered(ptr, a, table, filters, order, after, limit, maximum)) orelse return null;
+            page.stable_ties = false;
+            return page;
+        }
         fn get(_: *anyopaque, _: A, id: cypher.value.Identity) !?*const cypher.value.Node {
             for (&nodes) |*node| if (node.identity.eql(id)) return node;
             return null;
@@ -688,6 +698,24 @@ test "SQL GRAPH_TABLE dependency partitions share quotas and resume narrow pages
             defer next_page.deinit();
             try std.testing.expectEqual(@as(i64, 2), (try next_page.rows[0].cell("rank")).value.integer);
         }
+    }
+    callbacks.scan_ordered = F.coarse;
+    for ([_]bool{ false, true }) |licensed| {
+        const cursor = try Cursor.open(std.testing.allocator, ordered_binding, indexed, &.{}, .{ .fields = &.{"rank"}, .order = &.{.{ .column = "rank", .descending = true, .nulls_first = true }}, .row_goal = 1, .ordered_window = if (licensed) 1 else null, .limit = 1 }, .{ .scanned_anchors = if (licensed) 2 else 3 });
+        defer cursor.close(cursor.ptr);
+        try std.testing.expectEqual(licensed, cursor.order_satisfied);
+        try std.testing.expectEqual(@as(?u64, null), if (licensed) try cursor.count_rows.?(cursor.ptr) else null);
+        var emitted: usize = 0;
+        while (true) {
+            const page = try cursor.next(cursor.ptr, std.testing.allocator, 1);
+            defer page.deinit();
+            for (page.rows) |row| {
+                emitted += 1;
+                try std.testing.expectEqual(@as(i64, if (licensed) 3 else @intCast(emitted)), (try row.cell("rank")).value.integer);
+            }
+            if (page.after == null) break;
+        }
+        try std.testing.expectEqual(@as(usize, if (licensed) 1 else 3), emitted);
     }
 }
 

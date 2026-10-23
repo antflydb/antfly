@@ -7898,29 +7898,46 @@ test "coarse RPC prefixes refine owner ties and bound partial DISTINCT across wi
             fixture: *Self,
             partition: usize,
             records: usize = 0,
+            probes: usize = 0,
             fn scan(ptr: *anyopaque, a: A, _: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
                 return page(ptr, a, after, limit, null);
             }
             fn ordered(ptr: *anyopaque, a: A, _: []const u8, _: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8, limit: usize, maximum: usize) !?b.Page(*const v.Node) {
-                if (order.len != 1 or !std.mem.eql(u8, order[0].property, "rank")) return null;
-                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .next = "0", .examined = 0, .stable_ties = false };
-                return try page(ptr, a, after, @min(limit, maximum), order[0].descending);
+                if (order.len == 0 or order.len > 2) return null;
+                for (order) |field| if (!std.mem.eql(u8, field.property, "rank") and !std.mem.eql(u8, field.property, "id")) return null;
+                if (limit == 0) {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.probes += 1;
+                    return .{ .items = &.{}, .cursors = &.{}, .next = "0", .examined = 0, .stable_ties = false };
+                }
+                return try page(ptr, a, after, @min(limit, maximum), order);
             }
-            fn page(ptr: *anyopaque, a: A, after: ?[]const u8, limit: usize, descending: ?bool) !b.Page(*const v.Node) {
+            fn page(ptr: *anyopaque, a: A, after: ?[]const u8, limit: usize, order: ?[]const b.PropertyOrder) !b.Page(*const v.Node) {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 const start = if (after) |bytes| try std.fmt.parseInt(usize, bytes, 10) else 0;
                 const end = @min(4, start + limit);
                 const nodes = try a.alloc(*const v.Node, end - start);
                 const cursors = try a.alloc(?[]const u8, nodes.len);
-                const asc = [_][4]usize{ .{ 1, 2, 0, 3 }, .{ 2, 1, 0, 3 } };
-                const desc = [_][4]usize{ .{ 3, 2, 0, 1 }, .{ 3, 0, 1, 2 } };
+                var sorted = [_]usize{ 0, 1, 2, 3 };
+                const SortContext = struct { owner: @TypeOf(self), fields: []const b.PropertyOrder };
+                if (order) |fields| std.mem.sort(usize, &sorted, SortContext{ .owner = self, .fields = fields }, struct {
+                    fn less(context: SortContext, left: usize, right: usize) bool {
+                        for (context.fields) |field| {
+                            const l = (v.Value{ .node = &context.owner.fixture.nodes[context.owner.partition * 4 + left] }).property(field.property);
+                            const r = (v.Value{ .node = &context.owner.fixture.nodes[context.owner.partition * 4 + right] }).property(field.property);
+                            const comparison = v.Value.order(l, r) catch unreachable;
+                            if (comparison != .eq) return (comparison == .lt) != field.descending;
+                        }
+                        return left > right;
+                    }
+                }.less);
                 for (nodes, cursors, start..) |*node, *cursor, ordinal| {
-                    const position = if (descending) |known| (if (known) desc[self.partition][ordinal] else asc[self.partition][ordinal]) else ordinal;
+                    const position = if (order != null) sorted[ordinal] else ordinal;
                     node.* = &self.fixture.nodes[self.partition * 4 + position];
                     cursor.* = if (ordinal + 1 < 4) try std.fmt.allocPrint(a, "{d}", .{ordinal + 1}) else null;
                 }
                 self.records += nodes.len;
-                return .{ .items = nodes, .cursors = cursors, .next = if (end < 4) try std.fmt.allocPrint(a, "{d}", .{end}) else null, .examined = nodes.len, .stable_ties = descending == null };
+                return .{ .items = nodes, .cursors = cursors, .next = if (end < 4) try std.fmt.allocPrint(a, "{d}", .{end}) else null, .examined = nodes.len, .stable_ties = order == null };
             }
             fn backend(self: *@This()) b.Backend {
                 return .{ .ptr = self, .vtable = &.{ .bind = Self.bind, .checkpoint = Self.check, .scan = scan, .get = Self.get, .expand = Self.expand, .scan_ordered = ordered } };
@@ -7982,4 +7999,118 @@ test "coarse RPC prefixes refine owner ties and bound partial DISTINCT across wi
         try std.testing.expectEqual(@as(i128, 0), result.rows[0][0].integer);
         try std.testing.expectEqual(@as(i128, 2), result.rows[0][1].integer);
     }
+    for ([_][]const u8{ "n.id", "n.rank", "n.rank,n.id" }) |group|
+        for ([_][]const u8{ "count(*)", "count(n)", "count(n.rank),min(n.rank),max(n.rank)", "count(DISTINCT n.id)", "min(n.rank),max(n.rank)" }) |observers|
+            for ([_][]const u8{ "ASC", "DESC" }) |direction|
+                for ([_]usize{ 0, 1, 3 }) |skip|
+                    for ([_]usize{ 0, 1, 9 }) |limit| {
+                        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                        defer arena.deinit();
+                        const a = arena.allocator();
+                        // Include every grouping key in its corresponding order.
+                        const order = if (std.mem.eql(u8, group, "n.rank,n.id")) try std.fmt.allocPrint(a, "n.rank {s},n.id {s}", .{ direction, direction }) else try std.fmt.allocPrint(a, "{s} {s}", .{ group, direction });
+                        const query = try std.fmt.allocPrint(a, "MATCH (n:Document) RETURN {s},{s} ORDER BY {s} SKIP {d} LIMIT {d}", .{ group, observers, order, skip, limit });
+                        const control_order = if (std.mem.eql(u8, group, "n.rank,n.id")) try std.fmt.allocPrint(a, "CASE WHEN true THEN n.rank ELSE n.rank END {s},n.id {s}", .{ direction, direction }) else try std.fmt.allocPrint(a, "CASE WHEN true THEN {s} ELSE {s} END {s}", .{ group, group, direction });
+                        const control = try std.fmt.allocPrint(a, "MATCH (n:Document) RETURN {s},{s} ORDER BY {s} SKIP {d} LIMIT {d}", .{ group, observers, control_order, skip, limit });
+                        try std.testing.expectEqualStrings(try F.run(a, set.backend(), control), try F.run(a, set.backend(), query));
+                    };
+    for ([_][]const u8{
+        "MATCH (n:Document) RETURN n.id AS k,count(*) AS k ORDER BY k LIMIT 2",
+        "MATCH (n:Document) WITH n.id AS k,n RETURN n.id,count(*) AS k ORDER BY k LIMIT 2",
+        "MATCH (n:Document) RETURN n.id,count(*) AS n ORDER BY n.id LIMIT 2",
+        "MATCH (n:Document) WITH n.id AS k,count(*) AS copies ORDER BY k LIMIT 2 UNWIND range(1,1000) AS i RETURN count(*),sum(copies)",
+        "MATCH (n:Document) WITH n.id AS k,max(n.rank) AS r ORDER BY k LIMIT 3 RETURN sum(r)",
+    }) |query| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const order_start = std.mem.indexOf(u8, query, "ORDER BY ").? + "ORDER BY ".len;
+        const order_end = std.mem.indexOf(u8, query, " LIMIT").?;
+        const control = try std.fmt.allocPrint(arena.allocator(), "{s}CASE WHEN true THEN {s} END{s}", .{ query[0..order_start], query[order_start..order_end], query[order_end..] });
+        try std.testing.expectEqualStrings(try F.run(arena.allocator(), set.backend(), control), try F.run(arena.allocator(), set.backend(), query));
+    }
+    {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, "MATCH (n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
+        defer compiled.deinit();
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, set.backend(), g, compiled.query, &.{}, .{})).?;
+        defer cursor.close();
+        try std.testing.expect(!try cursor.certifyOrder(&.{.{ .property = "rank", .descending = true }}));
+        try std.testing.expect(try cursor.certifyWindow(&.{.{ .property = "rank", .descending = true }}, 3));
+        const probes = owners[0].probes + owners[1].probes;
+        try std.testing.expect(!try cursor.certifyOrder(&.{.{ .property = "rank", .descending = true }}));
+        try std.testing.expectEqual(probes, owners[0].probes + owners[1].probes);
+        try std.testing.expectEqual(@as(?u64, null), try cursor.countRows());
+        try std.testing.expect(!try cursor.enableWeights(.exact));
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var values: std.ArrayList([]const v.Value) = .empty;
+        while (!cursor.done) {
+            const rows = try cursor.next(arena.allocator(), 1);
+            for (rows) |row| {
+                const cells = try arena.allocator().alloc(v.Value, row.len);
+                for (row, cells) |entry, *cell| cell.* = entry.value;
+                try values.append(arena.allocator(), cells);
+            }
+        }
+        try std.testing.expectEqualStrings(try F.run(arena.allocator(), set.backend(), "MATCH (n:Document) RETURN n.id,n.rank ORDER BY CASE WHEN true THEN n.rank ELSE n.rank END DESC LIMIT 3"), try std.json.Stringify.valueAlloc(arena.allocator(), values.items, .{}));
+    }
+}
+
+test "equality-fixed extrema finish at their exact coarse witness budget" {
+    const F = struct {
+        fn ordered(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const b.PropertyFilter, order: []const b.PropertyOrder, _: ?[]const u8, limit: usize, maximum: usize) !?b.Page(*const v.Node) {
+            if (order.len != 1 or !std.mem.eql(u8, order[0].property, "rank")) return null;
+            if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .next = "witness", .examined = 0, .stable_ties = false };
+            // Match native admission: a data request needs a positive remaining
+            // allowance, even when its exclusive tuple would discover EOF.
+            if (maximum == 0) return error.CypherAnchorBudgetExceeded;
+            if (order[0].after != null) return .{ .items = &.{}, .examined = 0, .stable_ties = false };
+            return .{ .items = try a.dupe(*const v.Node, &.{&Fixture.nodes[1]}), .next = "witness", .examined = 1, .stable_ties = false };
+        }
+    };
+    var fixture: Fixture = .{};
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.scan_ordered = F.ordered;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (n:Document) WHERE n.rank=2 RETURN min(n.rank),max(n.rank)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{}, .{ .scanned_anchors = 2 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.stats.scanned_anchors);
+    try std.testing.expectEqual(@as(i128, 2), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i128, 2), result.rows[0][1].integer);
+}
+
+test "group observers preserve shared values when retiring invocation arenas" {
+    const F = struct {
+        fn ordered(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, _: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8, limit: usize, _: usize) !?b.Page(*const v.Node) {
+            if (order.len != 1 or order[0].descending or !std.mem.eql(u8, order[0].property, "id")) return null;
+            if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .next = "", .examined = 0 };
+            return try Fixture.scan(ptr, a, table, after, limit);
+        }
+    };
+    var layers: [18][2]v.Value = undefined;
+    var shared: v.Value = .{ .integer = 1 };
+    for (&layers) |*layer| {
+        layer.* = .{ shared, shared };
+        shared = .{ .list = layer };
+    }
+    var fixture: Fixture = .{};
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.scan_ordered = F.ordered;
+    var suffix: [18 * 3]u8 = undefined;
+    for (0..18) |index| @memcpy(suffix[index * 3 ..][0..3], "[0]");
+    const query = try std.fmt.allocPrint(std.testing.allocator, "MATCH (n:Document) WITH n.id AS k,$p AS p,min($p) AS lo,max($p) AS hi ORDER BY k LIMIT 2 RETURN k,lo{s},hi{s}", .{ &suffix, &suffix });
+    defer std.testing.allocator.free(query);
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{.{ .name = "p", .value = shared }}, .{ .memory_bytes = 2 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    for (result.rows) |row| {
+        try std.testing.expectEqual(@as(i128, 1), row[1].integer);
+        try std.testing.expectEqual(@as(i128, 1), row[2].integer);
+    }
+    try std.testing.expect(result.stats.memory_bytes <= 2 << 20);
 }

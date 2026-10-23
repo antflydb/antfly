@@ -246,8 +246,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             var strength: u8 = 0;
             for (filters) |filter| {
                 if (self.work) |work| try work.charge(work.ptr, 1);
-                if (!std.mem.eql(u8, filter.property, name) or !filterCompatible(column_type, filter.value)) continue;
-                strength = @max(strength, if (filter.op == .eq) @as(u8, 4) else if (filter.op != .in) @as(u8, 2) else 0);
+                if (!std.mem.eql(u8, filter.property, name) or (filter.op != .is_null and !filterCompatible(column_type, filter.value))) continue;
+                strength = @max(strength, if (filter.op == .eq or filter.op == .is_null) @as(u8, 4) else if (filter.op != .in) @as(u8, 2) else 0);
             }
             return strength;
         }
@@ -439,7 +439,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     const column_type = for (schema.tableSchema().relational_columns) |column| {
                         if (std.mem.eql(u8, column.name, filter.property)) break column.column_type;
                     } else continue;
-                    if (!filterCompatible(column_type, filter.value)) continue;
+                    if (filter.op != .is_null and !filterCompatible(column_type, filter.value)) continue;
                     if (column_type == .number and filter.value == .integer and filter.op != .eq and
                         (filter.value.integer < -9007199254740992 or filter.value.integer > 9007199254740992)) continue;
                     const value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, filter.value, .{}), .{ .parse_numbers = false });
@@ -449,8 +449,9 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         .lte => .lte,
                         .gt => .gt,
                         .gte => .gte,
+                        .is_null => .is_null,
                         .in => unreachable,
-                    }, .value = value });
+                    }, .value = if (filter.op == .is_null) null else value });
                 }
                 // Partition equality is a disjointness proof, not an optional
                 // hint. It is first in the filter list so the hint cap cannot
@@ -463,7 +464,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     const name = schema.tableSchema().relational_columns[key.ordinal].name;
                     const enforced = for (conditions.items) |condition| {
                         if (self.work) |work| try work.charge(work.ptr, 1);
-                        if (condition.op == .eq and std.mem.eql(u8, condition.column, name)) break true;
+                        if ((condition.op == .eq or condition.op == .is_null) and std.mem.eql(u8, condition.column, name)) break true;
                     } else false;
                     if (!enforced) continue :candidates;
                 }
@@ -471,25 +472,30 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 opts.relational_query.?.index = index.name;
                 opts.relational_query.?.auto_index = true;
                 opts.relational_query.?.reverse = reverse;
-                if (order.len == 1) if (order[0].after orelse (if (order[0].exclude_null) @as(?v.Value, .null) else null)) |after| {
-                    const values = try temporary.alloc(std.json.Value, prefix + 1);
+                const has_after = for (order) |field| {
+                    if (field.after != null) break true;
+                } else false;
+                const nonnull_only = order.len == 1 and order[0].exclude_null;
+                if (has_after or nonnull_only) {
+                    if (has_after) for (order) |field| if (field.after == null) return error.CypherInvalidBackendPage;
+                    const values = try temporary.alloc(std.json.Value, prefix + order.len);
                     for (index.tuple.keys[0..prefix], values[0..prefix]) |key, *out| {
                         const name = schema.tableSchema().relational_columns[key.ordinal].name;
                         const fixed = for (filters) |filter| {
-                            if (filter.op == .eq and std.mem.eql(u8, filter.property, name)) break filter.value;
+                            if ((filter.op == .eq or filter.op == .is_null) and std.mem.eql(u8, filter.property, name) and (filter.op == .is_null or filterCompatible(key.column_type, filter.value))) break filter.value;
                         } else return error.CypherInvalidBackendPage;
                         out.* = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, fixed, .{}), .{ .parse_numbers = false });
                     }
-                    values[prefix] = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, after, .{}), .{ .parse_numbers = false });
-                    if (order[0].exclude_null) {
+                    for (order, values[prefix..]) |field, *out| out.* = if (field.after) |key| try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, key, .{}), .{ .parse_numbers = false }) else .null;
+                    if (nonnull_only) {
                         const nonnull = try temporary.dupe(std.json.Value, values);
                         nonnull[prefix] = .null;
                         if (index.tuple.keys[prefix].nulls_first) opts.relational_query.?.lower = .{ .values = nonnull, .inclusive = false } else opts.relational_query.?.upper = .{ .values = nonnull, .inclusive = false };
                     }
-                    if (order[0].after != null) {
+                    if (has_after) {
                         if (!reverse) opts.relational_query.?.lower = .{ .values = values, .inclusive = false } else opts.relational_query.?.upper = .{ .values = values, .inclusive = false };
                     }
-                };
+                }
                 opts.relational_query.?.after = if (cursor) |position| position.after else null;
                 opts.relational_query.?.schema_version = if (cursor) |position| position.schema_version else schema.version();
                 const session = db.openRelationalReadSession(temporary, "", "", opts) catch |err| switch (err) {
@@ -606,7 +612,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 }
                 // NUMERIC can round in the Cypher projection; its exact index
                 // bounds are unsafe. Unsupported/mixed operands stay residual.
-                if (!filterCompatible(column_type, operand)) continue;
+                if (filter.op != .is_null and !filterCompatible(column_type, operand)) continue;
                 // Open bounds cannot round a large integer to the neighboring
                 // double: that would exclude a true Cypher comparison.
                 if (column_type == .number and operand == .integer and filter.op != .eq and filter.op != .in and
@@ -618,7 +624,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     .lte => .lte,
                     .gt => .gt,
                     .gte => .gte,
-                }, .value = value });
+                    .is_null => .is_null,
+                }, .value = if (filter.op == .is_null) null else value });
             }
             if (conditions.items.len == 0) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             opts.relational_query.?.conditions = conditions.items;

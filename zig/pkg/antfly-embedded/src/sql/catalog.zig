@@ -202,6 +202,10 @@ pub const Scan = struct {
     /// Advisory SQL OFFSET + LIMIT for costing only. Never a scan stop bound.
     /// Absent when residual selectivity is unknown. Page size remains limit.
     row_goal: ?u64 = null,
+    /// Explicit consumer proof of an exact finite ordered prefix. A provider
+    /// may truncate only when it also attests order_satisfied. Advisory row_goal
+    /// alone never grants this capability.
+    ordered_window: ?u64 = null,
     index_range: ?IndexRange = null,
     fields: []const []const u8,
     /// Mutation-only full document preimage; ordinary reads remain projected.

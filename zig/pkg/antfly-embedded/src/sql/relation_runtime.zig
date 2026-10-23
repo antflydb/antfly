@@ -3594,6 +3594,26 @@ fn Source(comptime Context: type) type {
                 if (scans[index].table.graph == null) break :negotiate;
                 const changed = try search_arena.allocator().dupe(catalog.StatementScan, scans);
                 changed[index].request.order = physical;
+                // A costing row_goal is never a source cap. Grant a separate
+                // exact-prefix proof only across identity frames with no SQL
+                // residual, cardinality observer, or fallible projection.
+                license: {
+                    if (relation.statement.limit == null or relation.statement.predicate != null or context.binding.scalars.predicate != null or relation.statement.scalar_cardinality_limit or binding.rowPreservingScan(relation.root) != index) break :license;
+                    for (context.binding.scalars.projections) |program| if (program) |value| {
+                        if (value.instructions.len != 1 or value.root != 0) break :license;
+                        switch (value.instructions[0].operation) {
+                            .column, .literal => {},
+                            else => break :license,
+                        }
+                    };
+                    const request = changed[index].request;
+                    if (request.primary_key != null or request.after != null or request.graph_source_ordinals or request.conditions.len != 0 or request.graph_filters.len != 0 or request.graph_conditions.len != 0 or request.graph_predicates.len != 0) break :license;
+                    const skip = self.engine.context.offsetCount(relation.statement.offset) catch break :license;
+                    const limit = self.engine.context.count(relation.statement.limit, std.math.maxInt(usize)) catch break :license;
+                    const maximum = skip +| limit;
+                    if (maximum == 0 or maximum > context.limits.scan_rows) break :license;
+                    changed[index].request.ordered_window = maximum;
+                }
                 ordered_scan = index;
                 scans = changed;
                 ordered = requested;
@@ -4681,6 +4701,7 @@ test "transparent graph relations forward order requests and certificates throug
         examined: usize = 0,
         certify: bool,
         negotiated: bool = false,
+        window: ?u64 = null,
         fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
             return error.UnexpectedPhysicalResolve;
         }
@@ -4693,6 +4714,7 @@ test "transparent graph relations forward order requests and certificates throug
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.negotiated = request.order.len == 1 and std.mem.eql(u8, request.order[0].column, "score") and request.order[0].descending and request.order[0].nulls_first;
             self.position = 0;
+            self.window = request.ordered_window;
             return .{ .ptr = self, .next = next, .close = close, .order_satisfied = self.negotiated and self.certify };
         }
         fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
@@ -4720,6 +4742,7 @@ test "transparent graph relations forward order requests and certificates throug
         var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{});
         defer result.deinit();
         try std.testing.expect(fixture.negotiated);
+        try std.testing.expectEqual(@as(?u64, if (std.mem.indexOf(u8, text, "WHERE") == null) 5 else null), fixture.window);
         try std.testing.expectEqual(@as(usize, if (certify) 5 else 13000), fixture.examined);
         try std.testing.expectEqual(@as(usize, 5), result.output.rows.len);
         for (result.output.rows, 0..) |row_values, index| {

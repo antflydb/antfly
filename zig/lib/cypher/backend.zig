@@ -51,14 +51,14 @@ pub fn Page(comptime T: type) type {
         encounter_owners: ?[]const usize = null,
     };
 }
-pub const FilterOp = enum { eq, lt, lte, gt, gte, in };
+pub const FilterOp = enum { eq, lt, lte, gt, gte, in, is_null };
 pub const PropertyFilter = struct { property: []const u8, value: v.Value, op: FilterOp = .eq };
 pub const PropertyOrder = struct {
     property: []const u8,
     descending: bool = false,
     /// A consumer-confirmed complete key group can be excluded on refill.
     /// This is an index tuple bound, including NULL, not a Cypher comparison.
-    /// Only a single varying key may currently carry this hint.
+    /// All keys must carry their component of one complete tuple boundary.
     after: ?v.Value = null,
     exclude_null: bool = false,
 };

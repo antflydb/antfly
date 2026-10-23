@@ -8241,3 +8241,162 @@ def test_indexed_extrema_decline_rewrites_at_stage_ceiling(graph_db):
             {"query": f"MATCH (n:D) {stage} RETURN min(n.score),max(n.score)", "limits": {"recursion_depth": depth}},
         )
         assert constrained["rows"] == [[{"type": "integer", "value": "0"}, {"type": "integer", "value": "29"}]]
+
+
+def test_tuple_distinct_and_singleton_domains_skip_duplicate_runs(graph_db):
+    populate(graph_db, 13000)
+    for start in range(0, 12000, 1000):
+        graph_db.sql(f"UPDATE docs SET score=20000,id='same' WHERE score>={start} AND score<{start + 1000}")
+    graph_db.sql("CREATE INDEX tuples ON docs(score DESC,id)")
+    for stage, score, identity in (("", "n.score", "n.id"), ("WITH n.score AS s,n.id AS k", "s", "k")):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) {stage} RETURN DISTINCT {score},{identity} ORDER BY {score} DESC,{identity} LIMIT 5",
+                "limits": {"scanned_anchors": 16, "memory_bytes": 1 << 20},
+            },
+        )
+        assert [int(row[0]["value"]) for row in result["rows"]] == [20000, 12999, 12998, 12997, 12996]
+    for skip in (0, 1, 3):
+        for projection, predicate, order in (
+            ("7", "", ""),
+            ("n.score", "WHERE n.score=12999", ""),
+            ("7", "", "ORDER BY 7"),
+            ("n.score", "WHERE n.score=20000", "ORDER BY n.score DESC"),
+            ("n.score", "WHERE n.score=12999", "ORDER BY n.score DESC"),
+        ):
+            result = graph_db.cypher_json(
+                "g",
+                {
+                    "query": f"MATCH (n:D) {predicate} RETURN DISTINCT {projection} {order} SKIP {skip} LIMIT 5",
+                    "limits": {"scanned_anchors": 1},
+                },
+            )
+            assert len(result["rows"]) == (1 if skip == 0 else 0)
+    for predicate, expected in (("WHERE n.score=20000", "20000"), ("WHERE n.score<0", None)):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) {predicate} RETURN min(n.score),max(n.score)",
+                "limits": {"scanned_anchors": 2},
+            },
+        )
+        assert [entry["value"] for entry in result["rows"][0]] == [expected, expected]
+    empty = graph_db.cypher_json("g", {"query": "MATCH (n:D) WHERE false RETURN DISTINCT 7 ORDER BY 7 LIMIT 5"})
+    assert empty["rows"] == []
+    nulls = graph_db.cypher_json(
+        "g", {"query": "MATCH (n:D) RETURN min(null),max(null)", "limits": {"scanned_anchors": 1}}
+    )
+    assert [entry["value"] for entry in nulls["rows"][0]] == [None, None]
+    assert nulls["stats"]["scanned_anchors"] == 0
+
+
+def test_ordered_group_aggregates_only_observe_selected_domains(graph_db):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    for observers, anchors in (
+        ("count(*)", 16),
+        ("max(n.score)", 16),
+        ("count(n.score),min(n.score),max(n.score)", 32),
+    ):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) RETURN n.id,{observers} ORDER BY n.id SKIP 2 LIMIT 5",
+                "limits": {"scanned_anchors": anchors, "memory_bytes": 2 << 20},
+            },
+        )
+        assert [row[0]["value"] for row in result["rows"]] == ["n10", "n100", "n1000", "n10000", "n10001"]
+        assert result["stats"]["scanned_anchors"] <= anchors
+    with pytest.raises(af.GraphError, match="DuplicateCypherColumn"):
+        graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.id AS k,count(*) AS k ORDER BY k LIMIT 2"})
+    for query in ("MATCH (n:D) WITH n.id AS k,n RETURN n.id,count(*) AS k ORDER BY k LIMIT 2",):
+        before, ordered = query.split("ORDER BY ")
+        key, tail = ordered.split(" LIMIT ")
+        control = f"{before}ORDER BY CASE WHEN true THEN {key} END LIMIT {tail}"
+        assert (
+            graph_db.cypher_json("g", {"query": query})["rows"] == graph_db.cypher_json("g", {"query": control})["rows"]
+        )
+    with pytest.raises(af.GraphError, match="CypherTypeMismatch"):
+        graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.id,count(*) AS n ORDER BY n.id LIMIT 2"})
+    parameters = {"__antfly_group_0_0": "n1"}
+    query = "MATCH (n:D) WHERE n.id<>$__antfly_group_0_0 RETURN n.id,count(*) ORDER BY n.id LIMIT 5"
+    actual = graph_db.cypher_json("g", {"query": query, "parameters": parameters})
+    control = graph_db.cypher_json(
+        "g",
+        {"query": query.replace("ORDER BY n.id", "ORDER BY CASE WHEN true THEN n.id END"), "parameters": parameters},
+    )
+    assert actual["rows"] == control["rows"]
+    graph_db.sql("UPDATE docs SET id='a' WHERE score<1000")
+    graph_db.sql("UPDATE docs SET id=NULL WHERE score>=1000 AND score<2000")
+    for direction in ("ASC", "DESC"):
+        query = f"MATCH (n:D) RETURN n.id AS k,count(*),count(DISTINCT n.score),min(n.score),max(n.score) ORDER BY k {direction} LIMIT 3"
+        actual = graph_db.cypher_json("g", {"query": query})
+        control = graph_db.cypher_json(
+            "g", {"query": query.replace(f"ORDER BY k {direction}", f"ORDER BY CASE WHEN true THEN k END {direction}")}
+        )
+        assert actual["rows"] == control["rows"]
+    with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+        graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.id,min(1/(n.score-n.score)) ORDER BY n.id LIMIT 1"})
+
+
+def test_tuple_seeks_preserve_mixed_directions_nulls_and_fixed_prefixes(graph_db):
+    populate(graph_db, 90)
+    graph_db.sql("ALTER TABLE docs ADD COLUMN enabled BOOLEAN DEFAULT false")
+    graph_db.sql("UPDATE docs SET id='same' WHERE score<80")
+    graph_db.sql("UPDATE docs SET score=NULL WHERE score>=80")
+    graph_db.sql("CREATE INDEX tuples ON docs(enabled,id DESC,score)")
+    for direction, reverse in (("DESC", "ASC"), ("ASC", "DESC")):
+        for skip in (0, 1, 5):
+            query = f"MATCH (n:D) WHERE n.enabled=false RETURN DISTINCT n.id,n.score ORDER BY n.id {direction},n.score {reverse} SKIP {skip} LIMIT 8"
+            actual = graph_db.cypher_json("g", {"query": query})
+            control = graph_db.cypher_json(
+                "g",
+                {
+                    "query": query.replace(
+                        f"ORDER BY n.id {direction}", f"ORDER BY CASE WHEN true THEN n.id END {direction}"
+                    )
+                },
+            )
+            assert actual["rows"] == control["rows"]
+
+
+def test_sql_graph_ordered_windows_preserve_relational_barriers(graph_db):
+    populate(graph_db, 100)
+    graph_db.sql("UPDATE docs SET score=7 WHERE score<90")
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC,id)")
+    relation = "GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
+    for direction in ("ASC", "DESC"):
+        for skip in (0, 3, 95):
+            for source in (relation, f"(SELECT id,score FROM {relation}) q"):
+                query = f"SELECT q.id,q.score FROM {source} ORDER BY q.score {direction} OFFSET {skip} LIMIT 5"
+                actual = graph_db.sql(query)
+                control = graph_db.sql(query.replace(f"q.score {direction} OFFSET", f"q.score+0 {direction} OFFSET"))
+                assert actual["rows"] == control["rows"]
+    for suffix in (
+        "WHERE q.id='n50' ORDER BY q.score DESC LIMIT 1",
+        "ORDER BY q.score DESC",
+    ):
+        query = f"SELECT q.id,q.score FROM {relation} {suffix}"
+        actual = graph_db.sql(query)
+        control = graph_db.sql(query.replace("ORDER BY q.score DESC", "ORDER BY q.score+0 DESC"))
+        assert actual["rows"] == control["rows"]
+    with pytest.raises((af.AntflyError, SQLStateError)):
+        graph_db.sql(f"SELECT 1/(q.score-q.score) FROM {relation} ORDER BY q.score DESC LIMIT 1")
+
+
+def test_group_observer_plans_retire_between_selected_domains(graph_db):
+    populate(graph_db, 3000)
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    for observer in ("count(*)", "max(n.score)"):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) RETURN n.id,{observer} ORDER BY n.id LIMIT 3000",
+                "limits": {"memory_bytes": 16 << 20},
+            },
+        )
+        assert len(result["rows"]) == 3000
+        assert result["rows"][0][0]["value"] == "n0"
+        assert result["rows"][-1][0]["value"] == "n999"
+        assert result["stats"]["memory_bytes"] <= 16 << 20
