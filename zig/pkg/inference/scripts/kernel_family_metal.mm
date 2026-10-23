@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -87,7 +88,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         }
         for (int version = 0; version < 2; ++version)
             dispatch(queue, pipelines[version], test, buffers[version], data, 1);
-        bool exact = true, guards = true; NSUInteger i = 0, outputs = 0;
+        bool exact = true, guards = true, reference = true; NSUInteger i = 0, outputs = 0, reference_outputs = 0;
         for (NSDictionary *binding in test[@"bindings"]) {
             if ([binding[@"output"] boolValue]) {
                 ++outputs; NSData *initial = data[i];
@@ -97,10 +98,30 @@ int main(int argc, char **argv) { @autoreleasepool {
                 for (int version = 0; version < 2; ++version)
                     guards &= memcmp((char *)[buffers[version][i] contents] + written,
                                      (const char *)initial.bytes + written, initial.length - written) == 0;
+                if (binding[@"reference_file"]) {
+                    ++reference_outputs;
+                    NSData *expected = [NSData dataWithContentsOfFile:[directory stringByAppendingPathComponent:binding[@"reference_file"]]];
+                    NSString *dtype = binding[@"output_dtype"] ?: @"f32";
+                    require([dtype isEqual:@"f32"] || [dtype isEqual:@"f16"], @"Invalid reference dtype");
+                    NSUInteger width = [dtype isEqual:@"f16"] ? 2 : 4;
+                    require(written % width == 0 && expected != nil && expected.length == written / width * 4, @"Invalid reference extent");
+                    double absolute = [binding[@"absolute_tolerance"] doubleValue];
+                    double relative = [binding[@"relative_tolerance"] doubleValue];
+                    require(std::isfinite(absolute) && std::isfinite(relative) && absolute >= 0 && relative >= 0, @"Invalid reference tolerance");
+                    for (int version = 0; version < 2; ++version) {
+                        const void *actual = [buffers[version][i] contents];
+                        for (NSUInteger element = 0; element < written / width; ++element) {
+                            float want = ((const float *)expected.bytes)[element];
+                            float got = width == 2 ? (float)((const _Float16 *)actual)[element] : ((const float *)actual)[element];
+                            reference &= std::isfinite(want) ? (std::isfinite(got) && std::abs((double)got - want) <= absolute + relative * std::abs(want))
+                                       : (std::isnan(want) ? std::isnan(got) : got == want);
+                        }
+                    }
+                }
             }
             ++i;
         }
-        require(outputs > 0 && exact && guards, [NSString stringWithFormat:@"Parity/guard failure %@", test[@"name"]]);
+        require(outputs > 0 && exact && guards && reference, [NSString stringWithFormat:@"Parity/guard/reference failure %@", test[@"name"]]);
         bool resources = pipelines[1].maxTotalThreadsPerThreadgroup >= pipelines[0].maxTotalThreadsPerThreadgroup
                       && pipelines[1].staticThreadgroupMemoryLength <= pipelines[0].staticThreadgroupMemoryLength;
         int warmup = [manifest[@"warmup"] intValue], repeats = [manifest[@"repeats"] intValue];
@@ -124,6 +145,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         [results addObject:@{@"name":test[@"name"], @"kernel":name, @"exact":@(exact), @"guards":@(guards),
             @"baseline_ns":@(medians[0]), @"candidate_ns":@(medians[1]), @"ratio":@(ratio), @"pass":@(ok),
             @"resources_pass":@(resources), @"arms":arms,
+            @"reference_outputs":@(reference_outputs), @"reference_pass":reference_outputs ? @(reference) : [NSNull null],
             @"baseline_max_threads":@(pipelines[0].maxTotalThreadsPerThreadgroup),
             @"candidate_max_threads":@(pipelines[1].maxTotalThreadsPerThreadgroup),
             @"baseline_static_bytes":@(pipelines[0].staticThreadgroupMemoryLength),

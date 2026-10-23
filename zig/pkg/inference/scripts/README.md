@@ -123,7 +123,12 @@ threads, dynamic scratch, math mode and balanced timing protocol. Build it with
 pinned `nvcc -O3 -arch=native -lcuda`. The Metal executable takes
 `MANIFEST RECEIPT`; CUDA takes `BASELINE_IMAGE CANDIDATE_IMAGE CASES_BIN RECEIPT`.
 Both compare every declared output and guard byte, then time fixed addresses
-with balanced arms. CUDA also checks outputs, guards and persistent workspaces
+with balanced arms. Metal output bindings may additionally specify a
+`reference_file` of independent F32 values, `output_dtype: f32|f16`, and
+nonnegative `absolute_tolerance` / `relative_tolerance` (default zero). Both
+versions must match the reference before timing. Receipts distinguish outputs
+with references from ordinary differential-only outputs.
+ CUDA also checks outputs, guards and persistent workspaces
 after captured replay against separate correctness buffers. Optional `--long`
 after `RECEIPT` selects 32 balanced arms with 4,000 kernels per arm; the default
 uses 16 arms with 1,000 kernels per arm. Event time is divided by the actual

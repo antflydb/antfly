@@ -1076,8 +1076,10 @@ unqualified implementation as achieved savings.
 
 ## Proposed next bulk campaign: kernel bodies and typed launch ownership
 
-Status: proposed implementation plan, following the completed 24-package
-campaign. Freeze production baseline `0f10101b97825ecd9cb0cbf682ac426dec08f6da`
+Status: implementation in progress, following the completed 24-package
+campaign. Baseline source, images and qualified executables are frozen;
+package ownership and qualification receipts are tracked under ignored
+`.benchmark-assets/1166/next-bulk/`. Freeze production baseline `0f10101b97825ecd9cb0cbf682ac426dec08f6da`
 and preserve the existing work in `.worktrees/inference-unified-execution`.
 Treat the following **36 packages as one campaign**, with six implementation
 waves and integrated acceptance. Package boundaries are review/qualification
@@ -1199,6 +1201,30 @@ regions flow through their existing generators.
 | N34 | Retire superseded owners and duplicate metadata | Remove replaced private bodies/helpers and stale per-family declarations; retain exported ABI wrappers and required compatibility symbols. Include header/metadata dependency closure in source/JIT/artifact identities and freshness checks. File splitting alone is not deletion. |
 | N35 | Complete reusable fixture and ownership coverage | Extend existing runners for typed-ABI probes, auxiliary outputs, stateful replay and allocation failures as each package starts; finish the coverage audit here. Retain manifests/source hashes and actual dispatch evidence. Independent references must not silently become calls to the new production helper. |
 | N36 | Qualify the full composition and publish the ledger | Freeze the final candidate, compare all changes to N01's original baseline, regenerate/check artifacts, run model/training/lifetime/soak gates, collect caches and commit coherent waves with a clean worktree. Report retained specializations and hardware/toolchain limits explicitly. No push/deployment step. |
+
+### First implementation checkpoint: typed Metal and codec owners
+
+N07–N10 and N12 now share 27 exported Metal entry points through 13 native
+helpers: Q6_K subgroup count, ordinary Q8_0 matrix input storage, paired Q8_0
+matrix/RMS output storage, and nine format-local set-row/copy encoders. Native
+ABIs, exact accumulator sizes, arithmetic and format-specific packing remain
+unchanged. This cohort removes **20,187 bytes** from authored Metal source,
+after counting all helpers; it is outside the preceding campaign's ledger.
+
+All 282 direct safe/fast cases pass baseline bytes, guards, resources and the
+5% timing ceiling using 32 balanced arms / 2,000 dispatches. Seventy-eight cases
+also compare against independent F32/F16 arithmetic references. The harness
+rejects a deliberately incorrect reference. Nine existing codec reference tests
+pass on the actual Metal device.
+
+The first encoder helper version preserved bytes but regressed timing across
+126 cases. Its receipts remain retained. Requiring `always_inline` for these
+format-local helpers resolves the regression across the complete 180-case
+encoder control and the complete 282-case final cohort. The attribute is a
+necessary schedule/compiler constraint, not a relaxation of the budget.
+Ignored baseline identities, sources, raw arms and receipts are under
+`.benchmark-assets/1166/next-bulk/`; the full 36-package composition remains in
+progress.
 
 ### Six implementation waves
 
