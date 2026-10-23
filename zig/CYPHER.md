@@ -2620,9 +2620,10 @@ may move between index positions.
 Residual predicates and label membership run on every authorized candidate;
 scanning stops only after SKIP+LIMIT qualifying rows. Fallible projections and
 predicates retain eager execution so a window cannot hide an error. Candidate
-reads, including rejected rows, consume the anchor budget. This path currently
-uses the index for order; residual property predicates do not establish seek
-bounds on that ordered scan.
+reads, including rejected rows, consume the anchor budget. Compatible typed conjunctions establish native seek bounds on the ordered
+index. Sparse IN domains and stronger equality access paths on another index
+retain the native selective planner and a bounded Cypher top-k. Unsupported
+storage operands remain authoritative runtime residuals.
 
 Distributed reads negotiate the same capability over authenticated RPC. For
 multiple owners, a metadata-only probe establishes that every owner can provide
@@ -2659,3 +2660,55 @@ states), a two-identity domain examines two anchors (60 states), and indexed
 rank cases consume 388 and 722 states respectively, with less than 150 KiB
 reported statement memory. Tests enforce a 2,000-state, 1 MiB ceiling for
 these range cases rather than relying on elapsed-time thresholds.
+
+
+### Bounded ordered execution across graph and SQL boundaries
+
+Ordered native pages expose an optional exact continuation after each emitted
+item. A zero-row capability probe advertises this support with an empty cursor
+array. Authenticated RPC carries the array alongside the node page; legacy
+providers retain one-item reads. The final item resumes after the full examined
+page, including its rejected tail, while intermediate items resume after that
+specific row. Schema/index identity and the statement cut fence every token.
+
+The distributed heap retains one head per owner backed by bounded owner pages.
+It primes individual heads before speculative refills, caps refills by remaining
+output demand, and uses small reads when the remaining anchor budget is tight.
+All speculative and repeated records count against the global scan ceiling.
+Continuations advance only for consumed items, so unused prefetched nodes need
+not be serialized or retained across calls. Buffers use the execution allocator
+and remain bounded by coordinator demand and owner count.
+The two-owner regression returns 1,000 rows in 34 RPCs instead of 1,010,
+examining 1,016 records including lookahead. With alternating records hidden,
+it returns all 512 visible rows in 23 RPCs and accounts for all 1,024 records.
+
+SQL GRAPH_TABLE requests negotiate ordering before pulling rows. Direct typed
+scalar projection columns map to the shared Cypher order proof, including exact
+null placement. Both embedded and distributed wrappers preserve the resulting
+order certificate. The relational source adapter maps a direct graph scan's
+internal SQL columns back to graph projection columns before statement capture,
+then forwards only the physical cursor's attested order. Joins, derived
+relations, and previously captured mutation cursors retain their normal paths.
+A SQL executor regression requires five physical rows for an attested top-five
+query over 13,000 rows and checks the full-sort fallback when proof is declined.
+SQL retains its residuals and applies its normal row-goal
+rules; a graph cursor never truncates the relation using an advisory row goal.
+Fallible graph projections, incompatible ordering, staged postimages, and
+synthetic source ordinals decline the certificate. Ordered replay tokens use a
+separate ordinal namespace and must re-establish the same order on resume;
+legacy unordered tokens retain their original interpretation.
+
+A later SKIP/LIMIT over a ranked periodic domain slices inherited encounter
+order directly. Contiguous packets require a linear metadata pass. Interleaved
+packets use monotone rank searches through immutable provenance, including
+holes left by filters. Neither path walks the skipped rows. Small selected
+windows render only their surviving points, preserving floating AVG recurrence
+and collection order. The 1,300,000-value g,x-ranked window followed by
+SKIP 500000 LIMIT 5 is covered by a 2,000-state, 1 MiB public regression.
+
+On the 13,000-document public fixture, the selective ordered range examines
+five anchors in 213 states, and ordered equality examines one anchor in 45
+states on both storage backends. Warm SQL GRAPH_TABLE top-five calls measured
+about 0.3 ms on Lite and 4 ms on Directory, versus roughly 73 ms and 33 ms
+before order negotiation reached the relational source adapter. These timings
+are illustrative; regressions enforce physical work and resource ceilings.

@@ -165,5 +165,5 @@ pub fn open(adapter: anytype, a: A, binding: catalog.graph_relation.Binding, req
         parameter.* = .{ .name = name, .value = try cypher.value.Value.fromJson(temporary.allocator(), adapter.graph_parameters[index - 1]) };
     }
     self.child = try catalog.graph_relation.Cursor.open(a, binding, provider, parameters, request, .{});
-    return .{ .ptr = self, .next = Cursor.next, .close = Cursor.close, .count_rows = Cursor.countRows, .enable_weights = Cursor.enableWeights, .enable_aggregate_weights = Cursor.enableAggregateWeights, .estimated_rows = self.child.estimated_rows };
+    return .{ .order_satisfied = self.child.order_satisfied, .ptr = self, .next = Cursor.next, .close = Cursor.close, .count_rows = Cursor.countRows, .enable_weights = Cursor.enableWeights, .enable_aggregate_weights = Cursor.enableAggregateWeights, .estimated_rows = self.child.estimated_rows };
 }

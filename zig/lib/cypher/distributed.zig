@@ -209,9 +209,17 @@ pub const ReadSet = struct {
         try checkpoint(ptr);
         return .{ .items = page.items, .examined = page.examined, .unfiltered = page.unfiltered, .next = try self.next(a, table, position, page.next) };
     }
-    const OrderedPosition = struct { owner: usize, after: ?[]const u8 = null, finished: bool = false };
+    const OrderedPosition = struct { owner: usize, batched: bool = false, after: ?[]const u8 = null, finished: bool = false };
     const OrderedHead = struct { node: *const v.Node, after: ?[]const u8 };
-    const OrderedSlot = struct { position: OrderedPosition, head: ?OrderedHead = null };
+    const OrderedSlot = struct {
+        position: OrderedPosition,
+        head: ?OrderedHead = null,
+        buffer: []const *const v.Node = &.{},
+        cursors: ?[]const ?[]const u8 = null,
+        offset: usize = 0,
+        next: ?[]const u8 = null,
+        primed: bool = false,
+    };
     const OrderedMerge = struct {
         read_set: *ReadSet,
         a: A,
@@ -220,6 +228,8 @@ pub const ReadSet = struct {
         order: []const b.PropertyOrder,
         max_examined: usize,
         examined: usize = 0,
+        quantum: usize = 1,
+        demand: usize = 1,
         fn charge(ptr: *anyopaque, amount: usize) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.read_set.work) |work| try work.charge(work.ptr, amount);
@@ -228,15 +238,32 @@ pub const ReadSet = struct {
             const owner = self.read_set.snapshots[slot.position.owner].backend;
             const read = owner.vtable.scan_ordered orelse return error.CypherInvalidBackendPage;
             while (!slot.position.finished) {
+                if (slot.offset < slot.buffer.len) {
+                    const index = slot.offset;
+                    slot.offset += 1;
+                    slot.head = .{ .node = slot.buffer[index], .after = if (slot.cursors) |positions| positions[index] else slot.next };
+                    return;
+                }
                 if (self.examined == self.max_examined) return error.CypherAnchorBudgetExceeded;
-                const page = (try read(owner.ptr, self.a, self.table, self.filters, self.order, slot.position.after, 1, self.max_examined - self.examined)) orelse return error.CypherInvalidBackendPage;
+                // Prime one head per owner before speculating. Refills scale
+                // with the remaining output demand, not the entire table.
+                const count = if (slot.position.batched and slot.primed) @max(1, @min(self.quantum, self.demand)) else 1;
+                const page = (try read(owner.ptr, self.a, self.table, self.filters, self.order, slot.position.after, count, self.max_examined - self.examined)) orelse return error.CypherInvalidBackendPage;
+                slot.primed = true;
                 const examined = page.examined orelse page.items.len;
-                if (page.items.len > 1 or examined < page.items.len or examined > self.max_examined - self.examined) return error.CypherInvalidBackendPage;
+                if (page.items.len > count or examined < page.items.len or examined > self.max_examined - self.examined) return error.CypherInvalidBackendPage;
                 self.examined += examined;
                 if (page.items.len != 0) {
-                    if (!std.mem.eql(u8, page.items[0].identity.table, self.table)) return error.CypherInvalidBackendPage;
-                    slot.head = .{ .node = page.items[0], .after = page.next };
-                    return;
+                    for (page.items) |node| if (!std.mem.eql(u8, node.identity.table, self.table)) return error.CypherInvalidBackendPage;
+                    if (page.cursors) |positions| {
+                        if (positions.len != page.items.len or (positions[positions.len - 1] == null and page.next != null)) return error.CypherInvalidBackendPage;
+                        for (positions[0 .. positions.len - 1]) |position| if (position == null) return error.CypherInvalidBackendPage;
+                    } else if (page.items.len > 1) return error.CypherInvalidBackendPage;
+                    slot.buffer = page.items;
+                    slot.cursors = page.cursors;
+                    slot.offset = 0;
+                    slot.next = page.next;
+                    continue;
                 }
                 if (page.next == null) slot.position.finished = true else {
                     if (slot.position.after) |before| if (std.mem.eql(u8, before, page.next.?)) return error.CypherInvalidBackendPage;
@@ -293,7 +320,13 @@ pub const ReadSet = struct {
                 return null;
             };
             try checkpoint(ptr);
-            return .{ .items = page.items, .examined = page.examined, .next = if (page.next) |after| try std.json.Stringify.valueAlloc(a, &.{OrderedPosition{ .owner = index, .after = after }}, .{}) else null };
+            const cursors = if (page.cursors) |positions| blk: {
+                if (positions.len != page.items.len) return error.CypherInvalidBackendPage;
+                const saved = try a.alloc(?[]const u8, positions.len);
+                for (positions, saved) |position_after, *out| out.* = if (position_after) |after| try std.json.Stringify.valueAlloc(a, &.{OrderedPosition{ .owner = index, .after = after }}, .{}) else null;
+                break :blk saved;
+            } else null;
+            return .{ .items = page.items, .cursors = cursors, .examined = page.examined, .next = if (page.next) |after| try std.json.Stringify.valueAlloc(a, &.{OrderedPosition{ .owner = index, .after = after }}, .{}) else null };
         }
         var arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer arena.deinit();
@@ -308,7 +341,7 @@ pub const ReadSet = struct {
                 const read = snapshot.backend.vtable.scan_ordered orelse return null;
                 const proof = (try read(snapshot.backend.ptr, temporary, table, filters, order, null, 0, 0)) orelse return null;
                 if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
-                try positions.append(temporary, .{ .owner = owner, .after = proof.next });
+                try positions.append(temporary, .{ .owner = owner, .after = proof.next, .batched = proof.cursors != null });
             }
         }
         var count: usize = 0;
@@ -320,7 +353,7 @@ pub const ReadSet = struct {
         if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = try std.json.Stringify.valueAlloc(a, positions.items, .{}) };
         const slots = try temporary.alloc(OrderedSlot, count);
         var heap: std.ArrayList(usize) = .empty;
-        var merge: OrderedMerge = .{ .read_set = self, .a = a, .table = table, .filters = filters, .order = order, .max_examined = max_examined };
+        var merge: OrderedMerge = .{ .read_set = self, .a = a, .table = table, .filters = filters, .order = order, .max_examined = max_examined, .quantum = if (max_examined > limit *| 2 +| count) @max(1, @min(64, limit / count)) else 1, .demand = limit };
         var work: @import("value_work.zig").Work = .{ .a = temporary, .ptr = &merge, .charge = OrderedMerge.charge };
         for (slots, positions.items, 0..) |*slot, position, index| {
             slot.* = .{ .position = position };
@@ -341,6 +374,7 @@ pub const ReadSet = struct {
             slot.position.finished = slot.position.after == null;
             slot.head = null;
             if (output.items.len == limit) break;
+            merge.demand = limit - output.items.len;
             try merge.fetch(slot);
             if (slot.head == null) {
                 heap.items[0] = heap.items[heap.items.len - 1];
@@ -681,7 +715,7 @@ test "ordered owner streams merge stable ties through RPC and bounded continuati
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 if (!self.enabled or order.len != 1 or !std.mem.eql(u8, order[0].property, "score")) return null;
                 const start = if (after) |bytes| try std.fmt.parseInt(usize, bytes, 10) else 0;
-                if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = try std.fmt.allocPrint(a, "{d}", .{start}) };
+                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .next = try std.fmt.allocPrint(a, "{d}", .{start}) };
                 const end = @min(3, start + @min(limit, max_examined));
                 const sorted = if (self.index == 0) [_]usize{ 1, 2, 0 } else [_]usize{ 0, 2, 1 };
                 var output: std.ArrayList(*const v.Node) = .empty;
@@ -691,7 +725,15 @@ test "ordered owner streams merge stable ties through RPC and bounded continuati
                     if (self.deny_b and std.mem.eql(u8, node.identity.key, "b")) continue;
                     try output.append(a, node);
                 }
-                return .{ .items = output.items, .examined = end - start, .next = if (end < 3) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+                const cursors = try a.alloc(?[]const u8, output.items.len);
+                var emitted: usize = 0;
+                for (start..end) |position| {
+                    const node = &Self.nodes[self.index * 3 + sorted[if (order[0].descending) position else 2 - position]];
+                    if (self.deny_b and std.mem.eql(u8, node.identity.key, "b")) continue;
+                    cursors[emitted] = if (position + 1 == 3) null else try std.fmt.allocPrint(a, "{d}", .{position + 1});
+                    emitted += 1;
+                }
+                return .{ .items = output.items, .cursors = cursors, .examined = end - start, .next = if (end < 3) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
             }
         };
         fn rpc(ptr: *anyopaque, a: A, request: []const u8) ![]u8 {
@@ -747,4 +789,104 @@ test "ordered owner streams merge stable ties through RPC and bounded continuati
     }
     host.revoked = true;
     try std.testing.expectError(error.Forbidden, backend.vtable.scan_ordered.?(backend.ptr, arena.allocator(), "docs", &.{}, order, null, 1, 64));
+}
+
+test "ordered RPC buffers keep calls bounded and resume every unconsumed item" {
+    const rpc = @import("rpc.zig");
+    const root = @import("root.zig");
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
+    const Fixture = struct {
+        nodes: [1024]v.Node = undefined,
+        properties: [1024][1]v.Entry = undefined,
+        keys: [1024][16]u8 = undefined,
+        hidden: bool = false,
+        const Owner = struct {
+            fixture: *ThisFixture,
+            index: usize,
+            calls: usize = 0,
+            records: usize = 0,
+            fn backend(self: *@This()) b.Backend {
+                return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = check, .scan = scan, .scan_ordered = ordered, .get = get, .expand = expand } };
+            }
+            fn bind(_: *anyopaque, _: A, _: catalog.Graph) !void {}
+            fn check(_: *anyopaque) !void {}
+            fn close(_: *anyopaque) void {}
+            fn get(_: *anyopaque, _: A, _: v.Identity) !?*const v.Node {
+                return null;
+            }
+            fn expand(_: *anyopaque, _: A, _: catalog.Relationship, _: v.Identity, _: ast.Direction, _: ?[]const u8, _: usize) !b.Page(*const v.Relationship) {
+                return .{ .items = &.{} };
+            }
+            fn scan(_: *anyopaque, _: A, _: []const u8, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+                return error.UnexpectedScan;
+            }
+            fn ordered(ptr: *anyopaque, a: A, _: []const u8, _: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8, limit: usize, maximum: usize) !?b.Page(*const v.Node) {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (order.len != 1 or !order[0].descending or !std.mem.eql(u8, order[0].property, "score")) return null;
+                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .next = "0" };
+                const start = if (after) |bytes| try std.fmt.parseInt(usize, bytes, 10) else 0;
+                const end = @min(512, start + @min(limit, maximum));
+                self.records += end - start;
+                var nodes: std.ArrayList(*const v.Node) = .empty;
+                var cursors: std.ArrayList(?[]const u8) = .empty;
+                for (start..end) |position| {
+                    const node = &self.fixture.nodes[self.index * 512 + 511 - position];
+                    if (self.fixture.hidden and @mod(node.properties[0].value.integer, 2) == 0) continue;
+                    try nodes.append(a, node);
+                    try cursors.append(a, if (position == 511) null else try std.fmt.allocPrint(a, "{d}", .{position + 1}));
+                }
+                return .{ .items = nodes.items, .cursors = cursors.items, .examined = end - start, .next = if (end < 512) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+            }
+        };
+        const ThisFixture = @This();
+        fn checkSource(_: *anyopaque) !void {}
+        fn invoke(ptr: *anyopaque, a: A, body: []const u8) ![]u8 {
+            const endpoint: *rpc.Owner = @ptrCast(@alignCast(ptr));
+            const owner: *Owner = @ptrCast(@alignCast(endpoint.backend.ptr));
+            owner.calls += 1;
+            return endpoint.execute(a, body);
+        }
+    };
+    var fixture: Fixture = .{};
+    for (&fixture.nodes, &fixture.properties, &fixture.keys, 0..) |*node, *properties, *key, index| {
+        properties.* = .{.{ .name = "score", .value = .{ .integer = @intCast(index % 512 * 2 + index / 512) } }};
+        node.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.bufPrint(key, "k{d}", .{index}) }, .labels = &.{"D"}, .properties = properties };
+    }
+    var owners = [_]Fixture.Owner{ .{ .fixture = &fixture, .index = 0 }, .{ .fixture = &fixture, .index = 1 } };
+    var endpoints = [_]rpc.Owner{ .{ .backend = owners[0].backend(), .graph = graph, .table = "docs" }, .{ .backend = owners[1].backend(), .graph = graph, .table = "docs" } };
+    var clients = [_]rpc.Client{ .{ .channel = .{ .ptr = &endpoints[0], .call = Fixture.invoke }, .incarnation = 1, .revision = 1 }, .{ .channel = .{ .ptr = &endpoints[1], .call = Fixture.invoke }, .incarnation = 1, .revision = 1 } };
+    var snapshots = [_]Snapshot{ .{ .backend = clients[0].backend(), .ptr = &owners[0], .validate = Fixture.Owner.check, .close = Fixture.Owner.close }, .{ .backend = clients[1].backend(), .ptr = &owners[1], .validate = Fixture.Owner.check, .close = Fixture.Owner.close } };
+    const targets = [_]Target{ .{ .table = "docs", .table_id = 1, .group_id = 1 }, .{ .table = "docs", .table_id = 1, .group_id = 2 } };
+    var set: ReadSet = .{ .a = std.testing.allocator, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &fixture, .checkpoint = Fixture.checkSource, .admit = undefined, .capture = undefined } };
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(std.testing.allocator, "MATCH (n:D) RETURN n.score ORDER BY n.score DESC LIMIT 1000", .{}, &diagnostic);
+    defer compiled.deinit();
+    for ([_]bool{ false, true }) |hidden| {
+        fixture.hidden = hidden;
+        for (&owners) |*owner| {
+            owner.calls = 0;
+            owner.records = 0;
+        }
+        var result = try root.runtime.execute(std.testing.allocator, set.backend(), graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, if (hidden) 512 else 1000), result.rows.len);
+        for (result.rows, 0..) |row, index| try std.testing.expectEqual(@as(i64, 1023) - @as(i64, @intCast(index * (if (hidden) @as(usize, 2) else 1))), row[0].integer);
+        try std.testing.expect(owners[0].calls + owners[1].calls < 80);
+        try std.testing.expectEqual(result.stats.scanned_anchors, owners[0].records + owners[1].records);
+    }
+    fixture.hidden = false;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var after: ?[]const u8 = null;
+    var ordinal: usize = 0;
+    const backend = set.backend();
+    while (true) {
+        const page = (try backend.vtable.scan_ordered.?(backend.ptr, arena.allocator(), "docs", &.{}, &.{.{ .property = "score", .descending = true }}, after, 17, 4096)).?;
+        for (page.items) |node| {
+            try std.testing.expectEqual(@as(i64, 1023) - @as(i64, @intCast(ordinal)), node.properties[0].value.integer);
+            ordinal += 1;
+        }
+        after = page.next orelse break;
+    }
+    try std.testing.expectEqual(@as(usize, 1024), ordinal);
 }

@@ -7449,6 +7449,7 @@ test "ordered lineage programs release allocations after proof and packet failur
     for ([_][]const u8{
         "MATCH (n:Document) WHERE elementId(n) IN ['{\"kind\":\"node\",\"table\":\"docs\",\"key\":\"a\"}',null,'invalid'] RETURN n.id",
         "UNWIND range(1,150) AS x WITH x,x%3 AS g ORDER BY g%2,x+g LIMIT 5 RETURN avg(x)",
+        "UNWIND range(1,150) AS x WITH x,x%3 AS g ORDER BY g,x LIMIT 140 WITH x,g SKIP 130 LIMIT 5 RETURN avg(x)",
         "UNWIND range(1,150) AS x WITH x,x%3 AS g ORDER BY g,x LIMIT 90 RETURN head(collect(x)),last(collect(x)),collect(x)[..3],collect(x)[-3..]",
         "MATCH (n:Document) WHERE antfly.documentKey(n) IN ['a','b','a',null] RETURN n.id ORDER BY n.id",
         "UNWIND range(1,150) AS x WITH x,x%3 AS g ORDER BY g,x SKIP 45 LIMIT 10 RETURN avg(x)",
@@ -7628,6 +7629,7 @@ test "retained ordered domains stay compressed through reducers and ranking" {
         .{ .text = "UNWIND range(1,1300000)+range(1,1300000) AS x WITH x ORDER BY x LIMIT 1300000 RETURN count(*),sum(x)", .control = "UNWIND range(1,650000) AS x RETURN 1300000,sum(x)*2" },
         .{ .text = "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY g,x LIMIT 650000 RETURN head(collect(x)),last(collect(x))", .control = "UNWIND [10,1299994] AS x RETURN head(collect(x)),last(collect(x))" },
         .{ .text = "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY g%2,x+g LIMIT 5 RETURN avg(x)", .control = "UNWIND [2,4,10,6,12] AS x RETURN avg(x)" },
+        .{ .text = "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY g,x LIMIT 650000 WITH x,g SKIP 500000 LIMIT 5 RETURN avg(x)", .control = "RETURN 1100023.0" },
     }) |item| {
         var diagnostic: c.Diagnostic = .{};
         var compiled = try c.compile(a, item.text, .{}, &diagnostic);
@@ -7785,4 +7787,15 @@ test "ordered node certificates bound scans preserve residuals and decline falli
     defer result.deinit();
     try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    fixture.calls = 0;
+    var plain = try c.compile(std.testing.allocator, "MATCH (n:Document) RETURN n.rank AS r", .{}, &diagnostic);
+    defer plain.deinit();
+    const stream = (try runtime.NodeCursor.open(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, plain.query, &.{}, .{ .scanned_anchors = 1 })).?;
+    defer stream.close();
+    try std.testing.expect(try stream.certifyOrder(&.{.{ .property = "r", .descending = true }}));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rows = try stream.next(arena.allocator(), 1);
+    try std.testing.expectEqual(@as(i64, 3), rows[0][0].value.integer);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
 }

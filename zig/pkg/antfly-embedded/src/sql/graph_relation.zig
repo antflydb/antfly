@@ -281,6 +281,9 @@ fn scanQuery(a: A, binding: Binding, request: catalog.Scan) !cypher.ast.Query {
         for (request.fields) |field| if (std.mem.eql(u8, name, field)) {
             needed = true;
         };
+        for (request.order) |order| if (std.mem.eql(u8, name, order.column)) {
+            needed = true;
+        };
         for (request.conditions) |condition| if (std.mem.eql(u8, name, condition.column)) {
             needed = true;
         };
@@ -307,6 +310,7 @@ pub const Cursor = struct {
     position: usize = 0,
     resume_position: usize = 0,
     optimized: bool = true,
+    ordered: bool = false,
     empty: bool = false,
     weight_passes: []const WeightPass = &.{},
     weight_pass: usize = 0,
@@ -321,7 +325,8 @@ pub const Cursor = struct {
         for (request.fields, fields) |field, *out| out.* = try owned.dupe(u8, field);
         const conditions = try owned.alloc(catalog.Condition, request.conditions.len);
         for (request.conditions, conditions) |condition, *out| out.* = .{ .column = try owned.dupe(u8, condition.column), .op = condition.op, .value = try @import("../storage/typed_json.zig").clone(owned, condition.value), .operand = try @import("operators.zig").cloneDatum(owned, condition.datum()) };
-        const optimized = if (request.after) |after| std.mem.startsWith(u8, after, "g:") else true;
+        const ordered_resume = if (request.after) |after| std.mem.startsWith(u8, after, "o:") else false;
+        const optimized = if (request.after) |after| std.mem.startsWith(u8, after, "g:") or ordered_resume else true;
         const resume_position = if (request.after) |after| try std.fmt.parseUnsigned(usize, if (optimized) after[2..] else after, 10) else 0;
         var query_request = request;
         // Tagged tokens resume the same pruned/pushed relation. Legacy ordinal
@@ -336,6 +341,37 @@ pub const Cursor = struct {
         } else false;
         const stream = if (empty) null else try cypher.runtime.NodeCursor.open(a, backend, binding.graph, compiled.query, parameters, limits);
         errdefer if (stream) |cursor| cursor.close();
+        var ordered = false;
+        var source_ordinals = request.graph_source_ordinals;
+        for (request.fields) |field| source_ordinals = source_ordinals or std.mem.eql(u8, field, "_id");
+        for (request.conditions) |condition| source_ordinals = source_ordinals or std.mem.eql(u8, condition.column, "_id");
+        for (request.graph_filters) |filter| source_ordinals = source_ordinals or filterNeeds(filter, "_id");
+        if (stream) |cursor| if (request.order.len != 0 and (request.after == null or ordered_resume) and request.primary_key == null and !source_ordinals) {
+            var order: std.ArrayList(cypher.backend.PropertyOrder) = .empty;
+            var compatible = true;
+            for (request.order) |key| {
+                if (key.nulls_first != key.descending) {
+                    compatible = false;
+                    break;
+                }
+                const item = for (binding.definition.query.clauses[1].operation.project.value.items) |item| {
+                    if (std.mem.eql(u8, item.alias.?, key.column)) break item;
+                } else {
+                    compatible = false;
+                    break;
+                };
+                switch (expressionType(binding, item.expression)) {
+                    .integer, .string, .boolean => {},
+                    else => {
+                        compatible = false;
+                        break;
+                    },
+                }
+                try order.append(owned, .{ .property = key.column, .descending = key.descending });
+            }
+            if (compatible) ordered = try cursor.certifyOrder(order.items);
+        };
+        if (ordered_resume and !ordered) return error.InvalidSqlBackendResponse;
         var result: ?cypher.runtime.Result = if (!empty and stream == null) try cypher.runtime.execute(a, backend, binding.graph, &compiled, parameters, limits) else null;
         errdefer if (result) |*value| value.deinit();
         var copied = request;
@@ -345,8 +381,8 @@ pub const Cursor = struct {
         copied.after = null;
         copied.primary_key = if (request.primary_key) |key| try owned.dupe(u8, key) else null;
         if ((empty and resume_position != 0) or (result != null and resume_position > result.?.rows.len)) return error.InvalidSqlBackendResponse;
-        self.* = .{ .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .empty = empty };
-        return .{ .ptr = self, .next = next, .close = close, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
+        self.* = .{ .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .ordered = ordered, .empty = empty };
+        return .{ .order_satisfied = ordered, .ptr = self, .next = next, .close = close, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
     }
     fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
@@ -539,7 +575,7 @@ pub const Cursor = struct {
             }
         }
         const more = if (self.weight_passes.len != 0) !self.stream.?.done or self.weight_pass + 1 < self.weight_passes.len else if (self.empty) false else if (self.stream) |stream| !stream.done else self.position < self.result.?.rows.len;
-        return .{ .rows = try output.toOwnedSlice(owned), .aggregate_inputs = if (self.weight_passes.len != 0 and self.weight_passes[self.weight_pass].plan.statistic != null) aggregate_inputs.items else null, .exact_multiplicities = if (counts.items.len != 0) counts.items else null, .multiplicities = if (self.stream != null and self.stream.?.weighted) try weights.toOwnedSlice(owned) else null, .aggregate_slots = if (self.weight_passes.len != 0) try owned.dupe(usize, self.weight_passes[self.weight_pass].slots) else null, .owned_arena = arena, .after = if (!more) null else if (self.weight_passes.len != 0) try std.fmt.allocPrint(owned, "ag:{d}:{d}", .{ self.weight_pass, self.position }) else try std.fmt.allocPrint(owned, "{s}{d}", .{ if (self.optimized) "g:" else "", self.position }) };
+        return .{ .rows = try output.toOwnedSlice(owned), .aggregate_inputs = if (self.weight_passes.len != 0 and self.weight_passes[self.weight_pass].plan.statistic != null) aggregate_inputs.items else null, .exact_multiplicities = if (counts.items.len != 0) counts.items else null, .multiplicities = if (self.stream != null and self.stream.?.weighted) try weights.toOwnedSlice(owned) else null, .aggregate_slots = if (self.weight_passes.len != 0) try owned.dupe(usize, self.weight_passes[self.weight_pass].slots) else null, .owned_arena = arena, .after = if (!more) null else if (self.weight_passes.len != 0) try std.fmt.allocPrint(owned, "ag:{d}:{d}", .{ self.weight_pass, self.position }) else try std.fmt.allocPrint(owned, "{s}{d}", .{ if (self.ordered) "o:" else if (self.optimized) "g:" else "", self.position }) };
     }
 
     fn close(ptr: *anyopaque) void {
@@ -571,6 +607,15 @@ test "SQL GRAPH_TABLE dependency partitions share quotas and resume narrow pages
             const out = try a.alloc(*const cypher.value.Node, end - start);
             for (out, start..) |*node, i| node.* = &nodes[i];
             return .{ .items = out, .next = if (end < nodes.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+        fn ordered(_: *anyopaque, a: A, _: []const u8, _: []const cypher.backend.PropertyFilter, order: []const cypher.backend.PropertyOrder, after: ?[]const u8, limit: usize, _: usize) !?cypher.backend.Page(*const cypher.value.Node) {
+            if (order.len != 1 or !std.mem.eql(u8, order[0].property, "rank")) return null;
+            if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = "0" };
+            const start = if (after) |text| try std.fmt.parseInt(usize, text, 10) else 0;
+            const end = @min(nodes.len, start + limit);
+            const out = try a.alloc(*const cypher.value.Node, end - start);
+            for (out, start..) |*node, index| node.* = &nodes[if (order[0].descending) nodes.len - 1 - index else index];
+            return .{ .items = out, .examined = out.len, .next = if (end < nodes.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
         }
         fn get(_: *anyopaque, _: A, id: cypher.value.Identity) !?*const cypher.value.Node {
             for (&nodes) |*node| if (node.identity.eql(id)) return node;
@@ -620,6 +665,29 @@ test "SQL GRAPH_TABLE dependency partitions share quotas and resume narrow pages
             if (page.after == null) break;
         }
         if (bounded) try std.testing.expect(failed) else try std.testing.expectEqualSlices(i64, &.{ 12, 19 }, &totals);
+    }
+    const simple = try cypher.compiler.compileInto(a, "MATCH (n:D) RETURN n.rank AS rank", .{}, &diagnostic);
+    var ordered_binding = binding;
+    ordered_binding.definition.query = simple.query;
+    ordered_binding.dependencies = &.{.{ .id = 7, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "rank", .path = "rank", .type = .integer }} }};
+    var callbacks = backend.vtable.*;
+    callbacks.scan_ordered = F.ordered;
+    const indexed: cypher.backend.Backend = .{ .ptr = &marker, .vtable = &callbacks };
+    for ([_]bool{ true, false }) |nulls_first| {
+        const cursor = try Cursor.open(std.testing.allocator, ordered_binding, indexed, &.{}, .{ .fields = &.{"rank"}, .order = &.{.{ .column = "rank", .descending = true, .nulls_first = nulls_first }}, .row_goal = 1, .limit = 1 }, .{ .scanned_anchors = 1 });
+        defer cursor.close(cursor.ptr);
+        try std.testing.expectEqual(nulls_first, cursor.order_satisfied);
+        if (nulls_first) {
+            const page = try cursor.next(cursor.ptr, std.testing.allocator, 1);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(i64, 3), (try page.rows[0].cell("rank")).value.integer);
+            const resumed = try Cursor.open(std.testing.allocator, ordered_binding, indexed, &.{}, .{ .fields = &.{"rank"}, .order = &.{.{ .column = "rank", .descending = true, .nulls_first = true }}, .after = page.after, .limit = 1 }, .{ .scanned_anchors = 2 });
+            defer resumed.close(resumed.ptr);
+            try std.testing.expect(resumed.order_satisfied);
+            const next_page = try resumed.next(resumed.ptr, std.testing.allocator, 1);
+            defer next_page.deinit();
+            try std.testing.expectEqual(@as(i64, 2), (try next_page.rows[0].cell("rank")).value.integer);
+        }
     }
 }
 

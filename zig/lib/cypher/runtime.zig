@@ -558,6 +558,38 @@ pub const NodeCursor = struct {
         self.query.clauses = clauses;
         return true;
     }
+    /// Negotiate immutable node order before the first pull. This does not
+    /// truncate the relation: SQL retains its residuals and row-goal policy.
+    pub fn certifyOrder(self: *NodeCursor, requested: []const backend_mod.PropertyOrder) !bool {
+        if (self.started or self.done or self.weighted or self.engine.node_order != null or requested.len == 0) return false;
+        const e = self.engine;
+        const backend = e.backend;
+        const read = backend.vtable.scan_ordered orelse return false;
+        if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
+        defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
+        if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.fields);
+        defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
+        var projection = self.query.clauses[1].operation.project.value;
+        const orders = try e.a.alloc(ast.Order, requested.len);
+        for (requested, orders) |request, *order| {
+            const expression = for (projection.items) |item| {
+                if (std.mem.eql(u8, item.alias orelse try e.expressionName(item.expression), request.property)) break item.expression;
+            } else return false;
+            order.* = .{ .expression = expression, .descending = request.descending };
+        }
+        projection.order = orders;
+        const operation = self.query.clauses[0].operation.match;
+        var planned = (try e.planNodeOrder(&.{&.{}}, operation, projection, &.{})) orelse return false;
+        const filters = try e.nodeFilters(operation.paths[0].nodes[0], operation.predicate, &.{});
+        const proof = (try read(backend.ptr, e.a, planned.table, filters, planned.fields, null, 0, 0)) orelse return false;
+        if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
+        planned.active = true;
+        planned.initial_cursor = proof.next;
+        const retained = try e.a.create(NodeOrder);
+        retained.* = planned;
+        e.node_order = retained;
+        return true;
+    }
     pub fn next(self: *NodeCursor, a: A, demand: usize) ![]const Row {
         return self.pull(a, demand) catch |err| return if (self.budget.exhausted) error.CypherMemoryBudgetExceeded else err;
     }
@@ -1130,7 +1162,7 @@ pub fn queryHasWrites(query: ast.Query) bool {
 }
 const aggregateName = @import("expressions.zig").aggregateName;
 const aggregates = @import("expressions.zig").aggregates;
-const NodeOrder = struct { table: []const u8, alias: []const u8, fields: []const backend_mod.PropertyOrder, active: bool = false, declined: bool = false };
+const NodeOrder = struct { table: []const u8, alias: []const u8, fields: []const backend_mod.PropertyOrder, active: bool = false, declined: bool = false, initial_cursor: ?[]const u8 = null };
 const Engine = struct {
     const Invariants = struct {
         const MappingKey = struct { expression: *const ast.Expr, source: Identity };
@@ -5214,10 +5246,98 @@ const Engine = struct {
             }
             return output;
         }
+        fn inheritedOrdinal(cohort: RangeCohort, raw: i64) !?u128 {
+            if (cohort.encounter) |encounter| return try encounter.ordinal(raw);
+            return if (cohort.context.domainLength() == 1) cohort.ordinal else null;
+        }
+        fn inheritedPrefix(engine: *Engine, cohort: RangeCohort, part: @import("range.zig").Range, bound: u128) !?u128 {
+            var low: u128 = 0;
+            var high = part.length;
+            while (low < high) {
+                try engine.state();
+                const middle = low + (high - low) / 2;
+                const rank = (try inheritedOrdinal(cohort, part.at(middle).integer)) orelse return null;
+                if (rank < bound) low = middle + 1 else high = middle;
+            }
+            return low;
+        }
+        fn inheritedBoundary(engine: *Engine, cohorts: []const RangeCohort, amount: u128, length: u128, minimum: u128, maximum: u128) !?u128 {
+            if (amount == 0) return minimum;
+            if (amount == length) return maximum + 1;
+            var low = minimum;
+            var high = maximum;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                var cardinality: u128 = 0;
+                for (cohorts) |cohort| for (cohort.context.ranges()) |part| {
+                    cardinality += (try inheritedPrefix(engine, cohort, part, middle + 1)) orelse return null;
+                };
+                if (cardinality < amount) low = middle + 1 else high = middle;
+            }
+            return low + 1;
+        }
+        /// Paginate the inherited encounter order, rather than sorting raw
+        /// values again or rendering the skipped prefix. Contiguous packets
+        /// take a linear metadata pass; interleaved packets use monotone rank
+        /// searches in their immutable provenance, including filtered holes.
+        fn cohortInheritedWindow(fold: *@This(), engine: *Engine, cohorts: []const RangeCohort, p: ast.Projection, ranges: []const @import("range.zig").Range) !?[]RangeCohort {
+            const page = (try engine.provedPage(p)) orelse return null;
+            var length: u128 = 0;
+            var contiguous = true;
+            for (cohorts) |cohort| {
+                length += cohort.context.domainLength();
+                contiguous = contiguous and (cohort.ordered_packet or cohort.context.domainLength() <= 1);
+            }
+            var skip: u128 = @min(page.skip, length);
+            const keep: u128 = @min(page.limit orelse length, length - skip);
+            var output: std.ArrayList(RangeCohort) = .empty;
+            if (keep == 0) return output.items;
+            var first_bound: u128 = 0;
+            var last_bound: u128 = 0;
+            if (!contiguous) {
+                var minimum: u128 = std.math.maxInt(u128);
+                var maximum: u128 = 0;
+                for (cohorts) |cohort| for (cohort.context.ranges()) |part| if (part.length != 0) {
+                    minimum = @min(minimum, (try inheritedOrdinal(cohort, part.start)) orelse return null);
+                    maximum = @max(maximum, (try inheritedOrdinal(cohort, part.at(part.length - 1).integer)) orelse return null);
+                };
+                first_bound = (try inheritedBoundary(engine, cohorts, skip, length, minimum, maximum)) orelse return null;
+                last_bound = (try inheritedBoundary(engine, cohorts, skip + keep, length, minimum, maximum)) orelse return null;
+            }
+            var remaining = keep;
+            for (cohorts) |cohort| {
+                var parts: std.ArrayList(@import("range.zig").Range) = .empty;
+                for (cohort.context.ranges()) |part| {
+                    try engine.state();
+                    if (part.length == 0) continue;
+                    const start = if (contiguous) @min(skip, part.length) else (try inheritedPrefix(engine, cohort, part, first_bound)) orelse return null;
+                    const end = if (contiguous) start + @min(remaining, part.length - start) else (try inheritedPrefix(engine, cohort, part, last_bound)) orelse return null;
+                    if (contiguous) {
+                        skip -= start;
+                        remaining -= end - start;
+                    }
+                    if (end != start) try parts.append(engine.a, .{ .start = part.at(start).integer, .step = part.step, .length = end - start });
+                }
+                if (parts.items.len == 0) continue;
+                var packet = cohort;
+                packet.context.setRanges(parts.items);
+                packet.ordinal = (try inheritedOrdinal(cohort, parts.items[0].start)) orelse return null;
+                packet.order_scope = null;
+                try output.append(engine.a, packet);
+            }
+            if (keep <= 128) {
+                var local = p;
+                local.skip = null;
+                local.limit = null;
+                return fold.cohortWindow(engine, output.items, local, ranges, true);
+            }
+            return output.items;
+        }
         fn cohortWindow(fold: *@This(), engine: *Engine, cohorts: []const RangeCohort, p: ast.Projection, ranges: []const @import("range.zig").Range, ordered: bool) !?[]RangeCohort {
             var length: u128 = 0;
             for (cohorts) |cohort| length += cohort.context.domainLength();
             if (length > 128) {
+                if (ordered and p.order.len == 0) return fold.cohortInheritedWindow(engine, cohorts, p, ranges);
                 if (try fold.cohortAffineWindow(engine, cohorts, p, ranges, ordered)) |ranked| return ranked;
                 return fold.cohortBagWindow(engine, cohorts, p, ranges, ordered);
             }
@@ -7382,7 +7502,7 @@ const Engine = struct {
             self.cache_reads = previous_cache;
             if (!previous_cache) self.read_nodes = previous_reads;
         }
-        var node_order = if (input.len == 1 and continuation == null and consumer == null and (input_weights == null or input_weights.?[0].isOne())) try self.planNodeOrder(input, operation, projection, middle) else null;
+        var node_order = if (projection.limit != null and input.len == 1 and continuation == null and consumer == null and (input_weights == null or input_weights.?[0].isOne())) try self.planNodeOrder(input, operation, projection, middle) else null;
         const previous_node_order = self.node_order;
         self.node_order = if (node_order) |*order| order else null;
         defer self.node_order = previous_node_order;
@@ -9666,7 +9786,7 @@ const Engine = struct {
         // An ordinary empty scan may finish without spending an anchor. A
         // certificate cannot assume a zero-budget source is nonempty.
         if (self.stats.scanned_anchors >= self.limits.scanned_anchors) return null;
-        if (!self.read_only or self.backend.vtable.scan_ordered == null or input.len != 1 or middle.len != 0 or operation.optional or operation.paths.len != 1 or projection.distinct or projection.wildcard or projection.predicate != null or projection.order.len == 0 or projection.order.len > 32 or projection.limit == null) return null;
+        if (!self.read_only or self.backend.vtable.scan_ordered == null or input.len != 1 or middle.len != 0 or operation.optional or operation.paths.len != 1 or projection.distinct or projection.wildcard or projection.predicate != null or projection.order.len == 0 or projection.order.len > 32) return null;
         const path = operation.paths[0];
         if (path.edges.len != 0 or path.alias != null or path.selector != .all) return null;
         const node = path.nodes[0];
@@ -9700,18 +9820,23 @@ const Engine = struct {
         }
         return .{ .table = table orelse return null, .alias = alias, .fields = fields };
     }
+    fn nodeFilters(self: *Engine, first: ast.Node, predicate: ?*const ast.Expr, row: Row) ![]const backend_mod.PropertyFilter {
+        var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
+        try self.labelFilters(first, &filters);
+        for (first.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
+        if (predicate) |expression| if (first.alias) |alias| try self.predicateFilters(expression, alias, row, &filters);
+        return filters.items;
+    }
     fn scanNodes(self: *Engine, table: []const u8, first: ast.Node, predicate: ?*const ast.Expr, row: Row, cursor: ?[]const u8, demand: usize) !backend_mod.Page(*const v.Node) {
         const bounded_demand = @min(demand, @max(@as(usize, 1), self.limits.scanned_anchors -| self.stats.scanned_anchors));
         if (self.lookup) |lookup_plan| if (lookup_plan.complete and std.mem.eql(u8, lookup_plan.table, table)) return lookup_plan.cachedPage(self, cursor, bounded_demand);
         if (self.node_order) |order| if (!order.declined and std.mem.eql(u8, order.table, table) and first.alias != null and std.mem.eql(u8, order.alias, first.alias.?)) {
             const read = self.backend.vtable.scan_ordered orelse return error.CypherInvalidBackendPage;
-            var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
-            try self.labelFilters(first, &filters);
-            for (first.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
-            if (predicate) |expression| try self.predicateFilters(expression, order.alias, row, &filters);
+            const filters = try self.nodeFilters(first, predicate, row);
             const wanted = if (self.stream_fold) |fold| if (fold.top.*) |top| @min(bounded_demand, top.capacity -| top.total) else bounded_demand else bounded_demand;
-            if (try read(self.backend.ptr, self.a, table, filters.items, order.fields, cursor, @max(1, wanted), self.limits.scanned_anchors -| self.stats.scanned_anchors)) |page| {
+            if (try read(self.backend.ptr, self.a, table, filters, order.fields, cursor orelse order.initial_cursor, @max(1, wanted), self.limits.scanned_anchors -| self.stats.scanned_anchors)) |page| {
                 order.active = true;
+                order.initial_cursor = null;
                 return page;
             }
             if (order.active or cursor != null) return error.CypherInvalidBackendPage;

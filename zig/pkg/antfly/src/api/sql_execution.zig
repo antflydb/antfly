@@ -2029,7 +2029,7 @@ pub const Adapter = struct {
             errdefer child.close(child.ptr);
             const wrapper = try a.create(GraphStatementCursor);
             wrapper.* = .{ .a = a, .adapter = self, .table = request.table, .child = child, .owner = owner };
-            out.* = .{ .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close, .count_rows = if (child.count_rows != null) GraphStatementCursor.countRows else null, .enable_weights = if (child.enable_weights != null) GraphStatementCursor.enableWeights else null, .enable_aggregate_weights = if (child.enable_aggregate_weights != null) GraphStatementCursor.enableAggregateWeights else null };
+            out.* = .{ .order_satisfied = child.order_satisfied, .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close, .count_rows = if (child.count_rows != null) GraphStatementCursor.countRows else null, .enable_weights = if (child.enable_weights != null) GraphStatementCursor.enableWeights else null, .enable_aggregate_weights = if (child.enable_aggregate_weights != null) GraphStatementCursor.enableAggregateWeights else null };
             owner.opened += 1;
         }
         // All allocations through the local arena must finish before its

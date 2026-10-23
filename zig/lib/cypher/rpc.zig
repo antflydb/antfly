@@ -47,7 +47,7 @@ pub const Request = struct {
     include_relationships: bool = false,
 };
 pub const Projection = struct { node: ?*const v.Node, relationships: []const *const v.Relationship = &.{} };
-const Reply = struct { ordered: bool = false, estimate: ?usize = null, unfiltered: bool = false, work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
+const Reply = struct { cursors: ?[]const ?[]const u8 = null, ordered: bool = false, estimate: ?usize = null, unfiltered: bool = false, work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
 pub const Channel = struct { ptr: *anyopaque, call: *const fn (*anyopaque, A, []const u8) anyerror![]u8, checkpoint: ?*const fn (*anyopaque) anyerror!void = null };
 pub const Version = struct { incarnation: u64, revision: u64 };
 pub const Client = struct {
@@ -167,7 +167,7 @@ pub const Client = struct {
         const encoded_filters = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, try std.json.Stringify.valueAlloc(temporary, filters, .{}), .{ .parse_numbers = false });
         const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .order = order, .operation = .scan_ordered, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = after, .limit = limit, .max_examined = max_examined });
         if (!reply.ordered) {
-            if (reply.values.len != 0 or reply.next != null or after != null) return error.CypherInvalidBackendPage;
+            if (reply.values.len != 0 or reply.cursors != null or reply.next != null or after != null) return error.CypherInvalidBackendPage;
             return null;
         }
         const nodes = try a.alloc(*const v.Node, reply.values.len);
@@ -176,7 +176,13 @@ pub const Client = struct {
             if (value != .node or !std.mem.eql(u8, value.node.identity.table, table)) return error.CypherInvalidBackendPage;
             out.* = value.node;
         }
-        return .{ .items = nodes, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined };
+        const cursors = if (reply.cursors) |positions| blk: {
+            if (positions.len != nodes.len) return error.CypherInvalidBackendPage;
+            const saved = try a.alloc(?[]const u8, positions.len);
+            for (positions, saved) |position, *out| out.* = if (position) |bytes| try a.dupe(u8, bytes) else null;
+            break :blk saved;
+        } else null;
+        return .{ .items = nodes, .cursors = cursors, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined };
     }
     fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
         const self = cast(ptr);
@@ -321,7 +327,7 @@ pub const Owner = struct {
                 const page = if (self.backend.vtable.scan_ordered) |read| try read(self.backend.ptr, scratch, request.table, filters, request.order, request.after, request.limit, request.max_examined) else null;
                 if (page) |ordered| {
                     for (ordered.items) |node| try values.append(scratch, .{ .value = .{ .node = node } });
-                    return std.json.Stringify.valueAlloc(a, .{ .ordered = true, .values = values.items, .next = ordered.next, .examined = ordered.examined, .work = meter.units }, .{});
+                    return std.json.Stringify.valueAlloc(a, .{ .ordered = true, .values = values.items, .cursors = ordered.cursors, .next = ordered.next, .examined = ordered.examined, .work = meter.units }, .{});
                 }
                 return std.json.Stringify.valueAlloc(a, .{ .ordered = false, .work = meter.units }, .{});
             },

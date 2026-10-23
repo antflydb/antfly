@@ -3365,9 +3365,10 @@ fn Engine(comptime Context: type) type {
             partitioned: bool = false,
             weighted_reader: ?*WeightedReader = null,
             requested_fields: ?[]const []const u8 = null,
+            ordered: []const catalog.Scan.Order = &.{},
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
+                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
             }
             fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -3505,7 +3506,13 @@ fn Engine(comptime Context: type) type {
                 if (self.opened) return error.InvalidSqlBackendResponse;
                 self.opened = true;
                 self.requested_fields = try self.engine.context.arena.dupe([]const u8, request.fields);
-                return .{ .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .close = close };
+                const ordered = request.order.len != 0 and request.order.len == self.ordered.len and same: {
+                    for (request.order, self.ordered) |requested, known| {
+                        if (!std.mem.eql(u8, requested.column, known.column) or requested.descending != known.descending or requested.nulls_first != known.nulls_first) break :same false;
+                    }
+                    break :same true;
+                };
+                return .{ .order_satisfied = ordered, .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .close = close };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -3561,7 +3568,29 @@ fn Source(comptime Context: type) type {
             if (self.engine.context.backend.regex_execution == null) self.engine.context.backend.regex_execution = &self.regex_execution;
             var search_arena = std.heap.ArenaAllocator.init(context.alloc);
             defer search_arena.deinit();
-            const scans = try bindSearchScans(search_arena.allocator(), try outerGraphScans(search_arena.allocator(), relation, context.binding.scalars.predicate), context.parameters);
+            var scans = try bindSearchScans(search_arena.allocator(), try outerGraphScans(search_arena.allocator(), relation, context.binding.scalars.predicate), context.parameters);
+            // A transparent graph scan preserves its physical cursor's order.
+            // Negotiate before capturing the statement cut; never reopen a
+            // captured cursor or propagate order through joins/derived errors.
+            var ordered: []const catalog.Scan.Order = &.{};
+            if (context.statement_capture == null and context.backend.vtable.supports_scan_order and relation.root.operation == .scan and context.binding.aggregate == null and context.binding.window == null and !relation.statement.count_all) negotiate: {
+                const scan_node = relation.root.operation.scan;
+                if (scans[scan_node.index].table.graph == null) break :negotiate;
+                const requested = try describe.scanOrder(context.arena, context.binding, relation.statement);
+                if (requested.len == 0) break :negotiate;
+                const physical = try search_arena.allocator().alloc(catalog.Scan.Order, requested.len);
+                for (requested, physical) |key, *out| {
+                    const index = for (relation.root.columns, 0..) |column, index| {
+                        if (std.mem.eql(u8, column.internal, key.column)) break index;
+                    } else break :negotiate;
+                    out.* = key;
+                    out.column = scan_node.source_columns[index];
+                }
+                const changed = try search_arena.allocator().dupe(catalog.StatementScan, scans);
+                changed[scan_node.index].request.order = physical;
+                scans = changed;
+                ordered = requested;
+            }
             if (scans.len != 0) {
                 if (context.statement_capture) |capture| {
                     self.engine.cursors = try capture.cursors(relation);
@@ -3576,6 +3605,7 @@ fn Source(comptime Context: type) type {
                     self.engine.cursors = &self.single_list;
                 } else return error.SqlStatementSnapshotRequired;
             }
+            if (ordered.len != 0 and !self.engine.cursors[relation.root.operation.scan.index].order_satisfied) ordered = &.{};
             const Estimate = struct {
                 fn rows(raw: *anyopaque, node: *const binding.Node) ?u64 {
                     const engine: *Engine(Context) = @ptrCast(@alignCast(raw));
@@ -3607,7 +3637,7 @@ fn Source(comptime Context: type) type {
                 break :fallback relation.root;
             };
             self.iterator = try Engine(Context).Iterator.create(&self.engine, root);
-            self.adapter = .{ .engine = &self.engine, .iterator = self.iterator.?, .table = relation.table };
+            self.adapter = .{ .engine = &self.engine, .iterator = self.iterator.?, .table = relation.table, .ordered = ordered };
             return self;
         }
         fn close(self: *Self) void {
@@ -4633,5 +4663,56 @@ test "native projection refinements benchmark hybrid JSON projections" {
         try std.testing.expectEqual(@as(usize, 0), after.reads);
         try std.testing.expect(after.peak < before.peak);
         std.debug.print("HYBRID_JSON_PROJECTION sample={d} before_cpu_ns={d} after_cpu_ns={d} before_peak={d} after_peak={d} before_scalar_reads={d} after_scalar_reads={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak, before.reads, after.reads });
+    }
+}
+
+test "transparent graph relations forward order requests and certificates through SQL execution" {
+    const Fixture = struct {
+        position: usize = 0,
+        examined: usize = 0,
+        certify: bool,
+        negotiated: bool = false,
+        fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return error.UnexpectedPhysicalResolve;
+        }
+        fn graph(_: *anyopaque, a: Allocator, definition: @import("ast.zig").GraphTable) !catalog.Table {
+            const graph_binding = try a.create(catalog.graph_relation.Binding);
+            graph_binding.* = .{ .catalog_json = "{}", .definition = definition, .graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{}, .relationships = &.{} }, .dependencies = &.{} };
+            return .{ .id = 1, .physical_name = "graph", .schema_version = 1, .graph = graph_binding, .columns = &.{.{ .name = "score", .path = "score", .type = .integer }} };
+        }
+        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.negotiated = request.order.len == 1 and std.mem.eql(u8, request.order[0].column, "score") and request.order[0].descending and request.order[0].nulls_first;
+            self.position = 0;
+            return .{ .ptr = self, .next = next, .close = close, .order_satisfied = self.negotiated and self.certify };
+        }
+        fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const end = @min(13000, self.position + limit);
+            const rows = try a.alloc(catalog.Row, end - self.position);
+            const layout = try catalog.Row.TypedLayout.init(a, &.{"score"});
+            for (rows, self.position..) |*row_value, index| row_value.* = try catalog.Row.fromDatums(a, "row", layout, &.{Datum.json(.{ .integer = @intCast(if (self.certify and self.negotiated) 12999 - index else index) })});
+            self.examined += rows.len;
+            self.position = end;
+            return .{ .rows = rows, .after = if (end < 13000) "more" else null };
+        }
+        fn close(_: *anyopaque) void {}
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    for ([_]bool{ true, false }) |certify| {
+        var fixture: Fixture = .{ .certify = certify };
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_graph = Fixture.graph, .supports_scan_order = true, .scan = SetTestBackend.scan, .open_scan = Fixture.open, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g ORDER BY g.score DESC LIMIT 5", .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expect(fixture.negotiated);
+        try std.testing.expectEqual(@as(usize, if (certify) 5 else 13000), fixture.examined);
+        try std.testing.expectEqual(@as(usize, 5), result.output.rows.len);
+        for (result.output.rows, 0..) |row_values, index| {
+            const cell = row_values[0];
+            const actual = if (cell == .integer) cell.integer else try std.fmt.parseInt(i64, if (cell == .number_string) cell.number_string else cell.string, 10);
+            try std.testing.expectEqual(@as(i64, @intCast(12999 - index)), actual);
+        }
     }
 }

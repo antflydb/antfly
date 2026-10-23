@@ -36,7 +36,15 @@ pub fn reclaimingAllocator(input: std.mem.Allocator) std.mem.Allocator {
 /// An index/predicate-restricted scan must leave it false. Consumers still apply
 /// all label/predicate checks; the certificate only enables a reusable lookup.
 pub fn Page(comptime T: type) type {
-    return struct { items: []const T, next: ?[]const u8 = null, examined: ?usize = null, unfiltered: bool = false };
+    return struct {
+        items: []const T,
+        /// Optional exact continuation after each emitted item. An empty slice
+        /// on a zero-row capability probe certifies batched resumability.
+        cursors: ?[]const ?[]const u8 = null,
+        next: ?[]const u8 = null,
+        examined: ?usize = null,
+        unfiltered: bool = false,
+    };
 }
 pub const FilterOp = enum { eq, lt, lte, gt, gte, in };
 pub const PropertyFilter = struct { property: []const u8, value: v.Value, op: FilterOp = .eq };

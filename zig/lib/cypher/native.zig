@@ -242,11 +242,23 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
             return (try scanWhereImpl(ptr, a, table, filters, encoded, limit, false)).?;
         }
+        fn filterStrength(self: *Self, filters: []const b.PropertyFilter, name: []const u8, column_type: anytype) !u8 {
+            var strength: u8 = 0;
+            for (filters) |filter| {
+                if (self.work) |work| try work.charge(work.ptr, 1);
+                if (!std.mem.eql(u8, filter.property, name) or !filterCompatible(column_type, filter.value)) continue;
+                strength = @max(strength, if (filter.op == .eq) @as(u8, 4) else if (filter.op != .in) @as(u8, 2) else 0);
+            }
+            return strength;
+        }
         const OrderedCursor = struct { index: []const u8, after: ?[]const u8 = null, schema_version: u32 };
-        fn scanOrdered(ptr: *anyopaque, a: A, table: []const u8, _: []const b.PropertyFilter, order: []const b.PropertyOrder, encoded: ?[]const u8, limit: usize, max_examined: usize) !?b.Page(*const v.Node) {
+        fn scanOrdered(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, encoded: ?[]const u8, limit: usize, max_examined: usize) !?b.Page(*const v.Node) {
             if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;
             const self = cast(ptr);
             if (!self.authority.ordered_projection or order.len == 0 or order.len > 32) return null;
+            // Sparse unions already have bounded equality seeks. A single
+            // ordered scan must not replace them with their broad hull.
+            for (filters) |filter| if (filter.op == .in) return null;
             if (limit != 0 and max_examined == 0) return error.CypherAnchorBudgetExceeded;
             var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
             defer scratch.deinit();
@@ -271,28 +283,78 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         else => continue :candidates, // Exact NUMERIC/JSON projection has different ordering semantics.
                     }
                 }
+                if (cursor == null) {
+                    const leading = index.tuple.keys[0];
+                    const strength = try self.filterStrength(filters, schema.tableSchema().relational_columns[leading.ordinal].name, leading.column_type);
+                    // Prefer a stronger equality access path to an unrelated sort
+                    // index. The ordinary native planner can cost those candidates;
+                    // Cypher retains a bounded top-k over their qualifying rows.
+                    for (indexes.plan.boundIndexes()) |alternative| {
+                        if (alternative.predicate != null or alternative.tuple.keys.len == 0) continue;
+                        const key = alternative.tuple.keys[0];
+                        if (key.expression != null or key.fold_ascii) continue;
+                        if (try self.filterStrength(filters, schema.tableSchema().relational_columns[key.ordinal].name, key.column_type) > strength) return null;
+                    }
+                }
                 const authorization = try self.readAuthorization(temporary, table);
                 var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(@min(limit, 1024)) });
                 if (opts.relational_query == null) return null;
+                // The explicit index supplies order; compatible predicates
+                // supply exact seek bounds through the native condition planner.
+                const Query = @TypeOf(opts.relational_query.?);
+                var conditions: std.ArrayList(Query.Condition) = .empty;
+                for (filters) |filter| {
+                    if (conditions.items.len == 256) break;
+                    if (self.work) |work| try work.charge(work.ptr, 1);
+                    if (filter.op == .in) continue; // Sparse unions need separate ordered streams.
+                    const column_type = for (schema.tableSchema().relational_columns) |column| {
+                        if (std.mem.eql(u8, column.name, filter.property)) break column.column_type;
+                    } else continue;
+                    if (!filterCompatible(column_type, filter.value)) continue;
+                    if (column_type == .number and filter.value == .integer and filter.op != .eq and
+                        (filter.value.integer < -9007199254740992 or filter.value.integer > 9007199254740992)) continue;
+                    const value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, filter.value, .{}), .{ .parse_numbers = false });
+                    try conditions.append(temporary, .{ .column = filter.property, .op = switch (filter.op) {
+                        .eq => .eq,
+                        .lt => .lt,
+                        .lte => .lte,
+                        .gt => .gt,
+                        .gte => .gte,
+                        .in => unreachable,
+                    }, .value = value });
+                }
+                opts.relational_query.?.conditions = conditions.items;
                 opts.relational_query.?.index = index.name;
-                opts.relational_query.?.auto_index = false;
+                opts.relational_query.?.auto_index = true;
                 opts.relational_query.?.after = if (cursor) |position| position.after else null;
                 opts.relational_query.?.schema_version = if (cursor) |position| position.schema_version else schema.version();
                 const session = db.openRelationalReadSession(temporary, "", "", opts) catch |err| switch (err) {
                     error.RelationalIndexNotReady, error.IndexNotFound => if (cursor == null) continue :candidates else return error.CatalogGenerationChanged,
+                    error.InvalidBatchRequest, error.RelationalIndexColumnTypeMismatch, error.UnsupportedRelationalIndexColumn, error.RelationalIndexColumnNotFound => retry: {
+                        // A storage type can be narrower than Cypher. Keep the
+                        // order certificate and evaluate unsupported operands
+                        // in the authoritative runtime residual instead.
+                        opts.relational_query.?.conditions = &.{};
+                        break :retry try db.openRelationalReadSession(temporary, "", "", opts);
+                    },
                     else => return err,
                 };
                 defer session.deinit();
                 session.reader.now_ns = self.ttl_now_ns;
                 try session.checkpoint();
-                if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = try std.json.Stringify.valueAlloc(a, OrderedCursor{ .index = index.name, .schema_version = session.reader.active.version(), .after = if (cursor) |position| position.after else null }, .{}) };
+                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .next = try std.json.Stringify.valueAlloc(a, OrderedCursor{ .index = index.name, .schema_version = session.reader.active.version(), .after = if (cursor) |position| position.after else null }, .{}) };
                 var page = try session.reader.nextPage(temporary, null, .{ .rows = @min(limit, 1024), .records = @min(@min(@max(limit, 128), max_examined), 1024), .output_bytes = 16 << 20 });
                 defer page.deinit();
                 var nodes: std.ArrayList(*const v.Node) = .empty;
-                for (page.rows) |row| if (try self.node(a, table, row.key, row.json)) |node_value| if (node_value.labels.len != 0) try nodes.append(a, node_value);
+                var cursors: std.ArrayList(?[]const u8) = .empty;
+                for (page.rows) |row| if (try self.node(a, table, row.key, row.json)) |node_value| if (node_value.labels.len != 0) {
+                    try nodes.append(a, node_value);
+                    try cursors.append(a, try std.json.Stringify.valueAlloc(a, OrderedCursor{ .index = index.name, .schema_version = session.reader.active.version(), .after = row.cursor orelse return error.CypherInvalidBackendCursor }, .{}));
+                };
                 const next = if (page.more) try std.json.Stringify.valueAlloc(a, OrderedCursor{ .index = index.name, .schema_version = session.reader.active.version(), .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else null;
+                if (cursors.items.len != 0) cursors.items[cursors.items.len - 1] = next;
                 try checkpoint(ptr);
-                return .{ .items = try nodes.toOwnedSlice(a), .examined = page.records_examined, .next = next };
+                return .{ .items = try nodes.toOwnedSlice(a), .cursors = try cursors.toOwnedSlice(a), .examined = page.records_examined, .next = next };
             }
             if (cursor != null) return error.CatalogGenerationChanged;
             return null;

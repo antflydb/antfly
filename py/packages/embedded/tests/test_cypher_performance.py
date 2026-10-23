@@ -7447,11 +7447,11 @@ def test_indexed_node_order_reads_only_the_requested_window(graph_db):
         "g",
         {
             "query": "MATCH (n:D) WHERE n.score<12997 RETURN n.score ORDER BY n.score DESC LIMIT 2",
-            "limits": {"scanned_anchors": 5},
+            "limits": {"scanned_anchors": 2},
         },
     )
     assert [row[0]["value"] for row in residual["rows"]] == ["12996", "12995"]
-    assert residual["stats"]["scanned_anchors"] == 5
+    assert residual["stats"]["scanned_anchors"] == 2
     shadowed = graph_db.cypher_json(
         "g",
         {"query": "MATCH (n:D) RETURN n.score AS s,null AS n ORDER BY n.score DESC LIMIT 1"},
@@ -7548,3 +7548,77 @@ def test_empty_indexed_order_preserves_a_zero_anchor_budget(graph_db):
     )
     assert result["rows"] == []
     assert result["stats"]["scanned_anchors"] == 0
+
+
+@pytest.mark.parametrize(
+    "predicate,expected,budget",
+    [
+        ("n.score<5", [4, 3, 2, 1, 0], 5),
+        ("n.score=0", [0], 1),
+        ("n.score IN [0,2,4,2]", [4, 2, 0], 3),
+        ("n.id='n0'", [0], 1),
+    ],
+)
+def test_ordered_node_reads_preserve_selective_access_paths(graph_db, predicate, expected, budget):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.sql("CREATE INDEX by_id ON docs(id)")
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"MATCH (n:D) WHERE {predicate} RETURN n.score ORDER BY n.score DESC LIMIT {len(expected)}",
+            "limits": {"scanned_anchors": budget, "intermediate_states": 3000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert [int(row[0]["value"]) for row in result["rows"]] == expected
+    assert result["stats"]["scanned_anchors"] == budget
+
+
+@pytest.mark.parametrize("source", ["range(1,1300000)", "range(1300000,1,-1)"])
+def test_inherited_periodic_windows_do_not_expand_skipped_rows(graph_db, source):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND {source} AS x WITH x,x%10 AS g ORDER BY g,x LIMIT 650000 WITH x,g SKIP 500000 LIMIT 5 RETURN avg(x)",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert result["rows"] == [[{"type": "number", "value": 1100023}]]
+    assert result["stats"]["intermediate_states"] < 2000
+
+
+def test_sql_graph_order_negotiation_preserves_filters_aliases_and_staged_values(graph_db):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    source = "GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.id AS id,n.score AS score)) g"
+    assert graph_db.sql(f"SELECT g.score FROM {source} ORDER BY g.score DESC LIMIT 5")["rows"] == [
+        [str(i)] for i in range(12999, 12994, -1)
+    ]
+    assert graph_db.sql(f"SELECT g.score AS s FROM {source} WHERE g.score<5 ORDER BY s DESC LIMIT 5")["rows"] == [
+        [str(i)] for i in range(4, -1, -1)
+    ]
+    with closing(graph_db.sql_session()) as session:
+        session.execute("BEGIN")
+        session.execute("UPDATE docs SET score=14000 WHERE _id='n0'")
+        assert session.execute(f"SELECT g.id,g.score FROM {source} ORDER BY g.score DESC LIMIT 1")["rows"] == [
+            ["n0", "14000"]
+        ]
+        session.execute("ROLLBACK")
+    with pytest.raises(SQLStateError):
+        graph_db.sql(
+            "SELECT g.inv FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(1/n.score AS inv,n.score AS score)) g ORDER BY g.score DESC LIMIT 1"
+        )
+
+
+def test_sql_graph_order_certificates_keep_null_order_and_source_ordinals(graph_db):
+    graph_db.sql("INSERT INTO docs (_id,id,score) VALUES ('a','a',5),('b','b',NULL),('c','c',5),('d','d',2)")
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    source = "GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.id AS id,n.score AS score)) g"
+    for nulls, expected in (("FIRST", ["b", "a"]), ("LAST", ["a", "c"])):
+        assert graph_db.sql(f"SELECT g.id FROM {source} ORDER BY g.score DESC NULLS {nulls} LIMIT 2")["rows"] == [
+            [value] for value in expected
+        ]
+    assert (
+        graph_db.sql(f"SELECT g._id,g.id FROM {source} ORDER BY g.score DESC LIMIT 4")["rows"]
+        == graph_db.sql(f"SELECT g._id,g.id FROM {source} ORDER BY g.score+0 DESC LIMIT 4")["rows"]
+    )
