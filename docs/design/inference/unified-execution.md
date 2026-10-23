@@ -697,10 +697,13 @@ backward, interpreter backward reference and rank-adapter backward paths. Final
 CPU/Metal/CUDA product compilation, generated-source freshness (67 files plus
 Metal/CUDA runtime regions) and whitespace checks pass.
 
-## Planned bulk consolidation campaign
+## Bulk consolidation campaign
 
-Status: implementation in progress. The foundation/broad-family cohort below is
-qualified; the quantized-compute and attention cohorts remain under validation.
+Status: complete. All 24 packages have been implemented or retain documented
+tuned specializations after schedule/resource comparison. Integrated numerical,
+model and lifetime qualification is complete; environment limits are recorded
+below.
+
 Baseline: `dd1ee1b4ffd1a4a3a14878c648355b18a4096b8f`. Treat the following as one
 implementation campaign with four work waves and one integrated acceptance
 checkpoint, rather than another sequence of single-family requests. Keep the
@@ -825,6 +828,189 @@ under `.benchmark-assets/1166/bulk/`: `metal-wave1/long-receipt.json`,
 is `a0f8cb070791c8b4e9d37292553ea12dac01f1a29cf63239010f67b2c21891b7`;
 baseline SHA256 is
 `8c1cff7bf5f0a17dedd90f2f98a50594034237775a9e166f094e1342d30140fa`.
+
+### Compute and attention implementation audit
+
+The compute and attention changes are implemented and qualified against the
+original campaign baseline. This table records the ownership decision for each compute and
+attention package; preserving an existing specialization is deliberate where
+its arithmetic, storage or measured compiler resources differ.
+
+| Packages | Implemented owner or retained specialization |
+| --- | --- |
+| 03–04 | Metal generic Q4_0/Q8_0 MMA uses format-typed decoding; Q8 m32 and m64 each share F32/F16 input and full/tail policy. The two tile geometries and explicitly unrolled Q4 schedule remain distinct. |
+| 05 | One Metal 64×64×32 K-family scaffold retains Q4_K half staging, Q6_K float staging, each format's load placement and the F16-input wrapper. |
+| 06–07 | Paired activation and RHS projections share output-width policies with exact accumulator extents. The matching Q4 row schedules share compile-time row count and simdgroup count; the historical `r8` entry still means five rows. Existing shared MMV arity policies remain in place; RMS-scaled and differently reduced schedules stay separate. |
+| 08–10 | CUDA shares packed four/eight-row dot tiles, flat grouped versus ordinary coordinate acquisition, matching paired Q8-input schedules and gated-down column/warp policies. Packed rows2 keeps its lower-register specialization. The two F32 activation-slice exports retain their epilogue context: moving activation into a shared dot helper raised older-target registers, including unrelated libdevice callers. Restoring only those two contexts removes all resource increases. |
+| 13 | Runtime and standalone Metal decode use one renderer with explicit ABI and masked-mass policy; the legacy post-max barrier and exponent behavior remain. Generic paged prefill has one native MSL template consumed by the runtime generator and standalone compatibility renderer. The low-memory HD256/512 page-contiguous schedules remain separate. The template migration is an ownership change, fully counted as authored source. |
+| 14 | CUDA runtime emission owns one flash-prefill common definition and one split-K online common definition, with per-policy ABI wrappers. Standalone outputs remain self-contained. Export names, plan identities, default routing and cross-CTA volatile/publication ordering are preserved. |
+| 15–16 | Vision q32 shares typed F16/F32 staging and preserves each tail-output scratch policy. Dense eight-query and generic paged attention retain different KV addressing, staging, masks and barrier schedules; they are not forced into a common loop. |
+| 19–20 | Existing typed casts/gathers remain shared. Packed row encoders with different arithmetic remain format-specific. CUDA primitive F32/BF16 gather now shares indexing and the same storage-conversion owner used by dense embedding. Integer-index width and invalid/negative-index behavior remain unchanged. |
+| 22–23 | CPU grouped output construction transfers one buffer at a time into shaped handles with separate cleanup for untransferred buffers and completed handles. Allocation-failure coverage exercises every partial state for pairs and triples. Q4_K/Q6_K share MR1/MR2 traversal and range boundaries while retaining SIMD decode/accumulate leaves and reduction order. Existing panel kernels remain the owners of their distinct layouts and arithmetic. |
+| 24 | Superseded bodies and unused activation-slice policies are removed. Handwritten CUDA entry points also share 14 exact launch parameter lists across 110 explicit symbols; native CUDA bodies and generated ABIs remain separately owned. Final composition results and qualification limits are recorded below. |
+
+The launch-declaration consolidation removes **972 lines / 18,872 bytes**, after
+counting the entire new header. This is declaration duplication, reported
+separately from compute-body savings. Before/after CUDA preprocessing produces
+identical 554,535-token streams (SHA256
+`2b4cac34df2be82468a42b7ef3ed3f493129a06d6c8c023757536f303487d594`).
+There is no runtime interpretation or new kernel language.
+
+The final Metal direct cohort qualifies 182 distinct matrix, attention, paired
+and row cases in both math modes. Eight m64-tail fixture allocations were
+corrected from 8 KiB to the production 16 KiB; the earlier undersized fixtures
+are superseded. Initial timing outliers and the complete longer K-family
+control are retained, as detailed at the integrated checkpoint.
+CUDA executes the packed/grouped/gated
+and typed-gather cohort on GB10, plus all four compacted attention exports with
+exact uniform-score references and nontrivial paged fixtures. Seven-architecture
+static comparison shows no register/shared/local/stack increases. SM100/110/120
+SASS is unchanged; one HD256 flash-prefill body has different instruction
+scheduling on SM75/80/89/90 with unchanged instruction count and resources. This
+is not an SM89 hardware throughput qualification or a routing promotion.
+
+The Mac reference/compiler suite passes 143 selected tests with zero skips.
+The filtered Linux suite passes 141 with zero skips; the larger monolithic
+AArch64 debug test compilation hit a toolchain `fixup value out of range` limit,
+so its complete-suite result is not claimed. Product and browser WASM builds
+pass. Final model, decoder, replay/lifetime, artifact-freshness and source-ledger
+receipts are recorded at the integrated checkpoint below.
+
+### Integrated bulk checkpoint (2026-10-23)
+
+Integrated CPU/Metal/CUDA qualification is complete on the frozen candidate.
+Production changes are committed as `71751d339e`; the replay/reference runner
+improvements are committed separately as `b01ad350ab`. No routing/admission changes
+or new runtime descriptor interpreter are part of this campaign.
+
+Against `dd1ee1b4ff`, including the foundation cohort and every new production
+helper/template plus inline tests, the ledger records **1,558 net authored
+production lines / 74,764 bytes removed**. Of this, **972 lines / 18,872 bytes**
+are CUDA launch declarations; the remaining **586 lines / 55,892 bytes** are
+compute/dispatch/source-ownership consolidation. The source estimate was a
+planning target; incompatible tuned bodies remain where sharing changes their
+schedule or compiler resources. This does not count the earlier pre-campaign
+988-line / 63,012-byte consolidation again.
+
+Generated production source separately shrinks **648 lines / 19,025 bytes**.
+The CUDA runtime attention region removes 885 generated lines; self-contained
+standalone artifacts and the newly owned Metal compatibility region offset
+part of that reduction. The whole CUDA `.cu` bundle shrinks 82,439 bytes.
+Qualification scripts/tests/README add **606 lines** separately; design prose is
+excluded from production savings. The fatbin grows 224 bytes, SM89 cubin size
+is unchanged, and PTX text grows 19,062 bytes. This is source simplification,
+not a claim that device binaries become substantially smaller. The frozen Mac
+model executable is 14,944 bytes smaller than baseline.
+
+The complete tracked campaign change, including planning/qualification prose,
+test tools, PTX and binary images, removes 1,233 net text lines and 7,522 total bytes.
+These repository totals are separate from the authored production ledger.
+
+The final Metal qualification covers 182 distinct matrix, projection, row and
+attention cases in both math modes. The corrected 32-arm cohort passes 181/182;
+a tiny F16 K-matrix case initially exceeds the timing ceiling. The complete
+18-case K-family control then passes with the unchanged source at 64 balanced
+arms (worst ratio 1.014262, previously failing case 1.005414). A constant-address
+parameter probe also passes, but no parameter change is adopted because the
+unchanged control resolves the failure. The qualified composite uses the later
+whole K-family receipt for all 18 cases and the original receipt for the other
+164; its worst ratio is 1.042850. Exact bytes, guards, static scratch and thread
+limits pass throughout. The original failure and the superseded undersized-tail
+fixtures remain recorded.
+
+CUDA's final 123 direct cases (111 compute/gather, 12 paged attention) pass on
+GB10 with 32 balanced arms and 4,000 kernels per arm. Worst ratios are 1.039006
+and 1.003594 respectively. Independent reference fixtures poison outputs, and
+each captured version is checked separately after 100 consecutive kernel calls,
+including persistent split-K counter rearming.
+
+The first final Mac matrix passes 12/13 cases; Metal Q4_K reranker median
+initially measures 9.6% above baseline, exceeding the ceiling, with p95 and
+exact outputs passing. Its 16-row route cannot use the changed high-row K
+matrix. The predeclared longer
+whole seven-case Metal cohort uses 64 balanced arms, 25 warmups, 201 ordinary
+measurements and 1,001 for Q4_K, on the same frozen binaries. All seven pass;
+Q4_K is +1.93% median / +0.015% p95. No source change is adopted, and the first
+failure remains recorded. The six CPU rows use the complete final 32-arm Mac
+matrix; CUDA uses its complete final 32-arm four-case matrix. All 17 admitted
+CPU/Metal/CUDA model comparisons pass with finite, byte-identical complete
+outputs:
+
+| Backend | Model | p50 ratio | p95 ratio |
+| --- | --- | ---: | ---: |
+| CPU | MiniLM F32, b1/s16 | 1.001803 | 1.002981 |
+| CPU | MiniLM F32, b1/s128 | 0.999538 | 1.000977 |
+| CPU | MiniLM F32, b2/s16 | 1.001485 | 0.997737 |
+| CPU | MiniLM GGUF, b1/s16 | 1.000530 | 1.000717 |
+| CPU | Reranker F16 | 0.977738 | 0.994024 |
+| CPU | Reranker Q4_K | 0.995514 | 0.968572 |
+| Metal | Reranker Q4_K | 1.019253 | 1.000146 |
+| Metal | MiniLM F32, b1/s16 | 1.002107 | 1.002730 |
+| Metal | MiniLM F32, b1/s128 | 0.992023 | 0.996942 |
+| Metal | MiniLM F32, b2/s16 | 0.998721 | 1.001511 |
+| Metal | MiniLM GGUF, b1/s16 | 0.999429 | 0.998993 |
+| Metal | Reranker F16 | 1.013115 | 1.007932 |
+| Metal | MiniLM ONNX, b1/s16 | 0.991093 | 0.999277 |
+| CUDA | MiniLM F32, b1/s16 | 0.997062 | 1.010254 |
+| CUDA | MiniLM F32, b1/s128 | 0.997074 | 1.000948 |
+| CUDA | MiniLM F32, b2/s16 | 1.006004 | 1.091949 |
+| CUDA | Reranker Q4_K | 0.996882 | 0.999308 |
+
+Both admitted CUDA models complete simultaneous 120-second strict-resident,
+alternating-input soaks: 41,294 encoder and 10,238 reranker iterations, stable
+tracked memory and zero tracked host allocations after teardown. The initial
+wrapper incorrectly expected soak mode to write an output file; the benchmark
+returns before that writer. Separate finite-output probes correct that wrapper
+assertion while preserving the completed soak logs and original failed receipt.
+Focused Linux lifetime tests pass seven applicable cases, including prepared
+physical-frame retention under pool pressure/executable eviction, with 17
+Metal-only skips. Both baseline and candidate reject the optional TinyLlama
+CUDA fixture with `UnsupportedCudaArchitecture`; CUDA decoder model admission
+is not expanded or claimed. Paged attention still has the direct hardware gates
+above.
+
+The independent decoder oracle passes all 160,000 logits per CPU/Metal backend
+at tolerance 0.002 (maximum absolute error 0.000668 native / 0.000759 Metal).
+Both retain exact reset parity and pass chunked-prefill checks at 0.0001.
+Five concurrent 120-second Mac soaks also pass with stable tracked host/device
+memory and zero tracked allocations at teardown: native/Metal encoders, native
+Q4_K reranker and native/Metal decoders. The decoders perform 679 / 12 runtime
+evictions respectively while retaining output parity. These are representative
+composition soaks, not a repetition of every earlier long-duration run.
+
+The final local lifetime selection passes 21 tests with five hardware/fixture
+skips using `-Dmetal=true -Dcuda=false`. The earlier local CUDA-enabled run
+reaches a CUDA-only lifetime test and returns `CudaUnavailable`; that original
+receipt is retained, and the same CUDA lifetime case passes on Glowworm. No
+production/test logic is changed to bypass it.
+
+Generated-source freshness passes for all 67 files and Metal/CUDA runtime
+regions. The host has no offline `xcrun metal` toolchain, so the original AIR
+compilation check is recorded as unavailable. A separate, explicitly identified
+GPU-runtime compilation bridge validates the exact same 29 generated Metal
+artifacts and 25 shadow-rendered v2 sources using `newLibraryWithSource`; all
+54 compile successfully. It produces no offline AIR and is not reported as an
+offline compiler pass. The changed full runtime shader also compiles and
+executes in the 182 direct cases above. Pinned NVCC 13.2.86 fresh compilation
+checks all three CUDA images; product CPU/Metal/CUDA and browser WASM builds,
+formatter and whitespace checks pass. The temporary local validation worktree
+and isolated build caches are removed after hash matching its complete source
+to the committed production tree. Required local cache collection completes
+after the build/test session; optional shared `uv` pruning is skipped when
+other sessions hold its cache lock.
+
+The Mac frozen executable SHA256 is
+`f5ffbd69216287e4ec619cce600cec3a2979cf53ad2b07bf494d25aa7439b626`;
+the CUDA executable is
+`443f301cd3173a8242862f13b6119099a65ef8dccdec680e55283eb4f32fa47e`.
+Both compare against the original campaign baseline, not the foundation commit.
+Raw fixtures, initial failures, timing arms, source/image hashes and frozen
+executables remain under ignored `.benchmark-assets/1166/bulk/`. Final receipts
+are `final/ledger/source-ledger.json`, `final/metal-direct-composite.json`,
+`final/mac-models/`, `final/mac-metal-long/`, `final/mac-soaks/`,
+`final/runtime-metal-tool/receipt.jsonl`, `final/source-build-proof.json`,
+`final/metal-source-fixture-hashes.json`, and the locally retained CUDA
+archive/tree `final/cuda-qualified-receipts.tar.gz` / `final/cuda-qualified/`.
 
 ### Execution order
 
