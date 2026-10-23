@@ -653,6 +653,50 @@ All four local CUDA source/image hashes match the qualified remote snapshot;
 the SM89 cubin remains byte-identical. Required cache collection completed on
 both hosts.
 
+## Metal GELU backward family consolidation
+
+Building on `d730ca8412c94a6d288225cf206eb35b2742c761`, standalone GELU backward
+and four rank-one fused FFN backward entry points share one derivative body.
+A compile-time upstream type preserves lazy device loads for standalone
+nonfinite/saturated-negative paths and passes an already computed value in
+fused paths. Three compile-time policies select a precomputed second branch and
+whether second/upstream intermediates are saved. Kernel interfaces and host
+dispatch remain unchanged; CPU and CUDA production code are unchanged.
+
+The schedule retains stores before reading the GELU input and preserves the
+original expression boundaries: a saved second branch is rounded before
+addition, while the output-only branch keeps its single multiply/add expression
+and permitted FMA contraction. An initial direct comparison caught rounding
+changes from splitting that expression into a temporary; the final full matrix
+passes after restoring the expression. NaN/Inf handling, finite-derivative
+checks, tanh saturation returns and exact-GELU approximation remain unchanged.
+
+Including all helpers and wrappers, this removes **60 maintained lines / 2,815
+bytes**. `metal_kernels.m` falls from 70,305 to 70,245 lines. Across the four GPU
+family checkpoints, the reduction is **988 lines / 63,012 bytes** relative to
+`f79d38374f`; generated artifacts are excluded.
+
+The exact harness, production-safe-math full shader snapshots, source hashes,
+initial expression-failure receipt and final results are retained under ignored
+`.benchmark-assets/1166/gelu-backward-families/`. All **80 direct cases** are
+byte-identical to baseline, including every emitted branch intermediate and
+output guards. They cover all five entry points, exact/tanh variants, empty and
+ragged shapes through 64x1024, NaN/Inf upstreams and inputs, signed zero,
+saturation and extreme finite inputs. Independent F64 analytic references check
+finite upstream arithmetic (maximum absolute error 1.15e-6); nonfinite upstream
+arithmetic uses baseline bits because rounding a tiny derivative to zero can
+change an Inf product into NaN.
+
+All **40 timing cases** pass the 5% budget using 250 warmups and sixteen balanced
+`ABBABAABABBAABBA` arms of 1,000 dispatches. Worst ratio is 1.03900 (+3.90%);
+static threadgroup storage and maximum supported threads are unchanged.
+
+All six selected integration tests pass with zero skips after the final precision
+fix: native activation parity, retained Metal training-session bindings through
+backward, interpreter backward reference and rank-adapter backward paths. Final
+CPU/Metal/CUDA product compilation, generated-source freshness (67 files plus
+Metal/CUDA runtime regions) and whitespace checks pass.
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;
