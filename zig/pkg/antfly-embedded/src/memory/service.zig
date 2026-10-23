@@ -45,6 +45,7 @@ const GenerationProvenance = struct {
     context: []const t.DerivedDependency = &.{},
     views: []const t.EntityViewInput = &.{},
 };
+const JudgmentArtifact = struct { operation: prov.Resource, inputs: GenerationProvenance, reason: []const u8, output_assertion_id: ?[]const u8 = null };
 const ExplainedRecord = struct { resource: prov.Resource, record: std.json.Value, links: []const prov.Link };
 const StoredOutcome = struct { outcome: t.Outcome, owner: []const u8, recorded_at: i64, revision: u64 = 0 };
 const DependencyWork = struct { kind: []const u8, id: []const u8, revision: u64, cursor: ?[]const u8 = null };
@@ -59,6 +60,7 @@ const EntityCurationProvenance = struct {
     entity_ids: []const []const u8,
     reason: []const u8,
     evidence: []const t.EvidenceRef = &.{},
+    judgment: ?prov.Resource = null,
 };
 
 const ProposalBinding = t.EntityProposalInputs;
@@ -307,7 +309,7 @@ pub const Service = struct {
             .stage_embeddings => try run.stageEmbeddings(try parse(t.EmbeddingBatch, a, body)),
             .curate_entity => try run.curateEntity(try parse(t.EntityCorrection, a, body)),
             .propose_relationship => try run.proposeRelationship(try parse(t.RelationshipProposalRequest, a, body), &op),
-            .relationship_proposal => output = try run.encode(try run.relationshipProposal(id)),
+            .relationship_proposal => output = try run.encode(try run.publicRelationshipProposal(id)),
             .review_relationship => try run.reviewRelationship(id, try parse(t.EntityVerdict, a, body), &op),
             .entity_view => output = try run.encode(try run.entityView(id, try parse(t.EntityViewRequest, a, body))),
             .episodes => output = try run.episodes(try parse(t.EpisodeRequest, a, body)),
@@ -588,7 +590,39 @@ const Run = struct {
                 record.reason = null;
             }
         };
+        if (view == .visible) {
+            try self.publicClaim(&record.assertion);
+            record.conflicts_with = try self.publicAssertionRefs(record.conflicts_with);
+            if (record.superseded_by) |id| if (!try self.publicAssertionRef(id)) {
+                record.superseded_by = null;
+            };
+            if (record.explicit_disposition) |*baseline| {
+                baseline.conflicts_with = try self.publicAssertionRefs(baseline.conflicts_with);
+                if (baseline.superseded_by) |id| if (!try self.publicAssertionRef(id)) {
+                    baseline.superseded_by = null;
+                };
+            }
+        }
         return record;
+    }
+    fn publicClaim(self: *Run, claim: *t.Assertion) !void {
+        var branches: std.ArrayList(t.Support) = .empty;
+        if (try self.retainedSupport(claim.evidence, claim.depends_on, 0)) try branches.append(self.a, .{ .evidence = claim.evidence, .depends_on = claim.depends_on });
+        for (claim.support_sets) |support| if (try self.retainedSupport(support.evidence, support.depends_on, 0)) try branches.append(self.a, support);
+        claim.evidence = if (branches.items.len > 0) branches.items[0].evidence else &.{};
+        claim.depends_on = if (branches.items.len > 0) branches.items[0].depends_on else &.{};
+        claim.support_sets = if (branches.items.len > 1) branches.items[1..] else &.{};
+        inline for (.{ "supersedes", "motivates", "rejected_in_favor_of" }) |field| @field(claim.*, field) = try self.publicAssertionRefs(@field(claim.*, field));
+    }
+    fn publicAssertionRef(self: *Run, id: []const u8) !bool {
+        const record = (try self.assertion(id)) orelse return false;
+        self.authorize(record.owner, record.assertion.visibility) catch return false;
+        return self.retained(record, 0);
+    }
+    fn publicAssertionRefs(self: *Run, ids: []const []const u8) ![]const []const u8 {
+        var result: std.ArrayList([]const u8) = .empty;
+        for (ids) |id| if (try self.publicAssertionRef(id)) try result.append(self.a, id);
+        return result.items;
     }
     fn authorize(self: *Run, owner: []const u8, visibility: t.Visibility) !void {
         if (visibility == .private and !eql(u8, owner, self.service.context.principal) and !self.service.context.admin) return error.Forbidden;
@@ -733,23 +767,21 @@ const Run = struct {
     }
     fn generationRetained(self: *Run, kind: []const u8, id: []const u8) !bool {
         const inputs = (try self.read(GenerationProvenance, try self.generationKey(kind, id))) orelse return true;
-        for (inputs.evidence_ids) |input| {
-            try self.supportStep();
-            const source = (try self.evidence(input)) orelse return false;
-            self.authorize(source.owner, source.evidence.visibility) catch return false;
-            if (!try self.evidenceRetained(source)) return false;
-        }
-        return self.causalContextAvailable(inputs.context, false);
+        return self.provenanceAvailable(inputs, .retained);
     }
     fn entityRetained(self: *Run, record: t.EntityRecord) !bool {
         return try self.retainedSupport(record.entity.evidence, &.{}, 0) and try self.generationRetained("entity", record.entity.id);
     }
     fn generationVisible(self: *Run, kind: []const u8, id: []const u8) !bool {
-        const provenance = (try self.read(GenerationProvenance, try self.generationKey(kind, id))) orelse return true;
-        for (provenance.evidence_ids) |input| {
-            if (!try self.supportVisible(&.{.{ .id = input }}, &.{}, 0)) return false;
+        const inputs = (try self.read(GenerationProvenance, try self.generationKey(kind, id))) orelse return true;
+        return self.provenanceAvailable(inputs, .visible);
+    }
+    fn provenanceAvailable(self: *Run, inputs: GenerationProvenance, comptime view: RecordView) !bool {
+        if (try self.read(bool, "forgotten-all") != null) return false;
+        for (inputs.evidence_ids) |input| {
+            if (!try self.reasonSupport(&.{.{ .id = input }}, view)) return false;
         }
-        return self.causalContextAvailable(provenance.context, true);
+        return self.causalContextAvailable(inputs.context, view == .visible);
     }
     // Context snapshots carry their complete causal closure, so checking them
     // is bounded and cannot create cycles through later assertion revisions.
@@ -786,6 +818,20 @@ const Run = struct {
     fn curationProvenanceRetained(self: *Run, value: EntityCurationProvenance) !bool {
         if (value.entity_ids.len == 0 or value.entity_ids.len > 2) return error.MemoryCorruptState;
         if (try self.read(bool, "forgotten-all") != null) return false;
+        if (value.judgment) |ref| {
+            const artifact = (try self.read(JudgmentArtifact, try key(self.a, "judgment", ref.id))) orelse return false;
+            if (artifact.operation.revision != ref.revision) return false;
+            if (self.retention_maintenance) {
+                if (!try self.judgmentAvailable(artifact, .retained)) return false;
+            } else if (!try self.judgmentAvailable(artifact, .visible)) return false;
+        } else {
+            // Pre-binding external verdict rationales cannot prove their input
+            // closure. Manual curation still has its explicit evidence policy.
+            const event = try std.fmt.allocPrint(self.a, "audit-event/entity/{s}/{d:0>20}", .{ try hash(self.a, value.entity_ids[0]), value.revision });
+            if (try self.read(prov.Resource, event)) |ref| if (try self.read(prov.Decision, try key(self.a, "audit", ref.id))) |decision| {
+                if (eql(u8, decision.action, "review_entity")) return false;
+            };
+        }
         for (value.evidence) |ref| {
             const source = (try self.evidence(ref.id)) orelse return false;
             self.authorize(source.owner, source.evidence.visibility) catch return false;
@@ -1286,9 +1332,12 @@ const Run = struct {
         var reasons = try self.reasonBindings(incoming);
         const previous_links = record.assertion.supersedes;
         const decision = (try self.decideClaim(&visible.assertion, record.owner, reasons.assertion)) orelse return;
-        record.assertion = visible.assertion;
+        // Only decision fields flow back from the public/model projection.
+        // A temporary source denial must never delete retained alternatives.
+        record.assertion.supersedes = visible.assertion.supersedes;
+        record.assertion.reconciliation_reason = visible.assertion.reconciliation_reason;
         // Apply only the new verdict; retain already accepted relationship links.
-        try self.applySupersessions(record.assertion, record.owner, decision);
+        try self.applySupersessions(visible.assertion, record.owner, decision);
         var links: std.ArrayList([]const u8) = .empty;
         for (previous_links) |id| try links.append(self.a, id);
         for (record.assertion.supersedes) |id| {
@@ -1672,6 +1721,47 @@ const Run = struct {
             try self.captureJudgmentDependency(context, .{ .resource = try self.resourceRef(.assertion, id, parent.revision), .evidence = selected.evidence }, audience, depth + 1);
         }
     }
+    fn storeJudgment(self: *Run, views: []const t.EntityViewInput, refs: []const t.EvidenceRef, audience: t.Visibility, reason: []const u8, receipt: t.Operation, output_assertion_id: ?[]const u8) !JudgmentArtifact {
+        var context: JudgmentContext = .{};
+        for (refs) |ref| try context.evidence.put(self.a, ref.id, {});
+        for (views) |view| for (view.dependencies) |dependency| try self.captureJudgmentDependency(&context, dependency, audience, 0);
+        const ids = try self.a.alloc([]const u8, context.evidence.count());
+        var sources = context.evidence.keyIterator();
+        var i: usize = 0;
+        while (sources.next()) |source| : (i += 1) {
+            ids[i] = source.*;
+            const input = (try self.evidence(source.*)) orelse return error.MemoryForgotten;
+            if (audience == .team and input.evidence.visibility == .private) return error.MemoryVisibilityConflict;
+        }
+        std.mem.sort([]const u8, ids, {}, stringLess);
+        const artifact: JudgmentArtifact = .{
+            .operation = try self.resourceRef(.operation, receipt.id, receipt.revision),
+            .inputs = .{ .operation_id = receipt.id, .config_generation = self.state.config.generation, .evidence_ids = ids, .context = context.dependencies.items, .views = views },
+            .reason = reason,
+            .output_assertion_id = output_assertion_id,
+        };
+        try self.put(try key(self.a, "judgment", receipt.id), artifact);
+        return artifact;
+    }
+    fn judgmentAvailable(self: *Run, artifact: JudgmentArtifact, comptime view: RecordView) !bool {
+        if (artifact.output_assertion_id) |id| if (try self.read(bool, try key(self.a, "forgotten-assertion", id)) != null) return false;
+        return self.provenanceAvailable(artifact.inputs, view);
+    }
+    fn relationshipJudgment(self: *Run, proposal: t.RelationshipProposal) !?JudgmentArtifact {
+        const revision = proposal.verdict_revision orelse return null;
+        const ref = (try self.read(prov.Resource, try key(self.a, "relationship-judgment", proposal.id))) orelse return null;
+        if (ref.revision != revision) return error.MemoryCorruptState;
+        const artifact = (try self.read(JudgmentArtifact, try key(self.a, "judgment", ref.id))) orelse return null;
+        if (artifact.operation.revision != revision or !eql(u8, artifact.operation.id, ref.id)) return error.MemoryCorruptState;
+        return artifact;
+    }
+    fn redactVerdict(proposal: *t.RelationshipProposal) void {
+        proposal.reason = "";
+        proposal.verdict_evidence = &.{};
+        proposal.verdict_actor = "";
+        proposal.verdict_principal = "";
+        proposal.model = null;
+    }
     fn reviewEvidence(self: *Run, refs: []const t.EvidenceRef) !void {
         if (refs.len > t.max_items) return error.MemoryInputTooLarge;
         for (refs) |ref| {
@@ -1966,6 +2056,7 @@ const Run = struct {
         return .{ .entity = record.entity, .canonical_id = selected, .description = text.items, .dependencies = dependencies.items, .fingerprint = try hash(self.a, .{ selected, record.revision, self.state.config.generation, dependencies.items, text.items }), .revision = self.state.revision, .config_generation = self.state.config.generation, .complete = complete, .scanned = related.scanned };
     }
     fn relationshipRetained(self: *Run, proposal: t.RelationshipProposal) !bool {
+        if (try self.read(bool, try key(self.a, "forgotten-assertion", proposal.assertion.id)) != null) return false;
         if (!try self.viewInputsRetained(proposal.views)) return false;
         if (try self.read(bool, "forgotten-all") != null) return false;
         if (!try self.retainedSupport(proposal.assertion.evidence, proposal.assertion.depends_on, 0)) return false;
@@ -1985,11 +2076,32 @@ const Run = struct {
             try self.authorize(record.owner, record.entity.visibility);
             if (!try self.entityVisible(record)) return error.MemoryNotFound;
         }
-        if (!try self.supportVisible(proposal.verdict_evidence, &.{}, 0)) {
-            proposal.reason = "";
-            proposal.verdict_evidence = &.{};
-        }
+        const judgment = try self.relationshipJudgment(proposal);
+        if (judgment == null or !try self.judgmentAvailable(judgment.?, .visible) or !try self.supportVisible(proposal.verdict_evidence, &.{}, 0)) {
+            redactVerdict(&proposal);
+        } else proposal.reason = judgment.?.reason;
         return proposal;
+    }
+    fn publicViewInputs(self: *Run, inputs: ?[]const t.EntityViewInput) !?[]const t.EntityViewInput {
+        const stored = inputs orelse return null;
+        const result = try self.a.dupe(t.EntityViewInput, stored);
+        for (result) |*input| {
+            var dependencies: std.ArrayList(t.DerivedDependency) = .empty;
+            for (input.dependencies) |dependency| if (try self.causalContextAvailable(&.{dependency}, false)) try dependencies.append(self.a, dependency);
+            input.dependencies = dependencies.items;
+        }
+        return result;
+    }
+    fn publicProposalBinding(self: *Run, stored: ProposalBinding) !ProposalBinding {
+        var result = stored;
+        result.views = try self.publicViewInputs(stored.views);
+        return result;
+    }
+    fn publicRelationshipProposal(self: *Run, id: []const u8) !t.RelationshipProposal {
+        var result = try self.relationshipProposal(id);
+        result.views = try self.publicViewInputs(result.views);
+        try self.publicClaim(&result.assertion);
+        return result;
     }
     fn proposeRelationship(self: *Run, request: t.RelationshipProposalRequest, receipt: *t.Operation) !void {
         if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
@@ -2024,6 +2136,9 @@ const Run = struct {
         if (proposal.config_generation != self.state.config.generation) return error.MemoryConfigurationChanged;
         try self.reviewEvidence(request.evidence);
         try self.bindJudgedViews(proposal.views, request.views);
+        const views = proposal.views orelse return error.MemoryResourceChanged;
+        const artifact = try self.storeJudgment(views, request.evidence, proposal.assertion.visibility, request.reason, receipt.*, proposal.assertion.id);
+        try self.put(try key(self.a, "relationship-judgment", proposal.id), artifact.operation);
         if (request.accept) |accept| {
             if (accept) {
                 for (request.evidence) |ref| {
@@ -2032,24 +2147,11 @@ const Run = struct {
                 }
                 // All external review context is a conjunctive causal input
                 // of the accepted assertion, independent of factual support.
-                var context: JudgmentContext = .{};
-                for (request.evidence) |ref| try context.evidence.put(self.a, ref.id, {});
-                const views = proposal.views orelse return error.MemoryResourceChanged;
-                for (views) |view| for (view.dependencies) |dependency| try self.captureJudgmentDependency(&context, dependency, proposal.assertion.visibility, 0);
-                const evidence_ids = try self.a.alloc([]const u8, context.evidence.count());
-                var sources = context.evidence.keyIterator();
-                var i: usize = 0;
-                while (sources.next()) |source| : (i += 1) {
-                    evidence_ids[i] = source.*;
-                    const context_source = (try self.evidence(source.*)) orelse return error.MemoryForgotten;
-                    if (proposal.assertion.visibility == .team and context_source.evidence.visibility == .private) return error.MemoryVisibilityConflict;
-                }
-                std.mem.sort([]const u8, evidence_ids, {}, stringLess);
                 if (try self.assertion(proposal.assertion.id) != null) return error.MemoryAssertionConflict;
-                try self.put(try self.generationKey("assertion", proposal.assertion.id), GenerationProvenance{ .operation_id = receipt.id, .config_generation = self.state.config.generation, .evidence_ids = evidence_ids, .context = context.dependencies.items, .views = views });
+                try self.put(try self.generationKey("assertion", proposal.assertion.id), artifact.inputs);
                 try self.assertions(&.{proposal.assertion}, false);
-                for (evidence_ids) |input| try self.put(try dependencyKey(self.a, "evidence", input, proposal.assertion.id), .{ .child = proposal.assertion.id });
-                for (context.dependencies.items) |input| try self.put(try dependencyKey(self.a, @tagName(input.resource.kind), input.resource.id, proposal.assertion.id), .{ .child = proposal.assertion.id });
+                for (artifact.inputs.evidence_ids) |input| try self.put(try dependencyKey(self.a, "evidence", input, proposal.assertion.id), .{ .child = proposal.assertion.id });
+                for (artifact.inputs.context) |input| try self.put(try dependencyKey(self.a, @tagName(input.resource.kind), input.resource.id, proposal.assertion.id), .{ .child = proposal.assertion.id });
             }
             proposal.state = if (accept) .accepted else .rejected;
         }
@@ -2867,7 +2969,7 @@ const Run = struct {
             const provenance = (try self.read(EntityCurationProvenance, try std.fmt.allocPrint(self.a, "entity-curation/{d:0>20}", .{revision}))) orelse break :blk @as(?[]const u8, null);
             break :blk if (try self.curationProvenanceRetained(provenance)) provenance.reason else null;
         } else null;
-        return self.encode(t.EntityProposalDetail{ .proposal = proposal, .inputs = binding, .reason = reason, .stale_configuration = binding.config_generation != self.state.config.generation, .revision = self.state.revision });
+        return self.encode(t.EntityProposalDetail{ .proposal = proposal, .inputs = try self.publicProposalBinding(binding), .reason = reason, .stale_configuration = binding.config_generation != self.state.config.generation, .revision = self.state.revision });
     }
     fn reviewEntity(self: *Run, id: []const u8, request: t.EntityVerdict, receipt: *t.Operation) !void {
         try self.service.context.requireGrant(.curator);
@@ -2900,6 +3002,7 @@ const Run = struct {
         if (inputs.len > t.max_items) return error.MemoryInputTooLarge;
         @memcpy(inputs[0..binding.evidence.len], binding.evidence);
         @memcpy(inputs[binding.evidence.len..], request.evidence);
+        const artifact = try self.storeJudgment(binding.views orelse return error.MemoryResourceChanged, inputs, .private, request.reason, receipt.*, null);
         if (request.accept) |accept| {
             const plan = try curation.decide(self.a, stored.state, stored.redirects, stored.redirects, id, .{ .accept = accept, .pin_distinct = request.pin_distinct }, .{ .actor = self.service.context.principal, .created_at_ms = @intCast(@max(0, self.service.context.now_ms)), .revision = self.state.revision });
             if (accept or request.pin_distinct) try self.curateEntity(.{ .action = if (!accept) .distinct else std.meta.stringToEnum(@FieldType(t.EntityCorrection, "action"), @tagName(proposal.action)).?, .from = proposal.key, .to = proposal.into, .expected_revision = request.expected_revision, .replace = if (accept) proposal.options.replace else false, .pin_distinct = if (accept) proposal.options.pin_distinct else false, .absorbed = if (accept) std.meta.stringToEnum(@FieldType(t.EntityCorrection, "absorbed"), @tagName(proposal.options.absorbed)).? else .reject });
@@ -2909,7 +3012,7 @@ const Run = struct {
             self.suppression_index = null;
         }
         const ids = if (proposal.into) |target| &[_][]const u8{ proposal.key, target } else &[_][]const u8{proposal.key};
-        if (request.reason.len > 0) try self.put(try std.fmt.allocPrint(self.a, "entity-curation/{d:0>20}", .{self.state.revision}), EntityCurationProvenance{ .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision, .entity_ids = ids, .reason = request.reason, .evidence = inputs });
+        if (request.reason.len > 0) try self.put(try std.fmt.allocPrint(self.a, "entity-curation/{d:0>20}", .{self.state.revision}), EntityCurationProvenance{ .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision, .entity_ids = ids, .reason = request.reason, .evidence = inputs, .judgment = artifact.operation });
         binding.verdict_revision = self.state.revision;
         binding.model = request.model;
         binding.verdict_actor = request.actor;
@@ -3702,15 +3805,23 @@ const Run = struct {
         } else if (std.mem.startsWith(u8, row.key, "episode-turn/")) {
             const binding = try parse(struct { id: []const u8 }, self.a, row.json);
             if (try self.evidence(binding.id) == null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "judgment/")) {
+            const artifact = try parse(JudgmentArtifact, self.a, row.json);
+            if (!try self.judgmentAvailable(artifact, .retained)) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "relationship-judgment/")) {
+            const ref = try parse(prov.Resource, self.a, row.json);
+            if (try self.read(JudgmentArtifact, try key(self.a, "judgment", ref.id)) == null) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "relationship-proposal/")) {
             var proposal = try parse(t.RelationshipProposal, self.a, row.json);
             if (!try self.relationshipRetained(proposal)) {
                 try self.put(try key(self.a, "forgotten-relationship-proposal", proposal.id), true);
                 try self.remove(row.key);
-            } else if (proposal.verdict_evidence.len > 0 and !try self.retainedSupport(proposal.verdict_evidence, &.{}, 0)) {
-                proposal.reason = "";
-                proposal.verdict_evidence = &.{};
-                try self.put(row.key, proposal);
+            } else if (proposal.verdict_revision != null) {
+                const judgment = try self.relationshipJudgment(proposal);
+                if (judgment == null or !try self.judgmentAvailable(judgment.?, .retained) or !try self.retainedSupport(proposal.verdict_evidence, &.{}, 0)) {
+                    redactVerdict(&proposal);
+                    try self.put(row.key, proposal);
+                }
             }
         } else if (std.mem.startsWith(u8, row.key, "proposal-input/")) {
             if (!try self.proposalInputsRetained(try parse(ProposalBinding, self.a, row.json))) try self.remove(row.key);
@@ -4100,6 +4211,18 @@ const Run = struct {
             after = if (snapshots.next) |cursor| try self.a.dupe(u8, cursor) else return .missing;
         }
     }
+    fn appendProvenanceLinks(self: *Run, inputs: GenerationProvenance, links: *std.ArrayList(prov.Link)) !void {
+        var seen: ResourceSet = .empty;
+        for (links.items) |link| try seen.put(self.a, try hash(self.a, .{ link.relation, link.target }), {});
+        for (inputs.evidence_ids) |id| if (try self.evidence(id)) |source| try self.appendProvenanceLink(links, &seen, .supported_by, try self.resourceRef(.evidence, id, source.revision));
+        for (inputs.context) |input| try self.appendProvenanceLink(links, &seen, .depends_on, input.resource);
+    }
+    fn appendProvenanceLink(self: *Run, links: *std.ArrayList(prov.Link), seen: *ResourceSet, relation: prov.Relation, target: prov.Resource) !void {
+        const identity = try hash(self.a, .{ relation, target });
+        if (seen.contains(identity)) return;
+        try seen.put(self.a, identity, {});
+        try links.append(self.a, .{ .relation = relation, .target = target });
+    }
     fn loadExplanationRecord(self: *Run, ref: *prov.Resource, request: prov.ExplainRequest, links: *std.ArrayList(prov.Link)) anyerror!std.json.Value {
         if (ref.external()) {
             const snapshot = try self.resourceSnapshot(ref.*);
@@ -4218,6 +4341,16 @@ const Run = struct {
                 if (targets.next != null) self.explanation_truncated = true;
                 try links.append(self.a, .{ .relation = .governed_by, .target = record.configuration });
                 value = try parse(std.json.Value, self.a, try self.encode(record));
+                if (eql(u8, record.action, "review_entity") or eql(u8, record.action, "review_relationship")) {
+                    if (try self.read(JudgmentArtifact, try key(self.a, "judgment", record.operation.id))) |artifact| {
+                        if (artifact.operation.revision == record.operation.revision and try self.judgmentAvailable(artifact, .retained)) {
+                            try self.appendProvenanceLinks(artifact.inputs, links);
+                            // Minimal admission decisions can be shared with an
+                            // output's readers; private review text cannot.
+                            if ((self.service.context.admin or eql(u8, record.initiator.id, self.service.context.principal)) and artifact.reason.len > 0) try value.object.put(self.a, "recorded_rationale", .{ .string = artifact.reason });
+                        } else self.explanation_incomplete_history = true;
+                    } else self.explanation_incomplete_history = true;
+                }
                 if (eql(u8, record.action, "curate_entity")) {
                     const reason_path = try std.fmt.allocPrint(self.a, "entity-curation/{d:0>20}", .{record.resource.revision});
                     if (try self.read(EntityCurationProvenance, reason_path)) |reason| {
@@ -4234,9 +4367,17 @@ const Run = struct {
                 try self.requireKnownAt(ref.*, if (snapshot) |version| version.recorded_at else null, request);
                 if (snapshot == null) self.explanation_incomplete_history = true;
                 value = try parse(std.json.Value, self.a, try self.encode(record));
+                if (try self.read(JudgmentArtifact, try key(self.a, "judgment", ref.id))) |artifact| {
+                    if (artifact.operation.revision == ref.revision and try self.judgmentAvailable(artifact, .retained)) {
+                        try self.appendProvenanceLinks(artifact.inputs, links);
+                        if (artifact.reason.len > 0) try value.object.put(self.a, "recorded_rationale", .{ .string = artifact.reason });
+                    } else self.explanation_incomplete_history = true;
+                } else if (eql(u8, record.action, "review_relationship") or eql(u8, record.action, "review_entity")) self.explanation_incomplete_history = true;
                 if (self.service.context.admin) if (try self.read(ProposalAttempt, try key(self.a, "proposal-attempt", record.id))) |attempt| {
                     if (attempt.inputs.operation) |operation| if (operation.revision == ref.revision and try self.proposalInputsRetained(attempt.inputs)) {
-                        try value.object.put(self.a, "entity_proposal", try parse(std.json.Value, self.a, try self.encode(attempt)));
+                        var projected = attempt;
+                        projected.inputs = try self.publicProposalBinding(attempt.inputs);
+                        try value.object.put(self.a, "entity_proposal", try parse(std.json.Value, self.a, try self.encode(projected)));
                         if (attempt.previous) |previous| try links.append(self.a, .{ .relation = .supersedes, .target = previous });
                         for (attempt.inputs.evidence) |evidence_ref| if (try self.evidence(evidence_ref.id)) |source| try links.append(self.a, .{ .relation = .supported_by, .target = try self.resourceRef(.evidence, source.evidence.id, source.revision) });
                         for (attempt.inputs.entities) |entity_ref| try links.append(self.a, .{ .relation = .depends_on, .target = try self.resourceRef(.entity, entity_ref.id, entity_ref.revision) });
@@ -4271,6 +4412,9 @@ const Run = struct {
                 for (record.outcome.used_memory_ids) |used| if (try self.asOf(used, record.recorded_at)) |parent| try links.append(self.a, .{ .relation = .used, .target = try self.resourceRef(.assertion, used, parent.revision) });
             },
             else => return error.InvalidResourceReference,
+        }
+        if (ref.kind == .assertion or ref.kind == .entity) {
+            if (try self.read(GenerationProvenance, try self.generationKey(@tagName(ref.kind), ref.id))) |inputs| try self.appendProvenanceLinks(inputs, links);
         }
         if (ref.kind == .entity or ref.kind == .table or ref.kind == .configuration) {
             const prefix = try std.fmt.allocPrint(self.a, "audit-event/{s}/{s}/", .{ @tagName(ref.kind), try hash(self.a, ref.id) });
@@ -4342,7 +4486,6 @@ const Run = struct {
                 self.authorize(record.owner, record.assertion.visibility) catch continue;
                 if (!try self.evidenceVisibleTime(record, request.known_at, request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null, 0)) continue;
                 const claim = record.assertion;
-                if (!relationsMatch(request, claim)) continue;
                 if (!matchesTime(request, record, self.service.context.now_ms)) continue;
                 if (!request.include_provisional and claim.stability == .provisional) continue;
                 const canonical_subject = (try self.canonical(claim.subject)) orelse continue;
@@ -4356,7 +4499,9 @@ const Run = struct {
                 if (request.kind) |v| if (claim.kind != v) continue;
                 if (request.environment) |v| if (claim.environment != null and !eql(u8, v, claim.environment.?)) continue;
                 if (request.task) |v| if (claim.task != null and !eql(u8, v, claim.task.?)) continue;
-                try items.append(self.a, try self.publicRecord(record));
+                const projected = try self.publicRecord(record);
+                if (!relationsMatch(request, projected.assertion)) continue;
+                try items.append(self.a, projected);
                 if (items.items.len == request.limit) break;
             }
             if (!more) break;
@@ -4546,7 +4691,6 @@ const Run = struct {
         const valid = request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null;
         if (!try self.evidenceVisibleTime(record, request.known_at, valid, 0)) return null;
         const claim = record.assertion;
-        if (!relationsMatch(request, claim)) return null;
         const historical = record.lifecycle == .superseded or record.lifecycle == .retracted or (claim.valid_to != null and claim.valid_to.? <= self.service.context.now_ms);
         if (!matchesTime(request, record, self.service.context.now_ms)) return null;
         if (!request.include_provisional and claim.stability == .provisional) return null;
@@ -4579,6 +4723,7 @@ const Run = struct {
         record.assertion.support_sets = &.{};
         record.assertion.embedding = null;
         record = try self.publicRecord(record);
+        if (!relationsMatch(request, record.assertion)) return null;
         return .{ .memory = record, .score = score, .historical = historical, .citations = support.evidence };
     }
     fn recall(self: *Run, request: t.Recall) ![]const u8 {

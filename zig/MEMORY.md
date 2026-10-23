@@ -535,7 +535,20 @@ references and source evidence. Both source evidence and assertion/entity
 forgetting fence reads immediately; dependency postings drive physical cleanup.
 Later support alternatives or mutable parent revisions cannot replace the
 context that was actually judged. Private view inputs cannot publish a team
-assertion. Rejection does not imply identity separation: typed relationship review rejects `pin_distinct`. Attribution and
+assertion. Every accept, reject and defer verdict also writes an immutable,
+operation-bound judgment artifact with that same selected support closure and
+rationale. The latest relationship verdict references its artifact, independently
+of accepted-assertion retention. Entity verdict rationales share this gate.
+Rationales are redacted immediately when their exact context becomes unavailable;
+relationship verdict detail follows the same gate. Irreversible loss scrubs the
+artifact and duplicate
+proposal/curation text. Explicitly forgetting an accepted assertion also retires
+its duplicate proposal payload and judgment rationale. Missing legacy relationship
+judgment bindings fail closed.
+Minimal decision state and authenticated operation metadata remain auditable.
+Proposal dependency payloads filter inaccessible references while retaining the
+opaque fingerprint used for native verdict admission; internal snapshots are
+never rewritten by public projection. Rejection does not imply identity separation: typed relationship review rejects `pin_distinct`. Attribution and
 review reasons are retained only while their own evidence permits disclosure.
 None of these contracts accepts a hosted client, credential or prompt to execute.
 
@@ -750,6 +763,14 @@ Context is disambiguation evidence, not another authoritative extraction stream.
 Generated assertions must cite a current observation as well as any prior support they use.
 `support_sets` represents independent alternative support; each individual set is
 conjunctive. Losing one set must not remove a claim with another retained set.
+Point reads, history, enumeration, proposal payloads and explanation records
+project authorized retained support branches. An unavailable conjunctive branch
+is omitted as a unit, with a surviving alternative promoted when necessary;
+other inaccessible assertion references are also omitted. Relationship filters
+run against the projected links, so query results cannot disclose a hidden edge.
+The persisted support
+tree remains intact under temporary denial. Model reconciliation copies only its
+decision fields back to storage, never a reader's filtered support projection.
 The durable dependency queue propagates irreversible retention loss as a bounded
 retirement frontier. Only loss of all complete retained support branches retires a
 fact: fence its immutable ID, remove its primary payload and generation metadata,
@@ -1643,7 +1664,17 @@ other declared edges without treating retrieval as evidence of use. Native
 assertion support alternatives remain separate in the assertion payload. Outcome
 usage links select memory as known when the outcome was recorded.
 
-Every resource edge is authorized separately. The HTTP reader checks current
+Generated assertion and entity explanations include their conjunctive generation
+inputs as `supported_by` edges and exact frozen context revisions as `depends_on`
+edges. Verdict-operation explanations use the independent judgment artifact,
+including its retained rationale; retired or missing judgment detail marks history
+incomplete. New causal edges are deduplicated against factual edges in linear
+work. This explains the actual retention dependencies even when the judge omitted
+them from factual citations or they arrived in a separate observation.
+
+Every resource edge is authorized separately. Assertion payloads and captured
+proposal dependencies apply reference redaction too, so a hidden target cannot
+leak through raw support arrays alongside a redacted edge. The HTTP reader checks current
 ordinary-table permissions and rejects unsupported row-filter policies; memory
 permission alone does not grant business-table access. Embedded reads use the
 local database owner's authority. Missing and denied targets share a redacted

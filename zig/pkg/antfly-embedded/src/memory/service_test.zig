@@ -6085,3 +6085,236 @@ test "memory judgment context pins transitive selected support without alternati
         try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .get, "link-2", "{}", ""));
     }
 }
+
+test "memory public projections redact inaccessible support without changing stored alternatives" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"public\",\"source_id\":\"public\",\"source_version\":\"1\",\"text\":\"Public support\",\"visibility\":\"team\"},{\"id\":\"denied-context-id\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"},\"visibility\":\"team\"}],\"assertions\":[{\"id\":\"claim\",\"subject\":\"subject\",\"predicate\":\"p\",\"value\":\"value\",\"statement\":\"An independently supported fact\",\"visibility\":\"team\",\"evidence\":[{\"id\":\"public\"}],\"support_sets\":[{\"evidence\":[{\"id\":\"denied-context-id\"}]}]}]}", "observe");
+    store.resource_state = .denied;
+    const reader = store.service("bob", false, 10);
+    try std.testing.expectError(error.MemoryNotFound, reader.execute(a, .evidence, "denied-context-id", "{}", ""));
+    for ([_]m.Action{ .get, .list, .history, .explain }) |action| {
+        const body = try reader.execute(a, action, if (action == .list) "" else "claim", "{}", "");
+        try std.testing.expect(std.mem.indexOf(u8, body, "denied-context-id") == null);
+    }
+    const stored = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, store.values.get(try fixtureKey(a, "assertion", "claim")).?, .{});
+    try std.testing.expectEqual(@as(usize, 1), stored.assertion.support_sets.len);
+    store.resource_state = .current;
+    const restored = try reader.execute(a, .get, "claim", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, restored, "denied-context-id") != null);
+    store.resource_state = .denied;
+    const recalled = try reader.execute(a, .recall, "", "{\"token_budget\":8192}", "");
+    try std.testing.expect(std.mem.indexOf(u8, recalled, "independently supported fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recalled, "denied-context-id") == null);
+}
+
+test "memory relationship explanations traverse frozen judgment sources" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create");
+    const observation: m.types.ObservationRequest = .{
+        .evidence = &.{.{ .id = "base", .source_id = "s", .source_version = "1", .text = "Concepts" }},
+        .entities = &.{ .{ .id = "a", .name = "Antfly", .evidence = &.{.{ .id = "base" }} }, .{ .id = "b", .name = "Database", .evidence = &.{.{ .id = "base" }} } },
+    };
+    _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, observation, .{}), "observe");
+    const context: m.types.ObservationRequest = .{
+        .evidence = &.{.{ .id = "judged-context", .source_id = "judged-source", .source_version = "1", .text = "JUDGED_CONTEXT_MARKER" }},
+        .assertions = &.{.{ .id = "judged-description", .subject = "a", .predicate = "description", .value = "database", .statement = "JUDGED_CONTEXT_MARKER", .evidence = &.{.{ .id = "judged-context" }} }},
+    };
+    _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, context, .{}), "context");
+    const view = try svc.execute(a, .entity_view, "a", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, view, "JUDGED_CONTEXT_MARKER") != null);
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const request: m.types.RelationshipProposalRequest = .{ .id = "proposal", .expected_revision = state.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "Accepted relation", .evidence = &.{.{ .id = "base" }} } };
+    const proposed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, request, .{}), "propose"), .{});
+    _ = try svc.execute(a, .review_relationship, "proposal", try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposed.revision, .accept = true }, .{}), "accept");
+    const explanation = try svc.execute(a, .explain, "link", "{\"max_nodes\":256,\"max_depth\":16,\"max_bytes\":1048576}", "");
+    const parsed_explanation = try std.json.parseFromSliceLeaky(std.json.Value, a, explanation, .{});
+    try std.testing.expect(!parsed_explanation.object.get("truncated").?.bool);
+    try std.testing.expect(std.mem.indexOf(u8, explanation, "Accepted relation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explanation, "judged-description") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explanation, "judged-context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explanation, "JUDGED_CONTEXT_MARKER") != null);
+    _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"judged-context\"]}", "forget");
+    try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .get, "link", "{}", ""));
+}
+test "memory relationship rationales forget pinned context independently of factual alternatives" {
+    for ([_]?bool{ true, false, null }) |accepted| {
+        for ([_]bool{ false, true }) |forget_output| {
+            if (forget_output and accepted != @as(?bool, true)) continue;
+            var store = Store.init();
+            defer store.deinit();
+            const a = store.arena.allocator();
+            const svc = store.service("alice", true, 10);
+            _ = try svc.execute(a, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create");
+            const observation: m.types.ObservationRequest = .{
+                .evidence = &.{.{ .id = "base", .source_id = "s", .source_version = "1", .text = "Concepts" }},
+                .entities = &.{ .{ .id = "a", .name = "Antfly", .evidence = &.{.{ .id = "base" }} }, .{ .id = "b", .name = "Database", .evidence = &.{.{ .id = "base" }} } },
+            };
+            _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, observation, .{}), "observe");
+            const context: m.types.ObservationRequest = .{
+                .evidence = &.{ .{ .id = "judged-context", .source_id = "judged-source", .source_version = "1", .text = "JUDGED_CONTEXT_MARKER" }, .{ .id = "alternative", .source_id = "alternative-source", .source_version = "1", .text = "Independent support" } },
+                .assertions = &.{.{ .id = "judged-description", .subject = "a", .predicate = "description", .value = "database", .statement = "JUDGED_CONTEXT_MARKER", .evidence = &.{.{ .id = "judged-context" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "alternative" }} }} }},
+            };
+            _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, context, .{}), "context");
+            const view = try svc.execute(a, .entity_view, "a", "{}", "");
+            try std.testing.expect(std.mem.indexOf(u8, view, "JUDGED_CONTEXT_MARKER") != null);
+            const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+            const request: m.types.RelationshipProposalRequest = .{ .id = "proposal", .expected_revision = state.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "Accepted relation", .evidence = &.{.{ .id = "base" }} } };
+            const proposed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, request, .{}), "propose"), .{});
+            _ = try svc.execute(a, .review_relationship, "proposal", try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposed.revision, .accept = accepted, .reason = "RATIONALE_FROM_FORGOTTEN_CONTEXT" }, .{}), "accept");
+            _ = try svc.execute(a, .forget, "", if (forget_output) "{\"assertion_ids\":[\"link\"]}" else "{\"evidence_ids\":[\"judged-context\"]}", "forget");
+            try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .get, "link", "{}", ""));
+            for (0..2) |phase| {
+                if (forget_output or (phase == 1 and accepted == @as(?bool, true))) {
+                    try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .relationship_proposal, "proposal", "{}", ""));
+                } else {
+                    const proposal = try svc.execute(a, .relationship_proposal, "proposal", "{}", "");
+                    try std.testing.expect(std.mem.indexOf(u8, proposal, "RATIONALE_FROM_FORGOTTEN_CONTEXT") == null);
+                }
+                if (phase == 0) for (0..32) |i| {
+                    _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}));
+                };
+                if (phase == 1) {
+                    var rows = store.values.valueIterator();
+                    while (rows.next()) |json| try std.testing.expect(std.mem.indexOf(u8, json.*, "RATIONALE_FROM_FORGOTTEN_CONTEXT") == null);
+                }
+            }
+        }
+    }
+}
+
+test "memory public support promotion redacts denied parents and relationship references" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    const observation: m.types.ObservationRequest = .{
+        .evidence = &.{ .{ .id = "public", .source_id = "s", .source_version = "1", .text = "Public", .visibility = .team }, .{ .id = "protected", .resource_selector = .{ .table = "business", .id = "approval" }, .visibility = .team } },
+        .assertions = &.{
+            .{ .id = "protected-parent", .subject = "s", .predicate = "p", .value = "parent", .statement = "Protected parent", .visibility = .team, .evidence = &.{.{ .id = "protected" }} },
+            .{ .id = "claim", .subject = "s", .predicate = "p", .value = "fact", .statement = "Independent fact", .visibility = .team, .evidence = &.{.{ .id = "protected" }}, .depends_on = &.{"protected-parent"}, .motivates = &.{"protected-parent"}, .support_sets = &.{.{ .evidence = &.{.{ .id = "public" }} }} },
+        },
+    };
+    _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, observation, .{}), "observe");
+    store.resource_state = .denied;
+    const reader = store.service("bob", false, 10);
+    const projected = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try reader.execute(a, .get, "claim", "{}", ""), .{});
+    try std.testing.expectEqualStrings("public", projected.assertion.evidence[0].id);
+    try std.testing.expectEqual(@as(usize, 0), projected.assertion.support_sets.len);
+    try std.testing.expectEqual(@as(usize, 0), projected.assertion.depends_on.len);
+    try std.testing.expectEqual(@as(usize, 0), projected.assertion.motivates.len);
+    const explain = try reader.execute(a, .explain, "claim", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, explain, "protected-parent") == null);
+    for ([_]m.Action{ .list, .recall }) |action| {
+        const hidden_links = try std.json.parseFromSliceLeaky(std.json.Value, a, try reader.execute(a, action, "", "{\"relationship\":\"motivates\",\"target_id\":\"protected-parent\",\"token_budget\":8192}", ""), .{});
+        try std.testing.expectEqual(@as(usize, 0), hidden_links.object.get("items").?.array.items.len);
+    }
+    store.resource_state = .current;
+    for ([_]m.Action{ .list, .recall }) |action| {
+        const restored_links = try std.json.parseFromSliceLeaky(std.json.Value, a, try reader.execute(a, action, "", "{\"relationship\":\"motivates\",\"target_id\":\"protected-parent\",\"token_budget\":8192}", ""), .{});
+        try std.testing.expectEqual(@as(usize, 1), restored_links.object.get("items").?.array.items.len);
+    }
+    const restored = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try reader.execute(a, .get, "claim", "{}", ""), .{});
+    try std.testing.expectEqualStrings("protected", restored.assertion.evidence[0].id);
+    try std.testing.expectEqual(@as(usize, 1), restored.assertion.support_sets.len);
+}
+
+test "memory model reconciliation never persists a reader's filtered support branches" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = modelService(&store, 10);
+    svc.backend.decide = reviewDecide;
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    const observation: m.types.ObservationRequest = .{
+        .evidence = &.{ .{ .id = "public", .source_id = "s", .source_version = "1", .text = "Public" }, .{ .id = "protected", .resource_selector = .{ .table = "business", .id = "approval" } } },
+        .assertions = &.{
+            .{ .id = "old", .subject = "s", .predicate = "p", .value = "old", .statement = "Old fact", .evidence = &.{.{ .id = "public" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "protected" }} }} },
+            .{ .id = "new", .subject = "s", .predicate = "p", .value = "new", .statement = "New fact", .evidence = &.{.{ .id = "public" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "protected" }} }} },
+        },
+    };
+    _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, observation, .{}), "observe");
+    store.resource_state = .denied;
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const config: m.types.Config = .{ .features = .{ .reconciliation = .model }, .models = .{ .decider = fake_model }, .predicates = &.{.{ .name = "p", .cardinality = .one }} };
+    _ = try svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = state.revision, .config = config }, .{}), "configure");
+    for ([_][]const u8{ "old", "new" }) |id| {
+        const raw = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, store.values.get(try fixtureKey(a, "assertion", id)).?, .{});
+        try std.testing.expectEqual(@as(usize, 1), raw.assertion.support_sets.len);
+        try std.testing.expectEqualStrings("protected", raw.assertion.support_sets[0].evidence[0].id);
+    }
+}
+
+test "memory entity verdict rationales retain the same immutable judgment privacy gate" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 10);
+    try externalReviewSetup(&store);
+    const observation: m.types.ObservationRequest = .{
+        .evidence = &.{ .{ .id = "context", .source_id = "s", .source_version = "1", .text = "Judged context" }, .{ .id = "fallback", .source_id = "s", .source_version = "2", .text = "Independent support" } },
+        .assertions = &.{.{ .id = "description", .subject = "a", .predicate = "description", .value = "database", .statement = "Judged description", .evidence = &.{.{ .id = "context" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "fallback" }} }} }},
+    };
+    _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, observation, .{}), "describe");
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const proposed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_entity, "", try std.json.Stringify.valueAlloc(a, m.types.EntityProposalRequest{ .action = .merge, .from = "a", .to = "b", .expected_revision = state.revision }, .{}), "propose"), .{});
+    _ = try svc.execute(a, .review_entity, proposed.proposal_id.?, try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposed.revision, .accept = false, .reason = "ENTITY_RATIONALE_MARKER" }, .{}), "reject");
+    const entity = try std.json.parseFromSliceLeaky(std.json.Value, a, try svc.execute(a, .resolve_entity, "a", "{}", ""), .{});
+    var request: std.json.ObjectMap = .empty;
+    try request.put(a, "resource", entity.object.get("resource_ref").?);
+    const body = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = request }, .{});
+    try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .explain, "", body, ""), "ENTITY_RATIONALE_MARKER") != null);
+    _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"context\"]}", "forget");
+    try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .explain, "", body, ""), "ENTITY_RATIONALE_MARKER") == null);
+    for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}));
+    var rows = store.values.valueIterator();
+    while (rows.next()) |json| try std.testing.expect(std.mem.indexOf(u8, json.*, "ENTITY_RATIONALE_MARKER") == null);
+}
+
+test "memory relationship verdict context survives temporary denial and fails closed without its binding" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create");
+    const observation: m.types.ObservationRequest = .{
+        .evidence = &.{ .{ .id = "base", .source_id = "s", .source_version = "1", .text = "Concepts" }, .{ .id = "protected", .resource_selector = .{ .table = "business", .id = "approval" } } },
+        .entities = &.{ .{ .id = "a", .name = "Antfly", .evidence = &.{.{ .id = "base" }} }, .{ .id = "b", .name = "Database", .evidence = &.{.{ .id = "base" }} } },
+        .assertions = &.{.{ .id = "description", .subject = "a", .predicate = "description", .value = "database", .statement = "Judged description", .evidence = &.{.{ .id = "protected" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "base" }} }} }},
+    };
+    _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, observation, .{}), "observe");
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const proposed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, m.types.RelationshipProposalRequest{ .id = "proposal", .expected_revision = state.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "A relation", .evidence = &.{.{ .id = "base" }} } }, .{}), "propose"), .{});
+    const accepted = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .review_relationship, "proposal", try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposed.revision, .accept = true, .reason = "RECOVERABLE_RATIONALE" }, .{}), "accept"), .{});
+    for (0..2) |mode| {
+        if (mode == 0) store.resource_state = .denied else store.resource_revision = 8;
+        const hidden = try svc.execute(a, .relationship_proposal, "proposal", "{}", "");
+        try std.testing.expect(std.mem.indexOf(u8, hidden, "RECOVERABLE_RATIONALE") == null);
+        if (mode == 0) try std.testing.expect(std.mem.indexOf(u8, hidden, "\"id\":\"protected\"") == null);
+        const current = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        _ = try svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = current.revision, .config = current.config }, .{}), try std.fmt.allocPrint(a, "cleanup-admission-{d}", .{mode}));
+        // Cleanup must preserve denied or changed historical context. Neither
+        // is proof that another principal's source was irreversibly forgotten.
+        for (0..16) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}-{d}", .{ mode, i }));
+        store.resource_state = .current;
+        store.resource_revision = 7;
+        const restored = try svc.execute(a, .relationship_proposal, "proposal", "{}", "");
+        try std.testing.expect(std.mem.indexOf(u8, restored, "RECOVERABLE_RATIONALE") != null);
+    }
+    const path = try fixtureKey(a, "relationship-judgment", "proposal");
+    const bound = store.values.get(path).?;
+    _ = store.values.remove(path);
+    const legacy = try svc.execute(a, .relationship_proposal, "proposal", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "RECOVERABLE_RATIONALE") == null);
+    // The independent per-operation artifact still explains the original
+    // verdict. Its association cannot be silently moved to a later verdict.
+    const operation: m.types.provenance.Resource = try std.json.parseFromSliceLeaky(m.types.provenance.Resource, a, bound, .{});
+    try std.testing.expectEqualStrings(accepted.id, operation.id);
+}
