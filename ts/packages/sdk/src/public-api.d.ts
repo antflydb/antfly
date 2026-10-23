@@ -19283,7 +19283,13 @@ export interface components {
             field: string;
             boost?: components["schemas"]["Boost"];
         };
+        /** @description Match an indexed post-analysis term exactly. Use match for analyzed natural-language input. */
         TermQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             term: string;
             field?: string;
             boost?: components["schemas"]["Boost"];
@@ -19354,16 +19360,33 @@ export interface components {
          *     substring, exactly like `match` on that field.
          */
         PrefixQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             prefix: string;
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /** @description Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed natural-language input. */
         RegexpQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             regexp: string;
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /** @description Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed natural-language input. */
         WildcardQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             wildcard: string;
             field?: string;
             boost?: components["schemas"]["Boost"];
