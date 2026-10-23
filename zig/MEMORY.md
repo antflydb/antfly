@@ -1581,8 +1581,11 @@ The proposed assertion model adds structured subject/predicate/value, explicit s
 
 ### Main integration and constrained-output follow-up (#1223)
 
-The native memory branch incorporates main through `1eb89d4e51`, including
-[#1246](https://github.com/antflydb/antfly/pull/1246) and the inference gateway.
+The native memory branch incorporates main through `d3d044e1c9`, including
+[#1262](https://github.com/antflydb/antfly/pull/1262)'s unified Apache CLI and
+`libantfly` packaging, [#1264](https://github.com/antflydb/antfly/pull/1264)'s CI
+and inference updates, and the earlier #1246 inference gateway. Native memory
+uses the shared physical engine and first-party API under Apache-2.0.
 The original constrained-output integration came through `dd49f55102` and merged
 [#1223](https://github.com/antflydb/antfly/pull/1223). Memory continues to use shared
 constrained-producer schema admission, exact-number validation, bounded JSON

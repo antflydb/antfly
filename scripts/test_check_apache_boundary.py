@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression tests for the Apache engine / ELv2 server source boundary."""
+"""Regression tests for the embedded / server source boundary."""
 
 from __future__ import annotations
 
@@ -26,14 +26,14 @@ import check_apache_boundary as boundary
 
 
 class ApacheBoundaryTests(unittest.TestCase):
-    def test_server_hot_standby_owners_keep_elv2(self):
+    def test_server_hot_standby_owners_use_apache(self):
         owners = boundary.server_only_sources()
         self.assertIn("storage/hot_standby/primary.zig", owners)
         self.assertIn("storage/metadata_hot_standby_port.zig", owners)
         for owner in owners:
             with self.subTest(owner=owner):
                 self.assertEqual(
-                    "elv2",
+                    "apache",
                     boundary.group_for(boundary.SERVER_SOURCE_ROOT + owner, "all"),
                 )
 
@@ -44,7 +44,7 @@ class ApacheBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(errors, [])
         _, errors = self.check_fixture('fn lazy() void { _ = @import("main.zig"); }')
-        self.assertTrue(any("non-Apache dependency" in error for error in errors))
+        self.assertTrue(any("server dependency" in error for error in errors))
 
     def check_fixture(self, source: str, files: dict[str, str] | None = None):
         with tempfile.TemporaryDirectory() as directory:
@@ -127,9 +127,7 @@ class ApacheBoundaryTests(unittest.TestCase):
                     f'const server = @import{gaps[0]}({gaps[1]}"main.zig"{gaps[2]});'
                 )
                 _, errors = self.check_fixture(source)
-                self.assertTrue(
-                    any("non-Apache dependency" in error for error in errors)
-                )
+                self.assertTrue(any("server dependency" in error for error in errors))
 
     def test_rejects_server_asset_with_comments_between_tokens(self):
         _, errors = self.check_fixture(
@@ -164,7 +162,7 @@ class ApacheBoundaryTests(unittest.TestCase):
         _, errors = self.check_fixture(
             'const server = @import // ("std")\n("main.zig",);'
         )
-        self.assertTrue(any("non-Apache dependency" in error for error in errors))
+        self.assertTrue(any("server dependency" in error for error in errors))
         _, errors = self.check_fixture(
             'const logo = @embedFile // ("allowed.txt")\n'
             '("../antfarm/assets/logo.svg",);',
@@ -253,8 +251,7 @@ class ApacheBoundaryTests(unittest.TestCase):
         self.assertIn("zig/lib/httpx/src/httpx.zig", seen)
         self.assertTrue(
             any(
-                "non-Apache dependency" in error and "main.zig" in error
-                for error in errors
+                "server dependency" in error and "main.zig" in error for error in errors
             )
         )
 
@@ -325,7 +322,7 @@ class ApacheBoundaryTests(unittest.TestCase):
             "apache", boundary.group_for("zig/pkg/inference/src/main.zig", "all")
         )
         self.assertEqual(
-            "elv2",
+            "apache",
             boundary.group_for(
                 boundary.SERVER_SOURCE_ROOT + "runtime_artifact_main.zig", "all"
             ),

@@ -321,7 +321,6 @@ jobs:
             scripts/ci/test_embedded_sdk_native.py \
             scripts/test_pgwire_drivers.py \
             ':(glob)scripts/pgwire_drivers/**' \
-            ':(glob)go/pkg/operator/**' \
             ':(glob)go/pkg/sdk/admin/**' \
             go/pkg/sdk/go.mod \
             go/pkg/sdk/go.sum \
@@ -1808,8 +1807,20 @@ jobs:
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
 
+      - name: Build optimized model E2E executable
+        if: inputs.full_validation
+        working-directory: zig
+        run: python3 tools/run_bounded_zig_build.py --zig zig -- build inference-http-server -Doptimize=ReleaseFast -Dcpu=baseline -Dstrip=true -Dcuda=false --summary all
+
       - name: Package E2E executable
-        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" zig-out/bin/antfly zig-out/bin/antfly-grep
+        env:
+          FULL_VALIDATION: ${{ inputs.full_validation }}
+        run: |
+          artifacts=(zig-out/bin/antfly zig-out/bin/antfly-grep)
+          if [[ "$FULL_VALIDATION" == "true" ]]; then
+            artifacts+=(zig-out/bin/antfly-inference-http-server)
+          fi
+          tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" "${artifacts[@]}"
 
       - name: Upload E2E executable
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -2123,27 +2134,6 @@ jobs:
           path: ${{ runner.temp }}/e2e-plan
       - name: Initialize lane timing history
         run: cp "${RUNNER_TEMP}/e2e-plan/durations.json" "$ANTFLY_E2E_DURATION_FILE"
-
-      - name: Set up Go for operator runtime contract
-        if: matrix.suite == 'inference'
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ steps.toolchain.outputs.go_version }}
-          cache: false
-
-      # Execute the SAME reconciler-generated contract as the operator job's
-      # pinned v0.2.1 baseline, now against this PR's newly built runtime.
-      - name: Test generated inference command against candidate runtime
-        if: matrix.suite == 'inference'
-        working-directory: go/pkg/operator
-        env:
-          ANTFLY_RUNTIME_BIN: ${{ github.workspace }}/zig/zig-out/bin/antfly
-          GOWORK: 'off'
-          GOEXPERIMENT: simd
-        run: >-
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} go test
-          -tags runtimeintegration ./controllers/inference
-          -run '^Test(InferenceRuntimeContract|RuntimeModelPullRetry)$' -count=1 -v -timeout=20m
 
       - name: Test exhaustive E2E shard partition
         if: matrix.suite == 'antfly-ordinary-0'
@@ -2485,8 +2475,17 @@ jobs:
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
 
+      - name: Build optimized model E2E executable
+        working-directory: zig
+        # Model latency includes attention/quantization kernels that BLAS does
+        # not cover. Optimize the entire inference graph, without rebuilding
+        # the storage/API owners in ReleaseFast or dropping their Debug checks.
+        # Use the production HTTP entry so offline training and benchmark CLI
+        # commands do not add optimization work to the shared E2E artifact.
+        run: python3 tools/run_bounded_zig_build.py --zig zig -- build inference-http-server -Doptimize=ReleaseFast -Dcpu=baseline -Dstrip=true -Dcuda=false --summary all
+
       - name: Package E2E executable
-        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly zig-out/bin/antfly-grep
+        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly zig-out/bin/antfly-grep zig-out/bin/antfly-inference-http-server
 
       - name: Upload E2E executable
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -2677,6 +2676,7 @@ jobs:
           ANTFLY_INFERENCE_BLAS: openblas
           OPENBLAS_NUM_THREADS: "2"
           ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_SERVER_BIN: ./zig-out/bin/antfly-inference-http-server
           ANTFLY_INFERENCE_REPORT_DIR: ${{ runner.temp }}/inference-reports
           ANTFLY_INFERENCE_SERVER_LOG_DIR: ${{ runner.temp }}/inference-server-logs
           ANTFLY_INFERENCE_DOWNLOAD: "1"

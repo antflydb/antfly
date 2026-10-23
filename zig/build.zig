@@ -111,7 +111,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_bin_name = shared.antfly_bin_name;
     const inference_enable_metal = shared.inference_enable_metal;
     const inference_enable_cuda = shared.inference_enable_cuda;
-    const build_info = shared.build_info;
     b.modules.put(b.allocator, "antfly-inference", shared.inference_graph.inference_mod) catch @panic("OOM");
     const platform_test_step = shared.platform_test_step;
     const standalone_runtime_build_options = shared.standalone_runtime_build_options;
@@ -1130,25 +1129,10 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_step = b.step("antfly", "Build and install the top-level Antfly CLI");
     antfly_step.dependOn(&install_antfly.step);
     antfly_step.dependOn(&install_antfarm_assets.step);
+    const cli_licenses = @import("lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly", "share/licenses/antfly");
+    antfly_step.dependOn(cli_licenses);
+    b.getInstallStep().dependOn(cli_licenses);
 
-    const lite_module_options: std.Build.Module.CreateOptions = .{
-        .root_source_file = b.path("pkg/antfly-embedded/src/lite_main.zig"),
-        .target = target,
-        .optimize = optimize,
-    };
-    const lite_main_mod = b.createModule(lite_module_options);
-    production_antfly_imports.configureEmbedded(b, lite_main_mod, link_libc);
-    lite_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    lite_main_mod.addImport("antfly_inference_host", production_antfly_imports.inference_host);
-    lite_main_mod.addImport("antfly_inference_engine", production_antfly_imports.inference_engine);
-    build_info.link(lite_main_mod);
-    const lite_main = b.addExecutable(.{
-        .name = "antfly-lite",
-        .root_module = lite_main_mod,
-        .use_llvm = @import("build_support/embedded/shared_library.zig").llvmBackend(target.result),
-    });
-    lite_main_mod.linkLibrary(embedded.native_inference);
-    lite_main_mod.linkLibrary(embedded.native_enrichment);
     const lite_cli_smoke = b.addExecutable(.{
         .name = "antfly-lite-cli-smoke",
         .root_module = b.createModule(.{
@@ -1157,36 +1141,19 @@ pub fn create(b: *std.Build) ?Artifacts {
             .optimize = optimize,
         }),
     });
-    const run_lite_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_cli_smoke.addArtifactArg2(lite_main, .{ .make_absolute = true });
     const run_antfly_lite_cli_smoke = b.addRunArtifact(lite_cli_smoke);
     run_antfly_lite_cli_smoke.addArtifactArg2(antfly_main, .{ .make_absolute = true });
-    const lite_main_tests = b.addTest(.{
-        .root_module = b.createModule(lite_module_options),
-        .filters = &.{"lite main compiles"},
-        .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    production_antfly_imports.configureEmbedded(b, lite_main_tests.root_module, link_libc);
-    lite_main_tests.root_module.addImport("antfly-client", antfly_client_pkg_mod);
-    lite_main_tests.root_module.addImport("antfly_inference_host", production_antfly_imports.inference_host);
-    lite_main_tests.root_module.addImport("antfly_inference_engine", production_antfly_imports.inference_engine);
-    // Unit tests use the stable test version; only final products link release metadata.
-    lite_main_tests.root_module.addImport("build_info", build_info.module);
-    const run_lite_main_tests = addFilteredTestRunArtifact(b, lite_main_tests);
-    const install_lite_main = b.addInstallArtifact(lite_main, .{});
-
-    const lite_step = b.step("lite", "Build and install the Antfly Lite CLI and libantfly C ABI");
-    lite_step.dependOn(&b.top_level_steps.get("licenses-antfly-lite").?.step);
-    lite_step.dependOn(&install_lite_main.step);
-    lite_step.dependOn(install_libantfly);
-    lite_step.dependOn(&install_capi_header.step);
+    b.step("cli-smoke-test", "Exercise public Lite and inference commands without model downloads").dependOn(&run_antfly_lite_cli_smoke.step);
+    const library_step = b.step("libantfly", "Build and install the embedding library, header, and pkg-config metadata");
+    library_step.dependOn(&b.top_level_steps.get("licenses-libantfly").?.step);
+    library_step.dependOn(install_libantfly);
+    library_step.dependOn(&install_capi_header.step);
+    const release_step = b.step("release", "Build the Antfly CLI and embedding library");
+    release_step.dependOn(antfly_step);
+    release_step.dependOn(library_step);
 
     const lite_test_step = b.step("lite-test", "Run Lite backend, CLI, bindings, examples, and C ABI packaging checks");
     lite_test_step.dependOn(&run_antfly_main_tests.step);
-    lite_test_step.dependOn(&run_lite_main_tests.step);
     lite_test_step.dependOn(&run_lite_cmd_tests.step);
     lite_test_step.dependOn(&run_lite_native_tests.step);
     lite_test_step.dependOn(&run_capi_smoke.step);
@@ -1197,7 +1164,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     lite_test_step.dependOn(&run_lite_ts_tests.step);
     lite_test_step.dependOn(&run_lite_go_example.step);
     lite_test_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_test_step.dependOn(&run_lite_cli_smoke.step);
     lite_test_step.dependOn(&run_antfly_lite_cli_smoke.step);
     lite_test_step.dependOn(&run_cabi_packaging_tests.step);
     lite_test_step.dependOn(&run_capi_tests.step);

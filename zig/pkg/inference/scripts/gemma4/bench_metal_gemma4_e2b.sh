@@ -96,7 +96,7 @@ fi
 if [[ "${1:-}" == "--self-test" ]]; then
   tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/antfly-gemma4-metal-bench-self-test.XXXXXX")"
   trap 'rm -rf "$tmp_dir"' EXIT
-  fake_bin="$tmp_dir/antfly-inference"
+  fake_bin="$tmp_dir/antfly-inference-dev"
   model_dir="$tmp_dir/model"
   mkdir -p "$model_dir"
   cat >"$fake_bin" <<'SH'

@@ -34,7 +34,7 @@ from .helpers import (
 )
 from .models import (
     ensure_model_by_name,
-    inference_command,
+    inference_server_command,
     inference_download_enabled,
     local_model_exists,
     ml_dir,
@@ -299,7 +299,7 @@ def test_read_recovers_after_forced_run_admission_denials():
 
     forced_denials = 3
     server = InferenceServer(
-        inference_command(),
+        inference_server_command(),
         str(models_dir()),
         str(ml_dir()),
         "127.0.0.1",

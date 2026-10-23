@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import subprocess
+import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -43,15 +44,60 @@ class ZigValidationScopeTests(unittest.TestCase):
         self.assertIn("vopr-test", workflow)
         self.assertIn("vopr-build", workflow)
 
-    def test_e2e_archives_include_native_grep(self):
+    def test_e2e_archives_package_the_selected_executables(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
-        packages = re.findall(
-            r'run: tar -C zig -czf .*antfly-e2e-(?:base|full)\.tar\.gz" (.*)', workflow
+        jobs = dict(
+            re.findall(r"\n  ([\w-]+):\n(.*?)(?=\n  [\w-]+:\n|\Z)", workflow, re.DOTALL)
         )
-        self.assertEqual(len(packages), 2)
-        for members in packages:
-            self.assertIn("zig-out/bin/antfly-grep", members.split())
-            self.assertIn("zig-out/bin/antfly", members.split())
+        for job, flavor, full in (
+            ("e2e-base-build", "base", False),
+            ("e2e-base-build", "base", True),
+            ("e2e-full-build", "full", True),
+        ):
+            with self.subTest(job=job, full=full), tempfile.TemporaryDirectory() as tmp:
+                step = re.search(
+                    r"^      - name: Package E2E executable\n(.*?)(?=^      - |\Z)",
+                    jobs[job],
+                    re.MULTILINE | re.DOTALL,
+                )
+                self.assertIsNotNone(step)
+                run = step[1].split("        run: ", 1)[1]
+                command = (
+                    textwrap.dedent(run.split("\n", 1)[1])
+                    if run.startswith("|")
+                    else run.strip()
+                )
+                root = Path(tmp)
+                expected = {"zig-out/bin/antfly", "zig-out/bin/antfly-grep"}
+                if full:
+                    expected.add("zig-out/bin/antfly-inference-http-server")
+                # Ordinary base packaging must also work when the optimized
+                # executable was never built. Verify contents and permissions
+                # of the real tar command rather than its shell spelling.
+                for member in expected:
+                    binary = root / "zig" / member
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    binary.write_text(member)
+                    binary.chmod(0o755)
+                subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", command],
+                    cwd=root,
+                    env={
+                        **os.environ,
+                        "RUNNER_TEMP": tmp,
+                        "FULL_VALIDATION": str(full).lower(),
+                        # Match Linux tar without macOS AppleDouble metadata.
+                        "COPYFILE_DISABLE": "1",
+                    },
+                    check=True,
+                )
+                with tarfile.open(root / f"antfly-e2e-{flavor}.tar.gz") as archive:
+                    self.assertEqual(set(archive.getnames()), expected)
+                    for member in expected:
+                        self.assertEqual(
+                            archive.extractfile(member).read().decode(), member
+                        )
+                        self.assertEqual(archive.getmember(member).mode & 0o777, 0o755)
 
     def test_full_validation_job_admission_and_build_reuse(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
