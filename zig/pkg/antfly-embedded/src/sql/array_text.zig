@@ -594,6 +594,6 @@ test "SQL text arrays unwind allocation faults and admit shape before cell stora
     try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .text, "{a,b}", .{ .values = .{ .bytes = 1 } }));
     try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .text, "{a,b}", .{ .values = .{ .work = 1 } }));
     try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .text, "{a,b}", .{ .wire_bytes = 1 }));
-    try std.testing.expectError(error.SqlInvalidTextEncoding, decode(a, .text, "{a\x00}", .{}));
+    try std.testing.expectError(error.SqlUntranslatableCharacter, decode(a, .text, "{a\x00}", .{}));
     try std.testing.expectError(error.SqlInvalidTextEncoding, decode(a, .text, "{\xff}", .{}));
 }

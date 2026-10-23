@@ -267,11 +267,16 @@ pub const Program = struct {
 };
 
 const PreparationControl = struct {
+    registry: ?*resources.ResourceManager = null,
     calls: usize = 0,
     fail_at: usize = std.math.maxInt(usize),
     failure: anyerror = error.Cancelled,
     fn check(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.registry) |manager| {
+            if (!manager.payload_retirement_mutex.tryLock()) return error.TestRegistryCheckpointUnderGuard;
+            manager.payload_retirement_mutex.unlock();
+        }
         const call = self.calls;
         self.calls += 1;
         if (call == self.fail_at) return self.failure;
@@ -450,7 +455,7 @@ test "controlled close status retained credits leave construction capacity avail
     defer a.free(programs);
     for (programs) |*program| program.* = .{};
     defer for (programs) |*program| program.deinit(a);
-    var control: PreparationControl = .{};
+    var control: PreparationControl = .{ .registry = &manager };
     const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = PreparationControl.check, .check_lifetime = PreparationControl.lifetime, .deadline_ns = PreparationControl.deadline }, .execution_wait = .{ .ptr = &control, .begin = PreparationControl.begin, .end = PreparationControl.end } };
     const original = admission.Port.init(&payload);
     for (programs, 0..) |*program, index| {

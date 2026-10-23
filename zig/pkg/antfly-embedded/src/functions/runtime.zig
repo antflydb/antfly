@@ -1019,7 +1019,7 @@ pub fn qualifyRemoteTransportRetirement() !void {
     defer Check.owner = null;
     const Run = struct {
         fn run(runtime: *Runtime, alloc: std.mem.Allocator, questions: decisions.Json, failure: *?anyerror) void {
-            _ = runtime.provider().evaluateBatch(alloc, &.{.{ .input = "refund", .decider = "remote", .questions = questions }}) catch |err| {
+            _ = runtime.provider().evaluateBatch(alloc, &.{.{ .input = .{ .text = "refund" }, .decider = "remote", .questions = questions }}) catch |err| {
                 failure.* = err;
                 return;
             };
@@ -1141,8 +1141,8 @@ test "decision functions serial provider batches remain on the admitted parent w
         .antfly_provider = .{ .ptr = &embedded, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Provider.decide },
     };
     const results = try runtime.provider().evaluateBatch(arena.allocator(), &.{
-        .{ .input = "first", .decider = "serial", .questions = questions },
-        .{ .input = "second", .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "first" }, .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "second" }, .decider = "serial", .questions = questions },
     });
     try std.testing.expectEqual(@as(usize, 2), embedded.calls);
     try std.testing.expectEqual(@as(usize, 2), results.len);
@@ -1164,8 +1164,8 @@ test "decision functions serial provider batches remain on the admitted parent w
         .antfly_provider = .{ .ptr = &embedded, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Provider.decide },
     };
     _ = try runtime.provider().evaluateBatch(arena.allocator(), &.{
-        .{ .input = "first", .decider = "serial", .questions = questions },
-        .{ .input = "second", .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "first" }, .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "second" }, .decider = "serial", .questions = questions },
     });
     try std.testing.expectEqual(@as(usize, 2), embedded.calls);
     try std.testing.expect(embedded.checkpoints > 0);
@@ -1176,8 +1176,8 @@ test "decision functions serial provider batches remain on the admitted parent w
     embedded.stop_after_provider = true;
     runtime.rows = 0;
     try std.testing.expectError(error.ParentExecutionStopped, runtime.provider().evaluateBatch(arena.allocator(), &.{
-        .{ .input = "first", .decider = "serial", .questions = questions },
-        .{ .input = "second", .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "first" }, .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "second" }, .decider = "serial", .questions = questions },
     }));
     try std.testing.expectEqual(@as(usize, 1), embedded.calls);
     try std.testing.expectEqual(@as(u64, 0), runtime.rows);
@@ -1192,8 +1192,8 @@ test "decision functions serial provider batches remain on the admitted parent w
     embedded.calls = 0;
     try parent_grant.start(&scheduler, .{ .io = io, .retained_bytes = 17 }, .query);
     _ = try runtime.provider().evaluateBatch(arena.allocator(), &.{
-        .{ .input = "first", .decider = "serial", .questions = questions },
-        .{ .input = "second", .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "first" }, .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "second" }, .decider = "serial", .questions = questions },
     });
     try std.testing.expect(parent_grant.resume_generation > 1);
     try std.testing.expectEqual(@as(usize, 2), embedded.calls);
@@ -1206,8 +1206,8 @@ test "decision functions serial provider batches remain on the admitted parent w
     runtime.rows = 0;
     try parent_grant.start(&scheduler, .{ .io = io, .retained_bytes = 17 }, .query);
     try std.testing.expectError(error.SchedulerClosed, runtime.provider().evaluateBatch(arena.allocator(), &.{
-        .{ .input = "first", .decider = "serial", .questions = questions },
-        .{ .input = "second", .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "first" }, .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "second" }, .decider = "serial", .questions = questions },
     }));
     try std.testing.expectEqual(@as(usize, 1), embedded.calls);
     try std.testing.expectEqual(@as(u64, 0), runtime.rows);

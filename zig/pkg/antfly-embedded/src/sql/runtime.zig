@@ -5394,14 +5394,16 @@ test "SQL constrained partition join preserves every row after shared allocation
     backend.execution_io = std.testing.io;
     var compiled = try compiler.compile(a, "SELECT COUNT(*) AS n, SUM(CAST(a._id AS BIGINT)) AS total FROM things a JOIN things b ON a._id = b._id", .{});
     defer compiled.deinit();
-    var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
-    defer std.debug.assert(quota.live == 0);
-    var result = try execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 });
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
-    try std.testing.expectEqualStrings("2000", result.output.rows[0][0].string);
-    try std.testing.expectEqualStrings("1999000", result.output.rows[0][1].string);
-    try std.testing.expect(result.state.budget.peak <= 256 * 1024);
+    for ([_]usize{ 256 * 1024, 384 * 1024, 512 * 1024 }) |retained_bytes| {
+        var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 2 * retained_bytes };
+        defer std.debug.assert(quota.live == 0);
+        var result = try execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = retained_bytes, .page_rows = 16 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("2000", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("1999000", result.output.rows[0][1].string);
+        try std.testing.expect(result.state.budget.peak <= retained_bytes);
+    }
 }
 
 test "SQL special floats retain PostgreSQL comparison ordering" {

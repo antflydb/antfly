@@ -109,7 +109,8 @@ const builtin = @import("builtin");
 // Durability grants include bounded atomic control replacement and directory creation.
 // DB close retains bounded mutable-snapshot fencing and accounting preflight.
 // Final status owns prepaid capture, packed input and canonical WAL preparation.
-pub const abi_version: u32 = 105;
+// Retirement cannot yield under its registry; SQL workspace preserves shared IO headroom.
+pub const abi_version: u32 = 106;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

@@ -4330,7 +4330,7 @@ fn selectedGroupReduction(a: Allocator, group_limit: usize) !void {
     for (seen) |present| try std.testing.expect(present);
 }
 test "SQL hash owned final reducers preserve typed state ordinals and lifetime" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, selectedGroupReduction, .{67});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, selectedGroupReduction, .{67});
     try std.testing.expectError(error.SqlProgramLimitExceeded, selectedGroupReduction(std.testing.allocator, 66));
 }
 

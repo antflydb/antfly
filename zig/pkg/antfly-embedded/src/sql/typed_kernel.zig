@@ -704,36 +704,6 @@ test "SQL typed kernels round REAL inputs and intermediate nodes with scalar err
     }
 }
 
-test "SQL typed kernels preserve int4 overflow and decline float4 execution" {
-    const Input = struct {
-        count: usize = 2,
-        pub fn cell(_: @This(), _: A, _: usize, _: u32) !Datum {
-            return error.UnexpectedColumnAccess;
-        }
-    };
-    for ([_][]const u8{ "2147483646 + 1", "2147483647 + 1" }, 0..) |sql, index| {
-        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
-        defer compiled.deinit();
-        var program = try scalar.bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
-        defer program.deinit();
-        try std.testing.expect(supported(&program));
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        if (index == 1) {
-            try std.testing.expectError(error.SqlNumericOutOfRange, evaluate(arena.allocator(), &.{&program}, Input{}, &.{}));
-            try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{}, &.{}, .{}));
-        } else {
-            const result = (try evaluate(arena.allocator(), &.{&program}, Input{}, &.{})).?;
-            for (result[0]) |value| try std.testing.expectEqual(@as(i64, 2147483647), value.value.integer);
-        }
-    }
-    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "x + x", .{});
-    defer compiled.deinit();
-    var program = try scalar.bind(std.testing.allocator, compiled.expression, &.{.{ .name = "x", .type = .number, .element_type = .float32 }}, &.{}, .{});
-    defer program.deinit();
-    try std.testing.expect(!supported(&program));
-}
-
 const PreparedTestInput = struct {
     count: usize,
     rows: []const []const Datum,

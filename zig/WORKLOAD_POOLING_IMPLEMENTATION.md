@@ -24969,3 +24969,64 @@ capability assertion. These have not been attributed to a baseline run and are
 not claimed as pre-existing. Receipt `merge-main-f406-cli-focused-v3` separately
 records the focused merge checks without hiding the broader failure receipt.
 Full GNU qualification remains waived; the full pooling design remains incomplete.
+
+
+### Shared SQL capacity and retirement guard corrections
+
+The six failures from the post-merge SQL run reproduce in isolation (receipt
+`sql-six-isolated-guard-v1`: six failed, one passed). Two expose production
+capacity errors. Ordered legacy scan producers sized CPU work from the full
+shared envelope and could occupy the room needed for IO. They now plan against
+CPU headroom and atomically submit with the existing IO reserve. Scoped scan
+children use their original node's allowance rather than borrowing the unrelated
+legacy global scheduler's advisory capacity.
+
+Join construction now caps the hash allowance by known live parent headroom.
+The existing soft halfway threshold therefore leaves actual room for input
+decoding and the transition into partitioned spill, after planning and enclosing
+iterators have spent their own capacity. This is advisory sizing: allocation
+owners still enforce every real byte, including concurrent pressure. No quota
+is raised. The native join regression checks all 2,000 rows and their checksum
+at 256, 384 and 512 KiB statement limits and verifies physical peak accounting.
+
+The other four failures were test assumptions: reducer allocation-fault
+enumeration now uses the repository's stable resize/remap wrapper; partition
+row-reference checks assert actual bounded skew replay, preserving all duplicate
+pairs, payload ownership and output-allocation failure checks; valid UTF-8 with
+NUL retains its distinct untranslatable-character error; an obsolete duplicate
+float4-rejection test is removed while int4 overflow and float4 rounding/error
+parity tests remain.
+
+Resource payload retirement checkpoints before acquiring its registry guard and
+uses lifetime-only checks during each fixed ledger pass. It cannot cooperatively
+park while excluding unrelated registration. The many-database close regression
+now asserts that every cooperative checkpoint can acquire that registry guard,
+while retaining 160 credits across 80 programs and proving construction capacity
+remains available. Destruction remains outside the guard; interrupted cleanup
+retains owned debt and cannot release payload credit early.
+
+Native ABI 106 and storage-owner ABI 166 fence these semantics. Receipt
+`sql-capacity-guard-v2` passes all 21 selected SQL cases, including the reproduced
+failures, typed kernels and original-scoped worker cancellation/retirement.
+All 23 build steps and 45/1/8 identity cases pass with unchanged inputs. This is
+a focused reproduction and regression run; the complete SQL corpus has not been
+rerun since these fixes. Final close/cleanup/archive qualification is recorded
+separately. The v3 boundary run found a stale decision-provider test fixture
+still passing strings to the structured evidence-input API. Its 11 call sites
+now explicitly construct text evidence, matching the current provider contract
+without changing production execution. The final combined qualification is
+`sql-capacity-retirement-boundaries-v4`; the v3 failure receipt is preserved.
+
+The full goal remains active. Final status owning WAL publication, manifest and
+frozen append admission, admitted final backend retirement, broader provider
+adoption and the complete default pooling gate are still unfinished. Full GNU
+qualification remains waived.
+
+
+Final v4 qualification passed 91/91 build steps: 21 selected SQL cases,
+28 embedded close cases, 51 cleanup/control cases, 2 host close cases,
+16 archive-boundary cases and 45/1/8 identity cases. There were no failures or
+leaks, and all 5,550 recorded native/spec inputs remained unchanged. In
+particular, the 80-database retained-credit guard assertion and original
+cancellation/pressure cleanup tests pass. Source snapshots and both failure
+receipts are retained alongside the final successful receipt.

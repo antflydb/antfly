@@ -640,7 +640,13 @@ const ParallelScan = struct {
             }
         };
         const scheduler = @import("parallel_scheduler.zig").global();
-        const workspace_budget = scheduler.workspaceBudget(source.context.limits.retained_bytes / 2);
+        // Scoped children spend their original node's authority. Legacy
+        // workers share this scheduler and leave room for required IO before
+        // choosing their speculative CPU workspace.
+        const workspace_budget = if (scope != null)
+            source.context.limits.retained_bytes / 2
+        else
+            scheduler.cpuWorkspaceBudget(source.context.limits.retained_bytes / 2);
         const fanout = @max(1, if (scope != null)
             @min(@as(usize, 8), @min(children.len, workspace_budget / (4 * 1024 * 1024)))
         else
@@ -701,7 +707,7 @@ const ParallelScan = struct {
             worker.task = if (scope) |owner|
                 try owner.submitNotified(workspace +| @sizeOf(Worker), a, Worker.runChild, .{worker}, Worker.discard, Worker.retired)
             else
-                @import("parallel_scheduler.zig").global().submit(io, workspace, Worker.run, .{worker});
+                scheduler.submitWithIoReserve(io, workspace, Worker.run, .{worker});
             if (worker.task == null) {
                 if (!batch_mode) {
                     self.close();

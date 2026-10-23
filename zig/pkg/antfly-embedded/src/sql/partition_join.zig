@@ -2082,10 +2082,10 @@ test "SQL rejected partition candidates bound output scratch" {
     try Fixture.run(64, 128, 128 << 10);
 }
 
-test "SQL native partition row references preserve duplicate cohorts and disk fallbacks" {
+test "SQL native partition row references preserve duplicate cohorts and bounded skew fallbacks" {
     const Fixture = struct {
         fn check(_: *anyopaque) !void {}
-        fn run(a: A, disk: bool, output_failure: bool) !void {
+        fn run(a: A, skewed: bool, output_failure: bool) !void {
             var dummy: u8 = 0;
             var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
             defer manager.deinit();
@@ -2094,11 +2094,11 @@ test "SQL native partition row references preserve duplicate cohorts and disk fa
             join.parallel_builds = false;
             join.evaluation = .{ .left_width = 1, .right_width = 2 };
             const key = Datum.json(.{ .integer = 7 });
-            // Distinct large strings force the bounded disk-chain fallback.
+            // Distinct large strings force bounded skew replay.
             var text: [2048]u8 = @splat('x');
             for (0..32) |i| {
                 text[0] = @as(u8, @intCast(i)) + 'A';
-                try join.add(true, &.{ Datum.json(.{ .integer = @intCast(i) }), Datum.json(.{ .string = if (disk) &text else text[0..1] }) }, &.{key}, i);
+                try join.add(true, &.{ Datum.json(.{ .integer = @intCast(i) }), Datum.json(.{ .string = if (skewed) &text else text[0..1] }) }, &.{key}, i);
             }
             for (0..9) |i| try join.add(false, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
             if (output_failure) {
@@ -2108,18 +2108,18 @@ test "SQL native partition row references preserve duplicate cohorts and disk fa
                 try std.testing.expectEqual(@as(usize, 0), batch.len());
                 try std.testing.expect(failure != null);
                 try std.testing.expectEqual(error.OutOfMemory, failure.?);
-                try std.testing.expect(join.hash.?.disk != null);
+                try std.testing.expect(join.skew != null);
                 return;
             }
             var page = std.heap.ArenaAllocator.init(a);
             defer page.deinit();
             var seen: [9][32]bool = @splat(@splat(false));
             var count: usize = 0;
-            var saw_disk = false;
+            var saw_skew = false;
             while (true) {
                 _ = page.reset(.free_all);
                 const batch = try join.nextBatch(page.allocator(), 91, null);
-                if (join.hash) |hash| saw_disk = saw_disk or hash.disk != null;
+                saw_skew = saw_skew or join.skew != null;
                 if (batch.len() == 0) break;
                 // Read only after the entire delivery page has been staged.
                 // This catches mutable probe selections and transient disks.
@@ -2130,16 +2130,16 @@ test "SQL native partition row references preserve duplicate cohorts and disk fa
                     try std.testing.expect(left < 9 and right < 32);
                     try std.testing.expect(!seen[left][right]);
                     seen[left][right] = true;
-                    try std.testing.expectEqual(if (disk) @as(usize, 2048) else 1, payload.len);
+                    try std.testing.expectEqual(if (skewed) @as(usize, 2048) else 1, payload.len);
                     try std.testing.expectEqual(@as(u8, @intCast(right)) + 'A', payload[0]);
                     count += 1;
                 }
             }
             try std.testing.expectEqual(@as(usize, 9 * 32), count);
-            try std.testing.expectEqual(disk, saw_disk);
+            try std.testing.expectEqual(skewed, saw_skew);
         }
     };
-    for ([_]bool{ false, true }) |disk| try Fixture.run(std.testing.allocator, disk, false);
+    for ([_]bool{ false, true }) |skewed| try Fixture.run(std.testing.allocator, skewed, false);
     try Fixture.run(std.testing.allocator, true, true);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ false, false });
 }

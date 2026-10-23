@@ -3735,7 +3735,10 @@ pub const ResourceManager = struct {
             try @import("../common/bounded_mutex.zig").lockAtomic(&self.payload_retirement_mutex, control);
             var registry_held = true;
             defer if (registry_held) self.payload_retirement_mutex.unlock();
-            try control.checkpoint();
+            // lockAtomic checkpoints before acquisition. A cooperative yield
+            // here could park while excluding every unrelated registration.
+            // This fixed-size ledger pass uses lifetime checks under the guard.
+            try control.checkLifetime();
             _ = self.tryDrainIdentityMetadataRetirement();
             const node = self.payload_retirement_cursor orelse break;
             self.payload_retirement_cursor = node.next orelse self.payload_retirement_head;
@@ -3743,7 +3746,7 @@ pub const ResourceManager = struct {
             // Own stable retirement debt before destroying embedded metadata.
             var debt: ?ConstructionCredit = null;
             for (&self.construction_cleanup) |*slot| {
-                try control.checkpoint();
+                try control.checkLifetime();
                 _ = self.tryDrainConstructionSlot(slot);
                 if (slot.state.cmpxchgStrong(.free, .active, .acquire, .monotonic) == null) {
                     slot.credit = node.credit.?.*;

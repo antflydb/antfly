@@ -2479,7 +2479,11 @@ fn Engine(comptime Context: type) type {
                 };
                 if (self.partition_join != null) return;
                 if (self.hash_join == null) {
-                    self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes, .spill = self.engine.context.spill, .control = self.engine.workControl() });
+                    // Planning and enclosing iterators already spend statement
+                    // capacity. The hash's soft halfway limit must leave actual
+                    // parent headroom for decoding and the spill transition.
+                    const hash_bytes = @min(self.engine.context.limits.retained_bytes, @import("memory_budget.zig").headroom(self.engine.context.alloc) orelse self.engine.context.limits.retained_bytes);
+                    self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = hash_bytes, .spill = self.engine.context.spill, .control = self.engine.workControl() });
                     if (!shared and kind != .left and kind != .full) try self.prepareScanFilter(if (self.flipped_join) join.right_keys else join.left_keys);
                     var scratch = std.heap.ArenaAllocator.init(self.engine.context.alloc);
                     defer scratch.deinit();
