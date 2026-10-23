@@ -344,6 +344,14 @@ func TestCorpusAppleIndexConfiguration(t *testing.T) {
 	if err = json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatal(err)
 	}
+	embedder := decoded[DefaultEmbeddingIndex].(map[string]any)["embedder"].(map[string]any)
+	if embedder["provider"] != "antfly" || embedder["model"] != DefaultEmbeddingModel {
+		t.Fatalf("unexpected native embedder: %#v", embedder)
+	}
+	if _, exists := embedder["api_url"]; exists {
+		t.Fatalf("native semantic embedding must not depend on the disabled HTTP inference endpoint: %#v", embedder)
+	}
+
 	text := decoded[corpusTextIndex].(map[string]any)
 	units := text["enrichments"].([]any)[0].(map[string]any)
 	var producer map[string]any

@@ -281,3 +281,69 @@ def test_direct_full_text_match_and_prefix(stateful_api):
     )
     assert prefix_result is not None
     assert prefix_result[:2] == ["doc:a", "doc:b"]
+
+
+def test_query_string_validation_and_indexed_case_folding(stateful_api):
+    """Check public lowering, syntax errors, and post-analysis term semantics."""
+    table = f"query_contract_{time.time_ns()}"
+    stateful_api.create_table(table, num_shards=1)
+    stateful_api.batch_write(
+        table,
+        inserts={
+            "one": {"text": "Maxwell Ghislaine"},
+            "two": {"text": "Ghislaine unrelated"},
+            "three": {"text": "other words"},
+        },
+        sync_level="full_text",
+    )
+    path = f"/tables/{table}/query"
+
+    def query_ids(leaf):
+        result = stateful_api.post(path, {"full_text_search": leaf, "limit": 10})
+        assert not result["responses"][0].get("error"), result
+        return set(_hit_ids(result))
+
+    assert wait_until(
+        lambda: query_ids({"match": "maxwell", "field": "text"}) == {"one"},
+        timeout_s=30,
+    )
+    # Exact operators match indexed terms. The analyzer stems maxwell to maxwel.
+    assert query_ids({"term": "maxwell", "field": "text"}) == set()
+    assert query_ids({"term": "maxwel", "field": "text"}) == {"one"}
+    for operator, pattern, expected in (
+        ("term", "MAXWEL", {"one"}),
+        ("regexp", "MAXWEL", {"one"}),
+        ("wildcard", "MAXWE?", {"one"}),
+        ("prefix", "GHISL", {"one", "two"}),
+    ):
+        assert (
+            query_ids({operator: pattern, "field": "text", "case_insensitive": True})
+            == expected
+        )
+    assert query_ids({"query": "Ghisl*"}) == {"one", "two"}
+    assert query_ids({"query": "Ghisl?in*"}) == {"one", "two"}
+
+    for malformed in (
+        "+(",
+        '"unterminated',
+        "AND",
+        "alpha OR",
+        "(alpha))",
+        "alpha^nan",
+    ):
+        response = requests.post(
+            stateful_api.url + path,
+            json={"full_text_search": {"query": malformed}, "limit": 5},
+            timeout=10,
+        )
+        assert response.status_code == 400, (
+            malformed,
+            response.status_code,
+            response.text,
+        )
+    response = requests.post(
+        stateful_api.url + path,
+        json={"full_text_search": {"prefix": "Ghisl", "case_insensitive": "true"}},
+        timeout=10,
+    )
+    assert response.status_code == 400, response.text

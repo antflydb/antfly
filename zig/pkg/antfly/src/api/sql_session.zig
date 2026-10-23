@@ -48,8 +48,9 @@ pub const Coordinator = struct {
         };
         defer request.deinit(alloc);
         if (!(try server.transactionRequestAuthorized(self.identity.*, request))) return error.Forbidden;
-        const tables = try request.distributedTables(alloc);
-        defer if (tables.len != 0) alloc.free(tables);
+        const tables_view = try request.distributedTables(alloc);
+        defer tables_view.deinit();
+        const tables = tables_view.tables;
         try server.validateCommitTablesAgainstSchema(self.context, tables);
         if (try server.validateCommitReadSet(request) != null) {
             if (!server.txn_sessions.removeBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };

@@ -326,6 +326,7 @@ pub const TableApi = struct {
         UnsupportedArtifactIndexSources,
         ArtifactIndexSourcesTemporarilyUnavailable,
         ProbeUnavailable,
+        InferenceEndpointAccessDenied,
         ModelNotFound,
         Backpressured,
         InternalFailure,
@@ -2443,6 +2444,8 @@ pub fn handleTableGetIndex(
     return .{ .status = 200, .body = response_body, .json = true };
 }
 
+pub const inference_endpoint_access_denied_message = "embedder.api_url denied inference access; check endpoint credentials and permissions. For local Antfly inference omit embedder.api_url. An HTTP /ai/v1 endpoint requires public_inference.enabled and inference permissions.";
+
 pub fn handleTableCreateIndex(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -2457,6 +2460,7 @@ pub fn handleTableCreateIndex(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"not_found\",\"message\":\"not found\",\"retryable\":false}"), .json = true },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "{\"error\":\"method_not_allowed\",\"message\":\"method not allowed\",\"retryable\":false}"), .json = true },
+        error.InferenceEndpointAccessDenied => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_index_request\",\"message\":\"embedder.api_url denied inference access; check endpoint credentials and permissions. For local Antfly inference omit embedder.api_url. An HTTP /ai/v1 endpoint requires public_inference.enabled and inference permissions.\",\"retryable\":false}"), .json = true },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_index_request\",\"message\":\"unsupported index configuration\",\"retryable\":false}"), .json = true },
         error.GraphMetricConfigurationLimitExceeded => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"graph_metric_configuration_limit_exceeded\",\"message\":\"graph metric configuration exceeds serverless limits (maximum 16 graph metric indexes, 16 metrics per graph, 64 metrics total, 64 edge types per filter, 256-byte index names, 128-byte metric names, and 256-byte edge type names)\",\"retryable\":false}"), .json = true },
         error.MissingEmbeddingArtifactEnrichment => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"missing_embedding_artifact_enrichment\",\"message\":\"embedding index source has no matching embedding enrichment\",\"retryable\":false}"), .json = true },
@@ -6669,4 +6673,28 @@ test "public table graph metric action handler returns status response" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(backend.called);
     try std.testing.expectEqualStrings("{\"status\":{\"state\":\"fresh\",\"maintenance_paused\":true}}", resp.body);
+}
+
+test "public table create index explains embedding endpoint access rejection" {
+    const Denied = struct {
+        fn create(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: @FieldType(TableApi, "request")) TableApi.ExecuteCreateIndexError![]u8 {
+            return error.InferenceEndpointAccessDenied;
+        }
+    };
+    const api: TableApi = .{ .ptr = undefined, .request = .{}, .vtable = &.{
+        .execute_table_batch = unsupportedBatch,
+        .execute_table_query_request = unsupportedQueryRequest,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = Denied.create,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+    } };
+    var response = try handleTableCreateIndex(std.testing.allocator, "docs", "semantic", "{}", api);
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "embedder.api_url") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "public_inference.enabled") != null);
 }
