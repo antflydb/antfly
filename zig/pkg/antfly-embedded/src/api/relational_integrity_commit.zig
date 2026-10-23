@@ -787,7 +787,7 @@ const Builder = struct {
                 .compare_claim, .check_owner => 1,
                 .release, .repair_release => 2,
                 .establish => 3,
-                .attach => 4,
+                .attach, .attach_historical => 4,
                 else => return error.InvalidIntegrityCommand,
             };
             if (phase != command_phase) continue;
@@ -820,6 +820,7 @@ const Builder = struct {
                     };
                     state.claim = claim;
                 },
+                .attach_historical => return error.InvalidIntegrityCommand,
                 .attach => |reference| {
                     if (validate and !try self.deferredReference(reference)) {
                         const claim = state.claim orelse return error.ForeignKeyParentMissing;
@@ -1953,7 +1954,7 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         }
         var prepared = try mapper.PreparedRelationalProjection.init(builder.alloc, row.json, table.view.tableSchema().*, table.view.physicalLayout(), selected_fields.items);
         defer prepared.deinit();
-        const expansion = plan.expand(builder.alloc, &.{.{ .key = row.key, .after = prepared.view }}) catch |err| switch (err) {
+        const expansion = plan.expandHistorical(builder.alloc, &.{.{ .key = row.key, .after = prepared.view }}) catch |err| switch (err) {
             error.ForeignKeyMatchFullViolation => {
                 validation_failure = @errorName(err);
                 break;
@@ -1967,7 +1968,7 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         for (expansion.commands) |command| {
             const selected = switch (command.command.operation) {
                 .establish => phase == .unique,
-                .attach => phase == .foreign_key,
+                .attach, .attach_historical => phase == .foreign_key,
                 else => false,
             };
             if (selected) try builder.appendCommand(command.table_name, command.command);

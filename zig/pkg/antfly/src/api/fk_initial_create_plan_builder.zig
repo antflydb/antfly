@@ -272,6 +272,7 @@ pub fn buildWithGeneratedNamesAndScratch(
         }
     }.less);
     const plan: publication.InitialCreatePlan = .{
+        .historical_reference_coverage = try publication.schemaHasUnvalidatedForeignKeys(alloc, child.schema_json),
         .id = id,
         .catalog_coverage = .checks_v1,
         .retirement_scope = retirementScopeForDeployment(server.cfg.deployment_mode),

@@ -8,19 +8,59 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
 ## Current original-case qualification (2026-10-23)
 
-The ledger now records **763 implemented / 137 rejected / 428 superseded /
-258 unresolved**. The requested next-100 batch has closed **35 original cases**:
+The ledger now records **764 implemented / 137 rejected / 428 superseded /
+257 unresolved**. The requested next-100 batch has closed **36 original cases**:
 `sql-0011`, `sql-0014`, `sql-0570`, `sql-0580`, `sql-0586`, `sql-0591`,
 `sql-0595`, `sql-0883`, `sql-0927`, `sql-0935`, `sql-0343`–`sql-0349`,
 `sql-1456`, `sql-1459`, `sql-1464`, `sql-0005`, `sql-0008`, `sql-0009`,
-`sql-0010`, `sql-0142`–`sql-0143`, `sql-0311`–`sql-0317`, and `sql-0744`–`sql-0745`;
-**65 of that target remain unfinished**. Thirty are implementations; five are
+`sql-0010`, `sql-0142`–`sql-0143`, `sql-0311`–`sql-0317`, `sql-0734`, and `sql-0744`–`sql-0745`;
+**64 of that target remain unfinished**. Thirty-one are implementations; five are
 PostgreSQL-invalid originals (outer recursive MERGE, 42601, and ambiguous
 `RETURNING id`, 42702, ALTER ROLE SET with an expression, 42601, and two
-index names used as constraints, 42704), not thirty-five
+index names used as constraints, 42704), not thirty-six
 newly supported forms. The earlier sixteen mutation witnesses are ten original
-cases, not sixteen completions. **166 unresolved DDL/catalog cases remain open**; the role
+cases, not sixteen completions. **165 unresolved DDL/catalog cases remain open**; the role
 default cohort does not complete that feature work.
+
+### NOT VALID FK: historical references and a durable coverage barrier
+
+The unchanged `sql-0734` preserves existing invalid children and the physical
+primary rows. New FK values still require a live parent; unchanged FK keys can
+be updated and historical orphans can be deleted. Historical reference records
+use a distinct checksummed encoding without increasing record size. Ordinary
+attachments cannot acquire the historical exemption, and backfill cannot
+downgrade an ordinary witness. Historical validation remains independent of
+physical reference coverage: the public `not_valid` declaration stays true after
+backfill, matching a false
+PostgreSQL `convalidated` value.
+
+Existing-table FK publication now retains a durable parent reference-coverage
+barrier after the early generation ACK. Backfill and parent inserts can progress,
+including self FKs; destructive parent claims wait. Child install receipts are
+withheld until a read-index observes the exact successor schema, generation set,
+range and enforced coverage. A distinct final ACK clears the exact durable
+barrier. Its receipt identity differs from the early ACK; lost replies and cold
+recovery cannot substitute one for the other. Table locks remain held until all
+parent coverage ACKs commit. The hot-path guard is checked once per preparation
+batch and checked again by the native participant before accepting effects.
+Already-draining FK actions retain exact job/state proofs for cancellation,
+validated completion and lost-reply replay; new destructive actions stay fenced.
+Confirmed coordinator aborts retain retryable SQL outcomes, while uncertain
+aborts remain unknown. Constraint lookup does not manufacture absent declaration
+collections, so DROP preserves unrelated schema bytes and publication shape.
+This uses the existing bounded activation worker and metadata coordinator;
+primary rows are never rewritten for the declaration. Coverage still requires
+streaming historical rows to build the reverse-reference index.
+
+The independent PostgreSQL 18 witness checks fourteen mutations and full child
+and parent postimages. Strict Debug gates cover native orphan references,
+restart during pending coverage, raced destructive prepares, stale/different
+coverage decisions, early ACK replay, authenticated mounted SQL cold recovery,
+and neighboring FK and self-FK publication. Decoder version 66 uses the existing
+coordinated activation barrier. Generated public models expose the declaration.
+This closes one original case and advances the requested batch to **36/100**.
+`sql-0736` VALIDATE remains unresolved: clearing the declaration without a
+coordinated historical proof returns `0A000`; MATCH PARTIAL NOT VALID is guarded.
 
 ### Column comments: stable attributes and bounded catalog admission
 

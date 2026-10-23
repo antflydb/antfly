@@ -430,8 +430,20 @@ test "relational index system NOT VALID CHECK enforces writes without historical
     defer storage_schema.freeSchema(a, runtime);
     try std.testing.expect(runtime.requires_deferred_constraints);
     try std.testing.expectEqual(@as(u32, 32), storage_schema.requiredReaderVersion(runtime));
-    const bytes = try storage_schema.serializeSchema(a, runtime);
+    const current_bytes = try storage_schema.serializeSchema(a, runtime);
+    defer a.free(current_bytes);
+    const current = try storage_schema.deserializeSchema(a, current_bytes);
+    defer storage_schema.freeSchema(a, current);
+    try std.testing.expectEqual(storage_schema.storage_format_version, current.decoded_format_version);
+    try std.testing.expect(current.requires_deferred_constraints);
+    // Main's v33 appends the independent UUID-default reader bit. Keep the
+    // explicit v32/v31 compatibility witnesses rather than relabeling v33.
+    try std.testing.expectEqual(@as(u32, 33), current.decoded_format_version);
+    try std.testing.expect(!current.requires_uuid_defaults);
+    try std.testing.expectEqual(@as(u8, 0), current_bytes[current_bytes.len - 1]);
+    const bytes = try a.dupe(u8, current_bytes[0 .. current_bytes.len - 1]);
     defer a.free(bytes);
+    std.mem.writeInt(u32, bytes[4..8], 32, .little);
     const restored = try storage_schema.deserializeSchema(a, bytes);
     defer storage_schema.freeSchema(a, restored);
     try std.testing.expect(restored.requires_deferred_constraints);

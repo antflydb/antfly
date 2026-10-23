@@ -2215,6 +2215,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "SQL session observations retry only pure active reads without mutation outcomes",
             "mounted SQL deferred uniqueness permits repaired transient conflicts with isolated observers and restart",
             "mounted SQL original FK schema lifecycles preserve parent references and cold owners",
+            "mounted SQL original NOT VALID FK preserves orphan coverage future enforcement and cold owners",
             "mounted SQL original USING conversions transform historical rows preserve future writes and recover cold owners",
             "mounted SQL original column rename preserves dependencies literals and cold postimages",
             "SQL parity timestamp comparison preserves nanoseconds and timezone offsets rather than textual spelling",
@@ -2378,6 +2379,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&sql_session_control_run.step);
     b.step("antfly-api-sql-schema-lifecycle-test", "Run original schema lifecycle DDL, future-write enforcement, postimages and cold owner recovery")
         .dependOn(&sql_schema_lifecycle_run.step);
+    const sql_fk_not_valid_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original NOT VALID FK preserves orphan coverage future enforcement and cold owners"});
+    sql_fk_not_valid_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-fk-not-valid-lifecycle-test", "Verify historical orphan coverage, new FK enforcement and cold owners")
+        .dependOn(&sql_fk_not_valid_run.step);
     const sql_fk_schema_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original FK schema lifecycles preserve parent references and cold owners"});
     sql_fk_schema_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-fk-schema-lifecycle-test", "Run original FK DDL through parent generation admission, future-write checks and cold recovery")
@@ -2620,7 +2625,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_retry_tests).step);
     const hosted_self_fk_diagnostic_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
-        .filters = &.{"mounted hosted self-FK ADD DROP restart"},
+        .filters = &.{ "mounted hosted self-FK ADD DROP restart", "SQL unknown mutation keeps native reconciliation receipt without allocation", "SQL catalog lifecycle retries only explicit definite DDL nonadmission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-self-fk-test", "Run mounted public self-FK ADD/DROP/restart")

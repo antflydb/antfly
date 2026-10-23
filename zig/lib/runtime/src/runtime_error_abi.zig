@@ -938,6 +938,7 @@ pub const Detail = enum(c_int) {
     store_registration_required,
     catalog_publication_fence_unavailable,
     undefined_column,
+    foreign_key_validation_required,
 };
 
 test "partial index proof rejection preserves exact callback error identity" {
@@ -1231,6 +1232,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.SqlIndexAlreadyExists => status(.already_exists, .sql_index_already_exists),
         error.SqlConstraintAlreadyExists => status(.already_exists, .sql_constraint_already_exists),
         error.UndefinedColumn => status(.invalid_argument, .undefined_column),
+        error.ForeignKeyValidationRequired => status(.unsupported, .foreign_key_validation_required),
         error.ProgramLimitExceeded => status(.invalid_argument, .program_limit_exceeded),
         error.CatalogOccupancyNotReady => status(.retryable, .catalog_occupancy_not_ready),
         error.RelationalExpressionBudgetExceeded => status(.invalid_argument, .relational_expression_budget_exceeded),
@@ -2153,6 +2155,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .sql_index_already_exists => "SqlIndexAlreadyExists",
         .sql_constraint_already_exists => "SqlConstraintAlreadyExists",
         .undefined_column => "UndefinedColumn",
+        .foreign_key_validation_required => "ForeignKeyValidationRequired",
         .program_limit_exceeded => "ProgramLimitExceeded",
         .catalog_occupancy_not_ready => "CatalogOccupancyNotReady",
         .relational_expression_budget_exceeded => "RelationalExpressionBudgetExceeded",
@@ -2946,7 +2949,7 @@ test "catalog publication preparation preserves explicit retry identity across a
     var forged = pending;
     forged.code = @backingInt(Code.corrupt);
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(forged));
-    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn }) |err| {
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired }) |err| {
         const encoded = statusFromError(err);
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(encoded));

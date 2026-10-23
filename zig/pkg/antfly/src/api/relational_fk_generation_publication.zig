@@ -135,7 +135,23 @@ pub const SourceReceipt = struct {
     applied_term: u64,
     applied_index: u64,
 
+    reference_coverage_ready: bool = false,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "reference_coverage_ready")) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            } else if (self.reference_coverage_ready) {
+                try writer.objectField(field);
+                try writer.write(true);
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validate(self: SourceReceipt, request: SourceRequest) !void {
+        if (self.reference_coverage_ready and self.action != .install) return error.InvalidGenerationPublication;
         if (!std.mem.eql(u8, &self.plan_id, &request.plan_id) or
             self.child_table_id != request.child_table_id or
             self.child_group_id != request.child_group_id or
@@ -171,6 +187,7 @@ pub const SourceReceipt = struct {
         hash.update(&self.before_catalog_digest);
         hash.update(&self.after_schema_digest);
         hash.update(&self.after_catalog_digest);
+        if (self.reference_coverage_ready) hash.update("reference-coverage-ready/v1");
         var result: integrity.Digest = undefined;
         hash.final(&result);
         return result;
@@ -204,7 +221,23 @@ pub const Receipt = struct {
     applied_term: u64,
     applied_index: u64,
 
+    reference_coverage_ready: bool = false,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "reference_coverage_ready")) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            } else if (self.reference_coverage_ready) {
+                try writer.objectField(field);
+                try writer.write(true);
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validate(self: Receipt, request: Request) !void {
+        if (self.reference_coverage_ready and self.action != .acknowledge) return error.InvalidGenerationPublication;
         if (!std.mem.eql(u8, &self.plan_id, &request.plan_id) or
             self.parent_table_id != request.parent_table_id or
             self.parent_group_id != request.parent_group_id or
@@ -228,6 +261,7 @@ pub const Receipt = struct {
         hash.update(@tagName(self.action));
         hash.update(&self.transitions_digest);
         hash.update(&self.decision_digest);
+        if (self.reference_coverage_ready) hash.update("reference-coverage-ready/v1");
         var result: integrity.Digest = undefined;
         hash.final(&result);
         return result;

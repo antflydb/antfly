@@ -3274,6 +3274,10 @@ const Parser = struct {
                 foreign.timing = if (self.keyword(.deferred)) "deferred" else if (self.keyword(.immediate)) "immediate" else return self.fail(error.InvalidSqlSyntax, "invalid constraint timing");
             } else break;
         }
+        if (self.keyword(.not)) {
+            if (!self.ddlWord("VALID")) return self.fail(error.InvalidSqlSyntax, "expected NOT VALID after foreign key");
+            foreign.not_valid = true;
+        }
         if (std.mem.eql(u8, foreign.timing, "deferred") and !foreign.deferrable) return self.fail(error.InvalidSqlSyntax, "INITIALLY DEFERRED requires DEFERRABLE");
         return .{ .add_foreign_key = foreign };
     }
@@ -4818,4 +4822,12 @@ test "compiler SQL COMMENT COLUMN binds quoted and qualified identity without sc
         try std.testing.expectEqual(@as(@FieldType(ast.CatalogDdl, "action"), .comment), compiled.statement.catalog_ddl.action);
         try std.testing.expect(compiled.statement.catalog_ddl.schema_change == null);
     }
+}
+
+test "SQL original FK NOT VALID retains independent historical validation intent" {
+    const a = std.testing.allocator;
+    var compiled = try compile(a, "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;", .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.statement.catalog_ddl.schema_change.?.add_foreign_key.not_valid);
+    try std.testing.expectEqualStrings("usage_records_user_id_fkey", compiled.statement.catalog_ddl.schema_change.?.add_foreign_key.name);
 }

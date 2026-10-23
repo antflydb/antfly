@@ -6665,6 +6665,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     private_claim_transfer_step.dependOn(&addFilteredTestRunArtifact(b, private_claim_transfer_tests).step);
     db_test_step.dependOn(&native_index_candidate_run.step);
     unit_test_step.dependOn(&native_index_candidate_run.step);
+    const historical_fk_tests = b.addTest(.{
+        .root_module = native_index_candidate_mod,
+        .filters = &.{"NOT VALID"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const historical_fk_run = addFilteredTestRunArtifact(b, historical_fk_tests);
+    historical_fk_run.addArg("--require-no-skips");
+    b.step("relational-fk-not-valid-test", "Verify historical orphan coverage, claim guards and unchanged-key enforcement")
+        .dependOn(&historical_fk_run.step);
     const native_index_catalog_tests = b.addTest(.{
         .root_module = native_index_candidate_mod,
         .filters = &.{ "relational index catalog", "relational index private addition" },

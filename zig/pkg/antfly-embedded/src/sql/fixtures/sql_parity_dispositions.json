@@ -2,6 +2,67 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-qualified-fk-not-valid-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-fk-not-valid-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-fk-not-valid-integrity-debug": {
+      "command": [
+        "zig",
+        "build",
+        "relational-fk-not-valid-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-fk-not-valid-publication-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-fk-historical-reference-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-fk-not-valid-parser-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL original FK",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-fk-not-valid-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_fk_not_valid_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_fk_not_valid_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
     "sql-qualified-column-comment-native-debug": {
       "command": ["zig", "build", "antfly-api-sql-column-comment-lifecycle-test", "-Doptimize=Debug", "-j1"],
       "cwd": "zig",
@@ -13204,8 +13265,35 @@
     },
     {
       "id": "sql-0734",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original NOT VALID foreign key preserves primary bytes and historical invalid rows while enforcing new FK values. PostgreSQL 18 and authenticated mounted native owners agree on complete child/parent postimages and exact 23503 failures before and after cold restart. Historical orphan references remain durable without weakening ordinary attachment. Parent admission retains an independent durable coverage barrier until every child owner proves exact schema/generation/range coverage; early ACKs and raced destructive effects cannot bypass it. VALIDATE remains guarded until coordinated historical proof exists.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original NOT VALID FK preserves orphan coverage future enforcement and cold owners",
+          "gate": "sql-qualified-fk-not-valid-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "relational integrity NOT VALID parent coverage barrier survives restart and rejects raced destructive effects",
+          "gate": "sql-qualified-fk-not-valid-integrity-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/fk_generation_publication.zig",
+          "test": "FK historical reference coverage requires independent durable completion ACK after child install",
+          "gate": "sql-qualified-fk-not-valid-publication-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL original FK NOT VALID retains independent historical validation intent",
+          "gate": "sql-qualified-fk-not-valid-parser-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original NOT VALID FK preserves orphan coverage future enforcement and cold owners",
+          "gate": "sql-qualified-fk-not-valid-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0735",

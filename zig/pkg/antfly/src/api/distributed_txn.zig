@@ -1644,7 +1644,7 @@ fn executeMultiTableCommitOnce(
                     // Preserve a typed retryable result without claiming
                     // not-proposed for the individual participant RPC. An
                     // uncertain abort above retains AbortDecisionNotDurable.
-                    return if (err == error.StorageReadTemporarilyUnavailable)
+                    return if (err == error.StorageReadTemporarilyUnavailable or err == error.ConstraintActivationInProgress)
                         error.TransactionPrepareAbortedUnavailable
                     else
                         err;
@@ -6366,15 +6366,17 @@ fn consumerTests() type {
                     try std.testing.expectError(error.AbortDecisionNotDurable, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null));
                 }
             }
-            recorder.prepare_failure = error.StorageReadTemporarilyUnavailable;
-            recorder.abort_failure = false;
-            recorder.observed_status = .aborted;
-            recorder.resolves.clearRetainingCapacity();
-            try std.testing.expectError(error.TransactionPrepareAbortedUnavailable, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null));
-            try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
-            recorder.abort_failure = true;
-            recorder.observed_status = .pending;
-            try std.testing.expectError(error.AbortDecisionNotDurable, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null));
+            for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.ConstraintActivationInProgress }) |prepare_failure| {
+                recorder.prepare_failure = prepare_failure;
+                recorder.abort_failure = false;
+                recorder.observed_status = .aborted;
+                recorder.resolves.clearRetainingCapacity();
+                try std.testing.expectError(error.TransactionPrepareAbortedUnavailable, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null));
+                try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
+                recorder.abort_failure = true;
+                recorder.observed_status = .pending;
+                try std.testing.expectError(error.AbortDecisionNotDurable, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null));
+            }
         }
 
         test "distributed txn coordinator never restarts a transaction id on topology change" {

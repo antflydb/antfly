@@ -156,6 +156,7 @@ fn stageBeginImpl(txn: anytype, fence: Fence, handoff: ?@import("relational_inte
     try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
     try @import("relational_integrity_generation_retirement.zig").requireActivationAcknowledged(txn);
     try @import("relational_integrity_generation_admission.zig").requireAcknowledged(txn);
+    try @import("relational_integrity_generation_admission.zig").requireReferenceCoverageAcknowledged(txn);
     // Split/merge transfer the durable generation tombstones through the
     // integrity handoff stream. Rewrite has a different copy protocol and
     // remains fenced until it transfers the same authority.

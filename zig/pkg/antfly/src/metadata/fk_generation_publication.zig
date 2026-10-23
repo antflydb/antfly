@@ -34,7 +34,7 @@ pub const CatalogCoverage = @import("antfly_local_sources").schema_relational_de
 fn writeCoverageFields(value: anytype, writer: anytype) !void {
     try writer.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |field| {
-        const include = if (comptime std.mem.eql(u8, field, "catalog_coverage")) value.catalog_coverage != .legacy else true;
+        const include = if (comptime std.mem.eql(u8, field, "catalog_coverage")) value.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field, "historical_reference_coverage")) value.historical_reference_coverage else if (comptime std.mem.eql(u8, field, "reference_coverage_ready")) value.reference_coverage_ready else true;
         if (include) {
             try writer.objectField(field);
             try writer.write(@field(value, field));
@@ -285,6 +285,7 @@ pub const Plan = struct {
         return false;
     }
 
+    historical_reference_coverage: bool = false,
     id: Id,
     child_before: records.TableRecord,
     child_after: records.TableRecord,
@@ -317,7 +318,7 @@ pub const Plan = struct {
     pub fn jsonStringify(self: Plan, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Plan).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "constraint_name_guard")) self.constraint_name_guard != null else if (comptime std.mem.eql(u8, field, "catalog_coverage")) self.catalog_coverage != .legacy else true;
+            const include = if (comptime std.mem.eql(u8, field, "constraint_name_guard")) self.constraint_name_guard != null else if (comptime std.mem.eql(u8, field, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field, "historical_reference_coverage")) self.historical_reference_coverage else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -327,6 +328,7 @@ pub const Plan = struct {
     }
 
     pub fn validate(self: Plan, alloc: std.mem.Allocator) !void {
+        if (!self.historical_reference_coverage and try schemaHasUnvalidatedForeignKeys(alloc, self.child_after.schema_json)) return error.InvalidGenerationPublication;
         if (std.mem.allEqual(u8, &self.id, 0) or self.child_before.table_id == 0 or
             self.child_before.table_id != self.child_after.table_id or
             !std.mem.eql(u8, self.child_before.name, self.child_after.name) or
@@ -440,6 +442,10 @@ pub const Plan = struct {
         }
         // Every changed FK must have exactly one parent transition. Unchanged
         // declarations retain their generation and require no parent fence.
+        for (before_foreign) |old| if (old.not_valid) {
+            for (after_foreign) |next| if (std.mem.eql(u8, old.name, next.name) and !next.not_valid)
+                return error.ForeignKeyValidationRequired;
+        };
         for (before_foreign) |fk| try self.validateForeignCoverage(prior_catalog, compiled_after.catalog, before_foreign, after_foreign, fk.name);
         for (after_foreign) |fk| {
             var was_present = false;
@@ -514,6 +520,7 @@ pub const Plan = struct {
     }
 
     pub fn verifySourceReceipt(self: Plan, identity: ChildIdentity, plan_digest: Digest, receipt: @import("../api/relational_fk_generation_publication.zig").SourceReceipt) !void {
+        if (self.historical_reference_coverage and receipt.action == .install and !receipt.reference_coverage_ready) return error.InvalidGenerationPublication;
         if (!std.mem.eql(u8, &receipt.plan_id, &self.id) or
             !std.mem.eql(u8, &receipt.plan_digest, &plan_digest) or
             receipt.child_table_id != self.child_before.table_id or
@@ -600,6 +607,7 @@ pub const InitialCreatePlan = struct {
         return false;
     }
 
+    historical_reference_coverage: bool = false,
     id: Id,
     catalog_coverage: CatalogCoverage = .legacy,
     retirement_scope: InitialRetirementScope,
@@ -625,7 +633,7 @@ pub const InitialCreatePlan = struct {
     pub fn jsonStringify(self: InitialCreatePlan, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(InitialCreatePlan).@"struct".field_names) |field_name| {
-            const include = if (comptime std.mem.eql(u8, field_name, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field_name, "constraint_name_admission")) self.constraint_name_admission != null else true;
+            const include = if (comptime std.mem.eql(u8, field_name, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field_name, "constraint_name_admission")) self.constraint_name_admission != null else if (comptime std.mem.eql(u8, field_name, "historical_reference_coverage")) self.historical_reference_coverage else true;
             if (include) {
                 try writer.objectField(field_name);
                 try writer.write(@field(self, field_name));
@@ -635,6 +643,7 @@ pub const InitialCreatePlan = struct {
     }
 
     pub fn validate(self: InitialCreatePlan, alloc: std.mem.Allocator) !void {
+        if (self.historical_reference_coverage != try schemaHasUnvalidatedForeignKeys(alloc, self.child.schema_json)) return error.InvalidGenerationPublication;
         if (self.constraint_name_admission) |admission| {
             if (admission.namespace_id != self.namespace_id) return error.InvalidGenerationPublication;
             try admission.validateSchema(alloc, self.child.schema_json);
@@ -1482,7 +1491,7 @@ fn validateOwnerFences(id: Id, table: records.TableRecord, ranges: []const recor
     }
 }
 
-pub const Phase = enum { fencing_child, staging_parents, activating_parents, acknowledging_parents, publishing_child, installing_child, published, canceling, canceled };
+pub const Phase = enum { fencing_child, staging_parents, activating_parents, acknowledging_parents, publishing_child, installing_child, published, canceling, canceled, acknowledging_reference_coverage };
 pub const Receipt = struct { group_id: u64, digest: Digest };
 
 pub const Command = struct {
@@ -1522,6 +1531,7 @@ pub const Publication = struct {
     parent_staged: []const Receipt = &.{},
     parent_activated: []const Receipt = &.{},
     parent_acknowledged: []const Receipt = &.{},
+    parent_coverage_acknowledged: []const Receipt = &.{},
     child_installed: []const Receipt = &.{},
     child_canceled: []const Receipt = &.{},
     parent_canceled: []const Receipt = &.{},
@@ -1558,6 +1568,8 @@ pub const Publication = struct {
         try validateReceipts(parent_groups.items, self.parent_staged);
         try validateReceipts(parent_groups.items, self.parent_activated);
         try validateReceipts(parent_groups.items, self.parent_acknowledged);
+        try validateReceipts(parent_groups.items, self.parent_coverage_acknowledged);
+        if (self.parent_coverage_acknowledged.len != 0 and (!self.plan.historical_reference_coverage or (self.phase != .acknowledging_reference_coverage and self.phase != .published))) return error.InvalidGenerationPublication;
         try validateReceipts(parent_groups.items, self.parent_canceled);
         if (self.phase != .canceling and self.phase != .canceled and (self.child_canceled.len != 0 or self.parent_canceled.len != 0)) return error.InvalidGenerationPublication;
         switch (self.phase) {
@@ -1566,7 +1578,8 @@ pub const Publication = struct {
             .activating_parents => if (self.child_fenced.len != self.plan.child_ranges.len or self.parent_staged.len != parent_groups.items.len or self.parent_acknowledged.len != 0 or self.child_installed.len != 0) return error.InvalidGenerationPublication,
             .acknowledging_parents => if (self.parent_activated.len != parent_groups.items.len or self.child_installed.len != 0) return error.InvalidGenerationPublication,
             .publishing_child, .installing_child => if (self.child_fenced.len != self.plan.child_ranges.len or self.parent_acknowledged.len != parent_groups.items.len) return error.InvalidGenerationPublication,
-            .published => if (self.child_installed.len != self.plan.child_ranges.len) return error.InvalidGenerationPublication,
+            .acknowledging_reference_coverage => if (!self.plan.historical_reference_coverage or self.child_installed.len != self.plan.child_ranges.len or self.parent_acknowledged.len != parent_groups.items.len) return error.InvalidGenerationPublication,
+            .published => if (self.child_installed.len != self.plan.child_ranges.len or (self.plan.historical_reference_coverage and self.parent_coverage_acknowledged.len != parent_groups.items.len)) return error.InvalidGenerationPublication,
             .canceling, .canceled => if (self.parent_activated.len != 0 or self.parent_acknowledged.len != 0 or self.child_installed.len != 0) return error.InvalidGenerationPublication,
         }
         if (self.phase == .canceled and (self.child_canceled.len != self.plan.child_ranges.len or self.parent_canceled.len != parent_groups.items.len)) return error.InvalidGenerationPublication;
@@ -1605,12 +1618,19 @@ pub const Publication = struct {
                 if (next.parent_activated.len == count) next.phase = .acknowledging_parents;
             },
             .parent_acknowledged => {
-                if (self.phase != .acknowledging_parents or command.parent_receipt.?.action != .acknowledge) return error.GenerationPublicationChanged;
+                const covering = self.phase == .acknowledging_reference_coverage;
+                if ((!covering and self.phase != .acknowledging_parents) or command.parent_receipt.?.action != .acknowledge or command.parent_receipt.?.reference_coverage_ready != covering) return error.GenerationPublicationChanged;
                 try self.plan.verifyParentReceipt(alloc, self.plan_digest, command.parent_receipt.?);
-                next.parent_acknowledged = try appendReceipt(alloc, self.parent_acknowledged, .{ .group_id = command.parent_receipt.?.parent_group_id, .digest = command.parent_receipt.?.digest() });
+                const receipt: Receipt = .{ .group_id = command.parent_receipt.?.parent_group_id, .digest = command.parent_receipt.?.digest() };
                 var count: usize = 0;
                 for (self.plan.parents) |parent| count += parent.ranges.len;
-                if (next.parent_acknowledged.len == count) next.phase = .publishing_child;
+                if (covering) {
+                    next.parent_coverage_acknowledged = try appendReceipt(alloc, self.parent_coverage_acknowledged, receipt);
+                    if (next.parent_coverage_acknowledged.len == count) next.phase = .published;
+                } else {
+                    next.parent_acknowledged = try appendReceipt(alloc, self.parent_acknowledged, receipt);
+                    if (next.parent_acknowledged.len == count) next.phase = .publishing_child;
+                }
             },
             .publish_child => {
                 if (self.phase != .publishing_child) return error.GenerationPublicationChanged;
@@ -1620,7 +1640,7 @@ pub const Publication = struct {
                 if (self.phase != .installing_child or command.source_receipt.?.action != .install) return error.GenerationPublicationChanged;
                 try self.plan.verifySourceReceipt(self.child_identity, self.plan_digest, command.source_receipt.?);
                 next.child_installed = try appendReceipt(alloc, self.child_installed, .{ .group_id = command.source_receipt.?.child_group_id, .digest = command.source_receipt.?.digest() });
-                if (next.child_installed.len == self.plan.child_ranges.len) next.phase = .published;
+                if (next.child_installed.len == self.plan.child_ranges.len) next.phase = if (self.plan.historical_reference_coverage) .acknowledging_reference_coverage else .published;
             },
             .cancel => {
                 if ((self.phase != .fencing_child and self.phase != .staging_parents and self.phase != .activating_parents) or
@@ -1699,6 +1719,8 @@ pub const SourceDecisionRequest = struct {
 };
 
 pub const Decision = struct {
+    historical_reference_coverage: bool = false,
+    reference_coverage_ready: bool = false,
     phase: Phase,
     metadata_group_id: u64,
     metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
@@ -1708,9 +1730,13 @@ pub const Decision = struct {
     transitions: []const Transition,
     parent_table: records.TableRecord,
     parent_range: records.RangeRecord,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writeCoverageFields(self, writer);
+    }
 };
 
 pub const SourceDecision = struct {
+    historical_reference_coverage: bool = false,
     phase: Phase,
     metadata_group_id: u64,
     metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
@@ -2332,4 +2358,142 @@ test "FK generation DROP requires drained child receipt and parent ACK before sc
     source.applied_index = 5;
     value = try value.apply(alloc, command(value, .child_installed, source, null));
     try std.testing.expectEqual(Phase.published, value.phase);
+}
+
+pub fn schemaHasUnvalidatedForeignKeys(alloc: std.mem.Allocator, bytes: []const u8) !bool {
+    if (bytes.len == 0) return false;
+    const Shape = struct { foreign_keys: ?[]const struct { not_valid: ?bool = null } = null };
+    var parsed = std.json.parseFromSlice(Shape, alloc, bytes, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidGenerationPublication;
+    defer parsed.deinit();
+    if (parsed.value.foreign_keys) |rules| for (rules) |rule| if (rule.not_valid orelse false) return true;
+    return false;
+}
+
+test "FK historical reference coverage requires independent durable completion ACK after child install" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const before_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parent","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const after_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var before = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, before_json);
+    defer before.deinit(alloc);
+    var compiled = try compileCatalog(alloc, before, 101, null);
+    defer compiled.deinit();
+    const old_b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(compiled.value.len));
+    _ = std.base64.standard.Encoder.encode(old_b64, compiled.value);
+    const derived = try deriveTransitions(alloc, 101, "child", before_json, after_json, old_b64);
+    try std.testing.expectEqual(@as(usize, 1), derived.len);
+    try std.testing.expectEqualStrings("parent", derived[0].parent_table_name);
+    try std.testing.expect(derived[0].transition.expected_generation != null);
+    try std.testing.expect(derived[0].transition.next_generation == null);
+
+    var id: Id = @splat(0);
+    std.mem.writeInt(u64, id[0..8], 7, .little);
+    std.mem.writeInt(u64, id[8..16], 1, .little);
+    const child_range: records.RangeRecord = .{ .table_id = 101, .group_id = 301, .range_id = 301, .doc_identity_shard_id = 301, .doc_identity_range_id = 301, .start_key = "" };
+    const parent_range: records.RangeRecord = .{ .table_id = 202, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" };
+    const child_fence: topology.Fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 301, .owner_group_id = 301, .role = .child_generation_source, .namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(1) };
+    const parent_fence: topology.Fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 401, .owner_group_id = 401, .role = .child_generation_parent, .namespace = .{ .table_id = 202, .shard_id = 401, .range_id = 401 }, .catalog_digest = @splat(2) };
+    const plan: Plan = .{
+        .historical_reference_coverage = true,
+        .id = id,
+        .child_before = .{ .table_id = 101, .name = "child", .schema_json = before_json },
+        .child_after = .{ .table_id = 101, .name = "child", .schema_json = after_json },
+        .child_catalog_before_b64 = old_b64,
+        .child_ranges = &.{child_range},
+        .child_fences = &.{child_fence},
+        .parents = &.{.{ .table = .{ .table_id = 202, .name = "parent" }, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .transitions = &.{derived[0].transition} }},
+    };
+    const digest = try plan.digest(alloc);
+    const identity = try plan.childIdentity(alloc);
+    var value: Publication = .{ .plan = plan, .plan_digest = digest, .child_identity = identity, .revision = 1, .phase = .fencing_child };
+    try value.validate(alloc);
+    const command = struct {
+        fn make(state: Publication, action: @FieldType(Command, "action"), source: ?@import("../api/relational_fk_generation_publication.zig").SourceReceipt, parent: ?@import("../api/relational_fk_generation_publication.zig").Receipt) Command {
+            return .{ .plan_id = state.plan.id, .child_table_id = state.plan.child_before.table_id, .expected_revision = state.revision, .action = action, .source_receipt = source, .parent_receipt = parent };
+        }
+    }.make;
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, command(value, .publish_child, null, null)));
+    const control = @import("../api/relational_fk_generation_publication.zig");
+    const admission = @import("antfly_local_sources").storage_db_relational_integrity_generation_admission;
+    const fence_bytes = try child_fence.encode();
+    var fence_digest: Digest = undefined;
+    std.crypto.hash.Blake3.hash(&fence_bytes, &fence_digest, .{});
+    var source: control.SourceReceipt = .{
+        .plan_id = id,
+        .child_table_id = 101,
+        .child_group_id = 301,
+        .action = .fence,
+        .plan_digest = digest,
+        .fence_digest = fence_digest,
+        .before_schema_version = identity.before_schema_version,
+        .before_schema_digest = identity.before_schema_digest,
+        .before_catalog_digest = identity.before_catalog_digest,
+        .after_schema_version = identity.after_schema_version,
+        .after_schema_digest = identity.after_schema_digest,
+        .after_catalog_digest = identity.after_catalog_digest,
+        .applied_term = 1,
+        .applied_index = 1,
+    };
+    value = try value.apply(alloc, command(value, .child_fenced, source, null));
+    try std.testing.expectEqual(Phase.staging_parents, value.phase);
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, command(value, .publish_child, null, null)));
+    const transition = derived[0].transition;
+    const transitions_digest = try admission.transitionsDigest(&.{.{
+        .child_table_id = transition.child_table_id,
+        .child_table_name = transition.child_table_name,
+        .constraint_name = transition.constraint_name,
+        .expected_generation = transition.expected_generation,
+        .next_generation = transition.next_generation,
+        .plan_id = id,
+        .decision_digest = digest,
+    }});
+    var parent: control.Receipt = .{
+        .plan_id = id,
+        .parent_table_id = 202,
+        .parent_group_id = 401,
+        .child_table_id = 101,
+        .action = .stage,
+        .transitions_digest = transitions_digest,
+        .decision_digest = digest,
+        .applied_term = 1,
+        .applied_index = 2,
+    };
+    value = try value.apply(alloc, command(value, .parent_staged, null, parent));
+    try std.testing.expectEqual(Phase.activating_parents, value.phase);
+    parent.action = .activate;
+    parent.applied_index = 3;
+    value = try value.apply(alloc, command(value, .parent_activated, null, parent));
+    try std.testing.expectEqual(Phase.acknowledging_parents, value.phase);
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, command(value, .publish_child, null, null)));
+    const serialized = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    value = try std.json.parseFromSliceLeaky(Publication, alloc, serialized, .{});
+    parent.action = .acknowledge;
+    parent.applied_index = 4;
+    value = try value.apply(alloc, command(value, .parent_acknowledged, null, parent));
+    try std.testing.expectEqual(Phase.publishing_child, value.phase);
+    value = try value.apply(alloc, command(value, .publish_child, null, null));
+    try std.testing.expectEqual(Phase.installing_child, value.phase);
+    source.action = .install;
+    source.applied_index = 5;
+    try std.testing.expectError(error.InvalidGenerationPublication, value.apply(alloc, command(value, .child_installed, source, null)));
+    source.reference_coverage_ready = true;
+    value = try value.apply(alloc, command(value, .child_installed, source, null));
+    try std.testing.expectEqual(Phase.acknowledging_reference_coverage, value.phase);
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, command(value, .parent_acknowledged, null, parent)));
+    const pending_bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    value = try std.json.parseFromSliceLeaky(Publication, alloc, pending_bytes, .{});
+    try value.validate(alloc);
+    parent.reference_coverage_ready = true;
+    parent.applied_index = 6;
+    const covered = command(value, .parent_acknowledged, null, parent);
+    value = try value.apply(alloc, covered);
+    try value.validate(alloc);
+    try std.testing.expectEqual(Phase.published, value.phase);
+    try std.testing.expectEqual(@as(usize, 1), value.parent_coverage_acknowledged.len);
+    try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, covered));
 }

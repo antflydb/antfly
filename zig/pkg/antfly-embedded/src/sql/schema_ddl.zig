@@ -486,7 +486,9 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
         },
         .drop_constraint, .validate_constraint => |constraint_name| {
             for ([_][]const u8{ "unique_constraints", "checks", "foreign_keys" }) |key| {
-                const constraints = try list(schema, alloc, key);
+                const entries = schema.object.getPtr(key) orelse continue;
+                if (entries.* != .array) return error.InvalidSqlBackendResponse;
+                const constraints = &entries.array;
                 if (named(constraints.items, constraint_name, "name")) |position| {
                     if (std.mem.eql(u8, key, "unique_constraints") and indexOwned(constraints.items[position])) return error.SqlConstraintNotFound;
                     // PostgreSQL VALIDATE applies only to CHECK and FK rules.
@@ -495,6 +497,10 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
                     if (change == .validate_constraint and std.mem.eql(u8, key, "unique_constraints")) return error.SqlWrongObjectType;
                     if (change == .drop_constraint) {
                         _ = constraints.orderedRemove(position);
+                    } else if (std.mem.eql(u8, key, "foreign_keys")) {
+                        const pending = constraints.items[position].object.get("not_valid");
+                        if (pending != null and pending.? == .bool and pending.?.bool) return error.ForeignKeyValidationRequired;
+                        return false;
                     } else if (std.mem.eql(u8, key, "checks")) {
                         // The caller must validate this unpublished candidate
                         // before publishing its cleared declaration. Background
@@ -532,7 +538,9 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
             if (constraintExists(schema.*, constraint.name)) return error.SqlConstraintAlreadyExists;
             const constraints = try list(schema, alloc, "foreign_keys");
             if (named(constraints.items, constraint.name, "name") != null) return error.SqlConstraintAlreadyExists;
-            try constraints.append(try value(alloc, .{ .name = constraint.name, .child_columns = constraint.columns, .parent_table = constraint.parent, .parent_columns = constraint.parent_columns, .on_delete = constraint.on_delete, .on_update = constraint.on_update, .match = constraint.match, .timing = constraint.timing, .deferrable = constraint.deferrable }));
+            var declaration = try value(alloc, .{ .name = constraint.name, .child_columns = constraint.columns, .parent_table = constraint.parent, .parent_columns = constraint.parent_columns, .on_delete = constraint.on_delete, .on_update = constraint.on_update, .match = constraint.match, .timing = constraint.timing, .deferrable = constraint.deferrable });
+            if (constraint.not_valid) try declaration.object.put(alloc, "not_valid", .{ .bool = true });
+            try constraints.append(declaration);
         },
         .create_index => |index| {
             var indexes = try list(schema, alloc, "relational_indexes");
@@ -881,4 +889,34 @@ test "SQL VALIDATE UNIQUE rejects the wrong constraint kind without publishing a
     defer compiled.deinit();
     try std.testing.expectError(error.SqlWrongObjectType, apply(a, &schema, compiled.statement.catalog_ddl));
     try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
+}
+
+test "SQL original FK NOT VALID cannot certify historical validity by changing metadata" {
+    const compiler = @import("compiler.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"storage_mode":"relational","default_type":"row","unique_constraints":[],"checks":[],"foreign_keys":[{"name":"fk","child_columns":["user_id"],"parent_table":"users","parent_columns":["id"],"not_valid":true}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"user_id":{"type":"keyword"}},"additionalProperties":false}}}}
+    , .{});
+    var ddl = try compiler.compile(a, "ALTER TABLE usage_records VALIDATE CONSTRAINT fk", .{});
+    defer ddl.deinit();
+    const before = try std.json.Stringify.valueAlloc(a, schema, .{});
+    try std.testing.expectError(error.ForeignKeyValidationRequired, apply(a, &schema, ddl.statement.catalog_ddl));
+    try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
+}
+
+test "SQL original FK drop preserves absent unrelated constraint collections" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"version":1,"foreign_keys":[{"name":"fk","child_columns":["parent_id"],"parent_table":"parent","parent_columns":["id"]}]}
+    , .{});
+    var ddl = try @import("compiler.zig").compile(a, "ALTER TABLE child DROP CONSTRAINT fk", .{});
+    defer ddl.deinit();
+    try std.testing.expect(try apply(a, &schema, ddl.statement.catalog_ddl));
+    try std.testing.expect(schema.object.get("checks") == null);
+    try std.testing.expect(schema.object.get("unique_constraints") == null);
+    try std.testing.expectEqual(@as(usize, 0), schema.object.get("foreign_keys").?.array.items.len);
 }

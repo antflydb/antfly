@@ -64,6 +64,7 @@ pub fn next(value: publication.Publication) !?Target {
         .staging_parents => parentWithoutReceipt(value, value.parent_staged, .stage) orelse error.GenerationPublicationChanged,
         .activating_parents => parentWithoutReceipt(value, value.parent_activated, .activate) orelse error.GenerationPublicationChanged,
         .acknowledging_parents => parentWithoutReceipt(value, value.parent_acknowledged, .acknowledge) orelse error.GenerationPublicationChanged,
+        .acknowledging_reference_coverage => parentWithoutReceipt(value, value.parent_coverage_acknowledged, .acknowledge) orelse error.GenerationPublicationChanged,
         .publishing_child => .publish_child,
         .installing_child => childWithoutReceipt(value, value.child_installed, .install) orelse error.GenerationPublicationChanged,
         .canceling => parentWithoutReceipt(value, value.parent_canceled, .cancel) orelse

@@ -15,6 +15,8 @@
 
 //! Native-only qualification: no server metadata/compiler imports.
 test {
+    _ = @import("storage/db/relational_integrity.zig");
+    _ = @import("api/relational_integrity.zig");
     _ = @import("storage/db/relational_index_candidate.zig");
     _ = @import("storage/db/relational_index_catalog.zig");
 }

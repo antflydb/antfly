@@ -145,3 +145,5 @@ pub const Corpus = struct {
         return std.fmt.parseInt(usize, id[4..], 10);
     }
 };
+
+pub const fk_not_valid_reference = @embedFile("fixtures/sql_fk_not_valid_reference.json");

@@ -304,10 +304,20 @@ pub const Claim = struct {
 };
 
 pub const Reference = struct {
+    historical_unvalidated: bool = false,
+
     child_table: []const u8,
     child_key: []const u8,
     constraint_name: []const u8,
     constraint_generation: Generation,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "historical_unvalidated") and !self.historical_unvalidated;
+    }
+
+    pub fn jsonStringify(self: @This(), writer: anytype) @TypeOf(writer.*).Error!void {
+        return @import("relational_integrity_json.zig").write(self, writer);
+    }
 
     pub fn key(self: Reference, address: Address) ![key_len + 32]u8 {
         if (self.child_table.len == 0 or self.child_key.len == 0 or self.constraint_name.len == 0 or std.mem.allEqual(u8, &self.constraint_generation, 0)) return error.InvalidIntegrityRecord;
@@ -329,7 +339,7 @@ pub const Reference = struct {
         const physical = try self.key(address);
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
-        try out.appendSlice(alloc, "AFR1");
+        try out.appendSlice(alloc, if (self.historical_unvalidated) "AFR2" else "AFR1");
         try out.appendSlice(alloc, &self.constraint_generation);
         for ([_][]const u8{ self.child_table, self.child_key, self.constraint_name }) |field| try appendField(alloc, &out, field);
         return finishRecord(alloc, &out, &physical);
@@ -338,10 +348,11 @@ pub const Reference = struct {
     pub fn decode(key_bytes: []const u8, value: []const u8) !Reference {
         const parsed = try parseKey(key_bytes);
         if (parsed.kind != .reference) return error.InvalidIntegrityKey;
-        const body = try recordBody(key_bytes, value, "AFR1");
+        const historical = std.mem.startsWith(u8, value, "AFR2");
+        const body = try recordBody(key_bytes, value, if (historical) "AFR2" else "AFR1");
         if (body.len < 16) return error.InvalidIntegrityRecord;
         var reader: Decoder = .{ .bytes = body[16..] };
-        const result: Reference = .{ .constraint_generation = body[0..16].*, .child_table = try reader.field(), .child_key = try reader.field(), .constraint_name = try reader.field() };
+        const result: Reference = .{ .historical_unvalidated = historical, .constraint_generation = body[0..16].*, .child_table = try reader.field(), .child_key = try reader.field(), .constraint_name = try reader.field() };
         try reader.finish();
         if (!std.mem.eql(u8, key_bytes, &(try result.key(parsed.address)))) return error.IntegrityAddressMismatch;
         return result;
@@ -359,6 +370,10 @@ pub const Command = struct {
         establish: Claim,
         check_owner: ClaimOwner,
         attach: Reference,
+        /// Coordinator-owned historical coverage for a NOT VALID declaration.
+        /// Guard claim absence as well as presence; retain the reverse reference
+        /// so a later parent creation cannot escape ON DELETE/UPDATE actions.
+        attach_historical: Reference,
         detach: Reference,
         repair_detach: Reference,
         release: ClaimOwner,
@@ -389,7 +404,7 @@ pub fn commandAdmissionBytes(command: Command) !usize {
         .establish => |claim| for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| {
             bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
         },
-        .attach, .detach, .repair_detach => |reference| for ([_][]const u8{ reference.child_table, reference.child_key, reference.constraint_name }) |field| {
+        .attach, .attach_historical, .detach, .repair_detach => |reference| for ([_][]const u8{ reference.child_table, reference.child_key, reference.constraint_name }) |field| {
             bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
         },
         .check_owner => |owner| {

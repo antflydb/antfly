@@ -273,6 +273,15 @@ pub const Plan = struct {
     }
 
     pub fn expand(self: *const Plan, alloc: Allocator, mutations: []const Mutation) !Expansion {
+        return self.expandMode(alloc, mutations, false);
+    }
+
+    pub fn expandHistorical(self: *const Plan, alloc: Allocator, mutations: []const Mutation) !Expansion {
+        for (mutations) |mutation| if (mutation.before != null or mutation.repair) return error.InvalidIntegrityCommand;
+        return self.expandMode(alloc, mutations, true);
+    }
+
+    fn expandMode(self: *const Plan, alloc: Allocator, mutations: []const Mutation, historical: bool) !Expansion {
         if (mutations.len > 4096) return error.TransactionTooLarge;
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
@@ -304,6 +313,13 @@ pub const Plan = struct {
                 } });
             }
             for (self.foreign) |foreign| {
+                if (!historical and foreign.definition.not_valid and mutation.before != null and mutation.after != null) {
+                    // PostgreSQL checks changed FK keys, not unrelated UPDATEs.
+                    // Compare the full canonical tuple, including mixed NULLs.
+                    const old_key = try encode(owned, foreign.tuple, mutation.before, false, false);
+                    const new_key = try encode(owned, foreign.tuple, mutation.after, false, false);
+                    if (sameTuple(old_key, new_key)) continue;
+                }
                 if (foreign.definition.match == .partial) {
                     const encoded = try std.json.Stringify.valueAlloc(owned, foreign.definition, .{});
                     const definition = try std.json.parseFromSliceLeaky(native.ForeignKey, owned, encoded, .{ .allocate = .alloc_always });
@@ -317,8 +333,8 @@ pub const Plan = struct {
                     });
                     continue;
                 }
-                const before = try encode(owned, foreign.tuple, mutation.before, true, foreign.definition.match == .full and !mutation.repair);
-                const after = try encode(owned, foreign.tuple, mutation.after, true, foreign.definition.match == .full);
+                const before = try encode(owned, foreign.tuple, mutation.before, true, foreign.definition.match == .full and !mutation.repair and !foreign.definition.not_valid);
+                const after = try encode(owned, foreign.tuple, mutation.after, true, foreign.definition.match == .full and !(historical and foreign.definition.not_valid));
                 const reference: storage.Reference = .{
                     .child_table = table_name,
                     .child_key = key,
@@ -326,8 +342,8 @@ pub const Plan = struct {
                     .constraint_generation = foreign.generation,
                 };
                 const parent_table = try owned.dupe(u8, foreign.definition.parent_table);
-                if (!sameTuple(before, after)) if (before) |tuple| try commands.append(owned, .{ .table_name = parent_table, .command = .{ .address = try storage.Address.init(foreign.parent_generation, tuple), .operation = if (mutation.repair) .{ .repair_detach = reference } else .{ .detach = reference } } });
-                if (after) |tuple| try commands.append(owned, .{ .table_name = parent_table, .command = .{ .address = try storage.Address.init(foreign.parent_generation, tuple), .operation = .{ .attach = reference } } });
+                if (!sameTuple(before, after)) if (before) |tuple| try commands.append(owned, .{ .table_name = parent_table, .command = .{ .address = try storage.Address.init(foreign.parent_generation, tuple), .operation = if (mutation.repair or foreign.definition.not_valid) .{ .repair_detach = reference } else .{ .detach = reference } } });
+                if (after) |tuple| try commands.append(owned, .{ .table_name = parent_table, .command = .{ .address = try storage.Address.init(foreign.parent_generation, tuple), .operation = if (historical and foreign.definition.not_valid) .{ .attach_historical = reference } else .{ .attach = reference } } });
             }
             if (commands.items.len + parents.items.len > storage.max_commands) return error.TransactionTooLarge;
         }
@@ -636,4 +652,31 @@ test "distributed txn partial unique integrity claims and SQL inference share ty
     defer enters_partial_index.deinit();
     try std.testing.expectEqual(@as(usize, 1), enters_partial_index.commands.len);
     try std.testing.expectEqual(@as(usize, 0), enters_partial_index.parents.len);
+}
+
+test "distributed txn NOT VALID history is separate from new-write and unchanged-key preparation" {
+    const a = std.testing.allocator;
+    const schema = @import("../storage/schema.zig");
+    const columns = [_]schema.RelationalColumn{.{ .name = "id", .path = "id", .column_type = .integer }};
+    var view = registry.SchemaView{ .epoch = try registry.Epoch.createCloned(a, .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns }) };
+    defer view.release();
+    const unique: native.UniqueConstraint = .{ .name = "pk", .columns = &.{"id"} };
+    const fk: native.ForeignKey = .{ .name = "fk", .child_columns = &.{"id"}, .parent_table = "parent", .parent_columns = &.{"id"}, .not_valid = true };
+    var plan = try Plan.init(a, "child", view, &.{}, &.{.{ .generation = @splat(2), .parent_generation = @splat(1), .definition = fk, .parent = view, .parent_unique = unique }});
+    defer plan.deinit();
+    const bytes = try codec.serializeOrdinal(a, 1, &columns, &.{.{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 9 } }}, @splat(0));
+    defer a.free(bytes);
+    const row = try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
+    var ordinary = try plan.expand(a, &.{.{ .key = "c", .after = row }});
+    defer ordinary.deinit();
+    try std.testing.expect(ordinary.commands[0].command.operation == .attach);
+    var historical = try plan.expandHistorical(a, &.{.{ .key = "c", .after = row }});
+    defer historical.deinit();
+    try std.testing.expect(historical.commands[0].command.operation == .attach_historical);
+    var unchanged = try plan.expand(a, &.{.{ .key = "c", .before = row, .after = row }});
+    defer unchanged.deinit();
+    try std.testing.expectEqual(@as(usize, 0), unchanged.commands.len);
+    var deleted = try plan.expand(a, &.{.{ .key = "c", .before = row }});
+    defer deleted.deinit();
+    try std.testing.expect(deleted.commands[0].command.operation == .repair_detach);
 }

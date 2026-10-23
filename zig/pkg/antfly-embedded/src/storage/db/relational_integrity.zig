@@ -150,7 +150,11 @@ fn validateOrdinaryTransferredCompanions(txn: anytype, key: []const u8, value: [
     // by the caller. Copy its fixed identity before that read.
     const transferred_job = if (parsed.kind == .job) (try Job.decode(key, value)).action_id else null;
     const claim_key = address.claimKey();
-    const claim_raw = if (parsed.kind == .claim) value else try optional(txn, &claim_key) orelse return error.IntegrityMissingCompanion;
+    const historical = parsed.kind == .reference and (try Reference.decode(key, value)).historical_unvalidated;
+    const claim_raw = if (parsed.kind == .claim) value else try optional(txn, &claim_key) orelse {
+        if (historical) return;
+        return error.IntegrityMissingCompanion;
+    };
     const claim = try Claim.decode(&claim_key, claim_raw);
     if (claim.state == .draining) {
         const job_action = transferred_job orelse (try Job.decode(&address.jobKey(), try optional(txn, &address.jobKey()) orelse return error.IntegrityMissingCompanion)).action_id;
@@ -197,6 +201,13 @@ const Builder = struct {
     retained_bytes: usize,
     operations: std.ArrayList(Operation) = .empty,
     positions: std.StringHashMapUnmanaged(usize) = .empty,
+    reference_coverage_checked: bool = false,
+
+    fn requireReferenceCoverage(self: *Builder, txn: anytype) !void {
+        if (self.reference_coverage_checked) return;
+        try @import("relational_integrity_generation_admission.zig").requireReferenceCoverageAcknowledged(txn);
+        self.reference_coverage_checked = true;
+    }
 
     fn current(self: *Builder, txn: anytype, key: []const u8) !?[]const u8 {
         if (self.positions.get(key)) |position| {
@@ -284,7 +295,7 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
                 .compare_claim, .check_owner => 0,
                 .release, .repair_release => 1,
                 .establish => 2,
-                .attach => 3,
+                .attach, .attach_historical => 3,
                 else => 4,
             };
             if (command_phase != phase) continue;
@@ -316,16 +327,30 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
                     }
                     try builder.add(txn, address, &claim_key, .put, try claim.encode(owned, address));
                 },
-                .attach => |reference| {
+                .attach, .attach_historical => |reference| {
                     if (try generation_retirement.isRetired(txn, reference)) return error.GenerationRetired;
-                    const raw = try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing;
-                    const claim = try Claim.decode(&claim_key, raw);
-                    if (claim.state != .live) return error.ForeignKeyActionInProgress;
+                    if (try builder.current(txn, &claim_key)) |raw| {
+                        const claim = try Claim.decode(&claim_key, raw);
+                        if (claim.state != .live) return error.ForeignKeyActionInProgress;
+                    } else if (command.operation == .attach) return error.ForeignKeyParentMissing;
                     try builder.add(txn, address, &claim_key, .guard, null);
                     const reference_key = try reference.key(address);
-                    const encoded_reference = try reference.encode(owned, address);
+                    if (command.operation == .attach and reference.historical_unvalidated) return error.InvalidIntegrityCommand;
+                    var stored = reference;
+                    stored.historical_unvalidated = command.operation == .attach_historical;
+                    const encoded_reference = try stored.encode(owned, address);
                     if (try builder.current(txn, &reference_key)) |old| {
-                        _ = try Reference.decode(&reference_key, old);
+                        const prior = try Reference.decode(&reference_key, old);
+                        if (command.operation == .attach_historical and !prior.historical_unvalidated) {
+                            // Existing ordinary writes prove stronger coverage.
+                            // A later backfill never downgrades that proof.
+                            try builder.add(txn, address, &reference_key, .guard, null);
+                            continue;
+                        }
+                        if (command.operation == .attach and prior.historical_unvalidated) {
+                            try builder.add(txn, address, &reference_key, .put, encoded_reference);
+                            continue;
+                        }
                         if (std.mem.eql(u8, old, encoded_reference)) {
                             try builder.add(txn, address, &reference_key, .guard, null);
                             continue;
@@ -351,6 +376,7 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
                     }
                     try requireOwner(claim, owner.parent_table, owner.parent_key);
                     if (claim.state != .live) return error.ForeignKeyActionInProgress;
+                    try builder.requireReferenceCoverage(txn);
                     try builder.requireEmpty(txn, address);
                     try builder.add(txn, address, &claim_key, .delete, null);
                 },
@@ -367,6 +393,7 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
                         try builder.add(txn, address, &claim_key, .guard, null);
                         continue;
                     }
+                    try builder.requireReferenceCoverage(txn);
                     claim.state = .draining;
                     claim.action = action.action;
                     claim.action_id = action.action_id;
@@ -499,6 +526,7 @@ pub fn validatePreparedEffects(alloc: Allocator, txn: anytype, operations: []con
         entry.value_ptr.* = index;
         if (!optionalEqual(try optional(txn, op.key), op.expected_value)) return error.VersionConflict;
     }
+    var reference_coverage_checked = false;
     for (operations) |op| {
         const parsed = try parseKey(op.key);
         const claim_key = parsed.address.claimKey();
@@ -507,6 +535,8 @@ pub fn validatePreparedEffects(alloc: Allocator, txn: anytype, operations: []con
                 if (op.kind == .put and try generation_retirement.isRetired(txn, try Reference.decode(op.key, op.value.?))) return error.GenerationRetired;
                 const claim_op = operations[overlay.get(&claim_key) orelse return error.IntegrityClaimGuardRequired];
                 const current_claim = if (claim_op.kind == .put) claim_op.value else claim_op.expected_value;
+                const historical = if (op.kind == .put) (try Reference.decode(op.key, op.value.?)).historical_unvalidated else if (op.expected_value) |raw| (try Reference.decode(op.key, raw)).historical_unvalidated else false;
+                if (current_claim == null and claim_op.kind == .guard and historical) continue;
                 const claim = try Claim.decode(&claim_key, current_claim orelse return error.ForeignKeyParentMissing);
                 if (op.kind == .put and (claim_op.kind == .delete or claim.state != .live)) return error.ForeignKeyActionInProgress;
             },
@@ -515,6 +545,18 @@ pub fn validatePreparedEffects(alloc: Allocator, txn: anytype, operations: []con
                 const old: ?Claim = if (op.expected_value) |bytes| try Claim.decode(op.key, bytes) else null;
                 const next: ?Claim = if (op.value) |bytes| try Claim.decode(op.key, bytes) else null;
                 if (old) |before| {
+                    // Existing draining jobs precede the barrier. Their exact
+                    // action/job proofs below must still permit completion or
+                    // cancellation; no new attachment can enter a draining claim.
+                    if (before.state == .live and (next == null or next.?.state != before.state or
+                        !std.mem.eql(u8, next.?.parent_table, before.parent_table) or
+                        !std.mem.eql(u8, next.?.parent_key, before.parent_key)))
+                    {
+                        if (!reference_coverage_checked) {
+                            try @import("relational_integrity_generation_admission.zig").requireReferenceCoverageAcknowledged(txn);
+                            reference_coverage_checked = true;
+                        }
+                    }
                     if (next) |after| {
                         if (!std.mem.eql(u8, after.parent_table, before.parent_table) or !std.mem.eql(u8, after.parent_key, before.parent_key)) {
                             if (before.state != .live or after.state != .live) return error.UniqueConstraintViolation;
@@ -1099,4 +1141,171 @@ test "relational integrity transaction reads preserve shared guards and isolate 
         try std.testing.expectEqual(@as(usize, 1), effects.operations.len);
         try std.testing.expectEqual(.delete, effects.operations[0].kind);
     }
+}
+
+test "relational integrity NOT VALID orphan coverage survives cold reopen and guards later parent deletion" {
+    const a = std.testing.allocator;
+    const DocStore = @import("../docstore.zig").DocStore;
+    const lsm = @import("../lsm_backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/historical", .{tmp.sub_path});
+    defer a.free(path);
+    const address = try Address.init(@splat(1), "orphan");
+    const reference: Reference = .{ .child_table = "child", .child_key = "c", .constraint_name = "fk", .constraint_generation = @splat(2) };
+    const claim: Claim = .{ .tuple = "orphan", .parent_table = "parent", .parent_key = "p", .schema_version = 1 };
+    for (0..2) |epoch| {
+        var backend = try lsm.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        if (epoch == 0) {
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            try std.testing.expectError(error.ForeignKeyParentMissing, prepare(a, &read, &.{.{ .address = address, .operation = .{ .attach = reference } }}));
+            try testCommands(&store, &manager, @splat(1), &.{.{ .address = address, .operation = .{ .attach_historical = reference } }}, true);
+            continue;
+        }
+        {
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            const reference_key = try reference.key(address);
+            const raw = try read.get(&reference_key);
+            try std.testing.expect((try Reference.decode(&reference_key, raw)).historical_unvalidated);
+            try validateTransferredCompanions(&read, &reference_key, raw);
+            try std.testing.expectError(error.ForeignKeyParentMissing, prepare(a, &read, &.{.{ .address = address, .operation = .{ .attach = reference } }}));
+        }
+        try testCommands(&store, &manager, @splat(2), &.{.{ .address = address, .operation = .{ .establish = claim } }}, true);
+        {
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            try std.testing.expectError(error.ForeignKeyReferenced, prepare(a, &read, &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } }}));
+        }
+        // New-write coverage upgrades a historical witness. Replayed backfill
+        // never downgrades it or allocates an extra reference record.
+        try testCommands(&store, &manager, @splat(3), &.{.{ .address = address, .operation = .{ .attach = reference } }}, true);
+        try testCommands(&store, &manager, @splat(4), &.{.{ .address = address, .operation = .{ .attach_historical = reference } }}, true);
+        {
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            const reference_key = try reference.key(address);
+            try std.testing.expect(!(try Reference.decode(&reference_key, try read.get(&reference_key))).historical_unvalidated);
+        }
+        try testCommands(&store, &manager, @splat(5), &.{ .{ .address = address, .operation = .{ .repair_detach = reference } }, .{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } } }, true);
+    }
+}
+
+test "relational integrity NOT VALID parent coverage barrier survives restart and rejects raced destructive effects" {
+    const a = std.testing.allocator;
+    const DocStore = @import("../docstore.zig").DocStore;
+    const lsm = @import("../lsm_backend.zig");
+    const admission = @import("relational_integrity_generation_admission.zig");
+    const topology = @import("relational_integrity_topology.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/coverage", .{tmp.sub_path});
+    defer a.free(path);
+    const address = try Address.init(@splat(1), "parent");
+    const claim: Claim = .{ .tuple = "parent", .parent_table = "parent", .parent_key = "p", .schema_version = 1 };
+    const fence: topology.Fence = .{ .role = .child_generation_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 }, .catalog_digest = @splat(4) };
+    const transitions: []const admission.Transition = &.{.{ .child_table_id = 51, .child_table_name = "child", .constraint_name = "fk", .expected_generation = null, .next_generation = @splat(8), .plan_id = @splat(2), .decision_digest = @splat(3) }};
+    const digest = try admission.completionReceipt(fence, transitions);
+    const release: Command = .{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } };
+    for (0..2) |epoch| {
+        var backend = try lsm.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        if (epoch == 0) {
+            try testCommands(&store, &manager, @splat(1), &.{.{ .address = address, .operation = .{ .establish = claim } }}, true);
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            var prepared = try prepare(a, &read, &.{release});
+            defer prepared.deinit();
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            for (transitions) |transition| {
+                try admission.stageTransition(a, &txn, transition);
+                try admission.activateTransition(a, &txn, transition);
+            }
+            try admission.stageCompletion(&txn, fence, transitions, 1, 2);
+            const encoded_fence = try fence.encode();
+            try txn.put(topology.receipt_key, &encoded_fence);
+            try admission.stageReferenceCoveragePending(&txn, digest);
+            try admission.stageAcknowledgement(&txn, fence, transitions, 1, 3);
+            // Early admission ACK does not certify historical coverage.
+            try std.testing.expectError(error.ConstraintActivationInProgress, admission.requireReferenceCoverageAcknowledged(&txn));
+            try std.testing.expectError(error.ConstraintActivationInProgress, validatePreparedEffects(a, &txn, prepared.operations));
+            try txn.commit();
+            continue;
+        }
+        {
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            try std.testing.expectError(error.ConstraintActivationInProgress, prepare(a, &read, &.{release}));
+        }
+        // New parent tuples and child backfill remain admitted while deletes wait.
+        const other_address = try Address.init(@splat(1), "new");
+        try testCommands(&store, &manager, @splat(4), &.{.{ .address = other_address, .operation = .{ .establish = .{ .tuple = "new", .parent_table = "parent", .parent_key = "new", .schema_version = 1 } } }}, true);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try std.testing.expectError(error.GenerationAdmissionChanged, admission.stageReferenceCoveragePending(&txn, @splat(99)));
+            var wrong = transitions[0];
+            wrong.next_generation = @splat(99);
+            try std.testing.expectError(error.GenerationAdmissionChanged, admission.stageReferenceCoverageAcknowledgement(&txn, fence, &.{wrong}, 1, 5));
+            try std.testing.expectError(error.ConstraintActivationInProgress, admission.requireReferenceCoverageAcknowledged(&txn));
+            try admission.stageReferenceCoverageAcknowledgement(&txn, fence, transitions, 1, 5);
+            try admission.requireReferenceCoverageAcknowledged(&txn);
+            // Exact lost-reply replay is harmless and retains the early receipt.
+            try admission.stageReferenceCoverageAcknowledgement(&txn, fence, transitions, 1, 5);
+            try txn.commit();
+        }
+        try testCommands(&store, &manager, @splat(5), &.{release}, true);
+    }
+}
+
+test "relational integrity NOT VALID coverage permits proven existing action recovery but fences new actions" {
+    const a = std.testing.allocator;
+    const DocStore = @import("../docstore.zig").DocStore;
+    const lsm = @import("../lsm_backend.zig");
+    const admission = @import("relational_integrity_generation_admission.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/actions", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try lsm.Backend.open(a, path, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var manager = try transactions.TxnManager.init(a, &store);
+    defer manager.deinit();
+    const finish = try Address.init(@splat(1), "finish");
+    const cancel = try Address.init(@splat(1), "cancel");
+    try testCommands(&store, &manager, @splat(1), &.{
+        .{ .address = finish, .operation = .{ .establish = .{ .tuple = "finish", .parent_table = "parent", .parent_key = "finish", .schema_version = 1 } } },
+        .{ .address = cancel, .operation = .{ .establish = .{ .tuple = "cancel", .parent_table = "parent", .parent_key = "cancel", .schema_version = 1 } } },
+    }, true);
+    const begin_finish: Command = .{ .address = finish, .operation = .{ .start_action = .{ .parent_table = "parent", .parent_key = "finish", .action_id = @splat(2), .action = .parent_delete, .parent_version = 1, .parent_schema_version = 1 } } };
+    const begin_cancel: Command = .{ .address = cancel, .operation = .{ .start_action = .{ .parent_table = "parent", .parent_key = "cancel", .action_id = @splat(3), .action = .parent_delete, .parent_version = 1, .parent_schema_version = 1 } } };
+    try testCommands(&store, &manager, @splat(2), &.{ begin_finish, begin_cancel }, true);
+    try store.put(admission.pending_reference_coverage_key, &@as([32]u8, @splat(4)));
+    // A lost begin reply does not become a new action after admission closes.
+    try testCommands(&store, &manager, @splat(3), &.{begin_finish}, true);
+    try testCommands(&store, &manager, @splat(4), &.{.{ .address = cancel, .operation = .{ .cancel_action = @splat(3) } }}, true);
+    {
+        var read = try CurrentView.init(&store);
+        defer read.deinit();
+        try std.testing.expectError(error.ConstraintActivationInProgress, prepare(a, &read, &.{begin_cancel}));
+        try std.testing.expectError(error.ForeignKeyActionNotValidated, prepare(a, &read, &.{.{ .address = finish, .operation = .{ .finish_action = @splat(2) } }}));
+    }
+    try testCommands(&store, &manager, @splat(5), &.{.{ .address = finish, .operation = .{ .advance_validation = .{ .action_id = @splat(2), .expected_cursor = "", .expected_rows = 0, .cursor = "", .rows = 0, .complete = true } } }}, true);
+    try testCommands(&store, &manager, @splat(6), &.{.{ .address = finish, .operation = .{ .finish_action = @splat(2) } }}, true);
+    var read = try CurrentView.init(&store);
+    defer read.deinit();
+    try std.testing.expectError(error.ConstraintActivationInProgress, admission.requireReferenceCoverageAcknowledged(&read));
 }

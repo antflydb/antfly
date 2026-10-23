@@ -30,6 +30,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .foreign_key_validation_required, .err = error.ForeignKeyValidationRequired },
     .{ .status = .undefined_column, .err = error.UndefinedColumn },
     .{ .status = .conflicting_data_apply_batch, .err = error.ConflictingDataApplyBatch },
     .{ .status = .invalid_data_apply_batch, .err = error.InvalidDataApplyBatch },

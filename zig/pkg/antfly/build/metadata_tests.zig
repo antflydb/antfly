@@ -49,6 +49,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     presentation_run.addArg("--require-no-skips");
     b.step("antfly-metadata-sql-presentation-test", "Verify bounded body-authorized SQL presentation mutations")
         .dependOn(&presentation_run.step);
+    const historical_fk_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "FK historical reference", "system catalog relation namespace transaction FK source epochs", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const historical_fk_run = addFilteredTestRunArtifact(b, historical_fk_tests);
+    historical_fk_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-fk-historical-reference-test", "Verify explicit historical reference decoder capability and legacy publication admission")
+        .dependOn(&historical_fk_run.step);
     const sequence_counter_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "sequence catalog", "metadata module compiles", "metadata storage module compiles" },

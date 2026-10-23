@@ -173,6 +173,7 @@ pub fn buildWithConstraintNameGuard(server: *server_mod.ApiHttpServer, alloc: st
         parent.transitions = sorted;
     }
     const result: publication.Plan = .{
+        .historical_reference_coverage = true,
         .id = id,
         .child_before = try ownedTableForPlan(alloc, current),
         .child_after = after,

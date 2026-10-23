@@ -7784,7 +7784,7 @@ pub const DB = struct {
             .begin => 1,
             .stage_child_generation => 2,
             .activate_child_generation => 3,
-            .acknowledge_child_generation => 4,
+            .acknowledge_child_generation => if (command.child_reference_coverage_ready) 8 else 4,
             .install_child_schema => 5,
             .cancel => 6,
             .cancel_child_generation_source => 7,
@@ -29059,6 +29059,8 @@ pub const DB = struct {
             ((command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement) != (command.parent_activation != null)) or
             ((command.action == .stage_child_generation or command.action == .activate_child_generation or command.action == .acknowledge_child_generation or
                 (command.action == .cancel and (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual))) != (command.child_generations != null))) return error.InvalidBatchRequest;
+        if ((command.child_generation_reference_coverage_required and command.action != .activate_child_generation) or
+            (command.child_reference_coverage_ready and command.action != .acknowledge_child_generation)) return error.InvalidBatchRequest;
         if (command.child_schema_install != null) return error.InvalidBatchRequest;
         const native_prepared: ?@import("native_topology_receipt.zig").Prepared = if (native_control) |control| blk: {
             if (ordered_receipt != null or native_receipt != null) return error.InvalidControlReceiptPosition;
@@ -29322,6 +29324,8 @@ pub const DB = struct {
                     for (transitions) |transition| try admission.activateTransition(self.alloc, &txn, transition);
                     try @import("relational_integrity_generation_retirement.zig").stageChildGenerationRetirements(self.alloc, &txn, command.fence, transitions);
                     try admission.stageCompletion(&txn, command.fence, transitions, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
+                    if (command.child_generation_reference_coverage_required)
+                        try admission.stageReferenceCoveragePending(&txn, try admission.completionReceipt(command.fence, transitions));
                     // The same fence still protects the old child schema. A
                     // dual-role owner releases it only with the published
                     // schema/catalog install, never at parent activation.
@@ -29337,7 +29341,11 @@ pub const DB = struct {
             },
             .acknowledge_child_generation => {
                 if (command.fence.role != .child_generation_parent and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
-                try @import("relational_integrity_generation_admission.zig").stageAcknowledgement(&txn, command.fence, command.child_generations.?, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
+                const admission = @import("relational_integrity_generation_admission.zig");
+                if (command.child_reference_coverage_ready)
+                    try admission.stageReferenceCoverageAcknowledgement(&txn, command.fence, command.child_generations.?, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0)
+                else
+                    try admission.stageAcknowledgement(&txn, command.fence, command.child_generations.?, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
             },
             .cancel_child_generation_source => {
                 if (command.fence.role != .child_generation_source and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;

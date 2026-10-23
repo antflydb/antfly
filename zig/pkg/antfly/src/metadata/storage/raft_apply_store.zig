@@ -3312,7 +3312,7 @@ test "system catalog relation namespace transaction FK source epochs ignore rece
     projection.phase = .installing_child;
     const retired = try RaftApplyStore.relationFkSourceDigest(projection, 7);
     try std.testing.expect(!std.mem.eql(u8, &expected, &retired));
-    for ([_]fk_generation_publication.Phase{ .published, .canceled }) |phase| {
+    for ([_]fk_generation_publication.Phase{ .acknowledging_reference_coverage, .published, .canceled }) |phase| {
         projection.phase = phase;
         try std.testing.expectEqualSlices(u8, &retired, &try RaftApplyStore.relationFkSourceDigest(projection, 7));
     }
@@ -21191,6 +21191,10 @@ pub const RaftApplyStore = struct {
         defer parsed.deinit();
         const command = parsed.value;
         try command.validateShape();
+        if (command.plan) |plan| {
+            if (plan.historical_reference_coverage) _ = try self.requireTopologyActivationTxn(txn, group_id, topology_protocol.fk_historical_references_version);
+        }
+
         var key_buf: [160]u8 = undefined;
         // Validation below reuses key_buf for range and collision probes.
         // Keep the final publication key stable through the entire Raft txn.
@@ -21577,10 +21581,10 @@ pub const RaftApplyStore = struct {
             publication.phase != switch (request.action) {
                 .stage => fk_generation_publication.Phase.staging_parents,
                 .activate => .activating_parents,
-                .acknowledge => .acknowledging_parents,
+                .acknowledge => @as(fk_generation_publication.Phase, if (publication.phase == .acknowledging_reference_coverage) .acknowledging_reference_coverage else .acknowledging_parents),
                 .cancel => .canceling,
             }) return error.GenerationPublicationChanged;
-        try self.validateFkGenerationCutTxn(&txn, group_id, publication.plan, false);
+        try self.validateFkGenerationCutTxn(&txn, group_id, publication.plan, publication.phase == .acknowledging_reference_coverage);
         const parent = for (publication.plan.parents) |candidate| {
             if (candidate.table.table_id == request.parent_table_id) break candidate;
         } else return error.GenerationPublicationChanged;
@@ -21591,6 +21595,8 @@ pub const RaftApplyStore = struct {
         const incarnation_bytes = txn.get(try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id)) catch return error.InvalidMetadataIncarnation;
         const incarnation = (try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation;
         const decision: fk_generation_publication.Decision = .{
+            .historical_reference_coverage = publication.plan.historical_reference_coverage,
+            .reference_coverage_ready = publication.phase == .acknowledging_reference_coverage,
             .phase = publication.phase,
             .metadata_group_id = group_id,
             .metadata_incarnation = incarnation,
@@ -21631,6 +21637,7 @@ pub const RaftApplyStore = struct {
         const incarnation_bytes = txn.get(try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id)) catch return error.InvalidMetadataIncarnation;
         const incarnation = (try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation;
         const decision: fk_generation_publication.SourceDecision = .{
+            .historical_reference_coverage = publication.plan.historical_reference_coverage,
             .phase = publication.phase,
             .metadata_group_id = group_id,
             .metadata_incarnation = incarnation,
@@ -23437,6 +23444,10 @@ pub const RaftApplyStore = struct {
         defer parsed_command.deinit();
         const command = parsed_command.value;
         try command.validateShape();
+        if (command.plan) |plan| {
+            if (plan.historical_reference_coverage) _ = try self.requireTopologyActivationTxn(txn, group_id, topology_protocol.fk_historical_references_version);
+        }
+
         const table_id = command.child_table_id;
         var key_buf: [160]u8 = undefined;
         const key = try fk_generation_publication.key(&key_buf, group_id, table_id);
@@ -29398,7 +29409,7 @@ pub const RaftApplyStore = struct {
     };
     fn relationFkReserved(phase: fk_generation_publication.Phase) bool {
         return switch (phase) {
-            .installing_child, .published, .canceled => false,
+            .installing_child, .acknowledging_reference_coverage, .published, .canceled => false,
             else => true, // Cancellation retains names until all owners retire.
         };
     }

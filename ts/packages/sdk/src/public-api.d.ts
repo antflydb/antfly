@@ -16751,14 +16751,22 @@ export interface components {
         /**
          * @description Composite foreign key. Child and parent columns correspond by position
          *     and must have the same physical comparison types. The parent columns
-         *     must identify a unique key. Existing-row validation is independent of
-         *     new-write enforcement and is never client-writable.
+         *     must identify a unique key. Existing-row validation is independent of new-write enforcement.
+         *     Clearing NOT VALID requires coordinated historical validation.
          *     Enforcement and referential actions share the bounded distributed
          *     transaction path, including TTL expiry. Partial matching uses ordered
          *     support indexes on the parent; activation waits until these are ready.
          *     SET NULL requires every child column to accept explicit NULL.
          */
         RelationalForeignKeyConstraint: {
+            /**
+             * @description Retain historical references without requiring their parents to exist.
+             *     New writes and parent referential actions remain enforced. Setting
+             *     false on an existing unvalidated declaration requires coordinated
+             *     validation before publication; it cannot certify coverage itself.
+             * @default false
+             */
+            not_valid?: boolean;
             name: string;
             child_columns: string[];
             /**

@@ -2283,6 +2283,11 @@ fn classifyMutationFailure(status: u16, body: []const u8) MutationFailure {
         if (std.mem.eql(u8, code, "transaction_precommit_read_unavailable") and parsed.value.transaction_id == null and parsed.value.status == null)
             return .{ .err = error.SqlStatementReadUnavailable };
         if (std.mem.eql(u8, code, "constraint_activation_pending")) return .{ .err = error.SqlWriteCapacityUnavailable, .transaction_id = id };
+        // This marker is emitted only after a durable coordinator abort. An
+        // accompanying decision/transaction envelope still wins above or fails
+        // closed here; generic 503 bodies never authorize replay.
+        if (std.mem.eql(u8, code, "transaction_precommit_aborted") and parsed.value.transaction_id == null and parsed.value.status == null)
+            return .{ .err = error.SqlWriteCapacityUnavailable };
     };
     return .{ .err = definiteMutationFailure(status, parsed.value.@"error" orelse "") orelse error.SqlMutationOutcomeUnknown, .transaction_id = id };
 }
@@ -3804,6 +3809,14 @@ test "SQL unknown mutation keeps native reconciliation receipt without allocatio
     }) |body| try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, body).err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(500, "{\"code\":\"transaction_precommit_read_unavailable\"}").err);
     try std.testing.expectEqual(error.SqlWriteCapacityUnavailable, classifyMutationFailure(503, "{\"code\":\"constraint_activation_pending\"}").err);
+    try std.testing.expectEqual(error.SqlWriteCapacityUnavailable, classifyMutationFailure(503, "{\"code\":\"transaction_precommit_aborted\"}").err);
+    inline for (.{
+        "{\"code\":\"transaction_precommit_aborted\",\"status\":\"committed_pending\"}",
+        "{\"code\":\"transaction_precommit_aborted\",\"status\":\"unknown\"}",
+        "{\"code\":\"transaction_precommit_aborted\",\"transaction_id\":\"0123456789abcdef0123456789abcdef\"}",
+        "{\"code\":\"transaction_precommit_aborted\",\"transaction_id\":\"invalid\"}",
+    }) |body| try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, body).err);
+    try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(500, "{\"code\":\"transaction_precommit_aborted\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "{\"code\":\"constraint_activation_pending\",\"status\":\"committed_pending\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "write committed locally; standby durability acknowledgment pending").err);
     try std.testing.expectEqual(catalog.MutationOutcome.committed_pending, try committedMutationOutcome("{\"status\":\"committed_pending\"}"));

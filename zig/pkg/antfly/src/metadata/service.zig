@@ -3560,6 +3560,8 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_fk_generation_publication and @import("schema_reader_wire.zig").requiresHistoricalReferences(command.apply_fk_generation_publication)) return metadata_topology_protocol.fk_historical_references_version;
+    if (command == .apply_fk_initial_create and @import("schema_reader_wire.zig").requiresHistoricalReferences(command.apply_fk_initial_create)) return metadata_topology_protocol.fk_historical_references_version;
     if (command == .comment_column) return metadata_topology_protocol.sql_column_comments_version;
     if (command == .apply_sql_sequence_counter) return metadata_topology_protocol.sql_sequence_catalog_version;
     if (command == .apply_sql_settings and @import("schema_reader_wire.zig").requiresRoleDefaults(command.apply_sql_settings)) return metadata_topology_protocol.sql_role_defaults_version;
@@ -23904,4 +23906,10 @@ test "metadata.lake index object table engine requires its own decoder capabilit
     const table: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "objects", .storage = .{ .engine = .object }, .min_ranges = 0, .desired_replica_count = 0 };
     try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
     try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } }));
+}
+
+test "FK historical reference decoder protects new writers without widening legacy publications" {
+    try std.testing.expectEqual(metadata_topology_protocol.fk_generation_column_addition_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_fk_generation_publication = "{\"plan\":{}}" }));
+    try std.testing.expectEqual(metadata_topology_protocol.fk_historical_references_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_fk_generation_publication = "{\"plan\":{\"historical_reference_coverage\":true}}" }));
+    try std.testing.expectEqual(metadata_topology_protocol.fk_historical_references_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_fk_initial_create = "{\"plan\":{\"historical_reference_coverage\":true}}" }));
 }

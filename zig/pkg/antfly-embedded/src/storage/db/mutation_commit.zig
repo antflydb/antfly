@@ -3664,7 +3664,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.startsWith(u8, key, generation_admission.prefix) or
                 std.mem.eql(u8, key, generation_admission.staged_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.activation_receipt_key) or
-                std.mem.eql(u8, key, generation_admission.acknowledged_receipt_key) or
+                std.mem.eql(u8, key, generation_admission.pending_reference_coverage_key) or std.mem.eql(u8, key, generation_admission.acknowledged_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.dual_acknowledged_fence_key) or
                 std.mem.eql(u8, key, generation_admission.dual_canceled_fence_key) or
                 std.mem.eql(u8, key, generation_admission.cancel_receipt_key) or

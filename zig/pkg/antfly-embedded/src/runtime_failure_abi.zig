@@ -853,6 +853,7 @@ pub const Status = enum(u32) {
     native_backup_origin_mismatch = 894,
     sequence_catalog_state_required = 895,
     undefined_column = 896,
+    foreign_key_validation_required = 897,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

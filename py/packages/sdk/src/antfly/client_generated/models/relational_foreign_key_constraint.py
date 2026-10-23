@@ -17,8 +17,8 @@ T = TypeVar("T", bound="RelationalForeignKeyConstraint")
 class RelationalForeignKeyConstraint:
     """Composite foreign key. Child and parent columns correspond by position
     and must have the same physical comparison types. The parent columns
-    must identify a unique key. Existing-row validation is independent of
-    new-write enforcement and is never client-writable.
+    must identify a unique key. Existing-row validation is independent of new-write enforcement.
+    Clearing NOT VALID requires coordinated historical validation.
     Enforcement and referential actions share the bounded distributed
     transaction path, including TTL expiry. Partial matching uses ordered
     support indexes on the parent; activation waits until these are ready.
@@ -31,6 +31,11 @@ class RelationalForeignKeyConstraint:
                 Resolved to an immutable table identity when the constraint is declared;
                 renaming a parent preserves the reference. Public schemas show its current name.
             parent_columns (list[str]):
+            not_valid (bool | Unset): Retain historical references without requiring their parents to exist.
+                New writes and parent referential actions remain enforced. Setting
+                false on an existing unvalidated declaration requires coordinated
+                validation before publication; it cannot certify coverage itself.
+                 Default: False.
             on_delete (ForeignKeyAction | Unset): Action on referencing rows when a referenced row is changed or removed.
             on_update (ForeignKeyAction | Unset): Action on referencing rows when a referenced row is changed or removed.
             timing (ForeignKeyTiming | Unset): Enforcement timing for atomic mutations and transaction sessions. Deferred
@@ -50,6 +55,7 @@ class RelationalForeignKeyConstraint:
     child_columns: list[str]
     parent_table: str
     parent_columns: list[str]
+    not_valid: bool | Unset = False
     on_delete: ForeignKeyAction | Unset = UNSET
     on_update: ForeignKeyAction | Unset = UNSET
     timing: ForeignKeyTiming | Unset = UNSET
@@ -64,6 +70,8 @@ class RelationalForeignKeyConstraint:
         parent_table = self.parent_table
 
         parent_columns = self.parent_columns
+
+        not_valid = self.not_valid
 
         on_delete: str | Unset = UNSET
         if not isinstance(self.on_delete, Unset):
@@ -93,6 +101,8 @@ class RelationalForeignKeyConstraint:
                 "parent_columns": parent_columns,
             }
         )
+        if not_valid is not UNSET:
+            field_dict["not_valid"] = not_valid
         if on_delete is not UNSET:
             field_dict["on_delete"] = on_delete
         if on_update is not UNSET:
@@ -116,6 +126,8 @@ class RelationalForeignKeyConstraint:
         parent_table = d.pop("parent_table")
 
         parent_columns = cast(list[str], d.pop("parent_columns"))
+
+        not_valid = d.pop("not_valid", UNSET)
 
         _on_delete = d.pop("on_delete", UNSET)
         on_delete: ForeignKeyAction | Unset
@@ -152,6 +164,7 @@ class RelationalForeignKeyConstraint:
             child_columns=child_columns,
             parent_table=parent_table,
             parent_columns=parent_columns,
+            not_valid=not_valid,
             on_delete=on_delete,
             on_update=on_update,
             timing=timing,

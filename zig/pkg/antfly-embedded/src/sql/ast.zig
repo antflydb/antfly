@@ -300,6 +300,7 @@ pub const Merge = struct {
 /// an array is never represented as a JSON column or an unknown NULL type.
 pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json, array };
 pub const ForeignKey = struct {
+    not_valid: bool = false,
     name: []const u8,
     name_generated: bool = false,
     columns: []const []const u8,

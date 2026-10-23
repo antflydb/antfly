@@ -12402,6 +12402,8 @@ pub const DataServer = struct {
         // set. Their phase enums differ; each read-index endpoint already
         // authenticates the requested action against its durable phase.
         const ParentDecision = struct {
+            historical_reference_coverage: bool = false,
+            reference_coverage_ready: bool = false,
             plan_digest: publication.Digest,
             fence: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence,
             transitions: []const publication.Transition,
@@ -12432,8 +12434,12 @@ pub const DataServer = struct {
         var identity_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
         defer identity_response.deinit(scratch);
         const owner_identity = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, scratch, identity_response.json, .{ .allocate = .alloc_always });
+        // A dual owner installs the successor child catalog before the final
+        // coverage ACK. Its exact completed fence and admission receipt, checked
+        // atomically by the native ACK, remain the authority across that change.
+        const installed_dual = decision.reference_coverage_ready and decision.fence.role == .child_generation_dual;
         if (!owner_identity.namespace.eql(decision.fence.namespace) or
-            !std.mem.eql(u8, &owner_identity.catalog_digest, &decision.fence.catalog_digest)) return error.IntegrityTopologyChanged;
+            (!installed_dual and !std.mem.eql(u8, &owner_identity.catalog_digest, &decision.fence.catalog_digest))) return error.IntegrityTopologyChanged;
         // Initial MATCH PARTIAL CREATE may publish an owned parent index
         // definition before asynchronous backfill completes. The exact
         // metadata plan derives these names, and the durable owner stage
@@ -12485,7 +12491,13 @@ pub const DataServer = struct {
         // Once the metadata activating decision is observed, client
         // cancellation cannot abort the irreversible parent switch. A lost
         // response is recovered from this replicated owner receipt.
-        if (!already_completed) try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = action, .fence = decision.fence, .child_generations = transitions } }, leader_term);
+        if (!already_completed or decision.reference_coverage_ready) try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{
+            .action = action,
+            .fence = decision.fence,
+            .child_generations = transitions,
+            .child_generation_reference_coverage_required = request.action == .activate and decision.historical_reference_coverage,
+            .child_reference_coverage_ready = decision.reference_coverage_ready,
+        } }, leader_term);
         var status_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"generation_publication\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
         defer status_response.deinit(scratch);
         const status = try std.json.parseFromSliceLeaky(admission.OwnerStatus, scratch, status_response.json, .{ .allocate = .alloc_always });
@@ -12510,6 +12522,7 @@ pub const DataServer = struct {
             .decision_digest = decision.plan_digest,
             .applied_term = applied.term,
             .applied_index = applied.index,
+            .reference_coverage_ready = decision.reference_coverage_ready,
         };
         try receipt.validate(request);
         return receipt;
@@ -12640,6 +12653,27 @@ pub const DataServer = struct {
         if (!std.mem.eql(u8, &applied.digest, &expected) or applied.term == 0 or applied.index == 0 or
             (request.action == .fence and (status.fence == null or !status.fence.?.eql(decision.fence))) or
             (request.action != .fence and (status.completed == null or !status.completed.?.eql(decision.fence)))) return error.GenerationAdmissionChanged;
+        const coverage_ready = request.action == .install and decision.historical_reference_coverage;
+        if (coverage_ready) {
+            const activation = @import("antfly_local_sources").storage_db_relational_integrity_activation_contract;
+            var coverage_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_activation_json = "{\"mode\":\"status\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
+            defer coverage_response.deinit(scratch);
+            const Coverage = struct {
+                schema_version: u32,
+                schema_digest: publication.Digest,
+                generation_set: publication.Digest,
+                range_start: []const u8,
+                range_end: []const u8,
+                state: activation.State,
+            };
+            const coverage = try std.json.parseFromSliceLeaky(Coverage, scratch, coverage_response.json, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+            if (coverage.state != .enforced) return error.GenerationAdmissionPending;
+            if (coverage.schema_version != after_schema.version or
+                !std.mem.eql(u8, &coverage.schema_digest, &next_compiled.catalog.schema_digest) or
+                !std.mem.eql(u8, &coverage.generation_set, &activation.generationSet(next_compiled.catalog)) or
+                !std.mem.eql(u8, coverage.range_start, decision.child_range.start_key) or
+                !std.mem.eql(u8, coverage.range_end, decision.child_range.end_key orelse "")) return error.GenerationAdmissionChanged;
+        }
         const receipt: antfly.public_api.relational_fk_generation_publication.SourceReceipt = .{
             .plan_id = request.plan_id,
             .child_table_id = request.child_table_id,
@@ -12655,6 +12689,7 @@ pub const DataServer = struct {
             .after_catalog_digest = next_digest,
             .applied_term = applied.term,
             .applied_index = applied.index,
+            .reference_coverage_ready = coverage_ready,
         };
         try receipt.validate(request);
         return receipt;

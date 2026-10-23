@@ -358,6 +358,9 @@ pub const ForeignKeyValidationState = enum(u8) {
 };
 
 pub const ForeignKey = struct {
+    /// Historical parent existence is independent of reverse-reference coverage.
+    /// Mutation preparation always requires live parents, regardless of this bit.
+    not_valid: bool = false,
     name: []const u8,
     child_columns: []const []const u8 = &.{},
     child_period: ?[]const u8 = null,

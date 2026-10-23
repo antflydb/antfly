@@ -120,6 +120,7 @@ pub const TableSchema = struct {
         const declarations = self.foreign_keys orelse return &.{};
         const definitions = try alloc.alloc(relational_native.ForeignKey, declarations.value.len);
         for (declarations.value, definitions) |declaration, *definition| definition.* = .{
+            .not_valid = declaration.not_valid orelse false,
             .name = declaration.name,
             .child_columns = declaration.child_columns,
             .parent_table = declaration.parent_table,
@@ -2964,6 +2965,7 @@ fn parseRelationalDeclarations(comptime T: type, alloc: std.mem.Allocator, value
             } else try validateConstraintColumns(columns);
         } else try validateConstraintColumns(columns);
         if (T == relational_wire.RelationalForeignKeyConstraint) {
+            if ((item.not_valid orelse false) and item.match == .partial) return error.InvalidSchemaUpdateRequest;
             if (item.parent_table.len == 0 or !std.unicode.utf8ValidateSlice(item.parent_table) or item.parent_columns.len != columns.len)
                 return error.InvalidSchemaUpdateRequest;
             try validateConstraintColumns(item.parent_columns);

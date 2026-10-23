@@ -243,6 +243,13 @@ pub const Command = struct {
     generation_handoff: ?GenerationHandoffIntent = null,
     generation_handoff_seal: ?GenerationHandoffSeal = null,
     generation_handoff_install: ?GenerationHandoffInstall = null,
+    child_generation_reference_coverage_required: bool = false,
+    child_reference_coverage_ready: bool = false,
+    pub fn nativeJsonSkipField(self: Command, comptime name: []const u8) bool {
+        if (comptime std.mem.eql(u8, name, "child_generation_reference_coverage_required")) return !self.child_generation_reference_coverage_required;
+        if (comptime std.mem.eql(u8, name, "child_reference_coverage_ready")) return !self.child_reference_coverage_ready;
+        return false;
+    }
     pub fn jsonStringify(self: Command, jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("relational_integrity_json.zig").write(self, jw);
     }

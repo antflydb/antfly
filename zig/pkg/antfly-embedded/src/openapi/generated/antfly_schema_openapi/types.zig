@@ -1041,8 +1041,10 @@ pub const RelationalExpressionType = enum {
     }
 };
 
-/// Composite foreign key. Child and parent columns correspond by position and must have the same physical comparison types. The parent columns must identify a unique key. Existing-row validation is independent of new-write enforcement and is never client-writable. Enforcement and referential actions share the bounded distributed transaction path, including TTL expiry. Partial matching uses ordered support indexes on the parent; activation waits until these are ready. SET NULL requires every child column to accept explicit NULL.
+/// Composite foreign key. Child and parent columns correspond by position and must have the same physical comparison types. The parent columns must identify a unique key. Existing-row validation is independent of new-write enforcement. Clearing NOT VALID requires coordinated historical validation. Enforcement and referential actions share the bounded distributed transaction path, including TTL expiry. Partial matching uses ordered support indexes on the parent; activation waits until these are ready. SET NULL requires every child column to accept explicit NULL.
 pub const RelationalForeignKeyConstraint = struct {
+    /// Retain historical references without requiring their parents to exist. New writes and parent referential actions remain enforced. Setting false on an existing unvalidated declaration requires coordinated validation before publication; it cannot certify coverage itself.
+    not_valid: ?bool = null,
     name: []const u8,
     child_columns: []const []const u8,
     /// Literal parent table name in the child table's database and namespace. Resolved to an immutable table identity when the constraint is declared; renaming a parent preserves the reference. Public schemas show its current name.
@@ -1056,6 +1058,7 @@ pub const RelationalForeignKeyConstraint = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "not_valid", "not_valid", true },
         .{ "name", "name", false },
         .{ "child_columns", "child_columns", false },
         .{ "parent_table", "parent_table", false },
@@ -1077,6 +1080,10 @@ pub const RelationalForeignKeyConstraint = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.not_valid) |value| {
+            try jw.objectField("not_valid");
+            try jw.write(value);
+        }
         try jw.objectField("name");
         try jw.write(self.name);
         try jw.objectField("child_columns");

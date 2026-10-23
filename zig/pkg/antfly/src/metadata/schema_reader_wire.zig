@@ -31,6 +31,10 @@ pub fn requiresTextGenerationBinding(bytes: []const u8) bool {
 
 /// One bounded token walk handles both command envelopes and stored records.
 /// Quoted payload strings are never mistaken for authoritative field names.
+pub fn requiresHistoricalReferences(bytes: []const u8) bool {
+    return requiresMarker(bytes, "historical_reference_coverage") or requiresMarker(bytes, "reference_coverage_ready");
+}
+
 pub fn requiresRoleDefaults(bytes: []const u8) bool {
     return requiresMarker(bytes, "@sql-role-defaults");
 }
@@ -202,4 +206,12 @@ test "system catalog schema reader publication validation checks every pair and 
         "{\"schema_reader_requirements\":{\"semantic_version\":30,\"encoding_version\":31,\"future\":true}}",
         "{\"tables\":[{\"schema_reader_requirements\":{\"semantic_version\":30,\"encoding_version\":31}},{\"schema_reader_requirements\":{}}]}",
     }) |invalid| try std.testing.expectError(error.InvalidSchemaReaderRequirements, validatePublication(FixtureRequirements, invalid));
+}
+
+test "FK historical reference decoder marker is explicit escaped and bounded" {
+    try std.testing.expect(!requiresHistoricalReferences("{}"));
+    try std.testing.expect(!requiresHistoricalReferences("{\"schema_json\":\"historical_reference_coverage\"}"));
+    try std.testing.expect(requiresHistoricalReferences("{\"plan\":{\"historical_reference_coverage\":true}}"));
+    try std.testing.expect(requiresHistoricalReferences("{\"plan\":{\"historical_reference_\\u0063overage\":true}}"));
+    try std.testing.expect(requiresHistoricalReferences("{"));
 }

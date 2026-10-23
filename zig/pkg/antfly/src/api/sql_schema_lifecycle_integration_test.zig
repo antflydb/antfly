@@ -401,7 +401,8 @@ test "mounted SQL original tablespace names preserve bound owners deletion guard
         try fixture.runWithState(TablespaceCampaign, .{ .case = case });
     }
 }
-const Probe = struct { statement: []const u8, sqlstate: ?[]const u8, after: Rows, repeat_on_reopen: bool = false, absent_table: ?[]const u8 = null, declared_not_valid: ?bool = null };
+const RelatedImage = struct { statement: []const u8, output: Rows };
+const Probe = struct { related_after: []const RelatedImage = &.{}, statement: []const u8, sqlstate: ?[]const u8, after: Rows, repeat_on_reopen: bool = false, reopen: ?struct { sqlstate: ?[]const u8 = null } = null, absent_table: ?[]const u8 = null, declared_not_valid: ?bool = null };
 const Outcome = struct { command_tag: []const u8, result: Rows };
 
 test "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart" {
@@ -434,6 +435,10 @@ test "mounted SQL original named arbiters distinguish constraints from indexes a
 }
 
 const Case = struct {
+    constraint_collection: []const u8 = "checks",
+    related_after_ddl: []const RelatedImage = &.{},
+    preserve_ddl_primary: bool = false,
+
     id: []const u8,
     table: []const u8,
     setup: []const struct { statement: []const u8, table: ?[]const u8 = null },
@@ -580,7 +585,7 @@ fn schemaFingerprint(ctx: *fixture.Context, table: []const u8) ![32]u8 {
     return result;
 }
 
-fn expectDeclaredValidity(ctx: *fixture.Context, table: []const u8, check_name: []const u8, not_valid: bool) !void {
+fn expectDeclaredValidity(ctx: *fixture.Context, table: []const u8, check_name: []const u8, not_valid: bool, collection: []const u8) !void {
     const domain = local.system_catalog_domain;
     const lookup: domain.ResolveMany = .{ .relations = &.{.{ .name = table }}, .include_query_definitions = true };
     const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
@@ -593,7 +598,7 @@ fn expectDeclaredValidity(ctx: *fixture.Context, table: []const u8, check_name: 
     const definition = relation.table.query_definition orelse return error.MissingSchemaDefinition;
     var schema = try std.json.parseFromSlice(Json, ctx.alloc, definition.schema_json, .{});
     defer schema.deinit();
-    const checks = try fixture.field(schema.value, "checks");
+    const checks = try fixture.field(schema.value, collection);
     for (checks.array.items) |check| {
         const name = try fixture.field(check, "name");
         if (!std.mem.eql(u8, check_name, name.string)) continue;
@@ -635,7 +640,7 @@ fn expectPublicValidationRequiresRewrite(ctx: *fixture.Context, table: []const u
     try std.testing.expectEqual(@as(u16, 409), response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "rewrite=true") != null);
     try std.testing.expectEqualDeep(before, try schemaFingerprint(ctx, table));
-    try expectDeclaredValidity(ctx, table, check_name, true);
+    try expectDeclaredValidity(ctx, table, check_name, true, "checks");
 }
 
 fn command(ctx: *fixture.Context, statement: []const u8, expected_error: ?[]const u8) !void {
@@ -643,6 +648,31 @@ fn command(ctx: *fixture.Context, statement: []const u8, expected_error: ?[]cons
 }
 
 fn awaitConstraintReceipt(ctx: *fixture.Context, receipt: wire.SQLDDLReceipt, version: u32) !void {
+    // FK DDL is explicitly asynchronous. Native child coverage alone does not
+    // attest the final parent coverage ACK: follow the admitted publication ID,
+    // never replay the ALTER or infer readiness from a fixed delay.
+    if (receipt.fk_generation_publication_id) |id| {
+        const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        const table_id = try std.fmt.parseInt(u64, receipt.table_id, 10);
+        const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+        while (true) {
+            if (platform.time.monotonicNs() >= deadline) return error.SchemaLifecyclePublicationTimeout;
+            try ctx.checkDrivers();
+            const context: local.api_operation.RequestContext = .{ .deadline_ns = deadline, .fk_generation_publication_authority = true };
+            const bytes = source.systemCatalog(ctx.alloc, context, .{ .fk_generation_publication_status = table_id }) catch |err| switch (err) {
+                error.GenerationPublicationNotFound, error.CatalogNotFound => try source.systemCatalog(ctx.alloc, context, .{ .fk_initial_create_status = table_id }),
+                else => return err,
+            };
+            defer ctx.alloc.free(bytes);
+            var progress = try std.json.parseFromSlice(struct { phase: []const u8, plan: struct { id: [16]u8 } }, ctx.alloc, bytes, .{ .ignore_unknown_fields = true });
+            defer progress.deinit();
+            const observed_id = std.fmt.bytesToHex(progress.value.plan.id, .lower);
+            if (!std.mem.eql(u8, id, &observed_id)) return error.GenerationPublicationChanged;
+            if (std.mem.eql(u8, progress.value.phase, "published")) break;
+            if (std.mem.eql(u8, progress.value.phase, "canceled")) return error.SchemaLifecyclePublicationFailed;
+            try ctx.io.sleep(.fromMilliseconds(20), .awake);
+        }
+    }
     const suffix = try std.fmt.allocPrint(ctx.alloc, "/db/v1/databases/{s}/namespaces/{s}/tables/{s}/constraints/status", .{ receipt.database, receipt.namespace, receipt.table });
     defer ctx.alloc.free(suffix);
     const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
@@ -794,7 +824,7 @@ const Campaign = struct {
         const parameters = try local.sql_parity_fixtures.Corpus.logicalParameters(parameters_arena.allocator(), original);
         const predecessor: ?fixture.ServingSchema = if (self.case.native_job_error != null or self.case.unchanged_owner) try readyTable(ctx, self.case.table, 0) else null;
         if (predecessor != null) self.failed_predecessor_digest = try schemaFingerprint(ctx, self.case.table);
-        const before_primary = if (self.case.verify_primary_identity and self.case.ddl_sqlstate != null) try primaryFingerprint(ctx, self.case.table) else null;
+        const before_primary = if (self.case.verify_primary_identity and (self.case.ddl_sqlstate != null or self.case.preserve_ddl_primary)) try primaryFingerprint(ctx, self.case.table) else null;
         try commandParameters(ctx, original.sql, if (self.case.native_job_error != null) null else self.case.ddl_sqlstate, parameters, self.case.outcome, self.case.native_job_error);
         if (before_primary) |digest| try std.testing.expectEqual(digest, try primaryFingerprint(ctx, self.case.table));
         if (predecessor) |owner|
@@ -803,18 +833,20 @@ const Campaign = struct {
             try std.testing.expectEqualDeep(digest, try schemaFingerprint(ctx, self.case.table));
         _ = try readyTable(ctx, self.case.table, 0);
         try expectRows(ctx, self.case.read_sql, self.case.after_ddl);
+        for (self.case.related_after_ddl) |related| try expectRows(ctx, related.statement, related.output);
         if (self.case.declared_not_valid) |state|
-            try expectDeclaredValidity(ctx, self.case.table, self.case.check_name.?, state);
-        if (self.case.declared_not_valid orelse false)
+            try expectDeclaredValidity(ctx, self.case.table, self.case.check_name.?, state, self.case.constraint_collection);
+        if ((self.case.declared_not_valid orelse false) and std.mem.eql(u8, self.case.constraint_collection, "checks"))
             try expectPublicValidationRequiresRewrite(ctx, self.case.table, self.case.check_name.?);
         if (self.case.retained_not_valid_check) |name|
-            try expectDeclaredValidity(ctx, self.case.table, name, true);
+            try expectDeclaredValidity(ctx, self.case.table, name, true, self.case.constraint_collection);
         for (self.case.probes) |probe| {
             try command(ctx, probe.statement, probe.sqlstate);
             if (probe.absent_table) |name| try expectAbsent(ctx, name);
             try expectRows(ctx, self.case.read_sql, probe.after);
+            for (probe.related_after) |related| try expectRows(ctx, related.statement, related.output);
             if (probe.declared_not_valid) |state|
-                try expectDeclaredValidity(ctx, self.case.table, self.case.check_name.?, state);
+                try expectDeclaredValidity(ctx, self.case.table, self.case.check_name.?, state, self.case.constraint_collection);
         }
         self.final_owner = try readyTable(ctx, self.case.table, 0);
         try expectCoverConsumer(ctx, self.case);
@@ -826,13 +858,15 @@ const Campaign = struct {
         if (self.primary_digest) |digest| try std.testing.expectEqual(digest, try primaryFingerprint(ctx, self.case.table));
         if (self.failed_predecessor_digest) |digest|
             try std.testing.expectEqualDeep(digest, try schemaFingerprint(ctx, self.case.table));
+        const final_related = self.case.probes[self.case.probes.len - 1].related_after;
+        for (final_related) |related| try expectRows(ctx, related.statement, related.output);
         const final = self.case.probes[self.case.probes.len - 1].after;
         try expectRows(ctx, self.case.read_sql, final);
         try expectCoverConsumer(ctx, self.case);
         if (self.case.retained_not_valid_check) |name|
-            try expectDeclaredValidity(ctx, self.case.table, name, true);
+            try expectDeclaredValidity(ctx, self.case.table, name, true, self.case.constraint_collection);
         if (self.case.probes[self.case.probes.len - 1].declared_not_valid) |state|
-            try expectDeclaredValidity(ctx, self.case.table, self.case.check_name.?, state);
+            try expectDeclaredValidity(ctx, self.case.table, self.case.check_name.?, state, self.case.constraint_collection);
         if (self.case.ddl_sqlstate) |code| if (self.case.native_job_error == null) {
             var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
             defer corpus.deinit();
@@ -841,10 +875,11 @@ const Campaign = struct {
             try command(ctx, original.sql, code);
             try expectRows(ctx, self.case.read_sql, final);
         };
-        for (self.case.probes) |probe| if (probe.sqlstate != null or probe.repeat_on_reopen) {
-            try command(ctx, probe.statement, probe.sqlstate);
+        for (self.case.probes) |probe| if (probe.sqlstate != null or probe.repeat_on_reopen or probe.reopen != null) {
+            try command(ctx, probe.statement, if (probe.reopen) |expected| expected.sqlstate else probe.sqlstate);
             if (probe.absent_table) |name| try expectAbsent(ctx, name);
             try expectRows(ctx, self.case.read_sql, final);
+            for (final_related) |related| try expectRows(ctx, related.statement, related.output);
         };
     }
 };
@@ -1068,4 +1103,24 @@ test "mounted SQL original FK schema lifecycles preserve parent references and c
         completed += 1;
     }
     try std.testing.expectEqual(ids.len, completed);
+}
+
+test "mounted SQL original NOT VALID FK preserves orphan coverage future enforcement and cold owners" {
+    var parsed = try std.json.parseFromSlice(struct { format: u8, reference: []const u8, cases: []const Case }, std.testing.allocator, local.sql_parity_fixtures.fk_not_valid_reference, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.cases.len);
+    try std.testing.expectEqualStrings("sql-0734", parsed.value.cases[0].id);
+    const NativeCampaign = struct {
+        pub const native_sessions = true;
+        pub const native_auth = true;
+        pub const cold_catalog = true;
+        inner: Campaign,
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.inner.beforeRestart(ctx);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.inner.afterRestart(ctx);
+        }
+    };
+    try fixture.runWithState(NativeCampaign, .{ .inner = .{ .case = parsed.value.cases[0] } });
 }

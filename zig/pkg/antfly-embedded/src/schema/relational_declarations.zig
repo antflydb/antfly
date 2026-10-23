@@ -123,7 +123,7 @@ pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSche
                 if (!column.allows_null) return error.InvalidSchemaUpdateRequest;
             }
         }
-        definition.* = try definitionAlloc(alloc, .foreign_key, foreign_key.name, .{
+        definition.* = try foreignDefinitionAlloc(alloc, foreign_key.name, foreign_key.not_valid, .{
             .domain = "antfly foreign key declaration v1",
             .name = foreign_key.name,
             .child_columns = foreign_key.child_columns,
@@ -221,4 +221,18 @@ test "relational declarations own arrays and fingerprint logical identity" {
     const moved = try definitionFingerprints(alloc, parsed, reordered);
     defer freeDefinitions(alloc, moved);
     try std.testing.expectEqualSlices(u8, &deferred[0].fingerprint, &moved[0].fingerprint);
+}
+
+/// Keep existing validated declarations byte-identical. NOT VALID is an
+/// explicit different generation; old ready coverage cannot certify it later.
+fn foreignDefinitionAlloc(alloc: std.mem.Allocator, name: []const u8, not_valid: bool, value: anytype) !catalog.Definition {
+    var definition = try definitionAlloc(alloc, .foreign_key, name, value);
+    errdefer alloc.free(definition.payload);
+    if (not_valid) {
+        const payload = try std.fmt.allocPrint(alloc, "{s},\"not_valid\":true}}", .{definition.payload[0 .. definition.payload.len - 1]});
+        alloc.free(definition.payload);
+        definition.payload = payload;
+        std.crypto.hash.Blake3.hash(payload, &definition.fingerprint, .{});
+    }
+    return definition;
 }
