@@ -28,6 +28,7 @@ export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, stri
 
 export const GENERATOR_PROVIDER_LABELS: Partial<Record<GeneratorProvider, string>> = {
   antfly: "Antfly (Local)",
+  bedrock: "Amazon Bedrock",
   apple: "Apple (On Device)",
   ollama: "Ollama (Local)",
   gemini: "Google AI (Gemini)",
@@ -46,6 +47,7 @@ export const GENERATOR_DEFAULT_CONFIG: GeneratorConfig = {
 
 /** Providers shown in the query-builder generator selectors. */
 export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
+  "bedrock",
   "apple",
   "gemini",
   "vertex",

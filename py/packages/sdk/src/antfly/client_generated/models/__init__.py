@@ -79,6 +79,8 @@ from .batch_response_status import BatchResponseStatus
 from .bedrock_embedder_config import BedrockEmbedderConfig
 from .bedrock_embedder_config_provider import BedrockEmbedderConfigProvider
 from .bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
+from .bedrock_generator_config import BedrockGeneratorConfig
+from .bedrock_generator_config_provider import BedrockGeneratorConfigProvider
 from .bool_field_query import BoolFieldQuery
 from .bool_query import BoolQuery
 from .bool_query_body import BoolQueryBody
@@ -1605,6 +1607,7 @@ from .text_chunk_options import TextChunkOptions
 from .text_content_part import TextContentPart
 from .text_content_part_type import TextContentPartType
 from .tool_call import ToolCall
+from .tool_call_extra_content import ToolCallExtraContent
 from .tool_call_function import ToolCallFunction
 from .tool_call_type import ToolCallType
 from .topology_changed_error import TopologyChangedError
@@ -1780,6 +1783,8 @@ __all__ = (
     "BedrockEmbedderConfig",
     "BedrockEmbedderConfigProvider",
     "BedrockEmbedderConfigRequestFormat",
+    "BedrockGeneratorConfig",
+    "BedrockGeneratorConfigProvider",
     "BooleanQuery",
     "BoolFieldQuery",
     "BoolQuery",
@@ -3290,6 +3295,7 @@ __all__ = (
     "TextContentPart",
     "TextContentPartType",
     "ToolCall",
+    "ToolCallExtraContent",
     "ToolCallFunction",
     "ToolCallType",
     "TopologyChangedError",

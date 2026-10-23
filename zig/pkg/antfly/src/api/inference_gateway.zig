@@ -542,7 +542,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 const native_body = try tasks.chatBody(a, configured, request);
                 return forward(server, ctx, sources.common_config.local_inference_connection_id, "chat/completions", native_body, fallback, observation, execution_options);
             }
-            if (cfg.provider == .openai or cfg.provider == .openrouter or cfg.provider == .ollama or (cfg.provider == .antfly and cfg.url.len != 0)) {
+            if ((cfg.usesChatCompletionsProtocol() and (cfg.provider != .antfly or cfg.url.len != 0)) or (cfg.provider == .bedrock and if (request.object.get("stream")) |v| v.bool else false)) {
                 var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = ctx };
                 const streaming = if (request.object.get("stream")) |v| v.bool else false;
                 const observed = observation.stream(transport.stream());
@@ -882,9 +882,9 @@ fn executeVendorConnection(server: anytype, ctx: *httpx.Context, task: gateway.T
     inline for (.{ "api_key", "project_id", "location", "credentials_path" }) |field| if (@field(cfg, field)) |value| {
         try provider.object.put(a, field, .{ .string = value });
     };
-    if (task == .embed) {
+    if (task == .embed or task == .generate) {
         if (cfg.region) |value| try provider.object.put(a, "region", .{ .string = value });
-        if (request.object.get("dimensions")) |value| try provider.object.put(a, "dimensions", value);
+        if (task == .embed) if (request.object.get("dimensions")) |value| try provider.object.put(a, "dimensions", value);
     }
     if (task == .decide) {
         if (cfg.max_image_input_tokens) |bound| try provider.object.put(a, "max_image_input_tokens", .{ .integer = std.math.cast(i64, bound) orelse return error.InvalidConfig });
@@ -1002,8 +1002,10 @@ fn generationOptions(a: std.mem.Allocator, request: Json) !tasks.GenerationOptio
         .max_tokens = if (request.object.get("max_tokens")) |v| try integer(v) else null,
         .max_completion_tokens = if (request.object.get("max_completion_tokens")) |v| try integer(v) else null,
         .temperature = if (request.object.get("temperature")) |v| @floatCast(try number(v)) else null,
+        .top_p = if (request.object.get("top_p")) |v| @floatCast(try number(v)) else null,
         .tools_json = if (request.object.get("tools")) |v| try std.json.Stringify.valueAlloc(a, v, .{}) else null,
         .tool_choice_json = if (request.object.get("tool_choice")) |v| try std.json.Stringify.valueAlloc(a, v, .{}) else null,
+        .response_format_json = if (request.object.get("response_format")) |v| try std.json.Stringify.valueAlloc(a, v, .{}) else null,
     };
 }
 
@@ -1013,14 +1015,54 @@ fn prepareGeneration(a: std.mem.Allocator, cfg: generating.GeneratorConfig, requ
     } else try only(request, &.{ "model", "messages", "stream", "max_tokens", "max_completion_tokens", "temperature", "tools", "tool_choice", "response_format", "top_p", "frequency_penalty", "presence_penalty", "stream_options", "seed", "stop" });
     var requirements = try tasks.chatRequirements(request);
     if (cfg.tools_json != null) requirements.tools = true;
-    const rich_adapter = cfg.provider == .openai or cfg.provider == .openrouter or cfg.provider == .ollama or cfg.provider == .antfly;
-    if (!rich_adapter) try only(request, &.{ "model", "messages", "stream", "max_tokens", "max_completion_tokens", "temperature", "tools", "tool_choice" });
-    if (!rich_adapter and (requirements.streaming or requirements.structured_output or requirements.images or requirements.audio)) return error.UnsupportedInferenceFeature;
+    const rich_adapter = cfg.usesChatCompletionsProtocol();
+    if (!rich_adapter) try only(request, &.{ "model", "messages", "stream", "max_tokens", "max_completion_tokens", "temperature", "top_p", "tools", "tool_choice", "response_format", "stream_options" });
+    // Media serialization is independent of raw response/stream forwarding.
+    // Image admission remains available on the native Google path when
+    // native-only options select it instead of chat-completions forwarding.
+    if (requirements.images and !generationAdapterSupportsImages(cfg.provider)) return error.UnsupportedInferenceFeature;
+    if (requirements.streaming and !cfg.supportsStreamingChat()) return error.UnsupportedInferenceFeature;
+    if (!rich_adapter and requirements.audio) return error.UnsupportedInferenceFeature;
+    if (!rich_adapter and requirements.structured_output and cfg.provider != .bedrock) return error.UnsupportedInferenceFeature;
     const messages = try tasks.chatMessages(a, request);
     const options = try generationOptions(a, request);
     const configured = try tasks.withGenerationOptions(cfg, options);
     if (rich_adapter) try tasks.validateChatConfig(configured);
     return .{ .config = configured, .requirements = requirements, .messages = messages, .options = options };
+}
+
+fn generationAdapterSupportsImages(provider: generating.Provider) bool {
+    return switch (provider) {
+        .openai, .openrouter, .ollama, .antfly, .gemini, .vertex, .bedrock => true,
+        .apple, .mock, .chatgpt => false,
+    };
+}
+
+test "httpx inference gateway image admission is independent of streaming and model names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"model":"generators/vision","messages":[{"role":"user","content":[{"type":"text","text":"Compare the character sheets"},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,aW1hZ2U="}}]}]}
+    , .{});
+    for ([_]generating.Provider{ .gemini, .vertex, .openai, .openrouter, .ollama, .antfly, .bedrock }) |provider| {
+        const prepared = try prepareGeneration(a, .{ .provider = provider, .model = "new-vision-model", .url = "https://fixture" }, request, "chat/completions");
+        try std.testing.expect(prepared.requirements.images);
+        try std.testing.expectEqualStrings("data:image/jpeg;base64,aW1hZ2U=", prepared.messages[0].content.?.parts[1].image_url.url);
+        try std.testing.expectError(error.UnsupportedInferenceFeature, (gateway.Capabilities{}).require(prepared.requirements));
+        try (gateway.Capabilities{ .images = .supported }).require(prepared.requirements);
+        if (provider == .gemini or provider == .vertex) {
+            var streaming = request;
+            streaming.object = try request.object.clone(a);
+            try streaming.object.put(a, "stream", .{ .bool = true });
+            const stream_plan = try prepareGeneration(a, prepared.config, streaming, "chat/completions");
+            try std.testing.expectError(error.UnsupportedInferenceFeature, (gateway.Capabilities{ .images = .supported }).require(stream_plan.requirements));
+            try (gateway.Capabilities{ .images = .supported, .streaming = .supported }).require(stream_plan.requirements);
+        }
+    }
+    for ([_]generating.Provider{ .apple, .mock }) |provider| {
+        try std.testing.expectError(error.UnsupportedInferenceFeature, prepareGeneration(a, .{ .provider = provider, .model = "text-only", .url = "https://fixture" }, request, "chat/completions"));
+    }
 }
 
 fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, request: Json, named: gateway.View, name: []const u8, options: ExecutionOptions) !httpx.Response {
@@ -1036,7 +1078,7 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
         const prepared = try prepareGeneration(a, link.generator_config orelse try named.providers.getGeneratorConfig(link.generator_name.?), candidate, options.operation orelse "generate");
         cfg.* = prepared.config;
         try named.capabilities(qualified).require(prepared.requirements);
-        if (cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly) return error.UnsupportedInferenceFeature;
+        if (cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly and cfg.provider != .gemini and cfg.provider != .vertex and cfg.provider != .bedrock) return error.UnsupportedInferenceFeature;
     }
     const previous_deadline = ctx.application_deadline_ns;
     const previous_clock = ctx.application_deadline_io;

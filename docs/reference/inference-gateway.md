@@ -71,6 +71,60 @@ a target for tools, streaming, media or structured output. Configured aliases
 stay in discovery when their upstream is offline; availability is a separate
 observation, not evidence of feature support.
 
+## Hosted image inputs and new models
+
+Image input is independent of streaming and structured output. The OpenAI,
+OpenRouter, Ollama, Antfly, Gemini, Vertex, and Bedrock generation adapters can
+preserve image content for a model that supports it. Gemini and Vertex gateway
+chat use Google’s official OpenAI-compatible endpoints, preserving streaming
+chunks and opaque tool metadata such as thought signatures. Bedrock uses
+Converse and incrementally translates ConverseStream events. Declare streaming,
+tools, and structured output separately when the selected model supports them.
+Bedrock structured output accepts `response_format.type: json_schema`. Native
+Google generation options such as `top_k` retain the completed GenerateContent
+path; those configurations cannot stream through Chat Completions.
+
+Declare the selected model's capabilities explicitly. This also enables new
+vision model IDs without waiting for an Antfly release or a model-name allowlist:
+
+```yaml
+generators:
+  character-sheets:
+    provider: vertex
+    model: gemini-4-argon
+    project_id: your-project
+    location: us-central1
+  bedrock-sheets:
+    provider: bedrock
+    model: your-converse-vision-model-id
+    region: us-east-1
+inference_capabilities:
+  generators/character-sheets:
+    images: supported
+  generators/bedrock-sheets:
+    images: supported
+    tools: supported
+```
+
+Bedrock uses the model-independent [Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html),
+including Claude and Nova models with image support. It reuses the service's
+regional AWS credential cache, signed requests, connection pool, cancellation,
+and deadline. The default AWS credential chain supplies credentials; an optional
+`api_key` secret reference selects Bedrock bearer authentication. `url` can
+override the regional runtime endpoint.
+
+Send image data URIs in `image_url` parts, inline base64 `media` parts with their
+actual `mime_type`, or binary attachment references. Bedrock supports PNG, JPEG,
+GIF and WebP bytes through this adapter. It rejects remote image URLs rather
+than fetching them implicitly or omitting their content. Direct requests,
+batches, physical connections and fallback chains retain the same image data.
+
+For a new vendor with an OpenAI-compatible API, use `provider: openai` and its
+`url`, then declare `images: supported` for the target. Capability declarations
+override unknown model facts; they cannot implement a missing wire format or
+make a text-only model accept images. Unknown or unsupported image capabilities
+fail admission before contacting the provider.
+
 ## Public contracts
 
 | Surface | Contract |

@@ -24,6 +24,7 @@ const RequestContext = @import("antfly_inference_execution_context").RequestCont
 const openai_provider = @import("antfly_inference_openai");
 const antfly_provider = @import("antfly_inference_local");
 const vertex_provider = @import("antfly_inference_vertex");
+const bedrock_provider = @import("antfly_inference_bedrock");
 const common_secrets = @import("../common/secrets.zig");
 const execution_context = @import("antfly_inference_execution_context");
 const platform_time = @import("antfly_platform").time;
@@ -207,6 +208,7 @@ pub const BackendFactory = struct {
     request_context: ?RequestContext = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     usage_observer: ?provider_limits.UsageObserver = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -234,6 +236,7 @@ pub const BackendFactory = struct {
         request_context: ?RequestContext = null,
         limits: *provider_limits.Registry = &provider_limits.process_registry,
         usage_observer: ?provider_limits.UsageObserver = null,
+        provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     };
 
     pub fn initWithOptions(
@@ -260,6 +263,7 @@ pub const BackendFactory = struct {
             .request_context = options.request_context,
             .limits = options.limits,
             .usage_observer = options.usage_observer,
+            .provider_runtime = options.provider_runtime,
         };
     }
 
@@ -280,7 +284,7 @@ pub const BackendFactory = struct {
             state.* = .{ .alloc = alloc, .provider = .{ .http = self.http, .failure = self.chatgpt_failure, .pin = self.chatgpt_pin, .registrations = manager, .owner = owner, .connection_id = cfg.connection_id.?, .tools_json = cfg.tools_json, .tool_choice_json = cfg.tool_choice_json, .reasoning_effort = if (cfg.reasoning_effort) |effort| @tagName(effort) else null, .max_response_bytes = self.max_response_bytes orelse 16 * 1024 * 1024 }, .context = self.request_context };
             return .{ .ptr = state, .vtable = &.{ .generate = ChatGPTBackend.generate, .deinit = ChatGPTBackend.deinit } };
         }
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits, self.usage_observer);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits, self.usage_observer, self.provider_runtime);
     }
 };
 
@@ -324,6 +328,7 @@ const BackendState = struct {
         embedded_antfly: managed_embedder.AntflyProvider,
         apple: void,
         vertex: vertex_provider.Provider,
+        bedrock: bedrock_provider.Provider,
         gemini: vertex_provider.GeminiProvider,
     },
 
@@ -339,6 +344,7 @@ const BackendState = struct {
         request_context: ?RequestContext,
         limits: *provider_limits.Registry,
         usage_observer: ?provider_limits.UsageObserver,
+        provider_runtime: ?*managed_embedder.ProviderRuntime,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
@@ -360,6 +366,9 @@ const BackendState = struct {
         else
             null;
         errdefer if (state.owned_base_url) |endpoint| alloc.free(endpoint);
+        if (cfg.provider == .bedrock and cfg.url.len == 0) {
+            state.owned_base_url = try std.fmt.allocPrint(alloc, "https://bedrock-runtime.{s}.amazonaws.com", .{cfg.region orelse @import("antfly_platform").env.getenv("AWS_REGION") orelse @import("antfly_platform").env.getenv("AWS_DEFAULT_REGION") orelse "us-east-1"});
+        }
         state.api_key = switch (cfg.provider) {
             .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key orelse (if (cfg.url.len == 0) inference_api_key else null), "ANTFLY_INFERENCE_API_KEY"),
             .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENAI_API_KEY"),
@@ -390,12 +399,21 @@ const BackendState = struct {
             .vertex => blk: {
                 const bearer_token = if (state.api_key) |*api_key_ref| try api_key_ref.resolveOwned(alloc, secret_store) else null;
                 defer if (bearer_token) |value| alloc.free(value);
+                const auth_control = if (request_context) |context| @import("antfly_google").RequestControl{
+                    .deadline_ns = context.deadline_ns,
+                    .cancellation = if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null,
+                } else @import("antfly_google").RequestControl{};
+                const token_source = if (bearer_token == null and provider_runtime != null)
+                    try provider_runtime.?.google_credentials.tokenSourceWithControl(cfg.credentials_path, vertex_provider.vertex_auth_scope, auth_control)
+                else
+                    null;
                 break :blk .{ .vertex = try vertex_provider.Provider.init(alloc, http, .{
                     .base_url = provider_defaults.normalizedBase(cfg.url, provider_defaults.vertex_v1_base),
                     .project_id = cfg.project_id,
                     .location = cfg.location orelse provider_defaults.default_google_location,
                     .credentials_path = cfg.credentials_path,
                     .bearer_token = bearer_token,
+                    .token_source = token_source,
                     .request_control = if (request_context) |context| .{
                         .deadline_ns = context.deadline_ns,
                         .cancellation = if (context.cancellation) |token|
@@ -404,6 +422,18 @@ const BackendState = struct {
                             null,
                     } else .{},
                 }) };
+            },
+            .bedrock => blk: {
+                const options = bedrock_provider.Options{
+                    .region = cfg.region orelse @import("antfly_platform").env.getenv("AWS_REGION") orelse @import("antfly_platform").env.getenv("AWS_DEFAULT_REGION") orelse "us-east-1",
+                    .endpoint = if (cfg.url.len > 0) cfg.url else state.owned_base_url.?,
+                    .timeout_ms = remote_generate_max_timeout_ms,
+                    .cancellation = execution.cancellation,
+                };
+                if (provider_runtime) |runtime| if (state.api_key == null) {
+                    break :blk .{ .bedrock = bedrock_provider.Provider.initWithCredentialCache(alloc, http, options, try runtime.bedrockCredentialsForRegion(options.region)) };
+                };
+                break :blk .{ .bedrock = bedrock_provider.Provider.init(alloc, http, options) };
             },
             .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
                 .{ .embedded_antfly = embedded_antfly_provider.? }
@@ -420,7 +450,7 @@ const BackendState = struct {
         };
 
         errdefer switch (state.provider) {
-            inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.deinit(),
+            inline .openai, .remote_antfly, .vertex, .gemini, .bedrock => |*provider| provider.deinit(),
             .embedded_antfly, .apple => {},
         };
         if (state.provider == .apple) return .{ .ptr = state, .vtable = &.{ .generate = generate, .deinit = deinit } };
@@ -457,6 +487,7 @@ const BackendState = struct {
             .remote_antfly => |*provider| provider.deinit(),
             .embedded_antfly, .apple => {},
             .vertex => |*provider| provider.deinit(),
+            .bedrock => |*provider| provider.deinit(),
             .gemini => |*provider| provider.deinit(),
         }
         if (self.quota) |*quota| quota.release();
@@ -469,6 +500,8 @@ const BackendState = struct {
     fn quotaIdentity(self: *const BackendState, model: []const u8) provider_limits.QuotaIdentity {
         const source = if (self.cfg.provider == .vertex and self.api_key == null)
             credential_identity.CredentialSourceIdentity.googleAdc(self.cfg.credentials_path)
+        else if (self.cfg.provider == .bedrock and self.api_key == null)
+            credential_identity.CredentialSourceIdentity.awsDefaultChain()
         else
             credential_identity.fromSecretValue(self.api_key);
         const endpoint = switch (self.provider) {
@@ -476,6 +509,7 @@ const BackendState = struct {
             .remote_antfly => |provider| provider.base_url,
             .vertex => |provider| provider.base_url,
             .gemini => |provider| provider.base_url,
+            .bedrock => |provider| provider.options.endpoint,
             .embedded_antfly, .apple => "",
         };
         return .{
@@ -486,7 +520,7 @@ const BackendState = struct {
                 .model = model,
                 .credentials = source,
                 .project = if (self.provider == .vertex) self.provider.vertex.project_id else "",
-                .location = if (self.provider == .vertex) self.provider.vertex.location else "",
+                .location = if (self.provider == .vertex) self.provider.vertex.location else if (self.provider == .bedrock) self.provider.bedrock.options.region else "",
             },
         };
     }
@@ -511,6 +545,7 @@ const BackendState = struct {
                     .cancellation = cancellation,
                 }),
                 .gemini => |*provider| provider.setRequestControl(timeout_ms, cancellation),
+                .bedrock => |*provider| provider.setRequestControl(timeout_ms, context.cancellation),
                 .embedded_antfly, .apple => {},
             }
         }
@@ -534,10 +569,12 @@ const BackendState = struct {
         const observer = if (media.tokens > 0 or self.usage_observer != null) reservation.observer() else quota.limiter().observer(try generationOutputBudget(self.cfg, 1));
         switch (self.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.attempt_observer = observer,
+            .bedrock => |*provider| provider.options.attempt_observer = observer,
             .embedded_antfly, .apple => {},
         }
         defer switch (self.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.attempt_observer = null,
+            .bedrock => |*provider| provider.options.attempt_observer = null,
             .embedded_antfly, .apple => {},
         };
         var result = switch (self.provider) {
@@ -580,6 +617,21 @@ const BackendState = struct {
                     remote_generate_max_timeout_ms,
                 ));
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k, self.cfg.frequency_penalty, self.cfg.presence_penalty);
+                break :blk try provider.generator().generate(alloc, model, messages);
+            },
+            .bedrock => |*provider| blk: {
+                const token = if (self.api_key) |*key| (try key.resolveOwned(alloc, self.secret_store)) orelse return error.MissingGeneratorCredentials else null;
+                defer if (token) |value| alloc.free(value);
+                provider.bearer_token = token;
+                defer provider.bearer_token = null;
+                provider.tools_json = self.cfg.tools_json;
+                provider.tool_choice_json = self.cfg.tool_choice_json;
+                provider.response_format_json = self.cfg.response_format_json;
+                provider.max_tokens = self.cfg.max_tokens;
+                provider.max_response_bytes = self.max_response_bytes;
+                provider.temperature = self.cfg.temperature;
+                provider.top_p = self.cfg.top_p;
+                if (self.request_context == null) provider.setRequestControl(try self.execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_generate_max_timeout_ms), self.execution.cancellation);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .vertex => |*provider| blk: {
@@ -825,6 +877,28 @@ pub fn executeChainWithOptions(
     };
     const control = Control{ .options = effective };
     return try lib.executeChainWithControl(alloc, http.io, chain, factory_impl.factory(), messages, .{ .context = &control, .check_fn = Control.check });
+}
+
+test "generating backend Bedrock borrows service credential caches by region" {
+    const a = std.testing.allocator;
+    var runtime = managed_embedder.ProviderRuntime.init(a, std.testing.io);
+    defer runtime.deinit();
+    var limits = provider_limits.Registry.init(a);
+    defer limits.deinit();
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    var factory = BackendFactory.initWithOptions(a, &client, .{ .provider_runtime = &runtime, .limits = &limits });
+    const cfg = GeneratorConfig{ .provider = .bedrock, .model = "new-vision-model", .url = "https://fixture", .region = "us-east-1" };
+    var first = try factory.factory().create(a, cfg);
+    defer first.deinit();
+    var second = try factory.factory().create(a, cfg);
+    defer second.deinit();
+    const left: *BackendState = @ptrCast(@alignCast(first.ptr));
+    const right: *BackendState = @ptrCast(@alignCast(second.ptr));
+    try std.testing.expect(left.provider.bedrock.credential_cache != null);
+    try std.testing.expect(left.provider.bedrock.credential_cache == right.provider.bedrock.credential_cache);
+    try std.testing.expect(left.provider.bedrock.credential_cache == try runtime.bedrockCredentialsForRegion("us-east-1"));
+    try std.testing.expect(left.provider.bedrock.credential_cache != try runtime.bedrockCredentialsForRegion("eu-west-1"));
 }
 
 test "generating backend enforces shared policies and token budgets before dispatch" {
@@ -1689,6 +1763,8 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
     const http = state.http;
     if (state.request_context) |context| try context.check();
     try validateGenerationMessagesTokenBudget(cfg, request.messages);
+    if (state.provider == .gemini or state.provider == .vertex) return googleChatResponseWithState(alloc, state, request);
+    if (state.provider == .bedrock) return bedrockChatResponseWithState(alloc, state, request);
     const base = switch (state.provider) {
         .openai => |provider| provider.base_url,
         .remote_antfly => |provider| provider.base_url,
@@ -1724,7 +1800,80 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
         .follow_redirects = false,
         .cookies_enabled = false,
     };
-    if (request.stream) |sink| {
+    return sendChatRequest(http, url, request_options, request.stream);
+}
+
+fn bedrockChatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request: lib.ChatRequest) !httpx.Response {
+    const sink = request.stream orelse return error.UnsupportedInferenceFeature;
+    const provider = &state.provider.bedrock;
+    const timeout_ms = if (state.request_context) |context| try context.remainingTimeoutMs() else try state.execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_generate_max_timeout_ms);
+    provider.setRequestControl(timeout_ms, if (state.request_context) |context| context.cancellation else state.execution.cancellation);
+    const token = if (state.api_key) |*key| (try key.resolveOwned(alloc, state.secret_store)) orelse return error.MissingGeneratorCredentials else null;
+    defer if (token) |value| alloc.free(value);
+    provider.bearer_token = token;
+    defer provider.bearer_token = null;
+    provider.tools_json = state.cfg.tools_json;
+    provider.tool_choice_json = state.cfg.tool_choice_json;
+    provider.response_format_json = state.cfg.response_format_json;
+    provider.max_tokens = state.cfg.max_tokens;
+    provider.max_response_bytes = state.max_response_bytes;
+    provider.temperature = state.cfg.temperature;
+    provider.top_p = state.cfg.top_p;
+    const media = try generationMediaReservation(state.cfg, request.messages);
+    var reservation = provider_limits.TokenReservation{ .limiter = state.quota.?.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(state.cfg, 1), .usage_observer = state.usage_observer };
+    provider.options.attempt_observer = if (media.tokens > 0 or state.usage_observer != null) reservation.observer() else state.quota.?.limiter().observer(try generationOutputBudget(state.cfg, 1));
+    defer provider.options.attempt_observer = null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, request.body_json, .{});
+    defer parsed.deinit();
+    const include_usage = if (parsed.value.object.get("stream_options")) |options|
+        if (options == .object) if (options.object.get("include_usage")) |value| value == .bool and value.bool else false else false
+    else
+        false;
+    const response = try provider.chatStream(alloc, state.cfg.model, request.messages, sink, include_usage);
+    if (state.usage_observer) |observer| if (response.body) |body| if (provider_limits.responseUsage(body)) |usage| observer.record(usage.input_tokens, usage.output_tokens);
+    return response;
+}
+
+fn googleChatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request: lib.ChatRequest) !httpx.Response {
+    const timeout_ms = if (state.request_context) |context| try context.remainingTimeoutMs() else try state.execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_generate_max_timeout_ms);
+    const cancellation = if (state.request_context) |context|
+        if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null
+    else
+        httpx.CancellationToken.fromCallback(state.execution.cancellation.ptr, state.execution.cancellation.is_cancelled_fn);
+    var headers: std.ArrayList([2][]const u8) = .empty;
+    defer headers.deinit(alloc);
+    var minted_auth: ?[]u8 = null;
+    defer if (minted_auth) |value| alloc.free(value);
+    const url = switch (state.provider) {
+        .gemini => |provider| blk: {
+            minted_auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{provider.api_key_header[1]});
+            try headers.append(alloc, .{ "Authorization", minted_auth.? });
+            const base = std.mem.trimEnd(u8, provider.base_url, "/");
+            break :blk try std.fmt.allocPrint(alloc, "{s}{s}/chat/completions", .{ base, if (std.mem.endsWith(u8, base, "/openai")) @as([]const u8, "") else "/openai" });
+        },
+        .vertex => |*provider| blk: {
+            const control = @import("antfly_google").RequestControl.fromTimeout(timeout_ms, cancellation);
+            try provider.appendAuthHeaders(alloc, &headers, &minted_auth, control);
+            break :blk try provider.openAiChatUrlAlloc(alloc, state.cfg.model);
+        },
+        else => unreachable,
+    };
+    defer alloc.free(url);
+    return sendChatRequest(state.http, url, .{
+        .json = request.body_json,
+        .headers = headers.items,
+        .timeout_ms = timeout_ms,
+        .cancellation = cancellation,
+        .attempt_observer = state.quota.?.limiter().observer(try generationOutputBudget(state.cfg, 1)),
+        .max_response_size = state.max_response_bytes,
+        .max_retries = 0,
+        .follow_redirects = false,
+        .cookies_enabled = false,
+    }, request.stream);
+}
+
+fn sendChatRequest(http: *httpx.Client, url: []const u8, options: httpx.RequestOptions, stream: ?lib.ChatStream) !httpx.Response {
+    if (stream) |sink| {
         const Writer = struct {
             sink: lib.ChatStream,
             pub fn startResponse(self: *@This(), response: httpx.Response) !void {
@@ -1735,12 +1884,12 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
             }
         };
         var writer = Writer{ .sink = sink };
-        var response = try http.requestToWriter(.POST, url, request_options, &writer, null, null);
+        var response = try http.requestToWriter(.POST, url, options, &writer, null, null);
         errdefer response.deinit();
         try sink.close(sink.context);
         return response;
     }
-    return http.post(url, request_options);
+    return http.post(url, options);
 }
 
 test "generating remote-only default endpoint is shared with named gateway execution" {

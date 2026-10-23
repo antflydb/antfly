@@ -450,6 +450,7 @@ export const indexEmbedderProviders = embedderProviders.filter(
 export type GeneratorProvider = components["schemas"]["GeneratorProvider"];
 export const generatorProviderCapabilities = {
   antfly: {},
+  bedrock: {},
   apple: {},
   gemini: {},
   ollama: {},

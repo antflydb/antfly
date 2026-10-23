@@ -2880,6 +2880,78 @@ pub const BedrockEmbedderConfig = struct {
     }
 };
 
+/// AWS Bedrock Converse generation, including image inputs and tools for models that support them. Uses the AWS default credential chain unless an explicit Bedrock API key is configured. Image capability is declared per target through inference_capabilities; model IDs are not allowlisted.
+pub const BedrockGeneratorConfig = struct {
+    provider: []const u8,
+    /// Optional Bedrock Runtime endpoint override. Defaults to the regional AWS endpoint.
+    url: ?[]const u8 = null,
+    /// Optional Bedrock bearer API key or secret reference. Omit to use signed AWS requests and the default credential chain.
+    api_key: ?[]const u8 = null,
+    /// The Bedrock model ID to use.
+    model: []const u8,
+    /// AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
+    region: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-1.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "url", "url", true },
+        .{ "api_key", "api_key", true },
+        .{ "model", "model", false },
+        .{ "region", "region", true },
+        .{ "temperature", "temperature", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "top_p", "top_p", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const BoolFieldQuery = struct {
     bool: bool,
     field: ?[]const u8 = null,
@@ -18056,6 +18128,8 @@ pub const GeneratorConfig = struct {
     url: ?[]const u8 = null,
     /// Path to service account JSON key file.
     credentials_path: ?[]const u8 = null,
+    /// AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
+    region: ?[]const u8 = null,
     /// HTTP response timeout in seconds for Ollama API calls.
     timeout: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -18084,6 +18158,7 @@ pub const GeneratorConfig = struct {
         .{ "api_key", "api_key", true },
         .{ "url", "url", true },
         .{ "credentials_path", "credentials_path", true },
+        .{ "region", "region", true },
         .{ "timeout", "timeout", true },
         .{ "api_url", "api_url", true },
         .{ "reasoning_effort", "reasoning_effort", true },
@@ -18148,6 +18223,10 @@ pub const GeneratorConfig = struct {
             try jw.objectField("credentials_path");
             try jw.write(value);
         }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
         if (self.timeout) |value| {
             try jw.objectField("timeout");
             try jw.write(value);
@@ -18188,6 +18267,7 @@ pub const GeneratorConfig = struct {
 pub const GeneratorProvider = enum {
     gemini,
     vertex,
+    bedrock,
     ollama,
     openai,
     chatgpt,
@@ -18199,6 +18279,7 @@ pub const GeneratorProvider = enum {
         const s = switch (self) {
             .gemini => "gemini",
             .vertex => "vertex",
+            .bedrock => "bedrock",
             .ollama => "ollama",
             .openai => "openai",
             .chatgpt => "chatgpt",
@@ -18217,6 +18298,7 @@ pub const GeneratorProvider = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "gemini", .gemini },
             .{ "vertex", .vertex },
+            .{ "bedrock", .bedrock },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
             .{ "chatgpt", .chatgpt },
@@ -47409,6 +47491,39 @@ pub const ToolCall = struct {
     id: []const u8,
     type: []const u8,
     function: ToolCallFunction,
+    /// Opaque provider tool metadata, including Google thought signatures. Preserve it unchanged when replaying assistant tool calls.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "type", "type", false },
+        .{ "function", "function", false },
+        .{ "extra_content", "extra_content", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("function");
+        try jw.write(self.function);
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The function called by a model tool call.

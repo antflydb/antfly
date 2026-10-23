@@ -33,6 +33,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
@@ -50,6 +51,7 @@ class Upstream(BaseHTTPRequestHandler):
     session_append_delay: ClassVar[float] = 0
     session_reply_override: ClassVar[bool] = False
     session_reply: ClassVar[object] = None
+    image_stream_release: ClassVar[threading.Event | None] = None
     calls: ClassVar[list[str]] = []
     chat_attempts: ClassVar[list[str]] = []
     requests: ClassVar[list[tuple[str, dict]]] = []
@@ -68,6 +70,249 @@ class Upstream(BaseHTTPRequestHandler):
             self.wfile.write(encoded)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def image_stream(self, packets, content_type):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            for index, packet in enumerate(packets):
+                # Deliberately split native frames and SSE records across writes.
+                for offset in range(0, len(packet), 13):
+                    self.wfile.write(packet[offset : offset + 13])
+                self.wfile.flush()
+                if index == 0 and self.image_stream_release is not None:
+                    assert self.image_stream_release.wait(10), (
+                        "gateway buffered the live upstream stream"
+                    )
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def google_chat(self, request):
+        assert self.headers.get("Authorization") == "Bearer mock-server-key"
+        if "mock-vision-busy" in request["model"]:
+            self.reply({"error": "busy"}, status=503)
+            return
+        self.calls.append(self.path)
+        history = request["messages"]
+        replay = any(message["role"] == "tool" for message in history)
+        if replay:
+            previous = next(
+                message for message in reversed(history) if message.get("tool_calls")
+            )
+            assert (
+                previous["tool_calls"][0]["extra_content"]["google"][
+                    "thought_signature"
+                ]
+                == "opaque-signature"
+            )
+        structured = "response_format" in request
+        tools = bool(request.get("tools")) and not replay
+        tool = {
+            "id": "google-call-1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"id":7}'},
+            "extra_content": {"google": {"thought_signature": "opaque-signature"}},
+        }
+        usage = (
+            None
+            if "mock-unknown" in request["model"]
+            else {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 5}
+        )
+        if not request.get("stream"):
+            self.reply(
+                {
+                    "id": "google-response",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": request["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": None
+                                if tools
+                                else (
+                                    '{"compared":true}'
+                                    if structured
+                                    else "google hello"
+                                ),
+                                **({"tool_calls": [tool]} if tools else {}),
+                            },
+                            "finish_reason": "tool_calls" if tools else "stop",
+                        }
+                    ],
+                    "usage": usage,
+                }
+            )
+            return
+
+        def chunk(delta, reason=None):
+            return (
+                "data: "
+                + json.dumps(
+                    {
+                        "id": "google-response",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": request["model"],
+                        "choices": [
+                            {"index": 0, "delta": delta, "finish_reason": reason}
+                        ],
+                    }
+                )
+                + "\n\n"
+            ).encode()
+
+        packets = [chunk({"role": "assistant"})]
+        if tools:
+            packets += [
+                chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                **tool,
+                                "function": {"name": "lookup", "arguments": ""},
+                            }
+                        ]
+                    }
+                ),
+                chunk(
+                    {"tool_calls": [{"index": 0, "function": {"arguments": '{"id":'}}]}
+                ),
+                chunk({"tool_calls": [{"index": 0, "function": {"arguments": "7}"}}]}),
+            ]
+        else:
+            packets += [chunk({"content": "google "}), chunk({"content": "hello"})]
+        packets += [chunk({}, "tool_calls" if tools else "stop")]
+        if request.get("stream_options", {}).get("include_usage"):
+            packets += [
+                (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "id": "google-response",
+                            "object": "chat.completion.chunk",
+                            "created": 1,
+                            "model": request["model"],
+                            "choices": [],
+                            "usage": usage,
+                        }
+                    )
+                    + "\n\n"
+                ).encode()
+            ]
+        packets += [b"data: [DONE]\n\n"]
+        self.image_stream(packets, "text/event-stream")
+
+    def bedrock_chat(self, request):
+        assert self.headers.get("Authorization") == "Bearer mock-server-key"
+        self.calls.append(self.path)
+        streaming = self.path.endswith("/converse-stream")
+        structured = "outputConfig" in request
+        if structured:
+            fmt = request["outputConfig"]["textFormat"]
+            assert fmt["type"] == "json_schema", fmt
+            assert (
+                json.loads(fmt["structure"]["jsonSchema"]["schema"])["type"] == "object"
+            ), fmt
+        tools = bool(request.get("toolConfig")) and not any(
+            "toolResult" in part
+            for message in request["messages"]
+            for part in message["content"]
+        )
+        if "stream-busy" in self.path:
+            if streaming:
+                self.image_stream(
+                    [
+                        bedrock_frame(
+                            "throttlingException", {"message": "busy"}, "exception"
+                        )
+                    ],
+                    "application/vnd.amazon.eventstream",
+                )
+            else:
+                self.reply({"error": "busy"}, status=429)
+            return
+        usage = {"inputTokens": 2, "outputTokens": 1, "totalTokens": 5}
+        if not streaming:
+            content = (
+                [
+                    {
+                        "toolUse": {
+                            "toolUseId": "bedrock-call-1",
+                            "name": "lookup",
+                            "input": {"id": 7},
+                        }
+                    }
+                ]
+                if tools
+                else [{"text": '{"compared":true}' if structured else "bedrock hello"}]
+            )
+            self.reply(
+                {
+                    "output": {"message": {"role": "assistant", "content": content}},
+                    "usage": usage,
+                }
+            )
+            return
+        packets = [bedrock_frame("messageStart", {"role": "assistant"})]
+        if "midstream" in self.path:
+            packets += [
+                bedrock_frame(
+                    "throttlingException", {"message": "interrupted"}, "exception"
+                )
+            ]
+        else:
+            if tools:
+                packets += [
+                    bedrock_frame(
+                        "contentBlockStart",
+                        {
+                            "contentBlockIndex": 0,
+                            "start": {
+                                "toolUse": {
+                                    "toolUseId": "bedrock-call-1",
+                                    "name": "lookup",
+                                }
+                            },
+                        },
+                    ),
+                    bedrock_frame(
+                        "contentBlockDelta",
+                        {
+                            "contentBlockIndex": 0,
+                            "delta": {"toolUse": {"input": '{"id":'}},
+                        },
+                    ),
+                    bedrock_frame(
+                        "contentBlockDelta",
+                        {"contentBlockIndex": 0, "delta": {"toolUse": {"input": "7}"}}},
+                    ),
+                ]
+            else:
+                packets += [
+                    bedrock_frame(
+                        "contentBlockDelta",
+                        {"contentBlockIndex": 0, "delta": {"text": "bedrock "}},
+                    ),
+                    bedrock_frame(
+                        "contentBlockDelta",
+                        {"contentBlockIndex": 0, "delta": {"text": "hello"}},
+                    ),
+                ]
+            packets += [
+                bedrock_frame("contentBlockStop", {"contentBlockIndex": 0}),
+                bedrock_frame(
+                    "messageStop", {"stopReason": "tool_use" if tools else "end_turn"}
+                ),
+                bedrock_frame("metadata", {"usage": usage}),
+            ]
+        self.image_stream(packets, "application/vnd.amazon.eventstream")
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -361,7 +606,18 @@ class Upstream(BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.requests.append((self.path, request))
         self.authorizations.append(self.headers.get("Authorization"))
+        if self.path.endswith(("/converse", "/converse-stream")):
+            self.bedrock_chat(request)
+            return
+        if self.path.endswith(
+            ("/openai/chat/completions", "/openapi/chat/completions")
+        ):
+            self.google_chat(request)
+            return
         if self.path.endswith(":generateContent"):
+            if "mock-vision-busy" in self.path:
+                self.reply({"error": "busy"}, status=503)
+                return
             assert (
                 self.headers.get("x-goog-api-key") == "mock-server-key"
                 or self.headers.get("Authorization") == "Bearer mock-server-key"
@@ -744,12 +1000,305 @@ def verify_session_transports(base_url: str, session_path: str) -> None:
             connection.close()
 
 
+def bedrock_frame(event, payload, message_type="event"):
+    headers = bytearray()
+    for name, value in (
+        (":message-type", message_type),
+        (":event-type", event),
+        (":content-type", "application/json"),
+    ):
+        key, value = name.encode(), value.encode()
+        headers += (
+            bytes([len(key)]) + key + b"\x07" + struct.pack(">H", len(value)) + value
+        )
+    body = json.dumps(payload).encode()
+    prelude = struct.pack(">II", 16 + len(headers) + len(body), len(headers))
+    frame = prelude + struct.pack(">I", zlib.crc32(prelude)) + headers + body
+    return frame + struct.pack(">I", zlib.crc32(frame))
+
+
+def verify_hosted_image_inputs(base_url):
+    """Model declarations enable new vision models without provider allowlists."""
+    content = [
+        {"type": "text", "text": "Compare the character sheets"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,aW1hZ2U="}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,c2hlZXQ="}},
+    ]
+
+    def invoke(path, body):
+        request = urllib.request.Request(
+            base_url + path,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.load(response)
+
+    def assert_images(path, body):
+        if path.endswith(("/converse", "/converse-stream")):
+            parts = body["messages"][0]["content"]
+            assert parts[0] == {"text": "Compare the character sheets"}, parts
+            images = [part["image"] for part in parts if "image" in part]
+            assert images == [
+                {"format": "jpeg", "source": {"bytes": "aW1hZ2U="}},
+                {"format": "png", "source": {"bytes": "c2hlZXQ="}},
+            ], images
+        elif path.endswith(":generateContent"):
+            parts = body["contents"][0]["parts"]
+            assert parts[0] == {"text": "Compare the character sheets"}, parts
+            assert [part["inlineData"] for part in parts if "inlineData" in part] == [
+                {"mimeType": "image/jpeg", "data": "aW1hZ2U="},
+                {"mimeType": "image/png", "data": "c2hlZXQ="},
+            ], parts
+        else:
+            assert body["messages"][0]["content"] == content, body
+
+    for model in (
+        "generators/google-known",
+        "generators/vertex-known",
+        "generators/bedrock-known",
+        "generators/vision-openai",
+        "connections/bedrock-vision/models/new-vision-model",
+    ):
+        body = {"model": model, "messages": [{"role": "user", "content": content}]}
+        for path in (
+            "/ai/v1/chat/completions",
+            "/ai/v1/generate",
+            "/ai/v1/generate/batch",
+        ):
+            before = len(Upstream.requests)
+            response = invoke(
+                path,
+                {"requests": [{"custom_id": "sheets", "body": body}]}
+                if path.endswith("/batch")
+                else body,
+            )
+            if path.endswith("/batch"):
+                assert response["summary"] == {
+                    "total": 1,
+                    "succeeded": 1,
+                    "failed": 0,
+                }, response
+                response = response["data"][0]["response"]
+            assert response["choices"][0]["message"]["content"], response
+            assert len(Upstream.requests) == before + 1, Upstream.requests[before:]
+            assert_images(*Upstream.requests[-1])
+    before = len(Upstream.requests)
+    response = invoke(
+        "/ai/v1/chat/completions",
+        {
+            "model": "chains/vision-fallback",
+            "messages": [{"role": "user", "content": content}],
+        },
+    )
+    assert response["choices"][0]["message"]["content"] == "bedrock hello", response
+    assert len(Upstream.requests) == before + 2, Upstream.requests[before:]
+    for path, body in Upstream.requests[before:]:
+        assert_images(path, body)
+    for model in (
+        "generators/google-known",
+        "generators/vertex-known",
+        "generators/bedrock-known",
+    ):
+        response = invoke(
+            "/ai/v1/chat/completions",
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": content}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "comparison",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {"compared": {"type": "boolean"}},
+                            "required": ["compared"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+            },
+        )
+        assert json.loads(response["choices"][0]["message"]["content"]) == {
+            "compared": True
+        }, response
+    # No declaration is an admission failure, not permission to silently omit
+    # the images or guess from a model-name prefix. Do not call the provider.
+    before = len(Upstream.requests)
+    try:
+        invoke(
+            "/ai/v1/chat/completions",
+            {
+                "model": "generators/google-unknown",
+                "messages": [{"role": "user", "content": content}],
+            },
+        )
+        raise AssertionError("undeclared image input reached a provider")
+    except urllib.error.HTTPError as error:
+        assert error.code == 400, error.read()
+    assert len(Upstream.requests) == before
+    print(
+        "hosted image inputs preserved across direct, batch, connection and fallback paths",
+        flush=True,
+    )
+
+
+def verify_hosted_image_streams(base_url):
+    content = [
+        {"type": "text", "text": "Compare the character sheets"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,aW1hZ2U="}},
+    ]
+    messages = [{"role": "user", "content": content}]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"id": {"type": "integer"}},
+                    "required": ["id"],
+                },
+            },
+        }
+    ]
+    client = openai.OpenAI(
+        api_key="unused", base_url=base_url + "/ai/v1", max_retries=0, timeout=20
+    )
+    try:
+        for model in (
+            "generators/google-known",
+            "generators/vertex-known",
+            "generators/bedrock-known",
+            "chains/vision-fallback",
+            "chains/bedrock-stream-fallback",
+        ):
+            for with_tools in (False, True):
+                gate = threading.Event()
+                Upstream.image_stream_release = gate
+                try:
+                    stream = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        stream=True,
+                        stream_options={"include_usage": True},
+                        **({"tools": tools} if with_tools else {}),
+                    )
+                    with stream:
+                        first = next(stream)
+                        assert first.choices[0].delta.role == "assistant", first
+                        assert not gate.is_set()
+                        gate.set()
+                        chunks = [first, *stream]
+                    assert chunks[-1].usage.total_tokens == 5, chunks[-1]
+                    reasons = [
+                        choice.finish_reason
+                        for chunk in chunks
+                        for choice in chunk.choices
+                        if choice.finish_reason
+                    ]
+                    assert reasons == ["tool_calls" if with_tools else "stop"], reasons
+                    if with_tools:
+                        deltas = [
+                            call
+                            for chunk in chunks
+                            for choice in chunk.choices
+                            for call in choice.delta.tool_calls or []
+                        ]
+                        assert {call.index for call in deltas} == {0}, deltas
+                        assert json.loads(
+                            "".join(call.function.arguments or "" for call in deltas)
+                        ) == {"id": 7}
+                        if model in (
+                            "generators/google-known",
+                            "generators/vertex-known",
+                            "chains/bedrock-stream-fallback",
+                        ):
+                            assert (
+                                deltas[0].model_extra["extra_content"]["google"][
+                                    "thought_signature"
+                                ]
+                                == "opaque-signature"
+                            ), deltas
+                    else:
+                        text = "".join(
+                            choice.delta.content or ""
+                            for chunk in chunks
+                            for choice in chunk.choices
+                        )
+                        assert text in ("google hello", "bedrock hello"), text
+                finally:
+                    gate.set()
+                    Upstream.image_stream_release = None
+        # Completed tool calls must retain opaque Google data through the
+        # official OpenAI client and the next provider request.
+        for model in (
+            "generators/google-known",
+            "generators/vertex-known",
+            "generators/bedrock-known",
+        ):
+            result = client.chat.completions.create(
+                model=model, messages=messages, tools=tools
+            )
+            reply = result.choices[0].message
+            assert reply.tool_calls, reply
+            history = [
+                *messages,
+                reply.model_dump(exclude_none=True),
+                {
+                    "role": "tool",
+                    "tool_call_id": reply.tool_calls[0].id,
+                    "content": "found",
+                },
+            ]
+            answer = client.chat.completions.create(
+                model=model, messages=history, tools=tools
+            )
+            assert answer.choices[0].message.content in (
+                "google hello",
+                "bedrock hello",
+            ), answer
+        # After the first event is published, an upstream failure cannot replay
+        # the request on a different model or fabricate a successful terminator.
+        before = len(Upstream.requests)
+        request = urllib.request.Request(
+            base_url + "/ai/v1/chat/completions",
+            data=json.dumps(
+                {
+                    "model": "chains/bedrock-midstream",
+                    "messages": messages,
+                    "stream": True,
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            try:
+                body = response.read()
+            except http.client.IncompleteRead as error:
+                body = error.partial
+        assert b"assistant" in body and b"[DONE]" not in body, body
+        assert len(Upstream.requests) == before + 1, Upstream.requests[before:]
+        print(
+            "hosted image streams, tool metadata, early delivery and fallback commit boundaries passed",
+            flush=True,
+        )
+    finally:
+        client.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--antfly",
         type=Path,
         default=Path(__file__).resolve().parents[2] / "zig/zig-out/bin/antfly",
+    )
+    parser.add_argument(
+        "--only-images",
+        action="store_true",
+        help="Run the hosted image contract without the unrelated session/discovery checks",
     )
     args = parser.parse_args()
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
@@ -920,6 +1469,77 @@ def main() -> None:
                 "location": "us-central1",
                 "api_key": "mock-server-key",
             }
+            config["generators"]["bedrock-known"] = {
+                "provider": "bedrock",
+                "model": "us.anthropic.claude-next-v1:0",
+                "url": upstream_url + "/bedrock",
+                "region": "us-east-1",
+                "api_key": "mock-server-key",
+            }
+            config["generators"]["google-vision-busy"] = {
+                **config["generators"]["google-known"],
+                "model": "mock-vision-busy",
+            }
+            config["generators"]["vision-openai"] = {
+                "provider": "openai",
+                "model": "mock-chat",
+                "url": upstream_url + "/ai/v1",
+                "api_key": "mock-server-key",
+            }
+            config["connections"]["bedrock-vision"] = {
+                "kind": "inference",
+                "capabilities": ["models.generate"],
+                "inference": {
+                    "provider": "bedrock",
+                    "url": upstream_url + "/bedrock",
+                    "region": "us-east-1",
+                    "api_key": "mock-server-key",
+                },
+            }
+            config["chains"]["vision-fallback"] = [
+                {"generator": "google-vision-busy", "condition": "on_error"},
+                {"generator": "bedrock-known"},
+            ]
+            for target in (
+                "generators/google-known",
+                "generators/vertex-known",
+                "generators/bedrock-known",
+                "generators/vision-openai",
+                "generators/google-vision-busy",
+                "chains/vision-fallback",
+                "connections/bedrock-vision/models/new-vision-model",
+            ):
+                config["inference_capabilities"][target] = {
+                    "images": "supported",
+                    "structured_output": "supported",
+                    "streaming": "supported",
+                    "tools": "supported",
+                }
+            for name in ("stream-busy", "midstream"):
+                config["generators"][name] = {
+                    **config["generators"]["bedrock-known"],
+                    "model": name,
+                }
+                config["inference_capabilities"]["generators/" + name] = {
+                    "images": "supported",
+                    "structured_output": "supported",
+                    "streaming": "supported",
+                    "tools": "supported",
+                }
+            for name, first in (
+                ("bedrock-stream-fallback", "stream-busy"),
+                ("bedrock-midstream", "midstream"),
+            ):
+                config["chains"][name] = [
+                    {"generator": first, "condition": "on_error"},
+                    {"generator": "google-known"},
+                ]
+                config["inference_capabilities"]["chains/" + name] = {
+                    "images": "supported",
+                    "structured_output": "supported",
+                    "streaming": "supported",
+                    "tools": "supported",
+                }
             config_path = root / "config.json"
             config_path.write_text(json.dumps(config))
             port = free_port()
@@ -966,6 +1586,10 @@ def main() -> None:
                             )
                         time.sleep(0.1)
                     print("remote-only gateway ready", flush=True)
+                    verify_hosted_image_inputs(base_url)
+                    verify_hosted_image_streams(base_url)
+                    if args.only_images:
+                        return
                     Upstream.model_delay_seconds = 0.3
                     started = time.monotonic()
                     try:

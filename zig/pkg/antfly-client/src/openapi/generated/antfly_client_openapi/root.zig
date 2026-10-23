@@ -53,6 +53,7 @@ pub const BatchCommittedFailure = types.BatchCommittedFailure;
 pub const BatchRequest = types.BatchRequest;
 pub const BatchResponse = types.BatchResponse;
 pub const BedrockEmbedderConfig = types.BedrockEmbedderConfig;
+pub const BedrockGeneratorConfig = types.BedrockGeneratorConfig;
 pub const BoolFieldQuery = types.BoolFieldQuery;
 pub const BoolQuery = types.BoolQuery;
 pub const BoolQueryBody = types.BoolQueryBody;

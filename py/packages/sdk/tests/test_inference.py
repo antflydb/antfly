@@ -459,3 +459,15 @@ def test_generated_request_models_preserve_nested_configuration(extraction: bool
         assert isinstance(request, GeneratedDecideRequest)
         result = client.decide(request)
     assert result.model == "registered"
+
+
+def test_tool_call_preserves_provider_metadata_for_replay() -> None:
+    from antfly.client_generated.models import ToolCall
+
+    payload = {
+        "id": "call-google",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": '{"id":7}'},
+        "extra_content": {"google": {"thought_signature": "opaque-signature"}},
+    }
+    assert ToolCall.from_dict(payload).to_dict() == payload

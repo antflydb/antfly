@@ -12,6 +12,7 @@ components:
       enum:
         - gemini
         - vertex
+        - bedrock
         - ollama
         - openai
         - chatgpt
@@ -27,6 +28,7 @@ components:
         - oneOf:
             - $ref: "#/components/schemas/GoogleGeneratorConfig"
             - $ref: "#/components/schemas/VertexGeneratorConfig"
+            - $ref: "#/components/schemas/BedrockGeneratorConfig"
             - $ref: "#/components/schemas/OllamaGeneratorConfig"
             - $ref: "#/components/schemas/AntflyGeneratorConfig"
             - $ref: "#/components/schemas/ChatGPTGeneratorConfig"
@@ -298,6 +300,10 @@ components:
             - function
         function:
           $ref: "#/components/schemas/ToolCallFunction"
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider tool metadata, including Google thought signatures. Preserve it unchanged when replaying assistant tool calls.
 
     ToolCallFunction:
       type: object
@@ -583,15 +589,27 @@ components:
     BedrockGeneratorConfig:
       type: object
       description: |
-        Configuration for the AWS Bedrock generative AI provider.
+        AWS Bedrock Converse generation, including image inputs and tools for
+        models that support them. Uses the AWS default credential chain unless
+        an explicit Bedrock API key is configured. Image capability is declared
+        per target through inference_capabilities; model IDs are not allowlisted.
       properties:
+        provider:
+          type: string
+          enum: [bedrock]
+        url:
+          type: string
+          description: Optional Bedrock Runtime endpoint override. Defaults to the regional AWS endpoint.
+        api_key:
+          type: string
+          description: Optional Bedrock bearer API key or secret reference. Omit to use signed AWS requests and the default credential chain.
         model:
           type: string
           description: "The Bedrock model ID to use."
           example: "anthropic.claude-sonnet-4-5-20250929-v1:0"
         region:
           type: string
-          description: "The AWS region for the Bedrock service."
+          description: AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
         temperature:
           type: number
           format: float
@@ -607,10 +625,8 @@ components:
           description: "Nucleus sampling parameter."
           minimum: 0.0
           maximum: 1.0
-        top_k:
-          type: integer
-          description: "Top-k sampling parameter."
       required:
+        - provider
         - model
 
     AnthropicGeneratorConfig:

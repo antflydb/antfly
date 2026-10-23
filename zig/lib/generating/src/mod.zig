@@ -261,6 +261,7 @@ test "Apple generation cancellation and disabled provider" {
 pub const Provider = enum {
     gemini,
     vertex,
+    bedrock,
     openai,
     chatgpt,
     openrouter,
@@ -272,9 +273,22 @@ pub const Provider = enum {
     /// Adapter capability; the selected model must also support function calling.
     pub fn supportsTools(self: Provider) bool {
         return switch (self) {
-            .antfly, .openai, .chatgpt, .openrouter, .ollama, .gemini, .vertex => true,
+            .antfly, .openai, .chatgpt, .openrouter, .ollama, .gemini, .vertex, .bedrock => true,
             .mock, .apple => false,
         };
+    }
+
+    /// Providers with an official Chat Completions surface. Preserve their
+    /// complete wire responses, including streaming and opaque tool metadata.
+    pub fn usesChatCompletionsProtocol(self: Provider) bool {
+        return switch (self) {
+            .openai, .openrouter, .ollama, .antfly, .gemini, .vertex => true,
+            .bedrock, .chatgpt, .apple, .mock => false,
+        };
+    }
+
+    pub fn supportsStreamingChat(self: Provider) bool {
+        return self.usesChatCompletionsProtocol() or self == .bedrock;
     }
 
     pub fn validate(self: Provider) !void {
@@ -308,7 +322,7 @@ pub fn defaultUrl(provider: Provider) []const u8 {
         .gemini => gemini_default_url,
         .vertex => vertex_default_url,
         // Antfly's empty URL selects embedded inference when available.
-        .antfly, .mock, .apple, .chatgpt => "",
+        .antfly, .mock, .apple, .chatgpt, .bedrock => "",
     };
 }
 
@@ -338,6 +352,7 @@ pub const GeneratorConfig = struct {
     capability_revision: ?[]const u8 = null,
     project_id: ?[]const u8 = null,
     location: ?[]const u8 = null,
+    region: ?[]const u8 = null,
     credentials_path: ?[]const u8 = null,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
@@ -351,6 +366,17 @@ pub const GeneratorConfig = struct {
     top_k: ?i64 = null,
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
+
+    pub fn usesChatCompletionsProtocol(self: GeneratorConfig) bool {
+        // Google's native top-k option has no documented Chat Completions
+        // equivalent. Keep existing completed native configurations intact.
+        return self.provider.usesChatCompletionsProtocol() and
+            !((self.provider == .gemini or self.provider == .vertex) and self.top_k != null);
+    }
+
+    pub fn supportsStreamingChat(self: GeneratorConfig) bool {
+        return self.usesChatCompletionsProtocol() or self.provider == .bedrock;
+    }
 
     pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !GeneratorConfig {
         const value = try std.json.innerParse(std.json.Value, alloc, source, options);
@@ -369,7 +395,7 @@ pub const GeneratorConfig = struct {
         var result = self;
         result.model = "";
         result.url = "";
-        const strings = .{ "connection_id", "api_key", "capability_token", "capability_revision", "project_id", "location", "credentials_path", "tools_json", "tool_choice_json", "response_format_json" };
+        const strings = .{ "connection_id", "api_key", "capability_token", "capability_revision", "project_id", "location", "region", "credentials_path", "tools_json", "tool_choice_json", "response_format_json" };
         inline for (strings) |field| @field(result, field) = null;
         errdefer result.deinit(alloc);
         if (self.model.len > 0) result.model = try alloc.dupe(u8, self.model);
@@ -389,6 +415,7 @@ pub const GeneratorConfig = struct {
         if (self.capability_revision) |revision| alloc.free(@constCast(revision));
         if (self.project_id) |value| alloc.free(value);
         if (self.location) |value| alloc.free(value);
+        if (self.region) |value| alloc.free(value);
         if (self.credentials_path) |value| alloc.free(value);
         if (self.tools_json) |value| alloc.free(value);
         if (self.tool_choice_json) |value| alloc.free(value);
@@ -434,7 +461,12 @@ pub const GeneratorConfig = struct {
                 return error.InvalidGeneratorConfig;
         } else if (self.connection_id != null) return error.InvalidGeneratorConfig;
         if (self.model.len == 0 and self.provider != .mock and self.provider != .apple) return error.InvalidGeneratorConfig;
-        if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .apple and self.provider != .vertex and self.provider != .gemini and self.provider != .chatgpt) return error.InvalidGeneratorConfig;
+        if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .apple and self.provider != .vertex and self.provider != .gemini and self.provider != .chatgpt and self.provider != .bedrock) return error.InvalidGeneratorConfig;
+        if (self.provider == .bedrock) {
+            if (self.top_k != null or self.frequency_penalty != null or self.presence_penalty != null or self.logprobs) return error.UnsupportedBedrockGenerationOptions;
+            if (self.temperature) |value| if (value > 1) return error.InvalidGeneratorConfig;
+            if (self.region) |value| if (value.len == 0) return error.InvalidGeneratorConfig;
+        } else if (self.region != null) return error.InvalidGeneratorConfig;
         if (self.provider == .apple) {
             if (self.model.len > 0 or self.url.len > 0 or self.api_key != null or
                 self.capability_token != null or self.capability_revision != null or self.project_id != null or
@@ -560,6 +592,7 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
         .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
         .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else null,
         .location = if (generated.location) |location| try alloc.dupe(u8, location) else null,
+        .region = if (generated.region) |region| try alloc.dupe(u8, region) else null,
         .credentials_path = if (generated.credentials_path) |credentials_path| try alloc.dupe(u8, credentials_path) else null,
         .max_tokens = generated.max_tokens orelse default_max_tokens,
         .max_completion_tokens = generated.max_completion_tokens,
@@ -581,7 +614,7 @@ pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
         .provider = providerToOpenApi(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .url = switch (cfg.provider) {
-            .openai, .openrouter, .ollama, .gemini, .vertex, .mock => if (cfg.url.len > 0) cfg.url else null,
+            .openai, .openrouter, .ollama, .gemini, .vertex, .bedrock, .mock => if (cfg.url.len > 0) cfg.url else null,
             .antfly, .chatgpt, .apple => null,
         },
         .api_url = switch (cfg.provider) {
@@ -592,6 +625,7 @@ pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
         .api_key = cfg.api_key,
         .project_id = cfg.project_id,
         .location = cfg.location,
+        .region = cfg.region,
         .credentials_path = cfg.credentials_path,
         .max_tokens = if (cfg.provider != .chatgpt and cfg.max_completion_tokens == null) cfg.max_tokens else null,
         .max_completion_tokens = cfg.max_completion_tokens,
@@ -935,6 +969,7 @@ fn providerFromOpenApi(provider: ?[]const u8) !Provider {
     const name = provider orelse return error.InvalidGeneratorConfig;
     if (std.mem.eql(u8, name, "gemini")) return .gemini;
     if (std.mem.eql(u8, name, "vertex")) return .vertex;
+    if (std.mem.eql(u8, name, "bedrock")) return .bedrock;
     if (std.mem.eql(u8, name, "openai")) return .openai;
     if (std.mem.eql(u8, name, "chatgpt")) return .chatgpt;
     if (std.mem.eql(u8, name, "openrouter")) return .openrouter;
@@ -1315,6 +1350,7 @@ test "generator provider URL defaults survive parsing and round trip" {
         .{ .provider = .antfly, .url = "" },
         .{ .provider = .gemini, .url = "https://generativelanguage.googleapis.com/v1beta" },
         .{ .provider = .vertex, .url = "https://aiplatform.googleapis.com/v1" },
+        .{ .provider = .bedrock, .url = "" },
     };
     for (cases) |case| {
         const raw = try std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"model\":\"test-model\"}}", .{@tagName(case.provider)});
@@ -1328,6 +1364,20 @@ test "generator provider URL defaults survive parsing and round trip" {
         defer round_trip.deinit(alloc);
         try std.testing.expectEqualStrings(cfg.url, round_trip.url);
     }
+}
+
+test "Bedrock generator region and endpoint survive cloning and serialization" {
+    const a = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(a, "{\"provider\":\"bedrock\",\"model\":\"new-converse-model\",\"region\":\"eu-west-1\",\"url\":\"https://fixture\"}");
+    defer cfg.deinit(a);
+    var cloned = try cfg.clone(a);
+    defer cloned.deinit(a);
+    const encoded = try stringifyConfigAlloc(a, cloned);
+    defer a.free(encoded);
+    var decoded = try parseConfigFromSlice(a, encoded);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings("eu-west-1", decoded.region.?);
+    try std.testing.expectEqualStrings("https://fixture", decoded.url);
 }
 
 test "generator explicit URL and api_url take precedence over defaults" {

@@ -458,6 +458,10 @@ pub const ProviderRuntime = struct {
         };
     }
 
+    pub fn bedrockCredentialsForRegion(self: *ProviderRuntime, region: []const u8) !*bedrock_provider.CredentialCache {
+        return self.bedrock_credentials.cacheForRegion(region);
+    }
+
     /// Lazily publish one service-scoped transport. Provider request objects
     /// retain per-request URLs, authentication, cancellation, and deadlines;
     /// the client owns only reusable DNS/TLS/connection state.

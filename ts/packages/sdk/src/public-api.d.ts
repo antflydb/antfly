@@ -14575,6 +14575,39 @@ export interface components {
             /** @description Top-k sampling parameter. */
             top_k?: number;
         };
+        /**
+         * @description AWS Bedrock Converse generation, including image inputs and tools for
+         *     models that support them. Uses the AWS default credential chain unless
+         *     an explicit Bedrock API key is configured. Image capability is declared
+         *     per target through inference_capabilities; model IDs are not allowlisted.
+         */
+        BedrockGeneratorConfig: {
+            /** @enum {string} */
+            provider: "bedrock";
+            /** @description Optional Bedrock Runtime endpoint override. Defaults to the regional AWS endpoint. */
+            url?: string;
+            /** @description Optional Bedrock bearer API key or secret reference. Omit to use signed AWS requests and the default credential chain. */
+            api_key?: string;
+            /**
+             * @description The Bedrock model ID to use.
+             * @example anthropic.claude-sonnet-4-5-20250929-v1:0
+             */
+            model: string;
+            /** @description AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1. */
+            region?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-1.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+        };
         /** @description Configuration for the Ollama generative AI provider. */
         OllamaGeneratorConfig: {
             /** @enum {string} */
@@ -14750,7 +14783,7 @@ export interface components {
          * @description Generator providers implemented by Antfly's generation runtime.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
+        GeneratorProvider: "gemini" | "vertex" | "bedrock" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -14760,7 +14793,7 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["GeneratorProvider"];
         };
@@ -19105,6 +19138,10 @@ export interface components {
             /** @enum {string} */
             type: "function";
             function: components["schemas"]["ToolCallFunction"];
+            /** @description Opaque provider tool metadata, including Google thought signatures. Preserve it unchanged when replaying assistant tool calls. */
+            extra_content?: {
+                [key: string]: unknown;
+            };
         };
         /** @description OpenAI-compatible message in a generation/chat conversation. */
         ChatMessage: {
