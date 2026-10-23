@@ -869,6 +869,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .b = b,
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .paths = inference_config.paths,
         .backend = inference_config.backend,
         .graph = inference_graph,
