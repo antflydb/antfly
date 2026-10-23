@@ -7143,7 +7143,7 @@ test "distributed txn table views isolate statement scratch from request ownersh
         );
         defer request.deinit(budget.allocator());
         request.tables[0].batch.writes[0].json_null_fields = try cloneJsonNullFields(budget.allocator(), &.{"nullable"});
-        const owned_bytes = budget.used;
+        const owned_bytes = budget.used.load(.acquire);
         // The SQL executor's conflict lookup receives an arena allocator even
         // though the staged request belongs to the connection budget. Destroy
         // that arena between lookups, then clean up the request via its owner.
@@ -7152,7 +7152,7 @@ test "distributed txn table views isolate statement scratch from request ownersh
             defer scratch.deinit();
             const view = try request.distributedTables(scratch.allocator());
             defer view.deinit();
-            try std.testing.expectEqual(owned_bytes, budget.used);
+            try std.testing.expectEqual(owned_bytes, budget.used.load(.acquire));
             try std.testing.expectEqual(@as(usize, 2), view.tables.len);
             for (request.tables, view.tables) |source, table| {
                 try std.testing.expectEqual(source.batch.writes.len, table.writes.len);
@@ -7171,9 +7171,9 @@ test "distributed txn table views isolate statement scratch from request ownersh
             }
         };
         try std.testing.checkAllAllocationFailures(alloc, Harness.run, .{&request});
-        try std.testing.expectEqual(owned_bytes, budget.used);
+        try std.testing.expectEqual(owned_bytes, budget.used.load(.acquire));
     }
-    try std.testing.expectEqual(@as(usize, 0), budget.used);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.acquire));
     const empty: OwnedTransactionCommitRequest = .{};
     const view = try empty.distributedTables(alloc);
     defer view.deinit();
@@ -7663,8 +7663,9 @@ test "distributed txn sessions retain one original cohort across failed saves re
     defer request.deinit(alloc);
     var sealed = (try writer.cloneCommitRequest(alloc, session.txn_id, &request)).?;
     defer sealed.deinit(alloc);
-    const tables = try sealed.distributedTables(alloc);
-    defer alloc.free(tables);
+    const tables_view = try sealed.distributedTables(alloc);
+    defer tables_view.deinit();
+    const tables = tables_view.tables;
     var logical = (try writer.sealExecutionPlan(alloc, session.txn_id, tables)).?;
     defer logical.deinit();
     const port = writer.participantPlanStore();
