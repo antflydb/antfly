@@ -596,7 +596,9 @@ pub const Adapter = struct {
         var snapshot = (try self.server.source.adminSnapshot()) orelse return error.IntegrityCatalogUnavailable;
         defer self.server.source.freeAdminSnapshot(&snapshot);
         const writes = try @import("antfly_local_sources").sql_mutation_images.writes(db_types.BatchWrite, alloc, mutations);
-        const previous = if (self.staged) |staged| try staged.distributedTables(alloc) else &.{};
+        const previous_view = if (self.staged) |staged| try staged.distributedTables(alloc) else null;
+        defer if (previous_view) |view| view.deinit();
+        const previous = if (previous_view) |view| view.tables else &.{};
         const owners = try integrity.resolveConflictTargetOwnersWithScratch(alloc, scratch_alloc, self.server.table_reads orelse return error.UnsupportedSqlExecution, snapshot.tables, snapshot.ranges, table.physical_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = predicates, .constraint_name = target.constraint_name }, writes, previous, self.context);
         try self.verify(alloc, table);
         const result = try alloc.alloc(catalog.ConflictOwner, owners.len);
