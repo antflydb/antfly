@@ -553,6 +553,43 @@ and whitespace checks pass; required cache collection completed on both hosts.
 These are GB10 runtime results; the seven-target disassembly checks establish
 static specialization/resource parity, not hardware throughput on other GPUs.
 
+## Segmented and grouped Metal SDPA consolidation
+
+Building on `b4b34bd03f1181af4ea9e15a448872a4e8001afd`, the three eight-key
+block SDPA entry points now use one `termite_sdpa_f32_blocks_impl<Grouped, DM>`
+schedule. Compile-time grouping selects KV-head mapping and caller-provided
+score scale; staging stride specializes to 256 or 512. Each entry point retains
+its original static threadgroup arrays. Online-softmax order, simdgroup matrix
+operations, barriers, disjoint/overlapping range union, position/window checks,
+empty-row behavior, ragged loads and 256/512-thread launch choices are preserved.
+The separate sixteen-key schedule remains its own implementation. Host dispatch,
+CPU and CUDA production code are unchanged.
+
+This removes another **155 maintained lines / 13,038 bytes**, including all new
+helpers and wrappers. `metal_kernels.m` falls from 70,545 to 70,390 lines. Combined
+with the preceding GPU-family checkpoint, the reduction is **823 lines / 52,622
+bytes** relative to `f79d38374f`; generated artifacts are excluded.
+
+The retained direct harness in `.benchmark-assets/1166/sdpa-families/` compiles the
+baseline and candidate full shader libraries with production `MTLMathModeSafe`.
+Twenty cases cover every changed entry point, dimensions 256/512, queries
+7/33/129, keys 19/257, one/two/four KV heads, both admitted threadgroup widths,
+custom scales, negative positions, local/unbounded windows, overlapping ranges,
+holes, empty rows and guarded output tails. All outputs are byte-identical to
+baseline and pass an independent F64 reference (maximum error 1.34e-7).
+Static threadgroup storage and maximum supported threads are unchanged.
+
+Fixed-buffer GPU timestamp measurements use 100 warmup dispatches followed by
+eight ABBAABBA arms of 300 dispatches. All twenty cases pass the 5% budget; the
+worst ratio is 1.00241 (+0.24%). These are direct family measurements rather than
+an unrelated model benchmark whose dispatch might bypass these kernels. Full
+source snapshots, exact harness, output/resource/timing receipt and source hashes
+are retained alongside the manifest. Product compilation and generated-source
+freshness (67 files plus Metal/CUDA runtime regions) pass. The existing grouped
+attention, segmented-audio and parallel local-attention reference suite passes
+all four selected tests with no skips, covering admitted fallback, F64 masks and
+scale, short/fused tails and invalid-key semantics.
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;
