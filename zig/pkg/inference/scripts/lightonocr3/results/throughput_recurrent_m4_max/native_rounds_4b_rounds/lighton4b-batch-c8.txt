@@ -1,0 +1,77 @@
+1/118 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...lightonocr3_prefill_core_norm: rows=432 heads=32
+lightonocr3_prefill_attention_mpp: queries=432 keys=432 heads=16 tile=32
+lightonocr3_recurrent_parallel: rows=1 heads=32 threads=512
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=273702912 peak_segments=1
+
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=7343 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=273702912 peak_segments=1
+OCR_REFERENCE {"image_index":0,"text":"Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"}
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=419340288 peak_segments=1
+OCR_REFERENCE {"image_index":1,"text":"# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"}
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=1
+OCR_REFERENCE {"image_index":2,"text":"# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY"}
+OCR_POLICY round=0 name=off
+LIGHTONOCR3 cohort_items=16 decode_steps=242 batched_steps=239 singleton_steps=3 decode_items=1391
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=1
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=26973 pages_per_second=0.5932 p50_ms=10038 p95_ms=24959 native_items=16 parity=true
+OCR_POLICY round=1 name=on
+LIGHTONOCR3 cohort_items=16 decode_steps=239 batched_steps=235 singleton_steps=4 decode_items=1386
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=1
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=27883 pages_per_second=0.5738 p50_ms=10514 p95_ms=25836 native_items=16 parity=true
+OCR_POLICY round=2 name=off
+LIGHTONOCR3 cohort_items=16 decode_steps=241 batched_steps=232 singleton_steps=9 decode_items=1390
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=1
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=28517 pages_per_second=0.5611 p50_ms=11271 p95_ms=26461 native_items=16 parity=true
+OCR_POLICY round=3 name=on
+LIGHTONOCR3 cohort_items=16 decode_steps=244 batched_steps=236 singleton_steps=8 decode_items=1386
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=2
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=30909 pages_per_second=0.5176 p50_ms=11382 p95_ms=28527 native_items=16 parity=true
+OCR_POLICY round=4 name=off
+LIGHTONOCR3 cohort_items=16 decode_steps=246 batched_steps=237 singleton_steps=9 decode_items=1388
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=2
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=36614 pages_per_second=0.4370 p50_ms=12936 p95_ms=33810 native_items=16 parity=true
+OCR_POLICY round=5 name=on
+LIGHTONOCR3 cohort_items=16 decode_steps=248 batched_steps=244 singleton_steps=4 decode_items=1380
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=3
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=37494 pages_per_second=0.4267 p50_ms=13040 p95_ms=34316 native_items=16 parity=true
+OCR_POLICY round=6 name=recurrent
+LIGHTONOCR3 cohort_items=16 decode_steps=254 batched_steps=250 singleton_steps=4 decode_items=1392
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=2
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=36219 pages_per_second=0.4417 p50_ms=14411 p95_ms=33624 native_items=16 parity=true
+OCR_POLICY round=7 name=attention
+LIGHTONOCR3 cohort_items=16 decode_steps=251 batched_steps=249 singleton_steps=2 decode_items=1390
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=3
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=34779 pages_per_second=0.4600 p50_ms=14096 p95_ms=32057 native_items=16 parity=true
+OCR_POLICY round=8 name=norm
+LIGHTONOCR3 cohort_items=16 decode_steps=240 batched_steps=234 singleton_steps=6 decode_items=1388
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=1
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=31248 pages_per_second=0.5120 p50_ms=11980 p95_ms=28855 native_items=16 parity=true
+OCR_POLICY round=9 name=static
+LIGHTONOCR3 cohort_items=16 decode_steps=272 batched_steps=267 singleton_steps=5 decode_items=1420
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=2
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=30388 pages_per_second=0.5265 p50_ms=10967 p95_ms=26814 native_items=16 parity=true
+OCR_POLICY round=10 name=on
+LIGHTONOCR3 cohort_items=16 decode_steps=246 batched_steps=239 singleton_steps=7 decode_items=1388
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=2
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=35150 pages_per_second=0.4552 p50_ms=12753 p95_ms=32008 native_items=16 parity=true
+OCR_POLICY round=11 name=coalesced
+LIGHTONOCR3 cohort_items=16 decode_steps=248 batched_steps=243 singleton_steps=5 decode_items=1391
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=1
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=34662 pages_per_second=0.4616 p50_ms=13187 p95_ms=32529 native_items=16 parity=true
+OCR_POLICY round=12 name=on
+LIGHTONOCR3 cohort_items=16 decode_steps=254 batched_steps=251 singleton_steps=3 decode_items=1398
+LIGHTONOCR3 shared_vision_peak_bytes=575815680 peak_segments=3
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=34174 pages_per_second=0.4682 p50_ms=13891 p95_ms=31871 native_items=16 parity=true
+metal_ocr_weight_residency: sets=31 allocations=0 peak_bytes=9068085248 current_bytes=0 released=1
+OK
+1 selected; 1 passed; 0 skipped.

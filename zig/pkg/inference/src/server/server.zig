@@ -7521,6 +7521,8 @@ pub const Node = struct {
         requests: usize,
         offset: usize,
         stride: usize,
+        next_request: *std.atomic.Value(usize),
+        static_assignment: bool,
         pages_per_request: usize,
         completed: usize = 0,
         native_items: usize = 0,
@@ -7537,8 +7539,8 @@ pub const Node = struct {
         }
         fn runInner(self: *@This()) !void {
             const allocator = std.heap.smp_allocator;
-            var index = self.offset;
-            while (index < self.requests) : (index += self.stride) {
+            var index = if (self.static_assignment) self.offset else self.next_request.fetchAdd(1, .monotonic);
+            while (index < self.requests) : (index = if (self.static_assignment) index + self.stride else self.next_request.fetchAdd(1, .monotonic)) {
                 var images: [8]readers_api.EncodedImage = undefined;
                 for (images[0..self.pages_per_request], 0..) |*image, page| {
                     image.* = .{ .bytes = self.images[(index * self.pages_per_request + page) % self.images.len], .mime_type = "image/png" };
@@ -7559,6 +7561,14 @@ pub const Node = struct {
             }
         }
     };
+
+    fn benchmarkOcrProcessCpuNs() ?u64 {
+        if (comptime @import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return null;
+        const usage = std.posix.getrusage(std.posix.rusage.SELF);
+        const seconds = @as(i128, usage.utime.sec) + usage.stime.sec;
+        const micros = @as(i128, usage.utime.usec) + usage.stime.usec;
+        return std.math.cast(u64, seconds * std.time.ns_per_s + micros * std.time.ns_per_us);
+    }
 
     fn benchmarkConcurrentOcr(node: *Node, model_dir: []const u8, fixture: []const u8, max_tokens: usize) !void {
         const concurrency = platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_CONCURRENCY") orelse return;
@@ -7600,37 +7610,108 @@ pub const Node = struct {
             defer allocator.free(encoded);
             std.debug.print("OCR_REFERENCE {s}\n", .{encoded});
         }
-        const latencies = try allocator.alloc(u64, requests);
-        defer allocator.free(latencies);
-        @memset(latencies, 0);
-        var start = std.atomic.Value(bool).init(false);
-        var tasks: [16]ConcurrentOcrBenchTask = undefined;
-        var threads: [16]std.Thread = undefined;
-        var spawned: usize = 0;
-        var spawn_error: ?anyerror = null;
-        const begin = embedTimingNowNs();
-        for (0..concurrency) |worker| {
-            tasks[worker] = .{ .node = node, .model_dir = model_dir, .images = image_list.items, .references = references, .max_tokens = max_tokens, .requests = requests, .offset = worker, .stride = concurrency, .pages_per_request = pages_per_request, .latencies = latencies, .start = &start };
-            threads[worker] = std.Thread.spawn(.{}, ConcurrentOcrBenchTask.run, .{&tasks[worker]}) catch |err| {
-                spawn_error = err;
-                break;
-            };
-            spawned += 1;
+        // Toggle only after all workers from the previous round have joined.
+        // One resident checkpoint and one serial reference remove model-load
+        // and reference-generation drift from old/new throughput comparisons.
+        const policy_flags = [_][:0]const u8{
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_CORE_NORM",
+            "TERMITE_METAL_DISABLE_LIGHTONOCR3_RECURRENT_PARALLEL",
+            "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP",
+            "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_CORE_NORM",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING",
+            "ANTFLY_TEST_OCR_STATIC_WORK_ASSIGNMENT",
+            "ANTFLY_LIGHTONOCR3_STATIC_PAGE_ASSIGNMENT",
+            "ANTFLY_LIGHTONOCR3_VISION_BATCH",
+            "ANTFLY_LIGHTONOCR3_PREFILL_BATCH",
+            "ANTFLY_LIGHTONOCR3_VISION_WAIT_US",
+            "ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US",
+            "ANTFLY_LIGHTONOCR3_BATCH_WINDOW",
+            "ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US",
+        };
+        const Env = struct {
+            extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+            extern "c" fn unsetenv([*:0]const u8) c_int;
+        };
+        var old_flags: [policy_flags.len]?[:0]u8 = @splat(null);
+        var saved_flags: usize = 0;
+        defer for (policy_flags[0..saved_flags], old_flags[0..saved_flags]) |flag, old| {
+            if (old) |value| {
+                _ = Env.setenv(flag, value, 1);
+                allocator.free(value);
+            } else _ = Env.unsetenv(flag);
+        };
+        for (policy_flags, 0..) |flag, i| {
+            if (platform.env.getenv(flag)) |value| old_flags[i] = try allocator.dupeSentinel(u8, value, 0);
+            saved_flags += 1;
         }
-        start.store(true, .release);
-        for (threads[0..spawned]) |thread| thread.join();
-        if (spawn_error) |err| return err;
-        const elapsed = embedTimingNowNs() - begin;
-        var completed: usize = 0;
-        var native_items: usize = 0;
-        for (tasks[0..spawned]) |task| {
-            if (task.failure) |err| return err;
-            completed += task.completed;
-            native_items += task.native_items;
+        var parsed_rounds: ?std.json.Parsed([]const []const u8) = null;
+        defer if (parsed_rounds) |*value| value.deinit();
+        if (platform.env.getenv("ANTFLY_TEST_OCR_POLICY_ROUNDS")) |raw| {
+            parsed_rounds = try std.json.parseFromSlice([]const []const u8, allocator, raw, .{});
         }
-        if (completed != requests * pages_per_request) return error.IncompleteBenchmark;
-        std.mem.sort(u64, latencies, {}, std.sort.asc(u64));
-        std.debug.print("OCR_CONCURRENCY concurrency={d} requests={d} pages_per_request={d} completed={d} elapsed_ms={d} pages_per_second={d:.4} p50_ms={d} p95_ms={d} native_items={d} parity=true\n", .{ concurrency, requests, pages_per_request, completed, elapsed / std.time.ns_per_ms, @as(f64, @floatFromInt(completed)) * 1e9 / @as(f64, @floatFromInt(elapsed)), latencies[requests / 2] / std.time.ns_per_ms, latencies[@min(requests - 1, requests * 95 / 100)] / std.time.ns_per_ms, native_items });
+        const policy_names: []const []const u8 = if (parsed_rounds) |value| value.value else &.{"current"};
+        if (policy_names.len == 0 or policy_names.len > 16) return error.InvalidBenchmarkPolicy;
+        for (policy_names, 0..) |policy, round| {
+            for (policy_flags, old_flags) |flag, old| {
+                const rc = if (old) |value| Env.setenv(flag, value, 1) else Env.unsetenv(flag);
+                if (rc != 0) return error.EnvironmentMutationFailed;
+            }
+            if (!std.mem.eql(u8, policy, "current")) {
+                const all = std.mem.eql(u8, policy, "on") or std.mem.eql(u8, policy, "coalesced") or std.mem.eql(u8, policy, "static") or std.mem.eql(u8, policy, "batched") or std.mem.eql(u8, policy, "window8") or std.mem.eql(u8, policy, "spin");
+                const recurrent = all or std.mem.eql(u8, policy, "recurrent");
+                const attention = all or std.mem.eql(u8, policy, "attention");
+                const norm = all or std.mem.eql(u8, policy, "norm");
+                if (!all and !recurrent and !attention and !norm and !std.mem.eql(u8, policy, "off")) return error.InvalidBenchmarkPolicy;
+                const enabled = [_]bool{ recurrent, attention, norm, !recurrent, !attention, !norm, std.mem.eql(u8, policy, "coalesced"), std.mem.eql(u8, policy, "static"), std.mem.eql(u8, policy, "static") };
+                for (policy_flags[0..9], enabled) |flag, value| {
+                    if (Env.setenv(flag, if (value) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+                }
+                if (std.mem.eql(u8, policy, "batched")) {
+                    if (Env.setenv(policy_flags[9], "1", 1) != 0 or Env.setenv(policy_flags[10], "1", 1) != 0 or
+                        Env.setenv(policy_flags[11], "20000", 1) != 0 or Env.setenv(policy_flags[12], "20000", 1) != 0) return error.EnvironmentMutationFailed;
+                }
+                if (std.mem.eql(u8, policy, "window8") and Env.setenv(policy_flags[13], "8", 1) != 0) return error.EnvironmentMutationFailed;
+                if (std.mem.eql(u8, policy, "spin") and Env.setenv(policy_flags[14], "0", 1) != 0) return error.EnvironmentMutationFailed;
+            }
+            std.debug.print("OCR_POLICY round={d} name={s}\n", .{ round, policy });
+            const latencies = try allocator.alloc(u64, requests);
+            defer allocator.free(latencies);
+            @memset(latencies, 0);
+            var start = std.atomic.Value(bool).init(false);
+            var next_request = std.atomic.Value(usize).init(0);
+            var tasks: [16]ConcurrentOcrBenchTask = undefined;
+            var threads: [16]std.Thread = undefined;
+            var spawned: usize = 0;
+            var spawn_error: ?anyerror = null;
+            const cpu_begin = benchmarkOcrProcessCpuNs();
+            const begin = embedTimingNowNs();
+            for (0..concurrency) |worker| {
+                tasks[worker] = .{ .node = node, .model_dir = model_dir, .images = image_list.items, .references = references, .max_tokens = max_tokens, .requests = requests, .offset = worker, .stride = concurrency, .next_request = &next_request, .static_assignment = platform.env.getenvBool("ANTFLY_TEST_OCR_STATIC_WORK_ASSIGNMENT"), .pages_per_request = pages_per_request, .latencies = latencies, .start = &start };
+                threads[worker] = std.Thread.spawn(.{}, ConcurrentOcrBenchTask.run, .{&tasks[worker]}) catch |err| {
+                    spawn_error = err;
+                    break;
+                };
+                spawned += 1;
+            }
+            start.store(true, .release);
+            for (threads[0..spawned]) |thread| thread.join();
+            if (spawn_error) |err| return err;
+            const elapsed = embedTimingNowNs() - begin;
+            const cpu_elapsed: ?u64 = if (cpu_begin) |before| if (benchmarkOcrProcessCpuNs()) |after| after -| before else null else null;
+            var completed: usize = 0;
+            var native_items: usize = 0;
+            for (tasks[0..spawned]) |task| {
+                if (task.failure) |err| return err;
+                completed += task.completed;
+                native_items += task.native_items;
+            }
+            if (completed != requests * pages_per_request) return error.IncompleteBenchmark;
+            if (cpu_elapsed) |value| std.debug.print("OCR_CPU round={d} process_cpu_ms={d}\n", .{ round, value / std.time.ns_per_ms });
+            std.mem.sort(u64, latencies, {}, std.sort.asc(u64));
+            std.debug.print("OCR_CONCURRENCY concurrency={d} requests={d} pages_per_request={d} completed={d} elapsed_ms={d} pages_per_second={d:.4} p50_ms={d} p95_ms={d} native_items={d} parity=true\n", .{ concurrency, requests, pages_per_request, completed, elapsed / std.time.ns_per_ms, @as(f64, @floatFromInt(completed)) * 1e9 / @as(f64, @floatFromInt(elapsed)), latencies[requests / 2] / std.time.ns_per_ms, latencies[@min(requests - 1, requests * 95 / 100)] / std.time.ns_per_ms, native_items });
+        }
     }
 
     // A pinned loaded generation is part of the grouping identity. Payloads
@@ -7644,13 +7725,14 @@ pub const Node = struct {
         control: InferenceExecutionControl,
     };
 
-    fn lightOnOcrPolicy(self: *const Node) runtime.scheduler.native_generate.Policy {
+    fn lightOnOcrPolicy(self: *const Node, physical_rows_limit: usize) runtime.scheduler.native_generate.Policy {
         var policy = self.config.generation_batching.schedulerPolicy();
-        policy.max_step_items = effectiveLightOnReadRows();
+        policy.max_step_items = @min(effectiveLightOnReadRows(), physical_rows_limit);
         policy.max_active_requests_for_batching = effectiveLightOnReadWindow();
         policy.allow_mixed_sequence_lengths = true;
         policy.max_decode_wait_us = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_DECODE_WAIT_US") orelse self.config.generation_batching.max_decode_wait_us, 10000));
         policy.decode_coalesce_rows = policy.max_step_items;
+        policy.contention_wait_us = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US") orelse 100, 1000));
         return policy;
     }
 
@@ -7671,6 +7753,8 @@ pub const Node = struct {
         kv_mutex: std.atomic.Mutex = .unlocked,
         controls_mutex: std.atomic.Mutex = .unlocked,
         controls: [16]?InferenceExecutionControl = @splat(null),
+        registered_pages: usize = 0,
+        registered_window_peak: usize = 0,
         execution_id: u64,
         completed: usize = 0,
         vision_broker: executor_microbatch.Broker,
@@ -7682,6 +7766,7 @@ pub const Node = struct {
             model: *model_manager_mod.LoadedModel,
             cfg: gpt_model_mod.Config,
             limits: runtime.tier.memory.Limits,
+            physical_rows_limit: usize,
             control: InferenceExecutionControl,
         };
         fn create(raw: *anyopaque) !*anyopaque {
@@ -7693,7 +7778,7 @@ pub const Node = struct {
             const a = std.heap.smp_allocator;
             const ctx = try a.create(LightOnStreamContext);
             ctx.* = .{ .allocator = a, .model = factory.model, .cfg = factory.cfg, .budget = runtime.tier.memory.RunBudget.init(factory.limits), .lane = lane, .coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a), .manager = runtime.kv.manager.KvManager.init(a), .vision_broker = executor_microbatch.Broker.init(a), .prefill_broker = executor_microbatch.Broker.init(a), .execution_id = lighton_stream_execution_id.fetchAdd(1, .monotonic) };
-            ctx.coordinator.setPolicy(factory.node.lightOnOcrPolicy());
+            ctx.coordinator.setPolicy(factory.node.lightOnOcrPolicy(factory.physical_rows_limit));
             // New prefill must progress, while already decoding pages retain
             // a bounded streak instead of losing every turn to new arrivals.
             ctx.coordinator.max_decode_streak_before_prefill = 4;
@@ -7701,8 +7786,10 @@ pub const Node = struct {
         }
         fn destroy(raw: *anyopaque) void {
             const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw));
+            std.debug.assert(ctx.registered_pages == 0);
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
                 const s = ctx.coordinator.stats;
+                std.debug.print("LIGHTONOCR3 registered_window_peak={d} physical_rows_limit={d}\n", .{ ctx.registered_window_peak, ctx.coordinator.policy.max_step_items });
                 std.debug.print("LIGHTONOCR3 cohort_items={d} decode_steps={d} batched_steps={d} singleton_steps={d} decode_items={d}\n", .{ ctx.completed, s.step_batches_total, s.step_batch_size_2_total + s.step_batch_size_3_4_total + s.step_batch_size_5_8_total, s.step_singleton_batches_total, s.step_decode_items_total });
             }
             ctx.vision_broker.deinit();
@@ -7733,6 +7820,8 @@ pub const Node = struct {
             defer ctx.controls_mutex.unlock();
             for (&ctx.controls, 0..) |*slot, index| if (slot.* == null) {
                 slot.* = control;
+                ctx.registered_pages += 1;
+                ctx.registered_window_peak = @max(ctx.registered_window_peak, ctx.registered_pages);
                 return index;
             };
             unreachable; // The pool admits at most sixteen live page leases.
@@ -7740,7 +7829,9 @@ pub const Node = struct {
         fn unregister(ctx: *LightOnStreamContext, index: usize) void {
             platform.sync.lockYielding(&ctx.controls_mutex);
             defer ctx.controls_mutex.unlock();
+            std.debug.assert(ctx.controls[index] != null and ctx.registered_pages > 0);
             ctx.controls[index] = null;
+            ctx.registered_pages -= 1;
         }
         fn check(raw: ?*anyopaque) !void {
             const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw.?));
@@ -8008,10 +8099,13 @@ pub const Node = struct {
         if (image.len > @min(readInlineSourceByteCap(self), contract.batch.max_encoded_media_bytes) or
             (try measureExecutorDecodedImages(&model.manifest, &.{image})) > (contract.batch.max_decoded_pixels orelse std.math.maxInt(u64)))
             return error.MicrobatchResourceLimitExceeded;
-        var factory = LightOnStreamContext.Factory{ .node = self, .model = model, .cfg = cfg, .limits = limits, .control = control };
+        var factory = LightOnStreamContext.Factory{ .node = self, .model = model, .cfg = cfg, .limits = limits, .physical_rows_limit = contract.batch.max_items, .control = control };
         // Queue before admission and GPU allocation. Only active slots reserve
         // live resources; independently completed pages immediately free slots.
-        var pool_lease = try model.native_reader_stream.join(control, @min(effectiveLightOnReadWindow(), contract.batch.max_items), &factory, LightOnStreamContext.create, LightOnStreamContext.destroy);
+        // Logical occupancy can exceed the physical per-step contract. Every
+        // page still acquires its own admission lease; the coordinator caps
+        // each GPU forward at the contract's physical row limit.
+        var pool_lease = try model.native_reader_stream.join(control, effectiveLightOnReadWindow(), &factory, LightOnStreamContext.create, LightOnStreamContext.destroy);
         var pool_owned = true;
         defer if (pool_owned) pool_lease.release();
         const ctx: *LightOnStreamContext = @ptrCast(@alignCast(pool_lease.context));
@@ -8147,9 +8241,13 @@ pub const Node = struct {
             failures: []?anyerror,
             offset: usize,
             stride: usize,
+            next_image: *std.atomic.Value(usize),
+            static_assignment: bool,
             fn run(task: *@This()) void {
-                var i = task.offset;
-                while (i < task.images.len) : (i += task.stride) {
+                // Short pages immediately claim the next pending page. Results
+                // retain their original indices regardless of completion order.
+                var i = if (task.static_assignment) task.offset else task.next_image.fetchAdd(1, .monotonic);
+                while (i < task.images.len) : (i = if (task.static_assignment) i + task.stride else task.next_image.fetchAdd(1, .monotonic)) {
                     task.values[i] = task.node.readLightOnContinuousPage(task.model, task.model_path, task.images[i], task.prompt, task.max_tokens, task.control) catch |err| {
                         task.failures[i] = err;
                         continue;
@@ -8157,13 +8255,14 @@ pub const Node = struct {
                 }
             }
         };
+        var next_image = std.atomic.Value(usize).init(0);
         var tasks: [16]Task = undefined;
         var threads: [16]std.Thread = undefined;
         var spawned: usize = 0;
         const count = @min(images.len, effectiveLightOnReadWindow());
         defer for (threads[0..spawned]) |thread| thread.join();
         for (0..count) |i| {
-            tasks[i] = .{ .node = self, .model = model, .model_path = model_path, .images = images, .prompt = prompt, .max_tokens = max_tokens, .control = control, .values = values, .failures = failures, .offset = i, .stride = count };
+            tasks[i] = .{ .node = self, .model = model, .model_path = model_path, .images = images, .prompt = prompt, .max_tokens = max_tokens, .control = control, .values = values, .failures = failures, .offset = i, .stride = count, .next_image = &next_image, .static_assignment = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_STATIC_PAGE_ASSIGNMENT") };
             if (count == 1) {
                 tasks[i].run();
             } else {
@@ -8414,7 +8513,7 @@ pub const Node = struct {
         var memory = LightOnCohortMemory{};
         var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(allocator);
         defer coordinator.deinit();
-        coordinator.setPolicy(self.lightOnOcrPolicy());
+        coordinator.setPolicy(self.lightOnOcrPolicy(items.len));
         coordinator.max_decode_streak_before_prefill = 0;
         const tasks = try allocator.alloc(LightOnReadTask, items.len);
         defer allocator.free(tasks);
@@ -39163,10 +39262,44 @@ test "embeddinggemma2 linked reduced dimensions match HTTP and preserve ownershi
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "LightOnOCR3 active windows preserve the physical reader contract" {
+    const a = std.testing.allocator;
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const flags = [_][:0]const u8{ "ANTFLY_LIGHTONOCR3_BATCH_ROWS", "ANTFLY_LIGHTONOCR3_BATCH_WINDOW" };
+    var old: [2]?[:0]u8 = @splat(null);
+    var saved: usize = 0;
+    defer for (flags[0..saved], old[0..saved]) |flag, value| {
+        if (value) |v| {
+            _ = Env.setenv(flag, v, 1);
+            a.free(v);
+        } else _ = Env.unsetenv(flag);
+    };
+    for (flags, 0..) |flag, i| {
+        if (platform.env.getenv(flag)) |value| old[i] = try a.dupeSentinel(u8, value, 0);
+        saved += 1;
+    }
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(flags[0], "8", 1));
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(flags[1], "16", 1));
+    var node: Node = undefined;
+    node.config = .{};
+    const limited = node.lightOnOcrPolicy(2);
+    try std.testing.expectEqual(@as(usize, 2), limited.max_step_items);
+    try std.testing.expectEqual(@as(usize, 2), limited.decode_coalesce_rows);
+    try std.testing.expectEqual(@as(?usize, 16), limited.max_active_requests_for_batching);
+    const full = node.lightOnOcrPolicy(8);
+    try std.testing.expectEqual(@as(usize, 8), full.max_step_items);
+    try std.testing.expectEqual(@as(usize, 16), effectiveLightOnReadWindow());
+}
+
 test "LightOnOCR3 continuous controls isolate canceled and expired pages" {
     var ctx: Node.LightOnStreamContext = undefined;
     ctx.controls_mutex = .unlocked;
     ctx.controls = @splat(null);
+    ctx.registered_pages = 0;
+    ctx.registered_window_peak = 0;
     const expired = ctx.register(.{ .deadline_ns = 0 });
     const live = ctx.register(.{});
     try Node.LightOnStreamContext.check(&ctx);
@@ -39174,6 +39307,8 @@ test "LightOnOCR3 continuous controls isolate canceled and expired pages" {
     try std.testing.expectError(error.Timeout, Node.LightOnStreamContext.check(&ctx));
     ctx.unregister(expired);
     try std.testing.expectError(error.Cancelled, Node.LightOnStreamContext.check(&ctx));
+    try std.testing.expectEqual(@as(usize, 0), ctx.registered_pages);
+    try std.testing.expectEqual(@as(usize, 2), ctx.registered_window_peak);
 }
 
 test "LightOnOCR3 read routing preserves image-only and grounding prompts" {

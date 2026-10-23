@@ -1047,6 +1047,18 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> qwen35_recurrent_columns4_pipeline;
     id<MTLComputePipelineState> qwen35_recurrent_decode_pipeline;
     id<MTLComputePipelineState> qwen35_fused_decode_pipeline;
+    id<MTLComputePipelineState> lightonocr3_recurrent_parallel_pipeline;
+    id<MTLComputePipelineState> lightonocr3_prefill_prepare_pipeline;
+    id<MTLComputePipelineState> lightonocr3_prefill_norm_pipeline;
+    uint64_t lightonocr3_prefill_norm_dispatches;
+    id<MTLComputePipelineState> lightonocr3_prefill_attention_mpp_pipeline;
+    id<MTLComputePipelineState> lightonocr3_prefill_attention_mpp32_pipeline;
+    id<MTLComputePipelineState> lightonocr3_prefill_attention_direct_pipeline;
+    uint64_t lightonocr3_prefill_attention_direct_dispatches;
+    uint64_t lightonocr3_prefill_attention_mpp_dispatches;
+    BOOL lightonocr3_recurrent_initialization_attempted;
+    uint64_t lightonocr3_recurrent_parallel_dispatches;
+    uint16_t lightonocr3_recurrent_parallel_traced_rows;
     id<MTLComputePipelineState> qwen35_prepare_parallel_pipeline;
     id<MTLComputePipelineState> qwen35_norm_parallel_pipeline;
     id<MTLComputePipelineState> qwen35_norm_pipeline;
@@ -6793,6 +6805,187 @@ typedef struct termite_metal_conv2d_f32_params {
     uint32_t reserved0;
 } termite_metal_conv2d_f32_params;
 
+// Independent optional library: unsupported pointer-table/PSO compilation must
+// leave the existing recurrent implementation available. F32 state, products,
+// reductions and outputs; each SIMD group owns eight value columns and splits
+// the 128 keys across its lanes. One dispatch covers independent pages.
+static NSString *termite_metal_lightonocr3_recurrent_source(void) {
+    return @""
+        "#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "struct CoreParams {\n"
+        "    uint seq, key_heads, value_heads, dim, kernel_size, initialized;\n"
+        "};\n"
+        "struct CoreRow {\n"
+        "    device float *buffers[15];\n"
+        "    CoreParams params;\n"
+        "};\n"
+        "kernel void termite_lightonocr3_recurrent_parallel(constant CoreRow *rows [[buffer(0)]],\n"
+        "                                                   uint2 group [[threadgroup_position_in_grid]],\n"
+        "                                                   uint d [[thread_index_in_threadgroup]],\n"
+        "                                                   ushort lane [[thread_index_in_simdgroup]],\n"
+        "                                                   ushort simd [[simdgroup_index_in_threadgroup]]) {\n"
+        "    constant CoreRow &r = rows[group.y];\n"
+        "    constant CoreParams &p = r.params;\n"
+        "    uint h = group.x;\n"
+        "    device const float *mixed = r.buffers[0];\n"
+        "    device const float *weight = r.buffers[1];\n"
+        "    device const float *beta = r.buffers[2];\n"
+        "    device const float *a = r.buffers[3];\n"
+        "    device const float *alog = r.buffers[4];\n"
+        "    device const float *dt = r.buffers[5];\n"
+        "    device const float *history = r.buffers[6];\n"
+        "    device float *next = r.buffers[7];\n"
+        "    device float *state = r.buffers[8];\n"
+        "    device float *conv = r.buffers[9];\n"
+        "    device float *gates = r.buffers[10];\n"
+        "    device float *core = r.buffers[11];\n"
+        "    device const float *z = r.buffers[12];\n"
+        "    device const float *norm = r.buffers[13];\n"
+        "    device float *output = r.buffers[14];\n"
+        "\n"
+        "    threadgroup float q[128], k[128], values[128], reduction[64], scales[4];\n"
+        "    const uint TM = 8, SG = 128 / TM;\n"
+        "    uint ratio = p.value_heads / p.key_heads, kh = h / ratio;\n"
+        "    if (d < 128) {\n"
+        "        uint indices[3] = {kh * 128 + d, (p.key_heads + kh) * 128 + d, 2 * p.key_heads * 128 + h * 128 + d};\n"
+        "        float v[3];\n"
+        "        for (uint j = 0; j < 3; j++) {\n"
+        "            uint c = indices[j];\n"
+        "            float sum = 0;\n"
+        "            for (uint t = 0; t < 4; t++) {\n"
+        "                float x = t == 3 ? mixed[c] : (p.initialized ? history[c * 4 + t + 1] : 0.0f);\n"
+        "                sum += x * weight[c * 4 + t];\n"
+        "                if (j == 2 || h % ratio == 0)\n"
+        "                    next[c * 4 + t] = x;\n"
+        "            }\n"
+        "            v[j] = sum / (1.0f + exp(-sum));\n"
+        "        }\n"
+        "        float qs = simd_sum(v[0] * v[0]), ks = simd_sum(v[1] * v[1]);\n"
+        "        if (lane == 0) {\n"
+        "            reduction[simd] = qs;\n"
+        "            reduction[4 + simd] = ks;\n"
+        "        }\n"
+        "        q[d] = v[0];\n"
+        "        k[d] = v[1];\n"
+        "        values[d] = v[2];\n"
+        "    }\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "    if (d == 0) {\n"
+        "        float qs = 0, ks = 0;\n"
+        "        for (uint s = 0; s < 4; s++) {\n"
+        "            qs += reduction[s];\n"
+        "            ks += reduction[4 + s];\n"
+        "        }\n"
+        "        scales[0] = 1.0f / sqrt(qs + 1e-6f) / sqrt(128.0f);\n"
+        "        scales[1] = 1.0f / sqrt(ks + 1e-6f);\n"
+        "        float x = a[h] + dt[h], sp = x > 20.0f ? x : (x < -20.0f ? exp(x) : log(1.0f + exp(x)));\n"
+        "        scales[2] = exp(-exp(alog[h]) * sp);\n"
+        "        scales[3] = 1.0f / (1.0f + exp(-beta[h]));\n"
+        "        gates[h * 2] = scales[2];\n"
+        "        gates[h * 2 + 1] = scales[3];\n"
+        "    }\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "    if (d < 128) {\n"
+        "        q[d] *= scales[0];\n"
+        "        k[d] *= scales[1];\n"
+        "        if (h % ratio == 0) {\n"
+        "            conv[kh * 128 + d] = q[d];\n"
+        "            conv[(p.key_heads + kh) * 128 + d] = k[d];\n"
+        "        }\n"
+        "        conv[2 * p.key_heads * 128 + h * 128 + d] = values[d];\n"
+        "    }\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "    uint col = simd * TM;\n"
+        "    float4 memories[TM / 4], previous[4][TM / 4], outputs[TM / 4];\n"
+        "#pragma unroll\n"
+        "    for (uint t = 0; t < TM / 4; t++)\n"
+        "        memories[t] = 0;\n"
+        "#pragma unroll\n"
+        "    for (uint i = 0; i < 4; i++) {\n"
+        "        uint key = lane * 4 + i;\n"
+        "#pragma unroll\n"
+        "        for (uint t = 0; t < TM / 4; t++) {\n"
+        "            float4 v = p.initialized\n"
+        "                           ? *((device const float4 *)(state + h * 128 * 128 + key * 128 + col + t * 4))\n"
+        "                           : float4(0);\n"
+        "            previous[i][t] = v * scales[2];\n"
+        "            memories[t] += previous[i][t] * k[key];\n"
+        "        }\n"
+        "    }\n"
+        "#pragma unroll\n"
+        "    for (uint t = 0; t < TM / 4; t++) {\n"
+        "        float4 memory = float4(simd_sum(memories[t].x), simd_sum(memories[t].y), simd_sum(memories[t].z),\n"
+        "                               simd_sum(memories[t].w));\n"
+        "        float4 delta = (float4(values[col + t * 4], values[col + t * 4 + 1], values[col + t * 4 + 2],\n"
+        "                               values[col + t * 4 + 3]) -\n"
+        "                        memory) *\n"
+        "                       scales[3];\n"
+        "        outputs[t] = 0;\n"
+        "#pragma unroll\n"
+        "        for (uint i = 0; i < 4; i++) {\n"
+        "            uint key = lane * 4 + i;\n"
+        "            float4 v = previous[i][t] + k[key] * delta;\n"
+        "            *((device float4 *)(state + h * 128 * 128 + key * 128 + col + t * 4)) = v;\n"
+        "            outputs[t] += v * q[key];\n"
+        "        }\n"
+        "        outputs[t] = float4(simd_sum(outputs[t].x), simd_sum(outputs[t].y), simd_sum(outputs[t].z),\n"
+        "                            simd_sum(outputs[t].w));\n"
+        "    }\n"
+        "    if (lane == 0) {\n"
+        "        float sum = 0;\n"
+        "#pragma unroll\n"
+        "        for (uint t = 0; t < TM / 4; t++) {\n"
+        "            float4 v = outputs[t];\n"
+        "            sum += dot(v, v);\n"
+        "            *((device float4 *)(core + h * 128 + col + t * 4)) = v;\n"
+        "        }\n"
+        "        reduction[simd] = sum;\n"
+        "    }\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "    if (d == 0) {\n"
+        "        float sum = 0;\n"
+        "        for (uint s = 0; s < SG; s++)\n"
+        "            sum += reduction[s];\n"
+        "        scales[0] = 1.0f / sqrt(sum / 128.0f + 1e-6f);\n"
+        "    }\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "    if (lane == 0) {\n"
+        "#pragma unroll\n"
+        "        for (uint t = 0; t < TM / 4; t++) {\n"
+        "            float4 gate = *((device const float4 *)(z + h * 128 + col + t * 4)),\n"
+        "                   n = *((device const float4 *)(norm + col + t * 4));\n"
+        "            *((device float4 *)(output + h * 128 + col + t * 4)) =\n"
+        "                outputs[t] * scales[0] * n * (gate / (1.0f + exp(-gate)));\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "kernel void termite_lightonocr3_prefill_prepare_parallel(device const float *beta [[buffer(2)]], device const float *a [[buffer(3)]], device const float *alog [[buffer(4)]], device const float *dt [[buffer(5)]], device float *conv [[buffer(9)]], device float *gates [[buffer(10)]], constant CoreParams &p [[buffer(15)]], uint gid [[thread_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+        "    uint row=gid/32; if(row>=p.seq*p.value_heads)return;uint t=row/p.value_heads,h=row%p.value_heads;\n"
+        "    if(h<p.key_heads) {\n"
+        "        uint qb=t*(2*p.key_heads+p.value_heads)*p.dim+h*p.dim,kb=qb+p.key_heads*p.dim;\n"
+        "        float qs=0,ks=0;\n"
+        "        for(uint d=uint(lane);d<p.dim;d+=32){float q=conv[qb+d],k=conv[kb+d];qs+=q*q;ks+=k*k;}\n"
+        "        float qn=1.0f/sqrt(simd_sum(qs)+1e-6f)/sqrt(float(p.dim)),kn=1.0f/sqrt(simd_sum(ks)+1e-6f);\n"
+        "        for(uint d=uint(lane);d<p.dim;d+=32){conv[qb+d]*=qn;conv[kb+d]*=kn;}\n"
+        "    }\n"
+        "    if(lane==0) {\n"
+        "        float x=a[row]+dt[h];\n"
+        "        float sp=x>20.0f?x:(x< -20.0f?exp(x):log(1.0f+exp(x)));\n"
+        "        gates[row*2]=exp(-exp(alog[h])*sp);\n"
+        "        gates[row*2+1]=1.0f/(1.0f+exp(-beta[row]));\n"
+        "    }\n"
+        "}\n"
+        "kernel void termite_lightonocr3_prefill_norm_parallel(device const float *core [[buffer(11)]], device const float *z [[buffer(12)]], device const float *weight [[buffer(13)]], device float *output [[buffer(14)]], constant CoreParams &p [[buffer(15)]], uint gid [[thread_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+        "    uint h=gid/32; if(h>=p.seq*p.value_heads)return; uint base=h*p.dim;\n"
+        "    float sum=0;\n"
+        "    for(uint d=uint(lane);d<p.dim;d+=32){float v=core[base+d];sum+=v*v;}\n"
+        "    float scale=1.0f/sqrt(simd_sum(sum)/float(p.dim)+1e-6f);\n"
+        "    for(uint d=uint(lane);d<p.dim;d+=32){float gate=z[base+d];output[base+d]=core[base+d]*scale*weight[d]*(gate/(1.0f+exp(-gate)));}\n"
+        "}\n"
+        ;
+}
+
 static NSString *termite_metal_lightonocr3_tensor_source(void) {
     return @""
         "#include <metal_stdlib>\n"
@@ -6836,6 +7029,387 @@ static NSString *termite_metal_lightonocr3_tensor_source(void) {
         "kernel void vision_pack_half(device const float*q[[buffer(0)]],device const float*k[[buffer(1)]],device const float*v[[buffer(2)]],device half*out[[buffer(3)]],constant VisionParams&p[[buffer(4)]],uint i[[thread_position_in_grid]]){\n"
         " uint count=p.batch*p.num_heads*p.reserved1*64;if(i>=count)return;uint d=i%64,s=(i/64)%p.reserved1,h=(i/(64*p.reserved1))%p.num_heads,b=i/(64*p.reserved1*p.num_heads);uint offset=((b*p.seq_len+s)*p.num_heads+h)*64+d;\n"
         " out[i]=s<p.seq_len?half(q[offset]*0.125f):half(0);out[count+i]=s<p.seq_len?half(k[offset]):half(0);out[2*count+i]=s<p.seq_len?half(v[offset]):half(0);\n"
+        "}\n"
+        "struct LightOnPrefillParams {\n"
+        "    uint q_len, kv_tokens, num_heads, num_kv_heads, head_dim, key_row_bytes, base_key_row_bytes,\n"
+        "        query_position_offset, kv_position_offset, sliding_window, v_row_stride, page_size, block_count,\n"
+        "        contiguous_base_token, contiguous_blocks, format, v_element_bytes, has_sinks;\n"
+        "    float softcap;\n"
+        "    uint swa_scan_clamp;\n"
+        "};\n"
+        "kernel void termite_lightonocr3_prefill_attention_mpp(\n"
+        "    device float *q [[buffer(0)]], device const half *k [[buffer(1)]], device const half *v [[buffer(2)]],\n"
+        "    device const uint *blocks [[buffer(3)]], device const float *sinks [[buffer(4)]],\n"
+        "    device float *y [[buffer(5)]], constant LightOnPrefillParams &p [[buffer(6)]],\n"
+        "    uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],\n"
+        "    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {\n"
+        "    const uint q0 = group.x * 16, h = group.y, kh = h / (p.num_heads / p.num_kv_heads), hd = 256,\n"
+        "               kw = p.key_row_bytes / 2;\n"
+        "    threadgroup atomic_uint nonfinite_v;\n"
+        "    threadgroup half kv[32 * 256];\n"
+        "    threadgroup float scores[16 * 32], prob[16 * 32], maxima[16], denom[16], correction[16];\n"
+        "    if (tid < 16) {\n"
+        "        maxima[tid] = -INFINITY;\n"
+        "        denom[tid] = 0;\n"
+        "    }\n"
+        "    tensor<device float, dextents<int, 2>, tensor_inline> qa(q + h * hd, dextents<int, 2>(hd, p.q_len),\n"
+        "                                                             array<int, 2>{1, int(p.num_heads * hd)});\n"
+        "    auto Q = qa.slice(0, int(q0));\n"
+        "    tensor<threadgroup half, dextents<int, 2>, tensor_inline> ka(kv, dextents<int, 2>(hd, 32),\n"
+        "                                                                 array<int, 2>{1, hd});\n"
+        "    auto K = ka.slice(0, int(sg * 8));\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> S(scores + sg * 8, dextents<int, 2>(8, 16),\n"
+        "                                                                 array<int, 2>{1, 32});\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> P(prob, dextents<int, 2>(32, 16),\n"
+        "                                                                 array<int, 2>{1, 32});\n"
+        "    tensor<threadgroup half, dextents<int, 2>, tensor_inline> V(kv + sg * 64, dextents<int, 2>(64, 32),\n"
+        "                                                                array<int, 2>{1, hd});\n"
+        "    constexpr auto qkd = matmul2d_descriptor(16, 8, 256, false, true, false);\n"
+        "    constexpr auto pvd =\n"
+        "        matmul2d_descriptor(16, 64, 32, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);\n"
+        "    matmul2d<qkd, execution_simdgroups<1>> qkop;\n"
+        "    matmul2d<pvd, execution_simdgroups<1>> pvop;\n"
+        "    auto out = pvop.get_destination_cooperative_tensor<decltype(P), decltype(V), float>();\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++)\n"
+        "        out[i] = 0;\n"
+        "    uint end = min(p.kv_tokens, p.query_position_offset + min(q0 + 16, p.q_len) - p.kv_position_offset);\n"
+        "    for (uint start = 0; start < end; start += 32) {\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint i = tid; i < 32 * 256; i += 128) {\n"
+        "            uint t = start + i / 256, d = i % 256;\n"
+        "            uint physical = t < p.kv_tokens ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "            kv[i] = t < p.kv_tokens ? k[physical * kw + kh * hd + d] : half(0);\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        auto dots = qkop.get_destination_cooperative_tensor<decltype(Q), decltype(K), float>();\n"
+        "        qkop.run(Q, K, dots);\n"
+        "        dots.store(S);\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint pass = 0; pass < 4; pass++) {\n"
+        "            uint row = sg + pass * 4, t = start + lane;\n"
+        "            bool valid = q0 + row < p.q_len && t < p.kv_tokens &&\n"
+        "                         t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "            float x = valid ? scores[row * 32 + lane] * 0.0625f : -INFINITY;\n"
+        "            if (!isfinite(x))\n"
+        "                x = -INFINITY;\n"
+        "            float m = simd_max(x), nm = max(maxima[row], m),\n"
+        "                  c = isfinite(maxima[row]) && isfinite(nm) ? exp(maxima[row] - nm) : 0;\n"
+        "            float e = isfinite(x) ? exp(x - nm) : 0;\n"
+        "            prob[row * 32 + lane] = e;\n"
+        "            float sum = simd_sum(e);\n"
+        "            if (lane == 0) {\n"
+        "                maxima[row] = nm;\n"
+        "                denom[row] = denom[row] * c + sum;\n"
+        "                correction[row] = c;\n"
+        "            }\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "            auto coord = out.get_multidimensional_index(i);\n"
+        "            out[i] = correction[coord[1]] == 0 ? 0 : out[i] * correction[coord[1]];\n"
+        "        }\n"
+        "        if (tid == 0)\n"
+        "            atomic_store_explicit(&nonfinite_v, 0, memory_order_relaxed);\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint i = tid; i < 32 * 256; i += 128) {\n"
+        "            uint t = start + i / 256, d = i % 256;\n"
+        "            uint physical = t < p.kv_tokens ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "            half value = t < p.kv_tokens ? v[physical * p.v_row_stride + kh * hd + d] : half(0);\n"
+        "            kv[i] = value;\n"
+        "            if (!isfinite(value))\n"
+        "                atomic_store_explicit(&nonfinite_v, 1, memory_order_relaxed);\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        if (atomic_load_explicit(&nonfinite_v, memory_order_relaxed) == 0)\n"
+        "            pvop.run(P, V, out);\n"
+        "        else\n"
+        "            for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "                auto coord = out.get_multidimensional_index(i);\n"
+        "                uint row = coord[1], d = sg * 64 + coord[0];\n"
+        "                float sum = 0;\n"
+        "                for (uint t = 0; t < 32; t++) {\n"
+        "                    float weight = prob[row * 32 + t];\n"
+        "                    if (weight != 0)\n"
+        "                        sum += weight * float(kv[t * 256 + d]);\n"
+        "                }\n"
+        "                out[i] += sum;\n"
+        "            }\n"
+        "    }\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "        auto coord = out.get_multidimensional_index(i);\n"
+        "        uint row = coord[1], d = sg * 64 + coord[0];\n"
+        "        if (q0 + row < p.q_len) {\n"
+        "            float value = denom[row] > 0 ? out[i] / denom[row] : 0;\n"
+        "            // Match the existing sentinel-softmax route when every score is invalid:\n"
+        "            // exp(sentinel-sentinel) gives uniform mass, including masked physical zero.\n"
+        "            if (denom[row] == 0) {\n"
+        "                float sum = 0;\n"
+        "                for (uint t = 0; t < p.kv_tokens; t++) {\n"
+        "                    bool allowed = t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "                    uint physical = allowed ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "                    sum += float(v[physical * p.v_row_stride + kh * hd + d]);\n"
+        "                }\n"
+        "                value = sum / float(p.kv_tokens);\n"
+        "            }\n"
+        "            y[((q0 + row) * p.num_heads + h) * hd + d] = value;\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "kernel void termite_lightonocr3_prefill_attention_mpp32(\n"
+        "    device float *q [[buffer(0)]], device const half *k [[buffer(1)]], device const half *v [[buffer(2)]],\n"
+        "    device const uint *blocks [[buffer(3)]], device const float *sinks [[buffer(4)]],\n"
+        "    device float *y [[buffer(5)]], constant LightOnPrefillParams &p [[buffer(6)]],\n"
+        "    uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],\n"
+        "    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {\n"
+        "    const uint q0 = group.x * 32, h = group.y, kh = h / (p.num_heads / p.num_kv_heads), hd = 256,\n"
+        "               kw = p.key_row_bytes / 2;\n"
+        "    threadgroup atomic_uint nonfinite_v;\n"
+        "    threadgroup half kv[32 * 256];\n"
+        "    threadgroup float scores[32 * 32], prob[32 * 32], maxima[32], denom[32], correction[32];\n"
+        "    if (tid < 32) {\n"
+        "        maxima[tid] = -INFINITY;\n"
+        "        denom[tid] = 0;\n"
+        "    }\n"
+        "    tensor<device float, dextents<int, 2>, tensor_inline> qa(q + h * hd, dextents<int, 2>(hd, p.q_len),\n"
+        "                                                             array<int, 2>{1, int(p.num_heads * hd)});\n"
+        "    auto Q = qa.slice(0, int(q0));\n"
+        "    tensor<threadgroup half, dextents<int, 2>, tensor_inline> ka(kv, dextents<int, 2>(hd, 32),\n"
+        "                                                                 array<int, 2>{1, hd});\n"
+        "    auto K = ka.slice(0, int(sg * 8));\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> S(scores + sg * 8, dextents<int, 2>(8, 32),\n"
+        "                                                                 array<int, 2>{1, 32});\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> P(prob, dextents<int, 2>(32, 32),\n"
+        "                                                                 array<int, 2>{1, 32});\n"
+        "    tensor<threadgroup half, dextents<int, 2>, tensor_inline> V(kv + sg * 64, dextents<int, 2>(64, 32),\n"
+        "                                                                array<int, 2>{1, hd});\n"
+        "    constexpr auto qkd = matmul2d_descriptor(32, 8, 256, false, true, false);\n"
+        "    constexpr auto pvd =\n"
+        "        matmul2d_descriptor(32, 64, 32, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);\n"
+        "    matmul2d<qkd, execution_simdgroups<1>> qkop;\n"
+        "    matmul2d<pvd, execution_simdgroups<1>> pvop;\n"
+        "    auto out = pvop.get_destination_cooperative_tensor<decltype(P), decltype(V), float>();\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++)\n"
+        "        out[i] = 0;\n"
+        "    uint end = min(p.kv_tokens, p.query_position_offset + min(q0 + 32, p.q_len) - p.kv_position_offset);\n"
+        "    for (uint start = 0; start < end; start += 32) {\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint i = tid; i < 32 * 256; i += 128) {\n"
+        "            uint t = start + i / 256, d = i % 256;\n"
+        "            uint physical = t < p.kv_tokens ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "            kv[i] = t < p.kv_tokens ? k[physical * kw + kh * hd + d] : half(0);\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        auto dots = qkop.get_destination_cooperative_tensor<decltype(Q), decltype(K), float>();\n"
+        "        qkop.run(Q, K, dots);\n"
+        "        dots.store(S);\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint pass = 0; pass < 8; pass++) {\n"
+        "            uint row = sg + pass * 4, t = start + lane;\n"
+        "            bool valid = q0 + row < p.q_len && t < p.kv_tokens &&\n"
+        "                         t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "            float x = valid ? scores[row * 32 + lane] * 0.0625f : -INFINITY;\n"
+        "            if (!isfinite(x))\n"
+        "                x = -INFINITY;\n"
+        "            float m = simd_max(x), nm = max(maxima[row], m),\n"
+        "                  c = isfinite(maxima[row]) && isfinite(nm) ? exp(maxima[row] - nm) : 0;\n"
+        "            float e = isfinite(x) ? exp(x - nm) : 0;\n"
+        "            prob[row * 32 + lane] = e;\n"
+        "            float sum = simd_sum(e);\n"
+        "            if (lane == 0) {\n"
+        "                maxima[row] = nm;\n"
+        "                denom[row] = denom[row] * c + sum;\n"
+        "                correction[row] = c;\n"
+        "            }\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "            auto coord = out.get_multidimensional_index(i);\n"
+        "            out[i] = correction[coord[1]] == 0 ? 0 : out[i] * correction[coord[1]];\n"
+        "        }\n"
+        "        if (tid == 0)\n"
+        "            atomic_store_explicit(&nonfinite_v, 0, memory_order_relaxed);\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint i = tid; i < 32 * 256; i += 128) {\n"
+        "            uint t = start + i / 256, d = i % 256;\n"
+        "            uint physical = t < p.kv_tokens ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "            half value = t < p.kv_tokens ? v[physical * p.v_row_stride + kh * hd + d] : half(0);\n"
+        "            kv[i] = value;\n"
+        "            if (!isfinite(value))\n"
+        "                atomic_store_explicit(&nonfinite_v, 1, memory_order_relaxed);\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        if (atomic_load_explicit(&nonfinite_v, memory_order_relaxed) == 0)\n"
+        "            pvop.run(P, V, out);\n"
+        "        else\n"
+        "            for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "                auto coord = out.get_multidimensional_index(i);\n"
+        "                uint row = coord[1], d = sg * 64 + coord[0];\n"
+        "                float sum = 0;\n"
+        "                for (uint t = 0; t < 32; t++) {\n"
+        "                    float weight = prob[row * 32 + t];\n"
+        "                    if (weight != 0)\n"
+        "                        sum += weight * float(kv[t * 256 + d]);\n"
+        "                }\n"
+        "                out[i] += sum;\n"
+        "            }\n"
+        "    }\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "        auto coord = out.get_multidimensional_index(i);\n"
+        "        uint row = coord[1], d = sg * 64 + coord[0];\n"
+        "        if (q0 + row < p.q_len) {\n"
+        "            float value = denom[row] > 0 ? out[i] / denom[row] : 0;\n"
+        "            // Match the existing sentinel-softmax route when every score is invalid:\n"
+        "            // exp(sentinel-sentinel) gives uniform mass, including masked physical zero.\n"
+        "            if (denom[row] == 0) {\n"
+        "                float sum = 0;\n"
+        "                for (uint t = 0; t < p.kv_tokens; t++) {\n"
+        "                    bool allowed = t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "                    uint physical = allowed ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "                    sum += float(v[physical * p.v_row_stride + kh * hd + d]);\n"
+        "                }\n"
+        "                value = sum / float(p.kv_tokens);\n"
+        "            }\n"
+        "            y[((q0 + row) * p.num_heads + h) * hd + d] = value;\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "kernel void termite_lightonocr3_prefill_attention_direct16_64(\n"
+        "    device float *q [[buffer(0)]], device half *k [[buffer(1)]], device half *v [[buffer(2)]],\n"
+        "    device const uint *blocks [[buffer(3)]], device const float *sinks [[buffer(4)]],\n"
+        "    device float *y [[buffer(5)]], constant LightOnPrefillParams &p [[buffer(6)]],\n"
+        "    uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],\n"
+        "    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {\n"
+        "    const uint q0 = group.x * 16, h = group.y, kh = h / (p.num_heads / p.num_kv_heads),\n"
+        "               kw = p.key_row_bytes / 2;\n"
+        "    threadgroup float scores[16 * 64], prob[16 * 64], maxima[16], denom[16], correction[16];\n"
+        "    threadgroup atomic_uint nonfinite_v;\n"
+        "    if (tid < 16) {\n"
+        "        maxima[tid] = -INFINITY;\n"
+        "        denom[tid] = 0;\n"
+        "    }\n"
+        "    tensor<device float, dextents<int, 2>, tensor_inline> qa(q + h * 256, dextents<int, 2>(256, p.q_len),\n"
+        "                                                             array<int, 2>{1, int(p.num_heads * 256)});\n"
+        "    auto Q = qa.slice(0, int(q0));\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> S(scores + sg * 16, dextents<int, 2>(16, 16),\n"
+        "                                                                 array<int, 2>{1, 64});\n"
+        "    tensor<threadgroup float, dextents<int, 2>, tensor_inline> Pbase(prob, dextents<int, 2>(16, 16),\n"
+        "                                                                     array<int, 2>{1, 64});\n"
+        "    tensor<device half, dextents<int, 2>, tensor_inline> Vbase(\n"
+        "        v + kh * 256 + sg * 64, dextents<int, 2>(64, 16), array<int, 2>{1, int(p.v_row_stride)});\n"
+        "    constexpr auto qkd = matmul2d_descriptor(16, 16, 256, false, true, false);\n"
+        "    constexpr auto pvd =\n"
+        "        matmul2d_descriptor(16, 64, 16, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);\n"
+        "    matmul2d<qkd, execution_simdgroups<1>> qkop;\n"
+        "    matmul2d<pvd, execution_simdgroups<1>> pvop;\n"
+        "    auto out = pvop.get_destination_cooperative_tensor<decltype(Pbase), decltype(Vbase), float>();\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++)\n"
+        "        out[i] = 0;\n"
+        "    uint end = min(p.kv_tokens, p.query_position_offset + min(q0 + 16, p.q_len) - p.kv_position_offset);\n"
+        "    for (uint start = 0; start < end; start += 64) {\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        uint key = start + sg * 16, count = key < p.kv_tokens ? min(16u, p.kv_tokens - key) : 0;\n"
+        "        if (count) {\n"
+        "            uint physical = blocks[key / p.page_size] + key % p.page_size;\n"
+        "            tensor<device half, dextents<int, 2>, tensor_inline> K(\n"
+        "                k + physical * kw + kh * 256, dextents<int, 2>(256, count), array<int, 2>{1, int(kw)});\n"
+        "            auto dots = qkop.get_destination_cooperative_tensor<decltype(Q), decltype(K), float>();\n"
+        "            qkop.run(Q, K, dots);\n"
+        "            dots.store(S);\n"
+        "        } else\n"
+        "            for (uint i = lane; i < 16 * 16; i += 32)\n"
+        "                scores[(i / 16) * 64 + sg * 16 + i % 16] = 0;\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint pass = 0; pass < 16 / 4; pass++) {\n"
+        "            uint row = sg + pass * 4;\n"
+        "            float x[2], m = -INFINITY;\n"
+        "            for (uint j = 0; j < 2; j++) {\n"
+        "                uint t = start + lane + j * 32;\n"
+        "                bool valid = q0 + row < p.q_len && t < p.kv_tokens &&\n"
+        "                             t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "                x[j] = valid ? scores[row * 64 + lane + j * 32] * .0625f : -INFINITY;\n"
+        "                if (!isfinite(x[j]))\n"
+        "                    x[j] = -INFINITY;\n"
+        "                m = max(m, x[j]);\n"
+        "            }\n"
+        "            m = simd_max(m);\n"
+        "            float nm = max(maxima[row], m),\n"
+        "                  c = isfinite(maxima[row]) && isfinite(nm) ? exp(maxima[row] - nm) : 0, sum = 0;\n"
+        "            for (uint j = 0; j < 2; j++) {\n"
+        "                float e = isfinite(x[j]) ? exp(x[j] - nm) : 0;\n"
+        "                prob[row * 64 + lane + j * 32] = e;\n"
+        "                sum += e;\n"
+        "            }\n"
+        "            sum = simd_sum(sum);\n"
+        "            if (lane == 0) {\n"
+        "                maxima[row] = nm;\n"
+        "                denom[row] = denom[row] * c + sum;\n"
+        "                correction[row] = c;\n"
+        "            }\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "            auto c = out.get_multidimensional_index(i);\n"
+        "            float scale = correction[c[1]];\n"
+        "            out[i] = scale == 0 ? 0 : out[i] * scale;\n"
+        "        }\n"
+        "        if (tid == 0)\n"
+        "            atomic_store_explicit(&nonfinite_v, 0, memory_order_relaxed);\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        for (uint i = tid; i < 64 * 256; i += 128) {\n"
+        "            uint t = start + i / 256, d = i % 256;\n"
+        "            if (t < p.kv_tokens) {\n"
+        "                uint physical = blocks[t / p.page_size] + t % p.page_size;\n"
+        "                if (!isfinite(v[physical * p.v_row_stride + kh * 256 + d]))\n"
+        "                    atomic_store_explicit(&nonfinite_v, 1, memory_order_relaxed);\n"
+        "            }\n"
+        "        }\n"
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        if (atomic_load_explicit(&nonfinite_v, memory_order_relaxed) == 0) {\n"
+        "            for (uint part = 0; part < 64 / 16; part++) {\n"
+        "                uint key = start + part * 16;\n"
+        "                if (key >= p.kv_tokens)\n"
+        "                    break;\n"
+        "                uint count = min(16u, p.kv_tokens - key),\n"
+        "                     physical = blocks[key / p.page_size] + key % p.page_size;\n"
+        "                tensor<threadgroup float, dextents<int, 2>, tensor_inline> P(\n"
+        "                    prob + part * 16, dextents<int, 2>(count, 16), array<int, 2>{1, 64});\n"
+        "                tensor<device half, dextents<int, 2>, tensor_inline> V(\n"
+        "                    v + physical * p.v_row_stride + kh * 256 + sg * 64, dextents<int, 2>(64, count),\n"
+        "                    array<int, 2>{1, int(p.v_row_stride)});\n"
+        "                pvop.run(P, V, out);\n"
+        "            }\n"
+        "        } else\n"
+        "            for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "                auto c = out.get_multidimensional_index(i);\n"
+        "                uint row = c[1], d = sg * 64 + c[0];\n"
+        "                float sum = 0;\n"
+        "                for (uint t = 0; t < 64 && start + t < p.kv_tokens; t++) {\n"
+        "                    float w = prob[row * 64 + t];\n"
+        "                    if (w != 0) {\n"
+        "                        uint key = start + t, physical = blocks[key / p.page_size] + key % p.page_size;\n"
+        "                        sum += w * float(v[physical * p.v_row_stride + kh * 256 + d]);\n"
+        "                    }\n"
+        "                }\n"
+        "                out[i] += sum;\n"
+        "            }\n"
+        "    }\n"
+        "    for (ushort i = 0; i < out.get_capacity(); i++) {\n"
+        "        auto c = out.get_multidimensional_index(i);\n"
+        "        uint row = c[1], d = sg * 64 + c[0];\n"
+        "        if (q0 + row >= p.q_len)\n"
+        "            continue;\n"
+        "        float value = denom[row] > 0 ? out[i] / denom[row] : 0;\n"
+        "        if (denom[row] == 0) {\n"
+        "            float sum = 0;\n"
+        "            for (uint t = 0; t < p.kv_tokens; t++) {\n"
+        "                bool allowed = t + p.kv_position_offset <= p.query_position_offset + q0 + row;\n"
+        "                uint physical = allowed ? blocks[t / p.page_size] + t % p.page_size : 0;\n"
+        "                sum += float(v[physical * p.v_row_stride + kh * 256 + d]);\n"
+        "            }\n"
+        "            value = sum / float(p.kv_tokens);\n"
+        "        }\n"
+        "        y[((q0 + row) * p.num_heads + h) * 256 + d] = value;\n"
+        "    }\n"
         "}\n"
         "struct Params { uint rows; uint in_dim; uint out_dim; uint pad; };\n"
         "template<uint S,uint N> inline void termite_lightonocr3_prefill_gate_body(device float*x,device bfloat*w,device float*bias,device float*y,constant Params&p,threadgroup float*tmp,uint2 group,uint sg,uint tid){\n"
@@ -17755,6 +18329,18 @@ static id<MTLComputeCommandEncoder> termite_metal_tracked_compute_command_encode
     return termite_metal_tracked_compute_command_encoder_for_dispatch(command_buffer, source, false);
 }
 
+// Reopen only at callers that register dependencies after opening the scope.
+// In particular, the shared F32 norm/residual dispatcher validates all bindings
+// first, then records every producer and consumer in the new serial encoder.
+static bool termite_metal_lightonocr3_decode_coalescing_enabled(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL && runtime->lightonocr3_projections_enabled &&
+        runtime->qwen35_ocr_vector_loads_enabled && runtime->active_frame_cb != nil &&
+        runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE &&
+        !termite_metal_concurrent_planned_dispatch_enabled(runtime) &&
+        termite_metal_should_coalesce_planned_compute_encoder(runtime) &&
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING"));
+}
+
 static id<MTLComputeCommandEncoder> termite_metal_scoped_compute_encoder_for(
     termite_metal_decode_runtime *runtime,
     id<MTLCommandBuffer> command_buffer,
@@ -25729,6 +26315,68 @@ static bool termite_metal_generated_flash_prefill_eligible(
     return eligible;
 }
 
+// F32 query and probability tiles consume the existing F16 paged KV cache.
+// No query/probability quantization, extra persistent storage or cache-format change.
+// These model/device-scoped kernels are qualified by the numerical and reader
+// gates. Explicit enable=0 and the independent disable switches both roll back.
+static bool termite_metal_lightonocr3_feature_default_enabled(const char *enable_name) {
+    const char *value = getenv(enable_name);
+    return value == NULL || termite_metal_env_flag_enabled(value);
+}
+
+static id<MTLComputePipelineState> termite_metal_lightonocr3_prefill_attention_pipeline(
+    termite_metal_decode_runtime *runtime, size_t queries, size_t page_size) {
+    // Each Q.K segment fits one physical 16-token page, including fragmented
+    // page tables. P.V consumes the same page-sized segments directly, avoiding
+    // the K/V threadgroup staging allocation without changing F32 arithmetic.
+    id<MTLComputePipelineState> direct = runtime->lightonocr3_prefill_attention_direct_pipeline;
+    if (queries >= 128 && page_size > 0 && page_size % 16 == 0 && direct != nil &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_DIRECT_KV")) &&
+        direct.threadExecutionWidth == 32 && direct.maxTotalThreadsPerThreadgroup >= 128 &&
+        direct.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength) return direct;
+    id<MTLComputePipelineState> large = runtime->lightonocr3_prefill_attention_mpp32_pipeline;
+    if (queries >= 256 && large != nil && large.threadExecutionWidth == 32 &&
+        large.maxTotalThreadsPerThreadgroup >= 128 &&
+        large.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength) return large;
+    return runtime->lightonocr3_prefill_attention_mpp_pipeline;
+}
+
+static bool termite_metal_lightonocr3_prefill_attention_mpp_eligible(
+    termite_metal_decode_runtime *runtime, const termite_metal_paged_attention_params *p) {
+    id<MTLComputePipelineState> pipeline = termite_metal_lightonocr3_prefill_attention_pipeline(runtime, p->q_len, p->page_size);
+    return runtime->lightonocr3_projections_enabled && runtime->qwen35_ocr_vector_loads_enabled &&
+        termite_metal_lightonocr3_feature_default_enabled("TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP") &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP")) &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP")) &&
+        p->format == 3 && p->v_element_bytes == 2 && p->head_dim == 256 && p->has_sinks == 0 &&
+        p->softcap == 0 && p->sliding_window == 0 && p->q_len >= 128 && p->q_len <= 2048 &&
+        p->kv_tokens >= p->q_len && p->kv_tokens <= 4096 && p->page_size > 0 &&
+        p->query_position_offset >= p->kv_position_offset &&
+        p->q_len <= UINT32_MAX - p->query_position_offset &&
+        p->kv_tokens <= UINT32_MAX - p->kv_position_offset &&
+        ((p->num_heads == 8 && p->num_kv_heads == 2) || (p->num_heads == 16 && p->num_kv_heads == 4)) &&
+        p->key_row_bytes >= p->num_kv_heads * 256 * 2 && p->key_row_bytes % 2 == 0 &&
+        p->v_row_stride >= p->num_kv_heads * 256 && pipeline != nil &&
+        pipeline.threadExecutionWidth == 32 && pipeline.maxTotalThreadsPerThreadgroup >= 128 &&
+        pipeline.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength;
+}
+
+static void termite_metal_lightonocr3_dispatch_prefill_attention(
+    termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder,
+    const termite_metal_paged_attention_params *p) {
+    const size_t tile = termite_metal_lightonocr3_prefill_attention_pipeline(runtime, p->q_len, p->page_size) ==
+        runtime->lightonocr3_prefill_attention_mpp32_pipeline ? 32 : 16;
+    const bool direct = termite_metal_lightonocr3_prefill_attention_pipeline(runtime, p->q_len, p->page_size) ==
+        runtime->lightonocr3_prefill_attention_direct_pipeline;
+    if (direct) runtime->lightonocr3_prefill_attention_direct_dispatches++;
+    [encoder dispatchThreadgroups:MTLSizeMake((p->q_len + tile - 1u) / tile, p->num_heads, 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (runtime->lightonocr3_prefill_attention_mpp_dispatches++ == 0 &&
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_ATTENTION_MPP")))
+        fprintf(stderr, "lightonocr3_prefill_attention_mpp: queries=%u keys=%u heads=%u tile=%zu direct=%d\n",
+            p->q_len, p->kv_tokens, p->num_heads, tile, direct);
+}
+
 static bool termite_metal_handwritten_flash_prefill_eligible(
     termite_metal_decode_runtime *runtime,
     uint32_t format,
@@ -26438,6 +27086,7 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
         return failure_code;
     }
 
+    const bool use_lightonocr3_prefill = termite_metal_lightonocr3_prefill_attention_mpp_eligible(runtime, &params);
     id<MTLComputePipelineState> decode_1x_pipeline = runtime->attention_1x_generated_pipeline != nil
         ? runtime->attention_1x_generated_pipeline
         : runtime->attention_paged_1x_pipeline;
@@ -26503,7 +27152,7 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
     // of the kernel body — the model-token acceptance gate for the generated route.
     // Prefer generated flash only when its model-shape and device gates pass;
     // otherwise preserve the independently eligible hand-written flash route.
-    [encoder setComputePipelineState:use_decode_gqa_split ? (split_launch.lightonocr3 ? runtime->lightonocr3_gqa_split_stage_pipeline : runtime->attention_decode_gqa_split_stage_pipeline) : (use_prefill_hd512 ? prefill_hd512_pipeline : (use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline)))];
+    [encoder setComputePipelineState:use_lightonocr3_prefill ? termite_metal_lightonocr3_prefill_attention_pipeline(runtime, q_len, page_size) : (use_decode_gqa_split ? (split_launch.lightonocr3 ? runtime->lightonocr3_gqa_split_stage_pipeline : runtime->attention_decode_gqa_split_stage_pipeline) : (use_prefill_hd512 ? prefill_hd512_pipeline : (use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline))))];
     [encoder setBuffer:q_buffer offset:q_offset atIndex:0];
     [encoder setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];
     [encoder setBuffer:runtime->attention_span_v_buffers[slot] offset:0 atIndex:2];
@@ -26525,7 +27174,9 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
     }
     [encoder setBuffer:(use_decode_gqa_split ? decode_gqa_split_scratch_buffer : output_buffer) offset:(use_decode_gqa_split ? 0u : output_offset) atIndex:5];
     [encoder setBytes:&params length:sizeof(params) atIndex:6];
-    if (use_decode_gqa_split) {
+    if (use_lightonocr3_prefill) {
+        termite_metal_lightonocr3_dispatch_prefill_attention(runtime, encoder, &params);
+    } else if (use_decode_gqa_split) {
         if (termite_metal_encode_decode_gqa_split_dispatch(
                 runtime,
                 runtime,
@@ -28902,6 +29553,12 @@ static void termite_metal_initialize_lightonocr3_mpp(termite_metal_decode_runtim
                 termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_mpp_float_8_16");
             runtime->lightonocr3_vision_pack_pipeline = termite_metal_make_pipeline(device,tensor_library,@"vision_pack_half");
             runtime->lightonocr3_vision_mpp_pipeline = termite_metal_make_pipeline(device,tensor_library,@"termite_sdpa_f32_vision_hd64_flash_packed_mpp");
+            runtime->lightonocr3_prefill_attention_mpp_pipeline = termite_metal_make_pipeline(
+                device, tensor_library, @"termite_lightonocr3_prefill_attention_mpp");
+            runtime->lightonocr3_prefill_attention_mpp32_pipeline = termite_metal_make_pipeline(
+                device, tensor_library, @"termite_lightonocr3_prefill_attention_mpp32");
+            runtime->lightonocr3_prefill_attention_direct_pipeline = termite_metal_make_pipeline(
+                device, tensor_library, @"termite_lightonocr3_prefill_attention_direct16_64");
             runtime->lightonocr3_prefill_gate8_16=termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_prefill_gate8_16");
             runtime->lightonocr3_prefill_gate16_32=termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_prefill_gate16_32");
             runtime->lightonocr3_local_gate_tg16 = termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_local_gate4_16");
@@ -28924,11 +29581,34 @@ static void termite_metal_initialize_lightonocr3_mpp(termite_metal_decode_runtim
     }
 }
 
+static void termite_metal_initialize_lightonocr3_recurrent(termite_metal_decode_runtime *runtime) {
+    if (runtime->lightonocr3_recurrent_initialization_attempted) return;
+    runtime->lightonocr3_recurrent_initialization_attempted = YES;
+    if (runtime->device.argumentBuffersSupport != MTLArgumentBuffersTier2) return;
+    MTLCompileOptions *options = [MTLCompileOptions new];
+    options.languageVersion = MTLLanguageVersion3_1;
+    options.fastMathEnabled = NO;
+    if (![options respondsToSelector:@selector(setMathMode:)]) return;
+    options.mathMode = MTLMathModeSafe;
+    NSError *error = nil;
+    id<MTLLibrary> library = [runtime->device newLibraryWithSource:termite_metal_lightonocr3_recurrent_source()
+                                                        options:options error:&error];
+    if (library != nil) {
+        runtime->lightonocr3_recurrent_parallel_pipeline = termite_metal_make_pipeline(
+            runtime->device, library, @"termite_lightonocr3_recurrent_parallel");
+        runtime->lightonocr3_prefill_prepare_pipeline = termite_metal_make_pipeline(
+            runtime->device, library, @"termite_lightonocr3_prefill_prepare_parallel");
+        runtime->lightonocr3_prefill_norm_pipeline = termite_metal_make_pipeline(
+            runtime->device, library, @"termite_lightonocr3_prefill_norm_parallel");
+    }
+}
+
 void termite_metal_decode_runtime_set_lightonocr3_projections(termite_metal_decode_runtime *runtime, int enabled) {
     if (runtime == NULL)
         return;
     runtime->lightonocr3_projections_enabled =
         enabled != 0 && [runtime->device.name isEqualToString:@"Apple M4 Max"];
+    if (runtime->lightonocr3_projections_enabled) termite_metal_initialize_lightonocr3_recurrent(runtime);
     if (runtime->lightonocr3_projections_enabled &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS")) &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP")))
@@ -30938,6 +31618,12 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->qwen35_recurrent_columns4_pipeline = nil;
     runtime->qwen35_recurrent_decode_pipeline = nil;
     runtime->qwen35_fused_decode_pipeline = nil;
+    runtime->lightonocr3_recurrent_parallel_pipeline = nil;
+    runtime->lightonocr3_prefill_prepare_pipeline = nil;
+    runtime->lightonocr3_prefill_norm_pipeline = nil;
+    runtime->lightonocr3_prefill_attention_mpp_pipeline = nil;
+    runtime->lightonocr3_prefill_attention_mpp32_pipeline = nil;
+    runtime->lightonocr3_prefill_attention_direct_pipeline = nil;
     runtime->qwen35_prepare_parallel_pipeline = nil;
     runtime->qwen35_norm_parallel_pipeline = nil;
     runtime->lightonocr3_gemv_pipeline = nil;
@@ -33940,10 +34626,118 @@ static bool termite_metal_qwen35_fused_decode_available(termite_metal_decode_run
         runtime->qwen35_fused_decode_pipeline.maxTotalThreadsPerThreadgroup >= 128;
 }
 
+// ABI shared with CoreRow in the optional Metal library. The inline table is
+// copied by setBytes; all referenced buffers remain command-buffer owned.
+typedef struct {
+    uint64_t buffers[15];
+    uint32_t params[6];
+} termite_metal_lightonocr3_recurrent_row;
+_Static_assert(sizeof(termite_metal_lightonocr3_recurrent_row) == 144, "Metal recurrent row ABI");
+_Static_assert(offsetof(termite_metal_lightonocr3_recurrent_row, params) == 120,
+               "Metal recurrent params ABI");
+
+// 0 declines before encoding, 1 encoded, negative values report a frame error.
+static int termite_metal_lightonocr3_encode_recurrent_parallel(termite_metal_decode_runtime *runtime,
+                                                               id<MTLCommandBuffer> cb, void *const *handles,
+                                                               const size_t *offsets, const size_t *bytes,
+                                                               const uint32_t *params, size_t rows) {
+    id<MTLComputePipelineState> pipeline = runtime->lightonocr3_recurrent_parallel_pipeline;
+    if (!runtime->lightonocr3_projections_enabled || !runtime->qwen35_ocr_vector_loads_enabled ||
+        !termite_metal_lightonocr3_feature_default_enabled("TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL") ||
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_RECURRENT_PARALLEL")) ||
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_QWEN35_FUSED_DECODE")) || rows < 1 ||
+        rows > 8 || pipeline == nil || pipeline.threadExecutionWidth != 32 ||
+        pipeline.maxTotalThreadsPerThreadgroup < 512 ||
+        pipeline.staticThreadgroupMemoryLength > runtime->device.maxThreadgroupMemoryLength)
+        return 0;
+    termite_metal_lightonocr3_recurrent_row table[8];
+    termite_metal_planned_encoder_range accesses[8 * 15];
+    __unsafe_unretained id<MTLResource> resources[8 * 15];
+    __unsafe_unretained id<MTLResource> writes[8 * 6];
+    size_t write_count = 0;
+    const size_t write_indices[6] = {7, 8, 9, 10, 11, 14};
+    for (size_t row = 0; row < rows; row++) {
+        const uint32_t *p = params + row * 6;
+        if (p[0] != 1 || p[1] != 16 || (p[2] != 16 && p[2] != 32) || p[2] != params[2] || p[3] != 128 ||
+            p[4] != 4)
+            return 0;
+        memcpy(table[row].params, p, sizeof(table[row].params));
+        for (size_t j = 0; j < 15; j++) {
+            const size_t index = row * 15 + j;
+            id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handles[index];
+            const uint64_t address = buffer.gpuAddress;
+            if (address == 0 || offsets[index] % 16 != 0 || offsets[index] > UINT64_MAX - address)
+                return 0;
+            table[row].buffers[j] = address + offsets[index];
+            resources[index] = buffer;
+            const bool write = j == 7 || j == 8 || j == 9 || j == 10 || j == 11 || j == 14;
+            if (write)
+                writes[write_count++] = buffer;
+            if (termite_metal_planned_range_make(buffer, offsets[index], bytes[index],
+                                                 write ? TERMITE_METAL_PLANNED_RANGE_WRITE
+                                                       : TERMITE_METAL_PLANNED_RANGE_READ,
+                                                 &accesses[index], -12) != 0)
+                return -12;
+        }
+        // The generic implementation supports more aliasing than this kernel.
+        // Only the persistent state itself is read and written in place here.
+        for (size_t w = 0; w < 6; w++)
+            for (size_t j = 0; j < 15; j++) {
+                const size_t wi = row * 15 + write_indices[w], ri = row * 15 + j;
+                if (wi == ri)
+                    continue;
+                if (handles[wi] == handles[ri] && offsets[wi] < offsets[ri] + bytes[ri] &&
+                    offsets[ri] < offsets[wi] + bytes[wi])
+                    return 0;
+            }
+    }
+    // Coalescing is independently qualified; ordinary tracked serial encoders
+    // remain the fallback. Range tracking includes all indirect GPU accesses.
+    if (runtime->active_frame_cb == cb && runtime->active_planned_compute_encoder == nil &&
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING")) &&
+        termite_metal_should_coalesce_planned_compute_encoder(runtime) &&
+        !termite_metal_concurrent_planned_dispatch_enabled(runtime)) {
+        if (termite_metal_decode_runtime_begin_planned_compute_scope(
+                runtime, TERMITE_METAL_COMPUTE_SOURCE_OTHER, runtime->active_compute_region) != 0)
+            return -12;
+    }
+    BOOL owned = YES;
+    id<MTLComputeCommandEncoder> encoder =
+        termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER, &owned);
+    if (encoder == nil)
+        return -12;
+    if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, rows * 15, -12) !=
+        0) {
+        termite_metal_end_scoped_compute_encoder(encoder, owned);
+        return -12;
+    }
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBytes:table length:rows * sizeof(table[0]) atIndex:0];
+    [encoder useResources:resources count:rows * 15 usage:MTLResourceUsageRead];
+    [encoder useResources:writes count:write_count usage:MTLResourceUsageWrite];
+    [encoder dispatchThreadgroups:MTLSizeMake(params[2], rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+    termite_metal_end_scoped_compute_encoder(encoder, owned);
+    runtime->lightonocr3_recurrent_parallel_dispatches++;
+    if ((runtime->lightonocr3_recurrent_parallel_traced_rows & (1u << rows)) == 0 &&
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_LIGHTONOCR3_RECURRENT_PARALLEL"))) {
+        runtime->lightonocr3_recurrent_parallel_traced_rows |= 1u << rows;
+        fprintf(stderr, "lightonocr3_recurrent_parallel: rows=%zu heads=%u threads=512\n", rows, params[2]);
+    }
+    return 1;
+}
 int termite_metal_decode_runtime_qwen35_core_batch_end(termite_metal_decode_runtime *runtime) {
     if (runtime == NULL || !runtime->qwen35_core_batch_active || runtime->active_frame_cb == nil ||
         runtime->qwen35_core_batch_count != runtime->qwen35_core_batch_expected) return -1;
     @autoreleasepool {
+        const int parallel_rc = termite_metal_lightonocr3_encode_recurrent_parallel(runtime,
+            runtime->active_frame_cb, &runtime->qwen35_core_batch_handles[0][0],
+            &runtime->qwen35_core_batch_offsets[0][0], &runtime->qwen35_core_batch_bytes[0][0],
+            &runtime->qwen35_core_batch_params[0][0], runtime->qwen35_core_batch_count);
+        if (parallel_rc != 0) {
+            termite_metal_decode_runtime_qwen35_core_batch_abort(runtime);
+            return parallel_rc < 0 ? parallel_rc : 0;
+        }
         if (termite_metal_qwen35_fused_decode_available(runtime)) {
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for_dispatch(
                 runtime->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER, true);
@@ -34032,6 +34826,14 @@ int termite_metal_decode_runtime_qwen35_core_device(
             runtime->qwen35_core_batch_count++;
             return 0;
         }
+        if (seq == 1) {
+            size_t bytes[15];
+            for (size_t i = 0; i < 15; i++) bytes[i] = counts[i] * sizeof(float);
+            const int parallel_rc = termite_metal_lightonocr3_encode_recurrent_parallel(
+                runtime, cb, handles, offsets, bytes, (const uint32_t *)&params, 1);
+            if (parallel_rc < 0) return parallel_rc;
+            if (parallel_rc > 0) return termite_metal_decode_runtime_finish_command_buffer(cb, frame_owned, -9);
+        }
         if (seq == 1 && termite_metal_qwen35_fused_decode_available(runtime)) {
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER);
             if (encoder == nil) return -8;
@@ -34057,10 +34859,24 @@ int termite_metal_decode_runtime_qwen35_core_device(
             pipelines[3] = runtime->qwen35_recurrent_columns4_pipeline;
             grids[3] /= 4;
         }
-        const bool parallel_norm = seq == 1 && termite_metal_qwen35_parallel_norm_available(runtime);
+        const bool prefill_norm = seq >= 128 && seq <= 2048 && key_heads == 16 &&
+            (value_heads == 16 || value_heads == 32) && runtime->lightonocr3_projections_enabled &&
+            runtime->qwen35_ocr_vector_loads_enabled &&
+            termite_metal_lightonocr3_feature_default_enabled("TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_CORE_NORM") &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_CORE_NORM")) &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_QWEN35_CORE_PARALLEL_NORM")) &&
+            runtime->lightonocr3_prefill_prepare_pipeline != nil && runtime->lightonocr3_prefill_norm_pipeline != nil &&
+            runtime->lightonocr3_prefill_prepare_pipeline.threadExecutionWidth == 32 &&
+            runtime->lightonocr3_prefill_norm_pipeline.threadExecutionWidth == 32 &&
+            runtime->lightonocr3_prefill_prepare_pipeline.maxTotalThreadsPerThreadgroup >= 32 &&
+            runtime->lightonocr3_prefill_norm_pipeline.maxTotalThreadsPerThreadgroup >= 32;
+        const bool parallel_norm = prefill_norm || (seq == 1 && termite_metal_qwen35_parallel_norm_available(runtime));
         if (parallel_norm) {
-            pipelines[2] = runtime->qwen35_prepare_parallel_pipeline;
-            pipelines[4] = runtime->qwen35_norm_parallel_pipeline;
+            pipelines[2] = prefill_norm ? runtime->lightonocr3_prefill_prepare_pipeline : runtime->qwen35_prepare_parallel_pipeline;
+            pipelines[4] = prefill_norm ? runtime->lightonocr3_prefill_norm_pipeline : runtime->qwen35_norm_parallel_pipeline;
+            if (prefill_norm && runtime->lightonocr3_prefill_norm_dispatches++ == 0 &&
+                termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_CORE_NORM")))
+                fprintf(stderr, "lightonocr3_prefill_core_norm: rows=%zu heads=%zu\n", seq, value_heads);
             grids[2] *= 32;
             grids[4] *= 32;
         }
@@ -38912,11 +39728,33 @@ static int termite_metal_try_lightonocr3_down_split(termite_metal_decode_runtime
                    termite_metal_decode_runtime_retain_frame_resource(runtime, output) != 0 ||
                    termite_metal_decode_runtime_retain_frame_resource(runtime, scratch) != 0))
         return -10;
-    termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
-    id<MTLComputeCommandEncoder> enc =
-        termite_metal_tracked_compute_command_encoder_for(cb, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);
-    if (enc == nil)
-        return -11;
+    const bool coalesced = termite_metal_lightonocr3_decode_coalescing_enabled(runtime);
+    BOOL encoder_owned = YES;
+    id<MTLComputeCommandEncoder> enc;
+    if (coalesced) {
+        termite_metal_planned_encoder_range accesses[5];
+        if (termite_metal_planned_range_make(input, input_offset, rows * in_dim * 4,
+                TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -11) ||
+            termite_metal_planned_range_make(runtime->linear_weight_buffers[slot], 0, in_dim * out_dim * 2,
+                TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -11) ||
+            termite_metal_planned_range_make(runtime->linear_bias_buffers[slot], 0, out_dim * 4,
+                TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -11) ||
+            termite_metal_planned_range_make(scratch, 0, scratch_bytes,
+                TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[3], -11) ||
+            termite_metal_planned_range_make(output, output_offset, rows * out_dim * 4,
+                TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[4], -11)) return -11;
+        enc = termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR,
+            &encoder_owned);
+        if (enc == nil) return -11;
+        if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 5, -11)) {
+            termite_metal_end_scoped_compute_encoder(enc, encoder_owned);
+            return -11;
+        }
+    } else {
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
+        enc = termite_metal_tracked_compute_command_encoder_for(cb, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);
+        if (enc == nil) return -11;
+    }
     termite_metal_linear_params params = {(uint32_t)rows, (uint32_t)in_dim, (uint32_t)out_dim,
                                           (uint32_t)splits};
     [enc setComputePipelineState:stage];
@@ -38935,12 +39773,12 @@ static int termite_metal_try_lightonocr3_down_split(termite_metal_decode_runtime
     const size_t count = rows * out_dim;
     [enc dispatchThreads:MTLSizeMake(count, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(reduce, count), 1, 1)];
-    [enc endEncoding];
+    termite_metal_end_scoped_compute_encoder(enc, encoder_owned);
     termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in_dim, out_dim,
                                                     splits == 16 ? "lightonocr3_down_split16"
                                                     : tail_split ? "lightonocr3_tail_split"
                                                                  : "lightonocr3_down_split",
-                                                    !owned, false, false, false, false);
+                                                    !owned, !encoder_owned, false, false, false);
     const int rc = termite_metal_decode_runtime_finish_command_buffer(cb, owned, -12);
     return rc == 0 ? 1 : rc;
 }
@@ -57066,7 +57904,7 @@ static int termite_metal_decode_runtime_gemma4_audio_dispatch(
         // MPS and unscoped helpers close the shared encoder. Reopen at the
         // next audio dispatch, after validating bindings and before recording
         // dependencies. Never open an empty encoder immediately before MPS.
-        if (runtime->audio_replay_scope &&
+        if ((runtime->audio_replay_scope || termite_metal_lightonocr3_decode_coalescing_enabled(runtime)) &&
             termite_metal_should_coalesce_planned_compute_encoder(runtime) &&
             runtime->active_planned_compute_encoder == nil &&
             termite_metal_decode_runtime_begin_planned_compute_scope(runtime,
@@ -64298,6 +65136,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     {
         return -15;
     }
+    const bool use_lightonocr3_prefill = termite_metal_lightonocr3_prefill_attention_mpp_eligible(runtime, &params);
     id<MTLComputePipelineState> decode_1x_pipeline = runtime->attention_1x_generated_pipeline != nil
         ? runtime->attention_1x_generated_pipeline
         : runtime->attention_paged_1x_pipeline;
@@ -64363,7 +65202,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     // of the kernel body — the model-token acceptance gate for the generated route.
     // Prefer generated flash only when its model-shape and device gates pass;
     // otherwise preserve the independently eligible hand-written flash route.
-    [encoder setComputePipelineState:use_decode_gqa_split ? (split_launch.lightonocr3 ? runtime->lightonocr3_gqa_split_stage_pipeline : runtime->attention_decode_gqa_split_stage_pipeline) : (use_prefill_hd512 ? prefill_hd512_pipeline : (use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline)))];
+    [encoder setComputePipelineState:use_lightonocr3_prefill ? termite_metal_lightonocr3_prefill_attention_pipeline(runtime, q_len, page_size) : (use_decode_gqa_split ? (split_launch.lightonocr3 ? runtime->lightonocr3_gqa_split_stage_pipeline : runtime->attention_decode_gqa_split_stage_pipeline) : (use_prefill_hd512 ? prefill_hd512_pipeline : (use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline))))];
     [encoder setBuffer:q_buffer offset:q_offset atIndex:0];
     [encoder setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];
     [encoder setBuffer:runtime->attention_span_v_buffers[slot] offset:0 atIndex:2];
@@ -64381,7 +65220,9 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     }
     [encoder setBuffer:(use_decode_gqa_split ? decode_gqa_split_scratch_buffer : output_buffer) offset:(use_decode_gqa_split ? 0u : output_offset) atIndex:5];
     [encoder setBytes:&params length:sizeof(params) atIndex:6];
-    if (use_decode_gqa_split) {
+    if (use_lightonocr3_prefill) {
+        termite_metal_lightonocr3_dispatch_prefill_attention(runtime, encoder, &params);
+    } else if (use_decode_gqa_split) {
         if (termite_metal_encode_decode_gqa_split_dispatch(
                 runtime,
                 frame_runtime,

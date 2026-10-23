@@ -1,0 +1,84 @@
+1/120 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...lightonocr3_prefill_core_norm: rows=432 heads=16
+lightonocr3_prefill_attention_mpp: queries=432 keys=432 heads=8 tile=16 direct=1
+lightonocr3_recurrent_parallel: rows=1 heads=16 threads=512
+LIGHTONOCR3 registered_window_peak=1 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=203779072 peak_segments=1
+
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=830 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+LIGHTONOCR3 registered_window_peak=1 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=203779072 peak_segments=1
+OCR_REFERENCE {"image_index":0,"text":"Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"}
+LIGHTONOCR3 registered_window_peak=1 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=312569856 peak_segments=1
+OCR_REFERENCE {"image_index":1,"text":"# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"}
+LIGHTONOCR3 registered_window_peak=1 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=429539328 peak_segments=1
+OCR_REFERENCE {"image_index":2,"text":"# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY"}
+OCR_POLICY round=0 name=off
+LIGHTONOCR3 registered_window_peak=8 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=16 decode_steps=245 batched_steps=242 singleton_steps=3 decode_items=1407
+LIGHTONOCR3 shared_vision_peak_bytes=429539328 peak_segments=1
+OCR_CPU round=0 process_cpu_ms=14003
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=8275 pages_per_second=1.9333 p50_ms=3010 p95_ms=7672 native_items=16 parity=true
+OCR_POLICY round=1 name=on
+lightonocr3_recurrent_parallel: rows=2 heads=16 threads=512
+lightonocr3_recurrent_parallel: rows=3 heads=16 threads=512
+lightonocr3_recurrent_parallel: rows=4 heads=16 threads=512
+lightonocr3_recurrent_parallel: rows=5 heads=16 threads=512
+lightonocr3_recurrent_parallel: rows=6 heads=16 threads=512
+lightonocr3_recurrent_parallel: rows=8 heads=16 threads=512
+lightonocr3_recurrent_parallel: rows=7 heads=16 threads=512
+LIGHTONOCR3 registered_window_peak=8 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=16 decode_steps=247 batched_steps=246 singleton_steps=1 decode_items=1408
+LIGHTONOCR3 shared_vision_peak_bytes=429539328 peak_segments=2
+OCR_CPU round=1 process_cpu_ms=12601
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=7844 pages_per_second=2.0396 p50_ms=3088 p95_ms=7253 native_items=16 parity=true
+OCR_POLICY round=2 name=off
+LIGHTONOCR3 registered_window_peak=8 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=16 decode_steps=239 batched_steps=237 singleton_steps=2 decode_items=1395
+LIGHTONOCR3 shared_vision_peak_bytes=429539328 peak_segments=1
+OCR_CPU round=2 process_cpu_ms=13505
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=8370 pages_per_second=1.9114 p50_ms=2973 p95_ms=7696 native_items=16 parity=true
+OCR_POLICY round=3 name=on
+LIGHTONOCR3 registered_window_peak=8 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=16 decode_steps=239 batched_steps=238 singleton_steps=1 decode_items=1413
+LIGHTONOCR3 shared_vision_peak_bytes=429539328 peak_segments=2
+OCR_CPU round=3 process_cpu_ms=12720
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=7639 pages_per_second=2.0945 p50_ms=2768 p95_ms=7050 native_items=16 parity=true
+OCR_POLICY round=4 name=spin
+LIGHTONOCR3 registered_window_peak=8 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=16 decode_steps=235 batched_steps=234 singleton_steps=1 decode_items=1402
+LIGHTONOCR3 shared_vision_peak_bytes=429539328 peak_segments=1
+OCR_CPU round=4 process_cpu_ms=18269
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=7867 pages_per_second=2.0338 p50_ms=2991 p95_ms=7183 native_items=16 parity=true
+OCR_POLICY round=5 name=on
+LIGHTONOCR3 registered_window_peak=8 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=16 decode_steps=239 batched_steps=238 singleton_steps=1 decode_items=1397
+LIGHTONOCR3 shared_vision_peak_bytes=429539328 peak_segments=1
+OCR_CPU round=5 process_cpu_ms=11828
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=7824 pages_per_second=2.0450 p50_ms=2944 p95_ms=7188 native_items=16 parity=true
+OCR_POLICY round=6 name=coalesced
+LIGHTONOCR3 registered_window_peak=8 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=16 decode_steps=238 batched_steps=236 singleton_steps=2 decode_items=1399
+LIGHTONOCR3 shared_vision_peak_bytes=429539328 peak_segments=2
+OCR_CPU round=6 process_cpu_ms=13472
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=8432 pages_per_second=1.8974 p50_ms=2994 p95_ms=7711 native_items=16 parity=true
+OCR_POLICY round=7 name=on
+LIGHTONOCR3 registered_window_peak=8 physical_rows_limit=8
+LIGHTONOCR3 cohort_items=16 decode_steps=243 batched_steps=241 singleton_steps=2 decode_items=1406
+LIGHTONOCR3 shared_vision_peak_bytes=429539328 peak_segments=2
+OCR_CPU round=7 process_cpu_ms=11443
+OCR_CONCURRENCY concurrency=8 requests=16 pages_per_request=1 completed=16 elapsed_ms=7882 pages_per_second=2.0298 p50_ms=2860 p95_ms=7168 native_items=16 parity=true
+metal_ocr_weight_residency: sets=4 allocations=0 peak_bytes=1698824192 current_bytes=0 released=1
+OK
+1 selected; 1 passed; 0 skipped.

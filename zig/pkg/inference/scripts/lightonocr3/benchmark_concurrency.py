@@ -46,11 +46,22 @@ def run(args, model, label, mode, concurrency, output):
         ) or key in (
             "TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS",
             "TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING",
+            "TERMITE_METAL_TRACE_LIGHTONOCR3_RECURRENT_PARALLEL",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP",
+            "TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_ATTENTION_MPP",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_CORE_NORM",
+            "TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_CORE_NORM",
+            "ANTFLY_TEST_OCR_POLICY_ROUNDS",
             "TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS",
             "ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE",
             "ANTFLY_FLORENCE2_BATCH_WAIT_US",
             "ANTFLY_INFERENCE_READ_PROFILE",
             "ANTFLY_LIGHTONOCR3_CONTINUOUS",
+            "ANTFLY_TEST_OCR_STATIC_WORK_ASSIGNMENT",
+            "ANTFLY_LIGHTONOCR3_STATIC_PAGE_ASSIGNMENT",
+            "ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US",
             "ANTFLY_LIGHTONOCR3_VISION_BATCH",
             "ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK",
             "ANTFLY_LIGHTONOCR3_PREFILL_BATCH",
@@ -77,6 +88,35 @@ def run(args, model, label, mode, concurrency, output):
             "TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE",
         ):
             del env[key]
+    if args.contention_wait_us is not None:
+        env["ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US"] = str(args.contention_wait_us)
+    if args.policy_rounds:
+        env["ANTFLY_TEST_OCR_POLICY_ROUNDS"] = json.dumps(args.policy_rounds)
+    if args.prefill_core_norm:
+        env["TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_CORE_NORM"] = "1"
+    if args.disable_prefill_core_norm:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_CORE_NORM"] = "1"
+    if args.require_prefill_core_norm:
+        env["TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_CORE_NORM"] = "1"
+    if args.static_work_assignment:
+        env["ANTFLY_TEST_OCR_STATIC_WORK_ASSIGNMENT"] = "1"
+        env["ANTFLY_LIGHTONOCR3_STATIC_PAGE_ASSIGNMENT"] = "1"
+    if args.disable_prefill_direct_kv_mpp:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_DIRECT_KV"] = "1"
+    if args.prefill_attention_mpp:
+        env["TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP"] = "1"
+    if args.disable_prefill_attention_mpp:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP"] = "1"
+    if args.require_prefill_attention_mpp:
+        env["TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_ATTENTION_MPP"] = "1"
+    if args.recurrent_parallel:
+        env["TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL"] = "1"
+    if args.disable_recurrent_parallel:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_RECURRENT_PARALLEL"] = "1"
+    if args.recurrent_coalescing:
+        env["TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING"] = "1"
+    if args.require_recurrent_parallel:
+        env["TERMITE_METAL_TRACE_LIGHTONOCR3_RECURRENT_PARALLEL"] = "1"
     if args.bf16_prefill_inputs:
         env["TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS"] = "1"
     if args.prefill_sg_attention:
@@ -259,6 +299,87 @@ def run(args, model, label, mode, concurrency, output):
             }
         )
         result.update(status="ok", serial_reference_parity=True)
+        if args.policy_rounds:
+            samples = [
+                {
+                    key: float(value) if key == "pages_per_second" else int(value)
+                    for key, value in zip(fields, item.groups())
+                }
+                for item in RESULT.finditer(text)
+            ]
+            labels = re.findall(r"OCR_POLICY round=(\d+) name=([a-z0-9]+)", text)
+            if [name for _, name in labels] != args.policy_rounds or len(
+                samples
+            ) != len(args.policy_rounds):
+                result["status"] = "incomplete_policy_rounds"
+            else:
+                result["policy_rounds"] = [
+                    dict(round=i, policy=name, **sample)
+                    for i, (name, sample) in enumerate(zip(args.policy_rounds, samples))
+                ]
+                sections = re.split(r"OCR_POLICY round=\d+ name=[a-z0-9]+\n", text)[1:]
+                for sample, section in zip(result["policy_rounds"], sections):
+                    windows = re.findall(
+                        r"LIGHTONOCR3 registered_window_peak=(\d+) physical_rows_limit=(\d+)",
+                        section,
+                    )
+                    if windows:
+                        sample["registered_window_peak"] = max(
+                            int(peak) for peak, _ in windows
+                        )
+                        sample["physical_rows_limit"] = max(
+                            int(rows) for _, rows in windows
+                        )
+                # Each round is a complete measurement; a single top-level
+                # throughput would misrepresent this alternating comparison.
+                for key in fields:
+                    if key != "concurrency":
+                        result.pop(key, None)
+        cpu_samples = [
+            int(value)
+            for _, value in re.findall(
+                r"OCR_CPU round=(\d+) process_cpu_ms=(\d+)", text
+            )
+        ]
+        if (
+            args.policy_rounds
+            and "policy_rounds" in result
+            and len(cpu_samples) == len(result["policy_rounds"])
+        ):
+            for sample, cpu_ms in zip(result["policy_rounds"], cpu_samples):
+                sample["process_cpu_ms"] = cpu_ms
+        elif not args.policy_rounds and len(cpu_samples) == 1:
+            result["process_cpu_ms"] = cpu_samples[0]
+        if args.require_prefill_core_norm:
+            observed = bool(
+                re.search(r"lightonocr3_prefill_core_norm: rows=\d+ heads=\d+", text)
+            )
+            result["prefill_core_norm_observed_including_warmup"] = observed
+            if not observed:
+                result["status"] = "missing_prefill_core_norm"
+        if args.require_prefill_attention_mpp:
+            dispatches = re.findall(
+                r"lightonocr3_prefill_attention_mpp: queries=\d+ keys=\d+ heads=\d+",
+                text,
+            )
+            result["prefill_attention_mpp_observed_including_warmup"] = bool(dispatches)
+            if not dispatches:
+                result["status"] = "missing_prefill_attention_mpp"
+        if args.require_recurrent_parallel:
+            dispatches = re.findall(
+                r"lightonocr3_recurrent_parallel: rows=\d+ heads=\d+ threads=512", text
+            )
+            result["recurrent_parallel_observed_including_warmup"] = bool(dispatches)
+            result["recurrent_parallel_rows_observed_including_warmup"] = sorted(
+                {
+                    int(value)
+                    for value in re.findall(
+                        r"lightonocr3_recurrent_parallel: rows=(\d+)", text
+                    )
+                }
+            )
+            if not dispatches:
+                result["status"] = "missing_recurrent_parallel"
         if args.require_small_tail_fusion:
             dispatches = re.findall(
                 r"site=bf16_gate_up_device[^\n]*rows=([234])[^\n]*variant=lightonocr3_gate_up_(?:split|local_vector|local_tg)(?:\s|$)",
@@ -317,6 +438,13 @@ def run(args, model, label, mode, concurrency, output):
             if not matches:
                 result["status"] = "reference_mismatch"
 
+        result["registered_windows_including_untimed_warmup"] = [
+            {"registered_window_peak": int(peak), "physical_rows_limit": int(rows)}
+            for peak, rows in re.findall(
+                r"LIGHTONOCR3 registered_window_peak=(\d+) physical_rows_limit=(\d+)",
+                text,
+            )
+        ]
         result["cohorts_including_untimed_warmup"] = [
             dict(
                 zip(
@@ -378,6 +506,38 @@ def main():
         help="Ablate the specialized small-batch Metal kernel",
     )
     parser.add_argument("--disable-tiled-projections", action="store_true")
+    parser.add_argument(
+        "--policy-rounds",
+        nargs="+",
+        choices=[
+            "off",
+            "on",
+            "recurrent",
+            "attention",
+            "norm",
+            "coalesced",
+            "static",
+            "batched",
+            "window8",
+            "spin",
+            "current",
+        ],
+    )
+    parser.add_argument("--prefill-core-norm", action="store_true", default=None)
+    parser.add_argument("--disable-prefill-core-norm", action="store_true")
+    parser.add_argument("--require-prefill-core-norm", action="store_true")
+    parser.add_argument("--disable-prefill-direct-kv-mpp", action="store_true")
+    parser.add_argument("--static-work-assignment", action="store_true")
+    parser.add_argument(
+        "--contention-wait-us", type=int, choices=range(1001), metavar="0..1000"
+    )
+    parser.add_argument("--prefill-attention-mpp", action="store_true", default=None)
+    parser.add_argument("--disable-prefill-attention-mpp", action="store_true")
+    parser.add_argument("--require-prefill-attention-mpp", action="store_true")
+    parser.add_argument("--recurrent-parallel", action="store_true", default=None)
+    parser.add_argument("--disable-recurrent-parallel", action="store_true")
+    parser.add_argument("--recurrent-coalescing", action="store_true")
+    parser.add_argument("--require-recurrent-parallel", action="store_true")
     parser.add_argument("--disable-recurrent-batch", action="store_true")
     parser.add_argument("--disable-recurrent-fusion", action="store_true")
     parser.add_argument("--disable-ffn-small-tile", action="store_true")
@@ -466,6 +626,8 @@ def main():
         parser.error("vision/prefill batching requires --continuous")
     if args.prefill_direct_kv and not args.prefill_sg_attention:
         parser.error("direct KV prefill requires --prefill-sg-attention")
+    if args.policy_rounds and len(args.policy_rounds) > 16:
+        parser.error("at most 16 policy rounds are supported")
     if args.requests < 1 or any(c < 1 or c > 16 for c in args.concurrency):
         parser.error("requests must be positive; concurrency must be 1..16")
     if args.admission_units < 1:

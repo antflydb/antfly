@@ -226,6 +226,10 @@ pub const Policy = struct {
     /// follower cannot bypass the first caller's bounded coalescing window.
     /// One preserves the existing eager/C2 scheduling policy.
     decode_coalesce_rows: usize = 1,
+    /// Model-scoped wait between unsuccessful turn/step claims. A positive
+    /// duration parks waiting OS threads while their peer owns a GPU forward.
+    /// Zero preserves the cooperative polling policy for other backends.
+    contention_wait_us: u32 = 0,
     /// Largest prefill issued for a sole request on an otherwise idle model.
     /// Admission budgets scratch at this size before generation starts. The
     /// ceiling remains configurable up to 2048. Model-specific performance
@@ -1023,10 +1027,17 @@ pub const NativeGenerateCoordinator = struct {
         self.finishTurnUnlocked(lease, phase);
     }
 
+    fn contentionWaitUs(self: *const NativeGenerateCoordinator) u32 {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        return self.policy.contention_wait_us;
+    }
+
     pub fn awaitTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase, io: std.Io) !void {
+        const wait_us = self.contentionWaitUs();
         while (!self.tryAcquireTurn(lease, phase)) {
             self.noteTurnYield();
-            try io.sleep(std.Io.Duration.fromMilliseconds(0), .awake);
+            try io.sleep(std.Io.Duration.fromMicroseconds(wait_us), .awake);
         }
     }
 
@@ -3031,4 +3042,40 @@ test "LightOnOCR3 cohort coalescing bounds sparse waits and shrinks after page r
     try std.testing.expect(try coordinator.claimStep(std.testing.allocator, &leases[0], @ptrFromInt(1), .decode, budget, &step));
     try std.testing.expectEqual(@as(usize, 2), step.items.len);
     coordinator.completeStep(&leases[0], step.items);
+}
+
+test "LightOnOCR3 scheduler contention wait parks outside the lock and propagates cancellation" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .contention_wait_us = 100 });
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(second);
+    try std.testing.expect(coordinator.tryAcquireTurn(&first, .prefill));
+    const Probe = struct {
+        coordinator: *NativeGenerateCoordinator,
+        called: bool = false,
+        observed_wait_us: i64 = -1,
+        observed_policy_us: u32 = 0,
+        fn sleep(raw: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.observed_wait_us = timeout.duration.raw.toMicroseconds();
+            // Reacquiring the coordinator proves awaitTurn released its lock.
+            self.observed_policy_us = self.coordinator.contentionWaitUs();
+            self.called = true;
+            return error.Canceled;
+        }
+    };
+    var probe = Probe{ .coordinator = &coordinator };
+    var vtable = std.testing.io.vtable.*;
+    vtable.sleep = Probe.sleep;
+    const io: std.Io = .{ .userdata = &probe, .vtable = &vtable };
+    try std.testing.expectError(error.Canceled, coordinator.awaitTurn(&second, .prefill, io));
+    try std.testing.expect(probe.called);
+    try std.testing.expectEqual(@as(i64, 100), probe.observed_wait_us);
+    try std.testing.expectEqual(@as(u32, 100), probe.observed_policy_us);
+    coordinator.finishTurn(&first, .prefill);
+    try coordinator.awaitTurn(&second, .prefill, io);
+    coordinator.finishTurn(&second, .prefill);
 }
