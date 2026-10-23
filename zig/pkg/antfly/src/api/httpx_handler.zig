@@ -15993,6 +15993,8 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     // sql-0557, sql-1205, sql-1206, sql-1265, sql-1268, sql-1269.
     // sql-1578.
     const alloc = std.testing.allocator;
+    var qualification_phase: []const u8 = "fixture initialization";
+    errdefer std.debug.print("SQL pooling qualification failed during {s}\n", .{qualification_phase});
     // Direct adapters mirror the listener fence and join every retained
     // cleanup task before their request/page arenas leave scope.
     const FixtureLifetime = struct {
@@ -16286,6 +16288,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
                 }
             }
         };
+        qualification_phase = "shared admission and scheduling";
         var held = server.query_admission.tryAcquireLease().?;
         defer held.release();
         var jobs = [_]MixedJob{
@@ -16499,14 +16502,21 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         }
         try server.query_admission.update(server.queryAdmissionStats().policy_version, 1, server.cfg.query_waiting, false);
         const configured_query_capacity_before_protocols = server.queryAdmissionStats().configured_capacity;
+        qualification_phase = "pgwire socket";
         try @import("sql_pgwire_socket_test.zig").qualify(&server, &storage_manager);
+        qualification_phase = "HTTP/2 socket";
         try qualifyNativeH2Waiting(&server);
         try std.testing.expectEqual(configured_query_capacity_before_protocols, server.queryAdmissionStats().configured_capacity);
         fixture_lifetime.drain();
         {
             // Closing requests cleanup; admission and the request lifetime stay
             // retained until that cleanup physically retires.
-            const stream = (try backend.vtable.open_stream.?(backend.context, alloc, identity, wire_request)).?;
+            qualification_phase = "retained stream";
+            // This is a new statement after the independent socket scenarios.
+            // Its deadline begins here and remains fixed across every page.
+            var stream_request = wire_request;
+            stream_request.deadline = .{ .clock = .awake, .raw = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(10)) };
+            const stream = (try backend.vtable.open_stream.?(backend.context, alloc, identity, stream_request)).?;
             defer stream.close(stream.context);
             try std.testing.expectEqual(@as(usize, 2), fixture_lifetime.references.load(.acquire));
             try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
@@ -16516,7 +16526,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqual(@as(u64, 1), parked_stats.operations);
             try std.testing.expectEqual(@as(u64, 0), parked_stats.runnable_slots);
             try std.testing.expectEqual(@as(u64, 1), parked_stats.output_blocked);
-            var page = try stream.next(stream.context, alloc, wire_request, 1);
+            var page = try stream.next(stream.context, alloc, stream_request, 1);
             defer page.result.deinit();
             try std.testing.expectEqual(@as(usize, 1), page.result.rowCount());
             try std.testing.expectEqual(@as(usize, 2), page.result.columns.len);
@@ -16526,7 +16536,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().runnable_slots);
             try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().output_blocked);
             cancel.store(true, .release);
-            try std.testing.expectError(error.QueryCanceled, stream.next(stream.context, alloc, wire_request, 1));
+            try std.testing.expectError(error.QueryCanceled, stream.next(stream.context, alloc, stream_request, 1));
             try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
         }
         fixture_lifetime.drain();
@@ -16537,6 +16547,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         {
             // Prior stream cancellation has physically retired before these
             // independent invocations receive their own deadline/cancel scope.
+            qualification_phase = "preparation fairness";
             cancel.store(false, .release);
             try server.query_admission.update(server.queryAdmissionStats().policy_version, 4, server.cfg.query_waiting, false);
             const comment: [1 << 20]u8 = @splat('x');
@@ -16665,6 +16676,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         }
     }
 
+    qualification_phase = "SQL parity";
     const reference_cases = [_][]const u8{
         "sql-0172", "sql-0180", "sql-0181", "sql-0183", "sql-0184", "sql-0223", "sql-0224",
         "sql-0229", "sql-0234", "sql-0235", "sql-0236", "sql-0237", "sql-0247", "sql-0297",

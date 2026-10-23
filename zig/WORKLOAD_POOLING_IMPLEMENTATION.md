@@ -24586,3 +24586,29 @@ preserves the intermediate test compilation corrections. Final verification
 confirms every v5 input and both immutable log hashes; the only source difference
 from v3 is the transaction test compatibility update. Full GNU qualification
 remains waived. The broader goal and the socket-test failure remain open.
+
+### Protocol qualification deadline ownership
+
+The retained-stream check after the independent native pgwire and HTTP/2
+scenarios reused the original fixture request's ten-second absolute deadline.
+Those earlier scenarios could consume that deadline before this new statement
+started. The new statement now receives a fresh finite deadline at its own
+entry; every page retains that same deadline. Production deadlines and live
+stream authority are unchanged. Failure diagnostics identify which qualification
+phase failed.
+
+The complete native `sql-protocol-pooling-tests` executable passes both selected
+tests without skips, failures or leaks. All six HTTP/pgwire preparation fairness
+and cancellation cases retire zero scheduler operations/bytes. The same test
+then runs the array and SQL parity campaigns: its body takes 129.4 seconds and
+I/O teardown completes in 42 microseconds. The earlier apparent teardown hang
+was unobserved parity work; the first run after the deadline fix was stopped
+prematurely while a sampled SQL worker was actively executing a set query.
+Its interrupted build receipt is retained and is not claimed as a passing run.
+
+`socket-lifetime-final-verification.json` verifies the successful direct run's
+binary/log hashes against the exact compiled source inventory, with no source
+changes after compilation. The build's error/status/failure-identity checks pass
+45/1/8. This supersedes the previous unresolved protocol qualification. Final
+status commit, backend flush, final durability and retirement admission remain
+open; the full design is not complete. Full GNU qualification remains waived.
