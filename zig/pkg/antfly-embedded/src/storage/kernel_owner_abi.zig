@@ -45,7 +45,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Close preflight fences TTL and sparse producers before derived finalization.
 // Graph metric producer close precedes derived and durable dependency fences.
 // Close preflight drains detached index pins before durable backend admission closes.
-pub const abi_version: u32 = 157;
+// Storage durability providers return owning physical sync operations.
+pub const abi_version: u32 = 158;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

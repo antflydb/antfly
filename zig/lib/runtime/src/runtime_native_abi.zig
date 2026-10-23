@@ -103,7 +103,8 @@ const builtin = @import("builtin");
 // TTL and sparse maintenance retain exclusive controlled close state.
 // Graph metric owners use shared maintenance and exclusive controlled joins.
 // Index managers permanently fence detached graph snapshots during controlled close.
-pub const abi_version: u32 = 97;
+// Physical sync operations retain native state and descriptor admission through controlled retries.
+pub const abi_version: u32 = 98;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

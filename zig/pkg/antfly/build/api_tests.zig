@@ -4382,6 +4382,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-local-decoder-admission-test", "Verify bounded local decode sharing and native sole-slot producer progress")
         .dependOn(&local_decoder_admission_run.step);
 
+    const physical_sync_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/physical_sync_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, physical_sync_root, true, true);
+    physical_sync_root.addImport("antfly_source_root", physical_sync_root);
+    const physical_sync_tests = b.addTest(.{
+        .name = "physical-sync-tests",
+        .root_module = physical_sync_root,
+        .filters = &.{"controlled physical sync"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const physical_sync_run = b.addRunArtifact(physical_sync_tests);
+    physical_sync_run.addArgs(&.{ "--test-filter", "controlled physical sync", "--require-no-skips" });
+    b.step("antfly-physical-sync-test", "Verify owning physical durability operations and controlled retry without synchronous fallback")
+        .dependOn(&physical_sync_run.step);
+
     const storage_read_admission_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/storage_read_admission_test_root.zig"),
         .target = target,

@@ -24260,3 +24260,75 @@ source. The first attempt records a test-only nested-type qualification fix.
 Final status sync, LSM generation-reader drainage and physical index/backend
 I/O still require controlled retirement; this is not full physical-close or full
 design qualification. Full GNU/Linux qualification remains waived.
+
+### Owning physical durability operations
+
+Native storage exposes owning file-content and parent-directory sync operations.
+Preparation, bounded pathname copying, descriptor admission and dispatch happen
+under the original finite caller control. Physical callbacks only open, sync and
+close the prepared path. They do not decode WAL metadata, flush memtables, compact,
+construct manifests or borrow the caller's admission port. Worker refusal returns
+ConcurrencyUnavailable without a synchronous fallback.
+
+An accepted operation retains native storage state, its executor/allocator and
+one process-shared descriptor permit until explicit deinit. That permit bounds
+retained operation metadata as well as in-flight descriptor use, including owners
+whose controlled wait was rejected. A failed handoff, lifetime or reentry leaves
+the same operation available for retry; retry observes one physical result and
+does not issue another sync. Atomic completion is observed while CPU is parked;
+physical join and result publication follow successful original reentry. Quiesced
+deinit performs the mandatory physical join and releases the permit last, outside
+the callback that owns the retained executor.
+
+Descriptor preparation supplies a synchronous adapter for finite wait/retry, so
+callers need no backend-specific progress callback. The existing descriptor FIFO
+now performs a lifetime-only check under its admission mutex. Yielding checkpoints
+and wait/reentry happen after releasing the guard; a caller checkpoint cannot
+retain the descriptor mutex while its CPU is parked. Missing owning providers,
+missing finite authority and unsupported native descriptor ledgers fail closed.
+POSIX native storage and its retained-lease views implement the new capability;
+legacy synchronous and logical-memory providers remain separate.
+
+The operation retains executor and descriptor ownership, not a logical filesystem
+publication generation. Its coordinator must retain WAL/file publication ownership
+through physical completion, including rejected waits. Native ABI 98 and
+storage-owner ABI 158 fence the optional provider extensions and operation layout.
+This is the physical durability layer. Final DB close does not yet use it for WAL
+metadata preparation, ordered WAL sync, final status persistence or backend flush/
+retirement. Those phases need owning resumable coordinators; wrapping an entire
+backend flush as an I/O wait would run backend CPU without execution capacity.
+The full goal stays active. Full GNU/Linux qualification remains waived; Linux
+builds require pinned Nix/glibc Zig.
+
+Pinned Darwin Debug receipt `owning-physical-sync-v4` passes all 82 build steps
+and 88 build-runner tests (63 maintenance, 23 execution-service and two linked
+C-entry close cases). The simple runners pass five named physical-sync cases,
+32 storage-read admission cases, 32 DB cases, 45 named graph-runtime cases and
+21 local-close cases without skips, failures or leaks. Error ABI (45), released
+status ABI (1) and failure identity (8) also pass. Recorded native/schema inputs
+and the immutable log hash match the final source.
+
+The physical matrix covers file and parent-directory durability across successful
+wait, rejected handoff, rejected reentry and original lifetime expiration. It
+closes the native storage owner while I/O is accepted and verifies its state,
+executor and descriptor permit survive rejection and exact retry. Repeated waits
+observe one physical operation, preserve the protected control execution and return all
+state/descriptor ownership on deinit. Descriptor exhaustion rejects the original
+begin without leaking its FIFO node or lease, then retries with the caller's
+finite execution even without a backend progress callback. The checkpoint probe
+rejects any invocation under the descriptor mutex.
+
+Additional cases reject both pre-dispatch metadata allocation failures, missing
+owning providers and unbounded original authority. The real native executor is
+set to refuse concurrent tasks: repeated attempts perform no physical sync and
+leak no descriptor/state capacity; restoring capacity admits exactly one operation.
+A physical FileNotFound remains stable across repeated waits. The first two
+intermediate receipts retain the test-state enum correction and nested callback
+variable-name correction; the third passes the initial four physical cases and
+FD/read/shared-service checks before the real dispatch-refusal regression.
+
+This qualifies the new owning physical-sync provider and the descriptor-guard
+correction. It does not qualify complete controlled WAL or final DB persistence.
+Ordered WAL metadata preparation/sync, status persistence, backend flush and
+physical retirement still require owning coordinator phases. Full GNU/Linux
+qualification remains waived; the full design is unfinished.

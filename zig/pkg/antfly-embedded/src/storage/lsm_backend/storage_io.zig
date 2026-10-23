@@ -294,6 +294,35 @@ pub const RangeReadFuture = struct {
     }
 };
 
+/// Owns one accepted durability operation. A failed controlled wait preserves
+/// the operation for retry; it never cancels or releases accepted physical I/O.
+/// Consumers must serialize wait/deinit and retain this owner after rejection.
+/// This retains executor/descriptor ownership, not a filesystem publication
+/// generation. The caller must keep its WAL/file publication lease through
+/// physical completion, including rejected waits.
+pub const SyncOperation = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+
+    pub const VTable = struct {
+        wait_with_admission: *const fn (*anyopaque, read_admission.Port) anyerror!void,
+        deinit: *const fn (*anyopaque) void,
+    };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn waitWithAdmission(self: *SyncOperation, original: read_admission.Port) !void {
+        try BoundaryAbi.call("wait_with_admission", self.boundary_dispatch, self.vtable.wait_with_admission, .{ self.ptr, original });
+    }
+
+    /// Mandatory physical join under quiesced cleanup ownership. This may
+    /// block and must not be used as automatic cleanup of a rejected wait.
+    pub fn deinit(self: *SyncOperation) void {
+        self.vtable.deinit(self.ptr);
+        self.* = undefined;
+    }
+};
+
 pub const ReadRuntime = if (builtin.os.tag == .freestanding)
     struct {
         pub fn getIo(_: *const ReadRuntime) ?std.Io {
@@ -685,6 +714,8 @@ pub const Storage = struct {
         /// the bytes addressed through this storage implementation.
         supports_host_path_generation_publication: bool = false,
         supports_native_path_locks: bool = false,
+        begin_sync_contents_with_admission: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!SyncOperation = null,
+        begin_sync_parent_with_admission: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!SyncOperation = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -960,6 +991,20 @@ pub const Storage = struct {
     pub fn coldSequentialReaderCapacity(self: Storage) usize {
         if (self.vtable.cold_sequential_reader_capacity) |capacity| return capacity(self.ptr);
         return std.math.maxInt(usize);
+    }
+
+    /// Fail closed without an owning provider; a legacy synchronous sync is
+    /// not an interruptible substitute. No original control escapes this call.
+    pub fn beginSyncFileContentsWithAdmission(self: Storage, path: []const u8, original: read_admission.Port) !SyncOperation {
+        try original.checkpoint();
+        const begin = self.vtable.begin_sync_contents_with_admission orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("begin_sync_contents_with_admission", self.boundary_dispatch, begin, .{ self.ptr, path, original });
+    }
+
+    pub fn beginSyncParentWithAdmission(self: Storage, path: []const u8, original: read_admission.Port) !SyncOperation {
+        try original.checkpoint();
+        const begin = self.vtable.begin_sync_parent_with_admission orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("begin_sync_parent_with_admission", self.boundary_dispatch, begin, .{ self.ptr, path, original });
     }
 
     pub fn syncFileContentsAbsolute(self: Storage, path: []const u8) !void {
@@ -1952,7 +1997,9 @@ else
                 self.admission_changed.broadcast(io);
             };
             while (true) {
-                try control.checkpoint();
+                // Metadata ownership forbids a yielding CPU checkpoint.
+                // Progress/reentry occurs only after releasing this guard.
+                try control.checkLifetime();
                 if (self.admission_head == &waiter and self.makeCapacityAvailableWithoutWaiting(count)) {
                     self.removeAdmissionWaiter(&waiter);
                     queued = false;
@@ -2412,6 +2459,39 @@ const NativeStorageState = struct {
         };
     }
 
+    fn acquireFdPermitWithAdmission(self: *NativeStorageState, control: read_admission.Port) !NativeFdPermit {
+        const retained = try self.acquireLease();
+        errdefer retained.release();
+        const io = retained.threaded.io();
+        const cache = retained.fdCache();
+        const Borrow = struct {
+            original: read_admission.Port,
+            io: std.Io,
+            fn checkpoint(raw: *anyopaque) !void {
+                const borrowed: *@This() = @ptrCast(@alignCast(raw));
+                try borrowed.original.checkpoint();
+            }
+            fn lifetime(raw: *anyopaque) !void {
+                const borrowed: *@This() = @ptrCast(@alignCast(raw));
+                try borrowed.original.checkLifetime();
+            }
+            fn deadline(raw: *anyopaque) !?u64 {
+                const borrowed: *@This() = @ptrCast(@alignCast(raw));
+                return borrowed.original.deadlineNs();
+            }
+            fn progress(raw: *anyopaque) !void {
+                const borrowed: *@This() = @ptrCast(@alignCast(raw));
+                // Reenter before retrying descriptor metadata. The caller
+                // need not supply a backend-specific progress callback.
+                try @import("../../common/cleanup_wait.zig").waitForRetry(borrowed.io, borrowed.original);
+            }
+        };
+        var borrow: Borrow = .{ .original = control, .io = io };
+        const payload: read_admission.Payload = .{ .ptr = &borrow, .vtable = &.{ .checkpoint = Borrow.checkpoint, .check_lifetime = Borrow.lifetime, .deadline_ns = Borrow.deadline, .wait_for_progress = Borrow.progress }, .execution_wait = try control.executionWaitAfterLifetime() };
+        try cache.reserveDescriptorsWithAdmission(io, 1, .init(&payload));
+        return .{ .state = retained, .cache = cache, .io = io, .count = 1 };
+    }
+
     fn tryAcquireFdPermits(self: *NativeStorageState, count: usize) !?NativeFdPermit {
         const retained = try self.retain();
         const io = retained.threaded.io();
@@ -2787,6 +2867,99 @@ else
         }
     };
 
+/// Test-only physical retirement latch. It never participates in production
+/// dispatch and does not retain an admission borrow in a filesystem worker.
+pub const NativeSyncTestControl = struct {
+    pub var pause: std.atomic.Value(bool) = .init(false);
+    pub var started: std.atomic.Value(bool) = .init(false);
+    pub var release: std.atomic.Value(bool) = .init(false);
+    pub var calls: std.atomic.Value(usize) = .init(0);
+};
+
+const NativeSyncOperation = if (!supports_native_storage or builtin.os.tag == .freestanding) struct {} else struct {
+    const Kind = enum { contents, directory };
+    allocator: Allocator,
+    permit: NativeFdPermit,
+    path: []u8,
+    kind: Kind,
+    future: ?std.Io.Future(void) = null,
+    done: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+
+    const vtable: SyncOperation.VTable = .{ .wait_with_admission = waitWithAdmission, .deinit = deinit };
+
+    fn create(state: *NativeStorageState, path: []const u8, kind: Kind, original: read_admission.Port) !SyncOperation {
+        if (comptime !supports_posix_fd_cache) return error.ExecutionWaitUnsupported;
+        if (path.len >= std.fs.max_path_bytes) return error.NameTooLong;
+        _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try original.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        try original.checkpoint();
+        var permit = try state.acquireFdPermitWithAdmission(original);
+        errdefer permit.release();
+        // The retained state owns this allocator and executor. Holding one
+        // shared descriptor permit until deinit bounds accepted operation
+        // metadata as well as physical descriptors, including rejected waits.
+        const allocator = state.allocator;
+        const self = try allocator.create(NativeSyncOperation);
+        errdefer allocator.destroy(self);
+        const path_copy = try allocator.dupe(u8, path);
+        errdefer allocator.free(path_copy);
+        self.* = .{ .allocator = allocator, .permit = permit, .path = path_copy, .kind = kind };
+        try original.checkpoint();
+        // Refuse dispatch failure instead of doing an unbounded synchronous
+        // fallback. Preparation and descriptor admission ran on caller CPU.
+        self.future = try permit.io.concurrent(run, .{self});
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn run(self: *NativeSyncOperation) void {
+        defer self.done.store(true, .release);
+        if (builtin.is_test and NativeSyncTestControl.pause.load(.acquire)) {
+            NativeSyncTestControl.started.store(true, .release);
+            while (!NativeSyncTestControl.release.load(.acquire))
+                self.permit.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        if (builtin.is_test) _ = NativeSyncTestControl.calls.fetchAdd(1, .release);
+        // This worker only opens, syncs and closes the prepared physical path.
+        // It performs no WAL decoding, flush, manifest work or admission call.
+        const result = switch (self.kind) {
+            .contents => fs_paths.syncFilePortable(self.permit.io, self.path),
+            .directory => fs_paths.syncDirPortable(self.permit.io, self.path),
+        };
+        result catch |cause| {
+            self.failure = cause;
+        };
+    }
+
+    fn waitWithAdmission(raw: *anyopaque, original: read_admission.Port) !void {
+        const self: *NativeSyncOperation = @ptrCast(@alignCast(raw));
+        const Ready = struct {
+            fn get(ptr: *anyopaque) anyerror!bool {
+                const operation: *NativeSyncOperation = @ptrCast(@alignCast(ptr));
+                return operation.done.load(.acquire);
+            }
+        };
+        try @import("../../common/cleanup_wait.zig").until(self.permit.io, original, self, Ready.get, null);
+        // Only successful original reentry authorizes the physical join and
+        // result observation. A rejected wait leaves every resource owned.
+        if (self.future) |*future| future.await(self.permit.io);
+        self.future = null;
+        if (self.failure) |cause| return cause;
+    }
+
+    fn deinit(raw: *anyopaque) void {
+        const self: *NativeSyncOperation = @ptrCast(@alignCast(raw));
+        if (self.future) |*future| future.await(self.permit.io);
+        const allocator = self.allocator;
+        var permit = self.permit;
+        allocator.free(self.path);
+        allocator.destroy(self);
+        // Release last: the storage state may destroy its executor/allocator.
+        // Never release it from its own running physical callback.
+        permit.release();
+    }
+};
+
 pub const NativeStorage = if (!supports_native_storage) UnsupportedNativeStorage else if (supports_evented_runtime) EventedNativeStorage else ThreadedNativeStorage;
 const UnsupportedNativeStorage = struct {
     pub const Lease = struct {
@@ -2874,6 +3047,8 @@ const EventedNativeStorage = struct {
         .rename_is_atomic = true,
         .supports_host_path_generation_publication = true,
         .supports_native_path_locks = true,
+        .begin_sync_contents_with_admission = beginSyncContents,
+        .begin_sync_parent_with_admission = beginSyncParent,
     };
 
     pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
@@ -3099,6 +3274,20 @@ const EventedNativeStorage = struct {
         return nativeColdSequentialReaderCapacity(self.state);
     }
 
+    fn beginSyncContents(ptr: *anyopaque, path: []const u8, original: read_admission.Port) !SyncOperation {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        const state = self.state;
+        return NativeSyncOperation.create(state, path, .contents, original);
+    }
+
+    fn beginSyncParent(ptr: *anyopaque, path: []const u8, original: read_admission.Port) !SyncOperation {
+        if (path.len >= std.fs.max_path_bytes) return error.NameTooLong;
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        const state = self.state;
+        const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
+        return NativeSyncOperation.create(state, parent, .directory, original);
+    }
+
     fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
         const self: *NativeStorage = @ptrCast(@alignCast(ptr));
         switch (self.runtime) {
@@ -3233,6 +3422,8 @@ const ThreadedNativeStorage = struct {
         .rename_is_atomic = true,
         .supports_host_path_generation_publication = true,
         .supports_native_path_locks = true,
+        .begin_sync_contents_with_admission = beginSyncContents,
+        .begin_sync_parent_with_admission = beginSyncParent,
     };
 
     pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
@@ -3463,6 +3654,18 @@ const ThreadedNativeStorage = struct {
     fn coldSequentialReaderCapacity(ptr: *anyopaque) usize {
         const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
         return nativeColdSequentialReaderCapacity(state);
+    }
+
+    fn beginSyncContents(ptr: *anyopaque, path: []const u8, original: read_admission.Port) !SyncOperation {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        return NativeSyncOperation.create(state, path, .contents, original);
+    }
+
+    fn beginSyncParent(ptr: *anyopaque, path: []const u8, original: read_admission.Port) !SyncOperation {
+        if (path.len >= std.fs.max_path_bytes) return error.NameTooLong;
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
+        return NativeSyncOperation.create(state, parent, .directory, original);
     }
 
     fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -6626,4 +6829,246 @@ test "generation tree accounting respects directory boundaries (#1210)" {
     defer a.free(file);
     try native_storage.writeFileAbsolute(file, "123456789");
     try std.testing.expectEqual(@as(u64, 9), try native_storage.treeBytes(a, path));
+}
+
+const SyncTestControl = struct {
+    const cpu = @import("../../common/runnable_scheduler.zig");
+    const now = @import("antfly_platform").time.monotonicNs;
+    const Mode = enum { success, begin_failure, end_failure, expired };
+    execution: ?*cpu.Execution = null,
+    scheduler: ?*cpu.Scheduler = null,
+    deadline_ns: u64 = 0,
+    mode: Mode = .success,
+    begins: usize = 0,
+    ends: usize = 0,
+    release_pool: ?*NativeStoragePool = null,
+    held_descriptors: usize = 0,
+    fn lifetime(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.execution) |execution| try execution.checkLifetime() else if (now() >= self.deadline_ns) return error.DeadlineExceeded;
+        if (self.mode == .expired and self.begins != 0) return error.DeadlineExceeded;
+    }
+    fn checkpoint(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try lifetime(raw);
+        if (comptime supports_posix_fd_cache) if (self.release_pool) |pool| {
+            if (!pool.fd_cache.admission_mutex.tryLock()) return error.TestUnexpectedResult;
+            pool.fd_cache.admission_mutex.unlock(std.testing.io);
+        };
+        if (self.execution) |execution| if (self.scheduler.?.state(&execution.entry.?) != .running) return error.InvalidRunnableTransition;
+    }
+    fn deadline(raw: *anyopaque) !?u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (self.execution) |execution| execution.entry.?.options.deadline_ns else self.deadline_ns;
+    }
+    fn begin(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.begins += 1;
+        if (self.mode == .begin_failure) return error.NotFound;
+        if (self.execution) |execution| try execution.park(.resource_blocked);
+        if (self.mode != .expired) NativeSyncTestControl.release.store(true, .release);
+        if (self.release_pool) |pool| {
+            pool.releaseDescriptorsForTest(std.testing.io, self.held_descriptors);
+            self.held_descriptors = 0;
+        }
+    }
+    fn end(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.ends += 1;
+        NativeSyncTestControl.release.store(true, .release);
+        if (self.mode == .end_failure) return error.Canceled;
+        if (self.execution) |execution| try execution.enter(.query);
+    }
+    fn payload(self: *@This()) read_admission.Payload {
+        return .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .check_lifetime = lifetime, .deadline_ns = deadline }, .execution_wait = .{ .ptr = self, .begin = begin, .end = end } };
+    }
+};
+
+test "controlled physical sync retains accepted file and directory work through original failures and storage close" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const cpu = SyncTestControl.cpu;
+    const now = SyncTestControl.now;
+    inline for (.{ false, true }) |directory_sync| {
+        for (std.enums.values(SyncTestControl.Mode)) |mode| {
+            const a = std.testing.allocator;
+            var pool = NativeStoragePool.initWithCapacityForTest(a, 8);
+            defer pool.deinit();
+            var native = try NativeStorage.initWithPool(a, .threaded, &pool);
+            var native_live = true;
+            defer if (native_live) native.deinit();
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/sync", .{tmp.sub_path});
+            defer a.free(path);
+            try native.storage().writeFileAbsolute(path, "durable");
+            var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+            defer slots.close();
+            var execution: cpu.Execution = .{};
+            defer execution.finish();
+            try execution.start(&slots, .{ .io = std.testing.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .query);
+            var health: cpu.Execution = .{};
+            defer health.finish();
+            try health.start(&slots, .{ .io = std.testing.io, .native_now_ns = now }, .control);
+            var control: SyncTestControl = .{ .execution = &execution, .scheduler = &slots };
+            var payload = control.payload();
+            const original = read_admission.Port.init(&payload);
+            NativeSyncTestControl.pause.store(true, .release);
+            NativeSyncTestControl.started.store(false, .release);
+            NativeSyncTestControl.release.store(false, .release);
+            NativeSyncTestControl.calls.store(0, .release);
+            defer NativeSyncTestControl.pause.store(false, .release);
+            var operation = if (directory_sync) try native.storage().beginSyncParentWithAdmission(path, original) else try native.storage().beginSyncFileContentsWithAdmission(path, original);
+            var live = true;
+            defer {
+                NativeSyncTestControl.release.store(true, .release);
+                if (live) operation.deinit();
+            }
+            const until = now() + 5 * std.time.ns_per_s;
+            while (!NativeSyncTestControl.started.load(.acquire)) {
+                if (now() >= until) return error.TestUnexpectedResult;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            const identity = operation.ptr;
+            var lease = try native.acquireLease();
+            native.deinit();
+            native_live = false;
+            try std.testing.expectError(error.StorageClosed, lease.storage().beginSyncFileContentsWithAdmission(path, original));
+            lease.deinit();
+            try std.testing.expectEqual(@as(usize, 1), pool.retainedStates());
+            control.mode = mode;
+            const result = operation.waitWithAdmission(original);
+            if (mode == .success) try result else {
+                try std.testing.expectError(switch (mode) {
+                    .begin_failure => error.NotFound,
+                    .end_failure => error.Canceled,
+                    .expired => error.DeadlineExceeded,
+                    else => unreachable,
+                }, result);
+                try std.testing.expect(operation.ptr == identity);
+                try std.testing.expectEqual(@as(usize, 1), pool.retainedStates());
+                try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_admitted_descriptors);
+                if (mode == .begin_failure) try std.testing.expectEqual(@as(usize, 0), NativeSyncTestControl.calls.load(.acquire));
+                if (mode == .end_failure) try execution.enter(.query);
+                control.mode = .success;
+                NativeSyncTestControl.release.store(true, .release);
+                try operation.waitWithAdmission(original);
+            }
+            try operation.waitWithAdmission(original);
+            try std.testing.expectEqual(@as(usize, 1), NativeSyncTestControl.calls.load(.acquire));
+            try std.testing.expectEqual(control.begins, control.ends + @as(usize, if (mode == .begin_failure) 1 else 0));
+            try std.testing.expectEqual(cpu.State.running, slots.state(&health.entry.?));
+            operation.deinit();
+            live = false;
+            try std.testing.expectEqual(@as(usize, 0), pool.retainedStates());
+            try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+        }
+    }
+}
+
+test "controlled physical sync descriptor admission rejects original failure and retries without leaking capacity" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 4);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+    const io = std.testing.io;
+    var held: usize = 0;
+    while (pool.fd_cache.tryReserveDescriptors(io, 1)) held += 1;
+    try std.testing.expect(held != 0);
+    var control: SyncTestControl = .{ .deadline_ns = SyncTestControl.now() + 5 * std.time.ns_per_s, .mode = .begin_failure, .release_pool = &pool, .held_descriptors = held };
+    defer if (control.held_descriptors != 0) pool.releaseDescriptorsForTest(io, control.held_descriptors);
+    var payload = control.payload();
+    const original = read_admission.Port.init(&payload);
+    try std.testing.expectError(error.NotFound, native.storage().beginSyncFileContentsWithAdmission("/missing-antfly-physical-sync", original));
+    try std.testing.expectEqual(held, pool.snapshotStats().fd_admitted_descriptors);
+    control.mode = .success;
+    var operation = try native.storage().beginSyncFileContentsWithAdmission("/missing-antfly-physical-sync", original);
+    defer operation.deinit();
+    try std.testing.expectEqual(@as(usize, 0), control.held_descriptors);
+    try std.testing.expectError(error.FileNotFound, operation.waitWithAdmission(original));
+    // Physical errors are stable observations; retry never reissues the syscall.
+    try std.testing.expectError(error.FileNotFound, operation.waitWithAdmission(original));
+}
+
+test "controlled physical sync allocation rejection returns descriptor and state ownership before dispatch" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    for (0..2) |failure_offset| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 4);
+        defer pool.deinit();
+        var native = try NativeStorage.initWithPool(failing.allocator(), .threaded, &pool);
+        defer native.deinit();
+        var control: SyncTestControl = .{ .deadline_ns = SyncTestControl.now() + 5 * std.time.ns_per_s };
+        var payload = control.payload();
+        failing.fail_index = failing.alloc_index + failure_offset;
+        const result = native.storage().beginSyncFileContentsWithAdmission("/unissued-sync", .init(&payload));
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |value| {
+            var operation = value;
+            operation.deinit();
+            return error.TestUnexpectedResult;
+        } else |cause| try std.testing.expectEqual(error.OutOfMemory, cause);
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(@as(usize, 1), pool.retainedStates());
+    }
+}
+
+test "controlled physical sync refuses legacy provider fallback and unbounded original authority" {
+    var memory = MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    const storage = memory.storage();
+    try storage.writeFileAbsolute("/sync", "payload");
+    try storage.syncFileContentsAbsolute("/sync");
+    var control: SyncTestControl = .{ .deadline_ns = SyncTestControl.now() + 5 * std.time.ns_per_s };
+    var payload = control.payload();
+    try std.testing.expectError(error.ExecutionWaitUnsupported, storage.beginSyncFileContentsWithAdmission("/sync", .init(&payload)));
+    try std.testing.expectError(error.ExecutionWaitUnsupported, storage.beginSyncParentWithAdmission("/sync", .init(&payload)));
+    try std.testing.expectEqual(@as(usize, 0), control.begins);
+    if (supports_posix_fd_cache) {
+        var native = try NativeStorage.init(std.testing.allocator, .threaded);
+        defer native.deinit();
+        payload.execution_wait = null;
+        try std.testing.expectError(error.ExecutionWaitUnsupported, native.storage().beginSyncFileContentsWithAdmission("/unissued", .init(&payload)));
+        payload = control.payload();
+        const NoDeadline = struct {
+            fn get(_: *anyopaque) !?u64 {
+                return null;
+            }
+        };
+        payload.vtable = &.{ .checkpoint = SyncTestControl.checkpoint, .check_lifetime = SyncTestControl.lifetime, .deadline_ns = NoDeadline.get };
+        try std.testing.expectError(error.ExecutionWaitUnsupported, native.storage().beginSyncFileContentsWithAdmission("/unissued", .init(&payload)));
+    }
+}
+
+test "controlled physical sync refuses actual executor saturation without inline I/O or leaked permits" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 4);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+    NativeSyncTestControl.pause.store(false, .release);
+    NativeSyncTestControl.calls.store(0, .release);
+    var control: SyncTestControl = .{ .deadline_ns = SyncTestControl.now() + 5 * std.time.ns_per_s };
+    var payload = control.payload();
+    const original = read_admission.Port.init(&payload);
+    // Change the real executor before it has any concurrent tasks. Refusal is
+    // produced by std.Io.Threaded, not by a sync-provider test replacement.
+    const previous_limit = native.state.threaded.concurrent_limit;
+    native.state.threaded.concurrent_limit = .nothing;
+    for (0..2) |_| {
+        const result = native.storage().beginSyncFileContentsWithAdmission("/unissued-antfly-sync", original);
+        if (result) |value| {
+            var operation = value;
+            operation.deinit();
+            return error.TestUnexpectedResult;
+        } else |cause| try std.testing.expectEqual(error.ConcurrencyUnavailable, cause);
+        try std.testing.expectEqual(@as(usize, 0), NativeSyncTestControl.calls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(@as(usize, 1), pool.retainedStates());
+    }
+    native.state.threaded.concurrent_limit = previous_limit;
+    var operation = try native.storage().beginSyncFileContentsWithAdmission("/unissued-antfly-sync", original);
+    defer operation.deinit();
+    try std.testing.expectError(error.FileNotFound, operation.waitWithAdmission(original));
+    try std.testing.expectEqual(@as(usize, 1), NativeSyncTestControl.calls.load(.acquire));
 }
