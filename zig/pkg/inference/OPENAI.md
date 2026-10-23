@@ -405,6 +405,15 @@ For native-checkpoint workload comparisons, use `qualify_matched_antfly.py`,
 `scripts/gemma4/`. These consume a passing public checkpoint reference, compare
 exact token IDs and generation settings, and keep full replay separate from
 portable restore and resident reuse. Run them serially on an idle device.
+The llama runner defaults to `--input-mode chat`; formatting and tokenization
+are included on both servers. The comparator rejects pretokenized or unlabeled
+historical runs as end-to-end evidence. An untimed template/tokenizer preflight
+requires identical token IDs, and every timed response must attest zero prefix
+reuse and matching output accounting. `--input-mode token_ids` remains available
+only as a separate inference diagnostic. Use `--reference-binary` on the Antfly
+runner to measure a saved qualified executable with an updated harness: the
+binary hash must still match the passing reference, and its original source
+provenance is recorded separately from the current harness checkout.
 The [validation guide](../../../docs/design/inference/native-kv-compaction.md#reproducing-checks)
 lists the maintained runners. Matching prompt counts alone is insufficient,
 and measured latency does not substitute for answer-quality qualification.

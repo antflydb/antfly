@@ -8,7 +8,8 @@ import hashlib
 import json
 from pathlib import Path
 
-from qualify_matched_llama import percentiles,content_token_count
+from qualify_matched_llama import percentiles,content_token_count,validate_result
+from matched_chat import request_identity,validate_chat
 from native_phase_timing import latency_sampling_qualified
 from native_benchmark_fixture import LOGICAL_TOKENS,MODEL_IDENTITY
 
@@ -32,6 +33,19 @@ def measured_rows(report):
 
 
 def compare(native,llama):
+    if native.get('input_mode')!='chat' or llama.get('input_mode')!='chat':
+        raise ValueError('end-to-end comparison requires chat input on both servers; pretokenized or unlabeled reports are diagnostic only')
+    if native.get('endpoint')!='/ai/v1/generate' or llama.get('endpoint')!='/v1/chat/completions':
+        raise ValueError('unexpected timed chat endpoints')
+    if (native.get('chat_request_sha256')!=request_identity(native['request']) or
+            llama.get('chat_request_sha256')!=request_identity(llama['request']) or
+            native['chat_request_sha256']!=llama['chat_request_sha256']):
+        raise ValueError('chat messages or generation parameters differ')
+    preflight=llama['template_preflight']
+    if (preflight.get('verified') is not True or
+            preflight.get('logical_tokens')!=llama['fixture']['logical_tokens'] or
+            preflight.get('token_bytes_sha256')!=llama['fixture']['token_bytes_sha256']):
+        raise ValueError('exact chat template/tokenizer verification missing')
     a=measured_rows(native);b=measured_rows(llama)
     if native.get('sampling_profile','extended')!=llama.get('sampling_profile','extended'):
         raise ValueError('sampling profiles differ')
@@ -48,10 +62,16 @@ def compare(native,llama):
         raise ValueError('hardware/driver mismatch')
     request=native['request'];settings=llama['request_settings']
     if (request.get('temperature')!=0 or settings.get('temperature')!=0 or
-            request.get('max_tokens')!=settings.get('n_predict') or request.get('max_tokens')!=16 or
+            request.get('max_tokens')!=settings.get('max_tokens') or request.get('max_tokens')!=16 or
             request.get('prompt_cache') is not False or settings.get('cache_prompt') is not False or
-            request.get('cache_dtype')!='f16' or settings.get('repeat_penalty')!=1):
+            request.get('cache_dtype')!='f16' or settings.get('repeat_penalty')!=1 or
+            request.get('stream') is not True or settings.get('stream') is not True or
+            request.get('chat_template_kwargs')!={'enable_thinking':False}):
         raise ValueError('generation settings mismatch')
+    if any(llama['request'].get(key)!=value for key,value in settings.items()):
+        raise ValueError('llama request settings do not match the timed request')
+    try:validate_result(llama['chat_preflight'],logical,5,'violet-729','replay')
+    except AssertionError as error:raise ValueError(str(error)) from error
     if native['worker'].get('server_kind')!='standalone' or native['worker'].get('stopped') is not True or llama.get('process_group_stopped') is not True:
         raise ValueError('serving scope or cleanup unverified')
     # Verify f16 KV for llama from the actual recorded launch, not a label.
@@ -69,11 +89,10 @@ def compare(native,llama):
                 if usage['prompt_tokens']!=logical or usage.get('cached_prompt_tokens',0)!=0:
                     raise ValueError('Antfly replay reused or changed the prompt')
             else:
-                timing=result['timings'];raw_count=result['tokens_predicted'];text=result['content'].strip()
-                if (result['tokens_evaluated']!=logical or timing['prompt_n']!=logical or timing['cache_n']!=0 or
-                        timing['predicted_n']!=raw_count or result['stop_type']!='eos' or result['truncated'] is not False):
-                    raise ValueError('llama replay reused, truncated or changed the workload')
-                try:count=content_token_count(result)
+                text=result['content'].strip()
+                try:
+                    validate_chat(result,logical,llama['chat_preflight'])
+                    count=content_token_count(llama['chat_preflight'])
                 except AssertionError as error:raise ValueError(str(error)) from error
             if type(count) is not int or not 0<count<=16 or text!='violet-729':raise ValueError('invalid generated answer/count')
             if expected_count is None:expected_count=count;expected_text=text
@@ -83,9 +102,9 @@ def compare(native,llama):
     ratios={metric:{q:summaries['antfly'][metric][q]/summaries['llama'][metric][q] for q in ('p50','p95')}
             for metric in ('total_seconds','first_content_seconds')}
     limits={'p50':1.25,'p95':1.5}
-    return {'scope':'One designated full-prompt-replay workload; total wall latency gate, first-content ratios reported separately',
+    return {'scope':'Chat-to-chat full prompt replay including server formatting/tokenization and streaming through DONE; first-content ratios reported separately',
             'size':size,'logical_tokens':logical,'output_tokens':expected_count,'comparable':True,
-            'output_accounting':'Content tokens exclude the verified terminal Gemma turn token (106). Raw counters and full completion wall time remain unchanged.',
+            'output_accounting':'Untimed raw-token preflight verifies EOS-inclusive output. Every timed chat must match its answer and raw count. Full completion wall time remains unchanged; timed chat does not expose per-token IDs.',
             'samples':{'antfly':len(a),'llama':len(b)},'sampling_profile':native.get('sampling_profile','extended'),
             'sampling_scope':'Observed workload percentiles; bounded sampling does not establish extended-run tail reliability.',
             'latency_seconds':summaries,'antfly_over_llama':ratios,

@@ -1,9 +1,10 @@
-"""Exact-token llama.cpp reference measurements; no Antfly parity claim.
+"""Chat-to-chat llama.cpp reference measurements; no automatic parity claim.
 
 Replay and resident-prefix reuse are separate workloads. Portable checkpoint
 restore is not equivalent to resident reuse. Run serially after CUDA compilation
 and other model campaigns finish. The inspected source checkout differs from the
 pinned release: actual HTTP token/cache accounting must validate its behavior.
+The optional token_ids mode is an inference diagnostic, not end-to-end chat.
 """
 import argparse
 import copy
@@ -26,6 +27,7 @@ from qualify_attention_match_queries import active_group_members
 
 from native_benchmark_fixture import qualified_fixture
 from native_phase_timing import latency_sampling_qualified
+from matched_chat import post_json, read_chat, request_identity, validate_chat, verify_template
 
 
 def percentiles(values,allow_zero=False):
@@ -183,6 +185,8 @@ def main():
     parser.add_argument('--assets-root',type=Path,default=ROOT,help='Root containing the pinned .models and .cache/llama-* assets')
     parser.add_argument('--size',choices=['8k','32k'],required=True)
     parser.add_argument('--mode',choices=['replay','resident'],default='replay')
+    parser.add_argument('--input-mode',choices=['chat','token_ids'],default='chat',
+                        help='Chat includes server formatting/tokenization; token_ids is a separate inference diagnostic')
     parser.add_argument('--reference',type=Path,required=True,help='passing Antfly public checkpoint campaign for this exact token fixture')
     parser.add_argument('--checkpoint',type=Path,required=True,help='checkpoint exported by the passing reference campaign')
     parser.add_argument('--output',type=Path,required=True)
@@ -192,6 +196,7 @@ def main():
     parser.add_argument('--samples',type=int)
     parser.add_argument('--smoke',action='store_true',help='permit fewer samples; never qualifies release sampling')
     args=parser.parse_args()
+    if args.input_mode=='chat' and args.mode!='replay':parser.error('chat comparison requires full replay')
     if args.samples is None: args.samples={'bounded':20,'extended':100}[args.sampling_profile]
     args.assets_root=args.assets_root.resolve()
     if args.warmups<0 or args.samples<1:parser.error('invalid sample counts')
@@ -199,7 +204,7 @@ def main():
     if args.output.exists():raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True,exist_ok=True)
     evidence={'passed':False,'production_ready':False,'generation_latency_gate_qualified':False,
-              'scope':__doc__,'mode':args.mode,'size':args.size,'smoke':args.smoke,
+              'scope':__doc__,'mode':args.mode,'size':args.size,'smoke':args.smoke,'input_mode':args.input_mode,
               'warmups_requested':args.warmups,'samples_requested':args.samples,'sampling_profile':args.sampling_profile,'observations':[],
               'runner_sha256':sha256_file(Path(__file__)),'reference_sha256':sha256_file(args.reference),
               'assets_root':str(args.assets_root)}
@@ -213,6 +218,18 @@ def main():
         token_ids=fixture.pop('token_ids')
         body={'prompt':token_ids,'n_predict':16,'temperature':0,'repeat_penalty':1,
               'cache_prompt':False,'stream':False,'return_tokens':True}
+        endpoint='/completion'
+        if args.input_mode=='chat':
+            from qualify_attention_match_queries import requests
+            body=next(iter(requests('google/gemma-4-E4B-it-qat-q4_0-gguf','f16',
+                                    [742 if args.size=='8k' else 2975],True,'fact')))
+            for key in ('cache_dtype','context_management'):body.pop(key)
+            body.update(cache_prompt=False,repeat_penalty=1)
+            endpoint='/v1/chat/completions'
+            evidence['chat_request_sha256']=request_identity(body)
+            evidence['request']=body
+        evidence['endpoint']=endpoint
+        evidence['chat_helper_sha256']=sha256_file(BASE/'matched_chat.py')
         evidence['fixture_helper_sha256']=sha256_file(BASE/'native_benchmark_fixture.py')
         prior=reference['exporter']['requests']
         prepared=next(row['result'] for row in prior if row['kind']=='prepare')
@@ -241,11 +258,12 @@ def main():
         command=[str(loader),'--library-path',library_path,str(binary),'-m',str(model),
                  '--host','127.0.0.1','--port',str(args.port),'-c','32768','-np','1',
                  '-b','512','-ub','512','-ngl','999','-fa','on','-ctk','f16','-ctv','f16','--no-context-shift']
+        if args.input_mode=='chat':command+=['--jinja','--alias',body['model']]
         hardware=cuda_device_evidence()
         if len(hardware)!=1 or hardware[0]['name']!='NVIDIA L4':raise AssertionError('expected the single designated L4')
         evidence.update(command=command,model_sha256=expected_model,fixture=fixture,
                         model_path=str(model.resolve()),hardware=hardware,
-                        request_settings={k:v for k,v in body.items() if k!='prompt'})
+                        request_settings={k:v for k,v in body.items() if k not in ('prompt','messages')})
         environment={key:value for key,value in os.environ.items()
                      if not key.startswith(('LLAMA_','GGML_')) and key!='LD_PRELOAD'}
         evidence.update(server_cwd=str(release),
@@ -271,6 +289,15 @@ def main():
             gpu_pids=subprocess.check_output(['nvidia-smi','--query-compute-apps=pid','--format=csv,noheader'],text=True)
             if {int(pid) for pid in gpu_pids.split()}!={process.pid}:
                 raise AssertionError('GPU attribution does not match the isolated llama process')
+            if args.input_mode=='chat':
+                evidence['template_preflight']=verify_template(args.port,body,token_ids)
+                preflight=post_json(args.port,endpoint,dict(body,stream=False,verbose=True,return_tokens=True))
+                raw=preflight['__verbose']
+                validate_result(raw,len(token_ids),expected_count,expected_output,'replay')
+                raw.pop('prompt',None)
+                evidence['chat_preflight']=raw
+                evidence['cold_scope']='First timed request after untimed template and generation preflight; excluded from warm percentiles, not a model cold-start measurement'
+                publish()
             generated_tokens=None
             for index in range(1+args.warmups+args.samples):
                 request=copy.deepcopy(body)
@@ -280,13 +307,17 @@ def main():
                 evidence['observations'].append(row);publish()
                 try:
                     started=time.monotonic()
-                    connection.request('POST','/completion',json.dumps(request).encode(),{'Content-Type':'application/json'})
+                    connection.request('POST',endpoint,json.dumps(request).encode(),{'Content-Type':'application/json'})
                     response=connection.getresponse()
                     if response.status!=200:raise AssertionError(f'llama HTTP {response.status}: {response.read(65536)!r}')
                     if not response.getheader('Content-Type','').startswith('text/event-stream'):
                         raise AssertionError('missing streamed completion')
-                    row.update(read_completion(response,started))
+                    row.update((read_chat if args.input_mode=='chat' else read_completion)(response,started))
                 finally:connection.close()
+                if args.input_mode=='chat':
+                    validate_chat(row['result'],len(token_ids),evidence['chat_preflight'])
+                    row['passed']=True;publish()
+                    continue
                 validate_result(row['result'],len(token_ids),expected_count,expected_output,'replay' if index==0 else args.mode)
                 row['output_accounting']={'raw_predicted_tokens':row['result']['tokens_predicted'],
                     'content_tokens':content_token_count(row['result']),
@@ -296,7 +327,8 @@ def main():
                 row['passed']=True;publish()
             measured=[row for row in evidence['observations'] if not row['cold'] and not row['warmup']]
             evidence['latency_seconds']={key:percentiles([row[key] for row in measured])
-                                         for key in ('total_seconds','ttft_seconds','first_content_seconds')}
+                                         for key in (('total_seconds','first_content_seconds') if args.input_mode=='chat'
+                                                     else ('total_seconds','ttft_seconds','first_content_seconds'))}
             evidence['engine_phase_ms']={key:percentiles([row['result']['timings'][key] for row in measured],allow_zero=True)
                                          for key in ('prompt_ms','predicted_ms')}
         if sha256_file(model)!=expected_model or sha256_file(args.reference)!=evidence['reference_sha256']:
@@ -304,6 +336,7 @@ def main():
         for path,digest in evidence['runtime_sha256'].items():
             if sha256_file(Path(path))!=digest:raise AssertionError(f'loaded runtime artifact changed: {path}')
         if sha256_file(Path(__file__))!=evidence['runner_sha256']:raise AssertionError('runner changed')
+        if sha256_file(BASE/'matched_chat.py')!=evidence['chat_helper_sha256']:raise AssertionError('chat helper changed')
         if sha256_file(BASE/'native_benchmark_fixture.py')!=evidence['fixture_helper_sha256'] or sha256_file(args.checkpoint)!=fixture['checkpoint_sha256_to_reverify']:
             raise AssertionError('checkpoint or fixture extractor changed')
         evidence.update(passed=True,sampling_qualified=latency_sampling_qualified(args.sampling_profile,args.warmups,len(measured),args.smoke))

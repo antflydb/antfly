@@ -4,7 +4,7 @@ import json
 import time
 import unittest
 
-from qualify_matched_antfly import read_timed_response,reference_result,validate_observation
+from qualify_matched_antfly import read_timed_response,reference_result,validate_observation,reference_binary_source
 
 
 def result(cached=False):
@@ -18,6 +18,15 @@ def event(value):return ('data: '+json.dumps(value)+'\n\n').encode()
 
 
 class MatchedAntflyEvidenceTests(unittest.TestCase):
+    def test_new_harness_can_measure_saved_binary_but_never_substitute_another_build(self):
+        reference={'binary_sha256':'a'*64,'source':{'head':'qualified'}}
+        newer={'head':'updated-harness'}
+        self.assertEqual(reference_binary_source(reference,'a'*64,newer,True),reference['source'])
+        with self.assertRaises(AssertionError):
+            reference_binary_source(reference,'a'*64,newer)
+        with self.assertRaises(AssertionError):
+            reference_binary_source(reference,'b'*64,newer,True)
+
     def test_content_timing_stops_at_done_without_waiting_for_eof(self):
         wire=(event({'choices':[{'index':0,'delta':{'role':'assistant'}}]})+
               event({'choices':[{'index':0,'delta':{'content':'violet-729'},'finish_reason':'stop'}]})+

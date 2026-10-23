@@ -27,6 +27,7 @@ from qualify_matched_llama import percentiles,require_idle
 from native_benchmark_fixture import qualified_fixture
 from native_phase_timing import latency_sampling_qualified
 from native_phase_timing import GENERATION_PHASES, generation_timing, request_log
+from matched_chat import request_identity
 
 
 class TimedStream:
@@ -66,6 +67,12 @@ def reference_result(reference,kind,logical_tokens):
     return found[0]
 
 
+def reference_binary_source(reference,binary_sha256,source,saved_binary=False):
+    if reference['binary_sha256']!=binary_sha256 or (not saved_binary and reference['source']!=source):
+        raise AssertionError('reference must qualify this exact source and binary')
+    return reference['source']
+
+
 def validate_observation(row,expected,logical_tokens,mode):
     result=row['result'];usage=result['usage']
     if mode not in ('replay','portable_restore'):raise ValueError('unknown workload mode')
@@ -89,6 +96,8 @@ def main():
     parser.add_argument('--models-dir',type=Path,default=Path('.models'))
     parser.add_argument('--model',default='google/gemma-4-E4B-it-qat-q4_0-gguf')
     parser.add_argument('--reference',type=Path,required=True)
+    parser.add_argument('--reference-binary',action='store_true',
+                        help='Measure the exact saved qualified binary with a newer harness; retain its original source provenance')
     parser.add_argument('--checkpoint',type=Path,required=True,help='checkpoint exported by the passing reference campaign')
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--size',choices=['8k','32k'],required=True)
@@ -123,14 +132,14 @@ def main():
         pinned={args.server:evidence['binary_sha256'],args.reference:evidence['reference_sha256'],
                 Path(__file__):evidence['runner_sha256'],
                 args.checkpoint:fixture['checkpoint_sha256_to_reverify']}
-        for helper in [BASE/'qualify_matched_llama.py',BASE/'native_benchmark_fixture.py',BASE/'native_phase_timing.py']:
+        for helper in [BASE/'qualify_matched_llama.py',BASE/'native_benchmark_fixture.py',BASE/'native_phase_timing.py',BASE/'matched_chat.py']:
             pinned[helper]=sha256_file(helper)
         model=args.models_dir/args.model/'gemma-4-E4B_q4_0-it.gguf'
         pinned[model]='676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee'
         for path,digest in pinned.items():
             if sha256_file(path)!=digest:raise AssertionError(f'input artifact changed: {path}')
-        if reference['binary_sha256']!=evidence['binary_sha256'] or reference['source']!=evidence['source']:
-            raise AssertionError('reference must qualify this exact source and binary')
+        evidence['binary_source']=reference_binary_source(reference,evidence['binary_sha256'],evidence['source'],args.reference_binary)
+        evidence['saved_reference_binary']=args.reference_binary
         def prior(kind):return reference_result(reference,kind,fixture['logical_tokens'])
         if prior('prepare')['file_sha256']!=fixture['checkpoint_sha256_to_reverify']:
             raise AssertionError('reference exported different token/identity state')
@@ -141,6 +150,9 @@ def main():
         hardware=cuda_device_evidence()
         if len(hardware)!=1 or hardware[0]['name']!='NVIDIA L4':raise AssertionError('expected the designated L4')
         evidence.update(hardware=hardware,fixture=fixture,request=body,
+                        input_mode='chat' if args.mode=='replay' else 'portable_restore',
+                        endpoint='/ai/v1/generate' if args.mode=='replay' else '/ai/v1/chat/context/resume',
+                        chat_request_sha256=request_identity(body),
                         input_sha256={str(p):d for p,d in pinned.items()},
                         timing_limits='First content and first-content-to-DONE are API wall observations. Pipeline phase milliseconds come from the existing generation timer; they include callback work and are not GPU-event timings. Portable-restore prefill includes restore/suffix execution.')
         require_idle();publish()

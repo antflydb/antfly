@@ -206,16 +206,56 @@ Each also passed 100 mixed requests with 10 fresh actual compactions, the hard
 quiescent-growth diagnostic. Request overlap is bounded; GPU execution is serial.
 The 20 successive real-model compaction cycles were explicitly deferred.
 
-### Matched full replay
+### Chat-to-chat full replay
+
+The corrected benchmark sends the same chat messages to both servers and checks
+identical rendered token IDs against the qualified checkpoint. Timings include
+JSON serialization, server formatting/tokenization, and streaming through
+`[DONE]`. Both use the same E4B Q4_0 GGUF and FP16 KV cache, with prefix reuse
+disabled, five warmups and 20 measured requests. The saved qualified Antfly
+binary uses eager CUDA; pinned llama.cpp b11669 uses its graph-enabled serving
+path. These are current serving configurations, not identical implementations.
+
+| Prefix tokens | Antfly p50 / p95 (s) | llama.cpp p50 / p95 (s) | Antfly / llama.cpp p50 |
+| --- | ---: | ---: | ---: |
+| 8,189 | 2.130 / 2.150 | 2.048 / 2.059 | 1.040x |
+| 32,752 | 11.233 / 11.305 | 10.751 / 10.768 | 1.045x |
+
+These runs still favor llama.cpp. The initial chat-based 8K llama measurement
+was 1.992 s median; a brief harness test overlapped that campaign. The entire
+reference was repeated after all tests, with the repeat selected in advance
+regardless of its result. Both reports are retained. The difference between
+passes also shows why small speedup claims need repeated isolated comparisons.
+These five-content-token responses establish short-answer request latency, not
+sustained decode throughput. No inference implementation changed in this audit.
+
+Reports are retained under the performance worktree's
+`.cache/e4b-latency/chat-baseline/`; `final-comparison.json` identifies the primary
+8K/32K comparisons and their hashes. This remeasures the saved qualified binary,
+not the newly built main-integration executable.
+
+### Historical full replay measurements
 
 The same model and exact prompt tokens are replayed from scratch, with five
 warmups and 20 samples per runtime. The designated answer has five content
 tokens; the comparator reconciles Gemma turn-token accounting explicitly.
+These recorded wall times used different input representations: Antfly received
+chat text, while llama.cpp received pretokenized IDs. They therefore do not
+establish an end-to-end latency gap, despite matching model tokens and answers.
 
 | Prefix tokens | Antfly full replay p50 / p95 (s) | llama.cpp p50 / p95 (s) | Antfly / llama.cpp p50 |
 | --- | ---: | ---: | ---: |
 | 8,189 | 2.125 / 2.177 | 1.975 / 1.999 | 1.076x |
 | 32,752 | 11.248 / 11.494 | 10.586 / 10.625 | 1.063x |
+
+New comparisons require chat input on both servers, including server-side
+formatting and tokenization in the timed interval. The llama runner defaults to
+`--input-mode chat` and checks rendered token IDs against the checkpoint before
+timing. It verifies raw output and EOS in an untimed preflight, then requires
+the same answer, output count and zero cached tokens in every streamed request.
+Both timers include serialization through `[DONE]`. The comparator rejects old
+unlabeled reports and `--input-mode token_ids` diagnostics. Five-token answers
+measure first-content and total request latency, not sustained decode throughput.
 
 ### Provenance and scope
 
