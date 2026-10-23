@@ -442,7 +442,13 @@ pub const Collector = struct {
                 try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len *| 2);
                 const leaf = try artifacts.leafReferences(a, self.store, ref, self.cancellation());
                 if (leaf.key_index) |index| if (index.inline_page.len == 0) try self.markPages(a, index.domain, index.page, false);
-                if (leaf.state_tree) |index| try self.markPages(a, index.domain, index.page, false);
+                if (leaf.state_tree) |index| {
+                    try self.markPages(a, index.domain, index.page, false);
+                    if (leaf.row_state) |rows| {
+                        try self.markPages(a, index.domain, rows.rows, false);
+                        try self.markPages(a, index.domain, rows.reverse, false);
+                    }
+                }
                 for (leaf.blocks) |child| _ = try self.mark(child);
             },
             .ordered_row_index => {

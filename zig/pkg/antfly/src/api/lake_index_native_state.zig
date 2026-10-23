@@ -215,7 +215,7 @@ pub fn decodeDirectoryFile(a: A, key: []const u8, bytes: []const u8, domain: [32
 }
 pub fn canUseDelta(provider: *Provider, snapshot: []const u8) bool {
     const delta = provider.native_delta orelse return false;
-    if (delta.selection == null) return false;
+    if (delta.selection == null and !(provider.fragment_rows != null and provider.key_digests.len == delta.count())) return false;
     return if (delta.prior_snapshot) |prior| std.mem.eql(u8, snapshot, prior) else false;
 }
 pub const ScanOrder = struct {
@@ -244,6 +244,7 @@ pub const Plan = struct {
     files: []File = &.{},
     changed: []bool = &.{},
     selection: ?Selection = null,
+    logical_provider: ?*Provider = null,
     append_file: ?Selection.Item = null,
     append_count: usize = 0,
     append_provider: ?*Provider = null,
@@ -272,6 +273,13 @@ pub const Plan = struct {
                 try self.updates.put(a, index, if (index == ordinal) self.append_file.?.file else .{ .id = entry.file_id, .digest = try identity(a, provider, entry) });
             }
             return self;
+        };
+        // Logical versions are already authenticated by the publication's row
+        // identity/input census. They do not claim immutable physical objects.
+        // Retain only changed key state and path-copy the durable directory.
+        if ((!has_seed or delta_compatible) and provider.paged_key_state and provider.fragment_rows != null and provider.key_digests.len != 0) if (provider.native_delta) |delta| {
+            if (provider.key_digests.len != delta.count() or delta.count() != provider.source.inventory.files.len or !std.mem.eql(u8, delta.source, provider.source.inventory.source_id) or !std.mem.eql(u8, delta.schema, provider.source.inventory.schema_fingerprint)) return error.InvalidNativeLakeFileState;
+            return .{ .a = a, .logical_provider = provider, .key_digests = provider.key_digests, .row_changes = if (has_seed and delta_compatible) provider.changed_rows else &.{}, .borrowed_positions = true, .force_all = !has_seed, .by_id = delta.by_id, .prior_directory = directory, .prior_files = previous, .source_delta = delta };
         };
         if (!has_seed or delta_compatible or previous.len == 0 and directory == null) if (provider.native_delta) |delta| if (delta.selection) |selection| {
             const inventory = provider.source.inventory;
@@ -313,9 +321,10 @@ pub const Plan = struct {
         return init(a, out, provider, previous);
     }
     pub fn isPaged(self: *const Plan) bool {
-        return self.selection != null or self.append_file != null;
+        return self.selection != null or self.append_file != null or self.logical_provider != null;
     }
     pub fn count(self: *const Plan) usize {
+        if (self.logical_provider) |provider| return provider.native_delta.?.count();
         if (self.append_file != null) return self.append_count;
         return if (self.selection) |selection| selection.files.len else self.files.len;
     }
@@ -326,7 +335,7 @@ pub const Plan = struct {
             const provider = self.append_provider.?;
             const input = provider.source.inventory.files[index];
             break :append .{ .id = input.file_id, .digest = try identity(self.a, provider, input) };
-        } else if (self.selection) |selection| try selection.file(index) else self.files[index];
+        } else if (self.logical_provider) |provider| try provider.native_delta.?.file(index) else if (self.selection) |selection| try selection.file(index) else self.files[index];
         if (index < self.key_digests.len) file.key_digest = self.key_digests[index];
         return file;
     }
@@ -339,6 +348,7 @@ pub const Plan = struct {
     }
     pub fn isChanged(self: *const Plan, index: usize) bool {
         if (self.append_file) |item| return index >= item.ordinal and index < self.append_count;
+        if (self.logical_provider) |provider| return self.force_all or provider.native_delta.?.isChanged(index);
         return self.force_all or if (self.selection) |selection| selection.changed(index) else self.changed[index];
     }
     pub const Iterator = struct {
@@ -381,7 +391,35 @@ pub const Plan = struct {
         var read_budget: u64 = 512 * 1024 * 1024;
         var write_budget: u64 = 512 * 1024 * 1024;
         var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = domain, .attempt = store.upload_scope.?.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &read_budget, .remaining_write_bytes = &write_budget, .streaming = true };
+        pages.admitPublication();
         var root = self.prior_directory;
+        if (root == null and self.logical_provider != null) {
+            const positions = try a.alloc(usize, self.count());
+            defer a.free(positions);
+            for (positions, 0..) |*position, index| position.* = index;
+            std.mem.sort(usize, positions, self, struct {
+                fn less(plan: *Plan, left: usize, right: usize) bool {
+                    const files_ = plan.logical_provider.?.source.inventory.files;
+                    return std.mem.lessThan(u8, &Selection.idKey(files_[left].file_id), &Selection.idKey(files_[right].file_id));
+                }
+            }.less);
+            var builder: tree.SortedBuilder = .{ .alloc = a, .store = pages.store() };
+            defer builder.deinit();
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            for (positions) |index| {
+                _ = scratch.reset(.retain_capacity);
+                const current = try self.stateAt(index);
+                const file = if (self.isChanged(index)) current else old: {
+                    for (self.prior_files) |prior| if (std.mem.eql(u8, prior.id, current.id)) break :old prior;
+                    return error.InvalidNativeLakeFileState;
+                };
+                try builder.add(&Selection.idKey(file.id), try std.json.Stringify.valueAlloc(scratch.allocator(), file, .{}));
+            }
+            root = try builder.finish();
+            if ((if (root) |ref| ref.records else 0) != self.count()) return error.InvalidNativeLakeFileState;
+            return root;
+        }
         // Census order is the directory's hash-key order, so first publication
         // streams bottom-up instead of repeatedly rewriting the growing root.
         if (root == null and self.selection != null and self.force_all) {
@@ -836,4 +874,60 @@ test "external lake private append directory passes the legacy inline file ceili
     const record = (try cursor.next()).?;
     const decoded = try decodeDirectoryFile(out, record.key, record.value, @splat(7));
     try std.testing.expectEqualStrings(entries[entries.len - 1].file_id, decoded.id);
+}
+
+test "external lake logical vector state path copies directories without immutable object authority" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("logical-key-directory");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    var entries = [_]local.serverless_external_source_types.FileEntry{
+        .{ .file_id = @constCast("first"), .object_uri = @constCast("file:///first"), .byte_len = 1, .row_count = 8, .row_groups = &.{} },
+        .{ .file_id = @constCast("second"), .object_uri = @constCast("file:///second"), .byte_len = 1, .row_count = 8, .row_groups = &.{} },
+    };
+    var source: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .scanner = undefined, .inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("current"), .schema_fingerprint = @constCast("schema"), .files = &entries } };
+    var current = [_]File{ .{ .id = "first", .digest = @splat(1) }, .{ .id = "second", .digest = @splat(2) } };
+    var changed = [_]bool{ true, true };
+    var delta: @import("lake_source_navigation.zig").Delta = .{ .source = "source", .schema = "schema", .prior_snapshot = "previous", .prior_count = 2, .files = &current, .changed = &changed, .prior_changed = &.{}, .by_id = .{} };
+    defer delta.by_id.deinit(a);
+    try delta.by_id.put(a, "first", 0);
+    try delta.by_id.put(a, "second", 1);
+    var marker: u8 = 0;
+    const NoScan = struct {
+        fn open(_: *anyopaque, _: A, _: local.serverless_segment_source_binding.Binding, _: ?usize, _: Cancellation, _: ?*const stores.IoPhase) !local.storage_rowsource_types.Source {
+            return error.UnexpectedParquetRead;
+        }
+    };
+    var provider: Provider = .{ .source = &source, .context = .{ .io = std.testing.io }, .fragment_rows = .{ .ptr = &marker, .open = NoScan.open }, .paged_key_state = true, .key_digests = &.{ @splat(8), @splat(9) }, .native_delta = delta };
+    try std.testing.expect(!source.immutable_objects);
+    var first = try Plan.initPaged(a, out, &provider, &.{}, null, false, false);
+    defer first.deinit();
+    try std.testing.expect(first.isPaged());
+    try std.testing.expectEqual(@as(usize, 0), first.files.len);
+    const root = (try first.publishDirectory(a, &store, @splat(7), .none)).?;
+    try std.testing.expectEqual(@as(u64, 2), root.records);
+    current[1].digest = @splat(3);
+    changed = .{ false, true };
+    delta.files = &current;
+    delta.changed = &changed;
+    delta.prior_changed = &.{.{ .id = "second", .digest = @splat(2), .key_digest = @splat(9) }};
+    provider.native_delta = delta;
+    try std.testing.expect(canUseDelta(&provider, "previous"));
+    var next = try Plan.initPaged(a, out, &provider, &.{}, root, true, true);
+    defer next.deinit();
+    try std.testing.expectEqual(@as(usize, 0), next.files.len);
+    try std.testing.expect(!next.isChanged(0) and next.isChanged(1));
+    const updated = (try next.publishDirectory(a, &store, @splat(7), .none)).?;
+    const files = try directoryFiles(out, store, updated, @splat(7), .none);
+    try std.testing.expectEqual(@as(usize, 2), files.len);
+    for (files) |file| try std.testing.expectEqualSlices(u8, &(if (std.mem.eql(u8, file.id, "first")) current[0] else current[1]).digest, &file.digest);
+    var invalid = provider;
+    invalid.native_delta.?.source = "another-source";
+    try std.testing.expectError(error.InvalidNativeLakeFileState, Plan.initPaged(a, out, &invalid, &.{}, root, true, true));
 }

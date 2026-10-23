@@ -802,7 +802,7 @@ pub const HashJoin = struct {
             errdefer result.deinit(a);
             if (count >= 8192 and manager.page_residency_bytes >= @import("execution_pager.zig").page_bytes) {
                 result.paged = .{ .pager = try manager.pager() };
-                for (0..count) |_| try result.paged.?.append(@import("spill.zig").none);
+                try result.paged.?.appendRepeated(@import("spill.zig").none, count);
             } else {
                 result.flat = try a.alloc(u64, count);
                 @memset(result.flat, @import("spill.zig").none);
@@ -814,6 +814,26 @@ pub const HashJoin = struct {
         }
         fn set(self: Buckets, index: usize, value: u64) !void {
             if (self.paged) |array| try array.set(index, value) else self.flat[index] = value;
+        }
+        fn seedProbes(self: Buckets, hashes: []const ?u64, probes: []Probe) !void {
+            var begin: usize = 0;
+            while (begin < hashes.len) {
+                const end = @min(hashes.len, begin + 128);
+                var indices: [128]usize = undefined;
+                var positions: [128]usize = undefined;
+                var values: [128]u64 = undefined;
+                var count: usize = 0;
+                for (hashes[begin..end], begin..) |hash, i| if (hash) |value| {
+                    indices[count] = value & (self.len - 1);
+                    positions[count] = i;
+                    count += 1;
+                };
+                if (self.paged) |array| try array.getMany(indices[0..count], values[0..count]) else {
+                    for (indices[0..count], values[0..count]) |index, *value| value.* = self.flat[index];
+                }
+                for (values[0..count], positions[0..count]) |head, index| probes[index].cursor = if (head == @import("spill.zig").none) null else @intCast(head);
+                begin = end;
+            }
         }
         fn residentCharge(self: Buckets) usize {
             return self.flat.len * @sizeOf(u64);
@@ -1445,12 +1465,10 @@ pub const HashJoin = struct {
             if (self.key_count != null and row.len != self.key_count.?) return error.InvalidSqlBackendResponse;
             probe_.* = .{ .owner = self, .keys = row, .cursor = null };
             if (hash) |value| {
-                if (self.disk != null) {
-                    const head = try self.disk_heads.get(value & (self.disk_heads.len - 1));
-                    probe_.cursor = if (head == @import("spill.zig").none) null else @intCast(head);
-                } else probe_.cursor = self.heads.get(value);
+                if (self.disk == null) probe_.cursor = self.heads.get(value);
             }
         }
+        if (self.disk != null) try self.disk_heads.seedProbes(hashes, probes);
         if (self.disk == null) {
             // Interleave chain traversal across lanes. Keep the first exact
             // match in the probe and leave remaining duplicates lazy.
@@ -3295,6 +3313,21 @@ test "SQL execution pager restores join buckets and grouped transitions through 
         try std.testing.expectEqual(@as(i64, @intCast(i)), (try grouped.state_columns[1].finish(i)).value.integer);
     }
     const pager = manager.execution_pages.?;
+    var keys: [128][]const Datum = undefined;
+    var values: [128]Datum = undefined;
+    for (&keys, &values, 0..) |*key, *value, index| {
+        value.* = Datum.json(.{ .integer = @intCast(index) });
+        key.* = @as([*]const Datum, @ptrCast(value))[0..1];
+    }
+    const before = pager.pins;
+    const probes = try join.probeBatch(a, &keys);
+    defer a.free(probes);
+    try std.testing.expect(pager.pins - before <= join.disk_heads.len / (@import("execution_pager.zig").page_bytes / @sizeOf(u64)));
+    for (probes, 0..) |*probe, index| {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(index + 100)), (try (try probe.next()).?.materializeValues(scratch.allocator()))[0].value.integer);
+    }
     try std.testing.expect(pager.evictions > 0 and pager.restores > 0);
     try std.testing.expect(pager.peak <= manager.page_residency_bytes);
 }

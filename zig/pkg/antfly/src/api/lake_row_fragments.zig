@@ -462,7 +462,7 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
             xorInput(&deltas[file], id, after orelse return error.InvalidLogicalRowIdentity);
             self.input_rows_hashed += 2;
         };
-        const key_digests = try out.alloc([32]u8, if (vectorRecipe(configs.value, recipe.name)) self.fragments.len else 0);
+        const key_digests = try out.alloc([32]u8, if (stableKeysRecipe(configs.value, recipe.name)) self.fragments.len else 0);
         for (self.fragments[0..key_digests.len], key_digests) |fragment, *digest| {
             var hash = std.crypto.hash.Blake3.init(.{});
             hash.update("native-lake-logical-coordinate-file-v1");
@@ -525,6 +525,12 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
         view.* = .{ .name = recipe.name, .files = files, .delta = nav.delta, .navigation = nav.ref, .changed_rows = row_changes, .key_digests = key_digests };
     }
     self.provider.fragment_views = views;
+}
+fn stableKeysRecipe(configs: std.json.Value, name: []const u8) bool {
+    if (vectorRecipe(configs, name)) return true;
+    const config = configs.object.get(name) orelse return false;
+    const kind = config.object.get("type") orelse return false;
+    return kind == .string and std.mem.eql(u8, kind.string, "full_text");
 }
 fn vectorRecipe(configs: std.json.Value, name: []const u8) bool {
     if (configs != .object) return false;

@@ -3740,8 +3740,8 @@ coordinate space and publication-bound navigation remain authoritative. A
 membership change, legacy private-key generation or incompatible predecessor
 uses the existing full-fragment mutation path. Protocol 76 gates readers on the
 new optional coordinate-key digests in native file state and navigation.
-Immutable text segments and aggregate contributions still use fragment-level
-replacement; sharing the row plan does not make those representations mutable.
+Protocol 77 extends the verified row plan to native text posting merges and
+persistent aggregate row contributions, as described below.
 
 Dense/sparse publication binds the selected input column once per batch. Native
 f32 vectors remain borrowed until the native write completes, dictionary strings
@@ -3757,3 +3757,62 @@ Generated `_type` metadata is synthesized only when the schema does not declare
 that column. Real Parquet coverage compares covered, omitted-cover and physical
 search paths, and the Parquet/Iceberg row-identity flow changes native vector
 inputs after reuse to exercise retained and mutated rows together.
+
+
+### Bounded mutable execution and publication deltas (protocol 77)
+
+The statement pager uses a free-handle chain and a resident-only idle LRU.
+Creating handles and selecting victims no longer scan spilled/retired handles.
+Busy frames retain their ownership while the directory lock is released for
+positional spill I/O; resident pins on unrelated pages can proceed. A separate
+file lock serializes the spill descriptor and buffer ownership. Cancellation or
+I/O failure restores frame/queue state before waking waiters. Parent admission,
+residency and disk quotas remain independent.
+
+Typed arrays expose leased page windows. COUNT/SUM/AVG/boolean transitions group
+bounded 128-lane tiles by page and invoke the existing contiguous native kernels.
+Each group's lanes retain their original order, including compensated floating
+reductions. Join probe batches gather bucket heads once per reached page; bucket
+initialization and aggregate migration copy/fill page windows rather than pinning
+each element. Pointer-owning reducers retain their typed spill path.
+
+Dense/sparse logical fragments publish their key state in COW directories even
+without a physical immutable-object catalog. Their authenticated input census is
+not object-store immutability evidence. Only changed prior descriptors are loaded;
+untouched key-state pages remain reachable through the retained directory. A
+legacy flat state migrates once. This removes inline key-state root growth and
+whole-directory parsing/serialization for ordinary sparse updates.
+
+Full-text fragments now bind stable private coordinate-key digests independently
+of input versions. A sparse, membership-preserving change gathers and analyzes
+only changed rows. Existing native postings are masked at those coordinates and
+merged with the new postings in private-key order using the shared native sorted
+segment merger. Physical ordinal maps, DF, conservative score summaries, opening
+packs and serving directories are rebuilt from that exact merged output. The
+bounded native fragment is still rewritten; unchanged Parquet rows are not read
+or reanalyzed. Old generations and membership/radix changes use complete fragment
+construction. Merge inputs stay in private spill until the final merged segment
+and summaries are published. Optional merge workspace/output pressure reopens the
+ordinary full-fragment path without exposing partial contributions.
+
+Eligible keyed algebraic cohorts retain a COW tree of typed per-row transitions
+and a reverse row-to-group map in their existing shared tree descriptor. Updates
+replace only changed row contributions. COUNT/integer SUM cohorts retract old
+transitions and add new ones directly; group membership comes from authenticated
+subtree counts. Extrema, boolean and exact NUMERIC cohorts recompute only the old
+and new affected groups from current contributions, avoiding invalid subtraction
+and predecessor chains. Initial publication reduces incoming transitions directly.
+The resulting group tree still feeds the existing file/radix reduction machinery,
+including exact group removal and NULL identities. Unsupported/oversized state
+uses the established complete fragment publisher. Row-state roots belong to the
+same publication, reader lease, cloud closure and resumable GC graph as the result
+root. Protocol 77 gates the optional descriptor edges and text key generation.
+
+Validation includes linear handle bookkeeping with 20,000 live slots, resident
+pins during spill transfers, page-pin counts for mixed aggregate tiles and join
+probes, typed row updates that move groups and retire extrema/NULL values, native
+posting replacement without old-row analysis, optional merge decline, and logical
+key directories without physical immutability. The real Parquet/Iceberg E2Es also
+compare grouped COUNT/SUM/MIN/MAX against a separate physical-scan table across
+rewrites, updates, membership changes and restart. Archive/cloud latency remains a
+separate measurement; these checks assert work bounds and result equivalence.

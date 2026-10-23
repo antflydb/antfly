@@ -2731,6 +2731,9 @@ pub const MergeScratchOptions = struct {
 };
 
 pub const MergeOptions = struct {
+    /// Explicitly sort physical inputs that do not advertise the requested
+    /// index order. Value domains and source payloads are still validated.
+    input_order: enum { index_sorted, arbitrary } = .index_sorted,
     source_map: ?*MergeSourceMap = null,
     scratch: ?MergeScratchOptions = null,
     index_sort: []const SegmentIndexSortField = &.{},
@@ -3417,7 +3420,10 @@ pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSin
     var tracked_sink = tracked.sink();
     const sink = &tracked_sink;
     if (options.index_sort.len > 0) {
-        var plan = try buildSortedMergePlanWithScratch(alloc, inputs, options.index_sort, options.scratch);
+        var plan = if (options.input_order == .arbitrary)
+            (if (options.scratch) |scratch| try buildExternalSortedMergePlanInner(alloc, inputs, options.index_sort, scratch, false) else try buildUnsortedMergePlanInner(alloc, inputs, options.index_sort, false))
+        else
+            try buildSortedMergePlanWithScratch(alloc, inputs, options.index_sort, options.scratch);
         defer plan.deinit(alloc);
         if (hasLiveTypedField(inputs, null)) {
             const prepared = try SortedPreparation.init(alloc, plan.ordered(), inputs);
@@ -4514,6 +4520,9 @@ fn buildUnsortedMergePlanAlloc(
     inputs: []const MergeInput,
     index_sort: []const SegmentIndexSortField,
 ) !SortedMergePlan {
+    return buildUnsortedMergePlanInner(alloc, inputs, index_sort, true);
+}
+fn buildUnsortedMergePlanInner(alloc: Allocator, inputs: []const MergeInput, index_sort: []const SegmentIndexSortField, validate_metadata: bool) !SortedMergePlan {
     if (index_sort.len == 0) return error.InvalidSegment;
     var reads = TypedReadScope.init(alloc);
     defer reads.deinit();
@@ -4531,7 +4540,7 @@ fn buildUnsortedMergePlanAlloc(
     }
 
     for (inputs, 0..) |input, input_idx| {
-        try validateInputIndexSortMetadata(alloc, input, index_sort);
+        if (validate_metadata) try validateInputIndexSortMetadata(alloc, input, index_sort);
         const map = try alloc.alloc(u32, input.reader.doc_count);
         @memset(map, std.math.maxInt(u32));
         doc_maps[input_idx] = map;
@@ -4814,6 +4823,9 @@ const ExternalCoordinateSort = struct {
 };
 
 fn buildExternalSortedMergePlan(alloc: Allocator, inputs: []const MergeInput, fields: []const SegmentIndexSortField, scratch: MergeScratchOptions) !SortedMergePlan {
+    return buildExternalSortedMergePlanInner(alloc, inputs, fields, scratch, true);
+}
+fn buildExternalSortedMergePlanInner(alloc: Allocator, inputs: []const MergeInput, fields: []const SegmentIndexSortField, scratch: MergeScratchOptions, validate_metadata: bool) !SortedMergePlan {
     if (scratch.external_sort_chunk_bytes == 0 or scratch.external_sort_chunk_documents == 0 or scratch.external_sort_fan_in < 2 or scratch.external_sort_fan_in > 4) return error.InvalidSegment;
     const file = try FileSortedPlan.create(alloc, inputs, scratch);
     errdefer file.deinit();
@@ -4832,7 +4844,7 @@ fn buildExternalSortedMergePlan(alloc: Allocator, inputs: []const MergeInput, fi
     @memset(domains, null);
     var chunk_bytes: usize = 0;
     for (inputs, 0..) |input, input_idx| {
-        try validateInputIndexSortMetadata(alloc, input, fields);
+        if (validate_metadata) try validateInputIndexSortMetadata(alloc, input, fields);
         var live = LiveDocs.init(&input, 0, input.reader.doc_count);
         while (live.next()) |doc| {
             if (chunk.items.len != 0 and (chunk.items.len >= scratch.external_sort_chunk_documents or chunk_bytes >= scratch.external_sort_chunk_bytes)) {

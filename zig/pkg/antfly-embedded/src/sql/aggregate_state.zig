@@ -99,6 +99,55 @@ pub const Column = struct {
             },
         }
     }
+    fn pageStart(self: *const Column, index: usize) usize {
+        return switch (self.paged.?) {
+            inline else => |array| array.pageStart(index),
+        };
+    }
+    fn pageWindow(self: *const Column, index: usize) !PageView {
+        switch (self.paged.?) {
+            inline else => |array, tag| {
+                const window = try array.pinPage(index, true);
+                return .{ .lease = window.lease, .column = .{ .spec = self.spec, .values = @unionInit(Values, @tagName(tag), .{ .items = window.values, .capacity = window.values.len, .pointer_stability = .{} }) } };
+            },
+        }
+    }
+    /// Group a bounded input tile by resident page. Each group's lanes keep
+    /// their original order, including compensated floating reductions.
+    fn updatePaged(self: *Column, a: A, ids: []const usize, values: ?[]const Datum, physical: ?@import("execution_batch.zig").PhysicalColumn) anyerror!void {
+        var begin: usize = 0;
+        while (begin < ids.len) {
+            const end = @min(ids.len, begin + 128);
+            var consumed: [128]bool = @splat(false);
+            for (ids[begin..end], 0..) |id, lane| {
+                if (consumed[lane]) continue;
+                const first = self.pageStart(id);
+                var selected: [128]usize = undefined;
+                var cells: [128]Datum = undefined;
+                var rows: [128]usize = undefined;
+                var count: usize = 0;
+                for (ids[begin..end], 0..) |candidate, position| {
+                    if (consumed[position] or self.pageStart(candidate) != first) continue;
+                    consumed[position] = true;
+                    selected[count] = candidate - first;
+                    if (values) |input| cells[count] = input[begin + position];
+                    if (physical) |input| rows[count] = input.rowAt(begin + position);
+                    count += 1;
+                }
+                var view = try self.pageWindow(id);
+                defer view.lease.release();
+                if (physical) |input| {
+                    var tile = input;
+                    tile.range = null;
+                    tile.selection = rows[0..count];
+                    if (!try view.column.updatePhysical(a, selected[0..count], tile)) {
+                        for (selected[0..count], 0..) |slot, position| try view.column.update(a, slot, try tile.cell(position));
+                    }
+                } else try view.column.updateBatch(a, selected[0..count], cells[0..count]);
+            }
+            begin = end;
+        }
+    }
     fn startPaging(self: *Column, a: A) !void {
         if (self.page_manager == null or self.paged != null) return;
         const manager = self.page_manager.?;
@@ -109,7 +158,7 @@ pub const Column = struct {
                 if (values.items.len < 2048) return;
                 var array: @FieldType(Paged, @tagName(tag)) = .{ .pager = try manager.pager() };
                 errdefer array.deinit();
-                for (values.items) |value| try array.append(value);
+                try array.appendSlice(values.items);
                 values.clearAndFree(a);
                 self.paged = @unionInit(Paged, @tagName(tag), array);
             },
@@ -406,8 +455,7 @@ pub const Column = struct {
     pub fn updateBatch(self: *Column, a: A, ids: []const usize, values: []const Datum) !void {
         if (self.paged != null) {
             if (ids.len != values.len) return error.InvalidSqlBackendResponse;
-            for (ids, values) |id, value| try self.update(a, id, value);
-            return;
+            return self.updatePaged(a, ids, values, null);
         }
         if (ids.len != values.len) return error.InvalidSqlBackendResponse;
         switch (self.values) {
@@ -558,11 +606,7 @@ pub const Column = struct {
         if (self.paged != null) {
             if (physical.len() != ids.len) return error.InvalidSqlBackendResponse;
             try physical.validate();
-            for (ids, 0..) |id, row| {
-                if (self.values == .counts) {
-                    if (!physical.vector.nulls.isNull(physical.rowAt(row))) try self.update(a, id, Datum.json(.{ .integer = 0 }));
-                } else try self.update(a, id, try physical.cell(row));
-            }
+            try self.updatePaged(a, ids, null, physical);
             return true;
         }
         if (physical.len() != ids.len) return error.InvalidSqlBackendResponse;
@@ -1188,4 +1232,39 @@ test "SQL execution pager grouping preserves compact cohort lane identities" {
     try std.testing.expectEqual(@as(i64, 1), (try column.finish(2995)).value.integer);
     try std.testing.expectEqual(@as(i64, 1), (try column.finish(2992)).value.integer);
     try std.testing.expectEqual(@as(i64, 0), (try column.finish(2999)).value.integer);
+}
+
+test "SQL paged native kernels pin each reached state page once per tile" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.check };
+    defer manager.deinit();
+    var column = Column.init(.{ .kind = .sum, .input_type = .number });
+    column.page_manager = &manager;
+    defer column.clear(a);
+    for (0..3000) |_| try column.append(a);
+    var ids: [128]usize = undefined;
+    var cells: [128]Datum = undefined;
+    for (&ids, &cells, 0..) |*id, *cell, lane| {
+        id.* = if (lane % 2 == 0) 0 else 2999;
+        cell.* = Datum.json(.{ .float = switch (lane % 3) {
+            0 => 1e16,
+            1 => 1,
+            else => -1e16,
+        } });
+    }
+    const pager = manager.execution_pages.?;
+    const before = pager.pins;
+    try column.updateBatch(a, &ids, &cells);
+    try std.testing.expectEqual(@as(u64, 2), pager.pins - before);
+    var expected = [_]operators.Aggregate{
+        try operators.Aggregate.init(a, .sum, .number), try operators.Aggregate.init(a, .sum, .number),
+    };
+    defer for (&expected) |*state| state.deinit();
+    for (cells, 0..) |cell, lane| try expected[lane % 2].update(cell);
+    try std.testing.expectEqualDeep(try expected[0].finish(), try column.finish(0));
+    try std.testing.expectEqualDeep(try expected[1].finish(), try column.finish(2999));
 }

@@ -240,7 +240,25 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                         "stats": {
                             "type": "algebraic",
                             "derive_from_schema": True,
-                            "aggregates": [{"name": "rows", "op": "count"}],
+                            "aggregates": (
+                                [
+                                    {"name": "rows", "op": "count"},
+                                    {
+                                        "name": "body_rows",
+                                        "op": "count",
+                                        "group_by": ["body"],
+                                    },
+                                ]
+                                + [
+                                    {
+                                        "name": f"body_{op}",
+                                        "op": op,
+                                        "measure": "id",
+                                        "group_by": ["body"],
+                                    }
+                                    for op in ("sum", "min", "max")
+                                ]
+                            ),
                         },
                     },
                 },
@@ -330,6 +348,7 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
             entry["name"]: entry["space"] for entry in original["reused"]
         }
 
+        text_after_body_update = None
         for step in (1, 2, 5, 3, 6, 4, 7):
             write(step)
             revision = ready("logical", revision)
@@ -373,10 +392,20 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     != original_spaces["all_text"]["navigation"]
                 ), current
                 assert "dense_native" in reused and "sparse_native" in reused, current
+                text_after_body_update = reused["text"]
             elif step == 6:
                 assert "text" in reused and "dense_native" in reused, current
+                # Stable private keys keep their original coordinate space;
+                # input-only mutations replace each affected index's navigation.
                 assert (
-                    reused["text"]["snapshot"] != reused["dense_native"]["snapshot"]
+                    reused["text"]["navigation"] == text_after_body_update["navigation"]
+                ), current
+                assert (
+                    reused["dense_native"]["navigation"]
+                    != original_spaces["dense_native"]["navigation"]
+                ), current
+                assert (
+                    reused["text"]["snapshot"] == text_after_body_update["snapshot"]
                 ), current
             else:
                 assert current.get("native_space") is not None, current
@@ -503,6 +532,8 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                 + str(base + 17)
                 + " ORDER BY id DESC LIMIT 9",
                 "SELECT COUNT(*) FROM {table}",
+                "SELECT body, COUNT(*), SUM(id), MIN(id), MAX(id) "
+                "FROM {table} GROUP BY body ORDER BY body",
             ):
                 actual = call(
                     "POST", "/sql", {"statement": statement.format(table="logical")}

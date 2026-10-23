@@ -87,6 +87,7 @@ test {
     _ = @import("api/lake_index_search_filter.zig");
     _ = @import("metadata/lake_index_lifecycle.zig");
     _ = @import("api/lake_index_aggregate_artifact.zig");
+    _ = @import("api/lake_index_aggregate_rows.zig");
     _ = @import("api/lake_index_aggregate_keys.zig");
     _ = @import("api/lake_index_aggregate_record.zig");
     _ = @import("api/lake_index_aggregate_composition.zig");

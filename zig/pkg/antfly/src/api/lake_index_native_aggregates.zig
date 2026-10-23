@@ -453,7 +453,7 @@ const LeafResolver = struct {
     /// artifacts and changing contribution ownership remain coordinator work.
     fn resolveParallel(self: *@This(), leaves: []const Reduction.Leaf) ![]const Reduction.Leaf {
         const io = self.provider.context.io.?;
-        if (self.provider.replay_consumer != null) return leaves;
+        if (self.provider.replay_consumer != null or @import("lake_index_aggregate_rows.zig").eligible(self.provider, self.recipe)) return leaves;
         if (leaves.len < 2 or leaves.len > 8 or self.metadata_count) return leaves;
         var needed: [8]bool = @splat(false);
         var count: usize = 0;
@@ -525,7 +525,26 @@ const LeafResolver = struct {
                 } else all_present = false;
             } else all_present = false;
         }
-        if (!all_present) {
+        var row_published = false;
+        if (!all_present and @import("lake_index_aggregate_rows.zig").eligible(self.provider, self.recipe)) {
+            var previous_ref: ?local.serverless_manifest_artifact_ref.ArtifactRef = null;
+            if (self.provider.rowsForFile(leaf.index) != null) if (self.provider.native_delta) |delta| if (self.index) |lookup| {
+                const file = self.source.inventory.files[leaf.index];
+                for (delta.prior_changed) |before| if (std.mem.eql(u8, before.id, file.file_id)) {
+                    if (before.aggregate_digest) |digest| {
+                        const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[0..1] };
+                        if (try lookup.lookup(self.out, contributionKey(digest, single.fingerprint(), self.names[0]))) |value| previous_ref = value.artifact;
+                    }
+                    break;
+                };
+            };
+            if (try @import("lake_index_aggregate_rows.zig").build(self.a, self.out, self.store, self.provider, self.binding, self.recipe, self.names, leaf.index, previous_ref, self.budget, self.cancellation)) |published| {
+                @memcpy(refs, published);
+                self.out.free(published);
+                row_published = true;
+            }
+        }
+        if (!all_present and !row_published) {
             const specs = try self.a.alloc(operators.AggregateSpec, self.recipe.inputs.len);
             defer self.a.free(specs);
             for (self.recipe.inputs, specs) |input, *spec| spec.* = input.spec;

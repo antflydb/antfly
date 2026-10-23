@@ -1065,7 +1065,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (paths, runtime.relational_columns) |*path, column| path.* = column.name;
             binding.column_bindings = paths;
         }
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v11:{s}", .{want.binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v12:{s}", .{want.binding.index_config_hash});
         const recipe = try sourceRecipe(ca, table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
@@ -1142,6 +1142,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         };
         var plan = prepared_plan orelse try state.Plan.init(a, ca, provider, previous);
         prepared_plan = null;
+        plan.key_digests = provider.key_digests;
         defer plan.deinit();
         for (baseline_records) |record| if (!plan.by_id.contains(record.file.id)) try checkpoint_removed.append(ca, record.file.id);
         if (paged_seed) {
@@ -1287,8 +1288,16 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer capture_manager.deinit();
             var output_manager: local.sql_spill.Manager = .{ .alloc = a, .io = capture_manager.io, .context = &capture_check, .checkpoint = capture_manager.checkpoint, .max_bytes = 768 * 1024 * 1024, .async_writes = false };
             defer output_manager.deinit();
-            var compactor: Compactor = .{ .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
+            var compactor: Compactor = .{ .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
             defer compactor.deinit();
+            if (provider.rowsForFile(file_ordinal)) |selected| if (selected.len != 0 and selected.len < source.inventory.files[file_ordinal].row_count / 2 and file.key_digest != null) {
+                const old = if (previous_refs.get(file.id)) |record| try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation) else previous_groups.get(file.id);
+                if (old) |previous_group| if (previous_group.file.key_digest != null and std.mem.eql(u8, &previous_group.file.key_digest.?, &file.key_digest.?)) {
+                    var bytes: u64 = 0;
+                    for (previous_group.admissions) |admission| bytes +|= admission.bytes;
+                    if (bytes <= 16 * 1024 * 1024) compactor.row_patch = .{ .base = previous_group, .rows = selected };
+                };
+            };
             var ordinals = physical.Builder.init(a, fa, store, cancellation);
             defer ordinals.deinit();
             var leases: ProjectionLeases = .{};
@@ -1297,73 +1306,104 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             var input = provider.*;
             input.only_file = file_ordinal;
             input.only_files = null;
-            const rows = input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation) catch |err| return buildFailure(err, "open_rows", file_ordinal, segments.items.len);
-            defer rows.deinit(a);
             while (true) {
-                if (leases.full()) {
-                    try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
-                    leases.clear();
-                    _ = batch_arena.reset(.free_all);
-                    builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
-                    input_bytes = 0;
-                }
-                const batch = (rows.next(a) catch |err| return buildFailure(err, "read_rows", file_ordinal, segments.items.len)) orelse break;
-                var column_arena = std.heap.ArenaAllocator.init(a);
-                defer column_arena.deinit();
-                const projection = try mapper.TextColumnProjection.bind(column_arena.allocator(), batch, binding.column_bindings);
-                const encoded = for (batch.columns) |column| {
-                    if (column.values == .encoded) break true;
-                } else false;
-                var owner = if (store_source or encoded) null else try rows.retainColumns(a);
-                defer if (owner) |held| held.release();
-                if (owner) |held| if (held.retained_bytes > ProjectionLeases.max_bytes) {
-                    held.release();
-                    owner = null;
-                };
-                if (owner) |held| if (held.retained_bytes > ProjectionLeases.max_bytes -| leases.bytes) {
-                    try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
-                    leases.clear();
-                    _ = batch_arena.reset(.free_all);
-                    builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
-                    input_bytes = 0;
-                };
-                for (0..batch.rowCount()) |row| {
-                    const ref = batch.rowRef(row);
-                    try provider.context.ensureActive();
-                    try cancellation.check();
-                    const ba = batch_arena.allocator();
-                    const id = try plan.privateKey(ba, ref);
-                    if (previous_id) |last_id| if (std.mem.order(u8, &last_id, id) != .lt) return error.InvalidNativeLakeTextCorpus;
-                    previous_id = id[0..96].*;
-                    const before = builder.batch().docs.len;
-                    input_bytes +|= try builder.appendColumnRow(projection, row, id, store_source, owner != null);
-                    if (builder.batch().docs.len != before) {
-                        if (ref != .external) return error.InvalidNativeLakeTextCorpus;
-                        ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal) catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
-                    }
-                    if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
-                        var retained = true;
-                        if (owner != null) {
-                            if (rows.retainColumns(a) catch null) |held| leases.add(held) else retained = false;
-                        }
-                        if (retained) try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source) else try flush(&compactor, builder.batch(), analysis, store_source);
+                input.only_ordinals = if (compactor.row_patch) |patch| patch.rows else null;
+                const rows = input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation) catch |err| return buildFailure(err, "open_rows", file_ordinal, segments.items.len);
+                defer rows.deinit(a);
+                while (true) {
+                    if (leases.full()) {
+                        try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
                         leases.clear();
                         _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
-                }
-                if (owner) |held| {
-                    if (builder.batch().docs.len != 0) {
-                        leases.add(held);
+                    const batch = (rows.next(a) catch |err| return buildFailure(err, "read_rows", file_ordinal, segments.items.len)) orelse break;
+                    var column_arena = std.heap.ArenaAllocator.init(a);
+                    defer column_arena.deinit();
+                    const projection = try mapper.TextColumnProjection.bind(column_arena.allocator(), batch, binding.column_bindings);
+                    const encoded = for (batch.columns) |column| {
+                        if (column.values == .encoded) break true;
+                    } else false;
+                    var owner = if (store_source or encoded) null else try rows.retainColumns(a);
+                    defer if (owner) |held| held.release();
+                    if (owner) |held| if (held.retained_bytes > ProjectionLeases.max_bytes) {
+                        held.release();
                         owner = null;
+                    };
+                    if (owner) |held| if (held.retained_bytes > ProjectionLeases.max_bytes -| leases.bytes) {
+                        try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
+                        leases.clear();
+                        _ = batch_arena.reset(.free_all);
+                        builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                        input_bytes = 0;
+                    };
+                    for (0..batch.rowCount()) |row| {
+                        const ref = batch.rowRef(row);
+                        try provider.context.ensureActive();
+                        try cancellation.check();
+                        const ba = batch_arena.allocator();
+                        const id = try plan.privateKey(ba, ref);
+                        if (previous_id) |last_id| if (std.mem.order(u8, &last_id, id) != .lt) return error.InvalidNativeLakeTextCorpus;
+                        previous_id = id[0..96].*;
+                        const before = builder.batch().docs.len;
+                        input_bytes +|= try builder.appendColumnRow(projection, row, id, store_source, owner != null);
+                        if (builder.batch().docs.len != before) {
+                            if (ref != .external) return error.InvalidNativeLakeTextCorpus;
+                            ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal) catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
+                        }
+                        if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
+                            var retained = true;
+                            if (owner != null) {
+                                if (rows.retainColumns(a) catch null) |held| leases.add(held) else retained = false;
+                            }
+                            if (retained) try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source) else try flush(&compactor, builder.batch(), analysis, store_source);
+                            leases.clear();
+                            _ = batch_arena.reset(.free_all);
+                            builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                            input_bytes = 0;
+                        }
+                    }
+                    if (owner) |held| {
+                        if (builder.batch().docs.len != 0) {
+                            leases.add(held);
+                            owner = null;
+                        }
                     }
                 }
+                try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
+                leases.clear();
+                try compactor.finishEncoding();
+                if (compactor.row_patch != null) {
+                    const merged = try compactor.mergeRows();
+                    if (merged == null) {
+                        // Optional merge admission failed before any publication.
+                        // Reopen the complete fragment with the ordinary encoder.
+                        compactor.discardPatch();
+                        ordinals.deinit();
+                        ordinals = physical.Builder.init(a, fa, store, cancellation);
+                        leases.clear();
+                        _ = batch_arena.reset(.free_all);
+                        builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                        input_bytes = 0;
+                        previous_id = null;
+                        continue;
+                    }
+                    const staged = merged.?;
+                    defer staged.release();
+                    var reader = try local.segment.SegmentReader.initSource(a, staged.source());
+                    defer reader.deinit();
+                    ordinals.deinit();
+                    ordinals = physical.Builder.init(a, fa, store, cancellation);
+                    for (0..reader.doc_count) |doc| {
+                        const stored = (try reader.storedDoc(@intCast(doc))) orelse return error.InvalidNativeLakeTextCorpus;
+                        const coordinate = try state.coordinates(stored.id);
+                        try ordinals.add(coordinate.group, coordinate.row);
+                    }
+                    if (reader.doc_count != 0) try compactor.publishSource(staged.source(), staged.statistics);
+                } else try compactor.finish();
+                break;
             }
-            try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
-            leases.clear();
-            try compactor.finishEncoding();
-            try compactor.finish();
             try opening.flush();
             group.opening_packs = opening.refs.items;
             ordinals.flush() catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
@@ -1933,6 +1973,9 @@ const Compactor = struct {
     };
     a: A,
     encoder: ?*EncoderPipeline = null,
+    context: local.serverless_query_lake_read_context.Context = .{},
+    row_patch: ?struct { base: FileGroup, rows: []const u64 } = null,
+    patch_inputs: std.ArrayList(Owned) = .empty,
     out: A,
     store: *stores.ArtifactStore,
     segments: *std.ArrayList(artifacts.ChunkRef),
@@ -1962,6 +2005,77 @@ const Compactor = struct {
             self.encoder = null;
         }
         self.clearRuns();
+        self.discardPatch();
+        self.patch_inputs.deinit(self.a);
+        self.patch_inputs = .empty;
+    }
+    fn discardPatch(self: *Compactor) void {
+        for (self.patch_inputs.items) |owned| owned.deinit(self.a);
+        self.patch_inputs.clearRetainingCapacity();
+        self.row_patch = null;
+    }
+    fn mergeRows(self: *Compactor) !?*@import("lake_index_segment_spill.zig").LocalSegment {
+        var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = self.workspace_bytes };
+        return self.mergeRowsInner(budget.allocator()) catch |err| {
+            if (err == error.NativeLakeTextCorpusTooLarge or err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and budget.isLocallyExhausted())) return null;
+            return err;
+        };
+    }
+    fn mergeRowsInner(self: *Compactor, a: A) !*@import("lake_index_segment_spill.zig").LocalSegment {
+        const patch = self.row_patch.?;
+        const count = patch.base.segments.len + self.patch_inputs.items.len;
+        if (count == 0) return error.InvalidNativeLakeTextCorpus;
+        const data = try a.alloc(local.index.SegmentData, patch.base.segments.len);
+        defer a.free(data);
+        const readers = try a.alloc(local.segment.SegmentReader, count);
+        defer a.free(readers);
+        const inputs = try a.alloc(local.segment.MergeInput, count);
+        defer a.free(inputs);
+        const deletes = try a.alloc(local.encoding_roaring.RoaringBitmap, patch.base.segments.len);
+        defer a.free(deletes);
+        var opened_data: usize = 0;
+        var opened_readers: usize = 0;
+        var opened_deletes: usize = 0;
+        defer {
+            for (deletes[0..opened_deletes]) |*bitmap| bitmap.deinit();
+            for (readers[0..opened_readers]) |*reader| reader.deinit();
+            for (data[0..opened_data]) |*source_| source_.deinit(a);
+        }
+        const expected = std.fmt.bytesToHex(&patch.base.file.key_digest.?, .lower);
+        for (patch.base.segments, 0..) |ref, i| {
+            data[i] = try @import("lake_index_seekable_text.zig").loadPublication(a, .{ .store = self.store.*, .cache = null, .context = self.context, .cancellation = self.cancellation }, ref);
+            opened_data += 1;
+            readers[i] = try local.segment.SegmentReader.initAuthenticated(a, data[i].source(), patch.base.admissions[i]);
+            opened_readers += 1;
+            deletes[i] = .init(a);
+            opened_deletes += 1;
+            for (0..readers[i].doc_count) |doc| {
+                try self.cancellation.check();
+                try self.context.ensureActive();
+                const stored = (try readers[i].storedDoc(@intCast(doc))) orelse return error.InvalidNativeLakeTextCorpus;
+                if (stored.id.len != 96 or !std.mem.eql(u8, stored.id[6..70], &expected)) return error.InvalidNativeLakeTextCorpus;
+                const coordinate = try state.coordinates(stored.id);
+                if (coordinate.group != 0) return error.InvalidNativeLakeTextCorpus;
+                if (std.sort.binarySearch(u64, patch.rows, coordinate.row, struct {
+                    fn order(left: u64, right: u64) std.math.Order {
+                        return std.math.order(left, right);
+                    }
+                }.order) != null) try deletes[i].add(@intCast(doc));
+            }
+            inputs[i] = .{ .reader = &readers[i], .deleted = deletes[i] };
+        }
+        for (self.patch_inputs.items, patch.base.segments.len..) |owned, i| {
+            readers[i] = try local.segment.SegmentReader.initSource(a, owned.source());
+            opened_readers += 1;
+            inputs[i] = .{ .reader = &readers[i] };
+        }
+        const staged = try @import("lake_index_segment_spill.zig").LocalSegment.empty(self.a, self.output_manager.?, self.store);
+        errdefer staged.release();
+        staged.captureStatistics(self.capture_manager.?);
+        var sink = staged.sink();
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs, .{ .input_order = .arbitrary, .index_sort = &.{.{ .field = "_id", .desc = false }} });
+        try staged.seal();
+        return staged;
     }
     fn clearRuns(self: *Compactor) void {
         for (self.pending[0..self.count]) |value| value.?.deinit(self.a);
@@ -1972,6 +2086,16 @@ const Compactor = struct {
         var adopted = false;
         defer if (!adopted) owned.deinit(self.a);
         try self.cancellation.check();
+        if (self.row_patch != null) {
+            if (owned.payload == .memory) {
+                const staged = try @import("lake_index_segment_spill.zig").LocalSegment.create(self.a, self.output_manager.?, self.store, owned.payload.memory);
+                errdefer staged.release();
+                try self.patch_inputs.append(self.a, .{ .payload = .{ .spill = staged } });
+                owned.deinit(self.a);
+            } else try self.patch_inputs.append(self.a, owned);
+            adopted = true;
+            return;
+        }
         if (self.count != 0 and owned.len() > target_bytes -| self.bytes) try self.finish();
         if (owned.len() > target_bytes) return self.publishSource(owned.source(), owned.captured);
         self.pending[self.count] = owned;
@@ -2998,4 +3122,57 @@ test "external lake canonical multi-pack publication keeps worker allocations ou
     try std.testing.expectEqual(@as(usize, 1), segments.items.len);
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
     try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+}
+
+test "external lake text row deltas merge retained postings without reanalyzing old rows" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("text-row-transition");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    var docs: [10]mapper.MapperDoc = undefined;
+    for (&docs, 0..) |*doc, row| doc.* = .{ .key = try std.fmt.allocPrint(out, "lake2:{s}:00000000:{x:0>16}", .{ std.fmt.bytesToHex(&@as([32]u8, @splat(9)), .lower), row }), .value = if (row == 3) "{\"body\":\"obsolete shared\"}" else "{\"body\":\"retained shared\"}" };
+    const bytes = (try mapper.buildTextSegmentFromDocuments(a, &docs, .{}, null)).?;
+    defer a.free(bytes);
+    var reader = try local.segment.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    const metadata = try reader.admission(out);
+    const saved = try @import("lake_index_seekable_text.zig").publish(a, out, &store, bytes, .none);
+    const group: FileGroup = .{ .file = .{ .id = "fragment", .digest = @splat(1), .key_digest = @splat(9) }, .segments = &.{.{ .artifact_id = saved.artifact_id, .checksum = saved.checksum, .byte_len = saved.byte_len }}, .admissions = &.{metadata}, .summaries = &.{null} };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.check, .async_writes = false };
+    defer manager.deinit();
+    var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+    var summaries: std.ArrayList(?statistics.Ref) = .empty;
+    var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+    var compactor: Compactor = .{ .a = a, .out = out, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .output_manager = &manager, .capture_manager = &manager, .io = std.testing.io, .row_patch = .{ .base = group, .rows = &.{3} } };
+    defer compactor.deinit();
+    const changed = (try mapper.buildTextSegmentFromDocuments(a, &.{.{ .key = docs[3].key, .value = "{\"body\":\"replacement shared\"}" }}, .{}, null)).?;
+    try compactor.addOwned(.{ .payload = .{ .memory = changed } });
+    try std.testing.expectEqual(@as(usize, 0), segments.items.len);
+    const staged = (try compactor.mergeRows()).?;
+    defer staged.release();
+    var merged = try local.segment.SegmentReader.initSource(a, staged.source());
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(u32, 10), merged.doc_count);
+    for (docs, 0..) |doc, row| try std.testing.expectEqualStrings(doc.key, (try merged.storedDoc(@intCast(row))).?.id);
+    var inverted = try local.section_inverted.ScopedInvertedIndexReader.initRanges(a, (try merged.sectionView("body", .inverted_text)).?, .{});
+    defer inverted.deinit();
+    try std.testing.expect((try inverted.lookup("obsolet")) == null);
+    try std.testing.expectEqual(@as(u32, 1), (try inverted.lookup("replac")).?.docFreq());
+    try std.testing.expectEqual(@as(u32, 9), (try inverted.lookup("retain")).?.docFreq());
+    try std.testing.expectEqual(@as(u32, 10), (try inverted.lookup("shar")).?.docFreq());
+    // Required fallback can still rebuild the whole fragment after a bounded
+    // optional merge decline, without publishing partial statistics/postings.
+    compactor.workspace_bytes = 1;
+    try std.testing.expect((try compactor.mergeRows()) == null);
+    try std.testing.expectEqual(@as(usize, 0), segments.items.len);
 }

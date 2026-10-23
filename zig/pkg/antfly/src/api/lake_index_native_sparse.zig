@@ -87,6 +87,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     for (desired.artifacts) |wanted| {
         var source_view = parent_source.*;
         var selected_provider = parent_provider.forIndex(&source_view, wanted.name);
+        selected_provider.paged_key_state = true;
         const provider = &selected_provider;
         if (!provider.wantsIndex(wanted.name)) continue;
         if (wanted.kind != .sparse_segment) continue;

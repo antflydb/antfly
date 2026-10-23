@@ -716,5 +716,21 @@ only. Additions, removals and radix splits still invalidate affected fragments;
 reusing their shifted row offsets would be incorrect. Each retained reader pins
 its own coordinate space, navigation, native files and cloud certificate. Reader
 protocol 76 covers the optional coordinate-key digest; legacy native generations
-upgrade by rebuilding the affected fragments. Text segments and aggregate
-contributions retain their bounded fragment-level replacement path.
+upgrade by rebuilding the affected fragments. Protocol 77 adds stable private
+text keys, bounded posting-level merges and per-row aggregate contributions.
+
+Sparse text changes analyze the selected rows and merge their postings with
+retained native postings after masking old coordinates. The final bounded native
+fragment remains immutable, with fresh physical maps and exact statistics; the
+source rows outside the delta are not reread. Workspace denial before publication
+selects the complete fragment encoder. Changes to membership still rebuild the
+affected fragment because they can shift native coordinates.
+
+Keyed algebraic cohorts persist typed row transitions plus reverse group routing
+under their existing shared aggregate descriptor. COW edits update selected rows;
+COUNT/integer SUM retract directly and other exact reducers recompute affected
+groups from their current transitions. All-NULL groups remain groups, and an empty
+group disappears. These roots are included in ordinary and resumable GC and cloud
+retention closure. Dense/sparse key-state directories now use the logical census
+without claiming physical object immutability, retaining untouched pages during
+sparse refreshes. Legacy and unsupported representations keep complete rebuilding.

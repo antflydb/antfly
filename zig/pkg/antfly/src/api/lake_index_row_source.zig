@@ -60,6 +60,7 @@ pub const Provider = struct {
     only_ordinals: ?[]const u64 = null,
     changed_rows: []const ?[]const u64 = &.{},
     key_digests: []const [32]u8 = &.{},
+    paged_key_state: bool = false,
     only_files: ?[]const bool = null,
     only_plan: ?*const @import("lake_index_native_state.zig").Plan = null,
     replay: ?*@import("lake_index_build_replay.zig").Replay = null,

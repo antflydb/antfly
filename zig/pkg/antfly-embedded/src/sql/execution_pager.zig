@@ -25,102 +25,173 @@ pub const Pager = struct {
         data: ?[]align(16) u8 = null,
         offset: ?u64 = null,
         pins: usize = 0,
-        used: u64 = 0,
         dirty: bool = false,
         live: bool = true,
         fresh: bool = true,
+        busy: bool = false,
+        previous: ?usize = null,
+        next: ?usize = null,
     };
     manager: *spill.Manager,
     pages: std.ArrayList(Page) = .empty,
     file: ?spill.File = null,
+    free_head: ?usize = null,
+    idle_head: ?usize = null,
+    idle_tail: ?usize = null,
+    inflight: usize = 0,
+    transfers: usize = 0,
     limit: usize,
     resident: usize = 0,
     peak: usize = 0,
-    clock: u64 = 0,
     evictions: u64 = 0,
     restores: u64 = 0,
+    directory_steps: u64 = 0,
+    pins: u64 = 0,
     mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
+    file_mutex: std.Io.Mutex = .init,
     pub const Lease = struct {
         owner: *Pager,
         id: usize,
         data: []align(16) u8,
         pub fn release(self: Lease) void {
-            // Cleanup must release pins even after request cancellation.
-            const io = self.owner.manager.io;
-            const protection = io.swapCancelProtection(.blocked);
-            defer _ = io.swapCancelProtection(protection);
-            self.owner.mutex.lock(io) catch unreachable;
-            defer self.owner.mutex.unlock(io);
-            const page = &self.owner.pages.items[self.id];
-            std.debug.assert(page.live and page.pins != 0);
+            const owner = self.owner;
+            const io = owner.manager.io;
+            owner.mutex.lockUncancelable(io);
+            defer owner.mutex.unlock(io);
+            const page = &owner.pages.items[self.id];
+            std.debug.assert(page.live and page.pins != 0 and !page.busy);
             page.pins -= 1;
+            if (page.pins == 0) owner.addIdle(self.id);
+            owner.changed.broadcast(io);
         }
     };
+    // Only resident, unpinned frames enter the eviction queue. Logical handles
+    // and retired slots never require directory-wide searches.
+    fn addIdle(self: *Pager, id: usize) void {
+        const page = &self.pages.items[id];
+        page.previous = self.idle_tail;
+        page.next = null;
+        if (self.idle_tail) |tail| self.pages.items[tail].next = id else self.idle_head = id;
+        self.idle_tail = id;
+    }
+    fn removeIdle(self: *Pager, id: usize) void {
+        const page = &self.pages.items[id];
+        if (page.previous) |previous| self.pages.items[previous].next = page.next else self.idle_head = page.next;
+        if (page.next) |next| self.pages.items[next].previous = page.previous else self.idle_tail = page.previous;
+        page.previous = null;
+        page.next = null;
+    }
     pub fn create(self: *Pager) !usize {
         try self.manager.check();
         try self.mutex.lock(self.manager.io);
         defer self.mutex.unlock(self.manager.io);
-        for (self.pages.items, 0..) |*page, id| if (!page.live) {
-            // Reuse the physical slot as well as the handle directory entry.
+        self.directory_steps += 1;
+        if (self.free_head) |id| {
+            const page = &self.pages.items[id];
+            self.free_head = page.next;
             const offset = page.offset;
             page.* = .{ .offset = offset, .dirty = true };
             return id;
-        };
+        }
         try self.pages.append(self.manager.allocator(), .{});
         return self.pages.items.len - 1;
     }
-    fn evict(self: *Pager) !bool {
-        var oldest: ?usize = null;
-        for (self.pages.items, 0..) |page, id| if (page.live and page.data != null and page.pins == 0) {
-            if (oldest == null or page.used < self.pages.items[oldest.?].used) oldest = id;
-        };
-        const page = &self.pages.items[oldest orelse return false];
-        try self.manager.check();
-        if (page.dirty) {
-            if (self.file == null) {
-                self.file = try self.manager.create();
-                // Whole pages use positional I/O directly. Avoid allocating
-                // ordinary row buffers while reclaiming a resident page.
-                self.file.?.buffer_bytes = 0;
-            }
-            const offset = page.offset orelse self.file.?.size;
-            try self.file.?.writeRaw(offset, page.data.?);
-            page.offset = offset;
-            page.dirty = false;
+    // The descriptor/buffer owner remains serialized, but a slow disk operation
+    // holds no frame-directory lock. Other resident pages stay pinnable. IDs,
+    // never pointers into the growable directory, survive this unlocked phase.
+    fn transfer(self: *Pager, id: usize, data: []align(16) u8, write: bool) !u64 {
+        const io = self.manager.io;
+        const saved = self.pages.items[id].offset;
+        self.transfers += 1;
+        self.mutex.unlock(io);
+        defer {
+            self.mutex.lockUncancelable(io);
+            self.transfers -= 1;
+            self.changed.broadcast(io);
         }
-        self.manager.allocator().free(page.data.?);
-        page.data = null;
+        try self.file_mutex.lock(io);
+        defer self.file_mutex.unlock(io);
+        if (self.file == null) {
+            std.debug.assert(write);
+            self.file = try self.manager.create();
+            self.file.?.buffer_bytes = 0;
+        }
+        const offset = saved orelse self.file.?.size;
+        if (write) try self.file.?.writeRaw(offset, data) else try self.file.?.readRaw(offset, data);
+        return offset;
+    }
+    fn evict(self: *Pager) !bool {
+        const id = self.idle_head orelse return false;
+        self.directory_steps += 1;
+        self.removeIdle(id);
+        self.pages.items[id].busy = true;
+        self.inflight += 1;
+        defer {
+            self.pages.items[id].busy = false;
+            self.inflight -= 1;
+            self.changed.broadcast(self.manager.io);
+        }
+        errdefer self.addIdle(id);
+        try self.manager.check();
+        const data = self.pages.items[id].data.?;
+        if (self.pages.items[id].dirty) {
+            const offset = try self.transfer(id, data, true);
+            self.pages.items[id].offset = offset;
+            self.pages.items[id].dirty = false;
+        }
+        self.manager.allocator().free(data);
+        self.pages.items[id].data = null;
         self.resident -= page_bytes;
         self.evictions += 1;
         return true;
     }
     pub fn pin(self: *Pager, id: usize, write: bool) !Lease {
+        const io = self.manager.io;
         try self.manager.check();
-        try self.mutex.lock(self.manager.io);
-        defer self.mutex.unlock(self.manager.io);
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
         if (id >= self.pages.items.len or !self.pages.items[id].live) return error.InvalidSqlSpill;
-        const page = &self.pages.items[id];
-        if (page.data == null) {
+        while (self.pages.items[id].busy) try self.changed.wait(io, &self.mutex);
+        if (self.pages.items[id].data == null) {
+            self.pages.items[id].busy = true;
+            self.inflight += 1;
+            defer {
+                self.pages.items[id].busy = false;
+                self.inflight -= 1;
+                self.changed.broadcast(io);
+            }
             while (self.resident +| page_bytes > self.limit or
                 (if (@import("memory_budget.zig").headroom(self.manager.allocator())) |available| available < page_bytes + 4096 else false))
-                if (!try self.evict()) return error.SqlProgramLimitExceeded;
+            {
+                if (!try self.evict()) {
+                    if (self.transfers != 0) {
+                        try self.changed.wait(io, &self.mutex);
+                        continue;
+                    }
+                    return error.SqlProgramLimitExceeded;
+                }
+            }
             const data = try self.manager.allocator().alignedAlloc(u8, alignment, page_bytes);
-            errdefer self.manager.allocator().free(data);
-            if (!page.fresh) {
-                try self.file.?.readRaw(page.offset.?, data);
+            self.resident += page_bytes;
+            self.peak = @max(self.peak, self.resident);
+            errdefer {
+                self.manager.allocator().free(data);
+                self.resident -= page_bytes;
+            }
+            if (!self.pages.items[id].fresh) {
+                _ = try self.transfer(id, data, false);
                 self.restores += 1;
             } else {
                 @memset(data, 0);
-                page.dirty = true;
+                self.pages.items[id].dirty = true;
             }
-            page.data = data;
-            page.fresh = false;
-            self.resident += page_bytes;
-            self.peak = @max(self.peak, self.resident);
-        }
-        self.clock +|= 1;
-        page.used = self.clock;
+            self.pages.items[id].data = data;
+            self.pages.items[id].fresh = false;
+        } else if (self.pages.items[id].pins == 0) self.removeIdle(id);
+        const page = &self.pages.items[id];
         page.pins += 1;
+        self.pins += 1;
         page.dirty = page.dirty or write;
         return .{ .owner = self, .id = id, .data = page.data.? };
     }
@@ -128,17 +199,21 @@ pub const Pager = struct {
         const io = self.manager.io;
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
-        self.mutex.lock(io) catch unreachable;
+        self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        while (self.pages.items[id].busy) self.changed.wait(io, &self.mutex) catch unreachable;
         const page = &self.pages.items[id];
         std.debug.assert(page.live and page.pins == 0);
         if (page.data) |data| {
+            self.removeIdle(id);
             self.manager.allocator().free(data);
             self.resident -= page_bytes;
         }
-        page.* = .{ .live = false, .offset = page.offset };
+        page.* = .{ .live = false, .offset = page.offset, .next = self.free_head };
+        self.free_head = id;
     }
     pub fn deinit(self: *Pager) void {
+        std.debug.assert(self.inflight == 0);
         for (self.pages.items) |page| {
             std.debug.assert(page.pins == 0);
             if (page.data) |data| self.manager.allocator().free(data);
@@ -157,7 +232,7 @@ pub fn Array(comptime T: type) type {
     }
     return struct {
         const Self = @This();
-        const per_page = page_bytes / @sizeOf(T);
+        const per_page: usize = page_bytes / @sizeOf(T);
         pager: *Pager,
         handles: std.ArrayList(usize) = .empty,
         len: usize = 0,
@@ -186,11 +261,78 @@ pub fn Array(comptime T: type) type {
             values[self.len % per_page] = value;
             self.len += 1;
         }
+        pub fn appendSlice(self: *Self, input: []const T) !void {
+            var begin: usize = 0;
+            while (begin < input.len) {
+                const page = self.len / per_page;
+                if (page == self.handles.items.len) {
+                    const id = try self.pager.create();
+                    errdefer self.pager.retire(id);
+                    try self.handles.append(self.pager.manager.allocator(), id);
+                }
+                const lease = try self.pager.pin(self.handles.items[page], true);
+                defer lease.release();
+                const values = std.mem.bytesAsSlice(T, lease.data[0 .. per_page * @sizeOf(T)]);
+                const count = @min(per_page - self.len % per_page, input.len - begin);
+                @memcpy(values[self.len % per_page ..][0..count], input[begin..][0..count]);
+                self.len += count;
+                begin += count;
+            }
+        }
+        pub fn appendRepeated(self: *Self, value: T, count: usize) !void {
+            var remaining = count;
+            while (remaining != 0) {
+                const page = self.len / per_page;
+                if (page == self.handles.items.len) {
+                    const id = try self.pager.create();
+                    errdefer self.pager.retire(id);
+                    try self.handles.append(self.pager.manager.allocator(), id);
+                }
+                const lease = try self.pager.pin(self.handles.items[page], true);
+                defer lease.release();
+                const values = std.mem.bytesAsSlice(T, lease.data[0 .. per_page * @sizeOf(T)]);
+                const length = @min(per_page - self.len % per_page, remaining);
+                @memset(values[self.len % per_page ..][0..length], value);
+                self.len += length;
+                remaining -= length;
+            }
+        }
+        pub fn getMany(self: Self, indices: []const usize, output: []T) !void {
+            if (indices.len != output.len) return error.InvalidSqlSpill;
+            for (indices) |index| if (index >= self.len) return error.InvalidSqlSpill;
+            var begin: usize = 0;
+            while (begin < indices.len) {
+                const end = @min(indices.len, begin + 128);
+                var done: [128]bool = @splat(false);
+                for (indices[begin..end], 0..) |index, lane| {
+                    if (done[lane]) continue;
+                    const window = try self.pinPage(index, false);
+                    defer window.lease.release();
+                    for (indices[begin..end], 0..) |selected, position| {
+                        if (done[position] or self.pageStart(selected) != window.begin) continue;
+                        output[begin + position] = window.values[selected - window.begin];
+                        done[position] = true;
+                    }
+                }
+                begin = end;
+            }
+        }
         pub fn pin(self: Self, index: usize, write: bool) !Pinned {
             if (index >= self.len) return error.InvalidSqlSpill;
             const lease = try self.pager.pin(self.handles.items[index / per_page], write);
             const values: []T = std.mem.bytesAsSlice(T, lease.data[0 .. per_page * @sizeOf(T)]);
             return .{ .lease = lease, .value = &values[index % per_page] };
+        }
+        pub const Window = struct { lease: Pager.Lease, values: []T, begin: usize };
+        pub fn pageStart(_: Self, index: usize) usize {
+            return index / per_page * per_page;
+        }
+        pub fn pinPage(self: Self, index: usize, write: bool) !Window {
+            if (index >= self.len) return error.InvalidSqlSpill;
+            const begin = self.pageStart(index);
+            const lease = try self.pager.pin(self.handles.items[index / per_page], write);
+            const length: usize = @min(per_page, self.len - begin);
+            return .{ .lease = lease, .values = std.mem.bytesAsSlice(T, lease.data[0 .. length * @sizeOf(T)]), .begin = begin };
         }
         pub fn get(self: Self, index: usize) !T {
             const pinned = try self.pin(index, false);
@@ -302,4 +444,55 @@ test "SQL execution pager refuses to evict a pinned page and reuses retired slot
     const fresh = try pager.pin(reused, false);
     try std.testing.expectEqual(@as(u8, 0), fresh.data[0]);
     fresh.release();
+}
+
+test "SQL execution pager directory work is linear and disk transfers permit resident pins" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        pager: ?*Pager = null,
+        hot: ?usize = null,
+        probing: bool = false,
+        probes: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.probing) return;
+            const pager = self.pager orelse return;
+            const hot = self.hot orelse return;
+            if (pager.file_mutex.tryLock()) {
+                pager.file_mutex.unlock(pager.manager.io);
+                return;
+            }
+            self.probing = true;
+            defer self.probing = false;
+            const held = try pager.pin(hot, false);
+            defer held.release();
+            try std.testing.expectEqual(@as(u8, 37), held.data[0]);
+            self.probes += 1;
+        }
+    };
+    var check: Check = .{};
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.check };
+    defer manager.deinit();
+    var pager: Pager = .{ .manager = &manager, .limit = 2 * page_bytes };
+    defer pager.deinit();
+    check.pager = &pager;
+    var ids: [20000]usize = undefined;
+    for (&ids) |*id| id.* = try pager.create();
+    try std.testing.expectEqual(@as(u64, ids.len), pager.directory_steps);
+    const hot = try pager.pin(ids[0], true);
+    hot.data[0] = 37;
+    check.hot = ids[0];
+    for (ids[1..65]) |id| {
+        const held = try pager.pin(id, true);
+        held.release();
+    }
+    const restored = try pager.pin(ids[1], false);
+    restored.release();
+    try std.testing.expect(check.probes > 0);
+    check.hot = null;
+    hot.release();
+    try std.testing.expectEqual(@as(u64, ids.len) + pager.evictions, pager.directory_steps);
+    for (ids) |id| pager.retire(id);
+    for (&ids) |*id| id.* = try pager.create();
+    try std.testing.expectEqual(@as(usize, ids.len), pager.pages.items.len);
 }
