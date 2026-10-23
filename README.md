@@ -1,8 +1,10 @@
 # Antfly
 
-Antfly is a search-and-inference database written in Zig. One engine carries full-text (BM25), dense, and sparse vector indexes plus graph traversal over the same table, and the models that chunk, embed, rerank, transcribe, OCR, and extract run inside the process. Embeddings, chunks, entities, and graph edges are generated automatically as you write data, and built-in RAG agents tie it together. The same engine runs as a single `.aflite` file, a single node with a hot standby, a multi-Raft cluster, or serverless over object storage.
+Antfly is an open-source search-and-inference database written in Zig. One engine carries full-text (BM25), dense, and sparse vector indexes plus graph traversal over the same table, and the models that chunk, embed, rerank, transcribe, OCR, and extract run inside the process. Embeddings, chunks, entities, and graph edges are generated automatically as you write data, and built-in RAG agents tie it together. The same engine runs as a single `.aflite` file, a single node with a hot standby, a multi-Raft cluster, or serverless over object storage.
 
-![Quickstart](https://cdn.antfly.io/quickstart.gif)
+[![Quickstart](https://cdn.antfly.io/quickstart.gif)](https://cdn.antfly.io/quickstart.gif)
+
+[Recording source](quickstart.tape)
 
 ## Quick Start
 
@@ -29,8 +31,7 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 
 ### One CLI, an embeddable library
 
-All first-party Antfly code is [Apache-2.0](LICENSES/Apache-2.0.txt). The `antfly`
-CLI runs the server, manages local database files, and runs inference:
+The `antfly` CLI runs the server, manages local database files, and runs inference:
 
 ```sh
 antfly standalone
@@ -184,9 +185,6 @@ Join the [Discord](https://discord.gg/zrdjguy84P) for support, discussion, and u
 Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
-
-Hosted Kubernetes orchestration and tenant/inference gateways are maintained in
-Colony. This repository builds and runs independently of those managed-service components.
 
 All first-party Antfly code, including the database server, distributed and serverless
 runtime, embedded engine, inference, CLI, SDKs, and bindings, is
