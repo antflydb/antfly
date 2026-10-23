@@ -545,8 +545,17 @@ entity view. Reject and defer have the same causal retention contract as accept.
 Native reconciliation snapshots every support branch actually supplied in the
 incoming claim and public prior records; an independent factual alternative
 cannot replace forgotten inference context. Historical support references stay
-bound to their captured assertion revisions. Legacy rationale records lacking a
-complete causal snapshot fail closed.
+bound to their captured assertion revisions. The snapshot also covers authorized
+`supersedes`, `motivates`, `rejected_in_favor_of`, conflict and supersession
+references, including explicit-disposition baselines and correction attribution
+in model input records. Reference targets pin their revisions and support; their
+relationship annotations are not recursively expanded. Snapshotting uses the
+incoming claim before model edits and the immutable external relationship
+candidate. Losing reference access invalidates that candidate's verdict admission;
+reviewing a newly redacted projection requires a fresh proposal, because native
+policy cannot prove that an earlier external judgment did not consume the lost
+reference. Legacy rationale records lacking any required input class fail closed
+under the private snapshot version.
 Rationales are redacted immediately when their exact context becomes unavailable;
 relationship verdict detail follows the same gate. Irreversible loss scrubs the
 artifact and duplicate

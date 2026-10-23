@@ -6463,3 +6463,157 @@ test "memory native reconciliation keeps denied causal context recoverable and f
     var rows = store.values.valueIterator();
     while (rows.next()) |json| try std.testing.expect(std.mem.indexOf(u8, json.*, "ALTERNATIVE_REASON") == null);
 }
+
+test "memory reconciliation rationales forget supplied relationship references" {
+    inline for (.{ "motivates", "rejected_in_favor_of" }) |field| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var svc = modelService(&store, 10);
+        const Judge = struct {
+            fn decide(_: *anyopaque, alloc: A, _: m.types.Config, _: m.types.Assertion, candidates: []const m.types.StoredAssertion) !m.types.ReconciliationDecision {
+                return .{ .supersedes = &.{}, .reason = try std.fmt.allocPrint(alloc, "Reviewed reference {s}", .{@field(candidates[0].assertion, field)[0]}) };
+            }
+        };
+        svc.backend.decide = Judge.decide;
+        const config: m.types.Config = .{ .features = .{ .reconciliation = .model }, .models = .{ .decider = fake_model }, .predicates = &.{.{ .name = "p", .cardinality = .one }} };
+        _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+        const observation: m.types.ObservationRequest = .{
+            .evidence = &.{.{ .id = "public", .source_id = "s", .source_version = "1", .text = "Public" }},
+            .assertions = &.{.{ .id = "FORGOTTEN_REFERENCE", .subject = "other", .predicate = "note", .value = "context", .statement = "Motivation", .evidence = &.{.{ .id = "public" }} }},
+        };
+        _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, observation, .{}), "sources");
+        var old: m.types.Assertion = .{ .id = "old", .subject = "s", .predicate = "p", .value = "old", .statement = "Old fact", .evidence = &.{.{ .id = "public" }} };
+        @field(old, field) = &.{"FORGOTTEN_REFERENCE"};
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{old} }, .{}), "old");
+        _ = try svc.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"new\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"new\",\"statement\":\"New fact\",\"evidence\":[{\"id\":\"public\"}]}]}", "new");
+        try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .get, "new", "{}", ""), "Reviewed reference FORGOTTEN_REFERENCE") != null);
+        // Version one froze support branches but omitted relationship fields.
+        const decisions = try Store.scan(&store, a, "decision/", null, 8);
+        const original = decisions.rows[0];
+        var legacy = try std.json.parseFromSliceLeaky(std.json.Value, a, original.json, .{});
+        try legacy.object.put(a, "input_version", .{ .integer = 1 });
+        try store.values.put(a, original.key, try std.json.Stringify.valueAlloc(a, legacy, .{}));
+        const hidden = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, "new", "{}", ""), .{});
+        try std.testing.expect(hidden.assertion.reconciliation_reason == null);
+        try store.values.put(a, original.key, original.json);
+        _ = try svc.execute(a, .forget, "", "{\"assertion_ids\":[\"FORGOTTEN_REFERENCE\"]}", "forget");
+        try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .get, "old", "{}", ""), "FORGOTTEN_REFERENCE") == null);
+        for ([_]m.Action{ .get, .history, .list, .explain }) |action| {
+            try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, action, if (action == .list) "" else "new", "{}", ""), "Reviewed reference FORGOTTEN_REFERENCE") == null);
+        }
+        for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}));
+        var rows = store.values.valueIterator();
+        while (rows.next()) |json| try std.testing.expect(std.mem.indexOf(u8, json.*, "Reviewed reference FORGOTTEN_REFERENCE") == null);
+    }
+}
+
+test "memory external verdict rationales forget supplied relationship references" {
+    inline for (.{ "motivates", "rejected_in_favor_of" }) |field| {
+        for ([_]?bool{ true, false, null }) |accept| {
+            var store = Store.init();
+            defer store.deinit();
+            const a = store.arena.allocator();
+            const svc = store.service("alice", true, 10);
+            _ = try svc.execute(a, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create");
+            const observation: m.types.ObservationRequest = .{
+                .evidence = &.{.{ .id = "base", .source_id = "s", .source_version = "1", .text = "Concepts" }},
+                .entities = &.{ .{ .id = "a", .name = "Antfly", .evidence = &.{.{ .id = "base" }} }, .{ .id = "b", .name = "Database", .evidence = &.{.{ .id = "base" }} } },
+                .assertions = &.{.{ .id = "FORGOTTEN_REFERENCE", .subject = "other", .predicate = "note", .value = "context", .statement = "Motivation", .evidence = &.{.{ .id = "base" }} }},
+            };
+            _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, observation, .{}), "observe");
+            const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+            var request: m.types.RelationshipProposalRequest = .{ .id = "proposal", .expected_revision = state.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "Candidate relation", .evidence = &.{.{ .id = "base" }} } };
+            @field(request.assertion, field) = &.{"FORGOTTEN_REFERENCE"};
+            const proposed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, request, .{}), "propose"), .{});
+            _ = try svc.execute(a, .review_relationship, "proposal", try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposed.revision, .accept = accept, .reason = "Judged FORGOTTEN_REFERENCE" }, .{}), "review");
+            _ = try svc.execute(a, .forget, "", "{\"assertion_ids\":[\"FORGOTTEN_REFERENCE\"]}", "forget");
+            const result = try std.json.parseFromSliceLeaky(m.types.RelationshipProposal, a, try svc.execute(a, .relationship_proposal, "proposal", "{}", ""), .{});
+            try std.testing.expectEqual(@as(usize, 0), @field(result.assertion, field).len);
+            try std.testing.expect(std.mem.indexOf(u8, result.reason, "FORGOTTEN_REFERENCE") == null);
+            if (accept == @as(?bool, true)) try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .get, "link", "{}", ""));
+            for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}));
+            var rows = store.values.valueIterator();
+            while (rows.next()) |json| try std.testing.expect(std.mem.indexOf(u8, json.*, "Judged FORGOTTEN_REFERENCE") == null);
+        }
+    }
+}
+
+test "memory reconciliation snapshots incoming references before model edits" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = modelService(&store, 10);
+    const Judge = struct {
+        fn decide(_: *anyopaque, alloc: A, _: m.types.Config, incoming: m.types.Assertion, _: []const m.types.StoredAssertion) !m.types.ReconciliationDecision {
+            return .{ .supersedes = &.{}, .reason = try std.fmt.allocPrint(alloc, "Reconsidered supersession {s}", .{incoming.supersedes[0]}) };
+        }
+    };
+    svc.backend.decide = Judge.decide;
+    const config: m.types.Config = .{ .features = .{ .reconciliation = .model }, .models = .{ .decider = fake_model }, .predicates = &.{.{ .name = "p", .cardinality = .one }} };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"public\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Public\"}],\"assertions\":[{\"id\":\"reference\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"original\",\"statement\":\"Original fact\",\"evidence\":[{\"id\":\"public\"}]}]}", "sources");
+    const reference = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, "reference", "{}", ""), .{});
+    _ = try svc.execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, m.types.Correction{ .id = "reference", .expected_revision = reference.revision, .lifecycle = .retracted, .reason = "Retracted" }, .{}), "retract");
+    _ = try svc.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"old\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"old\",\"statement\":\"Current fact\",\"evidence\":[{\"id\":\"public\"}]}]}", "old");
+    _ = try svc.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"new\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"new\",\"statement\":\"New fact\",\"evidence\":[{\"id\":\"public\"}],\"supersedes\":[\"reference\"]}]}", "new");
+    const before = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, "new", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 0), before.assertion.supersedes.len);
+    try std.testing.expectEqualStrings("Reconsidered supersession reference", before.assertion.reconciliation_reason.?);
+    _ = try svc.execute(a, .forget, "", "{\"assertion_ids\":[\"reference\"]}", "forget");
+    const after = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, "new", "{}", ""), .{});
+    try std.testing.expect(after.assertion.reconciliation_reason == null);
+}
+
+test "memory external reference loss fences stale verdicts and permits a fresh proposal" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"base\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Concepts\"}],\"entities\":[{\"id\":\"a\",\"name\":\"Antfly\",\"evidence\":[{\"id\":\"base\"}]},{\"id\":\"b\",\"name\":\"Database\",\"evidence\":[{\"id\":\"base\"}]}],\"assertions\":[{\"id\":\"reference\",\"subject\":\"other\",\"predicate\":\"note\",\"value\":\"context\",\"statement\":\"Motivation\",\"evidence\":[{\"id\":\"base\"}]}]}", "observe");
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    _ = try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, m.types.RelationshipProposalRequest{ .id = "proposal", .expected_revision = state.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "Candidate", .evidence = &.{.{ .id = "base" }}, .motivates = &.{"reference"} } }, .{}), "propose");
+    _ = try svc.execute(a, .forget, "", "{\"assertion_ids\":[\"reference\"]}", "forget");
+    const candidate = try std.json.parseFromSliceLeaky(m.types.RelationshipProposal, a, try svc.execute(a, .relationship_proposal, "proposal", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 0), candidate.assertion.motivates.len);
+    const current = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expectError(error.MemoryResourceChanged, svc.execute(a, .review_relationship, "proposal", try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = current.revision, .accept = false, .reason = "Stale reference rationale" }, .{}), "stale-review"));
+    const fresh = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, m.types.RelationshipProposalRequest{ .id = "fresh", .expected_revision = current.revision, .assertion = candidate.assertion }, .{}), "fresh"), .{});
+    _ = try svc.execute(a, .review_relationship, "fresh", try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = fresh.revision, .accept = false, .reason = "Reviewed authorized payload" }, .{}), "review");
+    for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}));
+    const result = try std.json.parseFromSliceLeaky(m.types.RelationshipProposal, a, try svc.execute(a, .relationship_proposal, "fresh", "{}", ""), .{});
+    try std.testing.expectEqualStrings("Reviewed authorized payload", result.reason);
+}
+
+test "memory reference judgment context survives temporary denial but is scrubbed after forgetting" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = modelService(&store, 10);
+    const Judge = struct {
+        fn decide(_: *anyopaque, alloc: A, _: m.types.Config, _: m.types.Assertion, candidates: []const m.types.StoredAssertion) !m.types.ReconciliationDecision {
+            return .{ .supersedes = &.{}, .reason = try std.fmt.allocPrint(alloc, "REFERENCE_CONTEXT {s}", .{candidates[0].assertion.motivates[0]}) };
+        }
+    };
+    svc.backend.decide = Judge.decide;
+    const config: m.types.Config = .{ .features = .{ .reconciliation = .model }, .models = .{ .decider = fake_model }, .predicates = &.{.{ .name = "p", .cardinality = .one }} };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"public\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Public\"},{\"id\":\"protected\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}},{\"id\":\"scratch\",\"source_id\":\"scratch\",\"source_version\":\"1\",\"text\":\"Unrelated cleanup trigger\"}],\"assertions\":[{\"id\":\"reference\",\"subject\":\"other\",\"predicate\":\"note\",\"value\":\"context\",\"statement\":\"Motivation\",\"evidence\":[{\"id\":\"protected\"}]}]}", "sources");
+    _ = try svc.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"old\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"old\",\"statement\":\"Old fact\",\"evidence\":[{\"id\":\"public\"}],\"motivates\":[\"reference\"]}]}", "old");
+    _ = try svc.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"new\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"new\",\"statement\":\"New fact\",\"evidence\":[{\"id\":\"public\"}]}]}", "new");
+    try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .get, "new", "{}", ""), "REFERENCE_CONTEXT reference") != null);
+    store.resource_state = .denied;
+    try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .get, "new", "{}", ""), "REFERENCE_CONTEXT") == null);
+    // Erasing an unrelated source schedules cleanup without requiring a
+    // configuration publication over the temporarily inaccessible premise.
+    _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"scratch\"]}", "trigger-cleanup");
+    for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "denied-cleanup-{d}", .{i}));
+    store.resource_state = .current;
+    try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .get, "new", "{}", ""), "REFERENCE_CONTEXT reference") != null);
+    _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"protected\"]}", "forget");
+    try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .get, "new", "{}", ""), "REFERENCE_CONTEXT") == null);
+    for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "forgotten-cleanup-{d}", .{i}));
+    var rows = store.values.valueIterator();
+    while (rows.next()) |json| try std.testing.expect(std.mem.indexOf(u8, json.*, "REFERENCE_CONTEXT") == null);
+}

@@ -31,9 +31,12 @@ const max_dependency_depth: u8 = 32;
 const max_support_work = 65536;
 const resource_check_interval_ms: i64 = 30000;
 const max_explanation_snapshot_candidates = 4096;
+// Increment when the private inference snapshot gains a required input class.
+const judgment_input_version: u8 = 2;
+const assertion_reference_fields = .{ "supersedes", "motivates", "rejected_in_favor_of" };
 const ReasonBindings = struct { assertion: ?[]const u8 = null, disposition: ?[]const u8 = null };
 const DecisionInput = struct { id: []const u8, revision: u64, reasons: ReasonBindings, correction_evidence: []const t.EvidenceRef = &.{} };
-const DecisionProvenance = struct { principal: []const u8, recorded_at: i64, config_generation: u64, assertion_id: []const u8, evidence_ids: []const []const u8, inputs: []const DecisionInput, context: ?[]const t.DerivedDependency = null, incoming_reason: ?[]const u8 = null };
+const DecisionProvenance = struct { input_version: u8 = 0, principal: []const u8, recorded_at: i64, config_generation: u64, assertion_id: []const u8, evidence_ids: []const []const u8, inputs: []const DecisionInput, context: ?[]const t.DerivedDependency = null, incoming_reason: ?[]const u8 = null };
 // Causal inference inputs are conjunctive retention/authorization dependencies,
 // independent of the alternative factual support selected by a producer.
 const GenerationProvenance = struct {
@@ -503,6 +506,7 @@ const Run = struct {
     }
     fn decisionAvailableInner(self: *Run, path: []const u8, depth: u8, comptime view: RecordView) anyerror!bool {
         const decision = (try self.read(DecisionProvenance, path)) orelse return false;
+        if (decision.input_version != judgment_input_version) return false;
         if (try self.read(bool, try key(self.a, "forgotten-assertion", decision.assertion_id)) != null) return false;
         if (view == .visible) {
             if (!try self.generationVisible("assertion", decision.assertion_id)) return false;
@@ -525,14 +529,14 @@ const Run = struct {
     }
     fn storeDecision(self: *Run, claim: t.Assertion, prior: []const t.StoredAssertion, incoming_reason: ?[]const u8) ![]const u8 {
         var context: JudgmentContext = .{};
-        try self.captureClaimSupport(&context, claim, claim.visibility, .retained);
+        try self.captureClaimInputs(&context, claim, claim.visibility, .retained);
         var inputs: std.ArrayList(DecisionInput) = .empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         for (prior) |record| {
             try self.captureJudgmentDependency(&context, .{ .resource = try self.resourceRef(.assertion, record.assertion.id, record.revision), .evidence = record.assertion.evidence }, claim.visibility, 0, .retained);
             // Every branch in this public payload was supplied to the model,
             // not just the branch currently sufficient to retain the fact.
-            try self.captureClaimSupport(&context, record.assertion, claim.visibility, .retained);
+            try self.captureRecordInputs(&context, record, claim.visibility);
             var reasons = try self.reasonBindings(record);
             if (record.assertion.reconciliation_reason == null) reasons.assertion = null;
             const correction_reason = if (record.explicit_disposition) |baseline| baseline.reason != null else false;
@@ -553,7 +557,7 @@ const Run = struct {
         }
         const ids = try self.judgmentEvidence(&context, claim.visibility);
         const path = try std.fmt.allocPrint(self.a, "decision/{s}/{d:0>20}", .{ try hash(self.a, claim.id), self.state.revision });
-        try self.put(path, DecisionProvenance{ .principal = self.service.context.principal, .recorded_at = self.service.context.now_ms, .config_generation = self.state.config.generation, .assertion_id = claim.id, .evidence_ids = ids, .inputs = inputs.items, .context = context.dependencies.items, .incoming_reason = incoming_reason });
+        try self.put(path, DecisionProvenance{ .input_version = judgment_input_version, .principal = self.service.context.principal, .recorded_at = self.service.context.now_ms, .config_generation = self.state.config.generation, .assertion_id = claim.id, .evidence_ids = ids, .inputs = inputs.items, .context = context.dependencies.items, .incoming_reason = incoming_reason });
         return path;
     }
     fn reasonSupport(self: *Run, refs: []const t.EvidenceRef, comptime view: RecordView) !bool {
@@ -612,7 +616,7 @@ const Run = struct {
         claim.evidence = if (branches.items.len > 0) branches.items[0].evidence else &.{};
         claim.depends_on = if (branches.items.len > 0) branches.items[0].depends_on else &.{};
         claim.support_sets = if (branches.items.len > 1) branches.items[1..] else &.{};
-        inline for (.{ "supersedes", "motivates", "rejected_in_favor_of" }) |field| @field(claim.*, field) = try self.publicAssertionRefs(@field(claim.*, field));
+        inline for (assertion_reference_fields) |field| @field(claim.*, field) = try self.publicAssertionRefs(@field(claim.*, field));
     }
     fn publicAssertionRef(self: *Run, id: []const u8) !bool {
         const record = (try self.assertion(id)) orelse return false;
@@ -1302,7 +1306,8 @@ const Run = struct {
         const inputs = try self.captureResources(decisionInputs, .{ claim.*, owner, incoming_reason });
         const prior = inputs.result;
         if (prior.len == 0) return null;
-        const decision = try decide(self.service.backend.ptr, self.a, self.state.config, claim.*, prior);
+        const incoming = claim.*;
+        const decision = try decide(self.service.backend.ptr, self.a, self.state.config, incoming, prior);
         try self.inferenceCompleted(inputs.resources);
         if (decision.reason.len == 0 or decision.reason.len > t.max_text_bytes) return error.MemoryUngroundedOutput;
         for (decision.supersedes) |target| {
@@ -1315,7 +1320,7 @@ const Run = struct {
         }
         claim.supersedes = decision.supersedes;
         claim.reconciliation_reason = decision.reason;
-        return try self.storeDecision(claim.*, prior, incoming_reason);
+        return try self.storeDecision(incoming, prior, incoming_reason);
     }
     fn decisionInputs(self: *Run, claim: t.Assertion, owner: []const u8, incoming_reason: ?[]const u8) ![]const t.StoredAssertion {
         _ = try self.supportVisible(claim.evidence, claim.depends_on, 0);
@@ -1733,9 +1738,36 @@ const Run = struct {
     }
     // The candidate payload and every support branch supplied to inference
     // are causal inputs even when none appears in an entity's rendered view.
-    fn captureClaimSupport(self: *Run, context: *JudgmentContext, claim: t.Assertion, audience: t.Visibility, mode: SupportSnapshot) !void {
+    fn captureClaimInputs(self: *Run, context: *JudgmentContext, claim: t.Assertion, audience: t.Visibility, mode: SupportSnapshot) !void {
         try self.captureSupport(context, .{ .evidence = claim.evidence, .depends_on = claim.depends_on }, audience, mode);
         for (claim.support_sets) |support| try self.captureSupport(context, support, audience, mode);
+        inline for (assertion_reference_fields) |field| try self.captureAssertionReferences(context, @field(claim, field), audience);
+    }
+    fn captureRecordInputs(self: *Run, context: *JudgmentContext, record: t.StoredAssertion, audience: t.Visibility) !void {
+        try self.captureClaimInputs(context, record.assertion, audience, .retained);
+        try self.captureDispositionInputs(context, record, audience);
+        if (record.explicit_disposition) |baseline| {
+            try self.captureDispositionInputs(context, baseline, audience);
+            // Correction attribution is part of the public model payload even
+            // when its free-text reason is empty.
+            if (baseline.provenance) |provenance| try self.captureSupport(context, .{ .evidence = provenance.evidence }, audience, .retained);
+        }
+    }
+    fn captureDispositionInputs(self: *Run, context: *JudgmentContext, disposition: anytype, audience: t.Visibility) !void {
+        try self.captureAssertionReferences(context, disposition.conflicts_with, audience);
+        if (disposition.superseded_by) |id| try self.captureAssertionReferences(context, &.{id}, audience);
+    }
+    fn captureAssertionReferences(self: *Run, context: *JudgmentContext, ids: []const []const u8, audience: t.Visibility) !void {
+        for (ids) |id| {
+            const record = (try self.assertion(id)) orelse return error.MemoryResourceChanged;
+            try self.authorize(record.owner, record.assertion.visibility);
+            if (!try self.retained(record, 0)) return error.MemoryResourceChanged;
+            // An annotation can refer to an authorized historical assertion.
+            // Pin its revision and selected support, but do not recursively
+            // follow annotations: they are identifiers, not expanded payloads.
+            const support = try self.snapshotSupport(record.assertion, .retained);
+            try self.captureJudgmentDependency(context, .{ .resource = try self.resourceRef(.assertion, id, record.revision), .evidence = support.evidence }, audience, 0, .retained);
+        }
     }
     fn captureSupport(self: *Run, context: *JudgmentContext, support: t.Support, audience: t.Visibility, mode: SupportSnapshot) !void {
         for (support.evidence) |ref| {
@@ -1764,10 +1796,10 @@ const Run = struct {
         var context: JudgmentContext = .{};
         for (refs) |ref| try context.evidence.put(self.a, ref.id, {});
         for (views) |view| for (view.dependencies) |dependency| try self.captureJudgmentDependency(&context, dependency, audience, 0, .current);
-        if (candidate) |claim| try self.captureClaimSupport(&context, claim, audience, .current);
+        if (candidate) |claim| try self.captureClaimInputs(&context, claim, audience, .current);
         const ids = try self.judgmentEvidence(&context, audience);
         const artifact: JudgmentArtifact = .{
-            .input_version = 1,
+            .input_version = judgment_input_version,
             .operation = try self.resourceRef(.operation, receipt.id, receipt.revision),
             .inputs = .{ .operation_id = receipt.id, .config_generation = self.state.config.generation, .evidence_ids = ids, .context = context.dependencies.items, .views = views },
             .reason = reason,
@@ -1777,7 +1809,7 @@ const Run = struct {
         return artifact;
     }
     fn judgmentAvailable(self: *Run, artifact: JudgmentArtifact, comptime view: RecordView) !bool {
-        if (artifact.input_version != 1) return false;
+        if (artifact.input_version != judgment_input_version) return false;
         if (artifact.output_assertion_id) |id| if (try self.read(bool, try key(self.a, "forgotten-assertion", id)) != null) return false;
         return self.provenanceAvailable(artifact.inputs, view);
     }
@@ -2171,7 +2203,11 @@ const Run = struct {
         try self.reviewEvidence(request.evidence);
         try self.bindJudgedViews(proposal.views, request.views);
         const views = proposal.views orelse return error.MemoryResourceChanged;
+        // The candidate is immutable: silently stripping a reference here
+        // cannot prove it was absent from the external judge's earlier input.
+        // Lost reference access requires a fresh independently grounded proposal.
         const artifact = try self.storeJudgment(views, request.evidence, proposal.assertion, proposal.assertion.visibility, request.reason, receipt.*, proposal.assertion.id);
+        if (!try self.judgmentAvailable(artifact, .visible)) return error.MemoryResourceChanged;
         try self.put(try key(self.a, "relationship-judgment", proposal.id), artifact.operation);
         if (request.accept) |accept| {
             if (accept) {
