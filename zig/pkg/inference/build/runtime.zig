@@ -542,7 +542,7 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
     };
     const measured_release = !options.strip and !options.has_accelerator and baseline_cpu and optimize == .fast;
     const darwin_linux_release = measured_release and b.graph.host.result.os.tag == .macos and
-        target.result.os.tag == .linux and target.result.cpu.arch == .x86_64 and
+        b.graph.host.result.cpu.arch == .aarch64 and target.result.os.tag == .linux and target.result.cpu.arch == .x86_64 and
         target.result.abi == .gnu;
     // CI's native Nix/glibc compiler peaked at 10,717,630,464 bytes, versus
     // 12,537,217,024 bytes for the Darwin-hosted cross-build.

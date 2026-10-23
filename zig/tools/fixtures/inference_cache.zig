@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
     var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
     for (b.top_level_steps.values()) |top| profiles.collectSteps(&top.step, &steps, &modules);
     var iterator = steps.keyIterator();
+    var inference_found = false;
     var pilot_found = false;
     var reporting_found = false;
     var pjrt_test_found = false;
@@ -35,7 +36,8 @@ pub fn build(b: *std.Build) void {
         profiles.addInferenceWasmProbe(b, artifact);
         profiles.addBenchmarkProbe(b, artifact);
         pjrt_test_found = profiles.addPjrtQualificationProbe(b, artifact) or pjrt_test_found;
-        if (std.mem.eql(u8, artifact.name, "antfly-inference")) {
+        if (std.mem.eql(u8, artifact.name, "antfly-inference-dev")) {
+            inference_found = true;
             // Exercise the real executable's final links without its large body.
             profiles.addObservabilityProbe(artifact.root_module, artifact.root_module.import_table.get("inference").?);
             const inference = artifact.root_module.import_table.get("inference").?;
@@ -88,5 +90,6 @@ pub fn build(b: *std.Build) void {
     profiles.addDataToolChecks(b, &steps);
     profiles.addAssetToolChecks(b, &steps);
     profiles.addOnnxTestChecks(b);
+    if (!inference_found) @panic("standalone fixture did not find its actual development executable");
     if (!pilot_found or !reporting_found or !pjrt_test_found) @panic("standalone fixture did not find its actual tool consumers");
 }

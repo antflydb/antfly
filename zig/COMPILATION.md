@@ -286,10 +286,10 @@ The full CLI is a separate, heavier build profile. At PR #1264's `7c4df469bb`,
 its native x86_64 GNU, baseline CPU, unstripped ReleaseFast build measured
 10,717,630,464 bytes of compiler RSS and 49 minutes cold wall time. It used the
 exact Nix/glibc Zig derivation pinned in `scripts/ci/toolchain-policy.json`.
-The corresponding Darwin-hosted Linux cross-build measured 12,537,217,024
+The corresponding aarch64 Darwin-hosted Linux cross-build measured 12,537,217,024
 bytes. Reserve the measured peak plus 25%, rounded up to 64 MiB: 12,800 MiB
 native and 14,976 MiB cross-built. Scope these claims to the measured host,
-target, optimization and unstripped profiles; other profiles keep their
+target, baseline CPU, accelerator-free, optimization and unstripped profiles; other profiles keep their
 existing claims. `-Dinference-compile-memory-mb` remains an explicit override.
 
 These claims do not change runner resources or model-process budgets. The
