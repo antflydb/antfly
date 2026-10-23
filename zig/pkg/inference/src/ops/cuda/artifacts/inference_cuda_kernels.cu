@@ -1691,31 +1691,24 @@ extern "C" __global__ void termite_linear_bias_add_f32_tile4_r2(
     termite_linear_bias_f32_tile_rows_cols<2u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
 }
 
-extern "C" __global__ void termite_linear_pair_bias_f32_tile4_r2(
-    float* dst_a,
-    float* dst_b,
-    const float* input,
-    const float* weight_a,
-    const float* bias_a,
-    const float* weight_b,
-    const float* bias_b,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
+// Projection count is an unrolled specialization, never a runtime loop.
+template<unsigned int Count>
+__device__ __forceinline__ void termite_linear_grouped_bias_tile4_r2(
+    float* const (&outputs)[Count], const float* input,
+    const float* const (&weights)[Count], const float* const (&biases)[Count],
+    unsigned int rows, unsigned int in_dim, unsigned int out_dim)
+{
     unsigned int col_tile = blockIdx.x * 4u;
     unsigned int row_base = blockIdx.y * 2u;
     unsigned int tid = threadIdx.x;
-    __shared__ float partial_a[2][4][256];
-    __shared__ float partial_b[2][4][256];
-    float acc_a[2][4];
-    float acc_b[2][4];
+    __shared__ float partial[Count][2][4][256];
+    float acc[Count][2][4];
     #pragma unroll
     for (unsigned int r = 0; r < 2u; ++r) {
         #pragma unroll
         for (unsigned int c = 0; c < 4u; ++c) {
-            acc_a[r][c] = 0.0f;
-            acc_b[r][c] = 0.0f;
+            #pragma unroll
+            for (unsigned int p = 0; p < Count; ++p) acc[p][r][c] = 0.0f;
         }
     }
 
@@ -1730,12 +1723,13 @@ extern "C" __global__ void termite_linear_pair_bias_f32_tile4_r2(
         for (unsigned int c = 0; c < 4u; ++c) {
             unsigned int col = col_tile + c;
             if (col < out_dim) {
-                float wa = weight_a[col * in_dim + k];
-                float wb = weight_b[col * in_dim + k];
+                float w[Count];
+                #pragma unroll
+                for (unsigned int p = 0; p < Count; ++p) w[p] = weights[p][col * in_dim + k];
                 #pragma unroll
                 for (unsigned int r = 0; r < 2u; ++r) {
-                    acc_a[r][c] += x[r] * wa;
-                    acc_b[r][c] += x[r] * wb;
+                    #pragma unroll
+                    for (unsigned int p = 0; p < Count; ++p) acc[p][r][c] += x[r] * w[p];
                 }
             }
         }
@@ -1745,8 +1739,8 @@ extern "C" __global__ void termite_linear_pair_bias_f32_tile4_r2(
     for (unsigned int r = 0; r < 2u; ++r) {
         #pragma unroll
         for (unsigned int c = 0; c < 4u; ++c) {
-            partial_a[r][c][tid] = acc_a[r][c];
-            partial_b[r][c][tid] = acc_b[r][c];
+            #pragma unroll
+            for (unsigned int p = 0; p < Count; ++p) partial[p][r][c][tid] = acc[p][r][c];
         }
     }
     __syncthreads();
@@ -1756,8 +1750,8 @@ extern "C" __global__ void termite_linear_pair_bias_f32_tile4_r2(
             for (unsigned int r = 0; r < 2u; ++r) {
                 #pragma unroll
                 for (unsigned int c = 0; c < 4u; ++c) {
-                    partial_a[r][c][tid] += partial_a[r][c][tid + stride];
-                    partial_b[r][c][tid] += partial_b[r][c][tid + stride];
+                    #pragma unroll
+                    for (unsigned int p = 0; p < Count; ++p) partial[p][r][c][tid] += partial[p][r][c][tid + stride];
                 }
             }
         }
@@ -1773,11 +1767,29 @@ extern "C" __global__ void termite_linear_pair_bias_f32_tile4_r2(
                 unsigned int col = col_tile + c;
                 if (col >= out_dim) continue;
                 unsigned int out_idx = row * out_dim + col;
-                dst_a[out_idx] = partial_a[r][c][0] + bias_a[col];
-                dst_b[out_idx] = partial_b[r][c][0] + bias_b[col];
+                #pragma unroll
+                for (unsigned int p = 0; p < Count; ++p) outputs[p][out_idx] = partial[p][r][c][0] + biases[p][col];
             }
         }
     }
+}
+
+extern "C" __global__ void termite_linear_pair_bias_f32_tile4_r2(
+    float* dst_a,
+    float* dst_b,
+    const float* input,
+    const float* weight_a,
+    const float* bias_a,
+    const float* weight_b,
+    const float* bias_b,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    float* outputs[] = {dst_a, dst_b};
+    const float* weights[] = {weight_a, weight_b};
+    const float* biases[] = {bias_a, bias_b};
+    termite_linear_grouped_bias_tile4_r2<2>(outputs, input, weights, biases, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_triple_bias_f32_tile4_r2(
@@ -1795,88 +1807,48 @@ extern "C" __global__ void termite_linear_triple_bias_f32_tile4_r2(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    unsigned int col_tile = blockIdx.x * 4u;
-    unsigned int row_base = blockIdx.y * 2u;
+    float* outputs[] = {dst_a, dst_b, dst_c};
+    const float* weights[] = {weight_a, weight_b, weight_c};
+    const float* biases[] = {bias_a, bias_b, bias_c};
+    termite_linear_grouped_bias_tile4_r2<3>(outputs, input, weights, biases, rows, in_dim, out_dim);
+}
+
+// One RMS reduction schedule; epilogues specialize before device code generation.
+// ScaleStage: 0=none, 1=scale normalized value before residual, 2=scale final sum.
+template<bool Weighted, bool Residual, bool Bf16, int ScaleStage>
+__device__ __forceinline__ void termite_rms_norm_impl(
+    float* dst, unsigned short* dst_bf16, const float* input,
+    const float* weight, const float* residual, const float* scalar,
+    unsigned int rows, unsigned int dim, float eps)
+{
+    unsigned int row = blockIdx.x;
+    if (row >= rows) return;
     unsigned int tid = threadIdx.x;
-    __shared__ float partial_a[2][4][256];
-    __shared__ float partial_b[2][4][256];
-    __shared__ float partial_c[2][4][256];
-    float acc_a[2][4];
-    float acc_b[2][4];
-    float acc_c[2][4];
-    #pragma unroll
-    for (unsigned int r = 0; r < 2u; ++r) {
-        #pragma unroll
-        for (unsigned int c = 0; c < 4u; ++c) {
-            acc_a[r][c] = 0.0f;
-            acc_b[r][c] = 0.0f;
-            acc_c[r][c] = 0.0f;
-        }
+    const unsigned int base = row * dim;
+    __shared__ float partial[256];
+    float sumsq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        float x = input[base + i];
+        sumsq += x * x;
     }
-
-    for (unsigned int k = tid; k < in_dim; k += 256u) {
-        float x[2];
-        #pragma unroll
-        for (unsigned int r = 0; r < 2u; ++r) {
-            unsigned int row = row_base + r;
-            x[r] = row < rows ? input[row * in_dim + k] : 0.0f;
-        }
-        #pragma unroll
-        for (unsigned int c = 0; c < 4u; ++c) {
-            unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                float wa = weight_a[col * in_dim + k];
-                float wb = weight_b[col * in_dim + k];
-                float wc = weight_c[col * in_dim + k];
-                #pragma unroll
-                for (unsigned int r = 0; r < 2u; ++r) {
-                    acc_a[r][c] += x[r] * wa;
-                    acc_b[r][c] += x[r] * wb;
-                    acc_c[r][c] += x[r] * wc;
-                }
-            }
-        }
-    }
-
-    #pragma unroll
-    for (unsigned int r = 0; r < 2u; ++r) {
-        #pragma unroll
-        for (unsigned int c = 0; c < 4u; ++c) {
-            partial_a[r][c][tid] = acc_a[r][c];
-            partial_b[r][c][tid] = acc_b[r][c];
-            partial_c[r][c][tid] = acc_c[r][c];
-        }
-    }
+    partial[tid] = sumsq;
     __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            #pragma unroll
-            for (unsigned int r = 0; r < 2u; ++r) {
-                #pragma unroll
-                for (unsigned int c = 0; c < 4u; ++c) {
-                    partial_a[r][c][tid] += partial_a[r][c][tid + stride];
-                    partial_b[r][c][tid] += partial_b[r][c][tid + stride];
-                    partial_c[r][c][tid] += partial_c[r][c][tid + stride];
-                }
-            }
-        }
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
         __syncthreads();
     }
-    if (tid == 0u) {
-        #pragma unroll
-        for (unsigned int r = 0; r < 2u; ++r) {
-            unsigned int row = row_base + r;
-            if (row >= rows) continue;
-            #pragma unroll
-            for (unsigned int c = 0; c < 4u; ++c) {
-                unsigned int col = col_tile + c;
-                if (col >= out_dim) continue;
-                unsigned int out_idx = row * out_dim + col;
-                dst_a[out_idx] = partial_a[r][c][0] + bias_a[col];
-                dst_b[out_idx] = partial_b[r][c][0] + bias_b[col];
-                dst_c[out_idx] = partial_c[r][c][0] + bias_c[col];
-            }
-        }
+    float scale = rsqrtf(partial[0] / (float)dim + eps);
+    float output_scale = 1.0f;
+    if (ScaleStage != 0) output_scale = scalar[0];
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        unsigned int idx = base + i;
+        float value = input[idx] * scale;
+        if (Weighted) value = value * weight[i];
+        if (ScaleStage == 1) value = value * output_scale;
+        if (Residual) value = value + residual[idx];
+        if (ScaleStage == 2) value = value * output_scale;
+        dst[idx] = value;
+        if (Bf16) dst_bf16[idx] = termite_f32_to_bf16(value);
     }
 }
 
@@ -1888,26 +1860,7 @@ extern "C" __global__ void termite_rms_norm_f32(
     unsigned int dim,
     float eps
 ) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
-    const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        dst[base + i] = input[base + i] * scale * weight[i];
-    }
+    termite_rms_norm_impl<true, false, false, 0>(dst, nullptr, input, weight, nullptr, nullptr, rows, dim, eps);
 }
 
 extern "C" __global__ void termite_rms_norm_f32_bf16(
@@ -1919,29 +1872,7 @@ extern "C" __global__ void termite_rms_norm_f32_bf16(
     unsigned int dim,
     float eps
 ) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
-    const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        unsigned int idx = base + i;
-        float value = input[idx] * scale * weight[i];
-        dst[idx] = value;
-        dst_bf16[idx] = termite_f32_to_bf16(value);
-    }
+    termite_rms_norm_impl<true, false, true, 0>(dst, dst_bf16, input, weight, nullptr, nullptr, rows, dim, eps);
 }
 
 extern "C" __global__ void termite_rms_norm_add_f32(
@@ -1953,27 +1884,7 @@ extern "C" __global__ void termite_rms_norm_add_f32(
     unsigned int dim,
     float eps
 ) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
-    const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float norm_scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        unsigned int idx = base + i;
-        dst[idx] = input[idx] * norm_scale * weight[i] + residual[idx];
-    }
+    termite_rms_norm_impl<true, true, false, 0>(dst, nullptr, input, weight, residual, nullptr, rows, dim, eps);
 }
 
 extern "C" __global__ void termite_rms_norm_add_f32_bf16(
@@ -1986,29 +1897,7 @@ extern "C" __global__ void termite_rms_norm_add_f32_bf16(
     unsigned int dim,
     float eps
 ) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
-    const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float norm_scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        unsigned int idx = base + i;
-        float value = input[idx] * norm_scale * weight[i] + residual[idx];
-        dst[idx] = value;
-        dst_bf16[idx] = termite_f32_to_bf16(value);
-    }
+    termite_rms_norm_impl<true, true, true, 0>(dst, dst_bf16, input, weight, residual, nullptr, rows, dim, eps);
 }
 
 extern "C" __global__ void termite_rms_norm_add_mul_scalar_f32(
@@ -2021,28 +1910,7 @@ extern "C" __global__ void termite_rms_norm_add_mul_scalar_f32(
     unsigned int dim,
     float eps
 ) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
-    const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float norm_scale = rsqrtf(partial[0] / (float)dim + eps);
-    float output_scale = scalar[0];
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        unsigned int idx = base + i;
-        dst[idx] = input[idx] * norm_scale * weight[i] * output_scale + residual[idx];
-    }
+    termite_rms_norm_impl<true, true, false, 1>(dst, nullptr, input, weight, residual, scalar, rows, dim, eps);
 }
 
 extern "C" __global__ void termite_rms_norm_add_output_scale_f32(
@@ -2055,28 +1923,7 @@ extern "C" __global__ void termite_rms_norm_add_output_scale_f32(
     unsigned int dim,
     float eps
 ) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
-    const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float norm_scale = rsqrtf(partial[0] / (float)dim + eps);
-    float output_scale = scalar[0];
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        unsigned int idx = base + i;
-        dst[idx] = (input[idx] * norm_scale * weight[i] + residual[idx]) * output_scale;
-    }
+    termite_rms_norm_impl<true, true, false, 2>(dst, nullptr, input, weight, residual, scalar, rows, dim, eps);
 }
 
 extern "C" __global__ void termite_rms_norm_bare_f32(
@@ -2086,26 +1933,7 @@ extern "C" __global__ void termite_rms_norm_bare_f32(
     unsigned int dim,
     float eps
 ) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
-    const unsigned int base = row * dim;
-    __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)dim + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        dst[base + i] = input[base + i] * scale;
-    }
+    termite_rms_norm_impl<false, false, false, 0>(dst, nullptr, input, nullptr, nullptr, nullptr, rows, dim, eps);
 }
 
 // Gemma 4 A4B branches three RMSNorms from the same attention residual. Share
@@ -2219,15 +2047,11 @@ extern "C" __global__ void termite_gemma4_a4b_parallel_ffn_post_residual_f32(
     }
 }
 
-extern "C" __global__ void termite_layer_norm_f32(
-    float* dst,
-    const float* input,
-    const float* gamma,
-    const float* beta,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
+template<bool Add>
+__device__ __forceinline__ void termite_layer_norm_impl(
+    float* dst, const float* input, const float* residual, const float* gamma,
+    const float* beta, unsigned int rows, unsigned int dim, float eps)
+{
     unsigned int row = blockIdx.x;
     if (row >= rows) return;
     const unsigned int base = row * dim;
@@ -2239,6 +2063,7 @@ extern "C" __global__ void termite_layer_norm_f32(
     float local_sumsq = 0.0f;
     for (unsigned int i = tid; i < dim; i += blockDim.x) {
         float x = input[base + i];
+        if (Add) x = x + residual[base + i];
         local_sum += x;
         local_sumsq += x * x;
     }
@@ -2259,8 +2084,21 @@ extern "C" __global__ void termite_layer_norm_f32(
     float inv = rsqrtf(var + eps);
     for (unsigned int i = tid; i < dim; i += blockDim.x) {
         float x = input[base + i];
+        if (Add) x = x + residual[base + i];
         dst[base + i] = (x - mean) * inv * gamma[i] + beta[i];
     }
+}
+
+extern "C" __global__ void termite_layer_norm_f32(
+    float* dst,
+    const float* input,
+    const float* gamma,
+    const float* beta,
+    unsigned int rows,
+    unsigned int dim,
+    float eps
+) {
+    termite_layer_norm_impl<false>(dst, input, nullptr, gamma, beta, rows, dim, eps);
 }
 
 extern "C" __global__ void termite_add_layer_norm_f32(
@@ -2273,39 +2111,7 @@ extern "C" __global__ void termite_add_layer_norm_f32(
     unsigned int dim,
     float eps
 ) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-    const unsigned int base = row * dim;
-    unsigned int tid = threadIdx.x;
-    __shared__ float sums[256];
-    __shared__ float sumsq[256];
-
-    float local_sum = 0.0f;
-    float local_sumsq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = a[base + i] + b[base + i];
-        local_sum += x;
-        local_sumsq += x * x;
-    }
-    sums[tid] = local_sum;
-    sumsq[tid] = local_sumsq;
-    __syncthreads();
-
-    for (unsigned int stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            sums[tid] += sums[tid + stride];
-            sumsq[tid] += sumsq[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    float mean = sums[0] / (float)dim;
-    float var = fmaxf(sumsq[0] / (float)dim - mean * mean, 0.0f);
-    float inv = rsqrtf(var + eps);
-    for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float x = a[base + i] + b[base + i];
-        dst[base + i] = (x - mean) * inv * gamma[i] + beta[i];
-    }
+    termite_layer_norm_impl<true>(dst, a, b, gamma, beta, rows, dim, eps);
 }
 
 extern "C" __global__ void termite_elementwise_f32(
@@ -3328,7 +3134,8 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64(
 // schedule and gives BERT's medium-batch prefill enough independent work to
 // fill the GPU.  The reduction tree deliberately mirrors the single-query
 // generic kernel so encoder embeddings remain bit-stable.
-extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q8(
+template<unsigned int Queries, typename Index>
+__device__ __forceinline__ void termite_bert_prefill_hd64_impl(
     float* dst,
     const float* q,
     const float* k,
@@ -3351,27 +3158,25 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q8(
     (void)bias_mode;
     (void)head_major;
 
-    const unsigned int tile_id = blockIdx.x;
-    const unsigned int tiles_per_head = 32u;
-    const unsigned int total_tiles = batch * num_heads * tiles_per_head;
-    if (tile_id >= total_tiles || seq_len != 256u || head_dim != 64u) return;
+    const Index tile_id = blockIdx.x;
+    const unsigned int tiles_per_head = 256u / Queries;
+    const Index total_tiles = static_cast<Index>(batch) * num_heads * tiles_per_head;
+    if (tile_id >= total_tiles || seq_len != 256u || head_dim != 64u || (Queries == 16u && blockDim.x != 512u)) return;
 
     const unsigned int tid = threadIdx.x;
     const unsigned int lane = tid & 31u;
     const unsigned int warp = tid >> 5u;
-    const unsigned int tile = tile_id % tiles_per_head;
-    const unsigned int tmp = tile_id / tiles_per_head;
-    const unsigned int head = tmp % num_heads;
-    const unsigned int b = tmp / num_heads;
-    const unsigned int qi = tile * 8u + warp;
-    const unsigned int base = ((b * num_heads + head) * 256u) * 64u;
-    const unsigned int q_base = base + qi * 64u;
+    const unsigned int tile = static_cast<unsigned int>(tile_id % tiles_per_head);
+    const Index tmp = tile_id / tiles_per_head;
+    const unsigned int head = static_cast<unsigned int>(tmp % num_heads);
+    const unsigned int b = static_cast<unsigned int>(tmp / num_heads);
+    const unsigned int qi = tile * Queries + warp;
+    const Index base = (static_cast<Index>(b) * num_heads + head) * 256u * 64u;
+    const Index q_base = base + qi * 64u;
     const float q0 = q[q_base + lane];
     const float q1 = q[q_base + lane + 32u];
 
-    __shared__ float scores[8][256];
-    // One [32, 64] tile is reused for K and V.  At B8 the eight query warps
-    // otherwise repeatedly fetch the same 256-byte rows from global memory.
+    __shared__ float scores[Queries][256];
     __shared__ float kv_tile[32][64];
     float max_score = -3.402823466e+38f;
     for (unsigned int key_start = 0u; key_start < 256u; key_start += 32u) {
@@ -3399,9 +3204,6 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q8(
     max_score = __shfl_sync(0xffffffffu, max_score, 0);
     __syncwarp();
 
-    // Reconstruct the generic 128-lane denominator reduction exactly.  Each
-    // lane owns four of its partial sums, then the warp performs the remaining
-    // 32-way tail of that same reduction tree.
     const unsigned int score_base = lane;
     const float e0 = expf(scores[warp][score_base] - max_score);
     const float e1 = expf(scores[warp][score_base + 32u] - max_score);
@@ -3449,6 +3251,25 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q8(
     dst[q_base + lane + 32u] = acc1 / denom;
 }
 
+extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q8(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const long long* mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int seq_len,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int causal,
+    unsigned int has_mask,
+    unsigned int bias_mode,
+    unsigned int head_major
+) {
+    termite_bert_prefill_hd64_impl<8, unsigned int>(dst, q, k, v, mask, bias, batch, seq_len, num_heads, head_dim, causal, has_mask, bias_mode, head_major);
+}
+
 // Sixteen-query version of the exact q8 schedule above. It preserves every
 // per-row arithmetic and reduction order, but doubles query rows per launch
 // block to reduce grid traffic and improve occupancy on encoder prefill.
@@ -3468,104 +3289,7 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q16(
     unsigned int bias_mode,
     unsigned int head_major
 ) {
-    (void)mask;
-    (void)bias;
-    (void)causal;
-    (void)has_mask;
-    (void)bias_mode;
-    (void)head_major;
-
-    const unsigned long long tile_id = blockIdx.x;
-    const unsigned int tiles_per_head = 16u;
-    const unsigned long long total_tiles = static_cast<unsigned long long>(batch) * num_heads * tiles_per_head;
-    if (tile_id >= total_tiles || seq_len != 256u || head_dim != 64u || blockDim.x != 512u) return;
-
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    const unsigned int tile = static_cast<unsigned int>(tile_id % tiles_per_head);
-    const unsigned long long tmp = tile_id / tiles_per_head;
-    const unsigned int head = static_cast<unsigned int>(tmp % num_heads);
-    const unsigned int b = static_cast<unsigned int>(tmp / num_heads);
-    const unsigned int qi = tile * 16u + warp;
-    const size_t base = (static_cast<size_t>(b) * num_heads + head) * 256u * 64u;
-    const size_t q_base = base + qi * 64u;
-    const float q0 = q[q_base + lane];
-    const float q1 = q[q_base + lane + 32u];
-
-    __shared__ float scores[16][256];
-    __shared__ float kv_tile[32][64];
-    float max_score = -3.402823466e+38f;
-    for (unsigned int key_start = 0u; key_start < 256u; key_start += 32u) {
-        for (unsigned int element = tid; element < 32u * 64u; element += blockDim.x) {
-            kv_tile[element / 64u][element % 64u] = k[base + key_start * 64u + element];
-        }
-        __syncthreads();
-        #pragma unroll
-        for (unsigned int key = 0u; key < 32u; ++key) {
-            const float dot_lo = q0 * kv_tile[key][lane];
-            const float dot_hi = q1 * kv_tile[key][lane + 32u];
-            float dot = __fadd_rn(dot_lo, dot_hi);
-            #pragma unroll
-            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
-                dot = __fadd_rn(dot, __shfl_down_sync(0xffffffffu, dot, offset));
-            }
-            if (lane == 0u) {
-                const float score = dot * 0.125f;
-                scores[warp][key_start + key] = score;
-                max_score = fmaxf(max_score, score);
-            }
-        }
-        __syncthreads();
-    }
-    max_score = __shfl_sync(0xffffffffu, max_score, 0);
-    __syncwarp();
-
-    const unsigned int score_base = lane;
-    const float e0 = expf(scores[warp][score_base] - max_score);
-    const float e1 = expf(scores[warp][score_base + 32u] - max_score);
-    const float e2 = expf(scores[warp][score_base + 64u] - max_score);
-    const float e3 = expf(scores[warp][score_base + 96u] - max_score);
-    const float e4 = expf(scores[warp][score_base + 128u] - max_score);
-    const float e5 = expf(scores[warp][score_base + 160u] - max_score);
-    const float e6 = expf(scores[warp][score_base + 192u] - max_score);
-    const float e7 = expf(scores[warp][score_base + 224u] - max_score);
-    scores[warp][score_base] = e0;
-    scores[warp][score_base + 32u] = e1;
-    scores[warp][score_base + 64u] = e2;
-    scores[warp][score_base + 96u] = e3;
-    scores[warp][score_base + 128u] = e4;
-    scores[warp][score_base + 160u] = e5;
-    scores[warp][score_base + 192u] = e6;
-    scores[warp][score_base + 224u] = e7;
-    float denom = __fadd_rn(
-        __fadd_rn(__fadd_rn(e0, e4), __fadd_rn(e2, e6)),
-        __fadd_rn(__fadd_rn(e1, e5), __fadd_rn(e3, e7))
-    );
-    #pragma unroll
-    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
-        denom = __fadd_rn(denom, __shfl_down_sync(0xffffffffu, denom, offset));
-    }
-    denom = __shfl_sync(0xffffffffu, denom, 0);
-    __syncwarp();
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    for (unsigned int key_start = 0u; key_start < 256u; key_start += 32u) {
-        for (unsigned int element = tid; element < 32u * 64u; element += blockDim.x) {
-            kv_tile[element / 64u][element % 64u] = v[base + key_start * 64u + element];
-        }
-        __syncthreads();
-        #pragma unroll
-        for (unsigned int key = 0u; key < 32u; ++key) {
-            const float weight = scores[warp][key_start + key];
-            acc0 += weight * kv_tile[key][lane];
-            acc1 += weight * kv_tile[key][lane + 32u];
-        }
-        __syncthreads();
-    }
-    dst[q_base + lane] = acc0 / denom;
-    dst[q_base + lane + 32u] = acc1 / denom;
+    termite_bert_prefill_hd64_impl<16, unsigned long long>(dst, q, k, v, mask, bias, batch, seq_len, num_heads, head_dim, causal, has_mask, bias_mode, head_major);
 }
 
 // Opt-in WMMA candidate for full BERT/XLM-R prefill attention. A block owns

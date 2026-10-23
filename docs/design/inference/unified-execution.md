@@ -448,6 +448,111 @@ receipts. Frozen executables and the 35 machine-code/resource comparisons are
 included. The CPU/Metal directory also retains the exact protocol scripts and
 post-qualification production-prefix checks.
 
+## GPU kernel family consolidation
+
+The next checkpoint consolidates maintained kernel bodies relative to
+`f79d38374f4984c08d63384e1cc8639345350b69`. Native Metal/CUDA compile-time
+specializations now share normalization, dense projection/FFN and duplicated
+attention schedules. There is no runtime recipe interpreter or new source
+emitter. Exported kernel interfaces, dispatch choices and model admission remain
+unchanged. CPU production code is unchanged in this checkpoint.
+
+Thirty-six Metal entry points share family implementations: eight LayerNorm
+variants, six RMSNorm variants, twelve typed scalar/32-lane dense projections,
+seven tiled projection/activation variants, and three q16 causal attention
+variants. Thirteen CUDA entry points share implementations: seven RMSNorm,
+two LayerNorm, pair/triple biased projection, and Q8/Q16 HD64 BERT prefill.
+
+Compile-time policies retain scalar centered-variance versus parallel
+sum/squared-sum normalization, residual/scale order and saved-sum behavior;
+F32/F16/BF16 conversion; accumulator and tile dimensions; and attention indexing,
+barrier order and full-tile versus ragged-tail staging. CUDA grouped projection
+arity is fully unrolled. Metal attention retains direct half tile loads while
+F32 retains its staging schedule. The distinct fast schedules remain explicit
+specializations of these shared bodies.
+
+The following counts include all added helpers and wrappers. The Metal file
+includes host code; these are whole-file counts, not shader-only estimates.
+Generated PTX changes are excluded from the maintained-source reduction.
+
+| Maintained file | Baseline lines | Candidate lines | Lines removed | Bytes removed |
+| --- | ---: | ---: | ---: | ---: |
+| `backends/metal_kernels.m` | 70,937 | 70,545 | 392 | 30,132 |
+| `ops/cuda/artifacts/inference_cuda_kernels.cu` | 25,186 | 24,910 | 276 | 9,452 |
+| Total | 96,123 | 95,455 | **668** | **39,584** |
+
+This is a reduction of repeated family bodies, not a wholesale collapse of the
+GPU backend. Other quantized, tensor-core and architecture-specific schedules
+still have separate implementations where their dataflow differs.
+
+### Qualification of the consolidated families
+
+Receipts, exact harness/protocol sources, frozen Metal executable, outputs and
+artifact hashes are retained under the ignored
+`.benchmark-assets/1166/kernel-families/` directory. CUDA's frozen executable
+and full disassemblies also remain on Glowworm under
+`~/antfly/.benchmark-assets/1166/kernel-families/`. The baseline CUDA artifacts
+there were frozen from the qualified `f79d38374f` production snapshot before
+regeneration. The private CUDA 13.2.86 toolchain regenerated PTX, the seven-target
+fatbin and SM89 cubin; system CUDA was unchanged. All four local CUDA
+source/artifact SHA256 values match the qualified remote snapshot.
+
+- Metal's affected normalization, linear and dense causal-attention suite:
+  150 passed, four unavailable-fixture skips (154 selected).
+- Direct Metal baseline/candidate comparisons: all 36 changed entry points at
+  edge and representative shapes, 72 cases total, byte-identical output. Fixed
+  buffers, 100 warmups and eight ABBAABBA arms of 300 dispatches use GPU command
+  timestamps. Every case passes the 5% budget; worst ratio is 1.03170. No pipeline
+  loses maximum threads per threadgroup.
+- Same-compiler CUDA disassembly/resource comparison: 439 functions on each of
+  SM75, SM80, SM89, SM90, SM100, SM110 and SM120. All eleven refactored
+  normalization/attention kernels retain identical instructions and resources
+  on all seven targets (77 comparisons). Only pair/triple projection differs:
+  register, shared-memory, local-memory and stack usage is unchanged, with the
+  same or fewer instructions. Thus 3,059 of 3,073 whole-image comparisons are
+  unchanged. On SM120 pair/triple instruction counts fall 376 to 368 and 504 to
+  488; register counts remain 40/48, with zero local memory and stack.
+- CUDA grouped projection: both arities at four edge/representative shapes,
+  eight cases total, byte-identical to baseline. Independent F64 reference
+  maximum error is 2.15e-7. CUDA graphs use 100 nodes, 40 alternating warm graph
+  launches, then eight ABBAABBA arms of 500 kernels each. All cases improve by
+  approximately 3.5–5.4% on GB10.
+- Actual CUDA shared-descriptor and prepared-frame ownership regressions:
+  two passed, zero skips, including retained outputs, pool pressure and eviction.
+- Tiny-Llama Metal independent decoder oracle: all 160,000 logits pass at
+  tolerance 0.002; maximum error is 0.00075894.
+- Concurrent 120-second strict-resident Metal soaks: encoder completes 10,036
+  iterations; decoder completes 3,402 iterations with 13 runtime evictions,
+  exact reset parity and exact chunked-prefill parity. Both finish with zero
+  tracked host bytes and no allocation denial.
+
+All seven Metal model cases pass byte-identical output checks and the existing
+5% median / 10% p95 budgets: MiniLM safetensors at batch1/sequence16,
+batch1/sequence128 and batch2/sequence16; GGUF MiniLM; F16 and Q4_K DeBERTa; and
+ONNX MiniLM. Eight ABBAABBA arms use 25 warmups and 201 measured requests. Worst
+median/p95 ratios are 1.00955/1.01510. Baseline executable SHA256 is
+`ec34b775ae7efc7d392f5ea0ebeddbc11cdb2ddde38be17b68f96dbb6e12e2dd`
+(the previously qualified production-equivalent Metal snapshot);
+candidate SHA256 is
+`6c34b46fac4faa7e6914d2ce82ec0c6eb1a4fdd0649368db027cf5db971da709`.
+The later CUDA image integration does not alter that qualified Metal shader.
+
+On Glowworm's GB10 (SM121, driver 580.178.04), all four CUDA model cases pass
+byte-identical output and the same budgets: MiniLM batch1/sequence16,
+batch1/sequence128, batch2/sequence16 and Q4_K DeBERTa. Sixteen balanced arms
+`ABBABAABABBAABBA` use 250 warmups and 1,001 measured requests, pinned to CPU cores
+5–9 and 15–19. Median ratios are 0.99812, 1.00013, 0.92779 and 1.00068;
+p95 ratios are 1.04465, 1.00006, 1.00953 and 1.00050. Baseline executable SHA256 is
+`ee30ab719c3838ee0d3e29d7f832a21f76f272af695eb1de594e8dd65dc19769`;
+candidate SHA256 is
+`49885eade6fc58ae12760bd1d80a0d890780123dcc4a1dde586bf3b97f8923a8`.
+Final CPU/Metal/CUDA product compilation and the WASM build pass. Generated
+source freshness (67 files plus Metal/CUDA runtime regions), CUDA source policy
+and whitespace checks pass; required cache collection completed on both hosts.
+
+These are GB10 runtime results; the seven-target disassembly checks establish
+static specialization/resource parity, not hardware throughput on other GPUs.
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;
