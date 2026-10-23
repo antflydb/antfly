@@ -66,6 +66,10 @@ pub fn Budget(comptime Controls: type, comptime check: anytype) type {
             if (self.controls.execution_runnable == null) return null;
             return .{ .ptr = self, .begin = begin, .end = end };
         }
+        pub fn delegationBoundary(self: *@This()) ?@import("read_admission.zig").Delegation {
+            if (self.controls.execution_runnable == null) return null;
+            return .{ .suspension = .{ .ptr = self, .begin = begin, .end = end } };
+        }
         fn begin(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.checkpoint();

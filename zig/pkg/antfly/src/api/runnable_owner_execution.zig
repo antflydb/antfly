@@ -27,7 +27,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .reserve_cleanup_root = reserveCleanupRoot, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .activate_child_checked = activateChildChecked, .check_lifetime = checkLifetime, .current_class = currentClass, .cpu_borrow = cpuBorrow, .request_resources = requestResources, .enter_resources = enterResources };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .reserve_cleanup_root = reserveCleanupRoot, .enter_cleanup_root = enterCleanupRoot, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .activate_child_checked = activateChildChecked, .check_lifetime = checkLifetime, .current_class = currentClass, .cpu_borrow = cpuBorrow, .request_resources = requestResources, .enter_resources = enterResources };
     }
 };
 
@@ -274,6 +274,13 @@ fn activateCleanup(raw: *anyopaque, out_slots: *usize) callconv(.c) runtime.erro
     if (value.cleanup) return runtime.error_abi.statusFromError(error.UnsupportedOperation);
     value.execution.activateCleanup() catch |err| return runtime.error_abi.statusFromError(err);
     out_slots.* = value.execution.entry.?.slots;
+    return .ok;
+}
+fn enterCleanupRoot(raw: *anyopaque, restriction: ?*const abi.Reentry, out_slots: *usize, out_deadline: *u64) callconv(.c) runtime.error_abi.Status {
+    const value = capsule(raw);
+    const deadline = @import("runnable_reentry.zig").enterReservedCleanup(&value.execution, restriction) catch |cause| return runtime.error_abi.statusFromError(cause);
+    out_slots.* = value.execution.entry.?.slots;
+    out_deadline.* = deadline;
     return .ok;
 }
 fn resizeTeam(raw: *anyopaque, slots: usize) callconv(.c) runtime.error_abi.Status {
@@ -1229,4 +1236,129 @@ test "runnable execution dormant cleanup allocation failures release admission a
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "runnable execution reserved cleanup resumes its original deadline and charge after close" {
+    TestClock.now_ns = 0;
+    defer TestClock.now_ns = 0;
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8 }), .native_now_ns = TestClock.now };
+    defer owner.owner.deinit();
+    const port = owner.port();
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var handle: ?*anyopaque = null;
+    try port.reserveCleanupRoot(&.{ .io = &io_borrow, .native_clock = 1, .budget_ns = 100, .out_handle = &handle });
+    var reserved: abi.ReservedCleanup = .{ .owner = port, .handle = handle };
+    defer reserved.deinit();
+    const charged = owner.owner.scheduler.stats().retained_bytes;
+    TestClock.now_ns = 1000;
+    const grant = try reserved.enter();
+    try std.testing.expectEqual(@as(u64, 1100), grant.deadline_ns);
+    try std.testing.expectEqual(abi.Class.write, try grant.borrow.currentClass());
+    try std.testing.expect(port.park(handle.?, @backingInt(abi.Wait.resource)).isOk());
+    const Reject = struct {
+        fn check(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.NotFound);
+        }
+    };
+    try std.testing.expectError(error.NotFound, grant.borrow.enterChecked(.write, &.{ .context = &owner, .check = Reject.check }));
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
+    owner.owner.close();
+    TestClock.now_ns = 1050;
+    const resumed = try reserved.enter();
+    try std.testing.expectEqual(grant.deadline_ns, resumed.deadline_ns);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expect(port.park(handle.?, @backingInt(abi.Wait.resource)).isOk());
+    TestClock.now_ns = 1100;
+    try std.testing.expectError(error.DeadlineExceeded, reserved.enter());
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
+}
+
+test "runnable execution budget delegates CPU and reenters with the original deadline" {
+    const sources = @import("antfly_local_sources");
+    const Controls = struct {
+        execution_runnable: ?abi.Borrowed,
+        fn check(self: @This()) !void {
+            if (self.execution_runnable) |borrow| {
+                const status = borrow.checkpoint(borrow.context);
+                if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+            }
+        }
+    };
+    TestClock.now_ns = 0;
+    defer TestClock.now_ns = 0;
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8 }), .native_now_ns = TestClock.now };
+    defer owner.owner.deinit();
+    const port = owner.port();
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var caller: ?*anyopaque = null;
+    const status = port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.Class.query), .has_deadline = 1, .native_deadline = 1, .deadline_ns = 100, .out_handle = &caller });
+    if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+    defer port.finish(caller.?);
+    const Budget = sources.common_read_execution_budget.Budget(Controls, Controls.check);
+    var budget: Budget = .{ .controls = .{ .execution_runnable = try abi.Borrowed.fromOwner(port, caller.?, 1, .query) }, .io = io };
+    var adapter: sources.common_read_admission.Adapter(*Budget) = .{ .budget = &budget };
+    var payload = adapter.payload();
+    const original = sources.common_read_admission.Port.init(&payload);
+    const delegation = (try original.executionDelegation()).?;
+    try delegation.beginDelegation();
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
+    try delegation.endDelegation();
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().runnable_slots);
+    try delegation.beginDelegation();
+    TestClock.now_ns = 100;
+    try std.testing.expectError(error.DeadlineExceeded, delegation.endDelegation());
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+}
+
+test "runnable execution reserved activation observes queued caller rejection without renewing cleanup" {
+    const Check = struct {
+        calls: usize = 0,
+        cause: anyerror,
+        fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls >= 3) return runtime.error_abi.statusFromError(self.cause);
+            return .ok;
+        }
+    };
+    for ([_]bool{ false, true }) |occupied| {
+        for ([_]anyerror{ error.NotFound, error.Canceled, error.DeadlineExceeded }) |cause| {
+            TestClock.now_ns = 0;
+            defer TestClock.now_ns = 0;
+            var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8 }), .native_now_ns = TestClock.now };
+            defer owner.owner.deinit();
+            const port = owner.port();
+            const io = std.testing.io;
+            const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+            var handle: ?*anyopaque = null;
+            try port.reserveCleanupRoot(&.{ .io = &io_borrow, .native_clock = 1, .budget_ns = 100, .out_handle = &handle });
+            var reserved: abi.ReservedCleanup = .{ .owner = port, .handle = handle };
+            defer reserved.deinit();
+            var holder: ?*anyopaque = null;
+            defer if (holder) |value| port.finish(value);
+            if (occupied) {
+                const status = port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.Class.control), .cleanup = 1, .allow_wait = 0, .has_deadline = 1, .native_deadline = 1, .deadline_ns = 100, .out_handle = &holder });
+                if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+            }
+            const charged = owner.owner.scheduler.stats().retained_bytes;
+            var check: Check = .{ .cause = cause };
+            try std.testing.expectError(cause, reserved.enterChecked(&.{ .context = &check, .check = Check.check }));
+            try std.testing.expectEqual(@as(usize, @intFromBool(occupied)), owner.owner.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
+            if (holder) |value| port.finish(value);
+            holder = null;
+            TestClock.now_ns = 10;
+            const grant = try reserved.enter();
+            try std.testing.expectEqual(@as(u64, 100), grant.deadline_ns);
+            try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+            try std.testing.expect(port.park(handle.?, @backingInt(abi.Wait.resource)).isOk());
+            TestClock.now_ns = 100;
+            try std.testing.expectError(error.DeadlineExceeded, reserved.enter());
+        }
+    }
 }

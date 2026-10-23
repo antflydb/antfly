@@ -21,7 +21,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 19;
+pub const abi_version: u32 = 20;
 /// Synchronous, non-yielding restriction on the original CPU-return wait.
 /// Borrowed only until enterChecked returns; never retained by the owner.
 /// Rejection stops that execution and does not retire physical ownership.
@@ -205,6 +205,8 @@ pub const Owner = extern struct {
     enter: *const fn (*anyopaque, c_int) callconv(.c) errors.Status,
     finish: *const fn (*anyopaque) callconv(.c) void,
     reserve_cleanup_root: ?*const fn (*anyopaque, *const CleanupReservation) callconv(.c) errors.Status = null,
+    /// Enter or resume the same reserved cleanup without renewing its fence.
+    enter_cleanup_root: ?*const fn (*anyopaque, ?*const Reentry, *usize, *u64) callconv(.c) errors.Status = null,
     /// Optional dynamic CPU team capability. All prior children must join
     /// before resizing. Absent support fails explicitly without new admission.
     resize_team: ?*const fn (*anyopaque, usize) callconv(.c) errors.Status = null,
@@ -384,7 +386,23 @@ pub const ReservedCleanup = struct {
     pub fn activate(self: *ReservedCleanup) !Borrowed {
         const handle = self.handle orelse return error.InvalidRunnableTransition;
         const slots = try self.owner.activateCleanup(handle);
-        return Borrowed.fromOwner(self.owner, handle, slots, .control);
+        return Borrowed.fromOwner(self.owner, handle, slots, .write);
+    }
+    pub const Grant = struct { borrow: Borrowed, deadline_ns: u64 };
+    pub fn enter(self: *ReservedCleanup) !Grant {
+        return self.enterChecked(null);
+    }
+    pub fn enterChecked(self: *ReservedCleanup, restriction: ?*const Reentry) !Grant {
+        if (restriction) |check| try check.validate();
+        if (!self.owner.valid()) return error.UnsupportedVersion;
+        const handle = self.handle orelse return error.InvalidRunnableTransition;
+        const callback = self.owner.enter_cleanup_root orelse return error.ExecutionWaitUnsupported;
+        var slots: usize = 0;
+        var deadline: u64 = 0;
+        const status = callback(handle, restriction, &slots, &deadline);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+        if (slots == 0) return error.InvalidRunnableDemand;
+        return .{ .borrow = try Borrowed.fromOwner(self.owner, handle, slots, .write), .deadline_ns = deadline };
     }
     pub fn deinit(self: *ReservedCleanup) void {
         const handle = self.handle orelse return;

@@ -33,6 +33,11 @@ pub fn enterWithResources(execution: *native.Execution, resources: native.GrantR
     try execution.enterWithResources(resources, if (restriction) |value| .{ .context = @ptrCast(@constCast(value)), .check = check } else null);
 }
 
+pub fn enterReservedCleanup(execution: *native.Execution, restriction: ?*const runtime.runnable_abi.Reentry) !u64 {
+    if (restriction) |value| try value.validate();
+    return execution.enterReservedCleanup(if (restriction) |value| .{ .context = @ptrCast(@constCast(value)), .check = check } else null);
+}
+
 fn check(raw: *anyopaque) !void {
     const restriction: *const runtime.runnable_abi.Reentry = @ptrCast(@alignCast(raw));
     try restriction.checkpoint();

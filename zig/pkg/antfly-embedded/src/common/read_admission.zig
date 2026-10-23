@@ -29,12 +29,25 @@ pub const VTable = struct {
     remote_executor: ?*const fn (*anyopaque) anyerror!?HttpExecutor = null,
 };
 pub const Boundary = callback.Boundary(VTable);
+/// Explicit synchronous delegation to a separately owned execution. Retire
+/// service guards before suspend; delegated CPU must park/finish before resume.
+/// This capability never authorizes running backend CPU as an I/O wait.
+pub const Delegation = struct {
+    suspension: @import("execution_wait.zig").Boundary,
+    pub fn beginDelegation(self: Delegation) !void {
+        try self.suspension.beginWait();
+    }
+    pub fn endDelegation(self: Delegation) !void {
+        try self.suspension.endWait();
+    }
+};
 pub const Payload = struct {
     vtable_contract: native.TypeContract = .of(VTable),
     ptr: *anyopaque,
     vtable: *const VTable,
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
     execution_wait: ?@import("execution_wait.zig").Boundary = null,
+    delegation: ?Delegation = null,
 };
 pub const Port = extern struct {
     contract: native.TypeContract = .of(Payload),
@@ -61,7 +74,7 @@ pub const Port = extern struct {
         if (!payload.vtable_contract.matches(.of(VTable))) return error.UnsupportedVersion;
         if (payload.vtable.check_lifetime) |check|
             return Boundary.call("check_lifetime", payload.dispatch, check, .{payload.ptr});
-        if (payload.execution_wait != null) return error.ExecutionWaitUnsupported;
+        if (payload.execution_wait != null or payload.delegation != null) return error.ExecutionWaitUnsupported;
         return self.checkpoint();
     }
     pub fn deadlineNs(self: Port) !?u64 {
@@ -96,6 +109,13 @@ pub const Port = extern struct {
         if (!payload.vtable_contract.matches(.of(VTable))) return error.UnsupportedVersion;
         return payload.execution_wait != null;
     }
+    /// No-suspension guards must reject either capability, while physical I/O
+    /// eligibility still requires its own execution_wait boundary.
+    pub fn hasExecutionSuspension(self: Port) !bool {
+        _ = try self.hasExecutionWait();
+        const payload: *const Payload = @ptrCast(@alignCast(self.payload));
+        return payload.execution_wait != null or payload.delegation != null;
+    }
     /// Only providers that perform physical I/O may use this boundary.
     pub fn executionWait(self: Port) !?@import("execution_wait.zig").Boundary {
         try self.checkpoint();
@@ -111,6 +131,11 @@ pub const Port = extern struct {
         try self.checkLifetime();
         const payload: *const Payload = @ptrCast(@alignCast(self.payload));
         return payload.execution_wait;
+    }
+    pub fn executionDelegation(self: Port) !?Delegation {
+        try self.checkLifetime();
+        const payload: *const Payload = @ptrCast(@alignCast(self.payload));
+        return payload.delegation;
     }
     pub fn waitForProgress(self: Port) !void {
         try self.checkpoint();
@@ -135,7 +160,7 @@ pub const ErrorRelay = struct {
         const original_payload: *const Payload = @ptrCast(@alignCast(original.payload));
         self.original = original;
         self.rejection = null;
-        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .check_lifetime = lifetime, .wait_for_progress = wait, .deadline_ns = deadline, .retirement_binding = retirement, .remote_executor = remoteExecutor }, .execution_wait = original_payload.execution_wait };
+        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .check_lifetime = lifetime, .wait_for_progress = wait, .deadline_ns = deadline, .retirement_binding = retirement, .remote_executor = remoteExecutor }, .execution_wait = original_payload.execution_wait, .delegation = original_payload.delegation };
         return Port.init(&self.payload);
     }
     fn source(raw: *anyopaque) !*ErrorRelay {
@@ -260,7 +285,7 @@ pub fn Adapter(comptime Budget: type) type {
                 .pointer => |pointer| pointer.child,
                 else => Budget,
             };
-            return .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .wait_for_progress = wait, .check_lifetime = if (@hasDecl(T, "checkLifetime")) lifetime else null, .deadline_ns = if (@hasDecl(T, "deadlineNs")) deadline else null, .retirement_binding = if (@hasDecl(T, "retirementBinding")) retirement else null, .remote_executor = if (@hasDecl(T, "remoteExecutor")) remoteExecutor else null }, .execution_wait = if (@hasDecl(T, "executionBoundary")) self.budget.executionBoundary() else null };
+            return .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .wait_for_progress = wait, .check_lifetime = if (@hasDecl(T, "checkLifetime")) lifetime else null, .deadline_ns = if (@hasDecl(T, "deadlineNs")) deadline else null, .retirement_binding = if (@hasDecl(T, "retirementBinding")) retirement else null, .remote_executor = if (@hasDecl(T, "remoteExecutor")) remoteExecutor else null }, .execution_wait = if (@hasDecl(T, "executionBoundary")) self.budget.executionBoundary() else null, .delegation = if (@hasDecl(T, "delegationBoundary")) self.budget.delegationBoundary() else null };
         }
     };
 }
@@ -436,9 +461,29 @@ pub const RejectionTrace = struct {
             const source: *const Payload = @ptrCast(@alignCast(original.?.payload));
             if (source.vtable_contract.matches(.of(VTable))) {
                 if (source.execution_wait != null) self.payload.execution_wait = .{ .ptr = self, .begin = beginWait, .end = endWait };
+                if (source.delegation != null) self.payload.delegation = .{ .suspension = .{ .ptr = self, .begin = suspendDelegation, .end = resumeDelegation } };
             } else self.failure = error.UnsupportedVersion;
         } else |cause| self.failure = cause;
         return Port.init(&self.payload);
+    }
+    fn originalDelegation(self: *@This()) Delegation {
+        const source: *const Payload = @ptrCast(@alignCast(self.original.?.payload));
+        return source.delegation.?;
+    }
+    fn suspendDelegation(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.failure) |cause| return cause;
+        self.originalDelegation().beginDelegation() catch |cause| {
+            self.failure = cause;
+            return cause;
+        };
+    }
+    fn resumeDelegation(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.originalDelegation().endDelegation() catch |cause| {
+            if (self.failure == null) self.failure = cause;
+        };
+        if (self.failure) |cause| return cause;
     }
     fn originalWait(self: *@This()) @import("execution_wait.zig").Boundary {
         const source: *const Payload = @ptrCast(@alignCast(self.original.?.payload));
@@ -515,11 +560,23 @@ pub const RejectionTrace = struct {
 pub const ExecutionErrorRelay = struct {
     errors: ErrorRelay = .{},
     original_wait: ?@import("execution_wait.zig").Boundary = null,
+    original_delegation: ?Delegation = null,
     pub fn bind(self: *ExecutionErrorRelay, original: Port) !Port {
         const borrowed = try self.errors.bind(original);
         self.original_wait = self.errors.payload.execution_wait;
+        self.original_delegation = self.errors.payload.delegation;
+        if (self.original_delegation != null) self.errors.payload.delegation = .{ .suspension = .{ .ptr = self, .begin = suspendDelegation, .end = resumeDelegation } };
         if (self.original_wait != null) self.errors.payload.execution_wait = .{ .ptr = self, .begin = begin, .end = end };
         return borrowed;
+    }
+    fn suspendDelegation(raw: *anyopaque) !void {
+        const self: *ExecutionErrorRelay = @ptrCast(@alignCast(raw));
+        if (self.errors.rejection != null) return error.Canceled;
+        self.original_delegation.?.beginDelegation() catch |cause| return self.reject(cause);
+    }
+    fn resumeDelegation(raw: *anyopaque) !void {
+        const self: *ExecutionErrorRelay = @ptrCast(@alignCast(raw));
+        self.original_delegation.?.endDelegation() catch |cause| return self.reject(cause);
     }
     fn reject(self: *ExecutionErrorRelay, cause: anyerror) anyerror {
         self.errors.rejection = self.errors.rejection orelse cause;
@@ -538,3 +595,49 @@ pub const ExecutionErrorRelay = struct {
         self.original_wait.?.endWait() catch |cause| return self.reject(cause);
     }
 };
+
+test "controlled dense finalization delegation relays retain separate capability and balanced reentry" {
+    const std = @import("std");
+    const Probe = struct {
+        begins: usize = 0,
+        ends: usize = 0,
+        reject_lifetime: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject_lifetime) return error.NotFound;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            self.reject_lifetime = false;
+        }
+    };
+    var probe: Probe = .{};
+    var payload: Payload = .{ .ptr = &probe, .vtable = &.{ .checkpoint = Probe.check, .check_lifetime = Probe.check }, .delegation = .{ .suspension = .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end } } };
+    const original = Port.init(&payload);
+    try std.testing.expect(!try original.hasExecutionWait());
+    try std.testing.expect(try original.hasExecutionSuspension());
+    var trace: RejectionTrace = .{};
+    const traced = trace.bind(original).?;
+    try std.testing.expect(!try traced.hasExecutionWait());
+    try std.testing.expect(try traced.hasExecutionSuspension());
+    const delegation = (try traced.executionDelegation()).?;
+    try delegation.beginDelegation();
+    probe.reject_lifetime = true;
+    try std.testing.expectError(error.NotFound, traced.checkLifetime());
+    try std.testing.expectError(error.NotFound, delegation.endDelegation());
+    try std.testing.expectEqual(@as(usize, 1), probe.ends);
+    var relay: ExecutionErrorRelay = .{};
+    const relayed = try relay.bind(original);
+    const checked = (try relayed.executionDelegation()).?;
+    try checked.beginDelegation();
+    probe.reject_lifetime = true;
+    try std.testing.expectError(error.Canceled, relayed.checkLifetime());
+    try checked.endDelegation();
+    try std.testing.expectEqual(error.NotFound, relay.errors.rejection.?);
+    try std.testing.expectEqual(@as(usize, 2), probe.ends);
+}

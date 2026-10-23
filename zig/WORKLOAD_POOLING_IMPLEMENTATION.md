@@ -23702,3 +23702,64 @@ failure identity (7) pass. All 5,508 native/schema hashes match the
 `dense-finish-receipt-final` receipt and `dense-finish-receipt-verified.json`
 snapshots. Full GNU/Linux qualification remains waived; Linux requires pinned
 Nix/glibc Zig. The complete design remains unfinished.
+
+### Execute controlled dense finish on its capture reservation
+
+Read admission now carries a distinct synchronous delegation capability in
+addition to physical-I/O waits. The default C-entry close control advertises
+it with checked original reentry; generic runnable read budgets can also expose
+it. Error relays preserve the capability and balanced return after rejection.
+No-suspension guards recognize either capability, while I/O eligibility still
+requires its separate wait boundary.
+
+A funded dense finish exclusively claims its exact session before suspending
+the caller. It enters the reservation without holding catalog/apply guards,
+then prepares under both the original caller lifetime and the retained cleanup
+lifetime. The first cleanup CPU wait also borrows the original caller's check
+through queueing and post-grant validation; that restriction is never retained
+in the reservation. Each authority checks its own clock; raw deadlines from different
+clocks are never compared. Metadata contention parks the delegated CPU, releases
+service guards and uses checked reentry before the next acquisition attempt.
+
+Consumption transfers the reservation out of registry metadata into the
+synchronous finishing owner. Durable finish, publication and mandatory retirement
+run while that owner holds cleanup execution. All physical users and index guards
+retire before it releases the capsule and asks for the original caller's grant.
+The completed finish receipt survives rejected original reentry. A rejection
+before consumption leaves the exact capture, snapshot and operation/byte charges
+in the registry, with CPU parked for another preparation attempt.
+
+Reserved cleanup reentry retains the original activation deadline, operation
+and byte charge, including after scheduler closure. A call-scoped preparation
+restriction may stop a grant; the dedicated owning-root API can retry only while
+the root's own unchanged cleanup authority remains valid. It cannot restore an
+expired cleanup budget or a stopped foreground execution. Cleanup keeps its
+ordinary write metadata charge and uses the cleanup CPU partition.
+
+Compatibility sessions without funding/delegation retain their existing finish
+path. Missing required reserved-entry support fails before caller suspension.
+Native ABI 89, storage-owner ABI 147 and runnable ABI 20 fence these layouts.
+
+The real DB matrix occupies the sole cleanup CPU with the caller, so delegated
+finish requires an actual CPU handoff. It covers successful finish, rejected
+suspension, immediate preparation rejection, a contended apply guard, lifetime
+rejection while parked with exact-session retry, and rejected original reentry
+after consumption. Owner tests check the unchanged cleanup deadline/charge and
+original caller deadline; relay tests check balanced return after sticky errors.
+
+Physical callback I/O remains opaque and holds cleanup execution; per-stage
+cooperative CPU bounds and I/O lending still need qualification. Ordinary scheduled finishes using the legacy callback and uncontrolled
+physical-deinit/abort paths still need the retained execution handoff. Other
+maintenance/backend teardown, parent metadata
+charges and broader linked-owner/cross-engine/performance gates remain open.
+This change does not establish the complete design. Strong required providers
+remain disabled.
+
+Pinned Darwin Debug validation passes all 86 build steps and 133 reported tests,
+plus cached current-source suites of 67 derived and 31 runnable-owner tests.
+The simple runners pass 25 DB/session cases and 20 local-close cases. Shared SQL,
+linked C-entry close, maintenance shutdown and execution-service targets pass.
+Error ABI (43), released status ABI (1), and failure identity (7) pass. All 5,509
+native/schema hashes match `dense-execution-handoff-final` and its verified
+snapshots. Full GNU/Linux qualification remains waived; Linux requires pinned
+Nix/glibc Zig. The full design remains unfinished.

@@ -207,6 +207,12 @@ pub const FinishClaim = struct {
     token: derived_executor_mod.CatchUpSessionToken,
     stored: *StoredSession,
 
+    /// Synchronous borrow protected by this exclusive claim. Never retain the
+    /// pointer across tryTake: that operation frees the registry metadata.
+    pub fn reservation(self: *FinishClaim) !?*ReservedCleanup {
+        if (self.owner == null) return error.DenseCatchUpSessionSuperseded;
+        return if (self.stored.session.cleanup) |*cleanup| cleanup else null;
+    }
     pub fn deinit(self: *FinishClaim) void {
         if (self.owner == null) return;
         self.owner = null;

@@ -27,12 +27,20 @@ pub const Prepared = struct {
 /// catalog/apply and session-registry admission have all succeeded. A failed
 /// attempt owns no guards and leaves the exact token and replay lease intact.
 pub fn prepare(manager: *manager_mod.IndexManager, sessions: *sessions_mod.Owner, index_ref: manager_mod.ManagedIndexRef, token: runtime_types.CatchUpSessionToken, original: admission.Port) !Prepared {
-    var claim = while (true) {
-        try original.checkpoint();
-        if (try sessions.tryClaimFinish(index_ref.name, token)) |claim| break claim;
-        try @import("../../common/cleanup_wait.zig").waitForRetry(manager.checkpointIo(), original);
-    };
+    var claim = try claimWithAdmission(manager, sessions, index_ref, token, original);
     defer claim.deinit();
+    return prepareClaim(manager, &claim, index_ref, original);
+}
+
+pub fn claimWithAdmission(manager: *manager_mod.IndexManager, sessions: *sessions_mod.Owner, index_ref: manager_mod.ManagedIndexRef, token: runtime_types.CatchUpSessionToken, original: admission.Port) !sessions_mod.FinishClaim {
+    while (true) {
+        try original.checkpoint();
+        if (try sessions.tryClaimFinish(index_ref.name, token)) |claim| return claim;
+        try @import("../../common/cleanup_wait.zig").waitForRetry(manager.checkpointIo(), original);
+    }
+}
+
+pub fn prepareClaim(manager: *manager_mod.IndexManager, claim: *sessions_mod.FinishClaim, index_ref: manager_mod.ManagedIndexRef, original: admission.Port) !Prepared {
     while (true) {
         var guard = try manager.lockManagedIndexApplyWithAdmission(index_ref, original);
         const maybe_session = claim.tryTake() catch |cause| {

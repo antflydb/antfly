@@ -43,7 +43,7 @@ pub fn check(store: *DocStore, alloc: std.mem.Allocator, catalog: Catalog, contr
     if (control) |port| {
         // Apply and policy are held. Reject lending before any checkpoint can
         // transfer CPU while those dependencies remain owned.
-        if (try port.hasExecutionWait()) return error.ExecutionWaitUnsupported;
+        if (try port.hasExecutionSuspension()) return error.ExecutionWaitUnsupported;
         try port.checkpoint();
     }
     var point = if (control) |port| try store.beginProbeTxnWithAdmission(.transient, port) else try store.beginProbeTxn();

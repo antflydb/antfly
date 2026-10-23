@@ -3713,6 +3713,21 @@ pub fn storageOwnerDrainClose(owner: ?*anyopaque, request: *const kernel_owner_a
             const self: *@This() = @ptrCast(@alignCast(raw));
             try checked(self.execution.park(self.execution.context, @backingInt(rt.runnable_abi.Wait.resource)));
         }
+        fn beginDelegation(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.execution.enter_checked == null) return error.ExecutionWaitUnsupported;
+            try checkpoint(raw);
+            try begin(raw);
+        }
+        fn reentry(raw: *anyopaque) callconv(.c) rt.error_abi.Status {
+            lifetime(raw) catch |cause| return rt.error_abi.statusFromError(cause);
+            return .ok;
+        }
+        fn resumeExecution(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enterChecked(self.class, &.{ .context = self, .check = reentry });
+            try lifetime(raw);
+        }
         fn end(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try checked(self.execution.enter(self.execution.context, @backingInt(self.class)));
@@ -3721,7 +3736,7 @@ pub fn storageOwnerDrainClose(owner: ?*anyopaque, request: *const kernel_owner_a
     };
     var controls: Control = .{ .execution = borrow, .clock = &receiver, .deadline = request.deadline_ns, .class = class };
     const read = @import("antfly_local_sources").common_read_admission;
-    var payload: read.Payload = .{ .ptr = &controls, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadlineNs }, .execution_wait = .{ .ptr = &controls, .begin = Control.begin, .end = Control.end } };
+    var payload: read.Payload = .{ .ptr = &controls, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadlineNs }, .execution_wait = .{ .ptr = &controls, .begin = Control.begin, .end = Control.end }, .delegation = .{ .suspension = .{ .ptr = &controls, .begin = Control.beginDelegation, .end = Control.resumeExecution } } };
     Control.checkpoint(&controls) catch |cause| return storageOwnerStatusFromError(cause);
     const handle = asHandle(owner) orelse return .invalid_argument;
     handle.db.drainCloseDependenciesWithAdmission(.init(&payload)) catch |cause| return storageOwnerStatusFromError(cause);

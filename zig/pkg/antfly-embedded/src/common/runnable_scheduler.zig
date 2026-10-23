@@ -2456,6 +2456,38 @@ pub const Execution = struct {
         const owner = try schedulerFor(e, true);
         try owner.reserveCleanupFor(e, cleanup, duration_ns);
     }
+    pub fn enterReservedCleanup(self: *Execution, restriction: ?AdmissionCheck) !u64 {
+        const e = if (self.entry) |*entry| entry else return error.InvalidRunnableTransition;
+        if (!e.dormant_cleanup_root) return error.InvalidRunnableTransition;
+        if (e.cleanup_active) {
+            // A preparation-only caller restriction may have stopped CPU
+            // return. This independent retained root can retry under its own
+            // unchanged fence; it cannot restore expired cleanup or foreground.
+            try e.options.check();
+            const owner = e.scheduler orelse return error.InvalidRunnableTransition;
+            owner.lock();
+            if (e.state == .stopped) {
+                e.failure = null;
+                e.state = .resource_blocked;
+                owner.metrics.resource_blocked += 1;
+            }
+            owner.mutex.unlock();
+            try self.enterWithCheck(e.class, restriction);
+        } else {
+            if (restriction) |check| try check.checkpoint();
+            const owner = e.scheduler orelse return error.InvalidRunnableTransition;
+            try owner.activateCleanup(e);
+            try owner.waitRetainedWithCheck(e, restriction);
+            self.resume_generation +%= 1;
+            self.quantum_start_ns = e.options.now();
+            self.read_sample_ns = self.quantum_start_ns;
+            self.checkpoints = 0;
+        }
+        errdefer self.park(.resource_blocked) catch {};
+        try self.checkLifetime();
+        return e.options.deadline_ns orelse return error.InvalidRunnableTransition;
+    }
+
     pub fn activateCleanup(self: *Execution) !void {
         const e = if (self.entry) |*entry| entry else return error.ExecutionWaitUnsupported;
         // A stopped foreground deliberately retains its entry for cleanup.
