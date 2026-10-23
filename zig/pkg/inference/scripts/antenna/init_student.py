@@ -20,7 +20,7 @@ ModernBERT (or mmBERT) encoder with freshly initialized published heads.
 Runs on the pinned GLiNER2.5 oracle (``scripts/gliner25/oracle.py``). The
 encoder snapshot is downloaded first, at an exact revision, because the oracle
 runtime is offline. The saved checkpoint is what the native training source
-loads (``antfly-inference finetune train gliner25``); ``processor.json`` pins
+loads (``antfly-inference-dev finetune train gliner25``); ``processor.json`` pins
 the upstream token ids and routes for this tokenizer, in the format of
 ``testdata/gliner25/modernbert_tokenizer/processor.json``.
 
