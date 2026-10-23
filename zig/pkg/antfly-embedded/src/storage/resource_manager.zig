@@ -1302,6 +1302,7 @@ const BatchReservationIdentity = struct {
 
 const ObserverIdentity = struct {
     current: u64,
+    host_current: u64 = 0,
 };
 
 const ObserverKey = struct {
@@ -3852,6 +3853,26 @@ pub const ResourceManager = struct {
         return self.reserveOwnedSplitAtMostWithPolicy(slice, requested_primary_bytes, required_secondary_bytes, true);
     }
 
+    /// Preserve the mandatory retained-output requirement when distinguishing
+    /// permanent oversize from another owner's temporary use of the envelope.
+    pub fn reserveOwnedSplitAtMostClassified(self: *ResourceManager, slice: Slice, requested_primary_bytes: u64, required_secondary_bytes: u64) !OwnedSplitReservation {
+        return self.reserveOwnedSplitAtMost(slice, requested_primary_bytes, required_secondary_bytes) catch |err| {
+            if (err != error.ResourceBudgetExceeded) return err;
+            const minimum = std.math.add(u64, required_secondary_bytes, @intFromBool(requested_primary_bytes > 0)) catch return error.ResourceRequestTooLarge;
+            return self.classifyRequestDenial(slice, minimum);
+        };
+    }
+
+    /// Call only after an admission failure. Classification depends on the
+    /// request's own demand and immutable limits, never on a racy usage sample.
+    pub fn classifyRequestDenial(self: *ResourceManager, slice: Slice, bytes: u64) error{ ResourceRequestTooLarge, ResourceTemporarilyUnavailable } {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const limit = self.slices[sliceIndex(slice)].budget.hard_limit_bytes;
+        const host_limit = self.memory.budget.hard_limit_bytes;
+        return if ((limit != 0 and bytes > limit) or (host_limit != 0 and bytes > host_limit)) error.ResourceRequestTooLarge else error.ResourceTemporarilyUnavailable;
+    }
+
     /// Atomically grant available headroom up to the requested ceiling. Like
     /// reserveWithoutReclaim, this never calls cache owners while the caller
     /// holds another subsystem's resources. A nonzero request requires a
@@ -4370,8 +4391,34 @@ pub const ResourceManager = struct {
         enforce_limits: bool,
         bounded_parent: bool,
     ) !void {
+        return self.reconcileUsageWithHostChargeAndParentAdmissionLocked(slice, observer_id, previous, next, next, enforce_limits, bounded_parent);
+    }
+
+    fn reconcileUsageWithHostChargeLocked(
+        self: *ResourceManager,
+        slice: Slice,
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+        host_next: u64,
+        enforce_limits: bool,
+    ) !void {
+        return self.reconcileUsageWithHostChargeAndParentAdmissionLocked(slice, observer_id, previous, next, host_next, enforce_limits, false);
+    }
+
+    fn reconcileUsageWithHostChargeAndParentAdmissionLocked(
+        self: *ResourceManager,
+        slice: Slice,
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+        host_next: u64,
+        enforce_limits: bool,
+        bounded_parent: bool,
+    ) !void {
         if (bounded_parent and !self.pressure_change.tryLock()) return error.ParentMemoryBusy;
         defer if (bounded_parent) self.pressure_change.unlock();
+        if (host_next > next) return error.ResourceAccountingMismatch;
         const key = ObserverKey{ .slice = slice, .identity = observer_id };
         var inserted = false;
         const owned = self.observer_identities.getPtr(key) orelse blk: {
@@ -4398,19 +4445,19 @@ pub const ResourceManager = struct {
         }
 
         const state = &self.slices[sliceIndex(slice)];
-        if (previous > state.used_bytes or previous > self.memory.used_bytes -| self.identityMetadataCharge()) {
+        if (previous > state.used_bytes or owned.host_current > self.memory.used_bytes -| self.identityMetadataCharge()) {
             self.memory.accounting_errors +|= 1;
             return error.ResourceAccountingMismatch;
         }
         const slice_next = std.math.add(u64, state.used_bytes - previous, next) catch
             return error.ResourceBudgetExceeded;
-        const memory_next = std.math.add(u64, self.memory.used_bytes - previous, next) catch
+        const memory_next = std.math.add(u64, self.memory.used_bytes - owned.host_current, host_next) catch
             return error.ResourceBudgetExceeded;
         // Observation-only callers may report allocations that already exist,
         // but admission callers must reject growth before allocation. A
         // validated decrease is always accepted, even while the aggregate is
         // still above a hard limit, so owners can converge out of pressure.
-        if (enforce_limits and next > previous) {
+        if (enforce_limits and (next > previous or host_next > owned.host_current)) {
             if ((state.budget.hard_limit_bytes > 0 and slice_next > state.budget.hard_limit_bytes) or
                 (self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes))
             {
@@ -4435,18 +4482,20 @@ pub const ResourceManager = struct {
             } else if (self.memory_parent) |parent| parent.release_fn(parent.ptr, released);
         }
 
+        const observed_host = host_next != 0 or owned.host_current != 0;
         state.used_bytes = slice_next;
         self.memory.used_bytes = memory_next;
         owned.current = next;
+        owned.host_current = host_next;
         state.peak_bytes = @max(state.peak_bytes, slice_next);
         self.memory.peak_bytes = @max(self.memory.peak_bytes, memory_next);
         if (state.budget.soft_limit_bytes > 0 and slice_next > state.budget.soft_limit_bytes)
             state.soft_limit_events +|= 1;
-        if (!enforce_limits and state.budget.hard_limit_bytes > 0 and slice_next > state.budget.hard_limit_bytes)
+        if (!enforce_limits and observed_host and state.budget.hard_limit_bytes > 0 and slice_next > state.budget.hard_limit_bytes)
             state.hard_limit_rejections +|= 1;
         if (self.memory.budget.soft_limit_bytes > 0 and memory_next > self.memory.budget.soft_limit_bytes)
             self.memory.soft_limit_events +|= 1;
-        if (!enforce_limits and self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)
+        if (!enforce_limits and observed_host and self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)
             self.memory.hard_limit_rejections +|= 1;
         if (next == 0) _ = self.observer_identities.remove(key);
         if (bounded_parent) self.pressure_change.advanceLocked() else self.notifyPressureChange();
@@ -4490,7 +4539,7 @@ pub const ResourceManager = struct {
         errdefer {
             if (inserted) _ = self.observer_identities.remove(key);
         }
-        if (observed.current != current.*) return error.ResourceAccountingMismatch;
+        if (observed.current != current.* or observed.host_current != observed.current) return error.ResourceAccountingMismatch;
         const source = &self.slices[sliceIndex(reservation.slice)];
         const target = &self.slices[sliceIndex(destination)];
         if (source.used_bytes < credit or self.memory.used_bytes -| self.identityMetadataCharge() < credit) return error.ResourceAccountingMismatch;
@@ -4518,6 +4567,7 @@ pub const ResourceManager = struct {
         reservation.bytes -= credit;
         source_owned.bytes = reservation.bytes;
         observed.current = observed_next;
+        observed.host_current = observed_next;
         current.* = observed_next;
         self.commitMemoryLocked(memory_next);
         if (control != null) self.pressure_change.advanceLocked() else self.pressure_change.advance();
@@ -4732,8 +4782,9 @@ pub const ResourceManager = struct {
             self.memory.accounting_errors +|= 1;
             return error.ResourceAccountingMismatch;
         }
+        if (source_owned.host_current != source_owned.current) return error.ResourceAccountingMismatch;
         const destination_previous = if (self.observer_identities.get(destination_key)) |owned| blk: {
-            if (owned.current != destination.*) {
+            if (owned.current != destination.* or owned.host_current != owned.current) {
                 self.memory.accounting_errors +|= 1;
                 return error.ResourceAccountingMismatch;
             }
@@ -4793,11 +4844,13 @@ pub const ResourceManager = struct {
             _ = self.observer_identities.remove(source_key);
         } else {
             self.observer_identities.getPtr(source_key).?.current = source_next;
+            self.observer_identities.getPtr(source_key).?.host_current = source_next;
         }
         if (destination_next == 0) {
             _ = self.observer_identities.remove(destination_key);
         } else {
             self.observer_identities.getPtr(destination_key).?.current = destination_next;
+            self.observer_identities.getPtr(destination_key).?.host_current = destination_next;
         }
         source.* = source_next;
         destination.* = destination_next;
@@ -4820,6 +4873,15 @@ pub const ResourceManager = struct {
         if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, budget) else lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         try self.reconcileUsageLockedWithParentAdmission(slice, @intFromPtr(current), current.*, next, true, control != null);
+        current.* = next;
+    }
+
+    /// Keep logical residency telemetry separate from owned host memory.
+    /// File-backed mappings are reclaimable address space, not heap claims.
+    pub fn observeUsageWithHostCharge(self: *ResourceManager, slice: Slice, current: *u64, next: u64, host_next: u64) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.reconcileUsageWithHostChargeLocked(slice, @intFromPtr(current), current.*, next, host_next, false) catch return;
         current.* = next;
     }
 
@@ -9988,4 +10050,20 @@ test "budgeted allocator no reclaim view preserves shared ownership and ordinary
     quiet.free(last);
     try std.testing.expectEqual(@as(u64, 0), owner.liveBytesThreadSafe());
     try std.testing.expectEqual(@as(usize, 0), backing.end_index);
+}
+
+test "mapped residency observations never consume inference host admission" {
+    var manager = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 8 * 1024 * 1024 * 1024 } });
+    defer manager.deinit(std.testing.allocator);
+    var mapped: u64 = 0;
+    manager.observeUsageWithHostCharge(.full_text_segment_residency, &mapped, 16 * 1024 * 1024 * 1024, 0);
+    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), manager.sliceStats(.full_text_segment_residency).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
+    var model = try manager.reserve(.inference_model_residency, 2 * 1024 * 1024 * 1024);
+    defer model.release();
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.inference_scratch_working_set, 7 * 1024 * 1024 * 1024));
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.full_text_segment_residency).hard_limit_rejections);
+    manager.observeUsageWithHostCharge(.full_text_segment_residency, &mapped, 0, 0);
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), metadata_fixture.payloadUsage(&manager));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }

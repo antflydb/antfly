@@ -6465,6 +6465,7 @@ pub const HttpHandler = struct {
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
         };
@@ -6475,6 +6476,7 @@ pub const HttpHandler = struct {
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
         };

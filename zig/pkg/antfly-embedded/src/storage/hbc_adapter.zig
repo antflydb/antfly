@@ -21844,7 +21844,7 @@ test "hbc standalone cache yields to foreground aggregate admission" {
     defer tp.cleanup();
     const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const bytes = estimateVectorCacheBytes(&vector);
-    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+    var resource_manager = try resource_manager_mod.metadata_fixture.init(.{
         .memory_budget = .{ .soft_limit_bytes = bytes, .hard_limit_bytes = bytes + 1 },
     });
     defer resource_manager.deinit(alloc);
@@ -21856,13 +21856,13 @@ test "hbc standalone cache yields to foreground aggregate admission" {
     var foreground = try resource_manager.reserve(.dense_apply_working_set, 2);
     defer foreground.release();
     try std.testing.expectEqual(@as(u64, 0), idx.hbcCacheStats().vector.used_bytes);
-    try std.testing.expectEqual(@as(u64, 2), resource_manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 2), resource_manager_mod.metadata_fixture.payloadUsage(&resource_manager));
 }
 
 test "hbc resource reclaimer never waits for an active cache owner" {
     const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const bytes = estimateVectorCacheBytes(&vector);
-    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+    var resource_manager = try resource_manager_mod.metadata_fixture.init(.{
         .memory_budget = .{ .hard_limit_bytes = bytes },
     });
     defer resource_manager.deinit(std.testing.allocator);

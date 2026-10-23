@@ -961,7 +961,17 @@ const RemoteContentSnapshot = struct {
     }
 };
 
-fn acquireRemoteContent(raw: *anyopaque) anyerror!scraping.RemoteContentConfig.Snapshot {
+fn acquireRemoteContent(raw: *anyopaque, output: *scraping.RemoteContentConfig.Snapshot) callconv(.c) scraping.RemoteContentConfig.RemoteContentRuntime.AcquireStatus {
+    output.* = acquireRemoteContentImpl(raw) catch |err| return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        error.Timeout => .timeout,
+        error.Canceled => .canceled,
+        else => .unavailable,
+    };
+    return .ok;
+}
+
+fn acquireRemoteContentImpl(raw: *anyopaque) !scraping.RemoteContentConfig.Snapshot {
     const owner: *StorageOwnerContext = @ptrCast(@alignCast(raw));
     const source = owner.remote_content_source.?;
     var bytes: kernel_owner_abi.OwnedBytes = .{};

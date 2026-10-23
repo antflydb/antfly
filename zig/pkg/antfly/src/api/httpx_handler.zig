@@ -8481,6 +8481,10 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("embedding index sources declare different dimensions");
             },
             error.ModelNotFound => return respondJsonErrorBody(ctx, 404, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
+            error.InferenceEndpointAccessDenied => {
+                _ = ctx.status(400);
+                return ctx.text(public_table_http.inference_endpoint_access_denied_message);
+            },
             error.EmbeddingProbeUnavailable => {
                 _ = ctx.status(503);
                 return ctx.text("table index validation probe unavailable");
@@ -8506,6 +8510,10 @@ pub const AntflyApiHandler = struct {
             },
         ) catch |err| switch (err) {
             error.ModelNotFound => return respondJsonErrorBody(ctx, 404, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
+            error.InferenceEndpointAccessDenied => {
+                _ = ctx.status(400);
+                return ctx.text(public_table_http.inference_endpoint_access_denied_message);
+            },
             error.EmbeddingProbeUnavailable => {
                 _ = ctx.status(503);
                 return ctx.text("table index validation probe unavailable");

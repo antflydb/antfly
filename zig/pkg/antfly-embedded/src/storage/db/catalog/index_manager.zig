@@ -8799,13 +8799,18 @@ pub const IndexManager = struct {
             },
         };
 
-        pub fn deinit(self: *NativeBackupCheckpoints) void {
+        fn releaseCheckpoints(self: *NativeBackupCheckpoints) void {
             for (self.artifacts.items) |*artifact| {
                 switch (artifact.checkpoint) {
                     inline else => |*checkpoint| checkpoint.deinit(),
                 }
                 self.alloc.free(artifact.index_name);
             }
+            self.artifacts.clearRetainingCapacity();
+        }
+
+        pub fn deinit(self: *NativeBackupCheckpoints) void {
+            self.releaseCheckpoints();
             if (self.native_files) |*checkpoint| checkpoint.deinit();
             self.artifacts.deinit(self.alloc);
             self.* = undefined;
@@ -9142,6 +9147,32 @@ pub const IndexManager = struct {
                 .checkpoint = .{ .lsm = checkpoints.reverse },
             });
         }
+        // Retain manifested files independently of the live index owners.
+        // Snapshot refs protect compaction, but a catalog replacement can close
+        // an owner and retire its root before off-fence sealing starts. Capture
+        // immutable links and owned manifest bytes while catalog admission is
+        // still fenced, just as for native dense generations above.
+        for (result.artifacts.items) |*artifact| {
+            const relative_root = try std.fs.path.join(self.alloc, &.{ "indexes", artifact.index_name, artifact.backend_root });
+            defer self.alloc.free(relative_root);
+            switch (artifact.checkpoint) {
+                .lsm => |*checkpoint| {
+                    const manifest_path = try self.retainNativeBackupAllocation(&native_owned, try std.fs.path.join(self.alloc, &.{ relative_root, "manifest.bin" }));
+                    try native_specs.append(self.alloc, .{ .relative_path = manifest_path, .source = .{ .bytes = checkpoint.manifest_bytes } });
+                    for (checkpoint.run_paths, checkpoint.run_ids) |source, run_id| {
+                        const relative = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "{s}/runs/{d}.tbl", .{ relative_root, run_id }));
+                        try native_specs.append(self.alloc, .{ .relative_path = relative, .source = .{ .immutable_file = source } });
+                    }
+                },
+                .text_segments => |*checkpoint| {
+                    for (checkpoint.snapshot.segments) |segment| {
+                        const source = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "{s}/{d}.seg", .{ checkpoint.source_root, segment.id }));
+                        const relative = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "{s}/{d}.seg", .{ relative_root, segment.id }));
+                        try native_specs.append(self.alloc, .{ .relative_path = relative, .source = .{ .immutable_file = source } });
+                    }
+                },
+            }
+        }
         if (native_specs.items.len != 0) {
             result.native_files = try native_backup.pinExplicitArtifacts(
                 self.alloc,
@@ -9151,6 +9182,7 @@ pub const IndexManager = struct {
                 cancellation,
             );
         }
+        result.releaseCheckpoints();
         return result;
     }
 

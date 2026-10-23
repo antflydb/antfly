@@ -172,6 +172,9 @@ pub const PinnedTextSource = struct {
     }
 };
 
+pub const QueryExecutionControl = query_mod.ExecutionControl;
+pub const ControlledLiveDocFilter = *const fn (?*anyopaque, Allocator, *const doc_set.ResolvedDocSet, ?u64, QueryExecutionControl) anyerror!doc_set.ResolvedDocSet;
+
 pub const IndexedTextPredicate = struct {
     bitmap: roaring.RoaringBitmap,
     exact: bool = true,
@@ -280,6 +283,9 @@ pub const SearchTextQueryExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    /// Bulk visibility providers must honor control while traversing rows.
+    /// Without this callback adaptive visibility stays on bounded candidates.
+    live_filter_doc_set_controlled: ?ControlledLiveDocFilter = null,
     all_docs_visible: ?*const fn (
         ctx: ?*anyopaque,
         generation: ?u64,
@@ -2872,6 +2878,7 @@ fn textDocNumsForResolvedDocSetAlloc(
     snapshot: *const index_mod.IndexSnapshot,
     set: *const doc_set.ResolvedDocSet,
 ) !?[]const u32 {
+    if (set.* == .ordinal_bitmap) return try snapshot.docNumsForOrdinalBitmapAlloc(alloc, &set.ordinal_bitmap);
     const ordinals = (try docNumsForResolvedDocSetAlloc(alloc, set)) orelse return null;
     defer alloc.free(ordinals);
     return try snapshot.docNumsForOrdinalsAlloc(alloc, ordinals);
@@ -12022,6 +12029,229 @@ fn visibleTextCandidateCount(
     return visible_count;
 }
 
+/// Refine posting candidates in their own ordinal space. A broad live mask
+/// would project the entire primary population before even a rare term search.
+/// This owner borrows only the request's pinned snapshot and callback context.
+const TextLiveVisibilityProducer = struct {
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    ctx: ?*anyopaque,
+    live_filter: @typeInfo(@FieldType(StructuredFilterResolverExecutor, "live_filter_doc_set")).optional.child,
+    generation: ?u64,
+    control: @FieldType(search_mod.SearchRequest, "control"),
+    materialize_after: u64,
+    controlled_filter: ?ControlledLiveDocFilter = null,
+    resolved_filter: ?*const doc_set.ResolvedDocFilter = null,
+    skip_live_filter: bool = false,
+    examined: AtomicU64 = .init(0),
+    building: std.atomic.Value(bool) = .init(false),
+    complete: std.atomic.Value(?*roaring.RoaringBitmap) = .init(null),
+
+    fn producer(self: *@This()) query_mod.DocNumProducer {
+        return .{ .ptr = self, .produce = produce, .materialized = materialized };
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.complete.load(.acquire)) |bitmap| {
+            bitmap.deinit();
+            self.alloc.destroy(bitmap);
+        }
+    }
+
+    fn materialized(raw: *anyopaque) ?*const roaring.RoaringBitmap {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.complete.load(.acquire);
+    }
+
+    fn buildComplete(self: *@This()) !?*roaring.RoaringBitmap {
+        const all: doc_set.ResolvedDocSet = .all;
+        var live = if (self.skip_live_filter) doc_set.ResolvedDocSet.all else blk: {
+            const controlled = self.controlled_filter orelse return null;
+            break :blk try controlled(self.ctx, self.alloc, &all, self.generation, self.control);
+        };
+        defer live.deinit(self.alloc);
+        // Legacy bulk `.all` can mean inconclusive primary coverage, including
+        // rows created after the read generation. Only the all-visible proof
+        // at request setup may skip candidate checks; an unknown bulk result
+        // must not widen already-refined membership during adaptation.
+        if ((!self.skip_live_filter and live == .all) or live == .doc_keys) return null;
+        const Membership = struct {
+            set: *const doc_set.ResolvedDocSet,
+            resolved: ?*const doc_set.ResolvedDocFilter,
+            pub fn contains(self_: @This(), ordinal: u32) bool {
+                return self_.set.containsOrdinal(ordinal) and resolvedContains(self_.resolved, ordinal);
+            }
+        };
+        const bitmap = try self.alloc.create(roaring.RoaringBitmap);
+        errdefer self.alloc.destroy(bitmap);
+        bitmap.* = (try self.snapshot.tryDocNumBitmapForOrdinalMembershipAlloc(self.alloc, Membership{ .set = &live, .resolved = self.resolved_filter }, self.control)) orelse {
+            self.alloc.destroy(bitmap);
+            return null;
+        };
+        errdefer bitmap.deinit();
+        try bitmap.prepareRead();
+        try self.control.check();
+        return bitmap;
+    }
+
+    fn resolvedContains(filter: ?*const doc_set.ResolvedDocFilter, ordinal: u32) bool {
+        const value = filter orelse return true;
+        return value.include.containsOrdinal(ordinal) and !value.exclude.containsOrdinal(ordinal);
+    }
+
+    fn identityFilter(_: ?*anyopaque, alloc: Allocator, set: *const doc_set.ResolvedDocSet, _: ?u64) !doc_set.ResolvedDocSet {
+        return doc_set.cloneAlloc(alloc, set);
+    }
+
+    fn fromComplete(self: *@This(), bitmap: *const roaring.RoaringBitmap, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        const input = candidates orelse return bitmap.sliceRebased(alloc, offset, @as(u64, offset) + count);
+        var result = roaring.RoaringBitmap.init(alloc);
+        errdefer result.deinit();
+        var it = input.iterator();
+        while (it.next()) |doc| {
+            try self.control.check();
+            if (doc >= count) return error.InvalidQueryRequest;
+            const global = std.math.add(u32, offset, doc) catch return error.InvalidQueryRequest;
+            if (bitmap.contains(global)) try result.add(doc);
+        }
+        return result;
+    }
+
+    fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.control.check();
+        if (self.complete.load(.acquire)) |bitmap| return self.fromComplete(bitmap, alloc, offset, count, candidates);
+        const incoming: u64 = if (candidates) |bitmap| bitmap.cardinality() else count;
+        if (incoming == 0) return roaring.RoaringBitmap.init(alloc);
+        const before = self.examined.fetchAdd(incoming, .monotonic);
+        // Bound selective probes before a broad query pays for one population
+        // projection. Never wait for another builder: concurrent lanes keep
+        // refining their candidates until immutable membership is published.
+        if (before + incoming >= self.materialize_after and self.building.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+            if (try self.buildComplete()) |bitmap| self.complete.store(bitmap, .release);
+        }
+        if (self.complete.load(.acquire)) |bitmap| return self.fromComplete(bitmap, alloc, offset, count, candidates);
+        var result = roaring.RoaringBitmap.init(alloc);
+        errdefer result.deinit();
+        // The producer receives one segment's base and local candidates.
+        // Resolve and lease that segment once, not once per posting hit.
+        const resolved = self.snapshot.resolveDocId(offset) orelse return error.InvalidQueryRequest;
+        var segment = try self.snapshot.leaseSegment(resolved.seg_idx);
+        defer segment.deinit();
+        if (resolved.local_id != 0 or segment.entry.reader.doc_count != count) return error.InvalidQueryRequest;
+        segment.entry.noteAccess();
+        var ordinal_cursor = try segment_mod.DocOrdinalCursor.init(&segment.entry.reader);
+        var iterator = if (candidates) |bitmap| bitmap.iterator() else null;
+        var position: u32 = 0;
+        var docs: [64]u32 = undefined;
+        var ordinals: [64]u32 = undefined;
+        var used: usize = 0;
+        while (true) {
+            try self.control.check();
+            const local = if (iterator) |*it| it.next() else if (position < count) position else null;
+            if (local) |doc| {
+                if (doc >= count) return error.InvalidQueryRequest;
+                position = doc +| 1;
+                if (try ordinal_cursor.get(doc)) |ordinal| {
+                    if (!resolvedContains(self.resolved_filter, ordinal)) continue;
+                    if (self.skip_live_filter) {
+                        try result.add(doc);
+                        continue;
+                    }
+                    docs[used] = doc;
+                    ordinals[used] = ordinal;
+                    used += 1;
+                }
+            }
+            if (used == docs.len or (local == null and used != 0)) {
+                var requested = try doc_set.fromOrdinalsAlloc(alloc, ordinals[0..used]);
+                defer requested.deinit(alloc);
+                var visible = try self.live_filter(self.ctx, alloc, &requested, self.generation);
+                defer visible.deinit(alloc);
+                if (visible == .doc_keys) return error.UnsupportedQueryRequest;
+                for (docs[0..used], ordinals[0..used]) |doc, ordinal| {
+                    if (visible.containsOrdinal(ordinal)) try result.add(doc);
+                }
+                used = 0;
+            }
+            if (local == null) break;
+        }
+        return result;
+    }
+};
+
+/// Keep indexed inclusion and identity visibility in the same candidate lane.
+/// Exposing two separate leaves disables the scorer's producer fast path.
+const TextConjunctionProducer = struct {
+    alloc: Allocator,
+    include: *IndexedTextPredicate,
+    visibility: *TextLiveVisibilityProducer,
+    complete: std.atomic.Value(?*roaring.RoaringBitmap) = .init(null),
+    building: std.atomic.Value(bool) = .init(false),
+
+    fn producer(self: *@This()) query_mod.DocNumProducer {
+        return .{ .ptr = self, .produce = produce, .materialized = materialized };
+    }
+    fn deinit(self: *@This()) void {
+        if (self.complete.load(.acquire)) |bitmap| {
+            bitmap.deinit();
+            self.alloc.destroy(bitmap);
+        }
+    }
+    fn materialized(raw: *anyopaque) ?*const roaring.RoaringBitmap {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.complete.load(.acquire);
+    }
+    fn publishComplete(self: *@This()) !void {
+        if (self.complete.load(.acquire) != null) return;
+        const visible = self.visibility.complete.load(.acquire) orelse return;
+        const indexed = if (self.include.producer) |value|
+            if (value.materialized) |get| get(value.ptr) orelse return else return
+        else
+            &self.include.bitmap;
+        if (self.building.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        try self.visibility.control.check();
+        const bitmap = try self.alloc.create(roaring.RoaringBitmap);
+        errdefer self.alloc.destroy(bitmap);
+        bitmap.* = try indexed.clone(self.alloc);
+        errdefer bitmap.deinit();
+        bitmap.andWith(visible);
+        try bitmap.prepareRead();
+        try self.visibility.control.check();
+        self.complete.store(bitmap, .release);
+    }
+    fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.visibility.control.check();
+        if (self.complete.load(.acquire)) |bitmap| return self.visibility.fromComplete(bitmap, alloc, offset, count, candidates);
+        // Borrowed masks use segment-local coordinates. Keep their owner pinned
+        // through visibility refinement, including allocation/error paths.
+        var borrowed: ?roaring.BorrowedBitmap = null;
+        defer if (borrowed) |*pin| pin.deinit();
+        var owned: ?roaring.RoaringBitmap = null;
+        defer if (owned) |*bitmap| bitmap.deinit();
+        const indexed = if (self.include.producer) |value| blk: {
+            if (value.borrow) |borrow| borrowed = try borrow(value.ptr, offset, count);
+            if (borrowed) |pin| {
+                if (candidates) |_| {
+                    owned = try self.visibility.fromComplete(pin.bitmap, alloc, 0, count, candidates);
+                    break :blk &owned.?;
+                }
+                break :blk pin.bitmap;
+            }
+            owned = try value.produce(value.ptr, alloc, offset, count, candidates);
+            break :blk &owned.?;
+        } else blk: {
+            owned = try self.visibility.fromComplete(&self.include.bitmap, alloc, offset, count, candidates);
+            break :blk &owned.?;
+        };
+        var result = try TextLiveVisibilityProducer.produce(self.visibility, alloc, offset, count, indexed);
+        errdefer result.deinit();
+        try self.publishComplete();
+        return result;
+    }
+};
+
 pub fn searchTextQuery(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -12097,6 +12327,60 @@ pub fn searchTextQuery(
     // still scoring it (observed as allocator corruption in termDocFreq()).
     const snapshot = text_source.snapshot;
     const can_apply_live_all_docs = !chunk_backed or (try snapshot.hasDocOrdinalCoverage());
+    var apply_broad_live_all_docs = can_apply_live_all_docs;
+    var live_visibility: ?TextLiveVisibilityProducer = null;
+    defer if (live_visibility) |*visibility| visibility.deinit();
+    if (can_apply_live_all_docs and executor.live_filter_doc_set != null and !executor.native_count_visibility_exact) {
+        const needs_full_visibility = if (executor.requires_full_candidate_visibility_filter) |requires|
+            try requires(executor.ctx, effective_req.identity_read_generation)
+        else
+            false;
+        if (!needs_full_visibility) {
+            const all_visible = if (executor.all_docs_visible) |visible|
+                try visible(executor.ctx, effective_req.identity_read_generation)
+            else
+                false;
+            if (all_visible) {
+                apply_broad_live_all_docs = false;
+            } else if (try snapshot.hasDocOrdinalCoverage()) {
+                live_visibility = .{
+                    .alloc = alloc,
+                    .snapshot = snapshot,
+                    .ctx = executor.ctx,
+                    .live_filter = executor.live_filter_doc_set.?,
+                    .generation = effective_req.identity_read_generation,
+                    .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+                    .materialize_after = @max(1024, snapshot.liveDocCount() / 128),
+                    .controlled_filter = executor.live_filter_doc_set_controlled,
+                };
+                apply_broad_live_all_docs = false;
+            }
+        }
+    }
+    // Wire-resolved ordinal constraints must refine posting candidates too.
+    // Projecting even a one-ordinal filter by scanning every segment restores
+    // the same population-sized floor that adaptive live visibility avoids.
+    var resolved_ordinal_filter_handled = false;
+    if (!suppress_native_resolved_doc_filter and resolvedTextDocNumFilterFromRequest(effective_req) == null) {
+        if (resolvedDocFilterFromRequest(effective_req)) |filter| {
+            if (filter.include != .doc_keys and filter.exclude != .doc_keys and try snapshot.hasDocOrdinalCoverage()) {
+                resolved_ordinal_filter_handled = true;
+                if (filter.include != .all or filter.exclude != .none) {
+                    if (live_visibility == null) live_visibility = .{
+                        .alloc = alloc,
+                        .snapshot = snapshot,
+                        .ctx = executor.ctx,
+                        .live_filter = TextLiveVisibilityProducer.identityFilter,
+                        .generation = effective_req.identity_read_generation,
+                        .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+                        .materialize_after = @max(1024, snapshot.liveDocCount() / 128),
+                        .skip_live_filter = true,
+                    };
+                    live_visibility.?.resolved_filter = filter;
+                }
+            }
+        }
+    }
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var indexed_include: ?IndexedTextPredicate = null;
     defer if (indexed_include) |*predicate| predicate.deinit();
@@ -12113,11 +12397,23 @@ pub fn searchTextQuery(
             };
         }
     }
-    if (indexed_include != null or indexed_exclude != null) {
-        const must = try arena_alloc.alloc(search_mod.SearchQuery, if (indexed_include != null) 2 else 1);
+    var conjunction: ?TextConjunctionProducer = null;
+    defer if (conjunction) |*value| value.deinit();
+    if (indexed_include) |*include| if (live_visibility) |*visibility| {
+        conjunction = .{ .alloc = alloc, .include = include, .visibility = visibility };
+    };
+    if (indexed_include != null or indexed_exclude != null or live_visibility != null) {
+        const has_include = indexed_include != null or live_visibility != null;
+        const must = try arena_alloc.alloc(search_mod.SearchQuery, if (has_include) 2 else 1);
         must[0] = base_search_query;
         const exclusions = try arena_alloc.alloc(search_mod.SearchQuery, if (indexed_exclude != null) 1 else 0);
-        if (indexed_include) |*bitmap| must[1] = .{ .doc_num = .{ .ids = &.{}, .bitmap = if (bitmap.producer == null) &bitmap.bitmap else null, .producer = bitmap.producer, .boost = 0 } };
+        if (conjunction) |*value| {
+            must[1] = .{ .doc_num = .{ .ids = &.{}, .producer = value.producer(), .boost = 0 } };
+        } else if (live_visibility) |*visibility| {
+            must[1] = .{ .doc_num = .{ .ids = &.{}, .producer = visibility.producer(), .boost = 0 } };
+        } else if (indexed_include) |*bitmap| {
+            must[1] = .{ .doc_num = .{ .ids = &.{}, .bitmap = if (bitmap.producer == null) &bitmap.bitmap else null, .producer = bitmap.producer, .boost = 0 } };
+        }
         if (indexed_exclude) |*bitmap| exclusions[0] = .{ .doc_num = .{ .ids = &.{}, .bitmap = if (bitmap.producer == null) &bitmap.bitmap else null, .producer = bitmap.producer } };
         base_search_query = .{ .bool_query = .{ .must = must, .must_not = exclusions } };
     }
@@ -12157,7 +12453,7 @@ pub fn searchTextQuery(
         .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
         .text_snapshot_for_doc_num_projection = snapshot,
-        .apply_live_all_docs = can_apply_live_all_docs,
+        .apply_live_all_docs = apply_broad_live_all_docs,
     });
     defer native_constraints.deinit(alloc);
     if (indexed_include) |predicate| if (predicate.exact) {
@@ -12172,7 +12468,7 @@ pub fn searchTextQuery(
         // postprocess below via effective_req.resolved_doc_filter.
     } else if (resolvedTextDocNumFilterFromRequest(effective_req)) |filter| {
         try applyResolvedTextDocNumFilterAlloc(alloc, &native_constraints, filter);
-    } else if (resolvedDocFilterFromRequest(effective_req)) |filter| {
+    } else if (if (resolved_ordinal_filter_handled) null else resolvedDocFilterFromRequest(effective_req)) |filter| {
         try applyResolvedDocFilterToTextDocNumsAlloc(alloc, snapshot, &native_constraints, filter, .{
             .ctx = executor.ctx,
             .text_index_entry = executor.text_index_entry,
@@ -18837,8 +19133,8 @@ const ValueExecution = struct {
     tuning_started: bool = false,
     source_epoch: usize = 0,
     original_average_bytes: u64 = 0,
-    membership_borrows: std.atomic.Value(u64) = .init(0),
-    membership_copies: std.atomic.Value(u64) = .init(0),
+    membership_borrows: AtomicU64 = .init(0),
+    membership_copies: AtomicU64 = .init(0),
     key_lookup_ns: u64 = 0,
     provider_ns: u64 = 0,
     literal_groups: std.ArrayListUnmanaged(LiteralGroup) = .empty,
@@ -32852,6 +33148,28 @@ test "text native constraints project resolved ordinals through segment sidecar"
     try std.testing.expectEqual(@as(u32, 0), constraints.exclude_doc_nums[0]);
     try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_ids.len);
     try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_ids.len);
+
+    // Preserve the same exact projection when the resolved population is a
+    // bitmap, including live ordinals absent from this particular text index.
+    filter.include.deinit(alloc);
+    filter.exclude.deinit(alloc);
+    filter = .{
+        .include = .{ .ordinal_bitmap = roaring.RoaringBitmap.init(alloc) },
+        .exclude = .{ .ordinal_bitmap = roaring.RoaringBitmap.init(alloc) },
+    };
+    try filter.include.ordinal_bitmap.addSortedAscending(&.{ 7, 99 });
+    try filter.exclude.ordinal_bitmap.addSortedAscending(&.{ 42, 123 });
+    var bitmap_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .text_snapshot_for_doc_num_projection = writer.snapshot(),
+    });
+    defer bitmap_constraints.deinit(alloc);
+    try std.testing.expect(bitmap_constraints.positive_filter);
+    try std.testing.expectEqualSlices(u32, constraints.filter_doc_nums, bitmap_constraints.filter_doc_nums);
+    try std.testing.expectEqualSlices(u32, constraints.exclude_doc_nums, bitmap_constraints.exclude_doc_nums);
 }
 
 test "text resolved doc filter projection passes identity generation to live filtering" {
@@ -35056,6 +35374,331 @@ test "logical value bootstrap reads only two originals before pinning projection
     try std.testing.expectEqual(@as(usize, docs.len - 2), loader.projected);
     try std.testing.expectEqual(@as(usize, 1), loader.opens);
     try std.testing.expectEqual(@as(u64, docs.len * body.len), execution.local_work.bytes.load(.monotonic));
+}
+
+test "text live visibility refines posting candidates and skips an all-visible filter" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const mapper = @import("../document_mapper.zig");
+    const docs = try scratch.alloc(mapper.MapperDoc, 10_000);
+    for (docs, 0..) |*doc, i| doc.* = .{
+        .key = try std.fmt.allocPrint(scratch, "doc:{d}", .{i}),
+        .value = if (i == 17 or i == 111 or i == 7000 or i == 9001) "{\"body\":\"needle\"}" else "{\"body\":\"haystack\"}",
+        .doc_ordinal = @intCast(i + 1),
+    };
+    const bytes = (try mapper.buildTextSegmentFromDocuments(a, docs[0..5000], .{}, null)).?;
+    defer a.free(bytes);
+    const second_bytes = (try mapper.buildTextSegmentFromDocuments(a, docs[5000..], .{}, null)).?;
+    defer a.free(second_bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    try writer.addSegment(second_bytes);
+    const Harness = struct {
+        writer: *index_mod.IndexWriter,
+        calls: usize = 0,
+        seen: usize = 0,
+        all_visible: bool = false,
+        fail: bool = false,
+        broad: enum { forbidden, bitmap, all, keys } = .forbidden,
+        broad_calls: usize = 0,
+        indexed_kind: enum { bitmap, lazy, borrowed } = .bitmap,
+        borrowed_first: ?*const roaring.RoaringBitmap = null,
+        borrowed_second: ?*const roaring.RoaringBitmap = null,
+        active_borrows: usize = 0,
+        indexed_probes: usize = 0,
+        fn acquire(raw: ?*anyopaque, _: ?[]const u8) !?PinnedTextSource {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .snapshot = self.writer.acquireSnapshot(), .name = "text", .text_analysis = .{}, .runtime_schema = null };
+        }
+        fn entry(_: ?*anyopaque, _: ?[]const u8) !?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+        fn chunk(_: ?*anyopaque, _: Allocator, _: ?[]const u8) !bool {
+            return false;
+        }
+        fn matchAll(_: ?*anyopaque, _: Allocator, _: types.SearchRequest) !types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+        fn stored(_: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn project(_: ?*anyopaque, out: Allocator, _: types.SearchRequest, _: []const u8, data: []const u8) ![]u8 {
+            return out.dupe(u8, data);
+        }
+        fn post(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, result: types.SearchResult, _: bool) !types.SearchResult {
+            return result;
+        }
+        fn visible(raw: ?*anyopaque, _: ?u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.all_visible;
+        }
+        fn resolve(raw: ?*anyopaque, alloc: Allocator, _: *const index_mod.IndexSnapshot, _: []const u8) !?IndexedTextPredicate {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            var bitmap = roaring.RoaringBitmap.init(alloc);
+            errdefer bitmap.deinit();
+            if (self.indexed_kind == .bitmap) try bitmap.addSortedAscending(&.{ 17, 111, 7000 });
+            return .{ .bitmap = bitmap, .producer = if (self.indexed_kind != .bitmap) .{ .ptr = self, .produce = indexed, .borrow = if (self.indexed_kind == .borrowed) borrowIndexed else null } else null };
+        }
+        fn borrowIndexed(raw: *anyopaque, offset: u32, count: u32) !?roaring.BorrowedBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u32, 5000), count);
+            const bitmap = if (offset == 0) self.borrowed_first.? else if (offset == 5000) self.borrowed_second.? else return error.InvalidQueryRequest;
+            self.active_borrows += 1;
+            return .{ .bitmap = bitmap, .cached_cardinality = bitmap.cardinality(), .context = .{ self, self }, .release = releaseIndexed };
+        }
+        fn releaseIndexed(context: [2]*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context[0]));
+            self.active_borrows -= 1;
+        }
+        fn indexed(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.indexed_kind == .borrowed) return error.UnexpectedMaterialization;
+            const input = candidates orelse return error.TestUnexpectedResult;
+            var result = roaring.RoaringBitmap.init(alloc);
+            errdefer result.deinit();
+            var it = input.iterator();
+            while (it.next()) |doc| {
+                try std.testing.expect(doc < count);
+                self.indexed_probes += 1;
+                if (doc + offset == 17 or doc + offset == 111 or doc + offset == 7000) try result.add(doc);
+            }
+            return result;
+        }
+        fn controlled(raw: ?*anyopaque, alloc: Allocator, requested: *const doc_set.ResolvedDocSet, generation: ?u64, control: QueryExecutionControl) !doc_set.ResolvedDocSet {
+            try control.check();
+            return filter(raw, alloc, requested, generation);
+        }
+        fn filter(raw: ?*anyopaque, alloc: Allocator, requested: *const doc_set.ResolvedDocSet, generation: ?u64) !doc_set.ResolvedDocSet {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.fail) return error.TestVisibilityFailure;
+            try std.testing.expectEqual(@as(?u64, 9), generation);
+            if (requested.* == .all) {
+                self.broad_calls += 1;
+                switch (self.broad) {
+                    .forbidden => return error.TestUnexpectedResult,
+                    .all => return .all,
+                    .keys => return doc_set.cloneDocKeysAlloc(alloc, &.{"legacy"}),
+                    .bitmap => {
+                        var bitmap = roaring.RoaringBitmap.init(alloc);
+                        errdefer bitmap.deinit();
+                        try bitmap.addRange(1, 112);
+                        try bitmap.addRange(113, 10001);
+                        return .{ .ordinal_bitmap = bitmap };
+                    },
+                }
+            }
+            if (requested.* != .ordinals or requested.ordinals.len > (if (self.broad == .forbidden) @as(usize, 4) else 64)) return error.TestUnexpectedResult;
+            self.calls += 1;
+            self.seen += requested.ordinals.len;
+            var kept: [64]u32 = undefined;
+            var used: usize = 0;
+            for (requested.ordinals) |ordinal| {
+                if (self.broad == .forbidden and ordinal != 18 and ordinal != 112 and ordinal != 7001 and ordinal != 9002) return error.TestUnexpectedResult;
+                if (ordinal != 112) {
+                    kept[used] = ordinal;
+                    used += 1;
+                }
+            }
+            return doc_set.fromOrdinalsAlloc(alloc, kept[0..used]);
+        }
+    };
+    var harness = Harness{ .writer = &writer };
+    var first_mask = roaring.RoaringBitmap.init(a);
+    defer first_mask.deinit();
+    try first_mask.addSortedAscending(&.{ 17, 111 });
+    var second_mask = roaring.RoaringBitmap.init(a);
+    defer second_mask.deinit();
+    try second_mask.add(2000);
+    harness.borrowed_first = &first_mask;
+    harness.borrowed_second = &second_mask;
+    const executor: SearchTextQueryExecutor = .{
+        .ctx = &harness,
+        .acquire_text_source = Harness.acquire,
+        .text_index_entry = Harness.entry,
+        .text_index_is_chunk_backed = Harness.chunk,
+        .search_match_all = Harness.matchAll,
+        .project_stored_search = Harness.project,
+        .load_stored = Harness.stored,
+        .postprocess = Harness.post,
+        .all_docs_visible = Harness.visible,
+        .resolve_indexed_filter = Harness.resolve,
+        .live_filter_doc_set = Harness.filter,
+        .live_filter_doc_set_controlled = Harness.controlled,
+    };
+    const req: types.SearchRequest = .{ .include_stored = false, .limit = 10, .identity_read_generation = 9 };
+    const query: types.TextQuery = .{ .match = .{ .field = "body", .text = "needle" } };
+    harness.all_visible = true;
+    var baseline = try searchTextQuery(a, req, query, executor);
+    defer baseline.deinit();
+    try std.testing.expectEqual(@as(usize, 4), baseline.hits.len);
+    harness.all_visible = false;
+    var result = try searchTextQuery(a, req, query, executor);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+    try std.testing.expectEqual(@as(u64, 3), result.total_hits);
+    for (result.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:111"));
+    try std.testing.expect(harness.calls != 0);
+    try std.testing.expect(harness.seen <= 16);
+    var count_req = req;
+    count_req.count_only = true;
+    var counted = try searchTextQuery(a, count_req, query, executor);
+    defer counted.deinit();
+    try std.testing.expectEqual(@as(u64, 3), counted.total_hits);
+    var sorted_req = req;
+    sorted_req.order_by = &.{.{ .field = "_id" }};
+    var sorted = try searchTextQuery(a, sorted_req, query, executor);
+    defer sorted.deinit();
+    try std.testing.expectEqual(@as(usize, 3), sorted.hits.len);
+    try std.testing.expectEqualStrings("doc:17", sorted.hits[0].id);
+    // Indexed inclusion plus visibility must keep both bitmap and lazy
+    // providers on the candidate path, for ranked, count and sorted requests.
+    for ([_]@FieldType(Harness, "indexed_kind"){ .bitmap, .lazy, .borrowed }) |kind| {
+        harness.indexed_kind = kind;
+        harness.indexed_probes = 0;
+        harness.seen = 0;
+        harness.broad_calls = 0;
+        for ([_]types.SearchRequest{ req, count_req, sorted_req }) |original| {
+            var filtered_req = original;
+            filtered_req.filter_query_json = "{\"doc_id\":[\"doc:17\",\"doc:111\",\"doc:7000\"]}";
+            var filtered = try searchTextQuery(a, filtered_req, query, executor);
+            defer filtered.deinit();
+            try std.testing.expectEqual(@as(u64, 2), filtered.total_hits);
+            if (!filtered_req.count_only) {
+                try std.testing.expectEqual(@as(usize, 2), filtered.hits.len);
+                for (filtered.hits) |hit| try std.testing.expect(std.mem.eql(u8, hit.id, "doc:17") or std.mem.eql(u8, hit.id, "doc:7000"));
+            }
+        }
+        if (kind == .borrowed) {
+            var filtered_req = count_req;
+            filtered_req.filter_query_json = "{\"doc_id\":[\"doc:17\",\"doc:111\",\"doc:7000\"]}";
+            var filtered = try searchTextQuery(a, filtered_req, .match_all, executor);
+            defer filtered.deinit();
+            try std.testing.expectEqual(@as(u64, 2), filtered.total_hits);
+        }
+        try std.testing.expectEqual(@as(usize, 0), harness.active_borrows);
+        try std.testing.expectEqual(@as(usize, 0), harness.broad_calls);
+        try std.testing.expect(harness.seen <= 24);
+        try std.testing.expect(harness.indexed_probes <= 24);
+    }
+    // Explicit wire filters use primary ordinals, not segment-local IDs.
+    // Even a full-population include must keep the rare-term path bounded.
+    var ordinal_include = try doc_set.fromOrdinalsAlloc(a, &.{ 18, 112, 7001 });
+    defer ordinal_include.deinit(a);
+    var population = roaring.RoaringBitmap.init(a);
+    defer population.deinit();
+    try population.addRange(1, 10001);
+    const explicit_filters = [_]doc_set.ResolvedDocFilter{
+        .{ .include = ordinal_include },
+        .{ .include = .{ .ordinal_bitmap = population }, .exclude = .{ .ordinals = &.{7001} } },
+    };
+    for (&explicit_filters) |*explicit| {
+        for ([_]types.SearchRequest{ req, count_req, sorted_req }) |original| {
+            harness.seen = 0;
+            var filtered_req = original;
+            filtered_req.resolved_doc_filter = @ptrCast(@constCast(explicit));
+            var filtered = try searchTextQuery(a, filtered_req, query, executor);
+            defer filtered.deinit();
+            try std.testing.expectEqual(@as(u64, 2), filtered.total_hits);
+            try std.testing.expect(harness.seen <= 4);
+        }
+    }
+    harness.all_visible = true;
+    harness.calls = 0;
+    var all = try searchTextQuery(a, req, query, executor);
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 4), all.hits.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.calls);
+    harness.all_visible = false;
+    for ([_]@FieldType(Harness, "broad"){ .bitmap, .all, .keys }) |mode| {
+        harness.broad = mode;
+        harness.broad_calls = 0;
+        harness.seen = 0;
+        var broad = try searchTextQuery(a, count_req, .{ .match = .{ .field = "body", .text = "haystack" } }, executor);
+        defer broad.deinit();
+        try std.testing.expectEqual(@as(u64, 9996), broad.total_hits);
+        try std.testing.expectEqual(@as(usize, 1), harness.broad_calls);
+        if (mode == .bitmap) try std.testing.expect(harness.seen <= 1024);
+    }
+    // The legacy bulk callback's `.all` is inconclusive, not an all-visible
+    // proof. Force adaptation on a query that actually matches ordinal 112:
+    // publishing unfiltered membership here would incorrectly count 10,000.
+    harness.broad = .all;
+    harness.broad_calls = 0;
+    var inconclusive = try searchTextQuery(a, count_req, .match_all, executor);
+    defer inconclusive.deinit();
+    try std.testing.expectEqual(@as(u64, 9999), inconclusive.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), harness.broad_calls);
+    // Providers without a controlled bulk API remain correct and cancellable
+    // through bounded candidate batches rather than an opaque population scan.
+    var bounded_executor = executor;
+    bounded_executor.live_filter_doc_set_controlled = null;
+    harness.broad = .bitmap;
+    harness.broad_calls = 0;
+    var bounded = try searchTextQuery(a, count_req, .{ .match = .{ .field = "body", .text = "haystack" } }, bounded_executor);
+    defer bounded.deinit();
+    try std.testing.expectEqual(@as(u64, 9996), bounded.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), harness.broad_calls);
+    // Candidate lookup must amortize sidecar validation and source reads too,
+    // rather than resolving the global segment/header again for every hit.
+    harness.broad = .bitmap;
+    harness.broad_calls = 0;
+    const pinned = writer.acquireSnapshot();
+    defer pinned.release();
+    var producer = TextLiveVisibilityProducer{ .alloc = a, .snapshot = pinned, .ctx = &harness, .live_filter = Harness.filter, .generation = 9, .control = .{}, .materialize_after = 1024 };
+    defer producer.deinit();
+    var candidates = roaring.RoaringBitmap.init(a);
+    defer candidates.deinit();
+    try candidates.addRange(0, 512);
+    const cache = &pinned.segments[0].reader.native.?.metadata_cache.?;
+    const before = cache.cache.clock;
+    var selected = try TextLiveVisibilityProducer.produce(&producer, a, 0, 5000, &candidates);
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 511), selected.cardinality());
+    try std.testing.expect(!selected.contains(111));
+    try std.testing.expect(cache.cache.clock - before <= 32);
+    try std.testing.expectEqual(@as(usize, 0), harness.broad_calls);
+    // A broad conjunction publishes the intersection, never visibility alone.
+    var wide = IndexedTextPredicate{ .bitmap = roaring.RoaringBitmap.init(a) };
+    defer wide.deinit();
+    try wide.bitmap.addRange(1, 10000);
+    var adaptive = TextLiveVisibilityProducer{ .alloc = a, .snapshot = pinned, .ctx = &harness, .live_filter = Harness.filter, .controlled_filter = Harness.controlled, .generation = 9, .control = .{}, .materialize_after = 1024 };
+    defer adaptive.deinit();
+    var combined = TextConjunctionProducer{ .alloc = a, .include = &wide, .visibility = &adaptive };
+    defer combined.deinit();
+    var broad_candidates = roaring.RoaringBitmap.init(a);
+    defer broad_candidates.deinit();
+    try broad_candidates.addRange(0, 2000);
+    var broad_selected = try TextConjunctionProducer.produce(&combined, a, 0, 5000, &broad_candidates);
+    defer broad_selected.deinit();
+    try std.testing.expectEqual(@as(usize, 1998), broad_selected.cardinality());
+    const complete = TextConjunctionProducer.materialized(&combined).?;
+    try std.testing.expect(!complete.contains(0) and !complete.contains(111) and complete.contains(7000));
+    const Cancel = struct {
+        remaining: usize = 4,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) return error.Canceled;
+            self.remaining -= 1;
+        }
+    };
+    var cancel: Cancel = .{};
+    var interrupted = TextLiveVisibilityProducer{ .alloc = a, .snapshot = pinned, .ctx = &harness, .live_filter = Harness.filter, .controlled_filter = Harness.controlled, .generation = 9, .control = .{ .cancellation = .{ .ptr = &cancel, .check_fn = Cancel.check } }, .materialize_after = 1024 };
+    defer interrupted.deinit();
+    try std.testing.expectError(error.Canceled, interrupted.buildComplete());
+    try std.testing.expect(interrupted.complete.load(.acquire) == null);
+    interrupted.control = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.Timeout, interrupted.buildComplete());
+    harness.broad = .forbidden;
+    harness.fail = true;
+    try std.testing.expectError(error.TestVisibilityFailure, searchTextQuery(a, req, query, executor));
+    harness.indexed_kind = .borrowed;
+    var failed_req = req;
+    failed_req.filter_query_json = "{\"doc_id\":[\"doc:17\",\"doc:111\",\"doc:7000\"]}";
+    try std.testing.expectError(error.TestVisibilityFailure, searchTextQuery(a, failed_req, query, executor));
+    try std.testing.expectEqual(@as(usize, 0), harness.active_borrows);
 }
 
 test "logical value borrowed sorted candidates retain local pins masks and global order" {

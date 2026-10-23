@@ -141,7 +141,7 @@ pub const StdHttpExecutor = struct {
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
-        const safe_io = threaded_connect_io.io(io_impl, io_vtable);
+        const safe_io = threaded_connect_io.ioWithOwnedVTable(io_impl, io_vtable);
         self.client = .{
             .allocator = alloc,
             .io = safe_io,
@@ -169,7 +169,7 @@ pub const StdHttpExecutor = struct {
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
-        const safe_io = threaded_connect_io.io(io_impl, io_vtable);
+        const safe_io = threaded_connect_io.ioWithOwnedVTable(io_impl, io_vtable);
         self.client = .{
             .allocator = alloc,
             .io = safe_io,
@@ -204,7 +204,7 @@ pub const StdHttpExecutor = struct {
         return self.borrowed_io orelse self.io_impl.?.io();
     }
     pub fn networkIo(self: *StdHttpExecutor) std.Io {
-        return self.borrowed_io orelse threaded_connect_io.io(self.io_impl.?, self.io_vtable.?);
+        return self.borrowed_io orelse threaded_connect_io.ioWithOwnedVTable(self.io_impl.?, self.io_vtable.?);
     }
 
     pub fn init(alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig) StdHttpExecutor {
@@ -1646,7 +1646,7 @@ test "std http executor cancellation interrupts a request queued for the pooled 
 
     var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true, .pool_max_connections = 1 });
     defer executor.deinit();
-    const io = threaded_connect_io.io(executor.io_impl.?, executor.io_vtable.?);
+    const io = threaded_connect_io.ioWithOwnedVTable(executor.io_impl.?, executor.io_vtable.?);
     var held = try executor.resolved_client.outbound.acquire("held", 1, .{});
     defer held.release();
 
@@ -1948,7 +1948,7 @@ test "std http executor borrowed clients isolate cancellation on one shared netw
     defer network.deinit();
     const vtable = try threaded_connect_io.createVTable(std.testing.allocator, &network);
     defer std.testing.allocator.destroy(vtable);
-    const network_io = threaded_connect_io.io(&network, vtable);
+    const network_io = threaded_connect_io.ioWithOwnedVTable(&network, vtable);
     var slow_client: StdHttpExecutor = undefined;
     slow_client.initBorrowedInPlace(std.testing.allocator, .{}, network_io);
     defer slow_client.deinit();

@@ -24385,3 +24385,22 @@ The original five sync cases and descriptor/read regressions remain qualified.
 This is bounded physical metadata-read qualification, not full WAL/final-close
 coordinator qualification. Full GNU/Linux qualification remains waived and the
 full design remains unfinished.
+
+### Main recovery merge (October 23)
+
+Merged origin/main `346894b054` into the existing workload-scheduling branch.
+Reconciled main's mapped-residency/host-charge accounting with bounded parent
+admission, retained both branches' appended tests and stable error identities,
+and adapted pooled HTTP ownership to the caller-local network I/O API. Three
+cache tests now provision explicitly charged identity metadata before applying
+their tiny payload limits, using the existing metadata fixture.
+
+Pinned Darwin Debug receipt `main-oct23-merge-v2` passes all 115 build steps and
+100 build-runner tests. Simple runners pass 95 resource-budget, five provisioned
+storage, seven physical-operation, 32 DB, 21 local-close, 36 HTTP support and
+48 HTTP tests (one platform skip); error/status/failure-identity suites pass
+45/1/8 cases. The first receipt preserves the metadata-fixture failures and
+sandbox-denied loopback bind failures; the final run permits local networking
+and has no failures or leaks. Native/schema inputs remained unchanged during
+qualification. Full GNU/Linux qualification remains waived; the owning WAL and
+final-close coordinator work described above remains unfinished.

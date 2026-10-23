@@ -245,7 +245,7 @@ pub const SegmentShared = struct {
             if (self.residency_manager) |previous| std.debug.assert(previous == owner);
             self.residency_manager = owner;
         }
-        if (self.residency_manager) |owner| owner.observeUsage(.full_text_segment_residency, &self.residency_accounted, if (self.mapped_residency_state.load(.acquire) == mapped_residency_cold) 0 else self.mapping_bytes);
+        if (self.residency_manager) |owner| owner.observeUsageWithHostCharge(.full_text_segment_residency, &self.residency_accounted, if (self.mapped_residency_state.load(.acquire) == mapped_residency_cold) 0 else self.mapping_bytes, 0);
     }
 
     fn noteMappedAccess(self: *SegmentShared) void {
@@ -635,7 +635,7 @@ pub const SegmentEntry = struct {
     }
 
     fn destroyShared(alloc: Allocator, shared: *SegmentShared) void {
-        if (shared.residency_manager) |manager| manager.observeUsage(.full_text_segment_residency, &shared.residency_accounted, 0);
+        if (shared.residency_manager) |manager| manager.observeUsageWithHostCharge(.full_text_segment_residency, &shared.residency_accounted, 0, 0);
         if (shared.deleted) |*deleted| deleted.deinit();
         freeTypedDocValuesCoverage(alloc, shared.typed_doc_values_coverage);
         alloc.destroy(shared);
@@ -1777,6 +1777,77 @@ pub const IndexSnapshot = struct {
         std.mem.sort(u32, sorted_ordinals, {}, u32LessThan);
         const unique_ordinals = sorted_ordinals[0..uniqueSortedU32(sorted_ordinals)];
 
+        const Membership = struct {
+            values: []const u32,
+            fn contains(membership: @This(), ordinal: u32) bool {
+                return containsSortedU32(membership.values, ordinal);
+            }
+        };
+        return self.docNumsForOrdinalMembershipAlloc(alloc, Membership{ .values = unique_ordinals });
+    }
+
+    /// Preserve compact resolved membership instead of expanding, copying and
+    /// sorting a table-sized ordinal array before each text query.
+    pub fn docNumsForOrdinalBitmapAlloc(self: *const IndexSnapshot, alloc: Allocator, ordinals: *const roaring.RoaringBitmap) ![]u32 {
+        if (ordinals.cardinality() == 0) return try alloc.alloc(u32, 0);
+        return self.docNumsForOrdinalMembershipAlloc(alloc, ordinals);
+    }
+
+    pub fn docNumsWithOrdinalsAlloc(self: *const IndexSnapshot, alloc: Allocator) ![]u32 {
+        const All = struct {
+            fn contains(_: @This(), _: u32) bool {
+                return true;
+            }
+        };
+        return self.docNumsForOrdinalMembershipAlloc(alloc, All{});
+    }
+
+    /// Stream directly into compact membership without a corpus-sized u32
+    /// result array. Check request control even across deleted/sparse rows.
+    pub fn tryDocNumBitmapForOrdinalMembershipAlloc(self: *const IndexSnapshot, alloc: Allocator, membership: anytype, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
+        var out = roaring.RoaringBitmap.init(alloc);
+        errdefer out.deinit();
+        var offset: u32 = 0;
+        var pending: [256]u32 = undefined;
+        var used: usize = 0;
+        for (self.segments, 0..) |_, segment_idx| {
+            try control.check();
+            var lease = try self.leaseSegment(segment_idx);
+            defer lease.deinit();
+            const seg = lease.entry;
+            var cursor: ?segment_mod.DocOrdinalCursor = null;
+            // Scorers can already hold this segment's shared deletion guard.
+            // A queued writer forbids another shared admission; waiting here
+            // would deadlock that writer against our outer scoring guard.
+            // Adaptation is optional: keep candidate refinement when busy.
+            if (!seg.shared.tryLockDeletionShared()) {
+                out.deinit();
+                return null;
+            }
+            defer seg.shared.unlockDeletionShared();
+            for (0..seg.reader.doc_count) |local| {
+                if (local % 256 == 0) try control.check();
+                const doc: u32 = @intCast(local);
+                if (seg.shared.deleted) |deleted| if (deleted.contains(doc)) continue;
+                if (cursor == null) cursor = try segment_mod.DocOrdinalCursor.init(&seg.reader);
+                const ordinal = (try cursor.?.get(doc)) orelse continue;
+                if (membership.contains(ordinal)) {
+                    pending[used] = offset + doc;
+                    used += 1;
+                    if (used == pending.len) {
+                        try out.addSortedAscending(&pending);
+                        used = 0;
+                    }
+                }
+            }
+            offset += seg.reader.doc_count;
+        }
+        try control.check();
+        try out.addSortedAscending(pending[0..used]);
+        return out;
+    }
+
+    fn docNumsForOrdinalMembershipAlloc(self: *const IndexSnapshot, alloc: Allocator, membership: anytype) ![]u32 {
         var out = std.ArrayListUnmanaged(u32).empty;
         errdefer out.deinit(alloc);
 
@@ -1785,6 +1856,7 @@ pub const IndexSnapshot = struct {
             var segment_lease = try self.leaseSegment(segment_idx);
             defer segment_lease.deinit();
             const seg = segment_lease.entry;
+            var ordinals_cursor: ?segment_mod.DocOrdinalCursor = null;
             {
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
@@ -1793,8 +1865,9 @@ pub const IndexSnapshot = struct {
                     if (seg.shared.deleted) |deleted| {
                         if (deleted.contains(local_doc)) continue;
                     }
-                    const ordinal = (try seg.reader.docOrdinal(local_doc)) orelse continue;
-                    if (!containsSortedU32(unique_ordinals, ordinal)) continue;
+                    if (ordinals_cursor == null) ordinals_cursor = try segment_mod.DocOrdinalCursor.init(&seg.reader);
+                    const ordinal = (try ordinals_cursor.?.get(local_doc)) orelse continue;
+                    if (!membership.contains(ordinal)) continue;
                     const global_doc = doc_offset + local_doc;
                     try out.append(alloc, global_doc);
                 }
@@ -3500,6 +3573,7 @@ test "external lake shared immutable mapped segments have one residency owner ac
     var fork = try writer.forkImmutable();
     fork.attachResourceManager(&manager);
     try std.testing.expectEqual(@as(u64, @intCast(bytes.len)), manager.sliceStats(.full_text_segment_residency).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     writer.deinit();
     try std.testing.expectEqual(@as(u64, @intCast(bytes.len)), manager.sliceStats(.full_text_segment_residency).used_bytes);
     fork.deinit();
@@ -5083,4 +5157,162 @@ test "external lake metadata navigation foreign corpora retain physical allocato
     destination_open = false;
     try std.testing.expectEqual(@as(usize, 0), physical_budget.live);
     try std.testing.expectEqual(@as(usize, 0), private_budget.live);
+}
+
+test "ordinal projection preserves mixed native legacy deleted and duplicate ordinal rows" {
+    const a = std.testing.allocator;
+    var first = segment_mod.SegmentWriter.init(a);
+    defer first.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d" }) |id| try first.addStoredDoc(id, "{}");
+    try first.addDocOrdinals(&.{ 9, 0, 2, 9 });
+    const first_bytes = try first.build();
+    defer a.free(first_bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = first_bytes }));
+    var legacy = segment_mod.SegmentWriter.init(a);
+    defer legacy.deinit();
+    try legacy.addStoredDoc("x", "{}");
+    try legacy.addStoredDoc("y", "{}");
+    const legacy_bytes = try legacy.build();
+    defer a.free(legacy_bytes);
+    try writer.addSegment(legacy_bytes);
+    var last = segment_mod.SegmentWriter.init(a);
+    defer last.deinit();
+    try last.addStoredDoc("e", "{}");
+    try last.addStoredDoc("f", "{}");
+    try last.addDocOrdinals(&.{ 7, 2 });
+    const last_bytes = try last.build();
+    defer a.free(last_bytes);
+    try writer.addSegment(last_bytes);
+    const held = writer.acquireSnapshot();
+    defer held.release();
+    const before = try held.docNumsForOrdinalsAlloc(a, &.{ 2, 9, 7, 9 });
+    defer a.free(before);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 3, 6, 7 }, before);
+    try std.testing.expect(try writer.deleteById("c"));
+    const after = try held.docNumsForOrdinalsAlloc(a, &.{ 2, 9, 7, 9 });
+    defer a.free(after);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 6, 7 }, after);
+    var membership = roaring.RoaringBitmap.init(a);
+    defer membership.deinit();
+    try membership.addSortedAscending(&.{ 2, 7, 9 });
+    const bitmap_after = try held.docNumsForOrdinalBitmapAlloc(a, &membership);
+    defer a.free(bitmap_after);
+    try std.testing.expectEqualSlices(u32, after, bitmap_after);
+    const all_after = try held.docNumsWithOrdinalsAlloc(a);
+    defer a.free(all_after);
+    try std.testing.expectEqualSlices(u32, after, all_after);
+    const absent = try held.docNumsForOrdinalsAlloc(a, &.{ 0, 123 });
+    defer a.free(absent);
+    try std.testing.expectEqual(@as(usize, 0), absent.len);
+}
+
+test "ordinal bitmap projection bounds native reads for a broad live population" {
+    const a = std.testing.allocator;
+    const count = 100_000;
+    const ordinals = try a.alloc(u32, count);
+    defer a.free(ordinals);
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (ordinals, 0..) |*ordinal, i| {
+        ordinal.* = @intCast(i + 1);
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "doc:{d}", .{i}), "{}");
+    }
+    try segment.addDocOrdinals(ordinals);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    const snapshot_ref = writer.acquireSnapshot();
+    defer snapshot_ref.release();
+    const cache = &snapshot_ref.segments[0].reader.native.?.metadata_cache.?;
+    // One non-visible identity makes the broad live population exclude it.
+    // Physical segment rows still include it, just as with a lagging delete.
+    var membership = roaring.RoaringBitmap.init(a);
+    defer membership.deinit();
+    try membership.addRange(2, count + 1);
+    const scalar_before = cache.cache.clock;
+    const scalar_start = platform_time.monotonicNs();
+    const expected = try snapshot_ref.docNumsForOrdinalsAlloc(a, ordinals[1..]);
+    defer a.free(expected);
+    const scalar_ns = platform_time.monotonicNs() - scalar_start;
+    const scalar_probes = cache.cache.clock - scalar_before;
+    const before = cache.cache.clock;
+    const start = platform_time.monotonicNs();
+    const actual = try snapshot_ref.docNumsForOrdinalBitmapAlloc(a, &membership);
+    defer a.free(actual);
+    const elapsed_ns = platform_time.monotonicNs() - start;
+    const probes = cache.cache.clock - before;
+    try std.testing.expectEqualSlices(u32, expected, actual);
+    try std.testing.expectEqual(@as(usize, count - 1), actual.len);
+    try std.testing.expectEqual(@as(u32, 1), actual[0]);
+    try std.testing.expectEqual(@as(u32, count - 1), actual[actual.len - 1]);
+    try std.testing.expect(probes <= 256);
+    std.debug.print("ORDINAL_PROJECTION docs={d} array_us={d} bitmap_us={d} array_probes={d} bitmap_probes={d}\n", .{ count, scalar_ns / 1000, elapsed_ns / 1000, scalar_probes, probes });
+}
+
+test "ordinal bitmap streaming projection cancels during traversal" {
+    const a = std.testing.allocator;
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    var ordinals: [2048]u32 = undefined;
+    for (&ordinals, 0..) |*ordinal, i| {
+        ordinal.* = @intCast(i + 1);
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "doc:{d}", .{i}), "{}");
+    }
+    try segment.addDocOrdinals(&ordinals);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    const snapshot_ = writer.acquireSnapshot();
+    defer snapshot_.release();
+    const Harness = struct {
+        remaining: usize = 4,
+        visited: usize = 0,
+        pub fn contains(self: *@This(), _: u32) bool {
+            self.visited += 1;
+            return true;
+        }
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) return error.Canceled;
+            self.remaining -= 1;
+        }
+    };
+    var harness: Harness = .{};
+    try std.testing.expectError(error.Canceled, snapshot_.tryDocNumBitmapForOrdinalMembershipAlloc(a, &harness, .{
+        .cancellation = .{ .ptr = &harness, .check_fn = Harness.check },
+    }));
+    try std.testing.expect(harness.visited > 0 and harness.visited < ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.visited % 256);
+    try std.testing.expectError(error.Timeout, snapshot_.tryDocNumBitmapForOrdinalMembershipAlloc(a, &harness, .{ .deadline_ns = 0 }));
+    var complete = (try snapshot_.tryDocNumBitmapForOrdinalMembershipAlloc(a, &harness, .{})).?;
+    defer complete.deinit();
+    try std.testing.expectEqual(@as(usize, ordinals.len), complete.cardinality());
+    // Reproduce scoring's retained reader with a deletion writer queued.
+    // The opportunistic population projection must return to the scorer,
+    // allowing its outer reader to leave and the writer to make progress.
+    const shared = (try snapshot_.readSegment(0)).shared;
+    shared.lockDeletionShared();
+    const Writer = struct {
+        shared: *SegmentShared,
+        fn run(self: @This()) void {
+            self.shared.lockDeletionExclusive();
+            self.shared.unlockDeletionExclusive();
+        }
+    };
+    const deletion = std.Thread.spawn(.{}, Writer.run, .{Writer{ .shared = shared }}) catch |err| {
+        shared.unlockDeletionShared();
+        return err;
+    };
+    defer deletion.join();
+    defer shared.unlockDeletionShared();
+    while ((shared.deletion_lock.load(.acquire) & SegmentShared.deletion_writer_bit) == 0) spinOrYield();
+    try std.testing.expect((try snapshot_.tryDocNumBitmapForOrdinalMembershipAlloc(a, &harness, .{})) == null);
 }

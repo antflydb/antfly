@@ -3209,7 +3209,7 @@ test "cache transfers existing usage when resource manager changes" {
 
 test "shared LSM cache yields to foreground aggregate admission" {
     const allocator = std.testing.allocator;
-    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+    var resource_manager = try resource_manager_mod.metadata_fixture.init(.{
         .memory_budget = .{ .soft_limit_bytes = 900, .hard_limit_bytes = 1024 },
     });
     defer resource_manager.deinit(std.testing.allocator);
@@ -3226,7 +3226,7 @@ test "shared LSM cache yields to foreground aggregate admission" {
     var foreground = try resource_manager.reserve(.dense_apply_working_set, 1000);
     defer foreground.release();
     try std.testing.expectEqual(@as(usize, 0), cache.currentBytes());
-    try std.testing.expectEqual(@as(u64, 1000), resource_manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 1000), resource_manager_mod.metadata_fixture.payloadUsage(&resource_manager));
 }
 
 test "shared LSM resource reclaimer never waits for active accounting" {

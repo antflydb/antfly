@@ -923,6 +923,7 @@ pub const Detail = enum(c_int) {
     invalid_embedding_identity,
     graph_start_identity_required,
     metadata_snapshot_head_mismatch,
+    inference_endpoint_access_denied,
     // Reserve a separate range for the unpublished pooling extension so future
     // main-branch additions cannot renumber either set of detail identities.
     runnable_wait_timeout = 0x10000,
@@ -1521,6 +1522,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.EmbedTransientFailure => status(.retryable, .embed_transient_failure),
         error.EmbedUpstreamFailure => status(.unavailable, .embed_upstream_failure),
         error.EmbeddingProbeUnavailable => status(.unavailable, .embedding_probe_unavailable),
+        error.InferenceEndpointAccessDenied => status(.forbidden, .inference_endpoint_access_denied),
         error.InvalidEmbeddingResponse => status(.invalid_argument, .invalid_embedding_response),
         error.InvalidEmbeddingDimensions => status(.invalid_argument, .invalid_embedding_dimensions),
         error.BackupAlreadyExists => status(.already_exists, .backup_already_exists),
@@ -2404,6 +2406,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .embed_transient_failure => "EmbedTransientFailure",
         .embed_upstream_failure => "EmbedUpstreamFailure",
         .embedding_probe_unavailable => "EmbeddingProbeUnavailable",
+        .inference_endpoint_access_denied => "InferenceEndpointAccessDenied",
         .invalid_embedding_response => "InvalidEmbeddingResponse",
         .invalid_embedding_dimensions => "InvalidEmbeddingDimensions",
         .backup_already_exists => "BackupAlreadyExists",

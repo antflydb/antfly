@@ -283,6 +283,11 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
         } else if (internal_keys.isAssetArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
             try appendUniqueHintAlloc(alloc, &target_hints, .resolution);
+            // Asset health is durable metadata for every serving consumer,
+            // even when the manifest itself has no indexable rows/edges.
+            try appendUniqueHintAlloc(alloc, &target_hints, .full_text);
+            try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
+            try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
         } else if (internal_keys.isResolutionArtifactKey(key)) {
             // The resolution stage journals its output; wake the graph
             // materializer for doc->entity provenance edges and the promoter so
@@ -959,6 +964,7 @@ pub const RecordFields = struct {
     deleted_doc_keys: bool = true,
     overwritten_doc_keys: bool = true,
     changed_artifact_keys: bool = true,
+    asset_roots_only: bool = false,
 };
 
 pub fn decodeBinaryRecordBorrowedScratch(alloc: Allocator, raw: []const u8, scratch: *BorrowedBinaryRecordScratch) !Record {
@@ -971,6 +977,20 @@ fn decodeSelectedList(alloc: Allocator, cursor: *BinaryCursor, list: *std.ArrayL
     const count = try cursor.readInt(u32);
     for (0..count) |_| _ = try cursor.readBytes(try cursor.readInt(u32));
     return &.{};
+}
+
+fn decodeSelectedArtifacts(alloc: Allocator, cursor: *BinaryCursor, list: *std.ArrayListUnmanaged([]const u8), present: bool, fields: RecordFields) ![]const []const u8 {
+    if (!fields.asset_roots_only or !fields.changed_artifact_keys)
+        return decodeSelectedList(alloc, cursor, list, present, fields.changed_artifact_keys);
+    if (!present) return &.{};
+    const count = try cursor.readInt(u32);
+    // Skip non-asset bytes without retaining a descriptor for every embedding
+    // or graph edge in a large publication. Still validate every encoded key.
+    for (0..count) |_| {
+        const key = try cursor.readBytes(try cursor.readInt(u32));
+        if (internal_keys.isAssetArtifactKey(key)) try list.append(alloc, key);
+    }
+    return list.items;
 }
 
 pub fn decodeBinaryRecordBorrowedScratchSelected(alloc: Allocator, raw: []const u8, scratch: *BorrowedBinaryRecordScratch, fields: RecordFields) !Record {
@@ -995,7 +1015,7 @@ pub fn decodeBinaryRecordBorrowedScratchSelected(alloc: Allocator, raw: []const 
         .changed_doc_keys = try decodeSelectedList(alloc, &cursor, &scratch.changed_doc_keys, field_mask.changed_doc_keys, fields.changed_doc_keys),
         .deleted_doc_keys = try decodeSelectedList(alloc, &cursor, &scratch.deleted_doc_keys, field_mask.deleted_doc_keys, fields.deleted_doc_keys),
         .overwritten_doc_keys = try decodeSelectedList(alloc, &cursor, &scratch.overwritten_doc_keys, field_mask.overwritten_doc_keys, fields.overwritten_doc_keys),
-        .changed_artifact_keys = try decodeSelectedList(alloc, &cursor, &scratch.changed_artifact_keys, field_mask.changed_artifact_keys, fields.changed_artifact_keys),
+        .changed_artifact_keys = try decodeSelectedArtifacts(alloc, &cursor, &scratch.changed_artifact_keys, field_mask.changed_artifact_keys, fields),
     };
     if (cursor.remaining() != 0) return error.InvalidBinaryRecord;
     return record;
@@ -1901,4 +1921,21 @@ test "change journal binary inspection polls original controls without allocatio
         try std.testing.expectError(error.OriginalReplayInspectionRejected, inspectBinaryRecord(raw, port));
         try std.testing.expectEqual(reject, check.calls);
     }
+}
+
+test "change journal asset metadata decode retains only root descriptors" {
+    const a = std.testing.allocator;
+    const root = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "units");
+    defer a.free(root);
+    var keys: [1025][]const u8 = @splat("not-an-asset");
+    keys[512] = root;
+    const raw = try encodeRecord(a, .{ .sequence = 1, .changed_artifact_keys = &keys });
+    defer a.free(raw);
+    var scratch: BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(a);
+    const decoded = try decodeBinaryRecordBorrowedScratchSelected(a, raw, &scratch, .{ .asset_roots_only = true });
+    try std.testing.expectEqual(@as(usize, 1), decoded.changed_artifact_keys.len);
+    try std.testing.expectEqualStrings(root, decoded.changed_artifact_keys[0]);
+    try std.testing.expect(scratch.changed_artifact_keys.capacity < 16);
+    try std.testing.expectError(error.UnexpectedEndOfInput, decodeBinaryRecordBorrowedScratchSelected(a, raw[0 .. raw.len - 1], &scratch, .{ .asset_roots_only = true }));
 }

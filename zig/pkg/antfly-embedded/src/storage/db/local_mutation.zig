@@ -452,6 +452,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const clearGeneratedSparseMemoJobs = preparation.clearGeneratedSparseMemoJobs;
         pub const clearGraphArtifactStatePaged = materialization.clearGraphArtifactStatePaged;
         pub const clearPrecomputeAssetProducerBatchItems = materialization.clearPrecomputeAssetProducerBatchItems;
+        pub const clearPublishedAssetArtifactRepairIssuesContext = materialization.clearPublishedAssetArtifactRepairIssuesContext;
         pub const clearPublishedEmbeddingArtifactRepairIssueContext = materialization.clearPublishedEmbeddingArtifactRepairIssueContext;
         pub const clearPublishedEmbeddingArtifactRepairIssuesContext = materialization.clearPublishedEmbeddingArtifactRepairIssuesContext;
         pub const collectDeleteKeysForPrefix = materialization.collectDeleteKeysForPrefix;
