@@ -245,6 +245,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "PDF image embedding has a media-sized batch byte default",
         "PDF composite lease releases admission between invocation windows",
         "PDF composite admission retries contention",
+        "PDF prefetch admission falls back",
+        "PDF scratch growth distinguishes",
         "PDF composite lease admits two future overlap windows atomically",
         "prepared document source cache isolates credentials and reuses bytes",
         "prepared document cache single-flights concurrent PDF variants and drains leases",

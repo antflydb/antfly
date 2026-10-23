@@ -16576,8 +16576,13 @@ const PdfWindowCompositeLease = struct {
                 std.math.cast(u64, growth) orelse return false,
             ) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
-                    const own_demand = self.reservedBytes() +| @as(u64, @intCast(growth));
-                    return switch (manager.classifyRequestDenial(.document_extraction_working_set, own_demand)) {
+                    // Growth is an upper bound, not a measured allocation.
+                    // This at-most reservation needs only one additional byte
+                    // to succeed. Reject permanently only if even that minimum
+                    // cannot fit beside this window's retained output. The
+                    // renderer remains responsible for its actual scratch cap.
+                    const minimum_demand = self.reservedBytes() +| 1;
+                    return switch (manager.classifyRequestDenial(.document_extraction_working_set, minimum_demand)) {
                         error.ResourceRequestTooLarge => false,
                         error.ResourceTemporarilyUnavailable => error.ResourceTemporarilyUnavailable,
                     };
@@ -17277,6 +17282,69 @@ test "PDF composite admission retries contention and rejects only standalone ove
     lease.destroy();
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, PdfWindowCompositeLease.create(alloc, alloc, &manager, 1, 101, 1));
+}
+
+test "PDF prefetch admission falls back after the preceding window releases" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 100, .soft_limit_bytes = 0 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    const current = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 40, 60, 1);
+    var current_owned = true;
+    defer if (current_owned) current.destroy();
+    // The next window cannot overlap, but is a legal standalone operation.
+    const speculative = PdfWindowCompositeLease.create(alloc, alloc, &manager, 40, 60, 1);
+    if (speculative) |unexpected| {
+        unexpected.destroy();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, err);
+        try checkPdfPrefetchRetry(err);
+    }
+    current.destroy();
+    current_owned = false;
+    const serial = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 40, 60, 1);
+    serial.destroy();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    // Preserve non-admission failures instead of retrying a broken source.
+    try std.testing.expectError(error.RemoteDocumentFetchFailed, checkPdfPrefetchRetry(error.RemoteDocumentFetchFailed));
+}
+
+test "PDF scratch growth distinguishes a ceiling from mandatory demand" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 100, .soft_limit_bytes = 0 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    {
+        var competing = try manager.reserveWithoutReclaim(.document_extraction_working_set, 80);
+        defer competing.release();
+        const lease = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 10, 10, 1);
+        defer lease.destroy();
+        // Both an envelope-sized ceiling and a larger user-configured ceiling
+        // permit a partial grant. Neither proves permanent document oversize.
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, lease.admitScratchRetry(100));
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, lease.admitScratchRetry(200));
+        // Exercise deferred retry: scratch is released, another owner takes
+        // that headroom, and completed outputs remain pinned to this window.
+        lease.finishRendering();
+        var peer = try manager.reserveWithoutReclaim(.document_extraction_working_set, 10);
+        defer peer.release();
+        lease.rendering_finished = false;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, lease.admitScratchRetry(200));
+        peer.release();
+        competing.release();
+        try std.testing.expect(try lease.admitScratchRetry(200));
+        try std.testing.expectEqual(@as(usize, 90), lease.scratch_bytes);
+        lease.finishRendering();
+    }
+    // A window already holding the standalone hard limit cannot grow even
+    // after every competing owner exits; preserve that actual hard boundary.
+    const full = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 10, 90, 1);
+    defer full.destroy();
+    try std.testing.expect(!try full.admitScratchRetry(200));
+    full.finishRendering();
 }
 
 test "PDF composite lease admits two future overlap windows atomically" {
@@ -18126,6 +18194,20 @@ const PdfWindowPrefetchStart = struct {
     }
 };
 
+/// Speculation may exhaust shared admission or its operation-local deadline.
+/// Once the preceding window is released, retry through ordinary preparation,
+/// which rechecks the owning request's cancellation and deadline. Other errors
+/// must retain their identity rather than being retried as memory pressure.
+fn checkPdfPrefetchRetry(err: anyerror) !void {
+    return switch (err) {
+        error.ResourceTemporarilyUnavailable,
+        error.DocumentExtractionWorkingSetTooLarge,
+        error.Canceled,
+        => {},
+        else => err,
+    };
+}
+
 const RuntimePdfRenderWindowPrefetch = struct {
     preparer: *const RuntimePdfRenderWindowPreparer,
     start_index: usize,
@@ -18369,8 +18451,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                             // the active one, or may expire behind slow model
                             // inference. Retry after releasing that window so
                             // bounded backpressure preserves serial behavior.
-                            if (err != error.DocumentExtractionWorkingSetTooLarge and err != error.Canceled)
-                                return err;
+                            try checkPdfPrefetchRetry(err);
                             window_started_ns = runtime.clock.nowRealtimeNs();
                             pdf_render_window = preparer.prepare(idx) catch |sync_err| {
                                 logRuntimePdfRenderWindowProfile(runtime, source_fingerprint, units, &.{}, null, @errorName(sync_err), window_started_ns);
@@ -26862,8 +26943,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
                 // expire behind slow inference. Once the current lease is
                 // released, retry synchronously instead of turning safe
                 // backpressure into durable enrichment failure.
-                if (err != error.DocumentExtractionWorkingSetTooLarge and err != error.Canceled)
-                    return err;
+                try checkPdfPrefetchRetry(err);
                 try embedding_lease_guard.check();
                 try checkProviderFailureGuard(runtime);
                 current_window = try window_preparer.prepare(next_first_item);
