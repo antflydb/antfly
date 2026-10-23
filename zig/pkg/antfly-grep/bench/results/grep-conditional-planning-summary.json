@@ -357,40 +357,43 @@
     "windows_cli": "cross-compilation passed; no runtime claim",
     "storage_shard_audit": "passed",
     "embedded_source_boundary_regressions": 20,
-    "apache_boundary_sources": 2432
+    "apache_boundary_sources": 2203,
+    "release_packaging_tests": 4,
+    "main_merge_commit": "9ca2e6e28f",
+    "cli_suite_reuse": "Post-merge rebuilds are byte-identical; see post_main_merge_validation."
   },
   "validation_artifacts": {
-    "conditional-planned-cli-macos-final.log": {
+    "conditional-main-contracts.log": {
       "availability": "local, unpublished",
-      "sha256": "1b703774fe9d12d830d55a811246020bc27463255795ec65c949c7d49f8d1162"
+      "sha256": "b38dcdf9293ef054e7c05dd45887078eff59c6c4effec5f011c8ec652283ca96"
     },
-    "conditional-planned-cli-linux-final.log": {
+    "conditional-main-boundary.log": {
       "availability": "local, unpublished",
-      "sha256": "05e91c567f79f8c6e620e26170850058310bfbae31621818581fb7457ddf138a"
+      "sha256": "d419304086e969f41f709425c365ed1f01eaa5342262b6b6fc9831255afa4529"
     },
-    "conditional-owned-real-scope-tests.log": {
+    "conditional-main-native-final.log": {
       "availability": "local, unpublished",
-      "sha256": "bd53a4a311018992106e6bfb86bb7f8ddc84b7a33e05e902211d9d869ca82569"
+      "sha256": "bd5d12822f9c8184295113d25b9a3835d6344c725fd676f965e5c81275dcb474"
     },
-    "conditional-owned-snapshot-final-tests.log": {
+    "conditional-main-packaging-final.log": {
       "availability": "local, unpublished",
-      "sha256": "67191fb30503a719dde6f02286c75db60f5c17446cbe47f609001fca5297c597"
+      "sha256": "11f94406f8af58b62708be31dbfde7f39ef601dcf0c32e44dada03cbaa0e3159"
     },
-    "conditional-owned-snapshot-native-final.log": {
-      "availability": "local, unpublished",
-      "sha256": "31fa0afcf3d2ab484ad3d5a903c82668e0b42e6adc4f1888cd3c6e28b36a80dd"
-    },
-    "conditional-cache-writers-test.log": {
-      "availability": "local, unpublished",
-      "sha256": "a77972c1cbe3394329424ca4862ea29a43d13ad6636dffb85388b71f53625eb7"
-    },
-    "conditional-planned-windows-build.log": {
+    "conditional-main-grep-build.log": {
       "availability": "local, unpublished",
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
-    "conditional-owned-snapshot-boundary-final.log": {
+    "conditional-main-grep-linux-build.log": {
       "availability": "local, unpublished",
-      "sha256": "809d64b31ad3c07a6a72de5dc7176917915947bf0dbb0b793eae2e68c6c2bbae"
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "conditional-main-grep-windows-build.log": {
+      "availability": "local, unpublished",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "conditional-main-cli-rebuilds.json": {
+      "availability": "local, unpublished",
+      "sha256": "311fb54eb7106bf3e112fb7a3ddcc4a173f51d8b4d12a27c89be47588868497c"
     }
   },
   "compiler": "0.17.0",
@@ -414,6 +417,217 @@
   },
   "integration_fixture_sha256": "de1e5f1803e23bd4ff488f1a41ca8d1a6cd985717d4d869d90d22ec1540815a8",
   "native_source_delivery": {
+    "scope": "Native single-shard JSON tables, synthetic ASCII source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
+    "main_merge_commit": "9ca2e6e28f",
+    "main_commit": "871c14378840c9fb4d2422464d95f35ba51c0814",
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu_count": 14,
+    "rounds": 5,
+    "documents": 8,
+    "value_bytes": 262144,
+    "build": {
+      "optimize": "ReleaseFast",
+      "strip": true,
+      "target": "aarch64-macos",
+      "cpu": "baseline",
+      "version": "antfly dev (zig runtime)"
+    },
+    "binaries": {
+      "baseline": {
+        "sha256": "074dbee368bec483600bb29e65fbcfc915d305974243476bfac9ca58b49c7489",
+        "bytes": 211070856
+      },
+      "candidate": {
+        "sha256": "25bd1ac46d75b0cf34ab184f8a56df307c984f2d25ade5a81eea8a3411d124c9",
+        "bytes": 211836616
+      }
+    },
+    "corpus_sha256": "553c2ce85f669d008a3a8fb798b73166f2c5a6148069ab195026a202bbc625f2",
+    "output_sha256": {
+      "full": "38a348f0497ea0dc4e4e4498d9c633ed2181a29cf13303c7413b2daaca8d20c9",
+      "conditional": "0466105df69a235c4b8f178e00924a7db5a0ce55cb4968cfc45beb2af6b20468"
+    },
+    "certificate_counts": [
+      {
+        "variant": "baseline",
+        "round": 0,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 0,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 1,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 1,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 2,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 2,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 3,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 3,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 4,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 4,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      }
+    ],
+    "medians": [
+      {
+        "variant": "baseline",
+        "phase": "ingest",
+        "elapsed_ns": 56354541,
+        "server_cpu_ns": 64687292,
+        "peak_rss_bytes": 155418624,
+        "response_bytes": 63,
+        "elapsed_range_ns": [
+          43434791,
+          85482167
+        ],
+        "server_cpu_range_ns": [
+          58483916,
+          85656125
+        ],
+        "median_peak_footprint_bytes": 121439240
+      },
+      {
+        "variant": "baseline",
+        "phase": "full",
+        "elapsed_ns": 15212709,
+        "server_cpu_ns": 12416792,
+        "peak_rss_bytes": 159825920,
+        "response_bytes": 2099279,
+        "elapsed_range_ns": [
+          10559292,
+          36326333
+        ],
+        "server_cpu_range_ns": [
+          8644209,
+          22000417
+        ],
+        "median_peak_footprint_bytes": 121078816
+      },
+      {
+        "variant": "baseline",
+        "phase": "conditional",
+        "elapsed_ns": 10292458,
+        "server_cpu_ns": 8886542,
+        "peak_rss_bytes": 159858688,
+        "response_bytes": 2071,
+        "elapsed_range_ns": [
+          7450833,
+          12348209
+        ],
+        "server_cpu_range_ns": [
+          6661750,
+          11542084
+        ],
+        "median_peak_footprint_bytes": 121832552
+      },
+      {
+        "variant": "candidate",
+        "phase": "ingest",
+        "elapsed_ns": 66237875,
+        "server_cpu_ns": 80216583,
+        "peak_rss_bytes": 152666112,
+        "response_bytes": 63,
+        "elapsed_range_ns": [
+          52714042,
+          71044500
+        ],
+        "server_cpu_range_ns": [
+          77095125,
+          95017042
+        ],
+        "median_peak_footprint_bytes": 118572040
+      },
+      {
+        "variant": "candidate",
+        "phase": "full",
+        "elapsed_ns": 17358250,
+        "server_cpu_ns": 14834292,
+        "peak_rss_bytes": 156434432,
+        "response_bytes": 2099279,
+        "elapsed_range_ns": [
+          11486459,
+          19978500
+        ],
+        "server_cpu_range_ns": [
+          9700875,
+          17076334
+        ],
+        "median_peak_footprint_bytes": 118359072
+      },
+      {
+        "variant": "candidate",
+        "phase": "conditional",
+        "elapsed_ns": 2165000,
+        "server_cpu_ns": 1089792,
+        "peak_rss_bytes": 156598272,
+        "response_bytes": 2071,
+        "elapsed_range_ns": [
+          1454333,
+          2323000
+        ],
+        "server_cpu_range_ns": [
+          708541,
+          1315083
+        ],
+        "median_peak_footprint_bytes": 118473760
+      }
+    ],
+    "raw_artifact": "output/conditional-main-native-server-final.json",
+    "raw_artifact_sha256": "6858fe35b33e6cb548467ec844d649c00a2af38510b05819e71276588810629e",
+    "raw_artifact_availability": "local, unpublished",
+    "limits": [
+      "Synthetic ASCII values in fresh single-shard native JSON tables; no inference, remote connector or independent host measurement.",
+      "Current certificates are required for omission; unsupported/legacy/stale cases retain full-value reference delivery and bounded repair.",
+      "Whole server process CPU includes background work. RSS is sampled and is not an allocation bound; remaining source fields/layouts can still require physical reads.",
+      "Ingestion and full delivery regress modestly in this corpus; warm read savings do not mean free writes or zero server work.",
+      "Response bytes count decoded HTTP bodies, not physical storage I/O.",
+      "Candidate includes main #1262 CLI/license unification as well as this feature; this pair does not isolate that merge. The separate pre-main run isolates the feature.",
+      "Shared-host timing/CPU and background activity vary between qualifications. No universal speed, memory or write-cost guarantee."
+    ]
+  },
+  "native_source_delivery_pre_main_merge": {
     "scope": "Native single-shard JSON tables, synthetic ASCII source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
     "platform": "macOS-27.0.1-arm64-arm-64bit",
     "machine": "arm64",
@@ -618,6 +832,149 @@
       "Whole server process CPU includes background work. RSS is sampled and is not an allocation bound; remaining source fields/layouts can still require physical reads.",
       "Ingestion and full delivery regress modestly in this corpus; warm read savings do not mean free writes or zero server work.",
       "Response bytes count decoded HTTP bodies, not physical storage I/O."
-    ]
+    ],
+    "measured_implementation_commit": "95cdf2a20a"
+  },
+  "post_main_merge_validation": {
+    "merge_commit": "9ca2e6e28f",
+    "main_commit": "871c14378840c9fb4d2422464d95f35ba51c0814",
+    "query_contracts": 149,
+    "source_identity_tests": 15,
+    "logical_field_tests": 91,
+    "logical_field_skips": 1,
+    "leaks": 0,
+    "native_integration_passed": 27,
+    "native_integration_skipped": 7,
+    "release_packaging_tests": 4,
+    "apache_source_files": 2203,
+    "cli_rebuilds": {
+      "macos_sha256": "faafe6832f4c44a74da8d07faf698de36bdf48119fcf898f573317712c9769ad",
+      "linux_sha256": "9bfdd5b3cd713fefa56966390286a222d15d5d45cd669957e4f284636dac9c44",
+      "windows": {
+        "sha256": "f9d4900f91439325b805c1fbb7622afeefe4834093bc662fc548a50d7149c5c1",
+        "bytes": 8711680
+      },
+      "windows_unchanged": true
+    },
+    "cli_test_reuse": "macOS/Linux/Windows CLI rebuilds are byte-identical to the fully tested pre-merge binaries; full CLI suites remain applicable.",
+    "driver_sha256": {
+      "zig/pkg/antfly-grep/bench/visual_batches.py": "11725a8e4da0c84eeec1dddb0016b18e4aee9101ccf7f252bec6e28e5e1d1c9b",
+      "zig/e2e/antfly/bench_source_projection.py": "c37345aedea3b65780bb99e11bd419e3ead28345200e3c66895450346fa57c89"
+    },
+    "driver_change": "Native benchmark header changed to Apache-2.0 to match main; benchmark code is unchanged.",
+    "integration_fixture_sha256": "4df875ea2dc8af4b6384ef6a730f1801ba4f19c3f0473f286e106ca8419091c8",
+    "artifacts": {
+      "conditional-main-contracts.log": {
+        "availability": "local, unpublished",
+        "sha256": "b38dcdf9293ef054e7c05dd45887078eff59c6c4effec5f011c8ec652283ca96"
+      },
+      "conditional-main-boundary.log": {
+        "availability": "local, unpublished",
+        "sha256": "d419304086e969f41f709425c365ed1f01eaa5342262b6b6fc9831255afa4529"
+      },
+      "conditional-main-native-final.log": {
+        "availability": "local, unpublished",
+        "sha256": "bd5d12822f9c8184295113d25b9a3835d6344c725fd676f965e5c81275dcb474"
+      },
+      "conditional-main-packaging-final.log": {
+        "availability": "local, unpublished",
+        "sha256": "11f94406f8af58b62708be31dbfde7f39ef601dcf0c32e44dada03cbaa0e3159"
+      },
+      "conditional-main-grep-build.log": {
+        "availability": "local, unpublished",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "conditional-main-grep-linux-build.log": {
+        "availability": "local, unpublished",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "conditional-main-grep-windows-build.log": {
+        "availability": "local, unpublished",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "conditional-main-cli-rebuilds.json": {
+        "availability": "local, unpublished",
+        "sha256": "311fb54eb7106bf3e112fb7a3ddcc4a173f51d8b4d12a27c89be47588868497c"
+      }
+    }
+  },
+  "measured_implementation_commit": "95cdf2a20a",
+  "pre_main_validation": {
+    "cli_macos": {
+      "total": 288,
+      "passed": 286,
+      "skipped": 2
+    },
+    "cli_linux_vm": {
+      "total": 288,
+      "passed": 285,
+      "skipped": 3
+    },
+    "query_contracts": {
+      "passed": 149,
+      "leaked": 0
+    },
+    "source_value_identity": {
+      "passed": 15,
+      "leaked": 0
+    },
+    "logical_field_queries": {
+      "passed": 91,
+      "skipped": 1,
+      "leaked": 0
+    },
+    "native_integration": {
+      "passed": 27,
+      "skipped": 7,
+      "covers": [
+        "single/two-shard delivery",
+        "wildcard/exclusion masks",
+        "integer/float/boolean/null/escaped Unicode identity equivalence",
+        "revision and authorization fences",
+        "current-value mutation",
+        "snapshot pagination and expiry"
+      ]
+    },
+    "artifact_cache": {
+      "passed": 4
+    },
+    "windows_cli": "cross-compilation passed; no runtime claim",
+    "storage_shard_audit": "passed",
+    "embedded_source_boundary_regressions": 20,
+    "apache_boundary_sources": 2432
+  },
+  "pre_main_validation_artifacts": {
+    "conditional-planned-cli-macos-final.log": {
+      "availability": "local, unpublished",
+      "sha256": "1b703774fe9d12d830d55a811246020bc27463255795ec65c949c7d49f8d1162"
+    },
+    "conditional-planned-cli-linux-final.log": {
+      "availability": "local, unpublished",
+      "sha256": "05e91c567f79f8c6e620e26170850058310bfbae31621818581fb7457ddf138a"
+    },
+    "conditional-owned-real-scope-tests.log": {
+      "availability": "local, unpublished",
+      "sha256": "bd53a4a311018992106e6bfb86bb7f8ddc84b7a33e05e902211d9d869ca82569"
+    },
+    "conditional-owned-snapshot-final-tests.log": {
+      "availability": "local, unpublished",
+      "sha256": "67191fb30503a719dde6f02286c75db60f5c17446cbe47f609001fca5297c597"
+    },
+    "conditional-owned-snapshot-native-final.log": {
+      "availability": "local, unpublished",
+      "sha256": "31fa0afcf3d2ab484ad3d5a903c82668e0b42e6adc4f1888cd3c6e28b36a80dd"
+    },
+    "conditional-cache-writers-test.log": {
+      "availability": "local, unpublished",
+      "sha256": "a77972c1cbe3394329424ca4862ea29a43d13ad6636dffb85388b71f53625eb7"
+    },
+    "conditional-planned-windows-build.log": {
+      "availability": "local, unpublished",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "conditional-owned-snapshot-boundary-final.log": {
+      "availability": "local, unpublished",
+      "sha256": "809d64b31ad3c07a6a72de5dc7176917915947bf0dbb0b793eae2e68c6c2bbae"
+    }
   }
 }

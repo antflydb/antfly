@@ -4668,23 +4668,28 @@ reads or writes. `e2e/antfly/bench_source_projection.py` separately qualifies
 native server ingestion, full delivery and conditional delivery without a model.
 
 
-The same qualification also measures the final native server separately, using
-five alternating rounds, eight fresh documents with 256 KiB ASCII values, one
-shard, exact response hashes and mandatory certificate-hit checks. Each candidate
-round records 16 certificate hits and no full-value fallbacks. Median times:
+The same qualification measures the final native server after merging main
+through `871c143788` (#1262), using five alternating rounds, eight fresh documents
+with 256 KiB ASCII values, one shard, exact response hashes and mandatory
+certificate-hit checks. Each candidate round records 16 certificate hits and no
+full-value fallbacks. Median times:
 
 | Native phase | Elapsed, baseline → current | Server process CPU, baseline → current |
 |---|---:|---:|
-| Ingestion | 41.22 → 43.33 ms | 52.49 → 55.39 ms |
-| Full delivery | 10.39 → 10.94 ms | 8.45 → 9.05 ms |
-| Conditional delivery | 7.51 → 1.37 ms | 6.87 → 0.68 ms |
+| Ingestion | 56.36 → 66.24 ms | 64.69 → 80.22 ms |
+| Full delivery | 15.21 → 17.36 ms | 12.42 → 14.83 ms |
+| Conditional delivery | 10.29 → 2.16 ms | 8.89 → 1.09 ms |
 
-Conditional delivery is about 82% faster and uses 90% less server CPU in this
-synthetic corpus. Publishing proofs adds about 5% ingestion time/CPU; full
-delivery takes about 5–7% more time/CPU. Conditional peak RSS is 148.0 → 149.5 MiB.
+Conditional delivery is about 79% faster and uses 88% less server CPU in this
+synthetic corpus. Ingestion/full delivery regress about 14–24% in elapsed/CPU
+terms. Conditional peak RSS is 152.5 → 149.3 MiB. The candidate also includes
+main's CLI unification; this pair does not isolate that merge. The report retains
+the separate pre-main feature qualification, where ingestion/full-delivery costs
+were about 5–7%. Shared-host measurements and background work vary between runs.
+
 Whole-process CPU includes background work, and sampled RSS is not an allocation
-bound. These are fresh native JSON certificates on the shared Mac, not a physical
-I/O or live-model qualification. Unsupported/stale layouts retain reference
+bound. These are fresh native JSON certificates on the shared Mac, with no
+physical-I/O or live-model claim. Unsupported/stale layouts retain reference
 execution. Proof reuse shifts work to bounded metadata and writes; authorization
 and remaining selected source reads still have a cost.
 
@@ -4696,3 +4701,10 @@ regression verifies published certificates, retained read cuts and replacement
 visibility; parsed ID-query worker round trips exercise the actual eligible
 request shape. Storage discovery, compatibility, license boundaries and Windows
 CLI cross-compilation pass. Raw trials and logs remain ignored.
+
+After the main merge, 149 query contracts, 15 identity/storage cases, 91 logical
+field cases (one skip), 27 native cases (seven opt-in benchmark skips), four
+release-packaging checks and the Apache boundary pass. Rebuilt macOS, Linux and
+Windows CLI binaries are byte-identical to the fully tested binaries above.
+Main's unified CLI and Apache licensing are preserved; the compact report records
+the final native binary and both pre-/post-main measurement sets separately.
