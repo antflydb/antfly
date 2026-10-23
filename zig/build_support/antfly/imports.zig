@@ -256,6 +256,7 @@ pub const AntflyRootImports = struct {
         options.addOption(bool, "bench_minimal_deps", false);
         mod.addOptions("build_options", options);
         mod.addImport("antfly_platform", self.platform);
+        mod.addImport("build_info", self.build_info.module);
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_cache_budget", self.cache_budget);
         mod.addImport("antfly_runtime_abi", self.runtime_abi);

@@ -10,9 +10,10 @@
         "custom_branch_policies": true
       },
       "branch_policies": [
-        {"name": "go/pkg/operator/v*", "type": "tag"},
-        {"name": "pkg/operator/v*", "type": "tag"},
-        {"name": "v*", "type": "tag"}
+        {
+          "name": "v*",
+          "type": "tag"
+        }
       ]
     },
     "release-promotion": {
@@ -24,7 +25,10 @@
         "custom_branch_policies": true
       },
       "branch_policies": [
-        {"name": "main", "type": "branch"}
+        {
+          "name": "main",
+          "type": "branch"
+        }
       ]
     },
     "crates-io": {

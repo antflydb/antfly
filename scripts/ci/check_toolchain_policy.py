@@ -253,27 +253,6 @@ def validate(policy: dict) -> list[str]:
         check_contains(errors, artifact_workflow_path, artifact_workflow, policy_output)
 
     for workflow_path in (
-        ".github/workflows/antfly-operator-go.yml",
-        ".github/workflows/antfly-proxy-go.yml",
-    ):
-        workflow = (REPO_ROOT / workflow_path).read_text()
-        check_contains(errors, workflow_path, workflow, TOOLCHAIN_ACTION)
-        check_contains(
-            errors,
-            workflow_path,
-            workflow,
-            "steps.toolchain.outputs.go_version",
-        )
-        check_contains(
-            errors,
-            workflow_path,
-            workflow,
-            "scripts/ci/toolchain-policy.json",
-        )
-        if re.search(r"GO_VERSION:\s*['\"]?\d+\.\d+", workflow):
-            errors.append(f"{workflow_path}: hard-codes a Go toolchain")
-
-    for workflow_path in (
         ".github/workflows/antfly-release.yml",
         ".github/workflows/ts-npm-publish.yml",
     ):

@@ -18,22 +18,16 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|embedded|lite|inference] [--apple-providers true|false] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|embedded] [--apple-providers true|false] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
-  antfly (server), or antfly-lite, antfly-inference, and antfly-inference-worker (embedded)
-  legacy Lite and inference products remain supported for schema 2 sources
-  completions/ (server only)
-  share/
-  lib/ and include/ (server and embedded; legacy Lite too)
-  README.md
-  LICENSE
-  THIRD_PARTY_NOTICES.md
-  LICENSING.md (server only)
-  scripts/{apache_engine_files.txt,source_license_roots.json,embedded_asset_licenses.json} (server and embedded; legacy Lite too)
-  LICENSES/Apache-2.0.txt
-  LICENSES/Elastic-2.0.txt (server only)
+  antfly and completions/ (server only)
+  lib/, include/antfly.h, and share/
+  README.md, LICENSE, LICENSING.md, and THIRD_PARTY_NOTICES.md
+  scripts/{apache_engine_files.txt,source_license_roots.json,embedded_asset_licenses.json}
+  LICENSES/Apache-2.0.txt and third-party notices
+The embedded product is a library-only archive with no public executables.
 EOF
 }
 
@@ -108,8 +102,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$product" in
-  server|embedded|lite|inference) ;;
-  *) echo "invalid --product: $product (expected server, embedded, lite, or inference)" >&2; exit 2 ;;
+  server|embedded) ;;
+  *) echo "invalid --product: $product (expected server or embedded)" >&2; exit 2 ;;
 esac
 
 if [ -z "$version" ] || [ -z "$target" ] || [ -z "$archive_name" ] || [ -z "$out_dir" ]; then
@@ -187,8 +181,8 @@ export SOURCE_DATE_EPOCH="$source_date_epoch"
 work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${product}-${target}"
 prefix="${work_root}/zig-out"
 stage="${work_root}/stage"
-# Keep project objects outside product scratch so server, embedded, standalone
-# inference and repeated archive builds can reuse compatible compile results.
+# Keep project objects outside product scratch so CLI and library archive
+# builds can reuse compatible compile results.
 # Zig keys these objects by source, toolchain, target and compile options.
 local_cache="$repo_root/.zig-cache/release"
 cache_root="${ANTFLY_ZIG_CACHE_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/zig-cache}"
@@ -266,7 +260,7 @@ run_zig_build_steps() {
   )
   command+=(-- build --summary all)
 
-  if [[ "$product" = lite || "$product" = embedded ]]; then
+  if [ "$product" = embedded ]; then
     command+=(--build-file embedded.build.zig)
   fi
   if [ -n "$jobs" ]; then
@@ -317,57 +311,22 @@ run_zig_build_steps_with_retry() {
 }
 
 (
-  if [ "$product" = inference ]; then
-    cd "$repo_root/zig/pkg/inference"
+  cd "$repo_root/zig"
+  if [ "$product" = embedded ]; then
+    run_zig_build_steps_with_retry archive libantfly
   else
-    cd "$repo_root/zig"
-  fi
-  # Runtime archives carry measured max-RSS admission claims. Independent units
-  # can compile concurrently when they fit the release memory budget; there are
-  # no artificial ordering dependencies between those compilations.
-  if [ "$product" = inference ]; then
-    run_zig_build_steps_with_retry archive
-  elif [[ "$product" = lite || "$product" = embedded ]]; then
-    run_zig_build_steps_with_retry archive lite
-  else
-    run_zig_build_steps_with_retry archive antfly capi grep
+    run_zig_build_steps_with_retry archive antfly libantfly grep
   fi
 )
 
-if [ "$product" = embedded ]; then
-  (
-    cd "$repo_root/zig/pkg/inference"
-    product=inference
-    run_zig_build_steps_with_retry inference
-  )
+test -f "$prefix/include/antfly.h"
+if [ ! -f "$lite_lib_prefix_path" ]; then
+  echo "missing Antfly C ABI library: $lite_lib_prefix_path" >&2
+  exit 1
 fi
-
-if [[ "$product" = lite || "$product" = embedded ]]; then
-  binary_name=antfly-lite
-elif [ "$product" = inference ]; then
-  binary_name=antfly-inference
-else
-  binary_name=antfly
-fi
-test -x "$prefix/bin/$binary_name"
-if [ "$product" != inference ]; then
-  test -f "$prefix/include/antfly.h"
-  if [ ! -f "$lite_lib_prefix_path" ]; then
-    echo "missing Antfly C ABI library: $lite_lib_prefix_path" >&2
-    find "$prefix" -maxdepth 3 -type f | sort >&2
-    exit 1
-  fi
-fi
-cp "$prefix/bin/$binary_name" "$stage/$binary_name"
-if [ "$product" = embedded ]; then
-  test -x "$prefix/bin/antfly-inference"
-  cp "$prefix/bin/antfly-inference" "$stage/antfly-inference"
-fi
-if [[ "$product" = lite || "$product" = embedded ]]; then
-  # The Lite executable understands `inference _worker`. A second filename
-  # gives embedded hosts a dedicated Apache worker candidate without another
-  # native compile or a dependency on the ELv2 server executable.
-  cp "$prefix/bin/antfly-lite" "$stage/antfly-inference-worker"
+if [ "$product" = server ]; then
+  test -x "$prefix/bin/antfly"
+  cp "$prefix/bin/antfly" "$stage/antfly"
 fi
 if [ "$apple_providers" = true ] && [ ! -f "$prefix/lib/libantfly-apple.dylib" ]; then
   echo "missing native Apple bridge: $prefix/lib/libantfly-apple.dylib" >&2
@@ -376,43 +335,28 @@ fi
 if [ -d "$prefix/share" ]; then
   cp -R "$prefix/share" "$stage/share"
 fi
-if [ "$product" != inference ]; then
-  python3 "$repo_root/scripts/packaging/render_libantfly_pkgconfig.py" \
-    --version "$version" --out "$prefix/lib/pkgconfig/libantfly.pc"
-fi
-if [ "$product" != inference ] && [ -d "$prefix/lib" ]; then
+python3 "$repo_root/scripts/packaging/render_libantfly_pkgconfig.py" \
+  --version "$version" --out "$prefix/lib/pkgconfig/libantfly.pc"
+if [ -d "$prefix/lib" ]; then
   cp -R "$prefix/lib" "$stage/lib"
 fi
-if [ "$product" != inference ] && [ -d "$prefix/include" ]; then
+if [ -d "$prefix/include" ]; then
   cp -R "$prefix/include" "$stage/include"
 fi
 if [ "$product" = embedded ]; then
   cp "$repo_root/scripts/packaging/embedded-release-README.md" "$stage/README.md"
-elif [ "$product" = lite ]; then
-  cp "$repo_root/scripts/packaging/lite-release-README.md" "$stage/README.md"
-elif [ "$product" = inference ]; then
-  cp "$repo_root/scripts/packaging/inference-release-README.md" "$stage/README.md"
 else
   cp "$repo_root/README.md" "$stage/README.md"
-  cp "$repo_root/LICENSING.md" "$stage/LICENSING.md"
 fi
-if [ "$product" != inference ]; then
-  mkdir -p "$stage/scripts"
-  cp "$repo_root/scripts/apache_engine_files.txt" "$stage/scripts/apache_engine_files.txt"
-  cp "$repo_root/scripts/source_license_roots.json" "$stage/scripts/source_license_roots.json"
-  cp "$repo_root/scripts/embedded_asset_licenses.json" "$stage/scripts/embedded_asset_licenses.json"
-fi
+cp "$repo_root/LICENSING.md" "$stage/LICENSING.md"
+mkdir -p "$stage/scripts"
+cp "$repo_root/scripts/apache_engine_files.txt" "$stage/scripts/apache_engine_files.txt"
+cp "$repo_root/scripts/source_license_roots.json" "$stage/scripts/source_license_roots.json"
+cp "$repo_root/scripts/embedded_asset_licenses.json" "$stage/scripts/embedded_asset_licenses.json"
 mkdir -p "$stage/LICENSES"
 cp "$repo_root/LICENSES/Apache-2.0.txt" "$stage/LICENSES/Apache-2.0.txt"
-if [ "$product" = server ]; then
-  cp "$repo_root/LICENSES/Elastic-2.0.txt" "$stage/LICENSES/Elastic-2.0.txt"
-fi
 cp -R "$repo_root/LICENSES/third-party" "$stage/LICENSES/third-party"
-if [ "$product" != server ]; then
-  cp "$repo_root/LICENSES/Apache-2.0.txt" "$stage/LICENSE"
-else
-  cp "$repo_root/LICENSE" "$stage/LICENSE"
-fi
+cp "$repo_root/LICENSES/Apache-2.0.txt" "$stage/LICENSE"
 cp "$repo_root/THIRD_PARTY_NOTICES.md" "$stage/THIRD_PARTY_NOTICES.md"
 if [ "$product" = server ]; then
   "$repo_root/scripts/completions.sh" "$stage/completions"
@@ -427,40 +371,26 @@ python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
   --output "$out_dir/$archive_name" \
   --mtime "$source_date_epoch"
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
-grep -Fx "./$binary_name" "$work_root/archive-contents.txt" >/dev/null
+if [ "$product" = server ]; then
+  grep -Fx "./antfly" "$work_root/archive-contents.txt" >/dev/null
+fi
 if [ "$product" = server ]; then
   for entry in antfly-grep completions/antfly-grep.bash completions/antfly-grep.zsh completions/antfly-grep.fish completions/antfly-grep.ps1 share/man/man1/antfly-grep.1 share/antfly-grep/build.json share/antfly-grep/schema/tables-v1.json; do
     grep -Fx "./$entry" "$work_root/archive-contents.txt" >/dev/null
   done
 fi
-if [ "$product" = embedded ]; then
-  grep -Fx "./antfly-inference" "$work_root/archive-contents.txt" >/dev/null
+if [ "$product" = embedded ] && grep -Eq '^\./(antfly|antfly-lite|antfly-inference|antfly-inference-worker|antfly-inference-dev)$' "$work_root/archive-contents.txt"; then
+  echo "Library archive unexpectedly contains a CLI executable" >&2
+  exit 1
 fi
-if [[ "$product" = lite || "$product" = embedded ]]; then
-  grep -Fx "./antfly-inference-worker" "$work_root/archive-contents.txt" >/dev/null
-  if grep -Fx './antfly' "$work_root/archive-contents.txt" >/dev/null; then
-    echo "Lite archive unexpectedly includes the server executable" >&2
-    exit 1
-  fi
-fi
-if [ "$product" = inference ]; then
-  if grep -Eq '^\./(antfly|antfly-lite|antfly-inference-worker)$' "$work_root/archive-contents.txt"; then
-    echo "Inference archive unexpectedly includes database or worker executables" >&2
-    exit 1
-  fi
-else
-  grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
-  grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
-  grep -Fx "./scripts/apache_engine_files.txt" "$work_root/archive-contents.txt" >/dev/null
-fi
+grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./scripts/apache_engine_files.txt" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "./THIRD_PARTY_NOTICES.md" "$work_root/archive-contents.txt" >/dev/null
 if [ "$product" = server ]; then
   grep -Fx "./completions/antfly.bash" "$work_root/archive-contents.txt" >/dev/null
   grep -Fx "./completions/antfly.zsh" "$work_root/archive-contents.txt" >/dev/null
   grep -Fx "./completions/antfly.fish" "$work_root/archive-contents.txt" >/dev/null
-fi
-if [ "$product" = server ]; then
-  grep -Fx "./LICENSES/Elastic-2.0.txt" "$work_root/archive-contents.txt" >/dev/null
 fi
 grep -Fx "./LICENSES/Apache-2.0.txt" "$work_root/archive-contents.txt" >/dev/null
 if [ "$apple_providers" = true ]; then

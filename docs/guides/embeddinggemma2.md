@@ -115,13 +115,13 @@ The linked provider exposes `embedDenseGroupsDirectWithControl` and uses the sam
 validation, media policy, model pinning and admission. CLI examples:
 
 ```sh
-antfly-inference embed models/embedders/embeddinggemma2 --backend metal \
+antfly inference embed models/embedders/embeddinggemma2 --backend metal \
   --group --title 'Account recovery' --dimensions 256 \
   --text 'Reset a forgotten password.' --image reset.png
-antfly-inference embed models/embedders/embeddinggemma2 --backend native \
+antfly inference embed models/embedders/embeddinggemma2 --backend native \
   --task-type RETRIEVAL_QUERY --text 'How do I regain access?'
-antfly-inference decisions models --request decision.json --backend metal
-antfly-inference decisions models --request multi-choice.json --backend native
+antfly inference decisions models --request decision.json --backend metal
+antfly inference decisions models --request multi-choice.json --backend native
 ```
 
 ## Choice decisions
@@ -456,7 +456,7 @@ python3 zig/pkg/inference/scripts/embeddinggemma2/compare.py --backend mps \
   --model-dir <model-dir> --suite suite.json --output pytorch-mps.json
 python3 zig/pkg/inference/scripts/embeddinggemma2/compare.py --backend metal \
   --model-dir <model-dir> --suite suite.json --reference pytorch-mps.json \
-  --binary zig/pkg/inference/zig-out/bin/antfly-inference --output metal.json
+  --binary zig/pkg/inference/zig-out/bin/antfly-inference-dev --output metal.json
 ```
 
 Use `native` and `cpu` for the CPU pair. Compile the native CLI with

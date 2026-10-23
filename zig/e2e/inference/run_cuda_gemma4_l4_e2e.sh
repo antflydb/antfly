@@ -29,7 +29,7 @@ Required environment:
   LLAMA_CPP_BIN               pinned llama-completion binary
 
 Optional environment:
-  ANTFLY_BIN                  prebuilt antfly-inference binary
+  ANTFLY_BIN                  prebuilt antfly-inference-dev binary
   CUDA_EVIDENCE_DIR           output directory
   CUDA_RELEASE_MODE           nightly or release (default: nightly)
   CUDA_VISIBLE_DEVICES        selected L4 (default: 0)
@@ -81,7 +81,7 @@ esac
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 inference_dir="$repo_root/zig/pkg/inference"
 zig_bin="${ZIG_BIN:-zig}"
-antfly_bin="${ANTFLY_BIN:-$inference_dir/zig-out/bin/antfly-inference}"
+antfly_bin="${ANTFLY_BIN:-$inference_dir/zig-out/bin/antfly-inference-dev}"
 evidence_dir="${CUDA_EVIDENCE_DIR:-/tmp/antfly-cuda-gemma4-l4-e2e-$(date -u +%Y%m%dT%H%M%SZ)}"
 e2b_model="${E2B_MODEL:-$repo_root/.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf}"
 gemma12b_q4_model="${GEMMA12B_Q4_MODEL:-$repo_root/.models/google/gemma-4-12B-it-q4_k/gemma-4-12B-it-Q4_K_M.gguf}"

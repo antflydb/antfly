@@ -618,7 +618,7 @@ def main(argv=None):
     parser.add_argument(
         "--standalone-inference",
         action="store_true",
-        help="Binary is antfly-inference rather than the unified antfly CLI",
+        help="Binary uses direct inference commands (antfly-inference-dev) rather than the unified antfly CLI",
     )
     parser.add_argument("--tests", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
