@@ -50,19 +50,20 @@ from .test_generate import (
 )
 
 
-def test_inference_command_selects_the_explicit_optimized_executable(
+def test_inference_server_command_selects_only_the_optimized_server(
     monkeypatch, tmp_path
 ):
-    binary = tmp_path / "antfly-inference"
+    binary = tmp_path / "antfly-inference-http-server"
     binary.touch()
     monkeypatch.setenv("ANTFLY_BIN", "/unused/debug-antfly")
-    monkeypatch.setenv("ANTFLY_INFERENCE_BIN", str(binary))
-    assert models.inference_command() == [str(binary)]
-    binary.unlink()
-    with pytest.raises(FileNotFoundError, match="ANTFLY_INFERENCE_BIN"):
-        models.inference_command()
-    monkeypatch.delenv("ANTFLY_INFERENCE_BIN")
+    monkeypatch.setenv("ANTFLY_INFERENCE_SERVER_BIN", str(binary))
+    assert models.inference_server_command() == [str(binary)]
     assert models.inference_command() == ["/unused/debug-antfly", "inference"]
+    binary.unlink()
+    with pytest.raises(FileNotFoundError, match="ANTFLY_INFERENCE_SERVER_BIN"):
+        models.inference_server_command()
+    monkeypatch.delenv("ANTFLY_INFERENCE_SERVER_BIN")
+    assert models.inference_server_command() == ["/unused/debug-antfly", "inference"]
 
 
 def test_server_budget_args_default_scratch_and_explicit_override(monkeypatch):

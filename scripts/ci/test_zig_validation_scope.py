@@ -70,7 +70,7 @@ class ZigValidationScopeTests(unittest.TestCase):
                 root = Path(tmp)
                 expected = {"zig-out/bin/antfly", "zig-out/bin/antfly-grep"}
                 if full:
-                    expected.add("zig-out/bin/antfly-inference")
+                    expected.add("zig-out/bin/antfly-inference-http-server")
                 # Ordinary base packaging must also work when the optimized
                 # executable was never built. Verify contents and permissions
                 # of the real tar command rather than its shell spelling.

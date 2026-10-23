@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-10-14
+Last updated: 2026-10-22
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -269,6 +269,34 @@ inside the existing 22 GiB aggregate budget, whereas the previous 20/16 GiB
 claims serialized them. This removes that admission bottleneck without
 increasing runner size or the deadline; a matched CI rerun must establish the
 resulting wall time.
+
+### Optimized HTTP inference for model E2E
+
+Full CPU model E2E builds `inference-http-server -Doptimize=ReleaseFast
+-Dcpu=baseline -Dstrip=true -Dcuda=false` and selects
+`zig-out/bin/antfly-inference-http-server` through
+`ANTFLY_INFERENCE_SERVER_BIN`. This existing production entry calls the same
+`runServer` as the CLI, without compiling offline training, benchmark and
+other CLI commands. `ANTFLY_BIN` continues selecting the Debug product for
+model pulls, CLI checks, storage/API and standalone process composition.
+Optimizing the serving graph covers attention and quantization as well as
+matrix multiplication; model assertions and request limits stay unchanged.
+
+The full CLI is a separate, heavier build profile. At PR #1264's `7c4df469bb`,
+its native x86_64 GNU, baseline CPU, unstripped ReleaseFast build measured
+10,717,630,464 bytes of compiler RSS and 49 minutes cold wall time. It used the
+exact Nix/glibc Zig derivation pinned in `scripts/ci/toolchain-policy.json`.
+The corresponding Darwin-hosted Linux cross-build measured 12,537,217,024
+bytes. Reserve the measured peak plus 25%, rounded up to 64 MiB: 12,800 MiB
+native and 14,976 MiB cross-built. Scope these claims to the measured host,
+target, optimization and unstripped profiles; other profiles keep their
+existing claims. `-Dinference-compile-memory-mb` remains an explicit override.
+
+These claims do not change runner resources or model-process budgets. The
+native full CLI leaves 9.5 GiB for concurrent steps inside the existing
+22 GiB aggregate build budget. Model CI uses the HTTP target's independent
+reservation rather than inheriting this full-CLI claim. Qualify its memory
+and elapsed time separately before changing its admission profile.
 
 ### October macOS compile-memory follow-up
 

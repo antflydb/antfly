@@ -19,13 +19,11 @@ const runtime_build = @import("runtime.zig");
 
 pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile {
     const b = ctx.b;
-    const exe = runtime_build.addStandaloneExecutable(b, ctx.graph, ctx.target, ctx.optimize, ctx.paths.inference_root, ctx.backend.link_libc);
-    exe.root_module.strip = ctx.strip;
+    const exe = runtime_build.addStandaloneExecutable(b, ctx.graph, ctx.target, ctx.optimize, ctx.paths.inference_root, ctx.backend.link_libc, ctx.strip);
     const install_exe = b.addInstallArtifact(exe, .{
         .dest_sub_path = "antfly-inference",
     });
     if (install_default) b.getInstallStep().dependOn(&install_exe.step);
-    ctx.step("build", "Build the standalone inference executable").dependOn(&install_exe.step);
 
     const run_exe = ctx.addRunArtifact(exe);
     run_exe.step.dependOn(&install_exe.step);
@@ -77,6 +75,7 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
         }),
     });
     ctx.graph.linkBuildInfo(http_server.root_module);
+    http_server.root_module.strip = ctx.strip;
     http_server.root_module.addImport("inference", ctx.graph.inference_mod);
     http_server.root_module.addImport("build_options", ctx.graph.build_options_mod);
     http_server.root_module.addImport("structlog", ctx.graph.structlog_mod);

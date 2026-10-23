@@ -26,7 +26,7 @@ import time
 import pytest
 import requests
 
-from .models import ensure_model_by_name, inference_command, models_dir
+from .models import ensure_model_by_name, inference_server_command, models_dir
 
 pytestmark = pytest.mark.model_integration
 MODEL = "BAAI/bge-small-en-v1.5"
@@ -67,7 +67,14 @@ def test_run_config_model_settings(tmp_path, run_config_models, layout):
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     config_flags = ["--config", str(config_path)]
-    command = [*inference_command(), "run", "--host", "127.0.0.1", "--port", str(port)]
+    command = [
+        *inference_server_command(),
+        "run",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+    ]
     command += (
         model_flags + config_flags
         if layout == "cli-before"

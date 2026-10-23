@@ -528,15 +528,18 @@ pub fn create(config: Config) Graph {
     };
 }
 
-pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
-    // Compiler memory depends on its host as well as the output target.
-    // Darwin-hosted x86_64-linux-gnu ReleaseFast measured 12.54 GB, even
-    // without Metal. Reserve 15 GiB for that profile (over 25% headroom).
-    const darwin_profile = b.graph.host.result.os.tag == .macos or target.result.os.tag == .macos;
-    const darwin_linux_release = b.graph.host.result.os.tag == .macos and
+pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, inference_root: []const u8, link_libc: bool, strip: bool) *std.Build.Step.Compile {
+    // These unstripped ReleaseFast profiles reserve the measured compiler peak
+    // plus 25%, rounded up to 64 MiB. Keep other modes and targets independent.
+    const darwin_linux_release = !strip and b.graph.host.result.os.tag == .macos and
         target.result.os.tag == .linux and target.result.cpu.arch == .x86_64 and
         target.result.abi == .gnu and optimize == .fast;
-    const default_compile_memory_mb: usize = if (darwin_linux_release) 15 * 1024 else if (darwin_profile) 14 * 1024 else 7 * 1024;
+    // CI's native Nix/glibc compiler peaked at 10,717,630,464 bytes, versus
+    // 12,537,217,024 bytes for the Darwin-hosted cross-build.
+    const native_linux_release = !strip and b.graph.host.result.os.tag == .linux and
+        b.graph.host.result.cpu.arch == .x86_64 and target.result.os.tag == .linux and
+        target.result.cpu.arch == .x86_64 and target.result.abi == .gnu and optimize == .fast;
+    const default_compile_memory_mb: usize = if (darwin_linux_release) 14976 else if (native_linux_release) 12800 else if (target.result.os.tag == .macos) 14 * 1024 else 7 * 1024;
     const compile_memory_mb = b.option(usize, "inference-compile-memory-mb", "Declared standalone inference compiler memory bound in MiB") orelse
         default_compile_memory_mb;
     if (compile_memory_mb == 0) @panic("inference compiler memory bound must be positive");
@@ -553,6 +556,7 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
         }),
     });
     graph.linkBuildInfo(exe.root_module);
+    exe.root_module.strip = strip;
     exe.root_module.addImport("inference", graph.inference_mod);
     exe.root_module.addImport("build_options", graph.build_options_mod);
     exe.root_module.addImport("structlog", graph.structlog_mod);
