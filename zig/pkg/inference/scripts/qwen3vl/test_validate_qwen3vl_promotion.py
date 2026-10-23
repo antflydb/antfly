@@ -106,7 +106,7 @@ class PromotionCampaignTests(unittest.TestCase):
         artifacts = root / "artifacts"
         reports.mkdir()
         artifacts.mkdir()
-        binary_path = artifacts / "antfly-inference"
+        binary_path = artifacts / "antfly-inference-dev"
         binary_path.write_bytes(b"release-safe-metal-binary")
         binary_path.chmod(0o755)
         binary_sha = sha256(binary_path)

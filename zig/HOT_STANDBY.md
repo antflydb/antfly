@@ -113,7 +113,7 @@ Implementation notes:
   WAL, fenced and unfenced promotion, old-primary rejoin/rewind/reseed, WAL
   expiry, and timeline propagation.
 - Hot-standby HA is productionized: runtime wiring, generated `/admin/v1/standby`
-  Zig and Go clients, `go/pkg/operator` integration through the Go SDK
+  Zig and Go clients, Colony's operator integration through the Go SDK
   wrapper, real base backup, sync commit, fencing, promotion/timeline/
   former-primary repair, standby freshness, WAL retention/reseed, auth,
   audit, metrics, runbooks, compatibility tests, and crash/e2e/operator
@@ -544,7 +544,7 @@ The implementation path is:
    promotion state, and rejoin state; and
 5. generate the same admin OpenAPI contract into `go/pkg/sdk/admin`, keep a
    small hand-written Go wrapper around the generated client, and have
-   `go/pkg/operator` and other Go automation call that typed `/admin/v1/standby`
+   Colony's operator and other Go automation call that typed `/admin/v1/standby`
    wrapper. The supported Zig CLI should use the Zig admin bindings generated
    from the same spec rather than importing or shelling through the Go SDK.
 
@@ -589,7 +589,7 @@ Recommended split:
   boundary for Go control-plane code; generated `oapi` symbols are a transport
   detail hidden inside the SDK package. This keeps operator behavior, SDK
   consumers, and OpenAPI compatibility checks on one reviewed contract instead
-  of creating a second admin API surface inside `go/pkg/operator`.
+  of creating a second admin API surface inside Colony's operator.
 
 The Go SDK wrapper should enforce the same HA identifier policy as the Zig
 runtime and operator admission layer before it builds operation metadata or
@@ -599,7 +599,7 @@ not acceptable merely because `url.PathEscape` can encode it into a path
 segment. Wrapper helpers for slot paths, node-scoped actions, promotion targets,
 and former-primary repair should reject missing, padded, overlong, or
 out-of-charset identifiers and should not silently trim operator input. This
-keeps local CLI use, Go SDK consumers, and `go/pkg/operator` automation aligned
+keeps local CLI use, Go SDK consumers, and Colony's operator automation aligned
 with the durable HA identity rules.
 
 Runtime HA validation should be shared but still field-aware. Helpers such as
@@ -736,7 +736,7 @@ The concrete follow-up decisions are:
   fences, old-primary rejoin, rewind, reseed, retained-WAL expiry, and timeline
   switch propagation.
 - Do not advertise production-grade Postgres-style HA parity until the runtime
-  wiring, generated `/admin/v1/standby` Zig and Go clients, `go/pkg/operator`
+  wiring, generated `/admin/v1/standby` Zig and Go clients, Colony's operator
   integration, real base backup, synchronous commit, fencing, promotion
   receipts, standby freshness, retention/reseed handling, auth, audit, metrics,
   runbooks, compatibility tests, crash/e2e/operator coverage, and former-primary
@@ -759,7 +759,7 @@ replication path, the implementation should satisfy this checklist:
   promotion with and without fence evidence, old-primary rejoin, rewind, reseed,
   WAL-retention expiry, and timeline switch propagation;
 - production-grade scope includes the generated `/admin/v1/standby` Zig and Go
-  clients, `go/pkg/operator` integration through the Go SDK wrapper, real
+  clients, Colony's operator integration through the Go SDK wrapper, real
   base-backup/reseed workflows, synchronous commit modes, fencing, promotion
   receipts, former-primary repair, standby freshness controls, WAL retention
   policy, auth, auditability, metrics, runbooks, compatibility tests, crash
@@ -832,7 +832,7 @@ retained-WAL expiry forcing reseed, and timeline switch propagation.
 
 Production-grade Postgres-style parity requires more than streaming records. The
 bulk feature-parity bar includes end-to-end primary/standby runtime wiring,
-generated `/admin/v1/standby` Zig and Go SDK clients, `go/pkg/operator` integration,
+generated `/admin/v1/standby` Zig and Go SDK clients, Colony's operator integration,
 real base-backup and seed workflows, `remote_write` and `remote_apply`
 synchronous commit policies, hard-to-misuse fencing, promotion/timeline
 switch/former-primary repair, standby freshness controls, WAL retention and
@@ -1368,7 +1368,7 @@ the style of the other SDK APIs; this is the single Go generation target for
 the admin contract. The wrapper validates slot names, node ids, and other
 durable HA identifiers before constructing operation metadata or issuing
 generated requests — path escaping alone is not treated as validation.
-`go/pkg/operator` consumes the `go/pkg/sdk/admin` wrapper for remote admin
+Colony's operator consumes the `go/pkg/sdk/admin` wrapper for remote admin
 operations rather than importing generated `oapi` internals or maintaining a
 second set of method paths, request/response structs, retry classification,
 or auth header plumbing. The supported Zig CLI consumes
@@ -1378,7 +1378,7 @@ pod-local volume manipulation, or explicit break-glass workflows.
 
 ### Operator Integration
 
-The Kubernetes operator integration lives in `go/pkg/operator`. The Zig HA
+The Kubernetes operator integration lives in Colony's operator. The Zig HA
 planner is a portable policy engine; CRD fields, status conditions,
 admin-job targeting, service updates, and promotion automation live in the
 operator package and are covered by its controller test suite
@@ -1449,9 +1449,9 @@ fencing requirements are satisfied by the configured environment.
 ## Operator Runbooks
 
 Hot-standby HA ships with boring operator runbooks, maintained as
-`go/pkg/operator/docs/operations/hot-standby-ha.md`. The summary below is a
+the Colony operator HA runbook. The summary below is a
 pointer into that runbook, which covers the Kubernetes operator path in
-`go/pkg/operator`, the typed `/admin/v1/standby` path generated from
+Colony's operator, the typed `/admin/v1/standby` path generated from
 `specs/openapi/antfly/admin.yaml`, and the supported Zig CLI path. The split
 is explicit:
 
@@ -1595,7 +1595,7 @@ described in [Implementation](#implementation):
   ownership and routing complexity and may need a small metadata consensus
   layer even with WAL-based data replication.
 - **Operator ergonomics polish**: the common-case workflows are covered by
-  `go/pkg/operator/docs/operations/hot-standby-ha.md`, but further work to
+  the Colony operator HA runbook, but further work to
   make edge cases boring (for example, richer degraded-state guidance) can
   continue without changing the core contract.
 - **Operator flag spellings**: the operator still generates the `--ha-*`

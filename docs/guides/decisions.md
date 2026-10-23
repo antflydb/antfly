@@ -135,7 +135,7 @@ set, and `abstained` means the boundary margin failed. These states are distinct
 ```sh
 curl --fail-with-body http://127.0.0.1:8080/ai/v1/decisions \
   -H 'Content-Type: application/json' --data-binary @decision.json
-antfly-inference decisions ./models --request decision.json --backend metal
+antfly inference decisions ./models --request decision.json --backend metal
 ```
 
 The inference listener serves `/decisions` directly (default port 8090).
