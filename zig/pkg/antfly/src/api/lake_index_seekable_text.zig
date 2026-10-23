@@ -255,53 +255,92 @@ pub fn publishSourceReusing(a: A, out: A, store: *stores.ArtifactStore, source: 
             }
         }
     }
-    const Pending = struct { offset: usize, bytes: []const u8, pack_offset: usize, retained: ?Piece, metadata: bool };
+    const Pending = struct { offset: usize, bytes: []const u8, pack_offset: usize, pack_slot: usize, retained: ?Piece, metadata: bool };
     var position: usize = 0;
     var meta: usize = 0;
+    var ahead: ?*PackReadAhead = null;
+    defer if (ahead) |job| job.deinit(store.io_phase.?.io);
     while (position < length) {
         try cancellation.check();
         var wave = std.heap.ArenaAllocator.init(a);
         defer wave.deinit();
         const wa = wave.allocator();
-        const end = @min(length, position + pack_bytes);
-        const payload = if (source == .contiguous) source.contiguous[position..end] else blk: {
-            const bytes = try wa.alloc(u8, end - position);
-            try source.readInto(position, bytes);
-            break :blk bytes;
-        };
-        var pending: std.ArrayList(Pending) = .empty;
-        var changed: std.ArrayList(u8) = .empty;
-        var offset = position;
-        while (offset < end) {
-            while (meta < ranges.len and ranges[meta].offset + ranges[meta].len <= offset) meta += 1;
-            const is_meta = meta < ranges.len and ranges[meta].offset <= offset;
-            const limit = @min(end, if (meta < ranges.len) (if (is_meta) ranges[meta].offset + ranges[meta].len else ranges[meta].offset) else length);
-            if (is_meta and compressed_bundle == null) {
-                offset = limit;
-                continue;
-            }
-            const next = if (is_meta) limit else offset + chunkLength(payload[offset - position .. limit - position]);
-            const bytes = payload[offset - position .. next - position];
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-            const retained = if (!is_meta) previous.pieces.get(digest) else null;
-            const reused = if (retained) |piece| piece.ref.byte_len == bytes.len else false;
-            try pending.append(wa, .{ .offset = offset, .bytes = bytes, .pack_offset = changed.items.len, .retained = if (reused) retained else null, .metadata = is_meta });
-            if (!reused) try changed.appendSlice(wa, bytes);
-            offset = next;
+        var contents: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
+        var count: usize = 0;
+        var next = position;
+        const reuse_width = @max(1, @min(uploadWidth(a, store), (@import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse 0) / (4 * pack_bytes)));
+        const width = if (store.io_phase != null and @import("lake_index_segment_spill.zig").LocalSegment.readAheadSource(source) != null)
+            @min(reuse_width, @max(1, store.io_phase.?.max_parallel -| 1))
+        else
+            reuse_width;
+        const ready = ahead;
+        ahead = null;
+        defer if (ready) |job| job.deinit(store.io_phase.?.io);
+        if (ready) |job| {
+            try job.join(store);
+            count = job.count;
+            for (contents[0..count], 0..) |*payload, i| payload.* = job.bytes[i * pack_bytes .. @min(job.bytes.len, (i + 1) * pack_bytes)];
+            next += job.bytes.len;
+        } else while (count < width and next < length) : (count += 1) {
+            const end = @min(length, next + pack_bytes);
+            contents[count] = if (source == .contiguous) source.contiguous[next..end] else blk: {
+                const bytes = try wa.alloc(u8, end - next);
+                try source.readInto(next, bytes);
+                break :blk bytes;
+            };
+            next = end;
         }
-        const pack = if (changed.items.len != 0) try upload(ca, store, changed.items, cancellation) else null;
-        previous.uploaded_bytes += changed.items.len;
+        if (next < length) ahead = PackReadAhead.start(a, store, source, next, width, cancellation);
+        var pending: std.ArrayList(Pending) = .empty;
+        var uploads: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
+        var upload_count: usize = 0;
+        var base = position;
+        for (contents[0..count]) |payload| {
+            const end = base + payload.len;
+            var changed: std.ArrayList(u8) = .empty;
+            var offset = base;
+            while (offset < end) {
+                while (meta < ranges.len and ranges[meta].offset + ranges[meta].len <= offset) meta += 1;
+                const is_meta = meta < ranges.len and ranges[meta].offset <= offset;
+                const limit = @min(end, if (meta < ranges.len) (if (is_meta) ranges[meta].offset + ranges[meta].len else ranges[meta].offset) else length);
+                if (is_meta and compressed_bundle == null) {
+                    offset = limit;
+                    continue;
+                }
+                const following = if (is_meta) limit else offset + chunkLength(payload[offset - base .. limit - base]);
+                const bytes = payload[offset - base .. following - base];
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+                const retained = if (!is_meta) previous.pieces.get(digest) else null;
+                const reused = if (retained) |piece| piece.ref.byte_len == bytes.len else false;
+                try pending.append(wa, .{ .offset = offset, .bytes = bytes, .pack_offset = changed.items.len, .pack_slot = upload_count, .retained = if (reused) retained else null, .metadata = is_meta });
+                if (!reused) try changed.appendSlice(wa, bytes);
+                offset = following;
+            }
+            if (changed.items.len != 0) {
+                uploads[upload_count] = changed.items;
+                upload_count += 1;
+            }
+            previous.uploaded_bytes += changed.items.len;
+            base = end;
+        }
+        // One bounded transport wave shares fresh publication's admission and
+        // drain contract. Retained ranges keep their original immutable packs.
+        var uploaded: [stores.ArtifactStore.max_upload_batch]stores.ArtifactMetadata = undefined;
+        try store.putBatchWithCancellation(if (store.io_phase) |phase| phase.io else null, uploads[0..upload_count], uploaded[0..upload_count], cancellation);
+        defer for (uploaded[0..upload_count]) |*item| item.deinit(store.allocator);
+        var packs: [stores.ArtifactStore.max_upload_batch]Ref = undefined;
+        for (uploaded[0..upload_count], packs[0..upload_count]) |item, *pack| pack.* = .{ .artifact_id = try ca.dupe(u8, item.artifact_id), .checksum = try ca.dupe(u8, item.checksum), .byte_len = item.byte_len };
         for (pending.items) |item| {
             const piece = if (item.retained) |retained| blk: {
                 var result = retained;
                 result.offset = item.offset;
                 previous.reused_bytes += item.bytes.len;
                 break :blk result;
-            } else try packedPiece(ca, pack.?, item.offset, item.pack_offset, item.bytes);
+            } else try packedPiece(ca, packs[item.pack_slot], item.offset, item.pack_offset, item.bytes);
             if (item.metadata) try metadata.append(ca, piece) else try blocks.append(ca, piece);
         }
-        position = end;
+        position = next;
     }
     const directory: Directory = .{ .version = if (compressed_bundle != null) 5 else 4, .metadata_bundle = compressed_bundle, .metadata_decoded_bytes = decoded_bytes, .bytes = length, .metadata = metadata.items, .blocks = blocks.items, .terms = &.{} };
     try directory.validate();
@@ -2468,7 +2507,8 @@ test "external lake seekable source publication pipelines local reads and drains
     var output = std.heap.ArenaAllocator.init(a);
     defer output.deinit();
     const expected = try publish(a, output.allocator(), &store, bytes, .none);
-    for ([_]usize{ 1, 3 }) |lanes| {
+    const old = try publish(a, output.allocator(), &store, &.{0}, .none);
+    for ([_]bool{ false, true }) |reusing| for ([_]usize{ 1, 3 }) |lanes| {
         var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = lanes, .max_bytes = 128 * 1024 * 1024 };
         var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 1024 };
         try execution.enter(std.testing.io);
@@ -2477,13 +2517,15 @@ test "external lake seekable source publication pipelines local reads and drains
         store.io_phase = phase.capability();
         defer store.io_phase = null;
         staged.test_ahead_reads.store(0, .monotonic);
-        const actual = try publishSource(a, output.allocator(), &store, staged.source(), .none);
+        const reuse = if (reusing) (try Reuse.create(a, store, &.{old}, .none)).? else null;
+        defer if (reuse) |prior| prior.deinit();
+        const actual = try publishSourceReusing(a, output.allocator(), &store, staged.source(), .none, null, reuse);
         try std.testing.expectEqualStrings(expected.artifact_id, actual.artifact_id);
         try std.testing.expectEqual(lanes > 1, staged.test_ahead_reads.load(.monotonic) > 0);
         try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
         try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
         try std.testing.expect(execution.active);
-    }
+    };
 }
 
 test "external lake source pack upload failure and cancellation drain pending local read ahead" {
@@ -2517,10 +2559,16 @@ test "external lake source pack upload failure and cancellation drain pending lo
     var phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
     store.io_phase = phase.capability();
     defer store.io_phase = null;
+    const prior = try publish(a, a, &store, &.{0}, .none);
+    defer a.free(prior.artifact_id);
+    defer a.free(prior.checksum);
+    const reuse = (try Reuse.create(a, store, &.{prior}, .none)).?;
+    defer reuse.deinit();
     var vtable = store.vtable.*;
     vtable.put_scoped = Fail.put;
     store.vtable = &vtable;
     try std.testing.expectError(error.TestUploadFailed, publishSource(a, a, &store, staged.source(), .none));
+    try std.testing.expectError(error.TestUploadFailed, publishSourceReusing(a, a, &store, staged.source(), .none, null, reuse));
     try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
     try std.testing.expect(execution.active);

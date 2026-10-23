@@ -421,6 +421,11 @@ pub fn publishReaderWithIo(a: A, store: *stores.ArtifactStore, segment: *local.s
 }
 /// The immutable source remains caller-owned, including file-backed outputs.
 pub fn publishReaderConsuming(a: A, store: *stores.ArtifactStore, segment: *local.segment.SegmentReader, cancellation: Cancellation, io: ?std.Io, consumer: anytype) !?Ref {
+    return publishReaderFiltered(a, store, segment, cancellation, io, consumer, null, null);
+}
+/// Exact DF retractions seek only removed ordinals; retained postings and
+/// positions remain encoded. Bounds may include removed rows conservatively.
+pub fn publishReaderFiltered(a: A, store: *stores.ArtifactStore, segment: *local.segment.SegmentReader, cancellation: Cancellation, io: ?std.Io, consumer: anytype, deleted: ?*const local.encoding_roaring.RoaringBitmap, removed_lengths: ?*std.StringHashMapUnmanaged(u64)) !?Ref {
     const names = try a.alloc([]const u8, segment.fields.len);
     defer a.free(names);
     for (segment.fields, names) |field, *name| name.* = field.name;
@@ -433,6 +438,9 @@ pub fn publishReaderConsuming(a: A, store: *stores.ArtifactStore, segment: *loca
         a: A,
         segment: *local.segment.SegmentReader,
         consumer: @TypeOf(consumer),
+        deleted: ?*const local.encoding_roaring.RoaringBitmap,
+        removed_lengths: ?*std.StringHashMapUnmanaged(u64),
+        token: Cancellation,
         names: []const []const u8,
         position: usize = 0,
         field: []const u8 = "",
@@ -453,6 +461,34 @@ pub fn publishReaderConsuming(a: A, store: *stores.ArtifactStore, segment: *loca
                     self.key = null;
                     self.key = try keyAlloc(self.a, self.field, entry.term);
                     var summary: Summary = .{ .frequency = entry.result.docFreq(), .max_frequency = std.math.maxInt(u32), .min_norm = 0 };
+                    if (self.deleted) |deleted_| {
+                        var postings = try entry.result.iterator(self.a);
+                        defer postings.deinit();
+                        var rows = deleted_.iterator();
+                        var removed: u32 = 0;
+                        var length: u64 = 0;
+                        var pending: ?inverted.PostingsIterator.Hit = null;
+                        while (rows.next()) |doc| {
+                            try self.token.check();
+                            // advanceTo consumes its returned candidate. Keep
+                            // an overshoot until the next retired ordinal can
+                            // match it, including inline one-hit terms.
+                            if (pending == null or pending.?.doc_id < doc) pending = try postings.advanceTo(doc);
+                            const hit = pending orelse break;
+                            if (hit.doc_id == doc) {
+                                removed += 1;
+                                length += hit.freq;
+                            }
+                        }
+                        summary.frequency = try std.math.sub(u32, summary.frequency, removed);
+                        if (self.removed_lengths) |lengths| {
+                            const value = try lengths.getOrPut(self.a, self.field);
+                            if (!value.found_existing) value.value_ptr.* = 0;
+                            value.value_ptr.* += length;
+                        }
+                        if (summary.frequency == 0) continue;
+                    }
+
                     switch (entry.result) {
                         .one_hit => |hit| {
                             summary.max_frequency = 0;
@@ -485,7 +521,7 @@ pub fn publishReaderConsuming(a: A, store: *stores.ArtifactStore, segment: *loca
             }
         }
     };
-    var source: Source = .{ .a = a, .segment = segment, .names = names, .consumer = consumer };
+    var source: Source = .{ .a = a, .segment = segment, .names = names, .consumer = consumer, .deleted = deleted, .removed_lengths = removed_lengths, .token = cancellation };
     defer source.close();
     defer if (source.key) |key| a.free(key);
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;

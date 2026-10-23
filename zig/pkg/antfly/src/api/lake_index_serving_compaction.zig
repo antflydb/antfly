@@ -37,11 +37,12 @@ const Input = struct {
     sources: []const Span,
     original_docs: u32,
     summary: ?corpus.statistics.Ref,
-    const Wire = struct { ref: ?Chunk, admission: local.segment.SegmentReader.Admission, sources: []const Span, original_docs: u32, summary: ?corpus.statistics.Ref };
+    masked: bool = false,
+    const Wire = struct { ref: ?Chunk, admission: local.segment.SegmentReader.Admission, sources: []const Span, original_docs: u32, summary: ?corpus.statistics.Ref, masked: bool = false };
     fn copy(self: Input, a: A) !Input {
-        const bytes = try std.json.Stringify.valueAlloc(a, Wire{ .ref = self.ref, .admission = self.admission, .sources = self.sources, .original_docs = self.original_docs, .summary = self.summary }, .{});
+        const bytes = try std.json.Stringify.valueAlloc(a, Wire{ .ref = self.ref, .admission = self.admission, .sources = self.sources, .original_docs = self.original_docs, .summary = self.summary, .masked = self.masked }, .{});
         const wire = try std.json.parseFromSliceLeaky(Wire, a, bytes, .{ .allocate = .alloc_always });
-        return .{ .ref = wire.ref, .staged = self.staged, .admission = wire.admission, .sources = wire.sources, .original_docs = wire.original_docs, .summary = wire.summary };
+        return .{ .ref = wire.ref, .staged = self.staged, .admission = wire.admission, .sources = wire.sources, .original_docs = wire.original_docs, .summary = wire.summary, .masked = wire.masked };
     }
 };
 const Builder = struct {
@@ -73,6 +74,7 @@ const Builder = struct {
     pending_arena: [4]std.heap.ArenaAllocator,
     metadata_bytes: [4]usize = @splat(0),
     pack_count: u32 = 0,
+    masked_documents: u32 = 0,
     serving_bytes: u64 = 0,
     serving_metadata_bytes: ?u64 = 0,
     fn check(self: *@This()) !void {
@@ -80,6 +82,12 @@ const Builder = struct {
         try self.token.check();
     }
     fn contribution(self: *@This(), group: corpus.FileGroup, sign: i64) !void {
+        if (group.masked) {
+            var live: u32 = 0;
+            for (group.sources) |span| live = try std.math.add(u32, live, span.count);
+            const dead = try std.math.sub(u32, group.admissions[0].doc_count, live);
+            self.masked_documents = if (sign < 0) try std.math.sub(u32, self.masked_documents, dead) else try std.math.add(u32, self.masked_documents, dead);
+        }
         if (!self.collect_term_deltas) return;
         for (group.summaries, group.segments) |summary, segment| try self.terms.add(self.pages.store(), summary, corpus.term_directory.identity(segment.artifact_id), sign);
     }
@@ -98,6 +106,9 @@ const Builder = struct {
         }
     }
     fn add(self: *@This(), input: Input) !void {
+        // A bounded posting delta retains its physical base for one cut. The
+        // next affected refresh compacts it; never merge unrelated work here.
+        if (input.masked) return self.emit(&.{input}, 0);
         var level: usize = 0;
         var threshold: usize = 8;
         while (level < 3 and input.sources.len >= threshold) : (level += 1) threshold *= 8;
@@ -158,17 +169,17 @@ const Builder = struct {
         var count: u32 = 0;
         for (inputs) |input| for (input.sources) |span_| {
             var span = span_;
-            span.pack_lower = count;
+            if (!input.masked) span.pack_lower = count;
             count = try std.math.add(u32, count, span.count);
             try sources.append(out, span);
         };
         if (count == 0) return;
-        const reuse = inputs.len == 1 and count == inputs[0].original_docs;
+        const reuse = inputs.len == 1 and (count == inputs[0].original_docs or inputs[0].masked);
         var group: corpus.FileGroup = undefined;
         var contributed = false;
         if (reuse and inputs[0].staged == null) {
             const input = inputs[0];
-            group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{input.ref.?}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{input.admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{input.summary}) };
+            group = .{ .file = undefined, .sources = sources.items, .masked = input.masked, .segments = try out.dupe(Chunk, &.{input.ref.?}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{input.admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{input.summary}) };
         } else {
             const staged = (if (reuse and inputs[0].staged != null) blk: {
                 const retained = inputs[0].staged.?;
@@ -391,6 +402,7 @@ fn publishDeltaWithStagingLimit(a: A, out: A, store: *stores.ArtifactStore, curr
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     if (prior) |old| {
+        builder.masked_documents = old.ordinalDocuments() - old.collection.?.documents;
         builder.collect_term_deltas = old.term_directory.leaves != null;
         if (old.source_routes_version == 0 or old.tie_bounds == null) {
             for (try corpus.text_directory.fileRecordsPublication(ca, old, store.*, token)) |record| {
@@ -456,7 +468,12 @@ fn publishDeltaWithStagingLimit(a: A, out: A, store: *stores.ArtifactStore, curr
         const physical = group.physical_manifest orelse return error.InvalidNativeLakeTextCorpus;
         const rows: u32 = @intCast(try corpus.physical.validate(group.rows));
         var lower: u32 = 0;
-        for (group.segments, group.admissions, group.summaries) |segment, admission, summary| {
+        for (group.segments, group.admissions, group.summaries, 0..) |segment, admission, summary, ordinal| {
+            if (group.parts.len != 0) {
+                try builder.add(.{ .ref = segment, .admission = admission, .sources = group.parts[ordinal], .original_docs = admission.doc_count, .summary = summary, .masked = true });
+                for (group.parts[ordinal]) |span| lower = try std.math.add(u32, lower, span.count);
+                continue;
+            }
             const span: Span = .{ .file = group.file, .physical = physical, .file_rows = rows, .file_lower = lower, .pack_lower = 0, .count = admission.doc_count };
             try builder.add(.{ .ref = segment, .admission = admission, .sources = &.{span}, .original_docs = admission.doc_count, .summary = summary });
             lower = try std.math.add(u32, lower, admission.doc_count);
@@ -477,6 +494,7 @@ fn publishDeltaWithStagingLimit(a: A, out: A, store: *stores.ArtifactStore, curr
     root.directories = try metadata.finish(if (prior) |old| old.directories else .{});
     root.file_count = builder.pack_count;
     root.segment_count = builder.pack_count;
+    root.physical_documents = if (builder.masked_documents == 0) null else try std.math.add(u32, root.collection.?.documents, builder.masked_documents);
     if (!builder.collect_term_deltas) {
         // A disabled directory supplies no complete base for signed deltas.
         // Bootstrap positive contributions from the final serving inventory,

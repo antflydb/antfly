@@ -164,24 +164,15 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     try opening.finish();
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    var key: std.ArrayList(u8) = .empty;
-    defer key.deinit(a);
     while (true) {
         var phase = try store.beginIo(1);
         defer phase.abort();
         const next = source.next(a) catch |err| return phase.failed(err);
         try phase.finish();
         const batch = next orelse break;
-        var bound = try tuple.bindExternalBatch(a, batch);
-        defer bound.deinit();
-        const ids = try a.alloc([32]u8, batch.rowCount());
-        defer a.free(ids);
-        for (ids, 0..) |*id, row| {
-            try token.check();
-            key.clearRetainingCapacity();
-            if (try bound.append(a, &key, row)) return error.NullLogicalRowKey;
-            id.* = try identity.logical.keyId(namespace, key.items);
-        }
+        const proof = try @import("lake_row_verification.zig").compute(a, tuple, namespace, batch, builder.cohorts, token, provider.context, store.io_phase);
+        defer proof.deinit();
+        const ids = proof.ids;
         if (capture_out.*) |capture| capture.add(batch, ids, store) catch |err| {
             if (!capture.optionalFailure(err)) return err;
             capture.deinit();
@@ -189,36 +180,14 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
             manager.max_bytes = provider.identity_spill_bytes;
         };
 
-        const input_plans = try a.alloc(fingerprints.Plan, builder.cohorts.len);
-        var bound_inputs: usize = 0;
-        defer {
-            for (input_plans[0..bound_inputs]) |*plan| plan.deinit();
-            a.free(input_plans);
-        }
-        for (builder.cohorts, input_plans) |recipe_, *plan| {
-            plan.* = try fingerprints.Plan.bind(a, recipe_.digest, batch, recipe_.columns);
-            bound_inputs += 1;
-        }
-        const input_tiles = try a.alloc([64]identity.logical.Digest, input_plans.len);
-        defer a.free(input_tiles);
-        const row_inputs = try a.alloc(identity.logical.Digest, builder.cohorts.len);
-        defer a.free(row_inputs);
-        var kernels = try fingerprints.Kernels.init(a, input_plans);
-        defer kernels.deinit();
-        const tile_rows = 64;
         for (0..batch.rowCount()) |row| {
-            if (row % tile_rows == 0) {
-                const count = @min(tile_rows, batch.rowCount() - row);
-                try kernels.fill(a, row, count, input_tiles);
-            }
-            for (row_inputs, input_tiles) |*value, tile| value.* = tile[row % tile_rows];
             try token.check();
             try provider.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
             const ref = batch.rowRef(row);
             if (ref != .external) return error.InvalidLogicalRowIdentity;
             const slot = by_file.get(ref.external.file_id) orelse return error.InvalidLogicalRowIdentity;
-            try builder.addWithInputs(.{ .id = ids[row], .values = ids[row] }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, row_inputs);
+            try builder.addWithInputs(.{ .id = ids[row], .values = ids[row] }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, proof.row(row));
         }
     }
     try extendInputs(a, builder, provider, store, &tuple, namespace, contract, by_file, token);

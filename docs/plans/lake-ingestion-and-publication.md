@@ -3816,3 +3816,22 @@ key directories without physical immutability. The real Parquet/Iceberg E2Es als
 compare grouped COUNT/SUM/MIN/MAX against a separate physical-scan table across
 rewrites, updates, membership changes and restart. Archive/cloud latency remains a
 separate measurement; these checks assert work bounds and result equivalence.
+
+### Publication refinements under reader protocol 79
+
+The [row-identity contract](lake-row-identity.md#bounded-posting-deltas-and-ordered-extrema-reader-protocol-79)
+now specifies bounded native posting deltas, durable ordered extrema and parallel
+typed rewrite verification. Text updates may retain one complete immutable base
+plus one changed-row segment, with generation-private tombstones and exact live
+DF/field totals. Physical ordinals stay distinct from the live scoring population.
+Mixed bases and subsequent affected updates use the existing bounded compactor.
+GC and retention tracing retain every referenced base, physical map and summary.
+
+Ordered MIN/MAX state removes affected-group refolding for COUNT/integer-SUM/
+extrema cohorts, and shares the existing typed scalar ordering and row-state
+publication. Typed proof kernels run on bounded shared CPU lanes, while duplicate
+validation, payload capture and final adoption remain coordinator-owned.
+Reuse-aware posting publication also batches changed pack uploads and overlaps
+local capture under the same cancellation/admission contract as fresh builds.
+These paths preserve inline/full-construction fallbacks when optional work cannot
+be admitted. No archive-scale speedup is claimed without measurement.

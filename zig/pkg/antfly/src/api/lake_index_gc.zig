@@ -447,6 +447,7 @@ pub const Collector = struct {
                     if (leaf.row_state) |rows| {
                         try self.markPages(a, index.domain, rows.rows, false);
                         try self.markPages(a, index.domain, rows.reverse, false);
+                        try self.markPages(a, index.domain, rows.extrema, false);
                     }
                 }
                 for (leaf.blocks) |child| _ = try self.mark(child);

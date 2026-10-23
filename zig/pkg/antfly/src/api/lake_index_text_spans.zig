@@ -44,17 +44,21 @@ pub fn planningBytes(payload: u64, metadata: u64) u64 {
     return payload +| (metadata *| 4);
 }
 pub fn validate(spans: []const Span, count: u32, domain: [32]u8) !void {
+    return validateMode(spans, count, domain, false);
+}
+pub fn validateMode(spans: []const Span, count: u32, domain: [32]u8, masked: bool) !void {
     if (spans.len == 0 or spans.len > max_spans) return error.InvalidNativeLakeTextCorpus;
     var lower: u32 = 0;
     for (spans) |span| {
         try state.validate(&.{span.file}, domain);
-        if (span.count == 0 or span.pack_lower != lower or @as(u64, span.file_lower) + span.count > span.file_rows or span.physical.byte_len == 0 or span.physical.byte_len > 4 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
+        if (span.count == 0 or (if (masked) span.pack_lower < lower else span.pack_lower != lower) or @as(u64, span.file_lower) + span.count > span.file_rows or span.physical.byte_len == 0 or span.physical.byte_len > 4 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
         try stores.validateSha256ArtifactIdentity(span.physical.artifact_id, span.physical.checksum);
         const scope = (try stores.uploadScopeFromArtifactId(span.physical.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
         if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
-        lower = try std.math.add(u32, lower, span.count);
+        lower = try std.math.add(u32, span.pack_lower, span.count);
+        if (lower > count) return error.InvalidNativeLakeTextCorpus;
     }
-    if (lower != count) return error.InvalidNativeLakeTextCorpus;
+    if (!masked and lower != count) return error.InvalidNativeLakeTextCorpus;
 }
 
 /// v10 packs contain complete single-run members; reject ambiguous subsets.

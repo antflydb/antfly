@@ -65,37 +65,95 @@ const GroupDelta = struct {
     }
 };
 fn invertible(recipe: Recipe) bool {
-    for (recipe.inputs) |input| if (!(input.spec.kind == .count or (input.spec.kind == .sum and input.spec.input_type == .integer))) return false;
+    for (recipe.inputs) |input| if (!(input.spec.kind == .count or (input.spec.kind == .sum and input.spec.input_type == .integer) or input.spec.kind == .min or input.spec.kind == .max)) return false;
     return true;
 }
-fn adjust(a: A, previous: ?[]const u8, delta: GroupDelta, layout: *const record.Layout) ![]u8 {
-    const before = previous orelse {
-        if (delta.removed != null or delta.added == null) return error.InvalidNativeAggregateArtifact;
-        return a.dupe(u8, delta.added.?);
-    };
-    if (delta.removed == null) return if (delta.added) |added| record.merge(a, before, added, layout) else a.dupe(u8, before);
+fn hasExtrema(recipe: Recipe) bool {
+    for (recipe.inputs) |input| if (input.spec.kind == .min or input.spec.kind == .max) return true;
+    return false;
+}
+fn extremumPrefix(a: A, group: []const u8, slot: usize) ![]u8 {
+    const result = try a.alloc(u8, group.len + 2);
+    @memcpy(result[0..group.len], group);
+    std.mem.writeInt(u16, result[group.len..][0..2], @intCast(slot), .big);
+    return result;
+}
+fn indexExtrema(a: A, mutations: *Mutations, group: []const u8, ordinal: u64, value: record.View, recipe: Recipe, removing: bool) !void {
+    for (recipe.inputs, 0..) |input, slot| {
+        if (input.spec.kind != .min and input.spec.kind != .max) continue;
+        const cell = try value.finish(a, slot, input.spec);
+        if (cell.sql_null) continue;
+        var key: std.ArrayList(u8) = .empty;
+        defer key.deinit(a);
+        try key.appendSlice(a, try extremumPrefix(a, group, slot));
+        try local.storage_db_relational_index_keys.appendSqlScalar(a, &key, cell, false);
+        var row: [8]u8 = undefined;
+        std.mem.writeInt(u64, &row, ordinal, .big);
+        try key.appendSlice(a, &row);
+        if (key.items.len > tree.max_key_bytes) return error.RelationalIndexKeyTooLarge;
+        try mutations.addRecord(key.items, if (removing) null else &row);
+    }
+}
+fn adjust(a: A, previous: ?[]const u8, delta: GroupDelta, layout: *const record.Layout, recipe: Recipe, rows: artifact.RowState, storage: tree.Store, group: []const u8) ![]u8 {
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     const sa = scratch.allocator();
-    const original = try record.View.init(before, layout);
-    const removed = try record.View.init(delta.removed.?, layout);
+    const before = if (previous) |value| try record.View.init(value, layout) else null;
+    const removed = if (delta.removed) |value| try record.View.init(value, layout) else null;
+    const added = if (delta.added) |value| try record.View.init(value, layout) else null;
+    if (before == null and removed != null) return error.InvalidNativeAggregateArtifact;
     const states = try sa.alloc(local.sql_operators.Aggregate, layout.slots.len);
-    for (states, layout.slots, 0..) |*state, slot, i| {
-        state.* = try original.read(sa, i);
-        const retired = try removed.read(sa, i);
-        if (retired.count > state.count) return error.InvalidNativeAggregateArtifact;
-        state.count -= retired.count;
-        if (slot.spec.kind == .sum) state.integer_sum = std.math.sub(i128, state.integer_sum, retired.integer_sum) catch return error.SqlNumericOutOfRange;
+    for (states, recipe.inputs, 0..) |*state, input, slot| {
+        state.* = try local.sql_operators.Aggregate.initTyped(sa, input.spec.kind, input.spec.input_type, input.spec.input_element);
+        if (input.spec.kind == .min or input.spec.kind == .max) {
+            const lower = try extremumPrefix(sa, group, slot);
+            const upper = try keys.successor(sa, lower);
+            const count = try tree.countRange(sa, storage, rows.extrema, lower, upper);
+            if (count == 0) continue;
+            var cursor = if (input.spec.kind == .max) try tree.Cursor.initReverse(sa, storage, rows.extrema, lower, upper) else try tree.Cursor.init(sa, storage, rows.extrema, lower, upper);
+            defer cursor.deinit();
+            const winner = (try cursor.next()) orelse return error.InvalidNativeAggregateArtifact;
+            if (winner.value.len != 8) return error.InvalidNativeAggregateArtifact;
+            var ordinal = std.mem.readInt(u64, winner.value[0..8], .big);
+            if (input.spec.kind == .max) {
+                // Equal scalar values retain the first row's representation,
+                // including signed zero and exact NUMERIC display scale.
+                if (winner.key.len < 8) return error.InvalidNativeAggregateArtifact;
+                const value_prefix = winner.key[0 .. winner.key.len - 8];
+                var first = try tree.Cursor.init(sa, storage, rows.extrema, value_prefix, try keys.successor(sa, value_prefix));
+                defer first.deinit();
+                const tied = (try first.next()) orelse return error.InvalidNativeAggregateArtifact;
+                if (tied.value.len != 8) return error.InvalidNativeAggregateArtifact;
+                ordinal = std.mem.readInt(u64, tied.value[0..8], .big);
+            }
+            const key = try rowKey(sa, group, ordinal);
+            var row = try tree.Cursor.init(sa, storage, rows.rows, key, null);
+            defer row.deinit();
+            const contribution = (try row.next()) orelse return error.InvalidNativeAggregateArtifact;
+            if (!std.mem.eql(u8, contribution.key, key)) return error.InvalidNativeAggregateArtifact;
+            state.* = try (try record.View.init(contribution.value, layout)).read(sa, slot);
+            if (state.count != 1) return error.InvalidNativeAggregateArtifact;
+            state.count = count;
+            if (state.numeric) |numeric| numeric.state.count = count;
+            continue;
+        }
+        if (before) |value| state.* = try value.read(sa, slot);
+        if (removed) |value| {
+            const retired = try value.read(sa, slot);
+            if (retired.count > state.count) return error.InvalidNativeAggregateArtifact;
+            state.count -= retired.count;
+            if (input.spec.kind == .sum) state.integer_sum = std.math.sub(i128, state.integer_sum, retired.integer_sum) catch return error.SqlNumericOutOfRange;
+        }
+        if (added) |value| try local.sql_aggregate_partial.merge(state, try value.read(sa, slot));
     }
-    const reduced = try record.encodeWithLayout(sa, .{ .keys = try original.keys(sa), .aggregates = &.{}, .typed_states = states, .ordinal = 0 }, layout.*);
-    return if (delta.added) |added| record.merge(a, reduced, added, layout) else a.dupe(u8, reduced);
+    return record.encodeWithLayout(a, .{ .keys = try (before orelse (added orelse return error.InvalidNativeAggregateArtifact)).keys(sa), .aggregates = &.{}, .typed_states = states, .ordinal = 0 }, layout.*);
 }
 fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, binding: local.serverless_segment_source_binding.Binding, recipe: Recipe, names: []const []const u8, file: usize, prior: ?Ref, budget: *@import("../serverless/build/lake_build_limits.zig").Budget, token: Token) ![]Ref {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
     const seed = if (prior) |ref| try artifact.rowSeed(ca, store.*, ref, recipe, token) else null;
-    const selected = if (seed != null) provider.rowsForFile(file) else null;
+    const selected = if (seed != null and (!hasExtrema(recipe) or seed.?.rows.extrema_version == 1)) provider.rowsForFile(file) else null;
     const old = if (selected != null) seed else null;
     var reads: u64 = 0;
     var writes: u64 = 0;
@@ -115,6 +173,11 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
     var reverse = Mutations.init(a, &manager, pages.store());
     defer reverse.deinit();
     reverse.private_pages.phase = store.io_phase;
+    var extrema = Mutations.init(a, &manager, pages.store());
+    defer extrema.deinit();
+    extrema.addition_first = true;
+    extrema.forest.policy = .addition_first;
+    extrema.private_pages.phase = store.io_phase;
     const layout = try record.Layout.init(a, recipe);
     defer layout.deinit(a);
     var groups: std.StringHashMapUnmanaged(GroupDelta) = .empty;
@@ -140,12 +203,13 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
             slot.value_ptr.* = .{};
         }
         const row_key = try rowKey(ca, group, ordinal);
-        if (invertible(recipe)) {
+        if (invertible(recipe) or hasExtrema(recipe)) {
             var rows = try tree.Cursor.init(a, pages.store(), before.rows.rows, row_key, null);
             defer rows.deinit();
             const value = (try rows.next()) orelse return error.InvalidNativeAggregateArtifact;
             if (!std.mem.eql(u8, value.key, row_key)) return error.InvalidNativeAggregateArtifact;
-            try slot.value_ptr.append(a, value.value, &layout, true);
+            if (invertible(recipe)) try slot.value_ptr.append(a, value.value, &layout, true);
+            try indexExtrema(ca, &extrema, group, ordinal, try record.View.init(value.value, &layout), recipe, true);
         }
         try changes.addRecord(row_key, null);
     };
@@ -191,6 +255,7 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
             }
             const encoded = try record.encodeWithLayout(sa, .{ .keys = group_keys, .aggregates = &.{}, .typed_states = states, .ordinal = ordinal }, layout);
             try changes.addRecord(try rowKey(sa, group, ordinal), encoded);
+            try indexExtrema(sa, &extrema, group, ordinal, try record.View.init(encoded, &layout), recipe, false);
             var reverse_key: [8]u8 = undefined;
             std.mem.writeInt(u64, &reverse_key, ordinal, .big);
             try reverse.addRecord(&reverse_key, group);
@@ -204,7 +269,7 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
         }
     }
     if (seen != (if (old != null) selected.?.len else provider.source.inventory.files[file].row_count)) return error.InvalidNativeAggregateArtifact;
-    const row_state: artifact.RowState = .{ .rows = try changes.finish(if (old) |seed_| seed_.rows.rows else null), .reverse = try reverse.finish(if (old) |seed_| seed_.rows.reverse else null) };
+    const row_state: artifact.RowState = .{ .rows = try changes.finish(if (old) |seed_| seed_.rows.rows else null), .reverse = try reverse.finish(if (old) |seed_| seed_.rows.reverse else null), .extrema_version = 1, .extrema = try extrema.finish(if (old) |seed_| seed_.rows.extrema else null) };
     if ((if (row_state.rows) |root| root.records else 0) != provider.source.inventory.files[file].row_count or (if (row_state.reverse) |root| root.records else 0) != provider.source.inventory.files[file].row_count) return error.InvalidNativeAggregateArtifact;
     var result_changes = Mutations.init(a, &manager, pages.store());
     defer result_changes.deinit();
@@ -229,7 +294,7 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
             defer cursor.deinit();
             const found = try cursor.next();
             const previous = if (found) |value| (if (std.mem.eql(u8, value.key, group.*[4..])) value.value else null) else null;
-            const updated = try adjust(a, previous, item.value_ptr.*, &layout);
+            const updated = try adjust(a, previous, item.value_ptr.*, &layout, recipe, row_state, pages.store(), group.*);
             defer a.free(updated);
             try result_changes.addRecord(group.*[4..], updated);
             continue;
@@ -250,6 +315,13 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
 }
 
 test "external lake aggregate row deltas gather only changed rows and retract moved extrema nulls" {
+    try aggregateRowScenario(.integer);
+}
+test "external lake ordered extrema retain strings and exact NUMERIC across row retractions" {
+    try aggregateRowScenario(.string);
+    try aggregateRowScenario(.numeric);
+}
+fn aggregateRowScenario(comptime mode: enum { integer, string, numeric }) !void {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -265,7 +337,9 @@ test "external lake aggregate row deltas gather only changed rows and retract mo
     const Rows = local.storage_rowsource_types;
     const Fixture = struct {
         keys: [4][]const u8 = .{ "a", "a", "b", "b" },
-        values: [4]i64 = .{ 1, 5, 10, 20 },
+        values: [4]i64 = if (mode == .numeric) .{ 9007199254740993, 9007199254740994, 9007199254740995, 9007199254740996 } else if (mode == .string) .{ 2, 10, 3, 20 } else .{ 1, 5, 10, 20 },
+        text_buffers: [4][64]u8 = undefined,
+        texts: [4][]const u8 = undefined,
         null_first: bool = false,
         selected: ?[]const u64 = null,
         finished: bool = false,
@@ -297,12 +371,13 @@ test "external lake aggregate row deltas gather only changed rows and retract mo
                 const index: usize = if (self.selected) |selected| @intCast(selected[position]) else position;
                 self.selected_keys[position] = self.keys[index];
                 self.selected_values[position] = self.values[index];
+                self.texts[position] = try std.fmt.bufPrint(&self.text_buffers[position], "{d}", .{self.values[index]});
                 if (index == 0 and self.null_first) self.nulls[position] = 1;
                 self.refs[position] = .{ .external = .{ .source_id = "source", .snapshot_id = "snapshot", .file_id = "fragment", .row_group_ordinal = 0, .row_ordinal = index } };
             }
             self.columns = .{
                 .{ .name = "k", .values = .{ .bytes = self.selected_keys[0..count] } },
-                .{ .name = "n", .nulls = .{ .bytes = self.nulls[0..count] }, .values = .{ .i64 = self.selected_values[0..count] } },
+                .{ .name = "n", .nulls = .{ .bytes = self.nulls[0..count] }, .values = if (mode == .integer) .{ .i64 = self.selected_values[0..count] } else .{ .bytes = self.texts[0..count] } },
             };
             self.visited += count;
             return .{ .snapshot = .{ .table_id = "source", .snapshot_id = "snapshot" }, .columns = &self.columns, .row_refs = self.refs[0..count] };
@@ -312,15 +387,22 @@ test "external lake aggregate row deltas gather only changed rows and retract mo
     var input_files = [_]local.serverless_external_source_types.FileEntry{.{ .file_id = @constCast("fragment"), .object_uri = @constCast("file:///fragment"), .row_count = 4, .byte_len = 1, .row_groups = &.{} }};
     var source: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .scanner = undefined, .inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &input_files } };
     var provider: Provider = .{ .source = &source, .context = .{ .io = std.testing.io }, .fragment_rows = .{ .ptr = &fixture, .open = Fixture.open, .open_selected = Fixture.selectedOpen } };
-    const column: local.sql_aggregate_materialization.Key = .{ .path = "n", .type = .integer, .nullable = true };
-    const all: Recipe = .{ .keys = &.{.{ .path = "k", .type = .string, .nullable = false }}, .inputs = &.{
+    const value_type = if (mode == .integer) .integer else if (mode == .string) .string else .number;
+    const element: ?local.sql_array_value.ElementType = if (mode == .numeric) .numeric else null;
+    const column: local.sql_aggregate_materialization.Key = .{ .path = "n", .type = value_type, .element_type = element, .nullable = true };
+    const all: Recipe = .{ .keys = &.{.{ .path = "k", .type = .string, .nullable = false }}, .inputs = if (mode == .integer) &.{
         .{ .spec = .{ .kind = .count }, .column = null },
         .{ .spec = .{ .kind = .sum, .input_type = .integer }, .column = column },
         .{ .spec = .{ .kind = .min, .input_type = .integer }, .column = column },
         .{ .spec = .{ .kind = .max, .input_type = .integer }, .column = column },
+    } else &.{
+        .{ .spec = .{ .kind = .count }, .column = null },
+        .{ .spec = .{ .kind = .min, .input_type = value_type, .input_element = element }, .column = column },
+        .{ .spec = .{ .kind = .max, .input_type = value_type, .input_element = element }, .column = column },
     } };
     const binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .algebraic, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "aggregate-rows", .column_bindings = &.{ "k", "n" } };
     for ([_]bool{ false, true }) |fixed_only| {
+        if (mode != .integer and fixed_only) continue;
         fixture = .{};
         provider.changed_rows = &.{};
         var recipe = all;
@@ -341,7 +423,7 @@ test "external lake aggregate row deltas gather only changed rows and retract mo
                 fixture.values[1] = -7;
             }
             var budget = try @import("../serverless/build/lake_build_limits.zig").Budget.init(.{});
-            const references = (try build(a, out, &store, &provider, binding, recipe, (if (fixed_only) &.{ "count", "sum" } else &.{ "count", "sum", "min", "max" }), 0, previous, &budget, .none)).?;
+            const references = (try build(a, out, &store, &provider, binding, recipe, (if (fixed_only) &.{ "count", "sum" } else if (mode == .integer) &.{ "count", "sum", "min", "max" } else &.{ "count", "min", "max" }), 0, previous, &budget, .none)).?;
             try std.testing.expectEqual(@as(usize, if (step == 0) 4 else 1), fixture.visited);
             previous = references[0];
             const seed = (try artifact.rowSeed(out, store, references[0], recipe, .none)).?;
@@ -362,14 +444,32 @@ test "external lake aggregate row deltas gather only changed rows and retract mo
                     count += 1;
                     if (index == 0 and fixture.null_first) continue;
                     sum += value;
-                    minimum = if (minimum) |prior| @min(prior, value) else value;
-                    maximum = if (maximum) |prior| @max(prior, value) else value;
+                    if (mode == .string) {
+                        const text = try std.fmt.allocPrint(out, "{d}", .{value});
+                        minimum = if (minimum) |prior| if (std.mem.lessThan(u8, text, try std.fmt.allocPrint(out, "{d}", .{prior}))) value else prior else value;
+                        maximum = if (maximum) |prior| if (std.mem.lessThan(u8, try std.fmt.allocPrint(out, "{d}", .{prior}), text)) value else prior else value;
+                    } else {
+                        minimum = if (minimum) |prior| @min(prior, value) else value;
+                        maximum = if (maximum) |prior| @max(prior, value) else value;
+                    }
                 };
                 try std.testing.expectEqual(count, (try view.finish(out, 0, recipe.inputs[0].spec)).value.integer);
                 const expected = [_]?i64{ if (minimum != null) sum else null, minimum, maximum };
-                for (expected[0 .. recipe.inputs.len - 1], 1..) |value, slot| {
+                const values = if (mode == .integer) expected[0 .. recipe.inputs.len - 1] else expected[1..];
+                for (values, 1..) |value, slot| {
                     const actual = try view.finish(out, slot, recipe.inputs[slot].spec);
-                    if (value) |number| try std.testing.expectEqual(number, actual.value.integer) else try std.testing.expect(actual.sql_null);
+                    if (value) |number| {
+                        if (mode == .integer) {
+                            try std.testing.expectEqual(number, actual.value.integer);
+                        } else {
+                            const text = try std.fmt.allocPrint(out, "{d}", .{number});
+                            if (mode == .string) try std.testing.expectEqualStrings(text, actual.value.string) else {
+                                var work: local.sql_array_value.Budget = .{};
+                                const wanted = try local.sql_scalar.numericTextLeaky(out, text, &work);
+                                try std.testing.expectEqual(std.math.Order.eq, try local.sql_scalar.compareDatums(wanted, actual));
+                            }
+                        }
+                    } else try std.testing.expect(actual.sql_null);
                 }
                 groups += 1;
             }
@@ -383,6 +483,10 @@ test "external lake aggregate row deltas gather only changed rows and retract mo
             try collector.markArtifact(out, references[0]);
             try std.testing.expect(collector.marked.contains(&try Pages.identity(domain, seed.rows.rows.?)));
             try std.testing.expect(collector.marked.contains(&try Pages.identity(domain, seed.rows.reverse.?)));
+            if (!fixed_only) {
+                try std.testing.expectEqual(@as(u8, 1), seed.rows.extrema_version);
+                try std.testing.expect(collector.marked.contains(&try Pages.identity(domain, seed.rows.extrema.?)));
+            }
         }
     }
 }

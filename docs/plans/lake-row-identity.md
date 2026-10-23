@@ -806,8 +806,8 @@ caches, and verifies zero payload uploads on an identical repeat.
 These are local structural bounds, not archive throughput measurements. Bounded
 native merges still read retained postings and compute the new native output;
 this refinement reduces provider write amplification without claiming to remove
-that merge cost. A query-visible posting-overlay format would require a separate
-visibility/statistics contract and is not introduced here.
+that merge cost. The bounded posting-delta contract below adds that optimization
+for eligible sparse updates without an unbounded history of query overlays.
 
 Sparse maintenance after serving compaction resolves a complete fragment cover
 through the paged source-to-pack index. It opens only those serving descriptors,
@@ -826,3 +826,65 @@ between publications through the object-store transport. It requires a payload
 change to preserve the untouched text navigation after a preceding sparse text
 update. The posting-merge regression separately exercises mixed-fragment packs
 and proves that unrelated rows and obsolete terms cannot enter the result.
+
+### Bounded posting deltas and ordered extrema (reader protocol 79)
+
+A sparse text update can now retain one immutable native base and publish only
+its changed-row segment. This path admits at most 16 changed rows, 8192 base
+documents and one delta segment. The base must cover one complete logical
+fragment. Mixed-fragment packs and a second affected update use the ordinary
+bounded merge, so readers never follow a recursive delta chain. This is a
+deliberate refresh/query tradeoff: a small update avoids rewriting retained
+postings while the number of query inputs and dead ordinals stays bounded.
+
+Canonical maintenance manifests retain per-segment source spans, the current
+physical row map and exact live collection totals. Serving descriptors carry
+authenticated live ordinal ranges. A private query generation installs their
+complement as native tombstones before publication; sharing a mutable deletion
+cell between generations is forbidden. Masked generations cannot seed physical
+reader sharing into an unmasked generation, including when restored content
+reuses a historical artifact identity.
+
+Exact term frequencies are built by seeking the retired ordinals in each term,
+without decoding their positions or serializing the retained posting lists.
+Removing those frequencies also removes their exact field lengths. Conservative
+block bounds may still include dead rows, but collection counts, field totals,
+DF and term-directory membership describe only live rows. The physical ordinal
+population is recorded separately from the live collection count: ranked windows
+and pending-ingestion offsets use physical ordinals; BM25 uses live statistics.
+Both cuts and their physical maps remain in ordinary GC and retention closure.
+
+Optional delta planning cannot mutate shared DF/directory reducers. A known
+workspace decline therefore selects the existing merge before adoption.
+Cancellation, integrity failures and backing allocation failures remain errors.
+The zero-input row-patch case is an explicit successful empty result rather than
+an invalid corpus or a reason to rescan the fragment.
+
+Keyed aggregate maintenance adds an ordered multiset under its existing row
+state. Keys bind group, reducer slot, native typed value and stable row ordinal;
+values identify the owning row contribution. MIN/MAX seek their current winner
+and count the non-null range after a retraction. Equal values retain the first
+row's representation, including signed zero and NUMERIC display scale. COUNT,
+integer SUM and extrema cohorts no longer refold every row of an affected group.
+Other exact reducer cohorts keep their validated reduction path. Oversized keys,
+legacy state without the multiset and denied optional workspace select complete
+construction. The multiset is authenticated and marked with both row-routing
+trees; protocol 79 prevents an older consumer from overlooking that GC edge.
+
+Rewrite proof construction splits a borrowed typed batch into at most four CPU
+lanes on the shared scheduler. Each lane owns key-expression and fingerprint
+scratch; dictionaries and source vectors stay immutable until all lanes drain.
+Only the coordinator captures payloads and mutates the global uniqueness census.
+Opaque decoders and denied concurrency retain inline execution. CPU admission is
+parked before joining children, including failure and cancellation.
+
+Reuse-aware native publication now shares fresh publication's bounded read-ahead
+and transport batches. Changed packs upload concurrently while retained blocks
+keep their prior locators. Wave width accounts for both source capture and
+changed-byte staging; an opaque or constrained allocator retains width one.
+
+Contracts exercise exact score/row-map parity for replacement and text removal,
+reopening without query caches, closure retention of the historical base, and
+compaction on a subsequent affected update. Typed proof lanes must reproduce
+serial bytes and return admission after null-key errors. Archive-scale speedups
+and live-provider qualification remain unmeasured.

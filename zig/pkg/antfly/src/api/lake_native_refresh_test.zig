@@ -20,15 +20,18 @@ const catalog = local.metadata_lake_index_catalog;
 const identity = @import("lake_row_identity.zig");
 
 test "external lake selective captured publication preserves untouched cohorts across physical rewrites" {
-    try refreshScenario(false, false);
+    try refreshScenario(false, false, false);
 }
 test "external lake selective object publication retains every live map during collection" {
-    try refreshScenario(true, true);
+    try refreshScenario(true, true, false);
 }
 test "external lake selective object publication preserves untouched cohorts without collection" {
-    try refreshScenario(true, false);
+    try refreshScenario(true, false, false);
 }
-fn refreshScenario(object_backend: bool, collect: bool) !void {
+test "external lake empty text refresh publishes nontext updates without rescanning" {
+    try refreshScenario(false, false, true);
+}
+fn refreshScenario(object_backend: bool, collect: bool, comptime numeric_body: bool) !void {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("lake-selective-publication");
     defer directory.cleanup();
@@ -37,8 +40,8 @@ fn refreshScenario(object_backend: bool, collect: bool) !void {
     var client = fs.client();
     try client.makeBucket("antfly");
     const schema = try std.fmt.allocPrint(a,
-        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"id":{{"type":"integer"}},"body":{{"type":"string"}},"label":{{"type":"string"}},"payload":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
-    , .{directory.path()});
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"id":{{"type":"integer"}},"body":{{"type":"{s}"}},"label":{{"type":"string"}},"payload":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+    , .{ directory.path(), if (numeric_body) "integer" else "string" });
     defer a.free(schema);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
     defer binding.deinit(a);
@@ -68,12 +71,14 @@ fn refreshScenario(object_backend: bool, collect: bool) !void {
     for (steps, 0..) |step, iteration| {
         var ids: [257]i64 = undefined;
         var bodies: [257][]const u8 = undefined;
+        var numeric_bodies: [257]i64 = undefined;
         var labels: [257][]const u8 = undefined;
         var payloads: [257][]const u8 = undefined;
         for (&ids, &bodies, &labels, &payloads, 0..) |*id, *body, *label, *payload, row| {
             const ordered = if (step == 0) row else (row * 73) % 257;
             const original = if (step == 2) 256 - ordered else ordered;
             id.* = 9007199254740993 + @as(i64, @intCast(original));
+            numeric_bodies[row] = if (step == 6 and original == 17) 2 else 1;
             body.* = if ((step == 3 or step == 6) and original == 17) "changed word" else "needle same text";
             label.* = if (step == 5) "updated label" else "original label";
             payload.* = if (step == 6 and original == 17) "new payload" else "old payload";
@@ -88,7 +93,10 @@ fn refreshScenario(object_backend: bool, collect: bool) !void {
             }
             const begin = part * 100;
             const end = @min(ids.len, begin + 100);
-            const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{.{ .column_id = "id", .field_id = 1, .values = ids[begin..end] }}, &.{
+            const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, if (numeric_body) &.{ .{ .column_id = "id", .field_id = 1, .values = ids[begin..end] }, .{ .column_id = "body", .field_id = 2, .values = numeric_bodies[begin..end] } } else &.{.{ .column_id = "id", .field_id = 1, .values = ids[begin..end] }}, if (numeric_body) &.{
+                .{ .column_id = "label", .field_id = 3, .converted_type = 0, .values = labels[begin..end] },
+                .{ .column_id = "payload", .field_id = 4, .converted_type = 0, .values = payloads[begin..end] },
+            } else &.{
                 .{ .column_id = "body", .field_id = 2, .converted_type = 0, .values = bodies[begin..end] },
                 .{ .column_id = "label", .field_id = 3, .converted_type = 0, .values = labels[begin..end] },
                 .{ .column_id = "payload", .field_id = 4, .converted_type = 0, .values = payloads[begin..end] },
@@ -116,7 +124,7 @@ fn refreshScenario(object_backend: bool, collect: bool) !void {
         const root = try identity.load(arena.allocator(), store, published.row_identity.?, .none, null);
         const navigation = root.spaceForIndex("body_text").navigation.?;
         if (step == 3) after_body = navigation.checksum[0..64].*;
-        if (step == 6) try std.testing.expectEqualSlices(u8, &after_body, navigation.checksum);
+        if (step == 6 and !numeric_body) try std.testing.expectEqualSlices(u8, &after_body, navigation.checksum);
         if (collect) {
             const Gc = @import("lake_index_gc.zig");
             var marks = std.heap.ArenaAllocator.init(a);

@@ -40,7 +40,10 @@ pub fn compactRoutes(a: A, group: corpus.FileGroup) ![]const corpus.SegmentRouti
             for (source.sections) |section| mask |= @as(u16, 1) << @as(u4, @intCast(@backingInt(section.kind)));
             field.* = .{ .name = source.name, .stats = source.stats, .section_mask = mask };
         }
-        out.* = .{ .ref = ref, .summary = summary, .bytes = metadata.bytes, .doc_count = metadata.doc_count, .fields = fields, .descriptor = if (group.descriptors.len == group.segments.len) group.descriptors[i] else null };
+        const sources = if (group.parts.len != 0) group.parts[i] else group.sources;
+        const live: []corpus.text_directory.Interval = if (group.parts.len != 0 or group.masked) try a.alloc(corpus.text_directory.Interval, sources.len) else &.{};
+        for (live, sources[0..live.len]) |*interval, span| interval.* = .{ .lower = span.pack_lower, .count = span.count };
+        out.* = .{ .ref = ref, .summary = summary, .bytes = metadata.bytes, .doc_count = metadata.doc_count, .fields = fields, .live = live, .descriptor = if (group.descriptors.len == group.segments.len) group.descriptors[i] else null };
     }
     return segments;
 }

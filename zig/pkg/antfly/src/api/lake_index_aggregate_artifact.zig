@@ -316,7 +316,14 @@ pub fn loadRecipe(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation
 
 /// GC traverses authenticated root references without reading every leaf.
 /// Unknown formats fail closed rather than guessing that a root has no edges.
-pub const RowState = struct { rows: ?state_tree.tree.Ref = null, reverse: ?state_tree.tree.Ref = null };
+pub const RowState = struct {
+    rows: ?state_tree.tree.Ref = null,
+    reverse: ?state_tree.tree.Ref = null,
+    /// Ordered (group, reducer slot, typed value, row ordinal) multiset.
+    /// Version distinguishes an indexed all-NULL cohort from legacy state.
+    extrema_version: u8 = 0,
+    extrema: ?state_tree.tree.Ref = null,
+};
 pub const LeafReferences = struct { blocks: []const ChunkRef, key_index: ?ordered_keys.Index, state_tree: ?state_tree.Index, row_state: ?RowState = null };
 pub fn leafReferences(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation) !LeafReferences {
     var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
@@ -680,6 +687,8 @@ fn validateRoot(artifact: Ref, root: Root) !void {
             if (artifact.metadata_version != 8) return error.InvalidNativeAggregateArtifact;
             if (rows.rows) |page| try page.validate();
             if (rows.reverse) |page| try page.validate();
+            if (rows.extrema_version > 1 or (rows.extrema_version == 0 and rows.extrema != null)) return error.InvalidNativeAggregateArtifact;
+            if (rows.extrema) |page| try page.validate();
             if ((if (rows.rows) |page| page.records else 0) != (if (rows.reverse) |page| page.records else 0)) return error.InvalidNativeAggregateArtifact;
         }
         return;

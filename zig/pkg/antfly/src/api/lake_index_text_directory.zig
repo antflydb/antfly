@@ -95,14 +95,21 @@ pub fn prepare(a: A, store: *stores.ArtifactStore, group: *corpus.FileGroup, tok
         group.source_pages = try corpus.source_spans.publish(a, store, group.sources, token);
         group.source_count = @intCast(group.sources.len);
     }
+    if (group.sources.len == 0) {
+        group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows, .opening_packs = group.opening_packs }, token);
+        if (group.parts.len != 0) {
+            for (group.parts) |part| for (@constCast(part)) |*span| {
+                span.physical = group.physical_manifest.?;
+            };
+        }
+    }
     const descriptors = try a.alloc(Chunk, group.segments.len);
-    for (descriptors, group.segments, group.admissions, group.summaries) |*ref, segment, admission, summary| {
+    for (descriptors, group.segments, group.admissions, group.summaries, 0..) |*ref, segment, admission, summary, ordinal| {
         try token.check();
-        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .sources = if (group.source_pages.len == 0) group.sources else &.{}, .source_pages = group.source_pages, .source_count = group.source_count, .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
+        const sources = if (group.parts.len != 0) group.parts[ordinal] else if (group.source_pages.len == 0) group.sources else &.{};
+        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .sources = sources, .masked = group.masked or group.parts.len != 0, .source_pages = group.source_pages, .source_count = group.source_count, .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
     }
     group.descriptors = descriptors;
-    if (group.sources.len != 0) return;
-    group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows, .opening_packs = group.opening_packs }, token);
 }
 const Reader = struct {
     store: stores.ArtifactStore,
@@ -148,7 +155,7 @@ const Segments = struct {
     }
     fn next(self: *Segments) !?SegmentRecord {
         if (self.ordinal == self.routes.len) {
-            if (self.group.sources.len == 0 and self.lower != try corpus.physical.validate(self.group.rows)) return error.InvalidNativeLakeTextCorpus;
+            if (self.group.sources.len == 0 and self.group.parts.len == 0 and self.lower != try corpus.physical.validate(self.group.rows)) return error.InvalidNativeLakeTextCorpus;
             return null;
         }
         const route = self.routes[self.ordinal];
@@ -161,7 +168,9 @@ const Segments = struct {
         }
         var end = self.first_block;
         while (end < self.group.rows.len and self.group.rows[end].base < upper) : (end += 1) self.blocks_examined += 1;
-        const result: SegmentRecord = .{ .sources = if (self.group.source_pages.len == 0) self.group.sources else &.{}, .source_pages = self.group.source_pages, .source_count = self.group.source_count, .file = fileState(self.group.file), .manifest = self.manifest, .physical = self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = self.group.rows[self.first_block..end] };
+        const has_parts = self.group.parts.len != 0;
+        const sources = if (has_parts) self.group.parts[self.ordinal] else if (self.group.source_pages.len == 0) self.group.sources else &.{};
+        const result: SegmentRecord = .{ .sources = sources, .source_pages = self.group.source_pages, .source_count = self.group.source_count, .file = fileState(self.group.file), .manifest = self.manifest, .physical = if (has_parts) null else self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = if (has_parts) &.{} else self.group.rows[self.first_block..end] };
         self.lower = upper;
         self.ordinal += 1;
         return result;
@@ -472,8 +481,12 @@ fn validatePhysical(record: SegmentRecord, domain: Id, upper: u32) !void {
         if (record.sources.len != record.source_count) return error.InvalidNativeLakeTextCorpus;
     }
     if (record.sources.len != 0) {
-        if (record.ordinal != 0 or record.interval.lower != 0 or record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
-        return corpus.source_spans.validate(record.sources, record.interval.count, domain);
+        if (record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
+        if (record.route.live.len != 0) {
+            if (record.route.live.len != record.sources.len) return error.InvalidNativeLakeTextCorpus;
+            for (record.route.live, record.sources) |live, span| if (live.lower != span.pack_lower or live.count != span.count) return error.InvalidNativeLakeTextCorpus;
+        }
+        return corpus.source_spans.validateMode(record.sources, record.interval.count, domain, record.route.live.len != 0);
     }
     var covered = record.interval.lower;
     for (record.rows, 0..) |block, i| {
@@ -693,7 +706,7 @@ fn assembleOrdered(a: A, root: corpus.Root, records: []const SegmentRecord, part
                 try blocks.append(a, block);
             }
         }
-        try groups.append(a, .{ .sources = selected[0].sources, .source_pages = selected[0].source_pages, .source_count = selected[0].source_count, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
+        try groups.append(a, .{ .masked = selected[0].route.live.len != 0, .sources = selected[0].sources, .source_pages = selected[0].source_pages, .source_count = selected[0].source_count, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
         try manifests.append(a, selected[0].manifest);
         try routes.append(a, routing);
         try segments.appendSlice(a, refs);

@@ -346,7 +346,7 @@ pub const Identities = struct {
         var segment: usize = 0;
         for (root.file_groups) |group| {
             if (group.sources.len == 0 or group.segments.len != 1 or segment >= snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
-            try corpus.source_spans.validate(group.sources, snapshot.segments[segment].reader.doc_count, root.domain);
+            try corpus.source_spans.validateMode(group.sources, snapshot.segments[segment].reader.doc_count, root.domain, group.masked);
             for (group.sources) |source| {
                 const owned = try std.json.Stringify.valueAlloc(a, source, .{});
                 defer a.free(owned);

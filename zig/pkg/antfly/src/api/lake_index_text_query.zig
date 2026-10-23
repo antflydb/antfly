@@ -1937,7 +1937,7 @@ const Execution = struct {
             if (pulled == null and !recent_window) break;
             var prepared = if (!recent_window) ahead.takePrepared() else null;
             defer if (prepared) |*pin| pin.deinit();
-            var window: @import("lake_index_text_directory.zig").RoutingCursor.Window = .{ .identities = &.{}, .doc_offset = root.collection.?.documents };
+            var window: @import("lake_index_text_directory.zig").RoutingCursor.Window = .{ .identities = &.{}, .doc_offset = root.ordinalDocuments() };
             if (pulled) |value| {
                 // Copy worker-owned output before the single lookahead reuses it.
                 @memcpy(ids[0..value.identities.len], value.identities);
@@ -1996,7 +1996,7 @@ const Execution = struct {
                 } else null;
                 if (if (self.relocated()) self.index_resolver else null) |resolver| {
                     if (recent_window) {
-                        const rank = std.math.add(u64, resolver.rows, ordinal - root.collection.?.documents) catch return error.InvalidSearchTieRank;
+                        const rank = std.math.add(u64, resolver.rows, ordinal - root.ordinalDocuments()) catch return error.InvalidSearchTieRank;
                         try winners.addLocated(hit, rank, location);
                         continue;
                     }
