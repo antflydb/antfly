@@ -2211,6 +2211,231 @@ pub const Backend = struct {
         }
     }
 
+    /// Close owns exclusive observation as well as mutation of this backend
+    /// across this continuation. All producer, reader and accounting admission
+    /// must be fenced; cached-reader releases may finish before detachment.
+    /// Detachment and observation allocate nothing and issue no filesystem
+    /// work. Final ledger reconciliation may admit existing-usage metadata.
+    pub const QuiescedClosePreflight = struct {
+        const Phase = enum {
+            mutable,
+            fixed,
+            active_ledger_reclamations,
+            ledger_snapshots,
+            active_compaction_publications,
+            retired_run_stores,
+            retired_admissions,
+            active_bulk_plans,
+            retired_bulk_plans,
+            retired_closures,
+            retired_gc,
+            live_read_versions,
+            retired_run_directories,
+            retired_read_versions,
+            immutable,
+            retired_immutable,
+            bulk_accounts,
+            cached,
+            retired_mutable,
+            retired_memory,
+            reclaiming,
+            reconcile,
+            done,
+        };
+        backend: ?*Backend = null,
+        detached: bool = false,
+        pass: u64 = 0,
+        phase: Phase = .mutable,
+        bytes: u64 = 0,
+        index: usize = 0,
+        current: ?*anyopaque = null,
+        initialized: bool = false,
+        mutable: ActiveMemTable.Accounting = .{},
+        state: State.Accounting = .{},
+        batch: ?*ReclaimingMemory = null,
+        version: ?*runtime_mod.ReadVersion = null,
+
+        fn advance(self: *@This()) void {
+            self.phase = @fromBackingInt(@intCast(@backingInt(self.phase) + 1));
+            self.index = 0;
+            self.current = null;
+            self.initialized = false;
+            self.state = .{};
+        }
+
+        fn detach(self: *@This(), backend: *Backend, io: std.Io, original: read_admission.Port) !bool {
+            try @import("../common/cleanup_wait.zig").lockAtomic(&backend.mu, io, original);
+            defer backend.mu.unlock();
+            if (backend.active_readers != 0) return false;
+            if (backend.mutable_read_snapshot) |snapshot| {
+                const ref = backend.mutableSnapshotReaderRefIndex(snapshot) orelse unreachable;
+                if (backend.mutable_snapshot_reader_refs.items[ref].readers != 0) return false;
+                backend.mutable_read_snapshot = null;
+                _ = backend.removeMutableSnapshotReaderRef(ref);
+                // The already-owned header carries retirement. Keep it reachable
+                // by legacy and admitted accounting until physical reclamation;
+                // no destructor or new background job runs after durable drain.
+                @import("lsm_backend/memtable_reclamation.zig").retire(backend, snapshot);
+            }
+            self.detached = true;
+            return true;
+        }
+
+        fn fixed(self: *@This(), b: *Backend) void {
+            const pass = self.pass;
+            if (b.options.unpublished_outputs) |queue| self.bytes +|= queue.observedMemoryBytes();
+            self.bytes +|= b.runs.memoryBytes(pass);
+            if (b.store_reclaimer) |*job| self.bytes +|= @sizeOf(RunStore) +| job.store.memoryBytes(pass);
+            inline for (.{ "run_directory", "manifest_directory", "manifest_checkpoint_directory" }) |field|
+                if (@field(b, field)) |directory| {
+                    self.bytes +|= directory.accountedMemoryBytes(pass);
+                };
+            inline for (.{ "pending_directory_closure", "pending_l0_directory_closure" }) |field|
+                if (@field(b, field)) |pending| {
+                    self.bytes +|= pending.directory.accountedMemoryBytes(pass);
+                };
+            for (b.pending_admissions) |pending| if (pending) |job| {
+                self.bytes +|= job.accountedMemoryBytes(pass);
+            };
+            if (b.pending_tombstone_reconcile) |pending| self.bytes +|= pending.account.chargeOnce(pass);
+            if (b.pending_gc) |pending| self.bytes +|= pending.accountedMemoryBytes(pass);
+            self.bytes +|= b.manifest_journal.obsolete.memoryBytes(pass);
+            self.bytes +|= b.obsolete_paths.memoryBytes(pass);
+            if (b.obsolete_reclaim_after) |path| self.bytes +|= path.len;
+            if (b.directory_reclaimer) |*job| self.bytes +|= job.directory.accountedMemoryBytes(pass);
+            if (b.domain_index) |value| self.bytes +|= value.memoryBytes();
+            self.bytes +|= b.bulk_snapshot_unshared_bytes;
+            if (b.memtable_reclaimer) |*job| self.bytes +|= job.memoryBytes(pass);
+        }
+
+        fn list(self: *@This(), b: *Backend, comptime phase: Phase) void {
+            const field = @tagName(phase);
+            const Pointer = @typeInfo(@FieldType(Backend, field)).optional.child;
+            const next = switch (phase) {
+                .active_ledger_reclamations, .active_compaction_publications => "next",
+                .ledger_snapshots, .active_bulk_plans => "active_next",
+                .live_read_versions => "live_next",
+                else => "retired_next",
+            };
+            if (!self.initialized) {
+                self.current = @field(b, field);
+                self.initialized = true;
+            }
+            if (self.current) |raw| {
+                const node: Pointer = @ptrCast(@alignCast(raw));
+                self.bytes +|= switch (phase) {
+                    .active_ledger_reclamations, .ledger_snapshots => node.memoryBytes(self.pass),
+                    .retired_run_stores => @sizeOf(RunStore) +| node.memoryBytes(self.pass),
+                    .retired_closures => node.directory.accountedMemoryBytes(self.pass),
+                    else => node.accountedMemoryBytes(self.pass),
+                };
+                self.current = @field(node, next);
+            } else self.advance();
+        }
+
+        fn stateStep(self: *@This(), value: *const State) bool {
+            var credits: usize = 64;
+            if (!self.state.step(value, self.pass, &credits)) return false;
+            self.bytes +|= self.state.bytes;
+            self.state = .{};
+            return true;
+        }
+
+        pub fn resumeWithAdmission(self: *@This(), b: *Backend, io: std.Io, original: read_admission.Port) !void {
+            try original.checkpoint();
+            if (self.backend) |bound| std.debug.assert(bound == b) else self.backend = b;
+            while (!self.detached) {
+                if (!try self.detach(b, io, original))
+                    try @import("../common/cleanup_wait.zig").waitForRetry(io, original);
+            }
+            if (self.pass == 0) self.pass = state_mod.memory_account.nextPass();
+            while (self.phase != .done) {
+                try original.checkpoint();
+                switch (self.phase) {
+                    .mutable => {
+                        var credits: usize = 64;
+                        if (self.mutable.step(&b.mutable, self.pass, &credits)) {
+                            self.bytes +|= self.mutable.bytes;
+                            self.advance();
+                        }
+                    },
+                    .fixed => {
+                        self.fixed(b);
+                        self.advance();
+                    },
+                    inline .active_ledger_reclamations, .ledger_snapshots, .active_compaction_publications, .retired_run_stores, .retired_admissions, .active_bulk_plans, .retired_bulk_plans, .retired_closures, .retired_gc, .live_read_versions, .retired_run_directories, .retired_read_versions => |phase| self.list(b, phase),
+                    .immutable, .retired_immutable, .retired_mutable => {
+                        const items = switch (self.phase) {
+                            .immutable => b.activeImmutableMemtables(),
+                            .retired_immutable => b.retired_immutable_memtables.items,
+                            .retired_mutable => b.retired_mutable_snapshots.items,
+                            else => unreachable,
+                        };
+                        if (self.index == items.len) self.advance() else if (self.stateStep(items[self.index])) self.index += 1;
+                    },
+                    .bulk_accounts => {
+                        const accounts = &b.bulk_snapshot_accounts;
+                        if (accounts.count() == 0 or self.index == accounts.capacity()) {
+                            self.advance();
+                        } else {
+                            // Iterator.next() can scan a sparse table without a
+                            // checkpoint. Enter it only at occupied slots, so
+                            // it returns immediately; inspect at most 64 slots.
+                            const end = @min(accounts.capacity(), self.index + 64);
+                            while (self.index < end) : (self.index += 1) {
+                                if (accounts.metadata.?[self.index].isUsed()) {
+                                    var iterator = accounts.iterator();
+                                    iterator.index = @intCast(self.index);
+                                    const entry = iterator.next().?;
+                                    self.bytes +|= entry.key_ptr.*.chargeOnce(self.pass);
+                                }
+                            }
+                        }
+                    },
+                    .cached => {
+                        if (b.mutable_read_snapshot) |snapshot| {
+                            if (self.stateStep(snapshot)) self.advance();
+                        } else self.advance();
+                    },
+                    .retired_memory => {
+                        if (!self.initialized) {
+                            self.current = b.retired_memory_head;
+                            self.initialized = true;
+                        }
+                        if (self.current) |raw| {
+                            const value: *State = @ptrCast(@alignCast(raw));
+                            if (self.stateStep(value)) {
+                                self.bytes +|= @sizeOf(State);
+                                self.current = value.retired_next;
+                            }
+                        } else self.advance();
+                    },
+                    .reclaiming => {
+                        if (!self.initialized) {
+                            self.batch = b.reclaiming_memory;
+                            self.version = if (self.batch) |batch| batch.versions else null;
+                            self.initialized = true;
+                        }
+                        if (self.version) |version| {
+                            self.bytes +|= version.accountedMemoryBytes(self.pass);
+                            self.version = version.retired_next;
+                        } else if (self.batch) |batch| {
+                            self.batch = batch.next;
+                            self.version = if (self.batch) |next| next.versions else null;
+                        } else self.advance();
+                    },
+                    .reconcile => {
+                        std.debug.assert(b.active_readers == 0 and b.mutable_read_snapshot == null);
+                        if (b.options.resource_manager) |manager|
+                            try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &b.tracked_in_memory_state_bytes, self.bytes, original);
+                        self.advance();
+                    },
+                    .done => unreachable,
+                }
+            }
+        }
+    };
+
     /// Own construction credit and a bounded mutable successor through WAL
     /// publication and old-state retirement. The backend, its observed usage
     /// identity and every unrelated account mutation must remain quiesced and
@@ -29521,6 +29746,226 @@ test "controlled physical sync WAL retirement keeps peer publication blocked unt
     try std.testing.expectEqual(before, pool.snapshotStats().fd_admitted_descriptors);
     var acquired = (try peer.tryAcquireWalOperationLock(.shared)) orelse return error.TestUnexpectedResult;
     acquired.release();
+}
+
+const ClosePreflightTestControl = struct {
+    calls: usize = 0,
+    fail_at: usize = std.math.maxInt(usize),
+    failure: anyerror = error.Cancelled,
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const call = self.calls;
+        self.calls += 1;
+        if (call == self.fail_at) return self.failure;
+    }
+    fn lifetime(_: *anyopaque) !void {}
+    fn deadline(_: *anyopaque) !?u64 {
+        return std.math.maxInt(u64);
+    }
+    fn begin(_: *anyopaque) !void {
+        return error.TestUnexpectedWait;
+    }
+    fn end(_: *anyopaque) !void {}
+};
+
+test "controlled physical sync close preflight fences snapshots and resumes every accounting checkpoint without allocation" {
+    const admission = @import("../common/read_admission.zig");
+    const a = std.testing.allocator;
+    var calls: usize = 0;
+    var offset: usize = 0;
+    while (offset <= calls) : (offset += 1) {
+        for ([_]anyerror{ error.Cancelled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+            defer manager.deinit(a);
+            var failing = std.testing.FailingAllocator.init(a, .{});
+            const allocator = failing.allocator();
+            var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false });
+            defer backend.close();
+            try backend.initOutputCleanup();
+            for (0..192) |i| {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, i, .big);
+                try backend.mutable.upsert(allocator, .{}, &key, "value", false);
+            }
+            const cached = try backend.snapshotMutableState();
+            backend.releaseMutableReadSnapshot(cached);
+            // Shared-account flat rows must be visited in slices without
+            // charging that account again for every row or generation.
+            try backend.mutable_read_snapshot.?.ensureFlat(allocator);
+            backend.mutable_read_snapshot.?.freezeMemoryAccounting();
+            const arena = try allocator.create(State);
+            arena.* = .{};
+            var arena_transferred = false;
+            errdefer if (!arena_transferred) {
+                arena.deinit(allocator);
+                allocator.destroy(arena);
+            };
+            arena.* = try backend.mutable.cloneArena(allocator);
+            try backend.immutable_memtables.append(allocator, arena);
+            arena_transferred = true;
+            try backend.immutable_wal_ranges.append(allocator, .{});
+            // Unfrozen arena accounting walks one block per credit.
+            try std.testing.expect(arena.frozen_memory_bytes == null);
+            var accounts: [64]*state_mod.memory_account.Account = undefined;
+            var account_count: usize = 0;
+            defer {
+                backend.bulk_snapshot_accounts.clearRetainingCapacity();
+                for (accounts[0..account_count]) |account| account.release();
+            }
+            for (&accounts) |*entry| {
+                entry.* = try state_mod.memory_account.Account.create(allocator);
+                account_count += 1;
+                try backend.bulk_snapshot_accounts.put(allocator, entry.*, 1);
+            }
+            var iterator = backend.bulk_snapshot_accounts.iterator();
+            var last: *state_mod.memory_account.Account = undefined;
+            while (iterator.next()) |entry| last = entry.key_ptr.*;
+            for (accounts) |account| if (account != last) {
+                _ = backend.bulk_snapshot_accounts.remove(account);
+            };
+            try std.testing.expectEqual(@as(usize, 1), backend.bulk_snapshot_accounts.count());
+            const baseline = backend.tracked_in_memory_state_bytes;
+            var preflight: Backend.QuiescedClosePreflight = .{};
+            var control: ClosePreflightTestControl = .{ .failure = failure };
+            const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = ClosePreflightTestControl.check, .check_lifetime = ClosePreflightTestControl.lifetime, .deadline_ns = ClosePreflightTestControl.deadline }, .execution_wait = .{ .ptr = &control, .begin = ClosePreflightTestControl.begin, .end = ClosePreflightTestControl.end } };
+            const original = admission.Port.init(&payload);
+            if (offset != 0) control.fail_at = offset - 1;
+            failing.fail_index = failing.alloc_index;
+            preflight.resumeWithAdmission(&backend, std.testing.io, original) catch |cause| {
+                try std.testing.expectEqual(failure, cause);
+                try std.testing.expectEqual(baseline, backend.tracked_in_memory_state_bytes);
+                control.fail_at = std.math.maxInt(usize);
+                try preflight.resumeWithAdmission(&backend, std.testing.io, original);
+            };
+            failing.fail_index = std.math.maxInt(usize);
+            if (offset == 0) calls = control.calls;
+            try std.testing.expect(preflight.detached and preflight.phase == .done);
+            try std.testing.expect(backend.mutable_read_snapshot == null);
+            try std.testing.expect(backend.retired_memory_head == cached);
+            try std.testing.expectEqual(@as(usize, 1), backend.memtable_reclaim_pending);
+            try std.testing.expectEqual(@as(usize, 0), backend.mutable_snapshot_reader_refs.items.len);
+            try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), preflight.bytes);
+            try std.testing.expectEqual(preflight.bytes, backend.tracked_in_memory_state_bytes);
+            try std.testing.expectEqualStrings("value", try cached.get(.{}, &@as([8]u8, @splat(0))));
+            try std.testing.expect(backend.mu.tryLock());
+            backend.mu.unlock();
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        }
+    }
+    try std.testing.expect(calls > 30);
+}
+
+test "controlled physical sync close preflight retains a cold legacy arena baseline through ledger allocation rejection" {
+    const admission = @import("../common/read_admission.zig");
+    const Control = struct {
+        preflight: *Backend.QuiescedClosePreflight,
+        failing: *std.testing.FailingAllocator,
+        reject: bool = true,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject and self.preflight.phase == .reconcile) self.failing.fail_index = self.failing.alloc_index;
+        }
+        fn lifetime(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+        fn end(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var metadata = std.testing.FailingAllocator.init(a, .{});
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = metadata.allocator() });
+    defer manager.deinit(a);
+    var backend = Backend.init(a, .{ .resource_manager = &manager, .wal_enabled = false });
+    defer backend.close();
+    try backend.initOutputCleanup();
+    backend.mutable.ordered_enabled = false;
+    try backend.mutable.upsert(a, .{}, "legacy", "retained", false);
+    const arena = try backend.mutable.ensureArenaAllocator(a);
+    _ = try arena.alloc(u8, 17 * 1024);
+    _ = try arena.alloc(u8, 65 * 1024);
+    try std.testing.expectEqual(@as(u64, 0), backend.tracked_in_memory_state_bytes);
+    var preflight: Backend.QuiescedClosePreflight = .{};
+    var control: Control = .{ .preflight = &preflight, .failing = &metadata };
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    try std.testing.expectError(error.OutOfMemory, preflight.resumeWithAdmission(&backend, std.testing.io, original));
+    try std.testing.expect(preflight.detached and preflight.phase == .reconcile);
+    try std.testing.expectEqual(@as(u64, 0), backend.tracked_in_memory_state_bytes);
+    try std.testing.expectEqualStrings("retained", try backend.mutable.get(.{}, "legacy"));
+    const observed = preflight.bytes;
+    control.reject = false;
+    metadata.fail_index = std.math.maxInt(usize);
+    try preflight.resumeWithAdmission(&backend, std.testing.io, original);
+    try std.testing.expect(preflight.phase == .done);
+    try std.testing.expectEqual(observed, preflight.bytes);
+    try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), backend.tracked_in_memory_state_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+test "controlled physical sync close preflight retains reader ownership across original wait rejection" {
+    const admission = @import("../common/read_admission.zig");
+    const Mode = enum { begin_failure, end_failure, lifetime_failure };
+    const Control = struct {
+        backend: *Backend,
+        snapshot: *const State,
+        mode: Mode,
+        parked: bool = false,
+        released: bool = false,
+        cached_reader: bool,
+        fn check(_: *anyopaque) !void {}
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.parked and self.mode == .lifetime_failure) return error.DeadlineExceeded;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.backend.mu.tryLock());
+            defer self.backend.mu.unlock();
+            if (!self.released) {
+                if (self.cached_reader) self.backend.releaseMutableReadSnapshot(self.snapshot);
+                self.backend.releaseReader();
+                self.released = true;
+            }
+            if (self.mode == .begin_failure) return error.FileNotFound;
+            self.parked = true;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.parked = false;
+            if (self.mode == .end_failure) return error.Cancelled;
+        }
+    };
+    const a = std.testing.allocator;
+    for (std.enums.values(Mode)) |mode| for ([_]bool{ false, true }) |cached_reader| {
+        var backend = Backend.init(a, .{ .wal_enabled = false });
+        defer backend.close();
+        try backend.mutable.upsert(a, .{}, "status", "old", false);
+        const snapshot = try backend.snapshotMutableState();
+        if (!cached_reader) backend.releaseMutableReadSnapshot(snapshot);
+        backend.retainReader();
+        var preflight: Backend.QuiescedClosePreflight = .{};
+        var control: Control = .{ .backend = &backend, .snapshot = snapshot, .mode = mode, .cached_reader = cached_reader };
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const original = admission.Port.init(&payload);
+        try std.testing.expectError(switch (mode) {
+            .begin_failure => error.FileNotFound,
+            .end_failure => error.Cancelled,
+            .lifetime_failure => error.DeadlineExceeded,
+        }, preflight.resumeWithAdmission(&backend, std.testing.io, original));
+        try std.testing.expect(!preflight.detached and control.released);
+        try std.testing.expect(backend.mutable_read_snapshot == snapshot and backend.retired_memory_head == null);
+        try std.testing.expectEqualStrings("old", try snapshot.get(.{}, "status"));
+        // The accepted reader completed. Retry needs no new wait boundary.
+        try preflight.resumeWithAdmission(&backend, std.testing.io, original);
+        try std.testing.expect(preflight.detached and preflight.phase == .done);
+        try std.testing.expect(backend.retired_memory_head == snapshot);
+    };
 }
 
 const MutablePublicationCreditControl = struct {

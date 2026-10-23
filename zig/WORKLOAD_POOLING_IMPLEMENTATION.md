@@ -24847,3 +24847,61 @@ the final status/WAL state machine. Admitted final backend flush/retirement and
 Lite/object provider adoption remain unfinished. No complete default pooling
 gate is enabled; the full goal remains active and full GNU qualification remains
 waived.
+
+### Default close snapshot fencing and bounded accounting preflight
+
+Default controlled LSM close now retains a `QuiescedClosePreflight` in the final
+status program. It runs after status capture and after producer, cache and durable
+dependency drains, serialized by the program's logical finisher. Status capture
+can still borrow primary read epochs, so the final snapshot fence follows it.
+
+Preflight waits for all backend reader pins and the cached snapshot's own readers
+under the original finite execution boundary. Backend.mu is released before any
+wait. Once readers finish, a fixed metadata transition clears the cached snapshot,
+removes its reader-reference registration and transfers its already-owned State
+header to the backend's existing retirement queue. No payload destruction,
+allocation, filesystem operation or new background job occurs during detachment.
+Repeated calls never detach or queue a generation twice. The generation stays
+reachable by both legacy accounting and eventual admitted physical retirement.
+
+The owning accounting cursor covers the same retained components as the full
+backend observer, including shared mutable roots, run/directory metadata, pending
+and retired job lists, immutable generations, sparse bulk-account registries and
+queued memory retirement. Fixed root/account aggregates are constant work;
+variable lists advance one node per checkpoint. Flat rows, arena blocks and sparse
+hash-table slots use at most 64 credits per CPU slice. Sparse iteration only calls
+the standard iterator at an occupied slot, preventing its internal empty-slot
+walk from bypassing admission. Frozen arenas reuse their recorded charge;
+unfrozen arenas use one-node views of the pinned allocator's capacity calculation.
+
+Progress retains its pass, visitation cursors and accumulated total across original
+failure without borrowing a caller scope. The caller must fence mutation and
+competing accounting observations for the unfinished pass; default close already
+owns the serving and producer fences. Final ledger reconciliation uses original
+admission and can admit observer metadata for previously unobserved existing
+allocations. Rejection, including metadata OOM, retains the computed total and
+backend-owned payloads for retry. This establishes the baseline required by the
+credit-owning mutable publication without a raw whole-backend walk.
+
+Native ABI 104 and storage-owner ABI 164 cover the new DB-owned continuation.
+The real C-entry close test checks completion and snapshot detachment for its LSM
+owner. Final receipt `close-store-accounting-preflight-v2` passes all 76 build
+steps, 34 physical/WAL cases, 32 storage-read cases, 24 embedded close cases,
+2 host close cases, 16 independently compiled archive cases and 45/1/8 identity
+cases. There are no skips, failures or leaks. New cases reject all three original
+errors at every accounting checkpoint with the data allocator exhausted, retain
+reader ownership through begin/end/lifetime wait rejection, and retry cold legacy
+arena accounting after observer-metadata allocation refusal. The fixtures cover
+shared-account flat snapshots, unfrozen arenas, retirement queues and a sparse
+bulk-account map; admitted totals match the full observer. Source/log hashes match
+all 5,541 final inputs. The v1 receipt qualifies the initial scan and default
+integration before the all-reader guard, sparse scan batching and cold-baseline
+case.
+
+Final status persistence still uses ordinary batch commit. Captured-input and
+encoded/frozen WAL credit, manifest debt admission and the owning final status/WAL
+state machine remain to be composed with this preflight and mutable publication.
+The queued snapshot still needs admitted physical retirement alongside final
+backend flush/retirement. Lite/object provider adoption and the complete default
+pooling gate remain open; the full goal stays active and full GNU qualification
+remains waived.

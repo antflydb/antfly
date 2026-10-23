@@ -7151,6 +7151,10 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         try backend_probes[2].entered.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } });
         try std.testing.expectEqual(@as(usize, 0), backend_probes[2].retirements.load(.acquire));
         try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerDrainClose(id, &request));
+        if (handle.db.core.primary_store_owner.lsmBackend()) |backend| {
+            try std.testing.expect(handle.db.local_execution.close_index_status.store_preflight.phase == .done);
+            try std.testing.expect(backend.mutable_read_snapshot == null);
+        }
         try std.testing.expect(!handle.db.isClosed());
         try std.testing.expect(text_merge.producer_closing.load(.acquire));
         try std.testing.expect(text_merge.joined.isSet() and text_merge.future == null);

@@ -19,6 +19,38 @@ const backend_adapter = @import("../backend_adapter.zig");
 const backend_types = @import("../backend_types.zig");
 pub const memory_account = @import("memory_account.zig");
 
+/// Quiesced arena observation without a whole block-list walk. A one-node
+/// view delegates capacity/alignment semantics to the pinned standard library.
+const ArenaAccounting = struct {
+    node: @FieldType(std.heap.ArenaAllocator.State, "used_list") = null,
+    list: u2 = 0,
+    started: bool = false,
+    bytes: u64 = 0,
+
+    fn step(self: *@This(), arena: *const std.heap.ArenaAllocator, credits: *usize) bool {
+        if (!self.started) {
+            self.node = arena.state.used_list;
+            self.started = true;
+        }
+        while (self.list < 2) {
+            if (self.node) |node| {
+                if (credits.* == 0) return false;
+                credits.* -= 1;
+                var copy = node.*;
+                copy.next = null;
+                var view = std.heap.ArenaAllocator.init(arena.child_allocator);
+                view.state.used_list = &copy;
+                self.bytes +|= view.queryCapacity();
+                self.node = node.next;
+            } else {
+                self.list += 1;
+                if (self.list == 1) self.node = arena.state.free_list;
+            }
+        }
+        return true;
+    }
+};
+
 const CollisionBucket = std.ArrayListUnmanaged(usize);
 
 /// Most key hashes are unique. Keep that path to one compact hash-table value
@@ -244,6 +276,53 @@ pub const State = struct {
         }
         return bytes;
     }
+
+    /// The caller retains this immutable generation and exclusively owns the
+    /// accounting pass across retries. Each flat row or arena block consumes
+    /// a credit; shared roots and frozen arena accounting are constant work.
+    pub const Accounting = struct {
+        started: bool = false,
+        complete: bool = false,
+        index: usize = 0,
+        arena: ArenaAccounting = .{},
+        bytes: u64 = 0,
+
+        pub fn step(self: *@This(), state: *const State, pass: u64, credits: *usize) bool {
+            if (self.complete) return true;
+            if (!self.started) {
+                if (credits.* == 0) return false;
+                credits.* -= 1;
+                self.started = true;
+                self.bytes = state.entries.capacity * @sizeOf(OwnedEntry);
+                if (state.account) |account| {
+                    self.bytes +|= account.chargeOnce(pass);
+                    self.complete = true;
+                    return true;
+                }
+                if (state.arena_owner != null and state.frozen_memory_bytes != null) {
+                    self.bytes = state.frozen_memory_bytes.?;
+                    self.complete = true;
+                    return true;
+                }
+            }
+            if (state.arena_owner) |arena| {
+                if (!self.arena.step(arena, credits)) return false;
+                self.bytes = state.entries.capacity * @sizeOf(OwnedEntry) +| self.arena.bytes;
+            } else {
+                while (self.index < state.entries.items.len) {
+                    if (credits.* == 0) return false;
+                    credits.* -= 1;
+                    const entry = state.entries.items[self.index];
+                    if (entry.shared != null and entry.shared.?.account != null) {
+                        self.bytes +|= entry.shared.?.account.?.chargeOnce(pass);
+                    } else self.bytes +|= logicalEntryBytes(entry) - @sizeOf(OwnedEntry) + entry.sharedOverheadBytes();
+                    self.index += 1;
+                }
+            }
+            self.complete = true;
+            return true;
+        }
+    };
 
     pub fn estimatedLogicalBytes(self: *const State) u64 {
         if (self.ordered_root) |root| return root.bytes - root.count * (@sizeOf(OrderedIndex.Node) + @sizeOf(SharedEntry)) + root.count * @sizeOf(OwnedEntry);
@@ -720,6 +799,34 @@ pub const ActiveMemTable = struct {
         if (self.ordered_enabled) return (if (self.ordered.account) |account| account.chargeOnce(pass) else 0) + self.ordered.spare.capacity * @sizeOf(*OrderedIndex.Node);
         return self.estimatedMemoryBytes();
     }
+
+    pub const Accounting = struct {
+        started: bool = false,
+        complete: bool = false,
+        arena: ArenaAccounting = .{},
+        bytes: u64 = 0,
+
+        pub fn step(self: *@This(), table: *const ActiveMemTable, pass: u64, credits: *usize) bool {
+            if (self.complete) return true;
+            if (!self.started) {
+                if (credits.* == 0) return false;
+                credits.* -= 1;
+                self.started = true;
+                if (table.ordered_enabled) {
+                    self.bytes = table.accountedMemoryBytes(pass);
+                    self.complete = true;
+                    return true;
+                }
+                const count = table.entries.items.len;
+                self.bytes = table.logical_bytes -| count * @sizeOf(OwnedEntry) +| count * @sizeOf(SharedEntry) +|
+                    table.entries.capacity * @sizeOf(OwnedEntry) +| table.index.estimatedMemoryBytes() +| table.ordered.memoryBytes();
+            }
+            if (table.arena_owner) |arena| if (!self.arena.step(arena, credits)) return false;
+            self.bytes +|= self.arena.bytes;
+            self.complete = true;
+            return true;
+        }
+    };
 
     /// Build the complete successor before WAL append. The live root is never
     /// edited, including when any allocation fails halfway through the batch.

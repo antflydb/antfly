@@ -6331,6 +6331,15 @@ pub const DB = struct {
         // stable program survives interruption; physical persistence consumes
         // it before index/allocator destruction without recollecting live state.
         if (self.open_mode.allowsIndexWorkers()) try self.captureCloseIndexStatusWithAdmission(original);
+        if (self.core.primary_store_owner.lsmBackend()) |backend| {
+            const program = &self.local_execution.close_index_status;
+            try program.acquire(cache_io, original);
+            defer program.release();
+            // Status capture may borrow primary-store read epochs. Detach its
+            // final cache only after capture, retaining all retired payloads
+            // in backend ownership while accounting walks bounded CPU slices.
+            try program.store_preflight.resumeWithAdmission(backend, cache_io, original);
+        }
     }
 
     fn stopRetainedPreparations(self: *DB) void {

@@ -49,7 +49,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Storage durability metadata uses owning bounded read operations.
 // Storage durability grants retain reusable worker, descriptor and buffer ownership.
 // Durability grants include bounded atomic control replacement and directory creation.
-pub const abi_version: u32 = 163;
+// DB close retains bounded mutable-snapshot fencing and accounting preflight.
+pub const abi_version: u32 = 164;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

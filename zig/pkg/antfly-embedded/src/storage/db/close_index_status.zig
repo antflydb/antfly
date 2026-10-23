@@ -24,6 +24,7 @@ pub const Program = struct {
     const Row = struct { key: []u8, value: [projection.index_status_encoded_len]u8 };
     const Chunk = struct { next: ?*Chunk = null, used: usize = 0, rows: [32]Row = undefined };
     busy: std.atomic.Value(bool) = .init(false),
+    store_preflight: @import("../lsm_backend.zig").Backend.QuiescedClosePreflight = .{},
     complete: bool = false,
     group: usize = 0,
     index: usize = 0,
