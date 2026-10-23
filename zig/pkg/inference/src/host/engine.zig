@@ -26,7 +26,7 @@ pub const callback = @import("antfly_runtime_abi").callback_abi;
 pub const NodeConfig = inference.server.NodeConfig;
 pub const HubConfig = inference.registry.download.HubConfig;
 pub const ProjectorSelection = inference.registry.download.ProjectorSelection;
-pub const Command = enum { worker, embed, classify, generate, chat, compile_artifact, export_model, quantize, run_artifact, transcribe, read, extract, compare, finetune, cuda_info, smoke, convert };
+pub const Command = enum { worker, embed, classify, generate, chat, compile_artifact, export_model, quantize, run_artifact, transcribe, read, extract, compare, finetune, cuda_info, smoke, convert, rerank, decisions, extract_v2, a4b_pack, quant_kernel_codegen, metal_info, bench_cuda };
 
 // Borrowed for the blocking serve operation. The server adapter owns signals,
 // the hard shutdown watchdog and readiness/failure publication; the core owns

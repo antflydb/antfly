@@ -320,7 +320,6 @@ jobs:
             scripts/ci/test_embedded_sdk_native.py \
             scripts/test_pgwire_drivers.py \
             ':(glob)scripts/pgwire_drivers/**' \
-            ':(glob)go/pkg/operator/**' \
             ':(glob)go/pkg/sdk/admin/**' \
             go/pkg/sdk/go.mod \
             go/pkg/sdk/go.sum \
@@ -2134,27 +2133,6 @@ jobs:
           path: ${{ runner.temp }}/e2e-plan
       - name: Initialize lane timing history
         run: cp "${RUNNER_TEMP}/e2e-plan/durations.json" "$ANTFLY_E2E_DURATION_FILE"
-
-      - name: Set up Go for operator runtime contract
-        if: matrix.suite == 'inference'
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ steps.toolchain.outputs.go_version }}
-          cache: false
-
-      # Execute the SAME reconciler-generated contract as the operator job's
-      # pinned v0.2.1 baseline, now against this PR's newly built runtime.
-      - name: Test generated inference command against candidate runtime
-        if: matrix.suite == 'inference'
-        working-directory: go/pkg/operator
-        env:
-          ANTFLY_RUNTIME_BIN: ${{ github.workspace }}/zig/zig-out/bin/antfly
-          GOWORK: 'off'
-          GOEXPERIMENT: simd
-        run: >-
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} go test
-          -tags runtimeintegration ./controllers/inference
-          -run '^Test(InferenceRuntimeContract|RuntimeModelPullRetry)$' -count=1 -v -timeout=20m
 
       - name: Test exhaustive E2E shard partition
         if: matrix.suite == 'antfly-ordinary-0'

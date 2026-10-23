@@ -21,7 +21,7 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const b = ctx.b;
     const exe = runtime_build.addStandaloneExecutable(b, ctx.graph, ctx.target, ctx.optimize, ctx.paths.inference_root, ctx.backend.link_libc, ctx.strip);
     const install_exe = b.addInstallArtifact(exe, .{
-        .dest_sub_path = "antfly-inference",
+        .dest_sub_path = "antfly-inference-dev",
     });
     if (install_default) b.getInstallStep().dependOn(&install_exe.step);
 

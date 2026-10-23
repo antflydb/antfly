@@ -544,7 +544,7 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
         default_compile_memory_mb;
     if (compile_memory_mb == 0) @panic("inference compiler memory bound must be positive");
     const exe = b.addExecutable(.{
-        .name = "antfly-inference",
+        .name = "antfly-inference-dev",
         // The F32 Metal ReleaseFast CLI measured 12.7 GiB during compilation.
         // Match the inference-test headroom so the scheduler admits this
         // measured build rather than rejecting its completed artifact.

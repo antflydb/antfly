@@ -76,7 +76,7 @@ fi
 zig_bin="$(resolve_zig)"
 "$zig_bin" build --global-cache-dir "$zig_global_cache_dir" -Dcuda=true -Dcuda-artifacts="$cuda_artifacts" -Dcuda-libs="$cuda_libraries" -Doptimize="$optimize"
 
-bin="$pkg_root/zig-out/bin/antfly-inference"
+bin="$pkg_root/zig-out/bin/antfly-inference-dev"
 ANTFLY_INFERENCE_READ_PROFILE="${ANTFLY_INFERENCE_READ_PROFILE:-0}" timeout "$command_timeout" "$bin" read "$model_dir" "$image_path" \
   --backend cuda \
   --prompt "$prompt" \
