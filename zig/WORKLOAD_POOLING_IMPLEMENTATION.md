@@ -24733,3 +24733,54 @@ barrier cannot precede later writes or be followed by duplicate legacy sync.
 Equivalent Lite/object provider adoption also remains open. The complete goal
 remains active; full GNU qualification remains waived and Linux builds require
 the pinned Nix/glibc toolchain.
+
+### Owning bounded mutable successor preparation
+
+`ActiveMemTable.PublicationPreparation` moves immutable input and retains the
+quiesced live root in constant time. Its allocation-free memory planning keeps
+a row cursor and checked byte totals, so the caller can reserve construction
+credit before successor allocation. The bound covers additional packed entries,
+copy-on-write nodes, the node-pointer pool and its account; input residency and
+encoded/frozen WAL bytes remain separate obligations.
+
+Preparation retains completed rows, partial packed byte copies, node reservations
+and comparison offsets across original admission rejection. Namespace/key/value
+copies and namespace/key comparisons checkpoint in 16 KiB quanta. Node reservation
+checks the original before each allocation and retains its partial pool on OOM.
+The input and speculative successor stay owned without retaining an admission
+borrow. The live root, its pool and existing reader snapshots remain unchanged.
+
+Rank search finishes before tree mutation. A new prepaid AVL insertion uses only
+child counts to insert or replace at that exact rank, avoiding unbounded key
+comparison or a fallible checkpoint inside a partly changed shared path. The
+edit and eventual publication swap are infallible, allocation-free and bounded
+by AVL height. The caller must exclude intervening writers and handle backend
+snapshot fencing and memory-credit adoption separately.
+
+After publication the preparation owner retains the previous root. Before or
+after publication, admitted retirement uses the existing allocation-free tree
+and state reclamation continuations in 64-credit slices, including arena-backed
+input. Rejected retirement keeps ownership and resumes from the same cursor.
+Mandatory quiesced destruction drains the same owned continuations. Canonical
+ordered-writer invariants exclude legacy flat/arena mutable generations from
+this tree publication protocol until normalized.
+
+The real backend WAL append regression now builds its successor with this owner,
+encodes its retained input, publishes through the owning WAL coordinator and
+retires through original CPU admission. Final receipt
+`mutable-publication-preparation-v2` passes all 65 build steps, all 29 named
+physical/WAL cases, all 16 independently compiled archive cases and 45/1/8
+identity cases without skips, failures or leaks. The three new cases inject
+each original failure at every planning/preparation checkpoint, fail every
+preparation allocation, verify allocation-free adoption and pinned-reader
+isolation, and abandon partial arena-backed and empty generations. Source and
+log hashes match all 5,541 final inputs. The v1 receipt qualifies the first two
+matrices before the added abandonment case.
+
+Default DB close still uses ordinary status batch commit. The next integration
+must own captured input/construction credit, adopt actual retained memory into
+backend accounting, reserve manifest debt, fence mutable snapshots and compose
+the prepared successor with owning WAL append. Admitted final backend flush,
+retirement and equivalent Lite/object provider adoption remain open. This
+preparation owner does not enable the complete default pooling gate; the full
+goal remains active and full GNU qualification remains waived.

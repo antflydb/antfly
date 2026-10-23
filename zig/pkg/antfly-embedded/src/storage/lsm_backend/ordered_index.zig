@@ -256,6 +256,22 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             }
         }
 
+        /// A single edit needs only a height-bounded pool. Retain every node
+        /// already reserved when admission or allocation rejects preparation.
+        /// Never use this inside a partially mutated tree traversal.
+        pub fn prepareWithAdmission(self: *Self, allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
+            try original.checkpoint();
+            if (self.account == null) self.account = try Account.create(allocator);
+            const needed = try self.preparedNodeCount(1);
+            try self.spare.ensureTotalCapacity(allocator, needed);
+            while (self.spare.items.len < needed) {
+                try original.checkpoint();
+                const node = try allocator.create(Node);
+                self.account.?.charge(@sizeOf(Node));
+                self.spare.appendAssumeCapacity(node);
+            }
+        }
+
         fn unique(self: *Self, allocator: std.mem.Allocator, node: *Node) *Node {
             if (node.refs.load(.acquire) == 1) return node;
             const copy = self.spare.pop().?;
@@ -320,6 +336,36 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
         /// here, so the ordered and hash indexes can publish atomically.
         pub fn putPrepared(self: *Self, allocator: std.mem.Allocator, entry: Entry) void {
             self.root = self.insert(allocator, self.root, entry);
+        }
+
+        /// The caller computes an insertion/replacement rank before entering
+        /// this infallible edit. In particular, arbitrarily long keys are never
+        /// compared while a shared path is being changed. The rank belongs to
+        /// this exact root; the owner must exclude intervening edits.
+        pub fn putPreparedAtRank(self: *Self, allocator: std.mem.Allocator, entry: Entry, rank: usize, replace: bool) void {
+            std.debug.assert(rank <= size(self.root));
+            std.debug.assert(!replace or rank < size(self.root));
+            self.root = self.insertAtRank(allocator, self.root, entry, rank, replace);
+        }
+
+        fn insertAtRank(self: *Self, allocator: std.mem.Allocator, old: ?*Node, entry: Entry, rank: usize, replace: bool) *Node {
+            const root = if (old) |node| self.unique(allocator, node) else {
+                std.debug.assert(rank == 0 and !replace);
+                const node = self.spare.pop().?;
+                node.* = .{ .account = self.account, .entry = entry.retainShared() };
+                node.refresh();
+                return node;
+            };
+            const left_count = size(root.left);
+            if (rank < left_count or (rank == left_count and !replace)) {
+                root.left = self.insertAtRank(allocator, root.left, entry, rank, replace);
+            } else if (rank > left_count) {
+                root.right = self.insertAtRank(allocator, root.right, entry, rank - left_count - 1, replace);
+            } else {
+                root.entry.deinit(allocator);
+                root.entry = entry.retainShared();
+            }
+            return self.rebalance(allocator, root);
         }
 
         fn remove(self: *Self, allocator: std.mem.Allocator, old: ?*Node, entry: Entry) ?*Node {

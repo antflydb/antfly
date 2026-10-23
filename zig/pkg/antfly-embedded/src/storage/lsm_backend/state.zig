@@ -742,6 +742,234 @@ pub const ActiveMemTable = struct {
         std.mem.swap(ActiveMemTable, self, candidate);
     }
 
+    /// Owning CPU preparation for a quiesced publication. The caller prepays
+    /// memory before resuming and retains the backend until retirement. No
+    /// admission borrow escapes a call. Rejection retains completed rows,
+    /// partial copies, comparisons and reserved nodes, without changing live.
+    pub const PublicationPreparation = struct {
+        const Port = @import("../../common/read_admission.zig").Port;
+        const quantum = 16 * 1024;
+        source: State,
+        candidate: ActiveMemTable,
+        planned_index: usize = 0,
+        planned_bytes: u64 = 0,
+        allocation_bound: ?u64 = null,
+        index: usize = 0,
+        pending: ?OwnedEntry = null,
+        copied: usize = 0,
+        copying: bool = false,
+        searching: bool = false,
+        node: ?*const OrderedIndex.Node = null,
+        rank: usize = 0,
+        replace: bool = false,
+        comparing_key: bool = false,
+        compared: usize = 0,
+        ready: bool = false,
+        published: bool = false,
+        retirement: ?struct { tree: OrderedIndex.Reclaimer, source: State.Reclaimer } = null,
+        retired: bool = false,
+
+        /// Move the immutable input and retain the live root in constant time.
+        /// The live table must remain quiesced through publication/abandonment.
+        pub fn init(live: *const ActiveMemTable, source: *State) @This() {
+            std.debug.assert(live.ordered_enabled);
+            // Ordered writers own a tree and its node pool exclusively. A
+            // legacy flat/arena generation must be normalized before using
+            // this tree-only publication and retirement protocol.
+            std.debug.assert(live.entries.capacity == 0 and live.index.estimatedMemoryBytes() == 0 and live.arena_owner == null);
+            const out = @This(){ .source = source.*, .candidate = .{ .ordered = live.ordered.fork(), .logical_bytes = live.logical_bytes } };
+            source.* = .{};
+            return out;
+        }
+
+        /// Conservative additional heap bound for this successor. Input and
+        /// encoded/frozen WAL bytes are separate obligations. Planning itself
+        /// allocates nothing and retains progress on rejection. The caller
+        /// reserves this credit before resumeWithAdmission can allocate.
+        pub fn memoryBoundWithAdmission(self: *@This(), original: Port) !u64 {
+            std.debug.assert(self.retirement == null and !self.retired and !self.published);
+            try original.checkpoint();
+            if (self.allocation_bound) |bound| return bound;
+            while (self.planned_index < self.source.entryCount()) {
+                try original.checkpoint();
+                const input = self.source.entryAt(self.planned_index);
+                var bytes: u64 = @sizeOf(SharedEntry);
+                if (input.namespace_name) |name| bytes = try std.math.add(u64, bytes, name.len);
+                bytes = try std.math.add(u64, bytes, input.key.len);
+                bytes = try std.math.add(u64, bytes, input.value.len);
+                self.planned_bytes = try std.math.add(u64, self.planned_bytes, bytes);
+                self.planned_index += 1;
+            }
+            const nodes = try self.candidate.ordered.prepareMemoryBound(self.source.entryCount());
+            const bound = try std.math.add(u64, nodes, self.planned_bytes);
+            try original.checkpoint();
+            self.allocation_bound = bound;
+            return bound;
+        }
+
+        pub fn resumeWithAdmission(self: *@This(), allocator: Allocator, original: Port) !void {
+            std.debug.assert(self.retirement == null and !self.retired and !self.published);
+            std.debug.assert(self.allocation_bound != null);
+            try original.checkpoint();
+            while (self.index < self.source.entryCount()) {
+                try original.checkpoint();
+                try self.candidate.ordered.prepareWithAdmission(allocator, original);
+                const input = self.source.entryAt(self.index);
+                if (self.pending == null) {
+                    const account = self.candidate.ordered.account.?;
+                    if (input.shared != null and (input.shared.?.account == null or input.shared.?.account == account)) {
+                        self.pending = input.retainShared();
+                    } else {
+                        const ns_len = if (input.namespace_name) |name| name.len else 0;
+                        var len = try std.math.add(usize, @sizeOf(SharedEntry), ns_len);
+                        len = try std.math.add(usize, len, input.key.len);
+                        len = try std.math.add(usize, len, input.value.len);
+                        const allocation = try allocator.alignedAlloc(u8, .of(SharedEntry), len);
+                        const owner: *SharedEntry = @ptrCast(allocation.ptr);
+                        owner.* = .{ .allocator = allocator, .allocation_len = len };
+                        const bytes = allocation[@sizeOf(SharedEntry)..];
+                        self.pending = .{ .shared = owner, .namespace_name = if (input.namespace_name != null) bytes[0..ns_len] else null, .key = bytes[ns_len..][0..input.key.len], .value = bytes[ns_len + input.key.len ..], .tombstone = input.tombstone };
+                        self.copying = true;
+                    }
+                }
+                if (self.copying) {
+                    const output = self.pending.?;
+                    const ns_len = if (input.namespace_name) |name| name.len else 0;
+                    const total = ns_len + input.key.len + input.value.len;
+                    while (self.copied < total) {
+                        try original.checkpoint();
+                        const offset = self.copied;
+                        const from, const to, const local = if (offset < ns_len)
+                            .{ input.namespace_name.?, output.namespace_name.?, offset }
+                        else if (offset - ns_len < input.key.len)
+                            .{ input.key, output.key, offset - ns_len }
+                        else
+                            .{ input.value, output.value, offset - ns_len - input.key.len };
+                        const end = @min(from.len, local + quantum);
+                        @memcpy(to[local..end], from[local..end]);
+                        self.copied += end - local;
+                    }
+                    self.copying = false;
+                }
+                if (!self.searching) {
+                    self.node = self.candidate.ordered.root;
+                    self.rank = 0;
+                    self.replace = false;
+                    self.searching = true;
+                }
+                while (self.node) |node| {
+                    try original.checkpoint();
+                    const order = try self.compareWithAdmission(node.entry, self.pending.?, original);
+                    self.compared = 0;
+                    self.comparing_key = false;
+                    const left_count = if (node.left) |left| left.count else 0;
+                    switch (order) {
+                        .lt => {
+                            self.rank += left_count + 1;
+                            self.node = node.right;
+                        },
+                        .gt => self.node = node.left,
+                        .eq => {
+                            self.rank += left_count;
+                            self.replace = true;
+                            self.node = null;
+                        },
+                    }
+                }
+                // All fallible work precedes this height-bounded mutation.
+                // In particular no checkpoint splits ownership from insertion.
+                try original.checkpoint();
+                var owned = self.pending.?;
+                if (owned.shared.?.account == null) {
+                    const account = self.candidate.ordered.account.?;
+                    owned.shared.?.account = account;
+                    account.charge(owned.shared.?.allocation_len);
+                }
+                self.candidate.ordered.putPreparedAtRank(allocator, owned, self.rank, self.replace);
+                owned.deinit(allocator);
+                self.pending = null;
+                self.copied = 0;
+                self.searching = false;
+                self.index += 1;
+                const root = self.candidate.ordered.root.?;
+                self.candidate.logical_bytes = root.bytes - root.count * (@sizeOf(OrderedIndex.Node) + @sizeOf(SharedEntry)) + root.count * @sizeOf(OwnedEntry);
+            }
+            try original.checkpoint();
+            self.ready = true;
+        }
+
+        fn compareWithAdmission(self: *@This(), a: OwnedEntry, b: OwnedEntry, original: Port) !std.math.Order {
+            if (!self.comparing_key) {
+                if (a.namespace_name == null and b.namespace_name != null) return .lt;
+                if (a.namespace_name != null and b.namespace_name == null) return .gt;
+                if (a.namespace_name != null) {
+                    const order = try self.compareBytes(a.namespace_name.?, b.namespace_name.?, original);
+                    if (order != .eq) return order;
+                }
+                self.comparing_key = true;
+                self.compared = 0;
+            }
+            return self.compareBytes(a.key, b.key, original);
+        }
+
+        fn compareBytes(self: *@This(), a: []const u8, b: []const u8, original: Port) !std.math.Order {
+            const len = @min(a.len, b.len);
+            while (self.compared < len) {
+                try original.checkpoint();
+                const end = @min(len, self.compared + quantum);
+                const order = std.mem.order(u8, a[self.compared..end], b[self.compared..end]);
+                self.compared = end;
+                if (order != .eq) return order;
+            }
+            return std.math.order(a.len, b.len);
+        }
+
+        /// Only the owning WAL coordinator may call this after durable append.
+        /// The owner separately handles snapshot fencing and memory credits.
+        pub fn publish(self: *@This(), live: *ActiveMemTable) void {
+            std.debug.assert(self.ready and !self.published and self.retirement == null and !self.retired);
+            live.publishPrepared(&self.candidate);
+            self.published = true;
+        }
+
+        fn beginRetirement(self: *@This(), allocator: Allocator) void {
+            if (self.retirement != null or self.retired) return;
+            if (self.pending) |*entry| entry.deinit(allocator);
+            self.pending = null;
+            self.retirement = .{ .tree = .init(self.candidate.ordered), .source = .init(self.source) };
+            self.candidate = .{};
+            self.source = .{};
+            self.node = null;
+        }
+
+        pub fn retireWithAdmission(self: *@This(), allocator: Allocator, original: Port) !void {
+            try original.checkpoint();
+            self.beginRetirement(allocator);
+            while (!self.retired) {
+                try original.checkpoint();
+                _ = self.retireStep(allocator);
+            }
+        }
+
+        fn retireStep(self: *@This(), allocator: Allocator) bool {
+            if (self.retired) return true;
+            var credits: usize = 64;
+            const retirement = &self.retirement.?;
+            if (!retirement.tree.step(allocator, &credits)) return false;
+            if (!retirement.source.step(allocator, &credits)) return false;
+            self.retirement = null;
+            self.retired = true;
+            return true;
+        }
+
+        /// Mandatory quiesced destruction, after all borrowers have joined.
+        /// Normal close uses retireWithAdmission, retaining rejected work.
+        pub fn deinit(self: *@This(), allocator: Allocator) void {
+            self.beginRetirement(allocator);
+            while (!self.retireStep(allocator)) {}
+        }
+    };
+
     pub fn upsert(
         self: *ActiveMemTable,
         allocator: Allocator,
@@ -1246,6 +1474,211 @@ pub fn stripTombstones(state: *State, allocator: Allocator) !void {
     }
     state.deinit(allocator);
     state.entries = filtered;
+}
+
+const PublicationPreparationTestControl = struct {
+    calls: usize = 0,
+    fail_at: usize = std.math.maxInt(usize),
+    failure: anyerror = error.Cancelled,
+
+    fn checkpoint(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const call = self.calls;
+        self.calls += 1;
+        if (call == self.fail_at) return self.failure;
+    }
+};
+
+fn publicationPreparationFixture(allocator: Allocator) !struct { live: ActiveMemTable, source: State, expected: State } {
+    var live: ActiveMemTable = .{};
+    errdefer live.deinit(allocator);
+    var source: State = .{};
+    errdefer source.deinit(allocator);
+    for (0..32) |i| {
+        var key: [2]u8 = undefined;
+        std.mem.writeInt(u16, &key, @intCast(i * 2), .big);
+        try live.upsert(allocator, .{}, &key, "old", false);
+        std.mem.writeInt(u16, &key, @intCast(63 - i * 2), .big);
+        try source.upsert(allocator, .{}, &key, "inserted", false);
+    }
+    try source.upsert(allocator, .{}, &.{ 0, 0 }, "replaced", false);
+    try source.upsert(allocator, .{}, &.{ 0, 20 }, "", true);
+    try live.upsert(allocator, .{ .name = "" }, "same", "empty namespace", false);
+    try source.upsert(allocator, .{ .name = "" }, "same", "replaced empty namespace", false);
+    try source.upsert(allocator, .{ .name = "docs" }, "same", "named", false);
+    const name = try allocator.alloc(u8, 65537);
+    defer allocator.free(name);
+    @memset(name, 'n');
+    const key = try allocator.alloc(u8, 65539);
+    defer allocator.free(key);
+    @memset(key, 'k');
+    const value = try allocator.alloc(u8, 98305);
+    defer allocator.free(value);
+    @memset(value, 'v');
+    try live.upsert(allocator, .{ .name = name }, key, "old long key", false);
+    try source.upsert(allocator, .{ .name = name }, key, value, false);
+    key[key.len - 1] = 'l';
+    try source.upsert(allocator, .{ .name = name }, key, "long neighbor", false);
+    var expected = try live.clone(allocator);
+    errdefer expected.deinit(allocator);
+    try applyState(&expected, allocator, &source);
+    return .{ .live = live, .source = source, .expected = expected };
+}
+
+fn expectPublicationPreparationState(live: *const ActiveMemTable, expected: *const State) !void {
+    try std.testing.expectEqual(expected.entryCount(), live.entryCount());
+    for (0..live.entryCount()) |i| {
+        const a = live.entryAt(i);
+        const b = expected.entryAt(i);
+        try std.testing.expectEqual(std.math.Order.eq, compareEntryTo(a, namespaceOf(b), b.key));
+        try std.testing.expectEqualSlices(u8, b.value, a.value);
+        try std.testing.expectEqual(b.tombstone, a.tombstone);
+    }
+}
+
+test "controlled physical sync mutable preparation retains every original rejection and publishes without allocation" {
+    const admission = @import("../../common/read_admission.zig");
+    var calls: usize = 0;
+    var offset: usize = 0;
+    while (offset <= calls) : (offset += 1) {
+        for ([_]anyerror{ error.Cancelled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            const allocator = failing.allocator();
+            var fixture = try publicationPreparationFixture(allocator);
+            defer fixture.live.deinit(allocator);
+            defer fixture.source.deinit(allocator);
+            defer fixture.expected.deinit(allocator);
+            var pinned = try fixture.live.snapshot(allocator);
+            defer pinned.deinit(allocator);
+            const root = fixture.live.ordered.root;
+            var preparation = ActiveMemTable.PublicationPreparation.init(&fixture.live, &fixture.source);
+            defer preparation.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 0), fixture.source.entryCount());
+            var control: PublicationPreparationTestControl = .{ .failure = failure };
+            const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = PublicationPreparationTestControl.checkpoint } };
+            const original = admission.Port.init(&payload);
+            if (offset != 0) control.fail_at = offset - 1;
+            const bound = preparation.memoryBoundWithAdmission(original) catch |cause| blk: {
+                try std.testing.expectEqual(failure, cause);
+                try std.testing.expectEqual(root, fixture.live.ordered.root);
+                control.fail_at = std.math.maxInt(usize);
+                break :blk try preparation.memoryBoundWithAdmission(original);
+            };
+            try std.testing.expect(bound > 3 * 65536);
+            preparation.resumeWithAdmission(allocator, original) catch |cause| {
+                try std.testing.expectEqual(failure, cause);
+                try std.testing.expectEqual(root, fixture.live.ordered.root);
+                control.fail_at = std.math.maxInt(usize);
+                try preparation.resumeWithAdmission(allocator, original);
+            };
+            if (offset == 0) calls = control.calls;
+            try std.testing.expectEqual(root, fixture.live.ordered.root);
+            try expectPublicationPreparationState(&preparation.candidate, &fixture.expected);
+            failing.fail_index = failing.alloc_index;
+            preparation.publish(&fixture.live);
+            failing.fail_index = std.math.maxInt(usize);
+            try expectPublicationPreparationState(&fixture.live, &fixture.expected);
+            try std.testing.expectEqualStrings("old", try pinned.get(.{}, &.{ 0, 0 }));
+            try std.testing.expectEqualStrings("old", try pinned.get(.{}, &.{ 0, 20 }));
+            control.fail_at = control.calls + 1;
+            try std.testing.expectError(failure, preparation.retireWithAdmission(allocator, original));
+            try std.testing.expect(!preparation.retired);
+            control.fail_at = std.math.maxInt(usize);
+            try preparation.retireWithAdmission(allocator, original);
+            try std.testing.expect(preparation.retired);
+        }
+    }
+    try std.testing.expect(calls > 100);
+}
+
+test "controlled physical sync mutable preparation resumes every allocation failure and retires abandoned shared roots" {
+    const admission = @import("../../common/read_admission.zig");
+    var allocations: usize = 0;
+    var offset: usize = 0;
+    while (offset <= allocations) : (offset += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const allocator = failing.allocator();
+        var fixture = try publicationPreparationFixture(allocator);
+        defer fixture.live.deinit(allocator);
+        defer fixture.source.deinit(allocator);
+        defer fixture.expected.deinit(allocator);
+        const account = fixture.live.ordered.account.?;
+        const baseline = account.bytes.load(.acquire);
+        const root = fixture.live.ordered.root;
+        var preparation = ActiveMemTable.PublicationPreparation.init(&fixture.live, &fixture.source);
+        defer preparation.deinit(allocator);
+        var control: PublicationPreparationTestControl = .{};
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = PublicationPreparationTestControl.checkpoint } };
+        const original = admission.Port.init(&payload);
+        _ = try preparation.memoryBoundWithAdmission(original);
+        const before = failing.alloc_index;
+        if (offset != 0) failing.fail_index = before + offset - 1;
+        preparation.resumeWithAdmission(allocator, original) catch |cause| {
+            try std.testing.expectEqual(error.OutOfMemory, cause);
+            try std.testing.expectEqual(root, fixture.live.ordered.root);
+            failing.fail_index = std.math.maxInt(usize);
+            try preparation.resumeWithAdmission(allocator, original);
+        };
+        if (offset == 0) allocations = failing.alloc_index - before;
+        try expectPublicationPreparationState(&preparation.candidate, &fixture.expected);
+        try std.testing.expect(account.bytes.load(.acquire) > baseline);
+        try preparation.retireWithAdmission(allocator, original);
+        try std.testing.expectEqual(root, fixture.live.ordered.root);
+        try std.testing.expectEqual(baseline, account.bytes.load(.acquire));
+    }
+    try std.testing.expect(allocations > 10);
+}
+
+test "controlled physical sync mutable preparation abandons partial arena input and empty generations without losing ownership" {
+    const admission = @import("../../common/read_admission.zig");
+    const allocator = std.testing.allocator;
+    var calls: usize = 0;
+    var offset: usize = 0;
+    while (offset <= calls) : (offset += 1) {
+        var fixture = try publicationPreparationFixture(allocator);
+        defer fixture.live.deinit(allocator);
+        defer fixture.source.deinit(allocator);
+        defer fixture.expected.deinit(allocator);
+        var arena_input = try fixture.source.cloneArena(allocator);
+        defer arena_input.deinit(allocator);
+        fixture.source.deinit(allocator);
+        // Both an existing shared account and creation of a new account must
+        // unwind partial node pools and packed byte copies without a commit.
+        if (offset % 2 == 1) fixture.live.deinit(allocator);
+        const account = fixture.live.ordered.account;
+        const baseline = if (account) |a| a.bytes.load(.acquire) else 0;
+        const root = fixture.live.ordered.root;
+        var preparation = ActiveMemTable.PublicationPreparation.init(&fixture.live, &arena_input);
+        defer preparation.deinit(allocator);
+        var control: PublicationPreparationTestControl = .{};
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = PublicationPreparationTestControl.checkpoint } };
+        const original = admission.Port.init(&payload);
+        _ = try preparation.memoryBoundWithAdmission(original);
+        control.calls = 0;
+        if (offset != 0) control.fail_at = offset - 1;
+        preparation.resumeWithAdmission(allocator, original) catch |cause| {
+            try std.testing.expectEqual(error.Cancelled, cause);
+        };
+        if (offset == 0) calls = control.calls;
+        control.fail_at = std.math.maxInt(usize);
+        try preparation.retireWithAdmission(allocator, original);
+        try std.testing.expectEqual(root, fixture.live.ordered.root);
+        if (account) |a| try std.testing.expectEqual(baseline, a.bytes.load(.acquire));
+    }
+    var empty: ActiveMemTable = .{};
+    defer empty.deinit(allocator);
+    var source: State = .{};
+    var preparation = ActiveMemTable.PublicationPreparation.init(&empty, &source);
+    defer preparation.deinit(allocator);
+    var control: PublicationPreparationTestControl = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = PublicationPreparationTestControl.checkpoint } };
+    const original = admission.Port.init(&payload);
+    _ = try preparation.memoryBoundWithAdmission(original);
+    try preparation.resumeWithAdmission(allocator, original);
+    try std.testing.expect(preparation.candidate.ordered.account == null);
+    preparation.publish(&empty);
+    try preparation.retireWithAdmission(allocator, original);
+    try std.testing.expectEqual(@as(usize, 0), empty.entryCount());
 }
 
 test "prepared mutable publication is atomic at every allocation failure" {

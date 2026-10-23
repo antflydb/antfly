@@ -29416,23 +29416,27 @@ test "controlled physical sync backend WAL append owns actual publication and a 
         var incoming: ActiveMemTable = .{ .ordered_enabled = false };
         defer incoming.deinit(a);
         try incoming.upsert(a, .{ .name = "docs" }, "final", "status", false);
-        var candidate = try backend.mutable.preparePublication(a, &incoming);
-        defer candidate.deinit(a);
-        const record = try wal_mod.prepareStateRecordWithAdmission(a, &incoming, original);
+        var source = try incoming.toStateMove(a);
+        defer source.deinit(a);
+        var preparation = ActiveMemTable.PublicationPreparation.init(&backend.mutable, &source);
+        defer preparation.deinit(a);
+        _ = try preparation.memoryBoundWithAdmission(original);
+        try preparation.resumeWithAdmission(a, original);
+        const record = try wal_mod.prepareStateRecordWithAdmission(a, &preparation.source, original);
         defer a.free(record);
         var published = false;
         var recover = false;
         var releases: usize = 0;
         const Publication = struct {
             backend: *Backend,
-            candidate: *ActiveMemTable,
+            preparation: *ActiveMemTable.PublicationPreparation,
             published: *bool,
             recover: *bool,
             releases: *usize,
             pub fn publish(self: *@This(), _: wal_mod.AppendResult) void {
                 std.debug.assert(!self.published.*);
                 self.backend.invalidateMutableReadSnapshot();
-                self.backend.mutable.publishPrepared(self.candidate);
+                self.preparation.publish(&self.backend.mutable);
                 self.published.* = true;
             }
             pub fn requireRecovery(self: *@This()) void {
@@ -29442,7 +29446,7 @@ test "controlled physical sync backend WAL append owns actual publication and a 
                 self.releases.* += 1;
             }
         };
-        const publication: Publication = .{ .backend = &backend, .candidate = &candidate, .published = &published, .recover = &recover, .releases = &releases };
+        const publication: Publication = .{ .backend = &backend, .preparation = &preparation, .published = &published, .recover = &recover, .releases = &releases };
         const baseline_fds = pool.snapshotStats().fd_admitted_descriptors;
         var held = try backend.acquireWalOperationLock(.exclusive);
         var held_live = true;
@@ -29488,5 +29492,6 @@ test "controlled physical sync backend WAL append owns actual publication and a 
         if (mode != .publish) try std.testing.expectError(error.RecoveryRequired, backend.tryBeginQuiescedWalAppendWithAdmission(record, publication, original));
         var shared = (try backend.tryAcquireWalOperationLock(.shared)) orelse return error.TestUnexpectedResult;
         shared.release();
+        try preparation.retireWithAdmission(a, original);
     }
 }
