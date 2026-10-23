@@ -1226,6 +1226,21 @@ Ignored baseline identities, sources, raw arms and receipts are under
 `.benchmark-assets/1166/next-bulk/`; the full 36-package composition remains in
 progress.
 
+### Second implementation checkpoint: Q4 scalar schedules
+
+N05/N06 share ten matching Q4_0 scalar exports through two forced-inline
+owners: eight NR/NSG/input/output variants and two sum-of-squares input
+variants. The separate NQ8 lane-packing schedule remains explicit. Exact
+accumulator extents, narrowing points and the auxiliary reduction are retained.
+This cohort removes **12452 authored Metal bytes** after counting both helpers.
+
+All 88 safe/fast direct cases pass baseline bytes, independent arithmetic
+references, guards, resources and the 5% timing ceiling with 32 balanced arms
+and 2,000 dispatches. Fixtures cover partial output tiles, multiple row/block
+sizes and empty rows. Full source compilation succeeds on the actual Metal
+runtime compiler. Receipts are in `next-bulk/metal-q4-scalar/`; composition
+qualification remains pending.
+
 ### Six implementation waves
 
 1. **Ownership and contracts — N01–N04.** Freeze the source/images/executables;
