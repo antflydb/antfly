@@ -1047,6 +1047,8 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> qwen35_recurrent_columns4_pipeline;
     id<MTLComputePipelineState> qwen35_recurrent_decode_pipeline;
     id<MTLComputePipelineState> qwen35_fused_decode_pipeline;
+    id<MTLComputePipelineState> lightonocr3_copy_pipeline;
+    uint64_t lightonocr3_copy_dispatches;
     id<MTLComputePipelineState> lightonocr3_recurrent_parallel_pipeline;
     id<MTLComputePipelineState> lightonocr3_prefill_prepare_pipeline;
     id<MTLComputePipelineState> lightonocr3_prefill_norm_pipeline;
@@ -6813,6 +6815,7 @@ static NSString *termite_metal_lightonocr3_recurrent_source(void) {
     return @""
         "#include <metal_stdlib>\n"
         "using namespace metal;\n"
+        "kernel void termite_lightonocr3_copy16(device const uint4 *x [[buffer(0)]], device uint4 *y [[buffer(1)]], constant uint &n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) y[i] = x[i]; }\n"
         "struct CoreParams {\n"
         "    uint seq, key_heads, value_heads, dim, kernel_size, initialized;\n"
         "};\n"
@@ -29594,6 +29597,8 @@ static void termite_metal_initialize_lightonocr3_recurrent(termite_metal_decode_
     id<MTLLibrary> library = [runtime->device newLibraryWithSource:termite_metal_lightonocr3_recurrent_source()
                                                         options:options error:&error];
     if (library != nil) {
+        runtime->lightonocr3_copy_pipeline = termite_metal_make_pipeline(
+            runtime->device, library, @"termite_lightonocr3_copy16");
         runtime->lightonocr3_recurrent_parallel_pipeline = termite_metal_make_pipeline(
             runtime->device, library, @"termite_lightonocr3_recurrent_parallel");
         runtime->lightonocr3_prefill_prepare_pipeline = termite_metal_make_pipeline(
@@ -31618,6 +31623,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->qwen35_recurrent_columns4_pipeline = nil;
     runtime->qwen35_recurrent_decode_pipeline = nil;
     runtime->qwen35_fused_decode_pipeline = nil;
+    runtime->lightonocr3_copy_pipeline = nil;
     runtime->lightonocr3_recurrent_parallel_pipeline = nil;
     runtime->lightonocr3_prefill_prepare_pipeline = nil;
     runtime->lightonocr3_prefill_norm_pipeline = nil;
@@ -70616,6 +70622,45 @@ int termite_metal_buffer_download(
     }
 }
 
+// Bit-preserving small device copies stay on a tracked serial compute encoder.
+// This avoids a blit transition between each page's attention result and its
+// following projections. Standalone, large, unaligned and aliasing copies keep
+// their established route. No persistent buffers or arithmetic conversions.
+static int termite_metal_lightonocr3_copy_on_frame(termite_metal_decode_runtime *runtime,
+    id<MTLBuffer> src, size_t src_offset, id<MTLBuffer> dst, size_t dst_offset, size_t length) {
+    if (runtime == NULL || !runtime->lightonocr3_projections_enabled ||
+        !runtime->qwen35_ocr_vector_loads_enabled || runtime->active_frame_cb == nil ||
+        runtime->active_frame_regime != TERMITE_METAL_FRAME_REGIME_DECODE ||
+        !termite_metal_should_coalesce_planned_compute_encoder(runtime) ||
+        termite_metal_concurrent_planned_dispatch_enabled(runtime) ||
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_COMPUTE_COPIES")) ||
+        length > 65536 || length % 16 != 0 || src_offset % 16 != 0 || dst_offset % 16 != 0 ||
+        src.device != runtime->device || dst.device != runtime->device) return 0;
+    id<MTLComputePipelineState> pipeline = runtime->lightonocr3_copy_pipeline;
+    if (pipeline == nil || pipeline.threadExecutionWidth != 32 ||
+        pipeline.maxTotalThreadsPerThreadgroup < 128 ||
+        pipeline.staticThreadgroupMemoryLength > runtime->device.maxThreadgroupMemoryLength) return 0;
+    if (src == dst && src_offset < dst_offset + length && dst_offset < src_offset + length) return 0;
+    if (termite_metal_decode_runtime_retain_frame_resource(runtime, src) ||
+        termite_metal_decode_runtime_retain_frame_resource(runtime, dst)) return -7;
+    if (runtime->active_planned_compute_encoder == nil &&
+        termite_metal_decode_runtime_begin_planned_compute_scope(runtime,
+            TERMITE_METAL_COMPUTE_SOURCE_OTHER, runtime->active_compute_region)) return -7;
+    if (termite_metal_decode_runtime_prepare_planned_compute_unary_accesses(runtime,
+        src, src_offset, length, dst, dst_offset, length, -7)) return -7;
+    id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+    const uint32_t count = (uint32_t)(length / 16);
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:src offset:src_offset atIndex:0];
+    [encoder setBuffer:dst offset:dst_offset atIndex:1];
+    [encoder setBytes:&count length:sizeof(count) atIndex:2];
+    [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (runtime->lightonocr3_copy_dispatches++ == 0 &&
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_LIGHTONOCR3_COMPUTE_COPIES")))
+        fprintf(stderr, "lightonocr3_compute_copy: bytes=%zu planned=1\n", length);
+    return 1;
+}
+
 int termite_metal_buffer_copy(
     termite_metal_decode_runtime *runtime,
     void *src_handle,
@@ -70628,7 +70673,8 @@ int termite_metal_buffer_copy(
     @autoreleasepool {
         id<MTLBuffer> src = (__bridge id<MTLBuffer>)src_handle;
         id<MTLBuffer> dst = (__bridge id<MTLBuffer>)dst_handle;
-        if (src_offset + length > src.length || dst_offset + length > dst.length) return -2;
+        if (src_offset > src.length || length > src.length - src_offset ||
+            dst_offset > dst.length || length > dst.length - dst_offset) return -2;
         if (src.storageMode == MTLStorageModeShared && dst.storageMode == MTLStorageModeShared &&
             (runtime == NULL || (runtime->active_frame_cb == nil && runtime->submitted_frame_cb == nil))) {
             memcpy((uint8_t *)dst.contents + dst_offset, (const uint8_t *)src.contents + src_offset, length);
@@ -70636,6 +70682,11 @@ int termite_metal_buffer_copy(
             return 0;
         }
         if (runtime == NULL || runtime->device == nil || runtime->queue == nil) return -3;
+        const int copied = termite_metal_lightonocr3_copy_on_frame(runtime, src, src_offset, dst, dst_offset, length);
+        if (copied != 0) {
+            if (copied > 0) termite_metal_telemetry_copy(TERMITE_METAL_COPY_BYTES, TERMITE_METAL_COPY_CALLS, length);
+            return copied > 0 ? 0 : copied;
+        }
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -4;

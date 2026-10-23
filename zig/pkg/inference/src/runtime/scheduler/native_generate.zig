@@ -226,6 +226,8 @@ pub const Policy = struct {
     /// follower cannot bypass the first caller's bounded coalescing window.
     /// One preserves the existing eager/C2 scheduling policy.
     decode_coalesce_rows: usize = 1,
+    /// Count only pages with known next decode work when forming a cohort.
+    decode_coalesce_ready_only: bool = false,
     /// Model-scoped wait between unsuccessful turn/step claims. A positive
     /// duration parks waiting OS threads while their peer owns a GPU forward.
     /// Zero preserves the cooperative polling policy for other backends.
@@ -807,6 +809,29 @@ pub const NativeGenerateCoordinator = struct {
         return now_ns < earliest +| (@as(u64, self.policy.max_decode_wait_us) * std.time.ns_per_us);
     }
 
+    fn deferReadyDecodeCohort(self: *const NativeGenerateCoordinator, budget: StepBudget, now_ns: u64, leader: PendingDecode) bool {
+        if (self.policy.decode_coalesce_rows <= 1 or self.policy.max_decode_wait_us == 0 or leader.exclusive_step) return false;
+        var eligible: usize = 0;
+        var queued: usize = 0;
+        var earliest = leader.enqueued_ns;
+        for (self.entries.items) |entry| {
+            if (self.findPendingDecodeByRequest(entry.id)) |idx| {
+                const pending = self.pending_decode.items[idx];
+                if (pending.exclusive_step or (!self.policy.allow_mixed_sequence_lengths and
+                    !decodeWorkCompatible(pending, leader.total_sequence_len, leader.kv_sequence_len, leader.kv_position_offset))) continue;
+                eligible += 1;
+                queued += 1;
+                earliest = @min(earliest, pending.enqueued_ns);
+            } else if (entry.phase == .decode) {
+                const next = entry.next_decode_work_total_sequence_len orelse continue;
+                if (self.policy.allow_mixed_sequence_lengths or next == leader.total_sequence_len) eligible += 1;
+            }
+        }
+        const target = @min(self.policy.decode_coalesce_rows, @max(budget.max_items, 1), @max(budget.max_query_tokens, 1), eligible);
+        if (target <= 1 or queued >= target) return false;
+        return now_ns < earliest +| (@as(u64, self.policy.max_decode_wait_us) * std.time.ns_per_us);
+    }
+
     /// Unified step claim: replaces the prefill/decode/mixed claim trio with a
     /// single entry point that always packs whatever pending work fits the
     /// budget. The leader is always included; additional items are packed
@@ -833,8 +858,14 @@ pub const NativeGenerateCoordinator = struct {
             if (selected != lease.request_id) return false;
         }
 
-        if (leader_phase == .decode and self.in_turn == null and self.policy.decode_coalesce_rows > 1 and
-            self.deferDecodeCohort(budget, platform.time.monotonicNs())) return false;
+        if (leader_phase == .decode and self.in_turn == null and self.policy.decode_coalesce_rows > 1) {
+            const now = platform.time.monotonicNs();
+            const delay = if (self.policy.decode_coalesce_ready_only) ready: {
+                const idx = self.findPendingDecodeByRequest(lease.request_id) orelse break :ready false;
+                break :ready self.deferReadyDecodeCohort(budget, now, self.pending_decode.items[idx]);
+            } else self.deferDecodeCohort(budget, now);
+            if (delay) return false;
+        }
 
         const max_items = @max(budget.max_items, 1);
         const max_query_tokens = @max(budget.max_query_tokens, 1);
@@ -3078,4 +3109,43 @@ test "LightOnOCR3 scheduler contention wait parks outside the lock and propagate
     coordinator.finishTurn(&first, .prefill);
     try coordinator.awaitTurn(&second, .prefill, io);
     coordinator.finishTurn(&second, .prefill);
+}
+
+test "LightOnOCR3 ready cohorts exclude prefill and unknown next work" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 4, .decode_coalesce_rows = 4, .decode_coalesce_ready_only = true, .allow_mixed_sequence_lengths = true });
+    var leases: [4]Lease = undefined;
+    for (&leases) |*lease| lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    coordinator.beginDecode(&leases[0], 4);
+    coordinator.beginDecode(&leases[1], 4);
+    try coordinator.enqueueDecodeWork(leases[0], @ptrFromInt(1), 5, 4, 0, .{});
+    coordinator.pending_decode.items[0].enqueued_ns = 1;
+    const budget = coordinator.defaultStepBudget();
+    const leader = coordinator.pending_decode.items[0];
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, 1, leader));
+    coordinator.noteDecodeProgress(&leases[1], 1);
+    try std.testing.expect(coordinator.deferReadyDecodeCohort(budget, 1, leader));
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, std.time.ns_per_s, leader));
+    var exclusive = leader;
+    exclusive.exclusive_step = true;
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, 1, exclusive));
+    var single = budget;
+    single.max_items = 1;
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(single, 1, leader));
+    single = budget;
+    single.max_query_tokens = 1;
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(single, 1, leader));
+    coordinator.policy.allow_mixed_sequence_lengths = false;
+    coordinator.noteDecodeProgress(&leases[1], 2);
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, 1, leader));
+    coordinator.policy.allow_mixed_sequence_lengths = true;
+    try coordinator.enqueueDecodeWork(leases[1], @ptrFromInt(2), 6, 5, 0, .{});
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, 1, leader));
+    try std.testing.expect(coordinator.deferDecodeCohort(budget, 1));
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(std.testing.allocator);
+    try std.testing.expect(try coordinator.claimStep(std.testing.allocator, &leases[0], @ptrFromInt(1), .decode, budget, &step));
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    coordinator.completeStep(&leases[0], step.items);
 }

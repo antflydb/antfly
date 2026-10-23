@@ -134,8 +134,10 @@ batching gives 1.5599. Bigger windows and longer waits are not promoted as faste
 defaults. Extra encoder reuse is also inconsistent (0.8B 1.8974 versus adjacent
 2.0450 and 2.0298), so remains opt-in.
 
-The earlier 146-case synchronized per-operation wall-time sweep is not evidence
-of whole-graph throughput or universal GPU-kernel parity.
+The earlier 146-case sweep uses command-buffer GPU timestamps for both native
+and MLX participants, rather than synchronized host wall time. Those isolated
+operation measurements do not establish whole-graph throughput or universal
+GPU-kernel parity; the native F32 and MLX BF16 participants also differ in precision.
 
 The unresolved throughput work includes the remaining attention gap against MLX
 BF16, noncontiguous recurrent-state access, CPU dispatch/allocation/environment

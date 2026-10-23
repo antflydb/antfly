@@ -62,6 +62,12 @@ def run(args, model, label, mode, concurrency, output):
             "ANTFLY_TEST_OCR_STATIC_WORK_ASSIGNMENT",
             "ANTFLY_LIGHTONOCR3_STATIC_PAGE_ASSIGNMENT",
             "ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US",
+            "ANTFLY_LIGHTONOCR3_WAIT_FOR_PREFILL_PEERS",
+            "ANTFLY_LIGHTONOCR3_READY_COHORTS",
+            "TERMITE_METAL_TRACE_LIGHTONOCR3_COMPUTE_COPIES",
+            "TERMITE_METAL_TRACE_LIGHTONOCR3_PACKED_CORE",
+            "TERMITE_METAL_TRACE_LIGHTONOCR3_WEIGHT_HANDLES",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_HANDLES",
             "ANTFLY_LIGHTONOCR3_VISION_BATCH",
             "ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK",
             "ANTFLY_LIGHTONOCR3_PREFILL_BATCH",
@@ -101,6 +107,20 @@ def run(args, model, label, mode, concurrency, output):
     if args.static_work_assignment:
         env["ANTFLY_TEST_OCR_STATIC_WORK_ASSIGNMENT"] = "1"
         env["ANTFLY_LIGHTONOCR3_STATIC_PAGE_ASSIGNMENT"] = "1"
+    if args.disable_direct_core_output:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_DIRECT_CORE_OUTPUT"] = "1"
+    if args.disable_compute_copies:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_COMPUTE_COPIES"] = "1"
+    if args.weight_handles:
+        env["TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_HANDLES"] = "1"
+    if args.require_weight_handles:
+        env["TERMITE_METAL_TRACE_LIGHTONOCR3_WEIGHT_HANDLES"] = "1"
+    if args.disable_packed_core:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PACKED_CORE"] = "1"
+    if args.trace_packed_core or args.require_packed_core:
+        env["TERMITE_METAL_TRACE_LIGHTONOCR3_PACKED_CORE"] = "1"
+    if args.trace_compute_copies:
+        env["TERMITE_METAL_TRACE_LIGHTONOCR3_COMPUTE_COPIES"] = "1"
     if args.disable_prefill_direct_kv_mpp:
         env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_DIRECT_KV"] = "1"
     if args.prefill_attention_mpp:
@@ -319,6 +339,27 @@ def run(args, model, label, mode, concurrency, output):
                 ]
                 sections = re.split(r"OCR_POLICY round=\d+ name=[a-z0-9]+\n", text)[1:]
                 for sample, section in zip(result["policy_rounds"], sections):
+                    sample["retained_weight_handles_observed"] = (
+                        "lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1"
+                        in section
+                    )
+                    frames = re.findall(
+                        r"LIGHTONOCR3 runtime_frames=(\d+) frame_gpu_ns=(\d+) frame_wait_ns=(\d+)",
+                        section,
+                    )
+                    if frames:
+                        sample["framed_runtime_totals"] = {
+                            key: sum(int(row[index]) for row in frames)
+                            for index, key in enumerate(("frames", "gpu_ns", "wait_ns"))
+                        }
+                    sample["packed_core_rows_observed"] = sorted(
+                        {
+                            int(row)
+                            for row in re.findall(
+                                r"lightonocr3_packed_core: rows=(\d+)", section
+                            )
+                        }
+                    )
                     windows = re.findall(
                         r"LIGHTONOCR3 registered_window_peak=(\d+) physical_rows_limit=(\d+)",
                         section,
@@ -365,6 +406,31 @@ def run(args, model, label, mode, concurrency, output):
             result["prefill_attention_mpp_observed_including_warmup"] = bool(dispatches)
             if not dispatches:
                 result["status"] = "missing_prefill_attention_mpp"
+        if args.require_weight_handles:
+            result["retained_weight_handles_observed_including_warmup"] = (
+                "lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1"
+                in text
+            )
+            if not result["retained_weight_handles_observed_including_warmup"]:
+                result["status"] = "missing_weight_handles"
+            for sample in result.get("policy_rounds", []):
+                enabled = sample["policy"] not in (
+                    "pipelineoff",
+                    "handlesoff",
+                    "default",
+                )
+                if enabled != sample["retained_weight_handles_observed"]:
+                    result["status"] = "weight_handle_control_mismatch"
+        if args.require_packed_core:
+            rows = sorted(
+                {
+                    int(row)
+                    for row in re.findall(r"lightonocr3_packed_core: rows=(\d+)", text)
+                }
+            )
+            result["packed_core_rows_observed_including_warmup"] = rows
+            if not rows:
+                result["status"] = "missing_packed_core"
         if args.require_recurrent_parallel:
             dispatches = re.findall(
                 r"lightonocr3_recurrent_parallel: rows=\d+ heads=\d+ threads=512", text
@@ -520,12 +586,30 @@ def main():
             "batched",
             "window8",
             "spin",
+            "copyoff",
+            "pipelineoff",
+            "packedoff",
+            "readyoff",
+            "visionoff",
+            "ready",
+            "handlesoff",
+            "default",
+            "direct",
+            "copykernel",
             "current",
         ],
     )
     parser.add_argument("--prefill-core-norm", action="store_true", default=None)
     parser.add_argument("--disable-prefill-core-norm", action="store_true")
     parser.add_argument("--require-prefill-core-norm", action="store_true")
+    parser.add_argument("--disable-direct-core-output", action="store_true")
+    parser.add_argument("--disable-compute-copies", action="store_true")
+    parser.add_argument("--trace-compute-copies", action="store_true")
+    parser.add_argument("--disable-packed-core", action="store_true")
+    parser.add_argument("--trace-packed-core", action="store_true")
+    parser.add_argument("--require-packed-core", action="store_true")
+    parser.add_argument("--require-weight-handles", action="store_true")
+    parser.add_argument("--weight-handles", action="store_true")
     parser.add_argument("--disable-prefill-direct-kv-mpp", action="store_true")
     parser.add_argument("--static-work-assignment", action="store_true")
     parser.add_argument(

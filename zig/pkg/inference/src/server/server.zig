@@ -7629,6 +7629,13 @@ pub const Node = struct {
             "ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US",
             "ANTFLY_LIGHTONOCR3_BATCH_WINDOW",
             "ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US",
+            "TERMITE_METAL_DISABLE_LIGHTONOCR3_DIRECT_CORE_OUTPUT",
+            "TERMITE_METAL_DISABLE_LIGHTONOCR3_COMPUTE_COPIES",
+            "TERMITE_METAL_DISABLE_LIGHTONOCR3_PACKED_CORE",
+            "ANTFLY_LIGHTONOCR3_WAIT_FOR_PREFILL_PEERS",
+            "TERMITE_METAL_DISABLE_LIGHTONOCR3_VISION_SLOT_REUSE",
+            "ANTFLY_LIGHTONOCR3_READY_COHORTS",
+            "TERMITE_METAL_DISABLE_LIGHTONOCR3_WEIGHT_HANDLES",
         };
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
@@ -7659,7 +7666,7 @@ pub const Node = struct {
                 if (rc != 0) return error.EnvironmentMutationFailed;
             }
             if (!std.mem.eql(u8, policy, "current")) {
-                const all = std.mem.eql(u8, policy, "on") or std.mem.eql(u8, policy, "coalesced") or std.mem.eql(u8, policy, "static") or std.mem.eql(u8, policy, "batched") or std.mem.eql(u8, policy, "window8") or std.mem.eql(u8, policy, "spin");
+                const all = std.mem.eql(u8, policy, "on") or std.mem.eql(u8, policy, "coalesced") or std.mem.eql(u8, policy, "static") or std.mem.eql(u8, policy, "batched") or std.mem.eql(u8, policy, "window8") or std.mem.eql(u8, policy, "spin") or std.mem.eql(u8, policy, "copyoff") or std.mem.eql(u8, policy, "direct") or std.mem.eql(u8, policy, "copykernel") or std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "packedoff") or std.mem.eql(u8, policy, "readyoff") or std.mem.eql(u8, policy, "visionoff") or std.mem.eql(u8, policy, "ready") or std.mem.eql(u8, policy, "handlesoff") or std.mem.eql(u8, policy, "default");
                 const recurrent = all or std.mem.eql(u8, policy, "recurrent");
                 const attention = all or std.mem.eql(u8, policy, "attention");
                 const norm = all or std.mem.eql(u8, policy, "norm");
@@ -7674,6 +7681,14 @@ pub const Node = struct {
                 }
                 if (std.mem.eql(u8, policy, "window8") and Env.setenv(policy_flags[13], "8", 1) != 0) return error.EnvironmentMutationFailed;
                 if (std.mem.eql(u8, policy, "spin") and Env.setenv(policy_flags[14], "0", 1) != 0) return error.EnvironmentMutationFailed;
+                if (Env.setenv(policy_flags[15], if (std.mem.eql(u8, policy, "copyoff") or std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "copykernel")) "1" else "0", 1) != 0 or
+                    Env.setenv(policy_flags[16], if (std.mem.eql(u8, policy, "copyoff") or std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "direct")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+                const packed_off = std.mem.eql(u8, policy, "copyoff") or std.mem.eql(u8, policy, "direct") or std.mem.eql(u8, policy, "copykernel") or std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "packedoff");
+                if (Env.setenv(policy_flags[17], if (packed_off) "1" else "0", 1) != 0 or
+                    Env.setenv(policy_flags[18], if (std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "readyoff")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+                if (Env.setenv(policy_flags[19], if (std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "visionoff")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+                if (Env.setenv(policy_flags[20], if (std.mem.eql(u8, policy, "ready")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+                if (Env.setenv(policy_flags[21], if (std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "handlesoff") or std.mem.eql(u8, policy, "default")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
             }
             std.debug.print("OCR_POLICY round={d} name={s}\n", .{ round, policy });
             const latencies = try allocator.alloc(u64, requests);
@@ -7732,6 +7747,7 @@ pub const Node = struct {
         policy.allow_mixed_sequence_lengths = true;
         policy.max_decode_wait_us = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_DECODE_WAIT_US") orelse self.config.generation_batching.max_decode_wait_us, 10000));
         policy.decode_coalesce_rows = policy.max_step_items;
+        policy.decode_coalesce_ready_only = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_READY_COHORTS") and !platform.env.getenvBool("ANTFLY_LIGHTONOCR3_WAIT_FOR_PREFILL_PEERS");
         policy.contention_wait_us = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US") orelse 100, 1000));
         return policy;
     }
@@ -7789,6 +7805,10 @@ pub const Node = struct {
             std.debug.assert(ctx.registered_pages == 0);
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
                 const s = ctx.coordinator.stats;
+                if (ctx.cb) |cb| {
+                    const t = cb.debugTimingSnapshot().provider;
+                    std.debug.print("LIGHTONOCR3 runtime_frames={d} frame_gpu_ns={d} frame_wait_ns={d}\n", .{ t.decoder_runtime_frame_submits, t.decoder_runtime_frame_gpu_nanos, t.decoder_runtime_frame_wait_nanos });
+                }
                 std.debug.print("LIGHTONOCR3 registered_window_peak={d} physical_rows_limit={d}\n", .{ ctx.registered_window_peak, ctx.coordinator.policy.max_step_items });
                 std.debug.print("LIGHTONOCR3 cohort_items={d} decode_steps={d} batched_steps={d} singleton_steps={d} decode_items={d}\n", .{ ctx.completed, s.step_batches_total, s.step_batch_size_2_total + s.step_batch_size_3_4_total + s.step_batch_size_5_8_total, s.step_singleton_batches_total, s.step_decode_items_total });
             }

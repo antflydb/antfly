@@ -8012,6 +8012,35 @@ pub fn qwen35LinearAttention(
     const a_proj = try cb.linearNoBias(input, a_w, total, hidden_size, value_heads);
     defer cb.free(a_proj);
 
+    if (comptime build_options.enable_metal) {
+        if (seq_len == 1 and batch > 1 and batch <= 8 and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb)) {
+            var states: [8]*metal_compute_mod.Qwen35LinearState = undefined;
+            var count: usize = 0;
+            for (decode_context.?.qwen35_linear_batch.?) |cache| {
+                const state = cache.?.layerState(layer) orelse break;
+                states[count] = &state.device;
+                count += 1;
+            }
+            if (count == batch) if (try metal_compute_mod.MetalCompute.lightOnPackedCore(cb, states[0..count], .{
+                .mixed = mixed,
+                .z = z,
+                .beta = beta_proj,
+                .a = a_proj,
+                .key_heads = key_heads,
+                .value_heads = value_heads,
+                .dim = key_head_dim,
+                .value_dim = value_head_dim,
+                .conv_kernel = config.qwen35_linear_conv_kernel_dim,
+                .eps = config.norm_eps,
+            })) |core| {
+                defer cb.free(core);
+                const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
+                const out_weight = try getModelWeight(cb, config, out_name);
+                defer cb.free(out_weight);
+                return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+            };
+        }
+    }
     const conv_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.conv1d.weight", .{layer}) catch return error.NameTooLong;
     const conv_w = try getModelWeight(cb, config, conv_w_name);
     defer cb.free(conv_w);
@@ -8027,7 +8056,7 @@ pub fn qwen35LinearAttention(
 
     if (batch == 1) {
         const state = if (decode_context) |dc| if (dc.qwen35_linear_cache) |cache| cache.layerState(layer) else null else null;
-        const core = try qwen35ProjectedCore(cb, allocator, config, mixed, z, beta_proj, a_proj, conv_w, a_log_w, dt_bias_w, norm_w, state, seq_len);
+        const core = try qwen35ProjectedCore(cb, allocator, config, mixed, z, beta_proj, a_proj, conv_w, a_log_w, dt_bias_w, norm_w, state, seq_len, null);
         defer cb.free(core);
         const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
         const out_weight = try getModelWeight(cb, config, out_name);
@@ -8049,6 +8078,14 @@ pub fn qwen35LinearAttention(
             false
     else
         false;
+    // A single destination lets each independent core write its final row
+    // directly. The old concatenation grows and copies every earlier row once
+    // per newcomer, opening a blit encoder at each join.
+    if (comptime build_options.enable_metal) {
+        if (parallel_cores and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb))
+            assembled = try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(value_dim) });
+    }
+    const direct_output = assembled != null;
     var pending_cores = parallel_cores;
     defer if (comptime build_options.enable_metal) {
         if (pending_cores) metal_compute_mod.MetalCompute.abortQwen35LinearBatch(cb);
@@ -8066,7 +8103,12 @@ pub fn qwen35LinearAttention(
         defer cb.free(beta_row);
         const a_row = try cb.sliceRows2D(allocator, a_proj, row * seq_len, seq_len, value_heads);
         defer cb.free(a_row);
-        cores[row] = try qwen35ProjectedCore(cb, allocator, config, mixed_row, z_row, beta_row, a_row, conv_w, a_log_w, dt_bias_w, norm_w, state, seq_len);
+        const destination = if (direct_output and assembled != null)
+            try cb.sliceRows2D(allocator, assembled.?, row * seq_len, seq_len, value_dim)
+        else
+            null;
+        defer if (destination) |tensor| cb.free(tensor);
+        cores[row] = try qwen35ProjectedCore(cb, allocator, config, mixed_row, z_row, beta_row, a_row, conv_w, a_log_w, dt_bias_w, norm_w, state, seq_len, destination);
         core_count += 1;
     }
     if (comptime build_options.enable_metal) {
@@ -8076,6 +8118,17 @@ pub fn qwen35LinearAttention(
         }
     }
     for (cores, 0..) |core, row| {
+        if (direct_output and assembled != null) {
+            if (comptime build_options.enable_metal) {
+                // A declined device core may use the established fallback.
+                // Only those rows need a copy, after all collected cores run.
+                if (!metal_compute_mod.MetalCompute.debugSharesStorage(cb, core, assembled.?)) {
+                    if (!try cb.copyRows2D(allocator, assembled.?, row * seq_len, core, 0, seq_len, value_dim))
+                        return error.UnsupportedTensorType;
+                }
+            }
+            continue;
+        }
         if (assembled) |previous| {
             const joined = try cb.concatRows2D(allocator, previous, core, row * seq_len, seq_len, value_dim);
             cb.free(previous);
@@ -8102,6 +8155,7 @@ fn qwen35ProjectedCore(
     norm_w: CT,
     maybe_state: ?*Qwen35LinearLayerState,
     seq_len: usize,
+    destination: ?CT,
 ) !CT {
     const key_heads: usize = @intCast(config.qwen35_linear_num_key_heads);
     const value_heads: usize = @intCast(config.qwen35_linear_num_value_heads);
@@ -8115,6 +8169,7 @@ fn qwen35ProjectedCore(
         if (cb.kind() == .metal and !getenvBool("TERMITE_METAL_DISABLE_QWEN35_RECURRENT_CORE")) {
             if (maybe_state) |state| {
                 if (try metal_compute_mod.MetalCompute.qwen35LinearCore(cb, &state.device, .{
+                    .destination = destination,
                     .mixed = mixed,
                     .z = z,
                     .beta = beta_proj,

@@ -676,6 +676,65 @@ static int prefill_core_check(termite_metal_decode_runtime *r, size_t seq, size_
     unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_CORE_NORM");
     return worst > 2e-4 ? 8 : 0;
 }
+static int compute_copy_check(termite_metal_decode_runtime *r) {
+    id<MTLBuffer> a = [r->device newBufferWithLength:131104 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b = [r->device newBufferWithLength:131104 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> c = [r->device newBufferWithLength:131104 options:MTLResourceStorageModeShared];
+    if (!a || !b || !c || !r->lightonocr3_copy_pipeline)
+        return 1;
+    for (size_t i = 0; i < a.length / 4; i++)
+        ((uint32_t *)a.contents)[i] = (uint32_t)i * 2654435761u;
+    for (size_t mode = 0; mode < 6; mode++) {
+        memset(b.contents, 0x5a, b.length);
+        memset(c.contents, 0xa5, c.length);
+        if (termite_metal_decode_runtime_begin_frame(r))
+            return 2;
+        r->active_frame_regime =
+            mode == 4 ? TERMITE_METAL_FRAME_REGIME_PREFILL : TERMITE_METAL_FRAME_REGIME_DECODE;
+        if (mode == 1)
+            setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_COMPUTE_COPIES", "1", 1);
+        id<MTLComputePipelineState> saved = r->lightonocr3_copy_pipeline;
+        if (mode == 2)
+            r->lightonocr3_copy_pipeline = nil;
+        size_t length = mode == 3 ? 131072 : 16384;
+        size_t offset = mode == 5 ? 4 : 16;
+        uint64_t before = r->lightonocr3_copy_dispatches;
+        if (mode == 0 && termite_metal_lightonocr3_copy_on_frame(r, a, 16, a, 32, 64) != 0) return 11;
+        if (termite_metal_buffer_copy(r, (__bridge void *)a, offset, (__bridge void *)b, offset, length) ||
+            termite_metal_buffer_copy(r, (__bridge void *)b, offset, (__bridge void *)c, offset, length) ||
+            termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r))
+            return 3;
+        r->lightonocr3_copy_pipeline = saved;
+        unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_COMPUTE_COPIES");
+        if (r->lightonocr3_copy_dispatches - before != (mode == 0 ? 2 : 0))
+            return 4;
+        if (r->last_frame_blit_encoder_count != (mode == 0 ? 0 : 2) ||
+            (mode == 0 && r->last_frame_compute_encoder_count != 1)) return 12;
+        if (memcmp((char *)a.contents + offset, (char *)b.contents + offset, length) ||
+            memcmp((char *)a.contents + offset, (char *)c.contents + offset, length))
+            return 5;
+        for (size_t i = 0; i < b.length; i++)
+            if ((i < offset || i >= offset + length) &&
+                (((uint8_t *)b.contents)[i] != 0x5a || ((uint8_t *)c.contents)[i] != 0xa5))
+                return 6;
+    }
+    memset(b.contents, 0x5a, b.length);
+    if (termite_metal_decode_runtime_begin_frame(r))
+        return 7;
+    r->active_frame_regime = TERMITE_METAL_FRAME_REGIME_DECODE;
+    if (termite_metal_buffer_copy(r, (__bridge void *)a, 16, (__bridge void *)b, 16, 16384) ||
+        termite_metal_decode_runtime_cancel_frame(r) || r->active_frame_retained_resources != NULL ||
+        r->active_planned_compute_encoder != nil)
+        return 8;
+    for (size_t i = 0; i < b.length; i++)
+        if (((uint8_t *)b.contents)[i] != 0x5a)
+            return 9;
+    if (termite_metal_buffer_copy(r, (__bridge void *)a, SIZE_MAX - 15, (__bridge void *)b, 16, 32) != -2)
+        return 10;
+    fprintf(stderr, "compute_copy_check bitwise_payload=pass producer_consumer=pass canaries=pass "
+                    "fallback=pass cancel=pass\n");
+    return 0;
+}
 static int fused_batch_core_check(termite_metal_decode_runtime *r, size_t kh, size_t vh, size_t pages,
                                   bool benchmark) {
     const size_t channels = (2 * kh + vh) * 128;
@@ -684,9 +743,11 @@ static int fused_batch_core_check(termite_metal_decode_runtime *r, size_t kh, si
         vh * 128 * 128, channels,     vh * 2, vh * 128, vh * 128, 128, vh * 128};
     id<MTLBuffer> buffers[2][8][15];
     void *handles[2][8][15];
-    size_t offsets[15];
-    for (size_t j = 0; j < 15; j++)
-        offsets[j] = 16;
+    size_t offsets[2][8][15];
+    for (size_t mode = 0; mode < 2; mode++)
+        for (size_t page = 0; page < pages; page++)
+            for (size_t j = 0; j < 15; j++)
+                offsets[mode][page][j] = 16;
     for (size_t mode = 0; mode < 2; mode++)
         for (size_t page = 0; page < pages; page++)
             for (size_t j = 0; j < 15; j++) {
@@ -702,6 +763,34 @@ static int fused_batch_core_check(termite_metal_decode_runtime *r, size_t kh, si
                 for (size_t i = 0; i < counts[j]; i++)
                     values[i] = j == 13 ? .5f + (i % 7) * .1f : sinf(i * .013f + j + page * .31f) * .1f;
             }
+    // Disjoint final rows share one destination, with guard bands per row.
+    id<MTLBuffer> joined = [r->device newBufferWithLength:pages * (counts[14] + 8) * 4
+                                                  options:MTLResourceStorageModeShared];
+    if (!joined)
+        return 27;
+    for (size_t i = 0; i < joined.length / 4; i++)
+        ((uint32_t *)joined.contents)[i] = 0xdeadbeef;
+    for (size_t page = 0; page < pages; page++) {
+        offsets[1][page][14] = 16 + page * (counts[14] + 8) * 4;
+        buffers[1][page][14] = joined;
+        handles[1][page][14] = (__bridge void *)joined;
+    }
+    // One workspace contains all conv/gate/core rows, matching the packed
+    // host dispatch. Keep guard bands around every independently written span.
+    const size_t conv_words = pages * (counts[9] + 8), gate_words = pages * (counts[10] + 8);
+    const size_t scratch_words = conv_words + gate_words + pages * (counts[11] + 8);
+    id<MTLBuffer> workspace = [r->device newBufferWithLength:scratch_words * 4 options:MTLResourceStorageModeShared];
+    if (!workspace) return 28;
+    for (size_t i=0;i<scratch_words;i++) ((uint32_t *)workspace.contents)[i]=0xdeadbeef;
+    for (size_t page=0;page<pages;page++) {
+        offsets[1][page][9] = (4 + page * (counts[9] + 8)) * 4;
+        offsets[1][page][10] = (conv_words + 4 + page * (counts[10] + 8)) * 4;
+        offsets[1][page][11] = (conv_words + gate_words + 4 + page * (counts[11] + 8)) * 4;
+        for (size_t j=9;j<=11;j++) {
+            buffers[1][page][j]=workspace;
+            handles[1][page][j]=(__bridge void *)workspace;
+        }
+    }
     // Check shared immutable weights as well as independent page state.
     const size_t shared[] = {1, 4, 5, 13};
     for (size_t mode = 0; mode < 2; mode++)
@@ -734,8 +823,8 @@ static int fused_batch_core_check(termite_metal_decode_runtime *r, size_t kh, si
             unsetenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING");
         setenv("TERMITE_METAL_DISABLE_QWEN35_FUSED_DECODE", "1", 1);
         for (size_t page = 0; page < pages; page++)
-            if (termite_metal_decode_runtime_qwen35_core_device(r, handles[0][page], offsets, 1, kh, vh, 128,
-                                                                4, step != 0 || page % 2))
+            if (termite_metal_decode_runtime_qwen35_core_device(r, handles[0][page], offsets[0][page], 1, kh,
+                                                                vh, 128, 4, step != 0 || page % 2))
                 return 2;
         unsetenv("TERMITE_METAL_DISABLE_QWEN35_FUSED_DECODE");
         id<MTLComputePipelineState> saved = r->lightonocr3_recurrent_parallel_pipeline;
@@ -757,13 +846,14 @@ static int fused_batch_core_check(termite_metal_decode_runtime *r, size_t kh, si
         if (pages > 1 && termite_metal_decode_runtime_qwen35_core_batch_begin(r, pages) != 1)
             return 3;
         for (size_t page = 0; page < pages; page++)
-            if (termite_metal_decode_runtime_qwen35_core_device(r, handles[1][page], offsets, 1, kh, vh, 128,
-                                                                4, step != 0 || page % 2))
+            if (termite_metal_decode_runtime_qwen35_core_device(r, handles[1][page], offsets[1][page], 1, kh,
+                                                                vh, 128, 4, step != 0 || page % 2))
                 return 4;
         if (pages > 1 && termite_metal_decode_runtime_qwen35_core_batch_end(r))
             return 5;
         for (size_t page = 0; page < pages; page++)
-            if (termite_metal_buffer_slice_last_dim_2d(r, handles[1][page][14], 16, 1, vh * 128, 0, vh * 128,
+            if (termite_metal_buffer_slice_last_dim_2d(r, handles[1][page][14], offsets[1][page][14], 1,
+                                                       vh * 128, 0, vh * 128,
                                                        (__bridge void *)consumers[page], 0))
                 return 13;
         if (termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r))
@@ -773,15 +863,16 @@ static int fused_batch_core_check(termite_metal_decode_runtime *r, size_t kh, si
         if (r->lightonocr3_recurrent_parallel_dispatches - before != (step < 6 ? 1 : 0))
             return 9;
         for (size_t page = 0; page < pages; page++)
-            if (memcmp(consumers[page].contents, (char *)buffers[1][page][14].contents + 16, vh * 128 * 4))
+            if (memcmp(consumers[page].contents, (char *)buffers[1][page][14].contents + offsets[1][page][14],
+                       vh * 128 * 4))
                 return 14;
         const size_t outputs[] = {7, 8, 9, 10, 11, 14};
         float worst = 0;
         for (size_t page = 0; page < pages; page++)
             for (size_t k = 0; k < 6; k++) {
                 const size_t j = outputs[k];
-                const float *gold = (float *)buffers[0][page][j].contents + 4,
-                            *got = (float *)buffers[1][page][j].contents + 4;
+                const float *gold = (float *)((char *)buffers[0][page][j].contents + offsets[0][page][j]),
+                            *got = (float *)((char *)buffers[1][page][j].contents + offsets[1][page][j]);
                 for (size_t i = 0; i < counts[j]; i++) {
                     if (!isfinite(got[i]) || !isfinite(gold[i]))
                         return 6;
@@ -791,7 +882,8 @@ static int fused_batch_core_check(termite_metal_decode_runtime *r, size_t kh, si
         for (size_t mode = 0; mode < 2; mode++)
             for (size_t page = 0; page < pages; page++)
                 for (size_t j = 0; j < 15; j++) {
-                    const uint32_t *raw = buffers[mode][page][j].contents;
+                    const uint32_t *raw = (const uint32_t *)((const char *)buffers[mode][page][j].contents +
+                                                             offsets[mode][page][j] - 16);
                     for (size_t i = 0; i < 4; i++)
                         if (raw[i] != 0xdeadbeefu || raw[counts[j] + 4 + i] != 0xdeadbeefu)
                             return 7;
@@ -835,7 +927,8 @@ static int fused_batch_core_check(termite_metal_decode_runtime *r, size_t kh, si
                     unsetenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING");
                 for (size_t page = 0; page < pages; page++)
                     for (size_t j = 0; j < 15; j++)
-                        memcpy((char *)buffers[mode][page][j].contents + 16, initial[page][j], counts[j] * 4);
+                        memcpy((char *)buffers[mode][page][j].contents + offsets[mode][page][j],
+                               initial[page][j], counts[j] * 4);
                 const uint64_t dispatch_before = r->lightonocr3_recurrent_parallel_dispatches;
                 if (termite_metal_decode_runtime_begin_frame(r))
                     return 16;
@@ -844,8 +937,8 @@ static int fused_batch_core_check(termite_metal_decode_runtime *r, size_t kh, si
                     if (pages > 1 && termite_metal_decode_runtime_qwen35_core_batch_begin(r, pages) != 1)
                         return 17;
                     for (size_t page = 0; page < pages; page++)
-                        if (termite_metal_decode_runtime_qwen35_core_device(r, handles[mode][page], offsets,
-                                                                            1, kh, vh, 128, 4, 1))
+                        if (termite_metal_decode_runtime_qwen35_core_device(
+                                r, handles[mode][page], offsets[mode][page], 1, kh, vh, 128, 4, 1))
                             return 18;
                     if (pages > 1 && termite_metal_decode_runtime_qwen35_core_batch_end(r))
                         return 19;
@@ -887,8 +980,8 @@ static int fused_batch_core_check(termite_metal_decode_runtime *r, size_t kh, si
         (pages > 1 && termite_metal_decode_runtime_qwen35_core_batch_begin(r, pages) != 1))
         return 23;
     for (size_t page = 0; page < pages; page++)
-        if (termite_metal_decode_runtime_qwen35_core_device(r, handles[1][page], offsets, 1, kh, vh, 128, 4,
-                                                            1))
+        if (termite_metal_decode_runtime_qwen35_core_device(r, handles[1][page], offsets[1][page], 1, kh, vh,
+                                                            128, 4, 1))
             return 24;
     if ((pages > 1 && termite_metal_decode_runtime_qwen35_core_batch_end(r)) ||
         termite_metal_decode_runtime_cancel_frame(r) || r->active_planned_compute_encoder != nil ||
@@ -2294,6 +2387,7 @@ int main(int argc, const char **argv) {
         setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS", "1", 1);
         if (projection(r, 5, 1024, 6144, 0)) return 53;
         unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS");
+        if (compute_copy_check(r)) return 105;
         termite_metal_decode_runtime_destroy(r);
         fprintf(stderr, "All OCR Metal kernel checks passed\n");
         return 0;

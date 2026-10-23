@@ -1,0 +1,18 @@
+{
+  "runtime_commit": "e7a0d695d77cc14dba96a942b7fc8b09ee70c13b",
+  "runtime_source_diff_sha256": "cc92c1e28f03e3a4c01e06740cdf130495a872018ba7b9d3c1a00762618caac2",
+  "runtime_files_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "43b0b2f2b030359502df60f325c95700a9cd6ab8afcf4e7aefe6499a808195ec",
+    "zig/pkg/inference/src/backends/metal_runtime.zig": "888a49e72ad1cb9c06fb5052e324cb7ca5ccb99469f80f11402427d42cbf99d0",
+    "zig/pkg/inference/src/architectures/gpt.zig": "8cad2361e7c1963f959206411318e1261389e98c793eb6a10dd1f419ec98880f",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "8519405f154cc0e34e69def9f3374a52a102c06974867de511c4aed818767483",
+    "zig/pkg/inference/src/server/server.zig": "30e8c7f7d3935de0664729060cf0e7d92d8631fcfb3872dad8390e7b5b1636b3",
+    "zig/pkg/inference/src/server/model_manager.zig": "b005bcdea0a92419fa61d7db09786344c22a0b8b1a40ae1ad99297bfe1b744fc",
+    "zig/pkg/inference/src/server/reader_execution_pool.zig": "6cdbcfa6e443473350364f21ee7af2ecf1f098b6b1ec9742edad37d281ed9814",
+    "zig/pkg/inference/src/architectures/qwen3vl_projector.zig": "58c89fbe275b276501b935ba39b1dd17a81e2c5aff741ada3f564c859308c21e",
+    "zig/pkg/inference/src/pipelines/generation.zig": "8a97623ccc043744ff571655f876c52e63097bb2c44fc8dda26acd64f50231d5",
+    "zig/pkg/inference/src/runtime/scheduler/native_generate.zig": "12cebc3cddf3c27b2640ef796e7ec4154c905071ca1530a881f9e9eb42b7a358"
+  },
+  "binary_sha256": "f45aedcc9911b2a143412491d908c89884952aba22c7ef2885d5d772bb2fc49b",
+  "binary_path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/.zig-cache/o/da5dbf57155ec4caa94af2942c7f037a/test"
+}

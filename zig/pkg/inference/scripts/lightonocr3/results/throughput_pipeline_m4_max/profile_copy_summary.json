@@ -1,0 +1,158 @@
+[
+  {
+    "round": 0,
+    "policy": "copyoff",
+    "frame_count": 323,
+    "compute_encoders": 61091,
+    "blit_encoders": 31523,
+    "encode_cpu_ms": 1648.946,
+    "median_encode_cpu_us": 4219,
+    "most_common_encoder_counts": [
+      [
+        [
+          253,
+          115
+        ],
+        144
+      ],
+      [
+        [
+          14,
+          0
+        ],
+        96
+      ],
+      [
+        [
+          277,
+          199
+        ],
+        31
+      ],
+      [
+        [
+          241,
+          73
+        ],
+        13
+      ]
+    ]
+  },
+  {
+    "round": 1,
+    "policy": "on",
+    "frame_count": 317,
+    "compute_encoders": 11153,
+    "blit_encoders": 776,
+    "encode_cpu_ms": 1176.706,
+    "median_encode_cpu_us": 3314,
+    "most_common_encoder_counts": [
+      [
+        [
+          1,
+          0
+        ],
+        150
+      ],
+      [
+        [
+          14,
+          0
+        ],
+        96
+      ],
+      [
+        [
+          109,
+          0
+        ],
+        63
+      ],
+      [
+        [
+          349,
+          97
+        ],
+        8
+      ]
+    ]
+  },
+  {
+    "round": 2,
+    "policy": "on",
+    "frame_count": 315,
+    "compute_encoders": 10503,
+    "blit_encoders": 776,
+    "encode_cpu_ms": 1243.167,
+    "median_encode_cpu_us": 3439,
+    "most_common_encoder_counts": [
+      [
+        [
+          1,
+          0
+        ],
+        154
+      ],
+      [
+        [
+          14,
+          0
+        ],
+        96
+      ],
+      [
+        [
+          109,
+          0
+        ],
+        57
+      ],
+      [
+        [
+          349,
+          97
+        ],
+        8
+      ]
+    ]
+  },
+  {
+    "round": 3,
+    "policy": "copyoff",
+    "frame_count": 318,
+    "compute_encoders": 59958,
+    "blit_encoders": 31554,
+    "encode_cpu_ms": 1457.297,
+    "median_encode_cpu_us": 3865.0,
+    "most_common_encoder_counts": [
+      [
+        [
+          253,
+          115
+        ],
+        128
+      ],
+      [
+        [
+          14,
+          0
+        ],
+        96
+      ],
+      [
+        [
+          277,
+          199
+        ],
+        41
+      ],
+      [
+        [
+          289,
+          241
+        ],
+        11
+      ]
+    ]
+  }
+]

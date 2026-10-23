@@ -20,6 +20,7 @@ pub const VideoGatherInput = union(enum) {
 };
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const builtin = @import("builtin");
 const ml = @import("ml");
 const build_options = @import("build_options");
@@ -774,6 +775,30 @@ fn gemma4DecodeScratchEnvelope(layers: []const ops.DecoderRuntimeLayerSpec, ple_
     return result;
 }
 
+/// Snapshot once per provider lease: inner-loop flags must be cheap, while
+/// a later epoch (including a benchmark rollback round) can choose anew.
+const LightOnRuntimePolicy = struct {
+    direct_core_output: bool = true,
+    packed_core: bool = true,
+    vision_slot_reuse: bool = true,
+    retain_weight_handles: bool = false,
+
+    fn fromEnvironment() LightOnRuntimePolicy {
+        // An explicit rollback value also lets same-process benchmark rounds
+        // force a candidate on or off without changing the production default.
+        const retain_handles = if (platform.env.getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_WEIGHT_HANDLES")) |value|
+            !platform.env.truthy(value)
+        else
+            platform.env.getenvBool("TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_HANDLES");
+        return .{
+            .direct_core_output = !platform.env.getenvBool("TERMITE_METAL_DISABLE_LIGHTONOCR3_DIRECT_CORE_OUTPUT"),
+            .packed_core = !platform.env.getenvBool("TERMITE_METAL_DISABLE_LIGHTONOCR3_PACKED_CORE"),
+            .vision_slot_reuse = !platform.env.getenvBool("TERMITE_METAL_DISABLE_LIGHTONOCR3_VISION_SLOT_REUSE"),
+            .retain_weight_handles = retain_handles,
+        };
+    }
+};
+
 pub const MetalCompute = if (build_options.enable_metal) struct {
     const mlx_quant = struct {
         pub const Provider = void;
@@ -797,6 +822,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         owned: bool,
         weight_handle_name: ?[]const u8 = null,
         weight_handle_refs: usize = 0,
+        weight_handle_compute_owned: bool = false,
         shared_data_refcount: ?*usize = null,
         logical_shape: ?[]i64 = null,
         view_strides: ?[]usize = null,
@@ -1249,6 +1275,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     active_deberta_encoder_frame_plan_key: ?ActiveDebertaEncoderFramePlanKey = null,
     qwen35_ocr_deferred_attention: bool = false,
     lightonocr3_projections: bool = false,
+    lightonocr3_policy: LightOnRuntimePolicy = .{},
+    lightonocr3_packed_core_reported_rows: u16 = 0,
+    lightonocr3_weight_handles_reported: bool = false,
     pending_prefill_kv_device_seeds: std.ArrayListUnmanaged(PendingKvDeviceSeed) = .empty,
     timing_stats: ops.NativeQuantTimingStats = .{},
     boundary_scope: ops.gliner_boundary_device.ScopeAccounting = .{},
@@ -1379,6 +1408,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .owned_native_provider = true,
                 .io = io,
             };
+            self.lightonocr3_policy = .fromEnvironment();
             self.captureRuntimeFrameBaselines();
             return;
         }
@@ -1402,6 +1432,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .shared_provider_lease_io = lock_io,
             .io = io,
         };
+        self.lightonocr3_policy = .fromEnvironment();
         self.captureRuntimeFrameBaselines();
     }
 
@@ -1658,6 +1689,100 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return true;
     }
 
+    pub fn lightOnDirectCoreOutputEnabled(cb: *const ops.ComputeBackend) bool {
+        if (cb.kind() != .metal) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lightonocr3_projections and self.lightonocr3_policy.direct_core_output;
+    }
+
+    /// Warm decode pages share projection matrices and one temporary workspace.
+    /// Their histories remain page-owned. Decline before recording or changing
+    /// any state when a page is cold or a required resident buffer is missing.
+    pub fn lightOnPackedCore(cb: *const ops.ComputeBackend, states: []const *Qwen35LinearState, request: anytype) !?CT {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (states.len < 2 or states.len > 8 or
+            request.key_heads != 16 or (request.value_heads != 16 and request.value_heads != 32) or
+            request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or request.eps != 1e-6 or
+            !self.lightonocr3_policy.packed_core or
+            getenvBool("TERMITE_METAL_DISABLE_QWEN35_RECURRENT_CORE")) return null;
+        if (!lightOnDirectCoreOutputEnabled(cb)) return null;
+        const raw = self.provider_impl.raw_decode_runtime orelse return null;
+        if (!metal_runtime_mod.hasActiveFrame(raw) or metal_runtime_mod.termite_metal_decode_runtime_qwen35_core_available(raw) == 0) return null;
+        const runtime: *anyopaque = @ptrCast(raw);
+        const rows = states.len;
+        const channels = (2 * request.key_heads + request.value_heads) * 128;
+        const value_width = request.value_heads * 128;
+        for (states) |state| {
+            if (!state.initialized or state.key_heads != request.key_heads or state.value_heads != request.value_heads or
+                state.conv[0] == null or state.conv[1] == null or state.recurrent == null) return null;
+            for (state.weights) |tensor| if (tensor == null) return null;
+            const tensors = [_]*const MetalTensor{ &state.conv[0].?, &state.conv[1].?, &state.recurrent.?, &state.weights[0].?, &state.weights[1].?, &state.weights[2].?, &state.weights[3].? };
+            const counts = [_]usize{ channels * 4, channels * 4, request.value_heads * 128 * 128, channels * 4, request.value_heads, request.value_heads, 128 };
+            for (tensors, counts) |tensor, count| {
+                if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.device.?.ref.runtime != runtime or tensor.elemCount() != count) return null;
+            }
+        }
+        const inputs = [_]CT{ request.mixed, request.z, request.beta, request.a };
+        const widths = [_]usize{ channels, value_width, request.value_heads, request.value_heads };
+        for (inputs, widths) |input, width| {
+            const tensor = toBuf(input).metal_tensor orelse return null;
+            if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.device.?.ref.runtime != runtime or tensor.elemCount() != rows * width) return null;
+        }
+        var mixed = try self.ownedDeviceMetalTensorFromCt(request.mixed);
+        defer mixed.deinit();
+        var z = try self.ownedDeviceMetalTensorFromCt(request.z);
+        defer z.deinit();
+        var beta = try self.ownedDeviceMetalTensorFromCt(request.beta);
+        defer beta.deinit();
+        var a = try self.ownedDeviceMetalTensorFromCt(request.a);
+        defer a.deinit();
+        const conv_count = rows * channels;
+        const gates_count = rows * request.value_heads * 2;
+        const core_count = rows * value_width;
+        const scratch_count = conv_count + gates_count + core_count;
+        var scratch = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, scratch_count * 4, .private, &.{@intCast(scratch_count)});
+        defer scratch.deinit();
+        var output = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, core_count * 4, .private, &.{ @intCast(rows), @intCast(value_width) });
+        errdefer output.deinit();
+        if (!try beginQwen35LinearBatch(cb, rows)) {
+            output.deinit();
+            return null;
+        }
+        var collecting = true;
+        defer if (collecting) abortQwen35LinearBatch(cb);
+        for (states, 0..) |state, row| {
+            const tensors = [_]*const MetalTensor{ &mixed, &state.weights[0].?, &beta, &a, &state.weights[1].?, &state.weights[2].?, &state.conv[0].?, &state.conv[1].?, &state.recurrent.?, &scratch, &scratch, &scratch, &z, &state.weights[3].?, &output };
+            var handles: [15]?*anyopaque = undefined;
+            var offsets: [15]usize = undefined;
+            for (tensors, &handles, &offsets) |tensor, *handle, *offset| {
+                handle.* = tensor.deviceHandle();
+                offset.* = tensor.deviceByteOffset();
+            }
+            offsets[0] += row * channels * 4;
+            offsets[2] += row * request.value_heads * 4;
+            offsets[3] += row * request.value_heads * 4;
+            offsets[9] += row * channels * 4;
+            offsets[10] += (conv_count + row * request.value_heads * 2) * 4;
+            offsets[11] += (conv_count + gates_count + row * value_width) * 4;
+            offsets[12] += row * value_width * 4;
+            offsets[14] += row * value_width * 4;
+            if (metal_runtime_mod.termite_metal_decode_runtime_qwen35_core_device(raw, &handles, &offsets, 1, request.key_heads, request.value_heads, 128, 4, 1) != 0) return error.Qwen35MetalCoreFailed;
+        }
+        try endQwen35LinearBatch(cb);
+        collecting = false;
+        for (states) |state| {
+            state.conv[1].?.invalidateHostMirror();
+            state.recurrent.?.invalidateHostMirror();
+            std.mem.swap(?MetalTensor, &state.conv[0], &state.conv[1]);
+        }
+        if ((self.lightonocr3_packed_core_reported_rows & (@as(u16, 1) << @intCast(rows))) == 0 and getenvBool("TERMITE_METAL_TRACE_LIGHTONOCR3_PACKED_CORE")) {
+            self.lightonocr3_packed_core_reported_rows |= @as(u16, 1) << @intCast(rows);
+            std.debug.print("lightonocr3_packed_core: rows={d} scratch_bytes={d}\n", .{ rows, scratch_count * 4 });
+        }
+        return try self.ctFromOwnedMetalTensor(output);
+    }
+
     pub fn beginQwen35LinearBatch(cb: *const ops.ComputeBackend, rows: usize) !bool {
         if (cb.kind() != .metal or getenvBool("TERMITE_METAL_DISABLE_QWEN35_RECURRENT_CORE")) return false;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -1722,7 +1847,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer gates.deinit();
         var core = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, request.seq_len * value_width * 4, .private, &.{ @intCast(request.seq_len), @intCast(value_width) });
         defer core.deinit();
-        var output = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, request.seq_len * value_width * 4, .private, &.{ @intCast(request.seq_len), @intCast(value_width) });
+        const destination = if (@hasField(@TypeOf(request), "destination")) request.destination else @as(?CT, null);
+        var output = if (destination) |tensor| blk: {
+            const buf = toBuf(tensor);
+            const view = buf.metal_tensor orelse return error.UnsupportedTensorType;
+            if (!view.isDevice() or view.dtype != .f32 or view.elemCount() != request.seq_len * value_width or
+                view.device.?.ref.runtime != runtime) return error.InvalidTensorShape;
+            break :blk try view.retainedView(0, view.deviceByteLen(), &.{ @intCast(request.seq_len), @intCast(value_width) });
+        } else try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, request.seq_len * value_width * 4, .private, &.{ @intCast(request.seq_len), @intCast(value_width) });
         errdefer output.deinit();
         state.conv[1].?.invalidateHostMirror();
         state.recurrent.?.invalidateHostMirror();
@@ -2713,6 +2845,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         ) != 0) return error.MetalLinearViewReleaseFailed;
     }
 
+    /// Integrated LightOn vision weights already have a provider-owned dense
+    /// cache. Its source bytes and lazy-store pin outlive projector wrappers,
+    /// so prepared slots keyed by those bytes can survive another page. Every
+    /// other tensor must retire its slots before allocator addresses are reused.
+    pub fn releaseProjectorSlotsForTensor(cb: *const ops.ComputeBackend, tensor: CT) void {
+        if (cb.kind() != .metal) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const buf = toBuf(tensor);
+        if (self.lightOnProjectorSlotBackingRetained(buf)) return;
+        releaseDynamicSlotsForTensor(cb, tensor);
+    }
+
+    fn lightOnProjectorSlotBackingRetained(self: *const MetalCompute, buf: *const Buf) bool {
+        if (!self.lightonocr3_projections or !self.lightonocr3_policy.vision_slot_reuse) return false;
+        const name = buf.weight_handle_name orelse return false;
+        if (std.mem.indexOf(u8, name, "model.visual.") == null) return false;
+        const cached = self.dense_weight_cache.get(name) orelse return false;
+        if (buf.owned or buf.native_dense_bytes_owned or buf.metal_tensor != null or
+            buf.owns_lazy_pin or buf.quantized_storage != null or buf.runtime_quantized_storage != null) return false;
+        if (buf.data.ptr != cached.data.ptr or buf.data.len != cached.data.len) return false;
+        if (buf.native_dense_bytes) |bytes| {
+            const retained = cached.native_dense_bytes orelse return false;
+            return bytes.ptr == retained.ptr and bytes.len == retained.len;
+        }
+        return cached.native_dense_bytes == null;
+    }
+
     /// Release slots keyed by a transient tensor after its GPU work completes,
     /// immediately before freeing the tensor wrapper and its identity.
     pub fn releaseDynamicSlotsForTensor(cb: *const ops.ComputeBackend, tensor: CT) void {
@@ -2979,14 +3138,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         errdefer if (source.owned and source.shared_data_refcount != null) {
             source.shared_data_refcount.?.* -= 1;
         };
+        const alias_shape = try self.allocator.dupe(i64, shape);
+        errdefer self.allocator.free(alias_shape);
+        const alias_strides = try self.allocator.dupe(usize, strides);
+        errdefer self.allocator.free(alias_strides);
+        const logical_strides = try allocLogicalDenseStrides(self.allocator, shape);
+        errdefer self.allocator.free(logical_strides);
         alias.* = .{
             .data = source.data,
             .allocator = self.allocator,
             .owned = source.owned,
             .shared_data_refcount = source.shared_data_refcount,
-            .logical_shape = try self.allocator.dupe(i64, shape),
-            .view_strides = try self.allocator.dupe(usize, strides),
-            .logical_view_strides = try allocLogicalDenseStrides(self.allocator, shape),
+            .logical_shape = alias_shape,
+            .view_strides = alias_strides,
+            .logical_view_strides = logical_strides,
             .view_index_map = null,
             .shared_view_index_refcount = null,
             .view_base_offset = base_offset,
@@ -7318,7 +7483,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const self: *MetalCompute = @ptrCast(@alignCast(ctx));
             std.debug.assert(buf.weight_handle_refs > 0);
             buf.weight_handle_refs -= 1;
-            if (buf.weight_handle_refs != 0) return;
+            if (buf.weight_handle_refs != 0) {
+                // Retain only the descriptor and its already cached source.
+                // A host mirror must not survive its last actual consumer.
+                if (buf.weight_handle_compute_owned and buf.weight_handle_refs == 1) {
+                    if (buf.native_dense_host_cache) |cache| {
+                        buf.native_dense_host_cache = null;
+                        freeOp(ctx, cache);
+                    }
+                }
+                return;
+            }
             std.debug.assert(self.weight_handles.remove(name));
             self.allocator.free(name);
             buf.weight_handle_name = null;
@@ -27810,8 +27985,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const owned_name = try self.allocator.dupe(u8, full_name);
         errdefer self.allocator.free(owned_name);
         const tensor = try self.loadWeight(name, full_name);
-        toBuf(tensor).weight_handle_name = owned_name;
-        toBuf(tensor).weight_handle_refs = 1;
+        const buf = toBuf(tensor);
+        // Layer projections reuse their immutable provider-cache backing. One
+        // additional owner keeps the small wrapper stable until this compute
+        // epoch drains. Borrowed/pinned, mutable and unshared handles retain
+        // their existing lifetimes; no additional weight bytes are retained.
+        const decoder_layer = std.mem.indexOf(u8, full_name, "model.layers.") != null or
+            std.mem.indexOf(u8, full_name, "model.language_model.layers.") != null;
+        const retain = self.lightonocr3_projections and self.lightonocr3_policy.retain_weight_handles and
+            decoder_layer and !buf.owned and !buf.owns_lazy_pin and !buf.mutable_state and
+            buf.metal_tensor == null and self.dense_weight_cache.contains(full_name);
+        buf.weight_handle_name = owned_name;
+        buf.weight_handle_compute_owned = retain;
+        buf.weight_handle_refs = if (retain) 2 else 1;
+        if (retain and !self.lightonocr3_weight_handles_reported) {
+            self.lightonocr3_weight_handles_reported = true;
+            if (platform.env.getenvBool("TERMITE_METAL_TRACE_LIGHTONOCR3_WEIGHT_HANDLES"))
+                std.debug.print("lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1\n", .{});
+        }
         self.weight_handles.putAssumeCapacityNoClobber(owned_name, tensor);
         return tensor;
     }
@@ -48452,4 +48643,150 @@ test "embeddinggemma2 video Metal input frame gathers projects and positions wit
             (positions[(row % 3) * 768 + h] + positions[(axis + (row / 3) % 3) * 768 + h]);
         try std.testing.expectApproxEqAbs(expected, v, 1e-6);
     }
+}
+
+test "LightOnOCR3 vision slots retain cache owners across page handles and retire transient weights" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var store = testMetalWeightStoreInit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    compute.lightonocr3_projections = true;
+    var cb = compute.computeBackend();
+    const name = "model.visual.blocks.0.attn.proj.weight";
+    const data = try allocator.dupe(f32, &.{ 1, 0, 0, 0, 1, 1 });
+    const shape = allocator.dupe(i64, &.{ 2, 3 }) catch |err| {
+        allocator.free(data);
+        return err;
+    };
+    _ = try compute.getOrInsertCachedDenseWeight(name, data, shape, null, null, null, null);
+    const host = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+    defer cb.free(host);
+    const input = try compute.ctFromOwnedMetalTensor(try compute.ownedDeviceMetalTensorFromCt(host));
+    defer cb.free(input);
+    var slots: usize = 0;
+    for (0..3) |page| {
+        const weight = try cb.getWeight(name);
+        defer cb.free(weight);
+        try std.testing.expect(compute.lightOnProjectorSlotBackingRetained(MetalCompute.toBuf(weight)));
+        const output = try cb.linearNoBias(input, weight, 2, 3, 2);
+        defer cb.free(output);
+        const values = try cb.toFloat32(output, allocator);
+        defer allocator.free(values);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 5, 4, 11 }, values);
+        if (page == 0) {
+            slots = compute.dynamic_linear_slots.count();
+            try std.testing.expect(slots > 0);
+        }
+        MetalCompute.releaseProjectorSlotsForTensor(&cb, weight);
+        try std.testing.expectEqual(slots, compute.dynamic_linear_slots.count());
+    }
+    // Address reuse is safe only for provider-cache-backed identities. An
+    // ordinary projector tensor must still retire its prepared slot.
+    const transient = try cb.fromFloat32Shape(&.{ 0, 1, 0, 1, 0, 0 }, &.{ 2, 3 });
+    defer cb.free(transient);
+    const output = try cb.linearNoBias(input, transient, 2, 3, 2);
+    defer cb.free(output);
+    const values = try cb.toFloat32(output, allocator);
+    defer allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 1, 5, 4 }, values);
+    try std.testing.expect(compute.dynamic_linear_slots.count() > slots);
+    MetalCompute.releaseProjectorSlotsForTensor(&cb, transient);
+    try std.testing.expectEqual(slots, compute.dynamic_linear_slots.count());
+    // The ordinary release remains available for explicit cache retirement.
+    const weight = try cb.getWeight(name);
+    defer cb.free(weight);
+    MetalCompute.releaseDynamicSlotsForTensor(&cb, weight);
+    try std.testing.expectEqual(@as(usize, 0), compute.dynamic_linear_slots.count());
+}
+
+test "LightOnOCR3 runtime policy snapshots isolate successive provider epochs" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const names = [_][:0]const u8{
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_DIRECT_CORE_OUTPUT",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_PACKED_CORE",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_VISION_SLOT_REUSE",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_WEIGHT_HANDLES",
+        "TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_HANDLES",
+    };
+    var saved: [names.len]?[:0]u8 = @splat(null);
+    var count: usize = 0;
+    defer for (names[0..count], saved[0..count]) |name, value| {
+        if (value) |old| {
+            _ = Env.setenv(name, old, 1);
+            std.testing.allocator.free(old);
+        } else _ = Env.unsetenv(name);
+    };
+    for (names, 0..) |name, i| {
+        if (platform.env.getenv(name)) |value| saved[i] = try std.testing.allocator.dupeSentinel(u8, value, 0);
+        count += 1;
+    }
+    for (names) |name| try std.testing.expectEqual(@as(c_int, 0), Env.setenv(name, "1", 1));
+    const disabled = LightOnRuntimePolicy.fromEnvironment();
+    for (names[0..4]) |name| try std.testing.expectEqual(@as(c_int, 0), Env.setenv(name, "0", 1));
+    const enabled = LightOnRuntimePolicy.fromEnvironment();
+    try std.testing.expect(!disabled.direct_core_output and !disabled.packed_core and !disabled.vision_slot_reuse and !disabled.retain_weight_handles);
+    try std.testing.expect(enabled.direct_core_output and enabled.packed_core and enabled.vision_slot_reuse and enabled.retain_weight_handles);
+    try std.testing.expectEqual(@as(c_int, 0), Env.unsetenv(names[3]));
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[4], "0", 1));
+    try std.testing.expect(!LightOnRuntimePolicy.fromEnvironment().retain_weight_handles);
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[4], "1", 1));
+    try std.testing.expect(LightOnRuntimePolicy.fromEnvironment().retain_weight_handles);
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[3], "1", 1));
+    try std.testing.expect(!LightOnRuntimePolicy.fromEnvironment().retain_weight_handles);
+}
+
+fn checkLightOnWeightDescriptors(allocator: std.mem.Allocator, retained: bool) !void {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    var store = testMetalWeightStoreInit(allocator);
+    var compute = MetalCompute{ .allocator = allocator, .data = &store, .provider_impl = undefined, .lightonocr3_projections = true };
+    compute.lightonocr3_policy.retain_weight_handles = retained;
+    defer compute.deinitWeightCaches();
+    const name = "model.language_model.layers.0.self_attn.q_proj.weight";
+    {
+        const bytes = try allocator.dupe(u8, &.{ 0x80, 0x3f, 0x20, 0xc0 });
+        errdefer allocator.free(bytes);
+        const shape = try allocator.dupe(i64, &.{ 1, 2 });
+        errdefer allocator.free(shape);
+        _ = try compute.getOrInsertCachedDenseWeight(name, &.{}, shape, null, null, .{ .bytes = bytes, .dtype = .bf16, .owned = true }, .bf16);
+    }
+    const first = try MetalCompute.getWeightOp(&compute, name);
+    var borrowed = true;
+    defer if (borrowed) MetalCompute.freeOp(&compute, first);
+    const peer = try MetalCompute.acquireWeightOp(&compute, name);
+    defer MetalCompute.freeOp(&compute, peer);
+    try std.testing.expect(peer != first and MetalCompute.toBuf(peer).weight_handle_name == null);
+    const alias = try compute.makeViewAlias(first, &.{2}, &.{1}, 0);
+    defer MetalCompute.freeOp(&compute, alias);
+    try std.testing.expect(MetalCompute.toBuf(first).native_dense_host_cache != null);
+    MetalCompute.freeOp(&compute, first);
+    borrowed = false;
+    if (retained) {
+        try std.testing.expectEqual(@as(usize, 1), compute.weight_handles.count());
+        try std.testing.expectEqual(@as(usize, 1), MetalCompute.toBuf(first).weight_handle_refs);
+        try std.testing.expect(MetalCompute.toBuf(first).native_dense_host_cache == null);
+        const again = try MetalCompute.getWeightOp(&compute, name);
+        try std.testing.expectEqual(first, again);
+        MetalCompute.freeOp(&compute, again);
+    } else try std.testing.expectEqual(@as(usize, 0), compute.weight_handles.count());
+    const values = try MetalCompute.toFloat32Op(&compute, alias, allocator);
+    defer allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, -2.5 }, values);
+}
+
+test "LightOnOCR3 decoder weight descriptors retain only cached backing and release idle host mirrors" {
+    try checkLightOnWeightDescriptors(std.testing.allocator, true);
+    try checkLightOnWeightDescriptors(std.testing.allocator, false);
+}
+
+test "LightOnOCR3 decoder weight descriptor allocation failures unwind owners and aliases" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkLightOnWeightDescriptors, .{true});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkLightOnWeightDescriptors, .{false});
 }

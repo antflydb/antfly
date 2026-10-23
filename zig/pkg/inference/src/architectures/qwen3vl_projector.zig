@@ -317,7 +317,8 @@ const Config = struct {
 /// short-lived wrapper after an op allowed allocator address reuse to alias a
 /// later vision layer onto stale weights. Retaining and reusing every named
 /// tensor for the whole multi-image request makes those identities unique,
-/// then explicitly releases their dynamic slots before the wrappers die.
+/// then retires transient slots before their wrappers die. Integrated Metal
+/// slots may instead retain their provider-cache-owned backing for the epoch.
 const WeightCache = struct {
     const Source = union(enum) {
         gguf: *tensor_store_mod.GgufStore,
@@ -351,7 +352,7 @@ const WeightCache = struct {
         var value_it = self.tensors.valueIterator();
         while (value_it.next()) |tensor| {
             if (self.cb.kind() == .metal) {
-                metal_compute_mod.MetalCompute.releaseDynamicSlotsForTensor(self.cb, tensor.*);
+                metal_compute_mod.MetalCompute.releaseProjectorSlotsForTensor(self.cb, tensor.*);
             }
             self.cb.free(tensor.*);
         }
