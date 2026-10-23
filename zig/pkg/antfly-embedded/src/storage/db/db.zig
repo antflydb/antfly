@@ -20894,13 +20894,18 @@ pub const DB = struct {
         const seal = @import("native_backup_seal.zig");
         const wal_bytes = try generated_checkpoints.walPrefixBytes();
         var vector_bytes: u64 = 0;
-        if (self.local_execution.source_vectors.load(.acquire)) |source| {
+        // Cancelled migrations retain a candidate for admitted old readers,
+        // but the current primary generation is entirely inline. It must not
+        // depend on that retired candidate's files or WAL admission budget.
+        const source_authoritative = self.local_execution.table_storage.dense_embeddings == .vector_store or
+            self.local_execution.vector_migration_active.load(.acquire);
+        if (source_authoritative) if (self.local_execution.source_vectors.load(.acquire)) |source| {
             if (wal_bytes > seal.wal_budget_bytes) return error.BackupSealWalBudgetExceeded;
             const vector_root = try std.fs.path.join(self.alloc, &.{ staging_root, "source-vectors" });
             defer self.alloc.free(vector_root);
             var remaining_wal = seal.wal_budget_bytes - wal_bytes;
             vector_bytes = try source.sealQuerySnapshot(io, vector_root, &remaining_wal, cancellation);
-        }
+        };
         if (seal_only) {
             if (wal_bytes > seal.wal_budget_bytes) return error.BackupSealWalBudgetExceeded;
             // The source-vector generation and every primary/generated
@@ -134080,6 +134085,9 @@ test "source vector migration cancellation restores sealed backup capability wit
     try std.testing.expect(db.local_execution.source_vectors.load(.acquire) != null);
     try std.testing.expect((try db.relationalTopologyIdentity()).backup_seal_supported);
     try std.testing.expect(try db.snapshotNative("cancelled") > 0);
+    const cancelled_vectors = try std.fmt.allocPrint(alloc, "{s}.snapshots/cancelled/source-vectors", .{path});
+    defer alloc.free(cancelled_vectors);
+    try std.testing.expect(!try snapshotPathExists(db.backend_runtime.filesystemIo().?, cancelled_vectors));
     db.close();
     db = try DB.open(alloc, path, options);
     try std.testing.expect(db.local_execution.source_vectors.load(.acquire) == null);
