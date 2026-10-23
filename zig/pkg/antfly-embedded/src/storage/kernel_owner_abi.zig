@@ -40,7 +40,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Owned assemblies retain checked memory state; native retries observe commits.
 // Close preflight drains restore/rewrite cache callbacks with caller execution.
 // Projection supervision uses shared maintenance dispatch and controlled close.
-pub const abi_version: u32 = 152;
+// Close preflight drains accepted HLL/repair/backend work in dependency order.
+pub const abi_version: u32 = 153;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

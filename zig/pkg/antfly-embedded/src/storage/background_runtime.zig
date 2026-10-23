@@ -717,6 +717,16 @@ pub const DurableJobLane = struct {
         }
     }
 
+    /// Drain producers before the owners they may submit dependent work to.
+    /// Keep every generation registered for physical close, including after a
+    /// rejected wait. This borrow never renews the original cleanup lifetime.
+    pub fn quiesceOwnersWithAdmission(self: DurableJobLane, owner_ids: []const u64, original: @import("../common/read_admission.zig").Port) !void {
+        for (owner_ids) |owner_id| {
+            if (owner_id == 0) continue;
+            try self.quiesceOwnerWithAdmission(owner_id, original);
+        }
+    }
+
     pub fn closeOwner(self: DurableJobLane, owner_id: u64) void {
         self.vtable.close_owner(self.ptr, owner_id);
     }

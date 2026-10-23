@@ -6294,6 +6294,11 @@ pub const DB = struct {
         try self.restore_decoder_cache.drainCallbacksWithAdmission(cache_io, original);
         try self.rewrite_program_cache.drainCallbacksWithAdmission(cache_io, original);
         try self.rewrite_tail_cache.drainCallbacksWithAdmission(cache_io, original);
+        // Accepted HLL and repair cleanup may still submit primary-backend
+        // work. Drain those producers first, keeping backend admission open
+        // until their callbacks and payload retirement have completed. Retain
+        // all three generations for physical close and interrupted retry.
+        try self.backend_runtime.durable_jobs.quiesceOwnersWithAdmission(&.{ self.algebraic_hll_owner_id, self.repair_cleanup_owner_id, self.backend_owner_id }, original);
     }
 
     fn stopRetainedPreparations(self: *DB) void {
@@ -150495,4 +150500,191 @@ test "logical source certificates skip revision reads across unrelated writes an
         try std.testing.expect(std.mem.indexOf(u8, rows[0].bytes.?, "new") != null);
     }
     try std.testing.expectEqual(@as(usize, 1), db.core.store.source_certificates.entries.count());
+}
+
+test "controlled durable close DB dependency drain preserves accepted work and peer admission" {
+    const cpu = @import("../../common/runnable_scheduler.zig");
+    const admission = @import("../../common/read_admission.zig");
+    const now = @import("antfly_platform").time.monotonicNs;
+    const Mode = enum { success, begin_failure, end_failure, expired };
+    for ([_]background_runtime_mod.Backend{ .manual, .io_threaded }) |backend_kind| {
+        for (std.enums.values(Mode)) |mode| {
+            var external_io = std.Io.Threaded.init(std.testing.allocator, .{});
+            defer external_io.deinit();
+            var backend = try background_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{
+                .backend = backend_kind,
+                .borrowed_io = if (backend_kind == .manual) .{ .general = external_io.io() } else null,
+                .filesystem_io = if (backend_kind == .manual) external_io.io() else null,
+            });
+            defer backend.deinit();
+            const io = backend.ptr().io().?;
+            const lane = backend.ptr().durable_jobs;
+            var directory = try TestDirectory.init("db");
+            defer directory.cleanup();
+            var peer_directory = try TestDirectory.init("db");
+            defer peer_directory.cleanup();
+            const options: OpenOptions = .{
+                .backend_runtime = backend.ptr(),
+                .primary_backend = .{ .mem = .{} },
+                .executor = .{ .backend = .manual },
+                .start_index_workers = false,
+                .start_optional_runtimes = false,
+                .start_optional_runtime_workers = false,
+                .start_independent_maintenance = false,
+                .ttl_cleanup = .{ .enabled = false },
+            };
+            var db = try DB.open(std.testing.allocator, directory.path(), options);
+            var db_live = true;
+            defer if (db_live) db.close();
+            var peer = try DB.open(std.testing.allocator, peer_directory.path(), options);
+            defer peer.close();
+            const ids = [_]u64{ db.algebraic_hll_owner_id, db.repair_cleanup_owner_id, db.backend_owner_id };
+            var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_wait_ms = 5000 });
+            defer slots.close();
+            var closer: cpu.Execution = .{};
+            defer closer.finish();
+            try closer.start(&slots, .{ .io = io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .query);
+            var health: cpu.Execution = .{};
+            defer health.finish();
+            try health.start(&slots, .{ .io = io, .native_now_ns = now }, .control);
+            const F = struct {
+                const Chain = @This();
+                io: std.Io,
+                lane: background_runtime_mod.DurableJobLane,
+                ids: [3]u64,
+                slots: *cpu.Scheduler,
+                entered: std.Io.Event = .unset,
+                peer_retired: std.Io.Event = .unset,
+                submit_error: ?anyerror = null,
+                stages: [3]Stage = undefined,
+                const Stage = struct {
+                    chain: *Chain,
+                    index: usize,
+                    execution: cpu.Execution = .{},
+                    runs: std.atomic.Value(usize) = .init(0),
+                    retirements: std.atomic.Value(usize) = .init(0),
+                    failed: std.atomic.Value(bool) = .init(false),
+                    fn run(raw: *anyopaque) !void {
+                        const self: *@This() = @ptrCast(@alignCast(raw));
+                        const f = self.chain;
+                        errdefer self.failed.store(true, .release);
+                        if (self.index == 0) f.entered.set(f.io);
+                        // Inline dependent jobs inherit the outer job's CPU.
+                        // Async jobs each retain their CPU through deinit.
+                        if (self.index == 0 or !f.lane.executesInline())
+                            try self.execution.start(f.slots, .{ .io = f.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .background);
+                        _ = self.runs.fetchAdd(1, .release);
+                        if (self.index + 1 < f.ids.len) try f.lane.submit(f.job(self.index + 1));
+                    }
+                    fn deinit(raw: *anyopaque) void {
+                        const self: *@This() = @ptrCast(@alignCast(raw));
+                        _ = self.retirements.fetchAdd(1, .release);
+                        self.execution.finish();
+                    }
+                };
+                fn job(self: *@This(), index: usize) background_runtime_mod.Job {
+                    return .{ .owner_id = self.ids[index], .class = switch (index) {
+                        0 => .maintenance,
+                        1 => .cleanup,
+                        else => .commit_durable,
+                    }, .ptr = &self.stages[index], .run = Stage.run, .deinit = Stage.deinit };
+                }
+                fn submitFirst(self: *@This()) void {
+                    self.lane.submit(self.job(0)) catch |cause| {
+                        self.submit_error = cause;
+                    };
+                }
+                fn noop(_: *anyopaque) !void {}
+                fn retirePeer(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.peer_retired.set(self.io);
+                }
+                fn noDeinit(_: *anyopaque) void {}
+            };
+            const Control = struct {
+                closer: *cpu.Execution,
+                slots: *cpu.Scheduler,
+                mode: Mode,
+                begins: usize = 0,
+                ends: usize = 0,
+                fn lifetime(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.closer.checkLifetime();
+                    if (self.mode == .expired and self.begins != 0) return error.DeadlineExceeded;
+                }
+                fn checkpoint(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try lifetime(raw);
+                    if (self.slots.state(&self.closer.entry.?) != .running) return error.InvalidRunnableTransition;
+                }
+                fn deadline(raw: *anyopaque) !?u64 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.closer.entry.?.options.deadline_ns;
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.begins += 1;
+                    if (self.mode == .begin_failure) return error.NotFound;
+                    try self.closer.park(.resource_blocked);
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    if (self.mode == .end_failure) return error.Canceled;
+                    try self.closer.enter(.query);
+                }
+            };
+            var f: F = .{ .io = io, .lane = lane, .ids = ids, .slots = &slots };
+            for (&f.stages, 0..) |*stage, index| stage.* = .{ .chain = &f, .index = index };
+            var group: std.Io.Group = .init;
+            defer {
+                // Mandatory retirement on assertion failure must release the
+                // CPU before joining jobs that may still need it.
+                closer.finish();
+                group.await(io) catch unreachable;
+                for (ids) |id| lane.closeOwner(id);
+            }
+            try group.concurrent(io, F.submitFirst, .{&f});
+            const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+            try f.entered.waitTimeout(io, timeout);
+            var control: Control = .{ .closer = &closer, .slots = &slots, .mode = mode };
+            const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+            const original = admission.Port.init(&payload);
+            const result = db.drainCloseDependenciesWithAdmission(original);
+            if (mode == .success) try result else {
+                try std.testing.expectError(switch (mode) {
+                    .begin_failure => error.NotFound,
+                    .end_failure => error.Canceled,
+                    .expired => error.DeadlineExceeded,
+                    else => unreachable,
+                }, result);
+                try std.testing.expect(!db.closed);
+                // Even a rejected wait must fence the producer. Its callback
+                // and exact owner generation remain alive for the retry.
+                try std.testing.expectError(error.BackgroundOwnerClosing, lane.submit(f.job(0)));
+                if (mode == .end_failure) try closer.enter(.query);
+                control.mode = .success;
+                try db.drainCloseDependenciesWithAdmission(original);
+            }
+            try group.await(io);
+            if (f.submit_error) |cause| return cause;
+            try std.testing.expect(control.begins != 0);
+            try std.testing.expectEqual(control.begins, control.ends + @as(usize, if (mode == .begin_failure) 1 else 0));
+            for (&f.stages) |*stage| {
+                try std.testing.expect(!stage.failed.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 1), stage.runs.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 1), stage.retirements.load(.acquire));
+                try std.testing.expectError(error.BackgroundOwnerClosing, lane.submit(f.job(stage.index)));
+            }
+            // A peer DB's owners on the same runtime retain admission.
+            try lane.submit(.{ .owner_id = peer.backend_owner_id, .class = .maintenance, .ptr = &f, .run = F.noop, .deinit = F.retirePeer });
+            try f.peer_retired.waitTimeout(io, timeout);
+            try std.testing.expectEqual(cpu.State.running, slots.state(&health.entry.?));
+            // Retry of successful preflight cannot replay any accepted work.
+            try db.drainCloseDependenciesWithAdmission(original);
+            db.close();
+            db_live = false;
+            for (ids) |id| try std.testing.expectError(error.BackgroundOwnerClosed, lane.submit(.{ .owner_id = id, .class = .maintenance, .ptr = &f, .run = F.noop, .deinit = F.noDeinit }));
+        }
+    }
 }

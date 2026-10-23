@@ -7077,12 +7077,57 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         const clock = rt.native_abi.IoBorrow.init(&io);
         const now: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds));
         const deadline = now +| 250 * std.time.ns_per_ms;
+        const durable_lane = handle.db.backend_runtime.durable_jobs;
+        const durable_ids = [_]u64{ handle.db.algebraic_hll_owner_id, handle.db.repair_cleanup_owner_id, handle.db.backend_owner_id };
+        var backend_retirement: native.Execution = .{};
+        try backend_retirement.reserveCleanupRoot(&state.owner.scheduler, .{ .io = handle.db.backend_runtime.io().?, .clock_io = io, .allow_wait = true }, 250 * std.time.ns_per_ms);
+        defer backend_retirement.finish();
+        const BackendProbe = struct {
+            io: std.Io,
+            execution: ?*native.Execution = null,
+            entered: std.Io.Event = .unset,
+            calls: std.atomic.Value(usize) = .init(0),
+            retirements: std.atomic.Value(usize) = .init(0),
+            failed: std.atomic.Value(bool) = .init(false),
+            fn run(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                _ = self.calls.fetchAdd(1, .release);
+            }
+            fn deinit(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                defer if (self.execution) |execution| execution.finish();
+                if (self.execution) |execution| {
+                    self.entered.set(self.io);
+                    execution.activateCleanup() catch {
+                        self.failed.store(true, .release);
+                        return;
+                    };
+                }
+                _ = self.retirements.fetchAdd(1, .release);
+            }
+        };
         var capsule: ?*anyopaque = null;
         const started = owner.start(owner.context, &.{ .io = &clock, .class = @backingInt(rt.runnable_abi.Class.control), .slots = 1, .cleanup = 1, .allow_wait = 0, .has_deadline = 1, .deadline_ns = deadline, .out_handle = &capsule });
         try std.testing.expect(started.isOk() and capsule != null);
-        defer owner.finish(capsule.?);
+        defer if (capsule) |active| owner.finish(active);
         const borrow = try rt.runnable_abi.Borrowed.fromOwner(owner, capsule.?, 1, .control);
         const request: kernel_owner_abi.CloseDrainRequest = .{ .deadline_ns = deadline, .execution_runnable = &borrow, .clock_io = &clock };
+        var backend_probes = [_]BackendProbe{ .{ .io = io }, .{ .io = io }, .{ .io = io, .execution = &backend_retirement } };
+        var probes_joined = false;
+        defer if (!probes_joined) {
+            // Assertion failure must return the caller CPU before joining a
+            // payload retirement that needs the same protected cleanup slot.
+            if (capsule) |active| owner.finish(active);
+            capsule = null;
+            for (durable_ids) |owner_id| durable_lane.drainOwner(owner_id);
+        };
+        for (&backend_probes, durable_ids, 0..) |*probe, owner_id, index| try durable_lane.submit(.{ .owner_id = owner_id, .class = switch (index) {
+            0 => .maintenance,
+            1 => .cleanup,
+            else => .commit_durable,
+        }, .ptr = probe, .run = BackendProbe.run, .deinit = BackendProbe.deinit });
+        try backend_probes[2].entered.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } });
+        try std.testing.expectEqual(@as(usize, 0), backend_probes[2].retirements.load(.acquire));
         try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerDrainClose(id, &request));
         try std.testing.expect(!handle.db.isClosed());
         try std.testing.expect(text_merge.producer_closing.load(.acquire));
@@ -7126,18 +7171,14 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         try std.testing.expect(handle.db.local_execution.schema_reconcile.stopping.load(.acquire));
         try std.testing.expect(handle.db.portable_activation_owner_id != handle.db.backend_owner_id and handle.db.schema_reconcile_owner_id != handle.db.backend_owner_id and handle.db.portable_activation_owner_id != handle.db.schema_reconcile_owner_id);
         for ([_]u64{ handle.db.portable_activation_owner_id, handle.db.schema_reconcile_owner_id }) |id_to_check| try std.testing.expectError(error.BackgroundOwnerIdExhausted, handle.db.backend_runtime.durable_jobs.reopenOwner(id_to_check));
-        const BackendProbe = struct {
-            calls: std.atomic.Value(usize) = .init(0),
-            fn run(raw: *anyopaque) !void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                _ = self.calls.fetchAdd(1, .release);
-            }
-            fn deinit(_: *anyopaque) void {}
-        };
-        var backend_probe: BackendProbe = .{};
-        try handle.db.backend_runtime.durable_jobs.submit(.{ .owner_id = handle.db.backend_owner_id, .class = .maintenance, .ptr = &backend_probe, .run = BackendProbe.run, .deinit = BackendProbe.deinit });
-        handle.db.backend_runtime.durable_jobs.drainOwner(handle.db.backend_owner_id);
-        try std.testing.expectEqual(@as(usize, 1), backend_probe.calls.load(.acquire));
+        for (&backend_probes, durable_ids) |*probe, owner_id| {
+            try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), probe.retirements.load(.acquire));
+            try std.testing.expect(!probe.failed.load(.acquire));
+            try std.testing.expectError(error.BackgroundOwnerClosing, durable_lane.submit(.{ .owner_id = owner_id, .class = .maintenance, .ptr = probe, .run = BackendProbe.run, .deinit = BackendProbe.deinit }));
+            try std.testing.expectError(error.BackgroundOwnerIdExhausted, durable_lane.reopenOwner(owner_id));
+        }
+        probes_joined = true;
         try std.testing.expect(!handle.db.publication_recovery.retired.load(.acquire));
         try std.testing.expectError(error.BackgroundOwnerIdExhausted, handle.db.backend_runtime.durable_jobs.reopenOwner(handle.db.publication_recovery.owner_id));
         try std.testing.expect(try handle.db.backend_runtime.durable_jobs.quiesceOwner(handle.db.publication_recovery.owner_id));

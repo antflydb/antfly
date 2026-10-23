@@ -23980,3 +23980,60 @@ The first run's single-CPU fixture requested only two backend I/O lanes, below
 the existing maintenance coordinator's eight-lane minimum. The final fixture uses
 eight I/O lanes while retaining the same single ordinary runnable CPU slot. Both
 receipts are preserved. No full GNU/Linux qualification was run.
+
+### Controlled durable storage-owner dependency drains
+
+Serving-owner close now quiesces the remaining accepted HLL maintenance, repair
+cleanup and primary-backend jobs after recurring producers, derived finalization,
+source publication, online merge readers and cache callbacks have drained. HLL and
+repair owners drain before the primary-backend owner: accepted producer callbacks
+may still submit dependent storage work. Fencing all owners at once would reject
+those dependencies. Each stage includes payload destruction in its readiness
+predicate and lends the original cleanup execution while accepted work finishes.
+
+The ordered lane helper retains the original owner generations for physical
+close. Any failed handoff, lifetime check or caller reentry keeps the DB and
+accepted payloads alive; retry re-observes the same fenced owners without replaying
+completed work. Zero owner IDs are skipped. Other owners and execution scopes keep
+admission. Storage-owner ABI 153 fences the expanded close contract; native payload
+layouts are unchanged.
+
+Physical backend destruction and callback CPU/I/O cooperation still require
+explicit execution propagation. Uncontrolled physical close, registry/scope
+metadata lock contention, explicit runnable adoption, remaining
+backend teardown, parent metadata charging and broader cross-engine/fault/default
+policy gates remain unfinished. Strong required providers remain disabled. The
+full goal remains active; full GNU/Linux qualification remains waived and Linux
+requires pinned Nix/glibc Zig.
+
+The linked C-entry regression now queues probes on all three durable owners
+before preflight and rejects late submissions after it. Primary-backend payload
+retirement activates an independently reserved cleanup root while the close
+caller holds the sole protected cleanup CPU. Its retirement marker remains
+unfinished until preflight lends that execution. The fixture returns the caller's
+CPU before mandatory callback joins on assertion failure, and retains the root
+through its actual payload retirement. This exercises the default close capability
+rather than only the DB helper's ordinary-slot model.
+
+Pinned Darwin Debug receipt `durable-close-dependency-v5` passes all 73 build
+steps and 21 execution-service tests. It reuses qualified unchanged maintenance
+(59) and linked C-entry (2) artifacts. The C-entry tests passed freshly in v4,
+including protected cleanup CPU lending through accepted backend payload
+retirement. The final v5 run normalizes the touched shared-service test's stale
+license header to the repository's Apache policy and rebuilds that suite. The simple
+runners pass 29 DB/finalization/cache/dependency and 21 local-close cases without
+skips, failures or leaks; error ABI (45), released status ABI (1) and failure
+identity (8) also pass. All 5,537 recorded native/schema hashes match the final
+source. The real DB matrix covers inline and threaded lanes, one ordinary CPU,
+protected control progress, rejected handoff/reentry/lifetime, dependent accepted
+submissions, exact retirement and peer DB admission. The shared-services archive
+case covers dependency ordering, reentry rejection/retry, skipped zero IDs and
+peer-scope admission. Physical close finally retires the fenced generations.
+
+Intermediate receipts remain available: the first attempt exposed a nested test
+fixture type-name error; the next passed the DB/shared dependency tests but found
+an obsolete C-entry expectation of post-preflight backend admission. The third
+attempt was superseded during compilation to preserve mandatory joins until
+fixture retirement checks succeed. The final run includes the corrected fixture
+and expanded protected-cleanup regression. Full GNU/Linux qualification was not
+run, as previously waived; the full design remains unfinished.

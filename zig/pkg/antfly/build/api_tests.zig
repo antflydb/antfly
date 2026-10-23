@@ -3894,7 +3894,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const dense_finalization_db_tests = b.addTest(.{
         .name = "dense-finalization-db-tests",
         .root_module = dense_finalization_db_root,
-        .filters = &.{ "controlled dense finalization DB callback", "controlled dense finalization session claim", "dense session owner", "maintenance runtime cache close", "native publication finalization forwards raced source completion" },
+        .filters = &.{ "controlled dense finalization DB callback", "controlled dense finalization session claim", "dense session owner", "maintenance runtime cache close", "native publication finalization forwards raced source completion", "controlled durable close DB dependency" },
         .max_rss = 16 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const local = @import("antfly_local_sources");
@@ -992,5 +992,112 @@ test "execution services archive boundary active cancellation preserves original
         try std.testing.expectEqual(@as(usize, 1), control.begins);
         try std.testing.expectEqual(@as(usize, 1), control.ends);
         try std.testing.expectEqual(@as(usize, 1), (try client.maintenanceStats()).?.owned_registrations);
+    }
+}
+
+test "execution services archive boundary ordered durable drain preserves dependent submissions and peer scopes" {
+    for ([_]bool{ false, true }) |reject_reentry| {
+        var fixture: Fixture = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        var client = try services.Client.open(&fixture.offer);
+        defer client.close() catch @panic("scope close");
+        var peer = try services.Client.open(&fixture.offer);
+        defer peer.close() catch @panic("peer scope close");
+        const lane = try client.durableJobs();
+        const peer_lane = try peer.durableJobs();
+        var ids: [3]u64 = undefined;
+        for (&ids) |*id| id.* = try client.allocOwnerId();
+        const peer_id = try peer.allocOwnerId();
+        defer peer_lane.closeOwner(peer_id);
+        const F = struct {
+            const Chain = @This();
+            lane: background.DurableJobLane,
+            ids: [3]u64,
+            release: std.atomic.Value(bool) = .init(false),
+            entered: std.atomic.Value(bool) = .init(false),
+            peer_retired: std.atomic.Value(bool) = .init(false),
+            stages: [3]Stage = undefined,
+            reject_reentry: bool,
+            begins: usize = 0,
+            ends: usize = 0,
+            const Stage = struct {
+                chain: *Chain,
+                index: usize,
+                ran: std.atomic.Value(usize) = .init(0),
+                retired: std.atomic.Value(usize) = .init(0),
+                failed: std.atomic.Value(bool) = .init(false),
+                fn run(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const f = self.chain;
+                    errdefer self.failed.store(true, .release);
+                    if (self.index == 0) {
+                        f.entered.store(true, .release);
+                        while (!f.release.load(.acquire)) std.Thread.yield() catch {};
+                    }
+                    _ = self.ran.fetchAdd(1, .release);
+                    if (self.index + 1 < f.ids.len) try f.lane.submit(f.job(self.index + 1));
+                }
+                fn deinit(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    _ = self.retired.fetchAdd(1, .release);
+                }
+            };
+            fn job(self: *@This(), index: usize) background.Job {
+                return .{ .owner_id = self.ids[index], .class = switch (index) {
+                    0 => .maintenance,
+                    1 => .cleanup,
+                    else => .commit_durable,
+                }, .ptr = &self.stages[index], .run = Stage.run, .deinit = Stage.deinit };
+            }
+            fn check(_: *anyopaque) !void {}
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                self.release.store(true, .release);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                if (self.reject_reentry) return error.Canceled;
+            }
+            fn noop(_: *anyopaque) !void {}
+            fn retirePeer(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.peer_retired.store(true, .release);
+            }
+        };
+        var f: F = .{ .lane = lane, .ids = ids, .reject_reentry = reject_reentry };
+        for (&f.stages, 0..) |*stage, index| stage.* = .{ .chain = &f, .index = index };
+        defer {
+            f.release.store(true, .release);
+            for (ids) |id| lane.closeOwner(id);
+        }
+        try lane.submit(f.job(0));
+        try yieldUntil(&f.entered);
+        const admission = local.common_read_admission;
+        const payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.begin, .end = F.end } };
+        const original = admission.Port.init(&payload);
+        const result = lane.quiesceOwnersWithAdmission(&.{ ids[0], 0, ids[1], ids[2] }, original);
+        if (reject_reentry) {
+            try std.testing.expectError(error.Canceled, result);
+            try std.testing.expectError(error.BackgroundOwnerClosing, lane.submit(f.job(0)));
+            f.reject_reentry = false;
+            try lane.quiesceOwnersWithAdmission(&ids, original);
+        } else try result;
+        for (&f.stages) |*stage| {
+            try std.testing.expect(!stage.failed.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), stage.ran.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), stage.retired.load(.acquire));
+            try std.testing.expectError(error.BackgroundOwnerClosing, lane.submit(f.job(stage.index)));
+        }
+        try peer_lane.submit(.{ .owner_id = peer_id, .class = .maintenance, .ptr = &f, .run = F.noop, .deinit = F.retirePeer });
+        try yieldUntil(&f.peer_retired);
+        try std.testing.expect(f.begins != 0);
+        try std.testing.expectEqual(f.begins, f.ends);
+        try lane.quiesceOwnersWithAdmission(&ids, original);
     }
 }
