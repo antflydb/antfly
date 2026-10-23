@@ -562,7 +562,7 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .estimate_scans = estimateScans, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -1691,6 +1691,33 @@ pub const Adapter = struct {
             retained.opened += 1;
         }
         return .{ .ptr = retained, .cursors = cursors, .close = DynamicStatementRead.close };
+    }
+
+    fn estimateScans(ptr: *anyopaque, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) ![]const catalog.ScanEstimate {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        try self.context.ensureActive();
+        if (requests.len > 64) return error.SqlProgramLimitExceeded;
+        const result = try alloc.alloc(catalog.ScanEstimate, requests.len);
+        errdefer alloc.free(result);
+        @memset(result, .{});
+        if (requests.len == 0) return result;
+        // Reuse the bounded optimizer planning generation. This is status
+        // metadata, never a native statement read or a row/search operation.
+        const generation = (try self.server.source.acquireJoinPlanning(.{ .clock = .{ .deadline_ns = self.context.deadline_ns, .io = self.context.deadline_io }, .cancellation = self.context.cancellation })) orelse return result;
+        defer generation.release();
+        for (requests, result) |request, *estimate| {
+            try self.context.ensureActive();
+            try self.verify(alloc, request.table);
+            // Native status cannot price a lake inventory or a ranked search.
+            if (request.table.external_base_source != null or request.request.search != null) continue;
+            const table = generation.tables.get(request.table.physical_name) orelse continue;
+            if (!table.identity_ready or table.table_id != request.table.id) continue;
+            estimate.* = .{
+                .estimated_rows = if (table.stats.row_count_known) table.stats.row_count else null,
+                .estimated_bytes = if (table.stats.size_bytes_known) table.stats.size_bytes else null,
+            };
+        }
+        return result;
     }
 
     fn openStatement(ptr: *anyopaque, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) anyerror!catalog.StatementRead {
@@ -3917,4 +3944,48 @@ test "SQL pgwire native read cursor keeps transported JSON encoded through colum
     try std.testing.expectEqual(@as(usize, 0), end.selection.len);
     cursor.retireColumns();
     try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
+
+test "public execution SQL estimates use planning metadata without row authority" {
+    const a = std.testing.allocator;
+    const planning = @import("join_planning.zig");
+    const generation = try a.create(planning.Generation);
+    generation.* = .{ .alloc = a, .arena = .init(a) };
+    defer generation.release();
+    try generation.tables.put(generation.arena.allocator(), "physical", .{ .table_id = 7, .name = "physical", .stats = .{ .row_count = 100, .row_count_known = true, .size_bytes = 4096, .size_bytes_known = true } });
+    const Fake = struct {
+        generation: *planning.Generation,
+        captures: usize = 0,
+        fail: bool = false,
+        fn capture(raw: *anyopaque, budget: @import("table_router.zig").RouteBudget) !?*planning.Generation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try budget.check();
+            self.captures += 1;
+            if (self.fail) return error.MockMetadataFailure;
+            return self.generation.retain();
+        }
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try std.testing.expect(call == .resolve_many);
+            return alloc.dupe(u8, "{\"revision\":3,\"tables\":[{\"table_id\":7,\"name\":\"physical\"}]}");
+        }
+    };
+    var fake: Fake = .{ .generation = generation };
+    // All row, search, mutation and tracking authorities remain poisoned.
+    var server: http_server.ApiHttpServer = undefined;
+    server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve, .acquire_join_planning = Fake.capture } };
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    const table: catalog.Table = .{ .id = 7, .physical_name = "physical", .schema_version = 9, .columns = &.{}, .scope = .{ .database = "d", .namespace = "n", .name = "logical", .revision = 3 } };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scans = [_]catalog.StatementScan{.{ .table = table, .request = .{ .fields = &.{}, .limit = 1 } }};
+    const estimates = try Adapter.estimateScans(&adapter, arena.allocator(), &scans);
+    try std.testing.expectEqual(@as(?u64, 100), estimates[0].estimated_rows);
+    try std.testing.expectEqual(@as(?u64, 4096), estimates[0].estimated_bytes);
+    try std.testing.expectEqual(@as(usize, 1), fake.captures);
+    generation.tables.getPtr("physical").?.stats.row_count_known = false;
+    const unknown = try Adapter.estimateScans(&adapter, arena.allocator(), &scans);
+    try std.testing.expect(unknown[0].estimated_rows == null);
+    fake.fail = true;
+    try std.testing.expectError(error.MockMetadataFailure, Adapter.estimateScans(&adapter, a, &scans));
 }

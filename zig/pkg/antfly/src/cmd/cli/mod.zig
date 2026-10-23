@@ -25,6 +25,7 @@ pub const table = @import("table.zig");
 pub const index = @import("index.zig");
 pub const artifact = @import("artifact.zig");
 pub const query = @import("query.zig");
+pub const discovery = @import("discovery.zig");
 pub const sql = @import("sql.zig");
 pub const data = @import("data.zig");
 pub const backup = @import("backup.zig");
@@ -33,6 +34,11 @@ pub const internal = @import("internal.zig");
 pub const auth = @import("auth.zig");
 pub const cloud_connections = @import("cloud_connections.zig");
 pub const connections = @import("connections.zig");
+
+pub const output = @import("antfly_local_sources").cmd_cli_io;
+pub const agent = output.agent;
+pub const isAgent = output.isAgent;
+pub const useJson = output.useJson;
 
 pub const OutputFormat = @import("antfly_local_sources").cmd_cli_io.OutputFormat;
 
@@ -57,13 +63,13 @@ pub const CatalogFlags = struct {
     pub fn explicit(self: CatalogFlags) ?Explicit {
         if (self.database == null and self.namespace == null) return null;
         return .{
-            .database = self.database orelse fatal("--database is required when --namespace is set or ANTFLY_NAMESPACE is configured", .{}),
-            .namespace = self.namespace orelse fatal("--namespace is required when --database is set or ANTFLY_DATABASE is configured", .{}),
+            .database = self.database orelse argumentError("--database is required when --namespace is set or ANTFLY_NAMESPACE is configured", .{}),
+            .namespace = self.namespace orelse argumentError("--namespace is required when --database is set or ANTFLY_DATABASE is configured", .{}),
         };
     }
 
     pub fn databaseOrFatal(self: CatalogFlags) []const u8 {
-        return self.database orelse fatal("--database is required or ANTFLY_DATABASE must be configured", .{});
+        return self.database orelse argumentError("--database is required or ANTFLY_DATABASE must be configured", .{});
     }
 };
 
@@ -72,10 +78,12 @@ pub fn isHelpArg(arg: []const u8) bool {
 }
 
 pub fn commandUsage(command: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, command, "schema")) return "usage: antfly schema [--table NAME] [--database NAME --namespace NAME]\nQualified names, columns/types, indexes and server field capabilities.\n";
+    if (std.mem.eql(u8, command, "capabilities")) return "usage: antfly capabilities\nSmall local CLI contract; schema provides server capabilities.\n";
     if (std.mem.eql(u8, command, "connections")) return connections.usage;
     if (std.mem.eql(u8, command, "sql")) return
     \\usage: antfly sql --statement '<SQL>' [--parameters '<JSON array>']
-    \\                  [--database <name>] [--namespace <name>] [--limit <1..4096>]
+    \\                  [--database <name>] [--namespace <name>] [--limit <1..4096>] [--explain|--estimate|--analyze]
     \\       antfly sql --interactive [--database <name>] [--namespace <name>]
     \\  Interactive mode accepts one statement per line; \q rolls back and exits.
     \\  Parameters bind as typed values; quote SQL to prevent shell expansion of $1.
@@ -195,6 +203,7 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
 pub fn printCommandUsage(command: []const u8) void {
     const usage = commandUsage(command) orelse return;
     std.debug.print("{s}", .{usage});
+    std.debug.print("\nGlobal options precede local options: --agent|--no-agent, --output auto|json|compact|table,\n--display-rows, --display-bytes, --display-cell-bytes, --deadline-ms, --progress, --fingerprint ordered|multiset.\nUse capabilities and schema for discovery. --output json retrieves omitted read data; never replay mutations.\n", .{});
     for ([_][]const u8{ "table", "index", "query", "lookup", "load", "insert", "delete", "backup", "restore" }) |name| if (std.mem.eql(u8, command, name)) {
         std.debug.print("\nTable scope: --database NAME --namespace NAME (defaults: default/public).\nTable names are literal; dots do not select a namespace.\n", .{});
         break;
@@ -206,12 +215,12 @@ pub fn takeUniqueValue(
     slot: *?[]const u8,
     flag: []const u8,
 ) void {
-    if (slot.* != null) fatal("{s} may only be provided once", .{flag});
-    slot.* = args.next() orelse fatal("{s} requires a value", .{flag});
+    if (slot.* != null) argumentError("{s} may only be provided once", .{flag});
+    slot.* = args.next() orelse argumentError("{s} requires a value", .{flag});
 }
 
 pub fn rejectRemainingArgs(args: *std.process.Args.Iterator, context: []const u8) void {
-    if (args.next()) |arg| fatal("unexpected argument for {s}: {s}", .{ context, arg });
+    if (args.next()) |arg| argumentError("unexpected argument for {s}: {s}", .{ context, arg });
 }
 
 test "client commands expose help without a server" {
@@ -236,11 +245,11 @@ pub const initClient = @import("antfly_local_sources").cmd_cli_io.initClient;
 pub const writeJson = @import("antfly_local_sources").cmd_cli_io.writeJson;
 
 pub fn printResponse(allocator: std.mem.Allocator, io: std.Io, resp: anytype) !void {
+    expectHttpSuccess(resp);
     if (resp.data) |parsed| {
         try writeJson(allocator, io, parsed.value);
         return;
     }
-    expectHttpSuccess(resp);
     try writeJson(allocator, io, .{ .status = resp.status_code });
 }
 
@@ -264,6 +273,8 @@ pub fn splitCommaListAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]con
     return try list.toOwnedSlice(allocator);
 }
 
+pub const argumentError = output.argumentError;
+
 pub const fatal = @import("antfly_local_sources").cmd_cli_io.fatal;
 
 test "cli mod compiles" {
@@ -272,6 +283,7 @@ test "cli mod compiles" {
     _ = artifact;
     _ = query;
     _ = sql;
+    _ = discovery;
     _ = data;
     _ = backup;
     _ = agents;
