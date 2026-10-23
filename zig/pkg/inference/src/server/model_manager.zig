@@ -6739,6 +6739,17 @@ pub const ModelManager = struct {
         return try model.manifest.clone(allocator);
     }
 
+    /// Request admission may reuse the selected immutable generator's metadata.
+    /// Clone under a short cache pin so invalid requests and slow media uploads
+    /// do not prevent eviction or recovery. Execution rechecks its own manifest.
+    pub fn copyCachedGenerationManifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        defer handle.release();
+        const model = handle.get();
+        if (model.manifest.model_type != .generator) return null;
+        return try model.manifest.clone(allocator);
+    }
+
     /// Pin one handle for every currently published model. Callers may release
     /// load_lock before taking per-model locks without racing model eviction or
     /// retirement destruction. Metrics/listing observation does not renew TTL;
@@ -15142,4 +15153,43 @@ test "GGUF chunk planning cancellation leaves revalidation retryable" {
     try std.testing.expectEqualDeep(snapshot, model.chunk_planning.?);
     try std.testing.expectError(error.Timeout, model.chunkPlanningIdentityWithControl(.{ .deadline_ns = 0 }));
     try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentityWithControl(.{ .io = io }));
+}
+
+test "warm generator admission metadata releases pins on OOM and survives retirement" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.metal} });
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    try std.testing.expect((try manager.copyCachedGenerationManifest(a, "not-loaded")) == null);
+    var probe = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &probe);
+    model.manifest.model_type = .generator;
+    model.manifest.inputs = try a.alloc([]const u8, 1);
+    model.manifest.inputs[0] = try a.dupe(u8, "text");
+    model.manifest.capabilities = try a.alloc([]const u8, 1);
+    model.manifest.capabilities[0] = try a.dupe(u8, "inference.max_input_tokens_per_item=4096");
+    var inference = try manager.publishLoadedModel(model, true, null, null, 0);
+    defer inference.release();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, manager.copyCachedGenerationManifest(failing.allocator(), "teardown-fixture"));
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    var copy = (try manager.copyCachedGenerationManifest(a, "teardown-fixture")).?;
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    inference.retire();
+    try std.testing.expect(probe.closed);
+    try std.testing.expectEqualStrings("text", copy.inputs[0]);
+    try std.testing.expectEqualStrings("inference.max_input_tokens_per_item=4096", copy.capabilities[0]);
+    try std.testing.expect((try manager.copyCachedGenerationManifest(a, "teardown-fixture")) == null);
+    var replacement_probe = TeardownTestProbe{};
+    const replacement_model = try teardownTestModel(&manager, &replacement_probe);
+    replacement_model.manifest.model_type = .generator;
+    replacement_model.manifest.hidden_size = 2048;
+    var replacement = try manager.publishLoadedModel(replacement_model, true, null, null, 0);
+    defer replacement.release();
+    var fresh = (try manager.copyCachedGenerationManifest(a, "teardown-fixture")).?;
+    defer fresh.deinit();
+    try std.testing.expectEqual(@as(u32, 2048), fresh.hidden_size);
+    try std.testing.expectEqual(@as(usize, 0), fresh.capabilities.len);
+    try std.testing.expectEqual(@as(usize, 1), replacement_model.active_handles);
 }

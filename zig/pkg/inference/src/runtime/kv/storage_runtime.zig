@@ -140,6 +140,10 @@ pub const SequenceState = struct {
     active: bool = true,
     block_table: block_table.SequenceBlockTable = .{},
     reserved_tail_blocks: std.ArrayListUnmanaged(block.KvBlockId) = .empty,
+    /// Allocate reserved device slots lazily on the first write. Logical
+    /// length still advances only through appendTokens.
+    initial_device_capacity_tokens: usize = 0,
+    device_capacity_limit_tokens: usize = 0,
     compacted: bool = false,
 
     pub fn deinit(self: *SequenceState, allocator: std.mem.Allocator) void {
@@ -162,6 +166,11 @@ pub const KvSuffixWrite = struct {
     sequence_id: SequenceId,
     layer_index: usize,
     total_token_count: usize,
+    /// Admitted, page-aligned capacity, separate from valid attention length.
+    /// Zero preserves incremental device allocation.
+    device_capacity_tokens: usize = 0,
+    /// Maximum admitted capacity for this request; zero keeps legacy growth.
+    device_capacity_limit_tokens: usize = 0,
     suffix_token_count: usize,
     /// Absolute position of the first suffix token in the sequence — passed
     /// through to the kernel so it can tag the span with position_offset.
@@ -584,6 +593,10 @@ pub const KvStorageRuntime = struct {
         const reserved_capacity = (sequence_state.block_table.blocks.items.len + sequence_state.reserved_tail_blocks.items.len) * page_size;
         if (write.total_token_count > reserved_capacity) return error.KvCapacityTooSmall;
         var enriched = write;
+        enriched.device_capacity_tokens = sequence_state.initial_device_capacity_tokens;
+        enriched.device_capacity_limit_tokens = sequence_state.device_capacity_limit_tokens;
+        if (enriched.device_capacity_limit_tokens != 0 and write.total_token_count > enriched.device_capacity_limit_tokens)
+            return error.KvCapacityTooSmall;
         enriched.allow_swa_ring = enriched.allow_swa_ring and sequence_state.block_table.shared_prefix_blocks == 0;
         enriched.logical_blocks = try self.logicalBlocksWithReservations(write.sequence_id);
         enriched.page_size_tokens = page_size;
@@ -686,6 +699,8 @@ pub const KvStorageRuntime = struct {
             seq_state.id = id;
             seq_state.active = true;
             seq_state.compacted = false;
+            seq_state.initial_device_capacity_tokens = 0;
+            seq_state.device_capacity_limit_tokens = 0;
             seq_state.block_table.reset();
             seq_state.reserved_tail_blocks.clearRetainingCapacity();
             return id;
@@ -802,6 +817,23 @@ pub const KvStorageRuntime = struct {
                 try sequence_state.reserved_tail_blocks.append(self.allocator, id);
             }
         }
+    }
+
+    /// Request-local CUDA FP16 reservation. No token is made visible and no
+    /// device allocation occurs until its layer receives a real suffix write.
+    pub fn reserveDeviceTokenCapacity(self: *KvStorageRuntime, sequence_id: SequenceId, token_capacity: usize, token_limit: usize) !void {
+        if (self.storage.config.backend != .cuda or self.storage.config.dtype != .f16 or
+            self.storage.config.sliding_window_size != null) return error.DeviceWriteUnsupported;
+        const page_size: usize = self.storage.config.page_size_tokens;
+        if (page_size == 0 or token_capacity == 0 or token_capacity > token_limit) return error.KvCapacityTooSmall;
+        const initial_pages = try std.math.divCeil(usize, token_capacity, page_size);
+        const limit_pages = try std.math.divCeil(usize, token_limit, page_size);
+        const initial = try std.math.mul(usize, initial_pages, page_size);
+        const limit = try std.math.mul(usize, limit_pages, page_size);
+        try self.reserveTokenCapacity(sequence_id, limit);
+        const sequence = try self.sequenceMut(sequence_id);
+        sequence.initial_device_capacity_tokens = initial;
+        sequence.device_capacity_limit_tokens = limit;
     }
 
     pub fn logicalBlocksWithReservations(self: *KvStorageRuntime, sequence_id: SequenceId) ![]const block.KvBlockId {
@@ -1027,6 +1059,8 @@ pub const KvStorageRuntime = struct {
         seq_state.block_table.reset();
         seq_state.reserved_tail_blocks.clearRetainingCapacity();
         seq_state.compacted = false;
+        seq_state.initial_device_capacity_tokens = 0;
+        seq_state.device_capacity_limit_tokens = 0;
         seq_state.active = false;
         self.free_sequence_indices.append(self.allocator, idx) catch {};
     }
@@ -1226,6 +1260,8 @@ test "storage runtime reuses released sequence slots" {
 const TestDeviceWriteHookContext = struct {
     calls: usize = 0,
     last_total_token_count: usize = 0,
+    last_device_capacity_tokens: usize = 0,
+    last_device_capacity_limit_tokens: usize = 0,
     last_logical_block_count: usize = 0,
     last_page_size_tokens: u16 = 0,
     last_allow_swa_ring: bool = false,
@@ -1238,6 +1274,8 @@ fn testDeviceWriteLayerKvSuffix(ctx: *anyopaque, write: KvSuffixWrite, _: Device
     const typed: *TestDeviceWriteHookContext = @ptrCast(@alignCast(ctx));
     typed.calls += 1;
     typed.last_total_token_count = write.total_token_count;
+    typed.last_device_capacity_tokens = write.device_capacity_tokens;
+    typed.last_device_capacity_limit_tokens = write.device_capacity_limit_tokens;
     typed.last_logical_block_count = if (write.logical_blocks) |blocks| blocks.len else 0;
     typed.last_page_size_tokens = write.page_size_tokens;
     typed.last_allow_swa_ring = write.allow_swa_ring;
@@ -1329,6 +1367,58 @@ test "storage runtime notifies device hooks after tail truncation" {
     try std.testing.expectEqual(@as(usize, 1), hook_context.truncate_calls);
     try std.testing.expectEqual(sequence_id, hook_context.last_truncated_sequence_id);
     try std.testing.expectEqual(@as(usize, 4), hook_context.last_retained_token_count);
+}
+
+test "CUDA prefill KV reservation separates valid rows from device capacity and resets on release" {
+    var runtime = try KvStorageRuntime.init(std.testing.allocator, .{
+        .backend = .cuda,
+        .dtype = .f16,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+        .store_cpu_bytes = false,
+    });
+    defer runtime.deinit();
+    var context = TestDeviceWriteHookContext{};
+    runtime.setDeviceWriteHook(.{ .ctx = &context, .vtable = &test_device_write_hook_vtable });
+    const sequence = try runtime.attachSequence(runtime.poolId());
+    try runtime.reserveDeviceTokenCapacity(sequence, 10, 16);
+    try std.testing.expectEqual(@as(?usize, 0), runtime.tokenCount(sequence));
+    try runtime.appendTokens(sequence, 2);
+    var marker: f32 = 1;
+    const ref = DeviceKvRef{ .handle = @ptrCast(&marker), .byte_offset = 0, .byte_len = @sizeOf(f32) };
+    var write = KvSuffixWrite{
+        .sequence_id = sequence,
+        .layer_index = 0,
+        .total_token_count = 2,
+        .suffix_token_count = 1,
+        .position_offset = 0,
+        .num_kv_heads = 1,
+        .head_dim = 1,
+    };
+    try runtime.writeLayerKvSuffixDevice(write, ref, ref);
+    try std.testing.expectEqual(@as(usize, 2), context.last_total_token_count);
+    try std.testing.expectEqual(@as(usize, 12), context.last_device_capacity_tokens);
+    try std.testing.expectEqual(@as(usize, 16), context.last_device_capacity_limit_tokens);
+    try std.testing.expectEqual(@as(?usize, 2), runtime.tokenCount(sequence));
+    try runtime.appendTokens(sequence, 11);
+    write.total_token_count = 13;
+    try runtime.writeLayerKvSuffixDevice(write, ref, ref);
+    try std.testing.expectEqual(@as(usize, 12), context.last_device_capacity_tokens);
+    try std.testing.expectEqual(@as(usize, 16), context.last_device_capacity_limit_tokens);
+    try std.testing.expectEqual(@as(?usize, 13), runtime.tokenCount(sequence));
+    try runtime.releaseSequence(sequence);
+    const reused = try runtime.attachSequence(runtime.poolId());
+    try std.testing.expectEqual(sequence, reused);
+    try runtime.appendTokens(reused, 1);
+    write.total_token_count = 1;
+    // Caller-supplied hints cannot bypass the runtime's reservation authority.
+    write.device_capacity_tokens = 1000;
+    write.device_capacity_limit_tokens = 1000;
+    try runtime.writeLayerKvSuffixDevice(write, ref, ref);
+    try std.testing.expectEqual(@as(usize, 0), context.last_device_capacity_tokens);
+    try std.testing.expectEqual(@as(usize, 0), context.last_device_capacity_limit_tokens);
 }
 
 test "storage runtime device writes count reserved blocks as capacity" {

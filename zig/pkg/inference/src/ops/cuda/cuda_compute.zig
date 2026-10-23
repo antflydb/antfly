@@ -4690,6 +4690,7 @@ const CudaKvLayer = struct {
     v: buffer_mod.DeviceBuffer = .{},
     block_table: buffer_mod.DeviceBuffer = .{},
     capacity_tokens: usize = 0,
+    reserved_capacity_tokens: usize = 0,
     token_count: usize = 0,
     row_width: usize = 0,
     key_row_bytes: usize = 0,
@@ -5103,7 +5104,7 @@ const CudaKvDeviceStorage = struct {
         token_count: usize,
         page_size_tokens: u16,
     ) !void {
-        const upload_blocks = try blockTableUploadBlockCount(token_count, page_size_tokens, logical_blocks);
+        const upload_blocks = try blockTableUploadBlockCount(@max(token_count, layer.reserved_capacity_tokens), page_size_tokens, logical_blocks);
         if (upload_blocks == 0) return;
         const block_table_bytes = try checkedMul(upload_blocks, @sizeOf(kv_block_mod.KvBlockId));
         const signature = blockTableSignature(logical_blocks, upload_blocks, page_size_tokens);
@@ -5161,6 +5162,18 @@ const CudaKvDeviceStorage = struct {
             else => try checkedMul(row_width, @sizeOf(f32)),
         };
         if (value_row_bytes == 0) return error.DeviceWriteFormatUnsupported;
+        const capacity_limit: ?usize = if (write.device_capacity_limit_tokens != 0) blk: {
+            if (self.dtype != .f16 or write.device_capacity_tokens == 0 or
+                write.device_capacity_tokens > write.device_capacity_limit_tokens or
+                write.total_token_count > write.device_capacity_limit_tokens or
+                write.page_size_tokens == 0) return error.InvalidPagedKvState;
+            const blocks = write.logical_blocks orelse return error.InvalidPagedKvState;
+            const limit_blocks = try neededBlockCount(write.device_capacity_limit_tokens, write.page_size_tokens);
+            break :blk try physicalCapacityTokens(blocks, limit_blocks, write.page_size_tokens);
+        } else if (write.device_capacity_tokens != 0)
+            return error.InvalidPagedKvState
+        else
+            null;
         const layer_key = try self.layerKey(write.sequence_id, write.layer_index);
         const gop = try self.layers.getOrPut(self.allocator, layer_key);
         if (!gop.found_existing) {
@@ -5180,10 +5193,13 @@ const CudaKvDeviceStorage = struct {
         layer.value_format = value_format;
         layer.page_size_tokens = write.page_size_tokens;
         layer.position_offset = write.position_offset;
+        // Keep the full reserved page table stable during both writes and
+        // attention reads; token_count continues to bound readable KV rows.
+        layer.reserved_capacity_tokens = write.device_capacity_limit_tokens;
 
         const required_capacity = if (compressed_format != null and write.logical_blocks != null and write.page_size_tokens != 0) blk: {
             const logical_blocks = write.logical_blocks.?;
-            const upload_blocks = try blockTableUploadBlockCount(write.total_token_count, write.page_size_tokens, logical_blocks);
+            const upload_blocks = try blockTableUploadBlockCount(@max(write.total_token_count, write.device_capacity_tokens), write.page_size_tokens, logical_blocks);
             break :blk try physicalCapacityTokens(logical_blocks, upload_blocks, write.page_size_tokens);
             // F32 KV is contiguous and does not derive its device allocation from
             // reserved logical blocks, so honor the explicit replay reserve here.
@@ -5197,10 +5213,12 @@ const CudaKvDeviceStorage = struct {
             try std.math.add(usize, write.total_token_count, 256)
         else
             write.total_token_count;
+        if (capacity_limit) |limit| if (required_capacity > limit) return error.InvalidPagedKvState;
         if (layer.capacity_tokens < required_capacity) {
             try preparePersistentCudaBufferReallocation(self.compute);
             const allocation_page_size = if (compressed_format != null) write.page_size_tokens else 0;
-            const new_capacity = try cudaKvGrowthCapacity(required_capacity, layer.capacity_tokens, allocation_page_size);
+            const growth_capacity = try cudaKvGrowthCapacity(required_capacity, layer.capacity_tokens, allocation_page_size);
+            const new_capacity = if (capacity_limit) |limit| @min(growth_capacity, limit) else growth_capacity;
             const k_bytes = try checkedMul(new_capacity, key_row_bytes);
             const v_bytes = try checkedMul(new_capacity, value_row_bytes);
             var new_k = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, k_bytes);
@@ -27931,6 +27949,62 @@ test "attention match CUDA fresh restore validates sequence and preserves candid
         try std.testing.expect(owner.match_binding == null);
         try std.testing.expectEqual(initial_live, compute.ctx.device_allocations.snapshot().live);
     }
+}
+
+test "CUDA prefill KV reservation preserves allocations and page table through append" {
+    if (!platform.env.getenvBool("ANTFLY_TEST_CUDA_REPEAT")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    var storage: CudaKvDeviceStorage = .{ .allocator = a, .compute = &compute, .dtype = .f16 };
+    defer storage.deinit();
+    const blocks = [_]u32{ 0, 1, 2, 3 };
+    var write = kv_storage_runtime.KvSuffixWrite{
+        .sequence_id = 0,
+        .layer_index = 0,
+        .total_token_count = 2,
+        .suffix_token_count = 2,
+        .device_capacity_tokens = 48,
+        .device_capacity_limit_tokens = 64,
+        .position_offset = 0,
+        .num_kv_heads = 1,
+        .head_dim = 16,
+        .logical_blocks = &blocks,
+        .page_size_tokens = 16,
+    };
+    const layer = try storage.ensureLayer(write);
+    try compute.ctx.synchronize();
+    const pointers = .{ layer.k.ptr, layer.v.ptr, layer.block_table.ptr };
+    const allocated = compute.ctx.device_allocations.snapshot().live;
+    const uploads = compute.stats.device_kv_paged_block_table_uploads;
+    try std.testing.expectEqual(@as(usize, 48), layer.capacity_tokens);
+    // Attention reads still use the real token length, while the reserved
+    // physical table stays stable across read/write dispatches.
+    try storage.ensureLayerBlockTable(layer, &blocks, 2, 16);
+    write.total_token_count = 17;
+    write.suffix_token_count = 15;
+    const appended = try storage.ensureLayer(write);
+    try std.testing.expectEqual(pointers, .{ appended.k.ptr, appended.v.ptr, appended.block_table.ptr });
+    try std.testing.expectEqual(allocated, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(uploads, compute.stats.device_kv_paged_block_table_uploads);
+    write.device_capacity_tokens = 80;
+    try std.testing.expectError(error.InvalidPagedKvState, storage.ensureLayer(write));
+    try std.testing.expectEqual(allocated, compute.ctx.device_allocations.snapshot().live);
+    // A longer decode can outgrow its initial reservation. Geometric growth
+    // is capped by admission and the full request page table remains stable.
+    write.device_capacity_tokens = 48;
+    write.total_token_count = 49;
+    write.suffix_token_count = 32;
+    const grown = try storage.ensureLayer(write);
+    try compute.ctx.synchronize();
+    try std.testing.expectEqual(@as(usize, 64), grown.capacity_tokens);
+    try std.testing.expectEqual(@as(usize, 4), grown.block_table_len);
+    try std.testing.expectEqual(uploads, compute.stats.device_kv_paged_block_table_uploads);
+    const grown_allocated = compute.ctx.device_allocations.snapshot().live;
+    write.total_token_count = 65;
+    write.suffix_token_count = 1;
+    try std.testing.expectError(error.InvalidPagedKvState, storage.ensureLayer(write));
+    try std.testing.expectEqual(grown_allocated, compute.ctx.device_allocations.snapshot().live);
 }
 
 test "attention match CUDA authoritative snapshot batches large half and float reads" {

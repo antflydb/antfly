@@ -2706,6 +2706,51 @@ const SelectionQueryEntry = struct {
     }
 };
 
+/// Match the measured E4B text geometry and bounded 32K serving envelope.
+/// Reserve multi-chunk prefill and a bounded decode tail. Reserving a large
+/// output limit for a short prompt wastes allocation time on early EOS.
+/// Reservation uses the same 16-token page alignment as request admission.
+fn cudaE4bPrefillKvCapacity(config: gpt_mod.Config, prompt_tokens: usize, output_tokens: i32) ?usize {
+    if (config.family != .gemma or config.hidden_size != 2560 or config.num_hidden_layers != 42 or
+        config.num_kv_shared_layers != 18 or config.num_attention_heads != 8 or
+        config.num_key_value_heads != 2 or config.attention_head_dim != 256 or config.global_head_dim != 512 or
+        config.gemma4_mtp_assistant or config.usesMoe() or config.isMultimodal() or
+        prompt_tokens <= 2048 or output_tokens <= 0) return null;
+    const tokens = std.math.add(usize, prompt_tokens, @intCast(output_tokens)) catch return null;
+    if (tokens > @min(@as(usize, 32768), config.max_position_embeddings)) return null;
+    const reserved_tokens = prompt_tokens + @min(@as(usize, @intCast(output_tokens)), 256);
+    return std.mem.alignForward(usize, reserved_tokens, 16);
+}
+
+test "CUDA prefill KV reservation respects admitted length and supported geometry" {
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_kv_shared_layers = 18,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .max_position_embeddings = 32768,
+    };
+    try std.testing.expectEqual(@as(?usize, 8208), cudaE4bPrefillKvCapacity(config, 8189, 16));
+    try std.testing.expectEqual(@as(?usize, 32768), cudaE4bPrefillKvCapacity(config, 32752, 16));
+    try std.testing.expectEqual(@as(?usize, 8448), cudaE4bPrefillKvCapacity(config, 8192, 16384));
+    try std.testing.expectEqual(@as(?usize, 8448), cudaE4bPrefillKvCapacity(config, 8192, 257));
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 2048, 16384) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 20, 4096) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 32753, 16) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, std.math.maxInt(usize), 16) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 1, 0) == null);
+    var other = config;
+    other.num_kv_shared_layers = 0;
+    try std.testing.expect(cudaE4bPrefillKvCapacity(other, 100, 16) == null);
+    other = config;
+    other.max_position_embeddings = 4096;
+    try std.testing.expect(cudaE4bPrefillKvCapacity(other, 8189, 16) == null);
+}
+
 pub const NativeDecodeState = struct {
     allocator: std.mem.Allocator,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
@@ -2931,6 +2976,17 @@ pub const NativeDecodeState = struct {
         const lock = self.lockPagedKv();
         defer if (lock) |mutex| mutex.unlock();
         return self.ensureAttachedUnlocked();
+    }
+
+    fn reserveFreshCudaKvCapacity(self: *NativeDecodeState, token_capacity: usize, token_limit: usize) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        if (!self.isPaged() or self.total_tokens != 0 or self.sequence_id != null)
+            return error.InvalidPagedKvState;
+        const storage = self.kv_storage orelse return error.DeviceWriteUnsupported;
+        try self.ensureAttachedUnlocked();
+        try self.kv_manager.?.reserveTokenCapacity(self.sequence_id.?, token_limit);
+        try storage.reserveDeviceTokenCapacity(self.sequence_id.?, token_capacity, token_limit);
     }
 
     fn prepareSelectedGlobalDonors(self: *NativeDecodeState, config: gpt_mod.Config) !void {
@@ -7163,6 +7219,24 @@ pub const NativeGenerationPipeline = struct {
         const allow_shared_kv_prefill = can_use_typed_prefill_outputs and
             self.checkpoint_prepare == null and self.checkpoint_resume == null and
             !capture_last_hidden and config.kv_cache_mode == .exact_hybrid;
+        // Admission already covers prompt + output KV. Reserve the prompt and
+        // a bounded decode tail instead of growing/copying every donor layer
+        // during prefill. Longer decodes keep the ordinary growth contract.
+        // Keep fitting, restore, shared prefixes, and speculation on their
+        // existing storage contracts until separately qualified.
+        if (allow_shared_kv_prefill and self.cb.kind() == .cuda and self.kv_dtype == .f16 and
+            self.prompt_cache == null and !config.prompt_cache_enabled and self.draft_cb == null and
+            !config.speculation_requested and prefilled_tokens == 0 and decode_state.total_tokens == 0 and
+            decode_state.sequence_id == null and decode_state.isPaged() and decode_state.kvSlidingWindowTokens() == null and
+            decode_state.cudaPagedKvReplayCapacityTokens() == null and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RESERVE_PREFILL_KV", true))
+        {
+            if (cudaE4bPrefillKvCapacity(self.gpt_config, seq_len, config.max_tokens)) |capacity| {
+                const limit = std.mem.alignForward(usize, seq_len + @as(usize, @intCast(config.max_tokens)), 16);
+                try decode_state.reserveFreshCudaKvCapacity(capacity, limit);
+                std.log.info("cuda_prefill_kv_reservation prompt_tokens={d} capacity_tokens={d}", .{ seq_len, capacity });
+            }
+        }
         const prefer_cuda_direct_last_logits = can_use_typed_prefill_outputs and self.cb.kind() == .cuda;
         debugGenerationStage(
             "executePrefill enter seq_len={d} prefilled={d} query_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
@@ -15268,6 +15342,44 @@ test "native decode state rejects KV compaction for DeepSeek V4 compressed cache
         error.DeepSeekV4CompressedKvCompactionNotSupported,
         state.compactKvCache(.{ .target_ratio = 0.5 }),
     );
+}
+
+test "CUDA prefill KV reservation keeps manager and storage counts aligned" {
+    const allocator = std.testing.allocator;
+    const config = runtime.kv.pool.KvPoolConfig{
+        .backend = .cuda,
+        .dtype = .f16,
+        .page_size_tokens = 16,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+        .store_cpu_bytes = false,
+    };
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool = try manager.addPool(config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try state.reserveFreshCudaKvCapacity(48, 64);
+    const sequence = state.sequence_id.?;
+    try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
+    try std.testing.expectEqual(@as(?usize, 0), manager.tokenCount(sequence));
+    try std.testing.expectEqual(@as(?usize, 0), storage.tokenCount(sequence));
+    try std.testing.expect(state.kvView() == null);
+    try state.appendPrefillChunk(17);
+    try state.appendGeneratedToken();
+    try std.testing.expectEqual(@as(?usize, 18), manager.tokenCount(sequence));
+    try std.testing.expectEqual(@as(?usize, 18), storage.tokenCount(sequence));
+    try std.testing.expectEqual(@as(usize, 18), state.kvView().?.token_count);
+    try std.testing.expectEqual(@as(usize, 4), (try storage.logicalBlocksWithReservations(sequence)).len);
+    try state.appendPrefillChunk(31);
+    try std.testing.expectEqual(@as(?usize, 49), manager.tokenCount(sequence));
+    try std.testing.expectEqual(@as(?usize, 49), storage.tokenCount(sequence));
+    try std.testing.expectEqual(@as(usize, 4), (try storage.logicalBlocksWithReservations(sequence)).len);
+    try std.testing.expectError(error.InvalidPagedKvState, state.reserveFreshCudaKvCapacity(64, 64));
 }
 
 test "attention match checkpoint owner retains logical history without host KV mirrors" {

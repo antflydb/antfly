@@ -163,6 +163,9 @@ pub const HfTokenizer = struct {
     /// The string table remains as a compatibility fallback for unusual
     /// tokenizer.json merges whose components are absent from the vocab.
     merge_pairs: std.AutoHashMapUnmanaged(u64, PackedBpeMerge),
+    /// Byte pairs that can be joined by a merge. An absent pair is a hard
+    /// boundary, provided it also falls between initial UTF-8 symbols.
+    bpe_merge_boundaries: std.StaticBitSet(65536) = .empty,
     /// Persistent, sharded pretoken cache. BPE inputs are highly repetitive
     /// in natural language; retaining their final token IDs avoids rebuilding
     /// symbol lists and priority queues on every occurrence and keeps lock
@@ -402,6 +405,7 @@ pub const HfTokenizer = struct {
         hash: u64,
         key: []const u8,
         token_ids: []const i32,
+        pure_merges: bool = false,
         referenced: std.atomic.Value(bool) = .init(true),
         next_retired: ?*BpeCacheEntry = null,
     };
@@ -1242,6 +1246,10 @@ pub const HfTokenizer = struct {
 
         try self.parseVocabDict(obj);
 
+        // Packed-ID lookups can alias distinct byte strings in unusual vocabularies.
+        // Keep their legacy behavior without inferring byte boundaries.
+        if (self.vocab.count() != self.id_to_token.count()) self.bpe_merge_boundaries = .full;
+
         // Parse merges into `merge_ranks`, keyed on "a<space>b" (the same
         // form the JSON provides). Lower rank = higher priority. The
         // priority-queue BPE merger is the only consumer.
@@ -1280,6 +1288,14 @@ pub const HfTokenizer = struct {
                         raw_key_owned = composed;
                         break :blk composed;
                     };
+                    // The legacy string table can also match another split
+                    // at a literal space inside either piece. Conservatively
+                    // include every such interpretation of this lookup key.
+                    for (raw_key, 0..) |byte, index| {
+                        if (byte == ' ' and index > 0 and index + 1 < raw_key.len) {
+                            self.bpe_merge_boundaries.set((@as(usize, raw_key[index - 1]) << 8) | raw_key[index + 1]);
+                        }
+                    }
                     const key = try self.dupeArenaString(raw_key);
                     // Earlier merges win ties because getOrPut is no-op on existing.
                     const gop = try self.merge_ranks.getOrPut(self.allocator, key);
@@ -6338,6 +6354,7 @@ pub const HfTokenizer = struct {
         shard: *BpeCacheShard,
         hash: u64,
         word: []const u8,
+        pure_merges: bool,
     ) bool {
         var slot_idx = bpeCacheSlot(hash);
         for (0..bpe_cache_slots_per_shard) |_| {
@@ -6345,7 +6362,7 @@ pub const HfTokenizer = struct {
             if (raw == 0) return false;
             if (raw > bpe_cache_tombstone) {
                 const entry: *const BpeCacheEntry = @ptrFromInt(raw);
-                if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) return true;
+                if (entry.hash == hash and entry.pure_merges == pure_merges and std.mem.eql(u8, entry.key, word)) return true;
             }
             slot_idx = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
         }
@@ -6357,6 +6374,7 @@ pub const HfTokenizer = struct {
         shard_idx: usize,
         hash: u64,
         word: []const u8,
+        pure_merges: bool,
     ) bool {
         const slots = bpeBulkShardSlots(cache, shard_idx) orelse return false;
         var slot_idx = bpeBulkCacheSlot(cache, hash);
@@ -6365,7 +6383,7 @@ pub const HfTokenizer = struct {
             if (raw == 0) return false;
             if (raw > bpe_cache_tombstone) {
                 const entry: *const BpeCacheEntry = @ptrFromInt(raw);
-                if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) return true;
+                if (entry.hash == hash and entry.pure_merges == pure_merges and std.mem.eql(u8, entry.key, word)) return true;
             }
             slot_idx = (slot_idx + 1) & (slots.len - 1);
         }
@@ -6421,6 +6439,7 @@ pub const HfTokenizer = struct {
         cache: *BpeCache,
         candidate_hash: u64,
         candidate_word: []const u8,
+        pure_merges: bool,
     ) void {
         // One pending retirement is sufficient to make the next encode retry
         // admission with released capacity. Avoid draining the cache when a
@@ -6437,12 +6456,14 @@ pub const HfTokenizer = struct {
                     shard,
                     candidate_hash,
                     candidate_word,
+                    pure_merges,
                 ) or
                     bpeBulkCacheShardContainsLocked(
                         cache,
                         shard_idx,
                         candidate_hash,
                         candidate_word,
+                        pure_merges,
                     )))
             {
                 shard.mutex.unlock();
@@ -6560,6 +6581,16 @@ pub const HfTokenizer = struct {
         word: []const u8,
         ids: *std.ArrayListUnmanaged(i32),
     ) !bool {
+        return self.appendCachedBpeMode(allocator, word, ids, false);
+    }
+
+    fn appendCachedBpeMode(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        word: []const u8,
+        ids: *std.ArrayListUnmanaged(i32),
+        pure_merges: bool,
+    ) !bool {
         if (word.len == 0 or word.len > bpe_cache_max_key_bytes) return false;
         const hash = bpeCacheHash(word);
         const cache = self.bpe_cache orelse return false;
@@ -6576,7 +6607,7 @@ pub const HfTokenizer = struct {
                 continue;
             }
             const entry: *const BpeCacheEntry = @ptrFromInt(raw);
-            if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) {
+            if (entry.hash == hash and entry.pure_merges == pure_merges and std.mem.eql(u8, entry.key, word)) {
                 // Keep steady-state hits read-only. A write is needed only
                 // after the CLOCK scanner has cleared this entry, avoiding
                 // cache-line ownership traffic between parallel readers.
@@ -6605,7 +6636,7 @@ pub const HfTokenizer = struct {
                     continue;
                 }
                 const entry: *const BpeCacheEntry = @ptrFromInt(raw);
-                if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) {
+                if (entry.hash == hash and entry.pure_merges == pure_merges and std.mem.eql(u8, entry.key, word)) {
                     if (!entry.referenced.load(.monotonic)) {
                         @constCast(entry).referenced.store(true, .monotonic);
                     }
@@ -6698,6 +6729,10 @@ pub const HfTokenizer = struct {
     /// Best-effort cache insertion. Tokenization must not fail merely because
     /// the optional cache cannot grow, so allocation failures are ignored.
     fn cacheBpe(self: *HfTokenizer, word: []const u8, token_ids: []const i32) void {
+        self.cacheBpeMode(word, token_ids, false);
+    }
+
+    fn cacheBpeMode(self: *HfTokenizer, word: []const u8, token_ids: []const i32, pure_merges: bool) void {
         if (word.len == 0 or word.len > bpe_cache_max_key_bytes or token_ids.len == 0) return;
 
         const hash = bpeCacheHash(word);
@@ -6720,7 +6755,7 @@ pub const HfTokenizer = struct {
             // If the candidate can ever fit, make room for its next admitted
             // occurrence. The current read epoch safely delays reclamation.
             if (entry_bytes <= cache.max_bytes -| @sizeOf(BpeCache)) {
-                evictBpeCacheEntryForPressure(cache, hash, word);
+                evictBpeCacheEntryForPressure(cache, hash, word, pure_merges);
             }
             return;
         }
@@ -6740,6 +6775,7 @@ pub const HfTokenizer = struct {
             .hash = hash,
             .key = key_copy,
             .token_ids = ids_copy,
+            .pure_merges = pure_merges,
         };
 
         const shard = &cache.shards[bpeCacheShard(hash)];
@@ -6758,7 +6794,7 @@ pub const HfTokenizer = struct {
                 continue;
             }
             const entry: *const BpeCacheEntry = @ptrFromInt(raw);
-            if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) return;
+            if (entry.hash == hash and entry.pure_merges == pure_merges and std.mem.eql(u8, entry.key, word)) return;
             slot_idx = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
         }
 
@@ -6769,7 +6805,7 @@ pub const HfTokenizer = struct {
                 if (raw == 0) break;
                 if (raw > bpe_cache_tombstone) {
                     const entry: *const BpeCacheEntry = @ptrFromInt(raw);
-                    if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) return;
+                    if (entry.hash == hash and entry.pure_merges == pure_merges and std.mem.eql(u8, entry.key, word)) return;
                 }
                 bulk_slot_idx = (bulk_slot_idx + 1) & (bulk_slots.len - 1);
             }
@@ -6898,6 +6934,42 @@ pub const HfTokenizer = struct {
             try self.bpeEncodeByDirectPieces(allocator, word, ids);
             return;
         }
+
+        if (self.pre_tokenizer_type == .none and self.end_of_word_suffix.len == 0 and word.len > bpe_cache_max_key_bytes and std.unicode.utf8ValidateSlice(word)) {
+            var start: usize = 0;
+            for (1..word.len) |end| {
+                // Input validation above preserves the legacy behavior for
+                // malformed UTF-8. Split only between initial Unicode symbols.
+                if (word[end] & 0xc0 == 0x80) continue;
+                const pair = (@as(usize, word[end - 1]) << 8) | word[end];
+                // StaticBitSet.isSet takes the 8 KiB set by value. Inspect
+                // its word directly so this byte scan never copies the set.
+                const mask = self.bpe_merge_boundaries.masks[pair / @bitSizeOf(usize)];
+                const shift: std.math.Log2Int(usize) = @intCast(pair % @bitSizeOf(usize));
+                if (mask & (@as(usize, 1) << shift) != 0) continue;
+                try self.bpeEncodeMergeSegment(allocator, word[start..end], ids, scratch);
+                start = end;
+            }
+            if (start != 0) {
+                try self.bpeEncodeMergeSegment(allocator, word[start..], ids, scratch);
+                return;
+            }
+        }
+        try self.bpeEncodeMerges(allocator, word, ids, scratch);
+    }
+
+    fn bpeEncodeMergeSegment(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32), scratch: *BpeScratch) !void {
+        // Segment results must not alias the whole-word vocabulary shortcut:
+        // a vocab entry can exist without being reachable by BPE merges.
+        if (self.bpe_profile_enabled.load(.acquire)) _ = self.bpe_profile.pretokens.fetchAdd(1, .monotonic);
+        if (try self.appendCachedBpeMode(allocator, word, ids, true)) return;
+        const first = ids.items.len;
+        try self.bpeEncodeMerges(allocator, word, ids, scratch);
+        self.cacheBpeMode(word, ids.items[first..], true);
+    }
+
+    fn bpeEncodeMerges(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32), scratch: *BpeScratch) !void {
+        if (word.len == 0) return;
 
         // Build a working buffer that holds `word` followed by the optional
         // end-of-word suffix. Symbols index into this buffer via (start, end),
@@ -10562,6 +10634,80 @@ test "worker BPE cache retains spilled token sequences" {
     const stats = tok.bpeCacheStats();
     try std.testing.expectEqual(@as(usize, 4), stats.worker_tables);
     try std.testing.expect(stats.worker_bytes > table_bytes);
+}
+
+test "BPE hard partitions preserve merge-only cache semantics and whole-word vocabulary hits" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{"model":{"type":"BPE","vocab":{"a":1,"b":2,"c":3,"ab":4,"abc":5,"\n":6,"x":7,"y":8,"xy":9,"bc":10},"merges":["a b","b c"]}}
+    ;
+    var fast = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer fast.deinitSelf();
+    fast.pre_tokenizer_type = .none;
+    var reference = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer reference.deinitSelf();
+    reference.pre_tokenizer_type = .none;
+    reference.bpe_merge_boundaries = .full;
+    try reference.configureBpeCache(.{ .max_bytes = 0 });
+    // Warm the whole-word shortcut with a token absent from the merge table.
+    for (0..4) |_| {
+        const whole = try fast.tokenizer().encode(allocator, "abc");
+        defer allocator.free(whole);
+        try std.testing.expectEqualSlices(i32, &.{5}, whole);
+    }
+    const pattern = "abc\nxy\n";
+    const input = try allocator.alloc(u8, pattern.len * 100);
+    defer allocator.free(input);
+    for (0..100) |i| @memcpy(input[i * pattern.len ..][0..pattern.len], pattern);
+    const expected = try reference.tokenizer().encode(allocator, input);
+    defer allocator.free(expected);
+    for (0..4) |_| {
+        const actual = try fast.tokenizer().encode(allocator, input);
+        defer allocator.free(actual);
+        try std.testing.expectEqualSlices(i32, expected, actual);
+    }
+    try std.testing.expect(fast.bpeCacheStats().entries > 0);
+    const whole = try fast.tokenizer().encode(allocator, "abc");
+    defer allocator.free(whole);
+    try std.testing.expectEqualSlices(i32, &.{5}, whole);
+}
+
+test "BPE hard partitions preserve string-key ambiguity Unicode and malformed input" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{"model":{"type":"BPE","vocab":{"a":1," ":2,"b":3,"a ":4,"b ":5,"a b":6,"é":7,"éa":8,"\n":9},"merges":["a  ",["a ","b"],"é a"]}}
+    ;
+    var fast = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer fast.deinitSelf();
+    fast.pre_tokenizer_type = .none;
+    var reference = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer reference.deinitSelf();
+    reference.pre_tokenizer_type = .none;
+    reference.bpe_merge_boundaries = .full;
+    try reference.configureBpeCache(.{ .max_bytes = 0 });
+    try std.testing.expect(fast.bpe_merge_boundaries.isSet((@as(usize, ' ') << 8) | 'b'));
+    for ([_][]const u8{ "a béa\n", "a\xffb\n", "a\xe2b\n" }) |pattern| {
+        const input = try allocator.alloc(u8, pattern.len * 100);
+        defer allocator.free(input);
+        for (0..100) |i| @memcpy(input[i * pattern.len ..][0..pattern.len], pattern);
+        const expected = try reference.tokenizer().encode(allocator, input);
+        defer allocator.free(expected);
+        for (0..3) |_| {
+            const actual = try fast.tokenizer().encode(allocator, input);
+            defer allocator.free(actual);
+            try std.testing.expectEqualSlices(i32, expected, actual);
+        }
+    }
+}
+
+test "BPE hard partitions disable boundary inference for aliased vocabulary IDs" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{"model":{"type":"BPE","vocab":{"a":1,"b":1,"c":2,"ac":3},"merges":["a c"]}}
+    ;
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+    try std.testing.expectEqual(@as(usize, 65536), tok.bpe_merge_boundaries.count());
 }
 
 test "packed parallel BPE rejects token IDs outside u16" {

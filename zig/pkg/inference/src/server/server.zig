@@ -13120,6 +13120,10 @@ pub const Node = struct {
     }
 
     fn generateContentScoped(self: *Node, ctx: *httpx.Context, completion: *?DeferredGenerationCompletion, native_transfer: ?*NativeCheckpointTransfer) !httpx.Response {
+        const admission_started: ?i96 = if (serverGenerateTimingEnabled()) std.Io.Clock.awake.now(ctx.io).nanoseconds else null;
+        defer if (admission_started) |started| {
+            std.debug.print("native_request_timing_ms: scope_total={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
+        };
         const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const uses_attachment_envelope = native_transfer == null and requestUsesAttachmentEnvelope(ctx);
@@ -13246,10 +13250,22 @@ pub const Node = struct {
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "generators") catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
-        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+        const manifest_started: ?i96 = if (admission_started != null) std.Io.Clock.awake.now(ctx.io).nanoseconds else null;
+        // The default route can inspect its resident generation without parsing
+        // GGUF tokenizer arrays on every request. Explicit backend requests keep
+        // artifact preflight until their selected publication is acquired below.
+        const cached_manifest = if (body.backend == null)
+            self.model_manager.copyCachedGenerationManifest(ctx.allocator, model_path) catch |err|
+                return modelLoadFailureResponse(ctx, err)
+        else
+            null;
+        var admission_manifest = cached_manifest orelse manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
-        const executor_contract = resolvedGenerateExecutorContract(self, &admission_manifest) catch |err| {
+        if (manifest_started) |started| {
+            std.debug.print("native_request_timing_ms: admission_manifest={d} cached={}\n", .{ @divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms), cached_manifest != null });
+        }
+        var executor_contract = resolvedGenerateExecutorContract(self, &admission_manifest) catch |err| {
             const failure = generateExecutorContractError(err);
             return ctx.status(failure.status).json(.{
                 .@"error" = failure.batch.code,
@@ -13720,6 +13736,22 @@ pub const Node = struct {
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
+        // A cached metadata copy does not pin the execution generation. A model
+        // can retire between admission and acquisition, so enforce the actual
+        // publication's contract before context processing or accelerator work.
+        executor_contract = resolvedGenerateExecutorContract(self, &model.manifest) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
+        validateGenerateExecutorInvocation(executor_contract, .{
+            .text_bytes_per_item = generatePreContextTextBytes(body, self.estimateGeneratePromptBytes(messages.items)),
+            .has_text = true,
+            .output_tokens_per_item = @intCast(numeric.max_tokens),
+            .encoded_media_bytes = media_budget.used_bytes,
+            .decoded_pixels = measureGenerateDecodedImages(&model.manifest, owned_messages.decoded_images) catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err),
+            .media_parts_per_item = media_shape.media_count,
+            .has_image = owned_messages.decoded_images.len > 0,
+            .has_audio = owned_messages.decoded_audio.len > 0,
+        }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         const gpt_config = session_factory.getGptConfig(model.session) orelse {
             // The session is not a decoder at all, which in practice means the
@@ -13858,6 +13890,7 @@ pub const Node = struct {
         // estimate's rendered prompt and token ids instead of redoing both.
         var prompt_estimate: ?NativePromptEstimate = null;
         defer if (prompt_estimate) |*estimate| estimate.deinit();
+        const tokenize_started: ?i96 = if (admission_started != null) std.Io.Clock.awake.now(ctx.io).nanoseconds else null;
         const prompt_tokens = self.estimateNativePromptTokens(
             ctx.allocator,
             model_path,
@@ -13878,6 +13911,9 @@ pub const Node = struct {
             }
             return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err) });
         };
+        if (tokenize_started) |started| {
+            std.debug.print("native_request_timing_ms: template_tokenize={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
+        }
         if (context_diagnostics == null and body.kv_cache != null) {
             context_diagnostics = .{
                 .policy = "reject",
@@ -14630,6 +14666,9 @@ pub const Node = struct {
             &model.native_generation_graph_cache
         else
             &request_graph_cache.?;
+        if (admission_started) |started| {
+            std.debug.print("native_request_timing_ms: before_pipeline={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
+        }
         const request_generate_timing = serverGenerateTimingEnabled();
         const debug_metal_timing = request_generate_timing and
             use_model_graph_cache and
