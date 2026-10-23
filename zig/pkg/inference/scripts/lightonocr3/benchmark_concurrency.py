@@ -57,6 +57,8 @@ def run(args, model, label, mode, concurrency, output):
             "TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS",
             "ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE",
             "ANTFLY_FLORENCE2_BATCH_WAIT_US",
+            "ANTFLY_FLORENCE2_DISABLE_NO_REPEAT_ARGMAX",
+            "ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX",
             "ANTFLY_INFERENCE_READ_PROFILE",
             "ANTFLY_LIGHTONOCR3_CONTINUOUS",
             "ANTFLY_TEST_OCR_STATIC_WORK_ASSIGNMENT",
@@ -64,6 +66,8 @@ def run(args, model, label, mode, concurrency, output):
             "ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US",
             "ANTFLY_LIGHTONOCR3_WAIT_FOR_PREFILL_PEERS",
             "ANTFLY_LIGHTONOCR3_READY_COHORTS",
+            "ANTFLY_LIGHTONOCR3_DISABLE_GATE_PARK",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY",
             "TERMITE_METAL_TRACE_LIGHTONOCR3_COMPUTE_COPIES",
             "TERMITE_METAL_TRACE_LIGHTONOCR3_PACKED_CORE",
             "TERMITE_METAL_TRACE_LIGHTONOCR3_WEIGHT_HANDLES",
@@ -94,6 +98,8 @@ def run(args, model, label, mode, concurrency, output):
             "TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE",
         ):
             del env[key]
+    if args.frame_policy:
+        env["TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY"] = "1"
     if args.contention_wait_us is not None:
         env["ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US"] = str(args.contention_wait_us)
     if args.policy_rounds:
@@ -164,6 +170,10 @@ def run(args, model, label, mode, concurrency, output):
         env["ANTFLY_INFERENCE_READ_PROFILE"] = "1"
         env["TERMITE_METAL_TRACE_VISION_ATTENTION"] = "1"
     env["ANTFLY_FLORENCE2_BATCH_WAIT_US"] = str(args.florence_batch_wait_us)
+    if args.disable_florence_no_repeat_argmax:
+        env["ANTFLY_FLORENCE2_DISABLE_NO_REPEAT_ARGMAX"] = "1"
+    if args.require_florence_no_repeat_argmax:
+        env["ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX"] = "1"
     if args.deferred_attention == "on":
         env["TERMITE_METAL_ENABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED"] = "1"
     elif args.deferred_attention == "off":
@@ -337,12 +347,39 @@ def run(args, model, label, mode, concurrency, output):
                     dict(round=i, policy=name, **sample)
                     for i, (name, sample) in enumerate(zip(args.policy_rounds, samples))
                 ]
-                sections = re.split(r"OCR_POLICY round=\d+ name=[a-z0-9]+\n", text)[1:]
+                pieces = re.split(r"OCR_POLICY round=\d+ name=[a-z0-9]+\n", text)
+                sections = pieces[1:]
+                snapshot_pattern = r"LIGHTONOCR3 frame_policy_snapshots=(\d+)"
+                prior_snapshots = re.findall(snapshot_pattern, pieces[0])
+                previous_snapshots = int(prior_snapshots[-1]) if prior_snapshots else 0
                 for sample, section in zip(result["policy_rounds"], sections):
                     sample["retained_weight_handles_observed"] = (
                         "lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1"
                         in section
                     )
+                    sample["execution_gate_wait_ns"] = sorted(
+                        {
+                            int(value)
+                            for value in re.findall(
+                                r"LIGHTONOCR3 execution_gate_wait_ns=(\d+)", section
+                            )
+                        }
+                    )
+                    # The C runtime can survive several reader epochs. Measure
+                    # counter increments; an unchanged lifetime total is zero
+                    # activity in an off round. A new runtime can reset it.
+                    raw_snapshots = [
+                        int(value) for value in re.findall(snapshot_pattern, section)
+                    ]
+                    sample["frame_policy_snapshot_lifetime_totals"] = raw_snapshots
+                    sample["frame_policy_snapshots"] = 0
+                    for value in raw_snapshots:
+                        sample["frame_policy_snapshots"] += (
+                            value - previous_snapshots
+                            if value >= previous_snapshots
+                            else value
+                        )
+                        previous_snapshots = value
                     frames = re.findall(
                         r"LIGHTONOCR3 runtime_frames=(\d+) frame_gpu_ns=(\d+) frame_wait_ns=(\d+)",
                         section,
@@ -406,6 +443,58 @@ def run(args, model, label, mode, concurrency, output):
             result["prefill_attention_mpp_observed_including_warmup"] = bool(dispatches)
             if not dispatches:
                 result["status"] = "missing_prefill_attention_mpp"
+        if args.require_frame_policy:
+            rounds = result.get("policy_rounds", [])
+            if not rounds:
+                result["status"] = "frame_policy_requires_rounds"
+            for sample in rounds:
+                enabled = sample["policy"] == "flags" or (
+                    sample["policy"] == "current" and args.frame_policy
+                )
+                if enabled != (sample["frame_policy_snapshots"] > 0):
+                    result["status"] = "frame_policy_control_mismatch"
+        if args.require_execution_gate_wait:
+            rounds = result.get("policy_rounds", [])
+            if not rounds:
+                result["status"] = "gate_wait_requires_policy_rounds"
+            for sample in rounds:
+                expected = (
+                    0
+                    if sample["policy"] in ("gateoff", "pipelineoff", "spin")
+                    else min(
+                        args.contention_wait_us
+                        if args.contention_wait_us is not None
+                        else 100,
+                        100,
+                    )
+                    * 1000
+                )
+                if sample["execution_gate_wait_ns"] != [expected]:
+                    result["status"] = "gate_wait_control_mismatch"
+        if args.require_florence_no_repeat_argmax:
+            timed = "".join(
+                re.split(r"OCR_POLICY round=\d+ name=[a-z0-9]+\n", text)[1:]
+            )
+            traces = re.findall(
+                r"FLORENCE2 no_repeat_argmax_enabled=(\d+) device_accepts=(\d+) cpu_fallbacks=(\d+)",
+                timed,
+            )
+            stats = {
+                "enabled": sorted({int(row[0]) for row in traces}),
+                "device_accepts": sum(int(row[1]) for row in traces),
+                "cpu_fallbacks": sum(int(row[2]) for row in traces),
+            }
+            result["florence_no_repeat_argmax"] = stats
+            enabled = not args.disable_florence_no_repeat_argmax
+            if (
+                stats["enabled"] != [int(enabled)]
+                or (enabled and not stats["device_accepts"])
+                or (
+                    not enabled
+                    and (stats["device_accepts"] or not stats["cpu_fallbacks"])
+                )
+            ):
+                result["status"] = "florence_no_repeat_argmax_control_mismatch"
         if args.require_weight_handles:
             result["retained_weight_handles_observed_including_warmup"] = (
                 "lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1"
@@ -418,6 +507,8 @@ def run(args, model, label, mode, concurrency, output):
                     "pipelineoff",
                     "handlesoff",
                     "default",
+                    "gateoff",
+                    "flags",
                 )
                 if enabled != sample["retained_weight_handles_observed"]:
                     result["status"] = "weight_handle_control_mismatch"
@@ -594,6 +685,8 @@ def main():
             "ready",
             "handlesoff",
             "default",
+            "gateoff",
+            "flags",
             "direct",
             "copykernel",
             "current",
@@ -610,6 +703,9 @@ def main():
     parser.add_argument("--require-packed-core", action="store_true")
     parser.add_argument("--require-weight-handles", action="store_true")
     parser.add_argument("--weight-handles", action="store_true")
+    parser.add_argument("--require-execution-gate-wait", action="store_true")
+    parser.add_argument("--frame-policy", action="store_true")
+    parser.add_argument("--require-frame-policy", action="store_true")
     parser.add_argument("--disable-prefill-direct-kv-mpp", action="store_true")
     parser.add_argument("--static-work-assignment", action="store_true")
     parser.add_argument(
@@ -658,6 +754,8 @@ def main():
     parser.add_argument("--disable-prefill-norm", action="store_true")
     parser.add_argument("--disable-ocr-attention", action="store_true")
     parser.add_argument("--disable-florence-window-softmax", action="store_true")
+    parser.add_argument("--disable-florence-no-repeat-argmax", action="store_true")
+    parser.add_argument("--require-florence-no-repeat-argmax", action="store_true")
     parser.add_argument("--disable-ocr-ffn-fusion", action="store_true")
     parser.add_argument("--disable-florence-channel-reduction", action="store_true")
     parser.add_argument("--disable-recurrent-encoder", action="store_true")
@@ -789,6 +887,7 @@ def main():
         "images": [
             {"path": str(p.resolve()), "sha256": digest(p)} for p in (args.images or [])
         ],
+        "benchmark_script_sha256": digest(Path(__file__)),
         "settings": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()

@@ -982,6 +982,57 @@ typedef struct termite_metal_planned_encoder_range {
 
 #include "metal_mtp_head.h"
 
+typedef enum termite_metal_frame_env_key {
+    TERMITE_METAL_FRAME_DISABLE_F16_ENCODER_MPP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_DOWN_SPLIT,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FOUR_ROW_SPLIT,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_GEMV,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LARGE_MPP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LOCAL_KERNELS,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PARTIAL_DOWN_SPLIT,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PROJECTIONS,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_SINGLE_DOWN_TILE,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_SMALL_MPP,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_TAIL_SPLIT,
+    TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS,
+    TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS,
+    TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_PREFILL_INPUTS,
+    TERMITE_METAL_FRAME_LIGHTONOCR3_SMALL_MPP,
+    TERMITE_METAL_FRAME_ENV_COUNT
+} termite_metal_frame_env_key;
+
+static const char *const termite_metal_frame_env_names[TERMITE_METAL_FRAME_ENV_COUNT] = {
+    "TERMITE_METAL_DISABLE_F16_ENCODER_MPP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_SPLIT",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_GEMV",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_LARGE_MPP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_LOCAL_KERNELS",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_DOWN_SPLIT",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_SINGLE_DOWN_TILE",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_SMALL_MPP",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_TAIL_SPLIT",
+    "TERMITE_METAL_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS",
+    "TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS",
+    "TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS",
+    "TERMITE_METAL_LIGHTONOCR3_SMALL_MPP",
+};
+
 typedef struct termite_metal_decode_runtime {
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
@@ -1278,6 +1329,13 @@ typedef struct termite_metal_decode_runtime {
     BOOL embeddinggemma2_rms_norm_enabled;
     BOOL qwen35_ocr_vector_loads_enabled;
     BOOL lightonocr3_projections_enabled;
+    // Immutable only while this frame is active; refresh on every begin so
+    // subsequent frame controls never inherit a process-global cached flag.
+    bool lighton_frame_policy_valid;
+    uint64_t lighton_frame_env_bits;
+    bool lighton_frame_access_profile;
+    bool lighton_frame_barriers_disabled;
+    uint64_t lighton_frame_policy_snapshots;
     BOOL lightonocr3_mpp_initialization_attempted;
     id<MTLComputePipelineState> lightonocr3_gemv_pipeline;
     id<MTLComputePipelineState> lightonocr3_gemv_rows2_pipeline;
@@ -2284,6 +2342,36 @@ typedef struct termite_metal_decode_runtime {
     uint64_t expert_subbuffer_cache_hits;
     uint64_t expert_subbuffer_cache_misses;
 } termite_metal_decode_runtime;
+
+static bool termite_metal_frame_env_enabled(
+    const termite_metal_decode_runtime *runtime, termite_metal_frame_env_key key
+) {
+    if (runtime != NULL && runtime->active_frame_cb != nil && runtime->lighton_frame_policy_valid)
+        return (runtime->lighton_frame_env_bits & (UINT64_C(1) << key)) != 0;
+    return termite_metal_env_flag_enabled(getenv(termite_metal_frame_env_names[key]));
+}
+
+static void termite_metal_snapshot_lighton_frame_policy(termite_metal_decode_runtime *runtime) {
+    runtime->lighton_frame_policy_valid = runtime->lightonocr3_projections_enabled &&
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY"));
+    if (!runtime->lighton_frame_policy_valid) return;
+    uint64_t bits = 0;
+    for (unsigned key = 0; key < TERMITE_METAL_FRAME_ENV_COUNT; ++key)
+        if (termite_metal_env_flag_enabled(getenv(termite_metal_frame_env_names[key])))
+            bits |= UINT64_C(1) << key;
+    runtime->lighton_frame_env_bits = bits;
+    // Preserve these legacy switches' exact nonempty/nonzero semantics.
+    const char *profile = getenv("TERMITE_METAL_PLANNED_ACCESS_PROFILE");
+    runtime->lighton_frame_access_profile = profile != NULL && profile[0] != '\0' && strcmp(profile, "0") != 0;
+    const char *disabled = getenv("TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS");
+    runtime->lighton_frame_barriers_disabled = disabled != NULL && disabled[0] != '\0' && strcmp(disabled, "0") != 0;
+    runtime->lighton_frame_policy_snapshots += 1;
+}
+
+uint64_t termite_metal_decode_runtime_lighton_frame_policy_snapshots(const termite_metal_decode_runtime *runtime) {
+    return runtime == NULL ? 0 : runtime->lighton_frame_policy_snapshots;
+}
+
 
 // Generated-route env gates are resolved once per decode-runtime instance and
 // cached here: getenv is a linear scan of environ and these gates sit on the
@@ -10633,9 +10721,9 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_argmax_logits_1x(device const float *logits [[buffer(0)]], device uint *output [[buffer(1)]], constant uint &out_dim [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid != 0) return;\n"
            "    if (out_dim == 0u) { output[0] = 0u; return; }\n"
-           "    float best = logits[0];\n"
+           "    float best = -INFINITY;\n"
            "    uint best_idx = 0u;\n"
-           "    for (uint i = 1u; i < out_dim; ++i) {\n"
+           "    for (uint i = 0u; i < out_dim; ++i) {\n"
            "        float value = logits[i];\n"
            "        if (value > best) { best = value; best_idx = i; }\n"
            "    }\n"
@@ -17299,13 +17387,17 @@ static bool termite_metal_planned_compute_barriers_enabled(termite_metal_decode_
     // Concurrent dispatch relies on range-tracked barriers for correctness, so
     // they cannot be disabled or suppressed in that mode.
     if (termite_metal_concurrent_planned_dispatch_enabled(runtime)) return true;
-    const char *disabled = getenv("TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS");
+    const char *disabled = runtime != NULL && runtime->active_frame_cb != nil && runtime->lighton_frame_policy_valid
+        ? (runtime->lighton_frame_barriers_disabled ? "1" : "0")
+        : getenv("TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS");
     if (disabled != NULL && disabled[0] != '\0' && strcmp(disabled, "0") != 0) return false;
     if (runtime != NULL && runtime->planned_compute_barrier_suppression_depth != 0) return false;
     return true;
 }
 
-static bool termite_metal_planned_access_profile_enabled(void) {
+static bool termite_metal_planned_access_profile_enabled(const termite_metal_decode_runtime *runtime) {
+    if (runtime != NULL && runtime->active_frame_cb != nil && runtime->lighton_frame_policy_valid)
+        return runtime->lighton_frame_access_profile;
     const char *enabled = getenv("TERMITE_METAL_PLANNED_ACCESS_PROFILE");
     return enabled != NULL && enabled[0] != '\0' && strcmp(enabled, "0") != 0;
 }
@@ -17440,7 +17532,7 @@ static void termite_metal_decode_runtime_reset_planned_access_profile(termite_me
 }
 
 static void termite_metal_decode_runtime_print_planned_access_profile(termite_metal_decode_runtime *runtime) {
-    if (runtime == NULL || !termite_metal_planned_access_profile_enabled()) return;
+    if (runtime == NULL || !termite_metal_planned_access_profile_enabled(runtime)) return;
     const uint64_t calls = runtime->active_frame_planned_access_prepare_calls;
     if (calls == 0) return;
     const double total_ms = (double)runtime->active_frame_planned_access_nanos / 1000000.0;
@@ -17588,7 +17680,7 @@ static void termite_metal_record_global_planned_barrier(
     if (runtime == NULL) return;
     runtime->active_frame_planned_barrier_count += 1;
     runtime->active_frame_planned_global_barrier_count += 1;
-    if (termite_metal_planned_access_profile_enabled()) {
+    if (termite_metal_planned_access_profile_enabled(runtime)) {
         runtime->active_frame_planned_access_barriers += 1;
     }
 }
@@ -17609,7 +17701,7 @@ static bool termite_metal_encode_resource_barrier(
     runtime->active_frame_planned_barrier_count += 1;
     runtime->active_frame_planned_resource_barrier_count += 1;
     runtime->active_frame_planned_barrier_resource_count += resource_count;
-    if (termite_metal_planned_access_profile_enabled()) {
+    if (termite_metal_planned_access_profile_enabled(runtime)) {
         runtime->active_frame_planned_access_barriers += 1;
     }
     return true;
@@ -17639,7 +17731,7 @@ static int termite_metal_decode_runtime_prepare_planned_compute_accesses(
     if (runtime == NULL || accesses == NULL || access_count == 0) return 0;
     if (runtime->active_frame_cb == nil || runtime->active_planned_compute_encoder == nil) return 0;
 
-    const bool collect_profile = termite_metal_planned_access_profile_enabled();
+    const bool collect_profile = termite_metal_planned_access_profile_enabled(runtime);
     const uint64_t profile_start_ns = collect_profile ? termite_metal_clock_monotonic_nanos() : 0;
     if (collect_profile) {
         runtime->active_frame_planned_access_prepare_calls += 1;
@@ -39401,7 +39493,7 @@ int termite_metal_decode_runtime_prepare_bitnet_tl2_linear_slot(
 
 static bool termite_metal_lightonocr3_fast_projections(termite_metal_decode_runtime *runtime) {
     return runtime != NULL && runtime->lightonocr3_projections_enabled &&
-           !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS"));
+           !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PROJECTIONS);
 }
 
 static id<MTLComputePipelineState> termite_metal_lightonocr3_gemv_pipeline(termite_metal_decode_runtime *runtime,
@@ -39409,7 +39501,7 @@ static id<MTLComputePipelineState> termite_metal_lightonocr3_gemv_pipeline(termi
                                                                            size_t out_dim, size_t *rows_per_group) {
     *rows_per_group = 1;
     if (!termite_metal_lightonocr3_fast_projections(runtime) || input_offset % 16 != 0 || in_dim % 128 != 0 ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_GEMV")))
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_GEMV))
         return nil;
     const bool shape = (in_dim == 1024 && (out_dim == 16 || out_dim == 512 || out_dim == 2048 || out_dim == 4096 ||
                                            out_dim == 6144 || out_dim == 3584 || out_dim == 248320)) ||
@@ -39420,7 +39512,7 @@ static id<MTLComputePipelineState> termite_metal_lightonocr3_gemv_pipeline(termi
     if (!shape)
         return nil;
     const bool single_down = in_dim == 3584 && out_dim == 1024 &&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_SINGLE_DOWN_TILE"));
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_SINGLE_DOWN_TILE);
     const bool rows2 = !single_down && (in_dim >= 3584 || out_dim == 248320);
     id<MTLComputePipelineState> pipeline =
         rows2 ? runtime->lightonocr3_gemv_rows2_pipeline : runtime->lightonocr3_gemv_pipeline;
@@ -39436,8 +39528,8 @@ static id<MTLComputePipelineState> termite_metal_lightonocr3_gemv_pipeline(termi
 static size_t termite_metal_lightonocr3_tiled_columns(termite_metal_decode_runtime *runtime, size_t rows, size_t in_dim, size_t out_dim) {
     if (!termite_metal_lightonocr3_fast_projections(runtime) ||
         !runtime->qwen35_ocr_vector_loads_enabled || in_dim % 128u != 0u ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS")) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS"))) return 0;
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS)) return 0;
     // Keep TensorOps ahead of tiling where the measured eight-row matrix
     // kernel wins. Partial batches retain their exact-row tiled kernels.
     if (rows == 8u && ((in_dim == 1024u && out_dim == 6144u) ||
@@ -39476,7 +39568,7 @@ static int termite_metal_try_f16_encoder_mpp(termite_metal_decode_runtime *runti
         !termite_metal_f16_encoder_mpp_shape(rows,in_dim,out_dim) || input_offset % 16 != 0 ||
         output_offset % 4 != 0 || input == output ||
         ![runtime->device.name isEqualToString:@"Apple M4 Max"] ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_F16_ENCODER_MPP"))) return 0;
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_F16_ENCODER_MPP)) return 0;
     // Shares the existing optional Metal 4 library; unsupported OS/pipelines
     // retain MPS. Initialization is once per execution-lane-owned runtime.
     termite_metal_initialize_lightonocr3_mpp(runtime);
@@ -39527,7 +39619,7 @@ static id<MTLComputePipelineState>
 termite_metal_lightonocr3_local_gate_pipeline(termite_metal_decode_runtime *r, size_t rows, size_t in,
                                               size_t out) {
     if (rows < 2 || rows > 8 || !((in == 1024 && out == 3584) || (in == 2560 && out == 9216)) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_LOCAL_KERNELS")))
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LOCAL_KERNELS))
         return nil;
     id<MTLComputePipelineState> p = rows <= 3    ? r->lightonocr3_local_gate_vectors[rows - 2]
                                     : in == 1024 ? r->lightonocr3_local_gate_tg16
@@ -39541,11 +39633,11 @@ static int termite_metal_try_lightonocr3_local_projection(termite_metal_decode_r
                                                           id<MTLBuffer> output, size_t output_offset) {
     if (rows < 1 || rows > 8 || !termite_metal_lightonocr3_fast_projections(r) || input_offset % 16 ||
         output_offset % 4 || r->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_LOCAL_KERNELS")) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS")) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS")) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP")) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS")))
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LOCAL_KERNELS) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_TILED_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS))
         return 0;
     const bool recurrent_gate = (in == 1024 && out == 16) || (in == 2560 && out == 32);
     if (rows == 1 && !recurrent_gate)
@@ -39567,10 +39659,10 @@ static int termite_metal_try_lightonocr3_local_projection(termite_metal_decode_r
     const bool qkv = (in == 1024 && out == 6144) || (in == 2560 && out == 8192);
     const bool ffn = (in == 1024 && out == 3584) || (in == 2560 && out == 9216);
     const bool small_down = in == 3584 && out == 1024, large_down = in == 9216 && out == 2560;
-    if ((qkv && termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE"))) ||
-        (ffn && termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE"))) ||
+    if ((qkv && termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE)) ||
+        (ffn && termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE)) ||
         ((small_down || large_down) &&
-         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT"))))
+         termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_DOWN_SPLIT)))
         return 0;
     id<MTLComputePipelineState> p = nil;
     size_t columns = 16, threads = 128, memory = 0, row_groups = 1;
@@ -39679,10 +39771,10 @@ static int termite_metal_try_lightonocr3_down_split(termite_metal_decode_runtime
         rows == 4 &&
         ((in_dim == 1024 && (out_dim == 6144 || out_dim == 3584)) ||
          (in_dim == 2560 && (out_dim == 8192 || out_dim == 9216)) || large) &&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_SPLIT"));
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FOUR_ROW_SPLIT);
     const bool partial_qkv =
         rows >= 5 && rows <= 7 && in_dim == 1024 && out_dim == 6144 &&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT"));
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT);
     // Balanced native/production/MLX trials qualify these partial cohorts.
     // Other tails keep the existing tile or streaming projection.
     const bool tail_shape = (in_dim == 1024 && out_dim == 6144 && rows == 3) ||
@@ -39691,15 +39783,15 @@ static int termite_metal_try_lightonocr3_down_split(termite_metal_decode_runtime
                              (rows == 2 || rows == 3 || (rows >= 5 && rows <= 7))) ||
                             (in_dim == 9216 && out_dim == 2560 && (rows == 3 || (rows >= 5 && rows <= 7)));
     const bool tail_split =
-        tail_shape && !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_TAIL_SPLIT"));
+        tail_shape && !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_TAIL_SPLIT);
     if ((!small && !large && !four_row && !partial_qkv && !tail_split) ||
         !termite_metal_lightonocr3_fast_projections(runtime) || input_offset % 16 != 0 ||
         output_offset % 4 != 0 ||
         runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_DOWN_SPLIT")) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP")) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS")) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS")))
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_DOWN_SPLIT) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS))
         return 0;
     const bool narrow = small || four_row || partial_qkv || tail_split;
     id<MTLComputePipelineState> stage =
@@ -39707,8 +39799,7 @@ static int termite_metal_try_lightonocr3_down_split(termite_metal_decode_runtime
     id<MTLComputePipelineState> reduce = runtime->lightonocr3_down_split_reduce_pipeline;
     id<MTLBuffer> scratch = termite_metal_decode_gqa_split_scratch_for_encoding(runtime);
     size_t splits = small && rows <= 7 &&
-                            !termite_metal_env_flag_enabled(
-                                getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_DOWN_SPLIT"))
+                            !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PARTIAL_DOWN_SPLIT)
                         ? 16
                         : 8;
     size_t scratch_bytes = splits * rows * out_dim * sizeof(float);
@@ -39801,10 +39892,10 @@ static int termite_metal_try_lightonocr3_prefill_gate(termite_metal_decode_runti
         output_offset % 4 || !((in == 1024 && out == 16) || (in == 2560 && out == 32)) ||
         r->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
         !r->linear_slot_prepared[slot] || r->linear_in_dims[slot] != in || r->linear_out_dims[slot] != out ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS")) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP")) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS")) ||
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS")))
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS) ||
+        termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_PREFILL_INPUTS))
         return 0;
     const size_t splits = out == 16 ? 8 : 16;
     const size_t columns = out == 16 ? 16 : 32;
@@ -39859,16 +39950,14 @@ static int termite_metal_try_lightonocr3_mpp(termite_metal_decode_runtime *runti
     const int prefill_gate_rc=termite_metal_try_lightonocr3_prefill_gate(runtime,slot,input,input_offset,rows,in_dim,out_dim,output,output_offset);
     if(prefill_gate_rc!=0)return prefill_gate_rc;
     const bool prefill_post=rows>=32&&rows<=2048&&in_dim==2048&&out_dim==1024&&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS"));
-    const bool bf16 = termite_metal_env_flag_enabled(getenv("TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS")) ||
-                      (rows >= 32 && termite_metal_env_flag_enabled(
-                                         getenv("TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS")));
-    const bool four_row_enabled = rows == 4 && !termite_metal_env_flag_enabled(
-                                                   getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE"));
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS);
+    const bool bf16 = termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS) ||
+                      (rows >= 32 && termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_PREFILL_INPUTS));
+    const bool four_row_enabled = rows == 4 && !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE);
     const bool segment4 =
         !bf16 && four_row_enabled && in_dim == 1024 && out_dim == 3584 &&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE")) &&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS")) &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE) &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) &&
         runtime->lightonocr3_four_row_segment_pipeline != nil &&
         runtime->lightonocr3_four_row_segment_pipeline.threadExecutionWidth == 32 &&
         runtime->lightonocr3_four_row_segment_pipeline.maxTotalThreadsPerThreadgroup >= 32;
@@ -39879,27 +39968,27 @@ static int termite_metal_try_lightonocr3_mpp(termite_metal_decode_runtime *runti
     // 32 rows. Preserve F32 inputs/accumulation and exact-row fallbacks.
     const bool small_ffn_shape =
         ((rows >= 7 && in_dim == 1024 && out_dim == 3584) || (in_dim == 2560 && out_dim == 9216)) &&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE"));
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE);
     const bool small_qkv_shape =
         ((in_dim == 1024 && out_dim == 6144) || (in_dim == 2560 && out_dim == 8192)) &&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE"));
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_QKV_SMALL_TILE);
     const bool small_tile = !bf16 && ((rows >= 4 && rows <= 8 && (small_ffn_shape || small_qkv_shape)) || prefill_post) &&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS")) &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_BATCH_PROJECTIONS) &&
         small_pipeline != nil &&
         small_pipeline.threadExecutionWidth == 32 &&
         small_pipeline.maxTotalThreadsPerThreadgroup >= 32;
     if (rows < 32u && !small_tile && !segment4 && termite_metal_lightonocr3_tiled_columns(runtime, rows, in_dim, out_dim) != 0 &&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_LIGHTONOCR3_SMALL_MPP"))) return 0;
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_SMALL_MPP)) return 0;
     const bool small_default = segment4 || small_tile || (rows == 8 &&
         ((in_dim == 1024 && (out_dim == 3584 || out_dim == 6144)) ||
          (in_dim == 2560 && (out_dim == 8192 || out_dim == 9216)) ||
          (in_dim == 9216 && out_dim == 2560)) &&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_SMALL_MPP")));
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_SMALL_MPP));
     const bool small_rows = small_default || (rows >= 2 && rows <= 8 &&
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_LIGHTONOCR3_SMALL_MPP")));
+        termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_SMALL_MPP));
     if (!termite_metal_lightonocr3_fast_projections(runtime) || (rows < 32 && !small_rows) || rows > 16384 ||
-        (rows > 2048 && termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_LARGE_MPP"))) || input_offset % 16 != 0 ||
-        output_offset % 4 != 0 || termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP")) ||
+        (rows > 2048 && termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LARGE_MPP)) || input_offset % 16 != 0 ||
+        output_offset % 4 != 0 || termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_MPP) ||
         runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16)
         return 0;
     const bool shape = prefill_post || (in_dim == 768 && (out_dim == 768 || out_dim == 2304 || out_dim == 3072)) ||
@@ -69234,6 +69323,7 @@ static int termite_metal_decode_runtime_begin_frame_internal(
             }
         }
         cb.label = @"termite_metal_decode_runtime_frame";
+        termite_metal_snapshot_lighton_frame_policy(runtime);
         runtime->active_frame_cb = cb;
         runtime->active_frame_encode_started_nanos = termite_metal_clock_monotonic_nanos();
         runtime->active_frame_encode_wait_nanos = 0;

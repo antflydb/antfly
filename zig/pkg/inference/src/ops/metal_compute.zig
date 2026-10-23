@@ -1689,6 +1689,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return true;
     }
 
+    pub fn lightOnFramePolicySnapshots(cb: *const ops.ComputeBackend) u64 {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return metal_runtime_mod.termite_metal_decode_runtime_lighton_frame_policy_snapshots(self.provider_impl.raw_decode_runtime);
+    }
+
     pub fn lightOnDirectCoreOutputEnabled(cb: *const ops.ComputeBackend) bool {
         if (cb.kind() != .metal) return false;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -35189,11 +35195,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn argmaxDenseRowSuppress(row: []const f32, suppress_token_ids: []const i32) u32 {
         var best_idx: u32 = 0;
         var best_val: f32 = -std.math.inf(f32);
-        var found = false;
         for (row, 0..) |value, idx| {
             if (tokenSuppressed(idx, suppress_token_ids)) continue;
-            if (!found or value > best_val) {
-                found = true;
+            if (value > best_val) {
                 best_val = value;
                 best_idx = @intCast(idx);
             }
@@ -48789,4 +48793,15 @@ test "LightOnOCR3 decoder weight descriptor allocation failures unwind owners an
     if (!build_options.enable_metal) return error.SkipZigTest;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkLightOnWeightDescriptors, .{true});
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkLightOnWeightDescriptors, .{false});
+}
+
+test "Florence host argmax matches device nonfinite and tie semantics" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    try std.testing.expectEqual(@as(u32, 2), MetalCompute.argmaxDenseRowSuppress(&.{ nan, -inf, inf, 5, inf }, &.{}));
+    try std.testing.expectEqual(@as(u32, 0), MetalCompute.argmaxDenseRowSuppress(&.{ nan, -inf, -inf }, &.{}));
+    try std.testing.expectEqual(@as(u32, 0), MetalCompute.argmaxDenseRowSuppress(&.{ nan, nan }, &.{}));
+    try std.testing.expectEqual(@as(u32, 0), MetalCompute.argmaxDenseRowSuppress(&.{ -inf, -inf }, &.{0}));
+    try std.testing.expectEqual(@as(u32, 3), MetalCompute.argmaxDenseRowSuppress(&.{ nan, -inf, inf, 5, 5 }, &.{2}));
 }

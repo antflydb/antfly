@@ -1,0 +1,577 @@
+{
+  "created_at": "2026-10-23T16:00:00.060471+00:00",
+  "hardware": {
+    "processor": "Apple M4 Max",
+    "physical_memory_bytes": 38654705664
+  },
+  "runtime_commit": "73a0e03c048f34856d036c969b2921bc01ac3abd",
+  "runtime_source_diff_sha256": "b9dcf50bb9853bc3184ad885b463729b36af93bfea798ea27708241d871d74c8",
+  "binary_sha256": "a60f4772d6a4b1e247782a705922969bc69d0e2f287694815be541d92ecb1b59",
+  "models": {
+    "lighton4b": {
+      "directory": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b",
+      "weight_bytes": 9078620536,
+      "weight_files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 9078620536
+        }
+      ],
+      "metadata": {
+        "config.json": {
+          "architectures": [
+            "Qwen3_5ForConditionalGeneration"
+          ],
+          "bos_token_id": null,
+          "dtype": "bfloat16",
+          "eos_token_id": 248046,
+          "image_token_id": 248056,
+          "model_type": "qwen3_5",
+          "pad_token_id": 248044,
+          "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "bos_token_id": null,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 2560,
+            "initializer_range": 0.02,
+            "intermediate_size": 9216,
+            "layer_types": [
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "mlp_only_layers": [],
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 0,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 32,
+            "num_key_value_heads": 4,
+            "pad_token_id": null,
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "mrope_interleaved": true,
+              "mrope_section": [
+                11,
+                11,
+                10
+              ],
+              "partial_rotary_factor": 0.25,
+              "rope_theta": 10000000,
+              "rope_type": "default"
+            },
+            "tie_word_embeddings": true,
+            "use_cache": true,
+            "vocab_size": 248320
+          },
+          "tie_word_embeddings": true,
+          "transformers_version": "5.5.4",
+          "video_token_id": 248057,
+          "vision_config": {
+            "deepstack_visual_indexes": [],
+            "depth": 24,
+            "dtype": "bfloat16",
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 1024,
+            "in_channels": 3,
+            "initializer_range": 0.02,
+            "intermediate_size": 4096,
+            "model_type": "qwen3_5",
+            "num_heads": 16,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 2560,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2
+          },
+          "vision_end_token_id": 248054,
+          "vision_start_token_id": 248053
+        },
+        "preprocessor_config.json": {
+          "size": {
+            "longest_edge": 16777216,
+            "shortest_edge": 65536
+          },
+          "patch_size": 16,
+          "temporal_patch_size": 2,
+          "merge_size": 2,
+          "image_mean": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "image_std": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "processor_class": "Qwen3VLProcessor",
+          "image_processor_type": "Qwen2VLImageProcessorFast"
+        },
+        "model_manifest.json": {
+          "type": "generator",
+          "tasks": [
+            "generate",
+            "read"
+          ],
+          "inputs": [
+            "text",
+            "image"
+          ],
+          "capabilities": [
+            "ocr",
+            "lightonocr3"
+          ]
+        }
+      }
+    }
+  },
+  "images": [
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png",
+      "sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png",
+      "sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png",
+      "sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+    }
+  ],
+  "settings": {
+    "model": [
+      "lighton4b=/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b"
+    ],
+    "concurrency": [
+      8
+    ],
+    "modes": [
+      "batch"
+    ],
+    "requests": 16,
+    "pages_per_request": 1,
+    "max_tokens": 256,
+    "admission_units": 256,
+    "batch_rows": 8,
+    "batch_window": 8,
+    "batch_wait_us": 20000,
+    "florence_batch_wait_us": 5000,
+    "profile_reader": false,
+    "require_small_tail_fusion": false,
+    "prefill_sg_attention": false,
+    "bf16_prefill_inputs": false,
+    "prefill_direct_kv": false,
+    "decode_wait_us": 1000,
+    "deferred_attention": "auto",
+    "disable_batch_projections": false,
+    "disable_tiled_projections": false,
+    "policy_rounds": [
+      "gateoff",
+      "default",
+      "default",
+      "gateoff"
+    ],
+    "prefill_core_norm": true,
+    "disable_prefill_core_norm": false,
+    "require_prefill_core_norm": true,
+    "disable_direct_core_output": false,
+    "disable_compute_copies": false,
+    "trace_compute_copies": true,
+    "disable_packed_core": false,
+    "trace_packed_core": true,
+    "require_packed_core": true,
+    "require_weight_handles": false,
+    "weight_handles": false,
+    "require_execution_gate_wait": true,
+    "disable_prefill_direct_kv_mpp": false,
+    "static_work_assignment": false,
+    "contention_wait_us": null,
+    "prefill_attention_mpp": true,
+    "disable_prefill_attention_mpp": false,
+    "require_prefill_attention_mpp": true,
+    "recurrent_parallel": true,
+    "disable_recurrent_parallel": false,
+    "recurrent_coalescing": false,
+    "require_recurrent_parallel": true,
+    "disable_recurrent_batch": false,
+    "disable_recurrent_fusion": false,
+    "disable_ffn_small_tile": false,
+    "disable_qkv_small_tile": false,
+    "disable_down_split": false,
+    "disable_four_row_tile": false,
+    "disable_f16_encoder_mpp": false,
+    "weight_residency": true,
+    "disable_local_kernels": false,
+    "disable_vision_mpp": false,
+    "disable_prefill_projections": false,
+    "require_vision_mpp": false,
+    "require_prefill_gates": false,
+    "require_decode_projections": false,
+    "disable_prefill_conv_vec4": false,
+    "continuous": true,
+    "vision_batch": false,
+    "disable_shared_vision_peak": false,
+    "prefill_batch": false,
+    "vision_wait_us": 2000,
+    "prefill_wait_us": 5000,
+    "disable_tail_split": false,
+    "disable_partial_qkv_split": false,
+    "disable_partial_down_split": false,
+    "disable_gate_up_split": false,
+    "disable_batch_gate_up": false,
+    "disable_prefill_columns": false,
+    "disable_single_down_tile": false,
+    "disable_four_row_split": false,
+    "disable_prefill_norm": false,
+    "disable_ocr_attention": false,
+    "disable_florence_window_softmax": false,
+    "disable_florence_no_repeat_argmax": false,
+    "require_florence_no_repeat_argmax": false,
+    "disable_ocr_ffn_fusion": false,
+    "disable_florence_channel_reduction": false,
+    "disable_recurrent_encoder": false,
+    "disable_recurrent_norm": false,
+    "disable_step_pool": false,
+    "small_mpp": false,
+    "florence_encoder_mirrors": false,
+    "disable_florence_encoder_mirrors": false,
+    "bf16_projection_inputs": false,
+    "native_read_batch_size": 8,
+    "memory_gib": 24,
+    "shared_memory_gib": 28,
+    "backend_memory_gib": 16,
+    "kv_memory_gib": 4,
+    "scratch_memory_gib": 4,
+    "timeout": 900,
+    "reference_report": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_epoch_m4_max/vllm_4b_reference/report.json",
+    "build_manifest": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_epoch_m4_max/parking_build_manifest.json"
+  },
+  "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
+  "results": [
+    {
+      "model": "lighton4b",
+      "mode": "batch",
+      "concurrency": 8,
+      "log": "lighton4b-batch-c8.txt.gz",
+      "exit_code": 0,
+      "status": "ok",
+      "serial_reference_parity": true,
+      "policy_rounds": [
+        {
+          "round": 0,
+          "policy": "gateoff",
+          "concurrency": 8,
+          "requests": 16,
+          "pages_per_request": 1,
+          "completed": 16,
+          "elapsed_ms": 24835,
+          "pages_per_second": 0.6442,
+          "p50_ms": 9282,
+          "p95_ms": 22673,
+          "native_items": 16,
+          "retained_weight_handles_observed": false,
+          "execution_gate_wait_ns": [
+            0
+          ],
+          "framed_runtime_totals": {
+            "frames": 676,
+            "gpu_ns": 18299892175,
+            "wait_ns": 20272644000
+          },
+          "packed_core_rows_observed": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+          ],
+          "registered_window_peak": 8,
+          "physical_rows_limit": 8,
+          "process_cpu_ms": 29351
+        },
+        {
+          "round": 1,
+          "policy": "default",
+          "concurrency": 8,
+          "requests": 16,
+          "pages_per_request": 1,
+          "completed": 16,
+          "elapsed_ms": 25608,
+          "pages_per_second": 0.6248,
+          "p50_ms": 9627,
+          "p95_ms": 23572,
+          "native_items": 16,
+          "retained_weight_handles_observed": false,
+          "execution_gate_wait_ns": [
+            100000
+          ],
+          "framed_runtime_totals": {
+            "frames": 678,
+            "gpu_ns": 18639261391,
+            "wait_ns": 20783136000
+          },
+          "packed_core_rows_observed": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+          ],
+          "registered_window_peak": 8,
+          "physical_rows_limit": 8,
+          "process_cpu_ms": 18265
+        },
+        {
+          "round": 2,
+          "policy": "default",
+          "concurrency": 8,
+          "requests": 16,
+          "pages_per_request": 1,
+          "completed": 16,
+          "elapsed_ms": 27227,
+          "pages_per_second": 0.5877,
+          "p50_ms": 10526,
+          "p95_ms": 25061,
+          "native_items": 16,
+          "retained_weight_handles_observed": false,
+          "execution_gate_wait_ns": [
+            100000
+          ],
+          "framed_runtime_totals": {
+            "frames": 688,
+            "gpu_ns": 19354584041,
+            "wait_ns": 21756979000
+          },
+          "packed_core_rows_observed": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+          ],
+          "registered_window_peak": 8,
+          "physical_rows_limit": 8,
+          "process_cpu_ms": 19213
+        },
+        {
+          "round": 3,
+          "policy": "gateoff",
+          "concurrency": 8,
+          "requests": 16,
+          "pages_per_request": 1,
+          "completed": 16,
+          "elapsed_ms": 29674,
+          "pages_per_second": 0.5392,
+          "p50_ms": 11456,
+          "p95_ms": 26977,
+          "native_items": 16,
+          "retained_weight_handles_observed": false,
+          "execution_gate_wait_ns": [
+            0
+          ],
+          "framed_runtime_totals": {
+            "frames": 688,
+            "gpu_ns": 19890051796,
+            "wait_ns": 22911479000
+          },
+          "packed_core_rows_observed": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+          ],
+          "registered_window_peak": 8,
+          "physical_rows_limit": 8,
+          "process_cpu_ms": 37925
+        }
+      ],
+      "prefill_core_norm_observed_including_warmup": true,
+      "prefill_attention_mpp_observed_including_warmup": true,
+      "packed_core_rows_observed_including_warmup": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "recurrent_parallel_observed_including_warmup": true,
+      "recurrent_parallel_rows_observed_including_warmup": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "references": [
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY"
+        }
+      ],
+      "cross_runtime_content_parity": true,
+      "reference_report_sha256": "7aac7b18365eb68684710a821b22e654c52c0b902edd7b0fbd0b3cbdf42549f7",
+      "registered_windows_including_untimed_warmup": [
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 8,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 8,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 8,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 8,
+          "physical_rows_limit": 8
+        }
+      ],
+      "cohorts_including_untimed_warmup": [
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 16,
+          "decode_steps": 235,
+          "batched_steps": 232,
+          "singleton_steps": 3,
+          "decode_items": 1385
+        },
+        {
+          "items": 16,
+          "decode_steps": 248,
+          "batched_steps": 241,
+          "singleton_steps": 7,
+          "decode_items": 1396
+        },
+        {
+          "items": 16,
+          "decode_steps": 245,
+          "batched_steps": 237,
+          "singleton_steps": 8,
+          "decode_items": 1383
+        },
+        {
+          "items": 16,
+          "decode_steps": 253,
+          "batched_steps": 248,
+          "singleton_steps": 5,
+          "decode_items": 1391
+        }
+      ]
+    }
+  ],
+  "worktree_runtime_commit": "73a0e03c048f34856d036c969b2921bc01ac3abd",
+  "worktree_runtime_source_diff_sha256": "272bf6678fd9010f24e6ad1d087a0cdbd6c894cf436fa2ab7c0bc7463c2a4cdf",
+  "build_manifest_sha256": "c42d6839154029028f61f4b00103cb193e73930786f1d96ef469e413f139e6ed"
+}

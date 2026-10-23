@@ -3469,6 +3469,8 @@ pub const NativeGenerationPipeline = struct {
     /// Serializes the shared model backend for one claimed scheduler step.
     /// Request-local tokenization and sampling remain outside this lock.
     execution_lock: ?*std.atomic.Mutex = null,
+    /// Optional bounded polling for a shared epoch gate; zero retains yielding.
+    execution_contention_wait_ns: u64 = 0,
     /// Optional smaller draft model for speculative decoding. When set
     /// together with `GenerationConfig.draft_model`, the generate loop
     /// proposes K tokens with the draft and verifies them against the
@@ -3504,7 +3506,7 @@ pub const NativeGenerationPipeline = struct {
 
     fn lockExecution(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) !void {
         if (self.execution_control) |control|
-            try control.lock(mutex)
+            try control.lockWithPoll(mutex, self.execution_contention_wait_ns)
         else
             platform.sync.lockYielding(mutex);
     }

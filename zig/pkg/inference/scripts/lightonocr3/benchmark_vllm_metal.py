@@ -48,11 +48,18 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
+    parser.add_argument(
+        "--kv-cache-blocks",
+        type=int,
+        help="Explicit cache block count; omit for vLLM's automatic capacity sizing",
+    )
     parser.add_argument("--startup-timeout", type=int, default=240)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.requests < 1 or any(c < 1 or c > 16 for c in args.concurrency):
         parser.error("requests must be positive; concurrency must be 1..16")
+    if args.kv_cache_blocks is not None and args.kv_cache_blocks < 1:
+        parser.error("kv-cache-blocks must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -87,6 +94,8 @@ def main():
         '{"image":1,"video":0}',
         "--no-enable-log-requests",
     ]
+    if args.kv_cache_blocks is not None:
+        command += ["--num-gpu-blocks-override", str(args.kv_cache_blocks)]
     versions = json.loads(
         subprocess.check_output(
             [
@@ -102,6 +111,7 @@ def main():
         "hardware": hardware(),
         "versions": versions,
         "command": command,
+        "kv_cache_block_override": args.kv_cache_blocks,
         "model": checkpoint(args.model_dir.resolve()),
         "images": [
             {"path": str(p.resolve()), "sha256": digest(p)} for p in args.images

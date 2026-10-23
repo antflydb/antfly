@@ -19135,6 +19135,7 @@ pub extern fn termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(runtime: 
 pub extern fn termite_metal_decode_runtime_lightonocr3_batch_projection_available(runtime: ?*RawMetalDecodeRuntime, rows: usize, in_dim: usize) c_int;
 pub extern fn termite_metal_decode_runtime_clear_lightonocr3_vision_workspace(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_set_lightonocr3_projections(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
+pub extern fn termite_metal_decode_runtime_lighton_frame_policy_snapshots(runtime: ?*RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_set_embeddinggemma2_rms_norm(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
 pub extern fn termite_metal_decode_runtime_embeddinggemma2_rms_norm_threads(runtime: ?*RawMetalDecodeRuntime, rows: usize, hidden_size: usize) u32;
 pub extern fn termite_metal_decode_runtime_destroy(runtime: ?*RawMetalDecodeRuntime) void;

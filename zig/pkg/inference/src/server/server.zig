@@ -7636,6 +7636,8 @@ pub const Node = struct {
             "TERMITE_METAL_DISABLE_LIGHTONOCR3_VISION_SLOT_REUSE",
             "ANTFLY_LIGHTONOCR3_READY_COHORTS",
             "TERMITE_METAL_DISABLE_LIGHTONOCR3_WEIGHT_HANDLES",
+            "ANTFLY_LIGHTONOCR3_DISABLE_GATE_PARK",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY",
         };
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
@@ -7666,7 +7668,7 @@ pub const Node = struct {
                 if (rc != 0) return error.EnvironmentMutationFailed;
             }
             if (!std.mem.eql(u8, policy, "current")) {
-                const all = std.mem.eql(u8, policy, "on") or std.mem.eql(u8, policy, "coalesced") or std.mem.eql(u8, policy, "static") or std.mem.eql(u8, policy, "batched") or std.mem.eql(u8, policy, "window8") or std.mem.eql(u8, policy, "spin") or std.mem.eql(u8, policy, "copyoff") or std.mem.eql(u8, policy, "direct") or std.mem.eql(u8, policy, "copykernel") or std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "packedoff") or std.mem.eql(u8, policy, "readyoff") or std.mem.eql(u8, policy, "visionoff") or std.mem.eql(u8, policy, "ready") or std.mem.eql(u8, policy, "handlesoff") or std.mem.eql(u8, policy, "default");
+                const all = std.mem.eql(u8, policy, "on") or std.mem.eql(u8, policy, "coalesced") or std.mem.eql(u8, policy, "static") or std.mem.eql(u8, policy, "batched") or std.mem.eql(u8, policy, "window8") or std.mem.eql(u8, policy, "spin") or std.mem.eql(u8, policy, "copyoff") or std.mem.eql(u8, policy, "direct") or std.mem.eql(u8, policy, "copykernel") or std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "packedoff") or std.mem.eql(u8, policy, "readyoff") or std.mem.eql(u8, policy, "visionoff") or std.mem.eql(u8, policy, "ready") or std.mem.eql(u8, policy, "handlesoff") or std.mem.eql(u8, policy, "default") or std.mem.eql(u8, policy, "gateoff") or std.mem.eql(u8, policy, "flags");
                 const recurrent = all or std.mem.eql(u8, policy, "recurrent");
                 const attention = all or std.mem.eql(u8, policy, "attention");
                 const norm = all or std.mem.eql(u8, policy, "norm");
@@ -7688,7 +7690,9 @@ pub const Node = struct {
                     Env.setenv(policy_flags[18], if (std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "readyoff")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
                 if (Env.setenv(policy_flags[19], if (std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "visionoff")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
                 if (Env.setenv(policy_flags[20], if (std.mem.eql(u8, policy, "ready")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
-                if (Env.setenv(policy_flags[21], if (std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "handlesoff") or std.mem.eql(u8, policy, "default")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+                if (Env.setenv(policy_flags[21], if (std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "handlesoff") or std.mem.eql(u8, policy, "default") or std.mem.eql(u8, policy, "gateoff") or std.mem.eql(u8, policy, "flags")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+                if (Env.setenv(policy_flags[22], if (std.mem.eql(u8, policy, "gateoff") or std.mem.eql(u8, policy, "pipelineoff")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+                if (Env.setenv(policy_flags[23], if (std.mem.eql(u8, policy, "flags")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
             }
             std.debug.print("OCR_POLICY round={d} name={s}\n", .{ round, policy });
             const latencies = try allocator.alloc(u64, requests);
@@ -7765,6 +7769,7 @@ pub const Node = struct {
         storage: runtime.kv.storage_runtime.KvStorageRuntime = undefined,
         pool: runtime.kv.block.KvPoolId = undefined,
         cb: ?ops.ComputeBackend = null,
+        execution_gate_wait_ns: u64 = 0,
         step_mutex: std.atomic.Mutex = .unlocked,
         kv_mutex: std.atomic.Mutex = .unlocked,
         controls_mutex: std.atomic.Mutex = .unlocked,
@@ -7795,6 +7800,7 @@ pub const Node = struct {
             const ctx = try a.create(LightOnStreamContext);
             ctx.* = .{ .allocator = a, .model = factory.model, .cfg = factory.cfg, .budget = runtime.tier.memory.RunBudget.init(factory.limits), .lane = lane, .coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a), .manager = runtime.kv.manager.KvManager.init(a), .vision_broker = executor_microbatch.Broker.init(a), .prefill_broker = executor_microbatch.Broker.init(a), .execution_id = lighton_stream_execution_id.fetchAdd(1, .monotonic) };
             ctx.coordinator.setPolicy(factory.node.lightOnOcrPolicy(factory.physical_rows_limit));
+            ctx.execution_gate_wait_ns = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_GATE_PARK")) 0 else @as(u64, @min(ctx.coordinator.policy.contention_wait_us, 100)) * std.time.ns_per_us;
             // New prefill must progress, while already decoding pages retain
             // a bounded streak instead of losing every turn to new arrivals.
             ctx.coordinator.max_decode_streak_before_prefill = 4;
@@ -7807,8 +7813,11 @@ pub const Node = struct {
                 const s = ctx.coordinator.stats;
                 if (ctx.cb) |cb| {
                     const t = cb.debugTimingSnapshot().provider;
+                    const snapshots = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnFramePolicySnapshots(&cb) else 0;
+                    std.debug.print("LIGHTONOCR3 frame_policy_snapshots={d}\n", .{snapshots});
                     std.debug.print("LIGHTONOCR3 runtime_frames={d} frame_gpu_ns={d} frame_wait_ns={d}\n", .{ t.decoder_runtime_frame_submits, t.decoder_runtime_frame_gpu_nanos, t.decoder_runtime_frame_wait_nanos });
                 }
+                std.debug.print("LIGHTONOCR3 execution_gate_wait_ns={d}\n", .{ctx.execution_gate_wait_ns});
                 std.debug.print("LIGHTONOCR3 registered_window_peak={d} physical_rows_limit={d}\n", .{ ctx.registered_window_peak, ctx.coordinator.policy.max_step_items });
                 std.debug.print("LIGHTONOCR3 cohort_items={d} decode_steps={d} batched_steps={d} singleton_steps={d} decode_items={d}\n", .{ ctx.completed, s.step_batches_total, s.step_batch_size_2_total + s.step_batch_size_3_4_total + s.step_batch_size_5_8_total, s.step_singleton_batches_total, s.step_decode_items_total });
             }
@@ -8229,6 +8238,7 @@ pub const Node = struct {
             .scheduler = &ctx.coordinator,
             .scheduler_lease = &lease,
             .execution_lock = &ctx.step_mutex,
+            .execution_contention_wait_ns = ctx.execution_gate_wait_ns,
             .execution_control = self.bindExecutionControl(control.io, .{ .ptr = ctx, .check_fn = LightOnStreamContext.check }),
             .continue_ctx = &page_control,
             .continue_fn = Continue.check,

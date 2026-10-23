@@ -692,6 +692,16 @@ pub const ReadingPipeline = struct {
         for (active_rows, 0..) |*row, index| row.* = index;
         var active_count = batch;
         var row_compaction_supported = true;
+        // An unmasked device winner is also the masked winner when the
+        // page's no-repeat policy allows that token. Only rejected winners
+        // need the existing full-logits host selection path.
+        const checked_no_repeat_argmax = cb.kind() == .metal and
+            !platform.env.getenvBool("ANTFLY_FLORENCE2_DISABLE_NO_REPEAT_ARGMAX");
+        var no_repeat_device_accepts: usize = 0;
+        var no_repeat_cpu_fallbacks: usize = 0;
+        defer if (self.config.no_repeat_ngram_size > 0 and platform.env.getenvBool("ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX")) {
+            std.debug.print("FLORENCE2 no_repeat_argmax_enabled={d} device_accepts={d} cpu_fallbacks={d}\n", .{ @intFromBool(checked_no_repeat_argmax), no_repeat_device_accepts, no_repeat_cpu_fallbacks });
+        };
         const fused_lm_head_allowed = if (self.config.no_repeat_ngram_size == 0)
             try self.florenceFinalLogitsBiasIsZero(cb, florence_cfg.vocab_size)
         else
@@ -699,6 +709,8 @@ pub const ReadingPipeline = struct {
         if (!fused_lm_head_allowed and last_read_telemetry.lm_head_path == null)
             last_read_telemetry.lm_head_path = if (self.config.no_repeat_ngram_size == 0)
                 "batch_full_logits_bias"
+            else if (checked_no_repeat_argmax)
+                "batch_logits_checked_no_repeat"
             else
                 "batch_full_logits_no_repeat";
         for (0..dec_len) |idx| {
@@ -780,7 +792,7 @@ pub const ReadingPipeline = struct {
                     );
                     hidden_live = false;
                     defer cb.free(logits_tensor);
-                    if (self.config.no_repeat_ngram_size == 0) {
+                    if (self.config.no_repeat_ngram_size == 0 or checked_no_repeat_argmax) {
                         if (try cb.argmaxRows(
                             logits_tensor,
                             0,
@@ -789,24 +801,28 @@ pub const ReadingPipeline = struct {
                             allocator,
                         )) |selected_tokens| {
                             defer allocator.free(selected_tokens);
-                            finished_count += try applyFlorenceBatchSelectedTokensActive(
-                                dec_ids,
-                                max_len,
-                                dec_len,
-                                finished,
-                                lengths,
-                                selected_tokens,
-                                active_rows[0..active_count],
-                                self.config.eos_token_id,
-                                self.config.pad_token_id,
-                                step_tokens[0..active_count],
-                            );
-                            selected_on_device = true;
-                            if (last_read_telemetry.lm_head_path == null)
-                                last_read_telemetry.lm_head_path = "batch_logits_argmax";
+                            if (florenceBatchArgmaxAllowedByNoRepeat(dec_ids, max_len, dec_len, active_rows[0..active_count], selected_tokens, self.config.no_repeat_ngram_size)) {
+                                if (self.config.no_repeat_ngram_size > 0) no_repeat_device_accepts += 1;
+                                finished_count += try applyFlorenceBatchSelectedTokensActive(
+                                    dec_ids,
+                                    max_len,
+                                    dec_len,
+                                    finished,
+                                    lengths,
+                                    selected_tokens,
+                                    active_rows[0..active_count],
+                                    self.config.eos_token_id,
+                                    self.config.pad_token_id,
+                                    step_tokens[0..active_count],
+                                );
+                                selected_on_device = true;
+                                if (last_read_telemetry.lm_head_path == null)
+                                    last_read_telemetry.lm_head_path = "batch_logits_argmax";
+                            }
                         }
                     }
                     if (!selected_on_device) {
+                        if (self.config.no_repeat_ngram_size > 0) no_repeat_cpu_fallbacks += 1;
                         const logits = try cb.toFloat32(logits_tensor, allocator);
                         defer allocator.free(logits);
 
@@ -2434,6 +2450,121 @@ test "Florence compacted active rows preserve original result identity" {
     try std.testing.expectEqualSlices(i64, &.{ 1, 5, 0, 0 }, decoder_ids[max_len .. max_len * 2]);
     try std.testing.expectEqualSlices(i64, &.{ 1, 6, 0, 0 }, decoder_ids[max_len * 2 .. max_len * 3]);
     try std.testing.expectEqualSlices(i64, &.{ 1, 7, 9, 0 }, decoder_ids[max_len * 3 ..]);
+}
+
+/// Validate each device winner against its original page history. Active
+/// decoder/cache rows may have been compacted or reordered after earlier EOS.
+/// A rejected winner leaves the existing full-logits policy in control.
+fn florenceBatchArgmaxAllowedByNoRepeat(
+    decoder_ids: []const i64,
+    max_len: usize,
+    decoder_len: usize,
+    active_rows: []const usize,
+    selected_tokens: []const u32,
+    no_repeat_ngram_size: usize,
+) bool {
+    if (max_len == 0 or decoder_len > max_len or decoder_ids.len % max_len != 0 or
+        selected_tokens.len != active_rows.len) return false;
+    const total_rows = decoder_ids.len / max_len;
+    for (selected_tokens, active_rows) |token, original_row| {
+        if (original_row >= total_rows) return false;
+        const prefix = decoder_ids[original_row * max_len ..][0..decoder_len];
+        if (wouldRepeatNgram(prefix, @intCast(token), no_repeat_ngram_size)) return false;
+    }
+    return true;
+}
+
+test "Florence device winners preserve per-page no-repeat after active row compaction" {
+    const ids = [_]i64{
+        1, 2, 3, 1, 2, 0,
+        7, 8, 9, 7, 8, 0,
+        4, 5, 6, 4, 5, 0,
+    };
+    const active = [_]usize{ 2, 0 };
+    try std.testing.expect(florenceBatchArgmaxAllowedByNoRepeat(&ids, 6, 5, &active, &.{ 3, 6 }, 3));
+    try std.testing.expect(!florenceBatchArgmaxAllowedByNoRepeat(&ids, 6, 5, &active, &.{ 6, 3 }, 3));
+    try std.testing.expect(!florenceBatchArgmaxAllowedByNoRepeat(&ids, 6, 5, &active, &.{ 3, 3 }, 3));
+    try std.testing.expect(florenceBatchArgmaxAllowedByNoRepeat(&ids, 6, 5, &active, &.{ 6, 3 }, 0));
+    try std.testing.expect(florenceBatchArgmaxAllowedByNoRepeat(&ids, 6, 5, &active, &.{ 6, 3 }, 1));
+    try std.testing.expect(!florenceBatchArgmaxAllowedByNoRepeat(&ids, 6, 5, &.{3}, &.{3}, 3));
+    try std.testing.expect(!florenceBatchArgmaxAllowedByNoRepeat(&ids, 6, 5, &active, &.{3}, 3));
+    try std.testing.expect(!florenceBatchArgmaxAllowedByNoRepeat(&ids, 6, 7, &active, &.{ 3, 6 }, 3));
+    try std.testing.expect(!florenceBatchArgmaxAllowedByNoRepeat(&ids, 0, 0, &active, &.{ 3, 6 }, 3));
+
+    // If a global maximum is allowed, it remains the masked maximum. A
+    // rejected maximum must use the established host policy instead. Cover
+    // tied maxima and every candidate for both independent page histories.
+    for ([_]usize{ 0, 2 }) |row| {
+        for (0..10) |candidate| {
+            var logits: [10]f32 = @splat(-1);
+            logits[candidate] = 4;
+            logits[(candidate + 1) % logits.len] = 4;
+            const unmasked = selectGreedyToken(&logits, ids[row * 6 ..][0..5], 0);
+            const masked = selectGreedyToken(&logits, ids[row * 6 ..][0..5], 3);
+            const allowed = florenceBatchArgmaxAllowedByNoRepeat(&ids, 6, 5, &.{row}, &.{@intCast(unmasked)}, 3);
+            if (allowed) try std.testing.expectEqual(masked, unmasked) else try std.testing.expect(masked != unmasked);
+        }
+    }
+}
+
+test "Florence checked no-repeat argmax keeps logits on Metal and preserves fallback" {
+    const Check = struct {
+        fn run(cb: ComputeBackend, _: ComputeBackend) !void {
+            const allocator = std.testing.allocator;
+            const ids = [_]i64{ 1, 2, 3, 1, 2, 0, 7, 8, 9, 7, 8, 0, 4, 5, 6, 4, 5, 0 };
+            const active = [_]usize{ 2, 0 };
+            for ([_]usize{ 16, 2051 }) |vocab| {
+                for (0..5) |scenario| {
+                    const logits = try allocator.alloc(f32, vocab * 2);
+                    defer allocator.free(logits);
+                    @memset(logits, -2);
+                    logits[3] = 4;
+                    logits[vocab + 6] = 4;
+                    if (scenario == 1) {
+                        logits[6] = 5;
+                        logits[vocab + 3] = 5;
+                    } else if (scenario == 2) {
+                        logits[6] = 4;
+                        logits[vocab + 3] = 4;
+                    } else if (scenario == 3) {
+                        logits[0] = std.math.nan(f32);
+                        logits[vocab] = std.math.nan(f32);
+                        logits[3] = std.math.inf(f32);
+                        logits[vocab + 6] = std.math.inf(f32);
+                    } else if (scenario == 4) {
+                        @memset(logits, -std.math.inf(f32));
+                        logits[0] = std.math.nan(f32);
+                        logits[vocab] = std.math.nan(f32);
+                    }
+                    const host = try cb.fromFloat32Shape(logits, &.{ 2, @as(i32, @intCast(vocab)) });
+                    defer cb.free(host);
+                    const device = (try cb.ensureDeviceResident(host)) orelse return error.DeviceLogitsUnavailable;
+                    defer cb.free(device);
+                    const transfers = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+                    const selected = (try cb.argmaxRows(device, 0, 2, vocab, allocator)) orelse return error.DeviceArgmaxUnavailable;
+                    defer allocator.free(selected);
+                    try transfers.expectUnchanged(cb);
+                    const allowed = florenceBatchArgmaxAllowedByNoRepeat(&ids, 6, 5, &active, selected, 3);
+                    try std.testing.expectEqual(scenario == 0 or scenario == 3 or scenario == 4, allowed);
+                    if (allowed) {
+                        for (selected, active, 0..) |token, original_row, row| {
+                            try std.testing.expectEqual(@as(u32, @intCast(selectGreedyToken(logits[row * vocab ..][0..vocab], ids[original_row * 6 ..][0..5], 3))), token);
+                        }
+                    } else {
+                        // A prior device reduction must leave the source logits
+                        // available for the unchanged masked host fallback.
+                        const downloaded = try cb.toFloat32(device, allocator);
+                        defer allocator.free(downloaded);
+                        for (active, 0..) |original_row, row| {
+                            try std.testing.expectEqual(selectGreedyToken(logits[row * vocab ..][0..vocab], ids[original_row * 6 ..][0..5], 3), selectGreedyToken(downloaded[row * vocab ..][0..vocab], ids[original_row * 6 ..][0..5], 3));
+                        }
+                    }
+                }
+            }
+        }
+    };
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onMetal(fixture.noWeights, Check.run);
 }
 
 fn selectGreedyToken(logits: []const f32, prefix: []const i64, no_repeat_ngram_size: usize) usize {
