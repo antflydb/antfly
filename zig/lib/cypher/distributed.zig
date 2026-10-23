@@ -57,6 +57,10 @@ pub const Source = struct {
     capture: *const fn (*anyopaque, A, Target) anyerror!?Fence,
 };
 pub const ReadSet = struct {
+    /// Local disjoint index partitions share this merge. Their tie order is
+    /// primary identity order, and nested coordinators need per-item cursors.
+    ordered_identity_ties: bool = false,
+    ordered_item_cursors: bool = false,
     work: ?b.Work = null,
     a: A,
     targets: []const Target,
@@ -278,6 +282,10 @@ pub const ReadSet = struct {
                 const comparison = try work.order((v.Value{ .node = slots[left].head.?.node }).property(order.property), (v.Value{ .node = slots[right].head.?.node }).property(order.property));
                 if (comparison != .eq) return if (order.descending) comparison == .gt else comparison == .lt;
             }
+            if (self.read_set.ordered_identity_ties) {
+                const comparison = try work.order(.{ .string = slots[left].head.?.node.identity.key }, .{ .string = slots[right].head.?.node.identity.key });
+                if (comparison != .eq) return comparison == .lt;
+            }
             // Plain distributed scans concatenate owners in catalog order.
             return slots[left].position.owner < slots[right].position.owner;
         }
@@ -350,7 +358,7 @@ pub const ReadSet = struct {
             count += 1;
         };
         if (count != positions.items.len or count == 0) return error.CypherInvalidBackendCursor;
-        if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = try std.json.Stringify.valueAlloc(a, positions.items, .{}) };
+        if (limit == 0) return .{ .items = &.{}, .cursors = if (self.ordered_item_cursors) &.{} else null, .examined = 0, .next = try std.json.Stringify.valueAlloc(a, positions.items, .{}) };
         const slots = try temporary.alloc(OrderedSlot, count);
         var heap: std.ArrayList(usize) = .empty;
         var merge: OrderedMerge = .{ .read_set = self, .a = a, .table = table, .filters = filters, .order = order, .max_examined = max_examined, .quantum = if (max_examined > limit *| 2 +| count) @max(1, @min(64, limit / count)) else 1, .demand = limit };
@@ -366,6 +374,7 @@ pub const ReadSet = struct {
             try merge.sift(&work, slots, heap.items, parent);
         }
         var output: std.ArrayList(*const v.Node) = .empty;
+        var cursors: std.ArrayList(?[]const u8) = .empty;
         while (output.items.len < limit and heap.items.len != 0) {
             const selected = heap.items[0];
             const slot = &slots[selected];
@@ -373,6 +382,16 @@ pub const ReadSet = struct {
             slot.position.after = slot.head.?.after;
             slot.position.finished = slot.position.after == null;
             slot.head = null;
+            if (self.ordered_item_cursors) {
+                var more = false;
+                for (slots, positions.items) |current, *position| {
+                    position.* = current.position;
+                    more = more or !position.finished;
+                }
+                const saved = if (more) try std.json.Stringify.valueAlloc(a, positions.items, .{}) else null;
+                try OrderedMerge.charge(&merge, count + if (saved) |bytes| bytes.len / 64 else @as(usize, 0));
+                try cursors.append(a, saved);
+            }
             if (output.items.len == limit) break;
             merge.demand = limit - output.items.len;
             try merge.fetch(slot);
@@ -388,7 +407,9 @@ pub const ReadSet = struct {
             more = more or !position.finished;
         }
         try checkpoint(ptr);
-        return .{ .items = try output.toOwnedSlice(a), .examined = merge.examined, .next = if (more) try std.json.Stringify.valueAlloc(a, positions.items, .{}) else null };
+        const continuation = if (more) try std.json.Stringify.valueAlloc(a, positions.items, .{}) else null;
+        if (cursors.items.len != 0) cursors.items[cursors.items.len - 1] = continuation;
+        return .{ .items = try output.toOwnedSlice(a), .cursors = if (self.ordered_item_cursors) cursors.items else null, .examined = merge.examined, .next = continuation };
     }
     fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?usize {
         const self = cast(ptr);
@@ -875,6 +896,8 @@ test "ordered RPC buffers keep calls bounded and resume every unconsumed item" {
         try std.testing.expectEqual(result.stats.scanned_anchors, owners[0].records + owners[1].records);
     }
     fixture.hidden = false;
+    set.ordered_item_cursors = true;
+    set.ordered_identity_ties = true;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var after: ?[]const u8 = null;
@@ -882,6 +905,11 @@ test "ordered RPC buffers keep calls bounded and resume every unconsumed item" {
     const backend = set.backend();
     while (true) {
         const page = (try backend.vtable.scan_ordered.?(backend.ptr, arena.allocator(), "docs", &.{}, &.{.{ .property = "score", .descending = true }}, after, 17, 4096)).?;
+        try std.testing.expectEqual(page.items.len, page.cursors.?.len);
+        if (ordinal == 0) for (page.cursors.?, 0..) |position, index| {
+            const resumed = (try backend.vtable.scan_ordered.?(backend.ptr, arena.allocator(), "docs", &.{}, &.{.{ .property = "score", .descending = true }}, position, 1, 4096)).?;
+            try std.testing.expectEqual(@as(i64, 1022) - @as(i64, @intCast(index)), resumed.items[0].properties[0].value.integer);
+        };
         for (page.items) |node| {
             try std.testing.expectEqual(@as(i64, 1023) - @as(i64, @intCast(ordinal)), node.properties[0].value.integer);
             ordinal += 1;

@@ -252,7 +252,110 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             return strength;
         }
         const OrderedCursor = struct { index: []const u8, after: ?[]const u8 = null, schema_version: u32 };
+        const OrderedPartition = struct {
+            parent: *Self,
+            filters: []const b.PropertyFilter,
+            fn check(ptr: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                try checkpoint(self.parent);
+            }
+            fn bindPartition(_: *anyopaque, _: A, _: root.catalog.Graph) !void {}
+            fn close(_: *anyopaque) void {}
+            fn scanPartition(_: *anyopaque, _: A, _: []const u8, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+                return error.CypherInvalidBackendPage;
+            }
+            fn getPartition(_: *anyopaque, _: A, _: v.Identity) !?*const v.Node {
+                return error.CypherInvalidBackendPage;
+            }
+            fn expandPartition(_: *anyopaque, _: A, _: root.catalog.Relationship, _: v.Identity, _: root.ast.Direction, _: ?[]const u8, _: usize) !b.Page(*const v.Relationship) {
+                return error.CypherInvalidBackendPage;
+            }
+            fn ordered(ptr: *anyopaque, a: A, table: []const u8, _: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8, limit: usize, maximum: usize) !?b.Page(*const v.Node) {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return scanOrderedScalar(self.parent, a, table, self.filters, order, after, limit, maximum, true);
+            }
+            fn backend(self: *@This()) b.Backend {
+                return .{ .ptr = self, .vtable = &.{ .bind = bindPartition, .checkpoint = check, .scan = scanPartition, .get = getPartition, .expand = expandPartition, .scan_ordered = ordered } };
+            }
+        };
         fn scanOrdered(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, encoded: ?[]const u8, limit: usize, max_examined: usize) !?b.Page(*const v.Node) {
+            if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;
+            const self = cast(ptr);
+            if (!self.authority.ordered_projection or order.len == 0 or order.len > 32) return null;
+            try checkpoint(ptr);
+            const chosen = for (filters, 0..) |filter, index| {
+                if (filter.op == .in) break index;
+            } else return scanOrderedScalar(ptr, a, table, filters, order, encoded, limit, max_examined, false);
+            // A bounded disjoint union, never the hull of sparse values.
+            // Multiple independent IN domains retain the ordinary native
+            // planner until their Cartesian product can be costed safely.
+            for (filters[chosen + 1 ..]) |filter| if (filter.op == .in) return null;
+            const operand = filters[chosen].value;
+            if (operand != .list or operand.list.len > 256) return null;
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
+            const db = try self.selected(table);
+            var schema = db.core.acquireSchemaView() orelse return null;
+            defer schema.release();
+            const column_type = for (schema.tableSchema().relational_columns) |column| {
+                if (std.mem.eql(u8, column.name, filters[chosen].property)) break column.column_type;
+            } else return null;
+            // Exact scalar domains keep partitions disjoint after storage
+            // conversion. Mixed and floating operands remain runtime residuals.
+            switch (column_type) {
+                .integer, .string, .boolean => {},
+                else => return null,
+            }
+            var unique: std.ArrayList(v.Value) = .empty;
+            var distinct: @import("value_work.zig").Index = .{};
+            var work = self.valueWork(temporary);
+            for (operand.list) |value| {
+                if (value == .null) continue;
+                if (!filterCompatible(column_type, value)) return null;
+                const hash = (try work.info(value)).hash;
+                var duplicate = false;
+                var candidate = distinct.head(hash);
+                while (candidate) |position| {
+                    const link = distinct.links.items[position];
+                    if (try work.eql(unique.items[link.index], value)) {
+                        duplicate = true;
+                        break;
+                    }
+                    candidate = link.next;
+                }
+                if (!duplicate) {
+                    try distinct.insert(temporary, hash, unique.items.len);
+                    try unique.append(temporary, value);
+                }
+            }
+            // Per-item continuations retain every partition position for
+            // nested RPC paging. Admit only a small fanout: wider domains
+            // keep sparse seeks/top-k instead of multiplying cursor work by
+            // the output cardinality and exhausting the default state budget.
+            if (unique.items.len == 0 or unique.items.len > 8) return null;
+            // Preserve the sparse-seek plan when the global ceiling cannot
+            // cover even the merge's required owner heads and lookahead.
+            if (encoded == null and limit != 0 and max_examined < limit +| (unique.items.len - 1)) return null;
+            const partitions = try temporary.alloc(OrderedPartition, unique.items.len);
+            const targets = try temporary.alloc(root.distributed.Target, unique.items.len);
+            const snapshots = try temporary.alloc(root.distributed.Snapshot, unique.items.len);
+            for (partitions, targets, snapshots, unique.items, 0..) |*partition, *target, *snapshot, value, index| {
+                const conditions = try temporary.dupe(b.PropertyFilter, filters);
+                conditions[chosen].op = .eq;
+                conditions[chosen].value = value;
+                std.mem.swap(b.PropertyFilter, &conditions[0], &conditions[chosen]);
+                partition.* = .{ .parent = self, .filters = conditions };
+                target.* = .{ .table = table, .table_id = 1, .group_id = index + 1 };
+                snapshot.* = .{ .backend = partition.backend(), .ptr = partition, .validate = OrderedPartition.check, .close = OrderedPartition.close };
+            }
+            // Reuse the authenticated coordinator's budgeted heap and exact
+            // continuation protocol over these already-pinned local partitions.
+            var merge: root.distributed.ReadSet = .{ .a = temporary, .work = self.work, .ordered_identity_ties = true, .ordered_item_cursors = true, .targets = targets, .snapshots = snapshots, .independent_validations = &.{}, .source = .{ .ptr = self, .checkpoint = checkpoint, .admit = undefined, .capture = undefined } };
+            const merged_backend = merge.backend();
+            return merged_backend.vtable.scan_ordered.?(merged_backend.ptr, a, table, &.{}, order, encoded, limit, max_examined);
+        }
+        fn scanOrderedScalar(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, encoded: ?[]const u8, limit: usize, max_examined: usize, partition: bool) !?b.Page(*const v.Node) {
             if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;
             const self = cast(ptr);
             if (!self.authority.ordered_projection or order.len == 0 or order.len > 32) return null;
@@ -273,8 +376,18 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const cursor = if (encoded) |bytes| try std.json.parseFromSliceLeaky(OrderedCursor, temporary, bytes, .{}) else null;
             candidates: for (indexes.plan.boundIndexes()) |index| {
                 if (cursor) |position| if (!std.mem.eql(u8, position.index, index.name)) continue;
-                if (index.predicate != null or index.tuple.keys.len != order.len) continue;
-                for (index.tuple.keys, order) |key, requested| {
+                if (index.predicate != null or index.tuple.keys.len < order.len) continue;
+                const prefix = index.tuple.keys.len - order.len;
+                for (index.tuple.keys[0..prefix]) |key| {
+                    switch (key.column_type) {
+                        .integer, .string, .boolean => {},
+                        else => continue :candidates,
+                    }
+                    if (key.expression != null or key.fold_ascii) continue :candidates;
+                    const name = schema.tableSchema().relational_columns[key.ordinal].name;
+                    if (try self.filterStrength(filters, name, key.column_type) != 4) continue :candidates;
+                }
+                for (index.tuple.keys[prefix..], order) |key, requested| {
                     if (self.work) |work| try work.charge(work.ptr, 1);
                     if (key.expression != null or key.fold_ascii or key.descending != requested.descending or key.nulls_first != requested.descending) continue :candidates;
                     if (!std.mem.eql(u8, schema.tableSchema().relational_columns[key.ordinal].name, requested.property)) continue :candidates;
@@ -293,7 +406,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         if (alternative.predicate != null or alternative.tuple.keys.len == 0) continue;
                         const key = alternative.tuple.keys[0];
                         if (key.expression != null or key.fold_ascii) continue;
-                        if (try self.filterStrength(filters, schema.tableSchema().relational_columns[key.ordinal].name, key.column_type) > strength) return null;
+                        if (try self.filterStrength(filters, schema.tableSchema().relational_columns[key.ordinal].name, key.column_type) > strength) continue :candidates;
                     }
                 }
                 const authorization = try self.readAuthorization(temporary, table);
@@ -323,6 +436,21 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         .in => unreachable,
                     }, .value = value });
                 }
+                // Partition equality is a disjointness proof, not an optional
+                // hint. It is first in the filter list so the hint cap cannot
+                // discard it. Failed storage lowering must decline the union.
+                if (partition and (conditions.items.len == 0 or conditions.items[0].op != .eq or !std.mem.eql(u8, conditions.items[0].column, filters[0].property))) continue :candidates;
+                // Omitting a fixed prefix would invalidate the order proof,
+                // even if an oversized hint list or storage coercion declined
+                // a condition. Every skipped key needs an enforced equality.
+                for (index.tuple.keys[0..prefix]) |key| {
+                    const name = schema.tableSchema().relational_columns[key.ordinal].name;
+                    const enforced = for (conditions.items) |condition| {
+                        if (self.work) |work| try work.charge(work.ptr, 1);
+                        if (condition.op == .eq and std.mem.eql(u8, condition.column, name)) break true;
+                    } else false;
+                    if (!enforced) continue :candidates;
+                }
                 opts.relational_query.?.conditions = conditions.items;
                 opts.relational_query.?.index = index.name;
                 opts.relational_query.?.auto_index = true;
@@ -331,6 +459,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 const session = db.openRelationalReadSession(temporary, "", "", opts) catch |err| switch (err) {
                     error.RelationalIndexNotReady, error.IndexNotFound => if (cursor == null) continue :candidates else return error.CatalogGenerationChanged,
                     error.InvalidBatchRequest, error.RelationalIndexColumnTypeMismatch, error.UnsupportedRelationalIndexColumn, error.RelationalIndexColumnNotFound => retry: {
+                        if (prefix != 0 or partition) {
+                            if (cursor != null) return error.CatalogGenerationChanged;
+                            continue :candidates;
+                        }
                         // A storage type can be narrower than Cypher. Keep the
                         // order certificate and evaluate unsupported operands
                         // in the authoritative runtime residual instead.

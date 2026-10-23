@@ -975,6 +975,7 @@ fn Engine(comptime Context: type) type {
         const Self = @This();
         context: Context,
         cursors: []const catalog.Cursor,
+        ordered_scan: ?usize = null,
         visited: usize = 0,
         work: usize = 0,
         cache_arena: std.heap.ArenaAllocator,
@@ -2118,7 +2119,7 @@ fn Engine(comptime Context: type) type {
                     // Each nested stage leaves room for upstream pages, bindings and spill operators.
                     const wanted = @min(self.batch_demand orelse std.math.maxInt(usize), @min(@min(context.limits.page_rows, @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + query.source.columns.len * @sizeOf(Datum) * 16))), self.query_remaining +| self.query_skip));
                     while (rows.items.len < wanted) {
-                        const input = (if (context.binding.scalars.predicate == null)
+                        const input = (if (context.binding.scalars.predicate == null or self.engine.ordered_scan != null)
                             try self.left.?.nextDemand(scratch, wanted - rows.items.len)
                         else
                             try self.left.?.next(scratch)) orelse break;
@@ -3573,21 +3574,27 @@ fn Source(comptime Context: type) type {
             // Negotiate before capturing the statement cut; never reopen a
             // captured cursor or propagate order through joins/derived errors.
             var ordered: []const catalog.Scan.Order = &.{};
-            if (context.statement_capture == null and context.backend.vtable.supports_scan_order and relation.root.operation == .scan and context.binding.aggregate == null and context.binding.window == null and !relation.statement.count_all) negotiate: {
-                const scan_node = relation.root.operation.scan;
-                if (scans[scan_node.index].table.graph == null) break :negotiate;
+            var ordered_scan: ?usize = null;
+            if (context.statement_capture == null and context.backend.vtable.supports_scan_order and context.binding.aggregate == null and context.binding.window == null and !relation.statement.count_all) negotiate: {
                 const requested = try describe.scanOrder(context.arena, context.binding, relation.statement);
                 if (requested.len == 0) break :negotiate;
                 const physical = try search_arena.allocator().alloc(catalog.Scan.Order, requested.len);
+                var scan_index: ?usize = null;
                 for (requested, physical) |key, *out| {
                     const index = for (relation.root.columns, 0..) |column, index| {
                         if (std.mem.eql(u8, column.internal, key.column)) break index;
                     } else break :negotiate;
+                    const origin = binding.scanColumn(relation.root, index) orelse break :negotiate;
+                    if (scan_index) |known| if (known != origin.scan_index) break :negotiate;
+                    scan_index = origin.scan_index;
                     out.* = key;
-                    out.column = scan_node.source_columns[index];
+                    out.column = origin.name;
                 }
+                const index = scan_index orelse break :negotiate;
+                if (scans[index].table.graph == null) break :negotiate;
                 const changed = try search_arena.allocator().dupe(catalog.StatementScan, scans);
-                changed[scan_node.index].request.order = physical;
+                changed[index].request.order = physical;
+                ordered_scan = index;
                 scans = changed;
                 ordered = requested;
             }
@@ -3605,7 +3612,9 @@ fn Source(comptime Context: type) type {
                     self.engine.cursors = &self.single_list;
                 } else return error.SqlStatementSnapshotRequired;
             }
-            if (ordered.len != 0 and !self.engine.cursors[relation.root.operation.scan.index].order_satisfied) ordered = &.{};
+            if (ordered_scan) |index| {
+                if (self.engine.cursors[index].order_satisfied) self.engine.ordered_scan = index else ordered = &.{};
+            }
             const Estimate = struct {
                 fn rows(raw: *anyopaque, node: *const binding.Node) ?u64 {
                     const engine: *Engine(Context) = @ptrCast(@alignCast(raw));
@@ -4699,10 +4708,14 @@ test "transparent graph relations forward order requests and certificates throug
         fn close(_: *anyopaque) void {}
         fn checkpoint(_: *anyopaque) !void {}
     };
-    for ([_]bool{ true, false }) |certify| {
+    for ([_][]const u8{
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g ORDER BY g.score DESC LIMIT 5",
+        "SELECT d.s FROM (SELECT g.score AS s FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g) d ORDER BY d.s DESC LIMIT 5",
+        "SELECT d.score FROM (SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score>=0) d ORDER BY d.score DESC LIMIT 5",
+    }) |text| for ([_]bool{ true, false }) |certify| {
         var fixture: Fixture = .{ .certify = certify };
         const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_graph = Fixture.graph, .supports_scan_order = true, .scan = SetTestBackend.scan, .open_scan = Fixture.open, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint } };
-        var compiled = try @import("compiler.zig").compile(std.testing.allocator, "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g ORDER BY g.score DESC LIMIT 5", .{});
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, text, .{});
         defer compiled.deinit();
         var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{});
         defer result.deinit();
@@ -4714,5 +4727,5 @@ test "transparent graph relations forward order requests and certificates throug
             const actual = if (cell == .integer) cell.integer else try std.fmt.parseInt(i64, if (cell == .number_string) cell.number_string else cell.string, 10);
             try std.testing.expectEqual(@as(i64, @intCast(12999 - index)), actual);
         }
-    }
+    };
 }

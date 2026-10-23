@@ -7752,6 +7752,10 @@ test "ordered node certificates bound scans preserve residuals and decline falli
     };
     for ([_]struct { text: []const u8, expected: i64, reads: usize, denied: bool = false }{
         .{ .text = "MATCH (n:Document) RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
+        .{ .text = "MATCH (n:Document) WITH n RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
+        .{ .text = "MATCH (n:Document) WITH n AS m WITH m.rank AS s RETURN s AS r ORDER BY r DESC LIMIT 1", .expected = 3, .reads = 1 },
+        .{ .text = "MATCH (n:Document) WITH * WHERE n.rank>1 RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
+        .{ .text = "MATCH (n:Document) WHERE n.rank IN [1,3] RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
         .{ .text = "MATCH (n:Document) RETURN n.rank AS r ORDER BY r DESC SKIP 1 LIMIT 1", .expected = 2, .reads = 2 },
         .{ .text = "MATCH (n:Document) WHERE n.rank<3 RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 1, .reads = 3, .denied = true },
     }) |item| {

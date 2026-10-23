@@ -2608,10 +2608,13 @@ an otherwise unequal element ID compare equal. Writes use the same lookup path.
 
 A readonly single-node match with a finite ordered projection can request a
 backend certificate for property order. The native adapter uses a ready index
-from the statement's pinned schema generation only when all index keys match
-the requested properties, directions, null placement, and stable primary-key
-ordering. Supported key types are integer, string with binary collation, and
-boolean. Partial indexes, expression keys, extra keys, incompatible collations,
+from the statement's pinned schema generation when its remaining index keys
+match the requested properties, directions, null placement, and stable primary-key
+ordering. Leading integer, binary-string, and boolean keys may be omitted from
+the requested order only when compatible equality conditions are enforced for
+every omitted key. A failed coercion or omitted hint declines that proof.
+Supported key types are integer, string with binary collation, and boolean.
+Partial indexes, expression keys, unproved extra keys, incompatible collations,
 and types whose storage order differs from Cypher decline the certificate.
 Authorization hooks must explicitly certify that visible scalar values remain
 unchanged. Active write overlays decline ordered reads because staged values
@@ -2621,9 +2624,14 @@ Residual predicates and label membership run on every authorized candidate;
 scanning stops only after SKIP+LIMIT qualifying rows. Fallible projections and
 predicates retain eager execution so a window cannot hide an error. Candidate
 reads, including rejected rows, consume the anchor budget. Compatible typed conjunctions establish native seek bounds on the ordered
-index. Sparse IN domains and stronger equality access paths on another index
-retain the native selective planner and a bounded Cypher top-k. Unsupported
-storage operands remain authoritative runtime residuals.
+index. Stronger equality access paths on another index are considered before
+falling back to the native selective planner and a bounded Cypher top-k.
+A single compatible IN domain can form a deduplicated disjoint union of bounded
+ordered equality streams; NULL members never open a stream. Mixed operands,
+floating domains, multiple independent IN domains, domains above 256 input members
+or eight distinct non-NULL partitions, and insufficient initial lookahead budgets
+retain ordinary execution.
+Unsupported storage operands remain authoritative runtime residuals.
 
 Distributed reads negotiate the same capability over authenticated RPC. For
 multiple owners, a metadata-only probe establishes that every owner can provide
@@ -2687,8 +2695,10 @@ scalar projection columns map to the shared Cypher order proof, including exact
 null placement. Both embedded and distributed wrappers preserve the resulting
 order certificate. The relational source adapter maps a direct graph scan's
 internal SQL columns back to graph projection columns before statement capture,
-then forwards only the physical cursor's attested order. Joins, derived
-relations, and previously captured mutation cursors retain their normal paths.
+then forwards only the physical cursor's attested order. Existing total-column
+lineage carries that proof through transparent derived projections and filters.
+Joins, ordered/cardinality-changing derived relations, fallible projections,
+and previously captured mutation cursors retain their normal paths.
 A SQL executor regression requires five physical rows for an attested top-five
 query over 13,000 rows and checks the full-sort fallback when proof is declined.
 SQL retains its residuals and applies its normal row-goal
@@ -2712,3 +2722,41 @@ states on both storage backends. Warm SQL GRAPH_TABLE top-five calls measured
 about 0.3 ms on Lite and 4 ms on Directory, versus roughly 73 ms and 33 ms
 before order negotiation reached the relational source adapter. These timings
 are illustrative; regressions enforce physical work and resource ceilings.
+
+### Order lineage and disjoint ordered domains
+
+Cypher WITH stages carry direct node/property lineage through total one-to-one
+projections, including renaming and wildcard forwarding. Every expression and
+filter in the crossed stages must be total. Shadowing replaces the old lineage;
+computed scalar values never become entity receivers. Intermediate ordering,
+DISTINCT, SKIP/LIMIT, aggregation, expansion, and fallible expressions remain
+barriers. The original stage executor still evaluates projections and residuals;
+lineage only supplies a physical source order certificate.
+
+SQL derives the same property order through its existing identity-column proof,
+which checks every intervening projection and predicate, then follows the
+attestation back from the physical graph cursor. Demand propagates through those
+certified filter frames as a page-prefetch hint rather than a total read ceiling.
+The executor's full-sort fallback remains available when any provider declines.
+
+Native IN partitions share the coordinator's budgeted ordered heap, pinned
+schema/authority checks, and exact continuation protocol. All primed heads,
+rejected rows, repeated reads, and speculative refills consume the global anchor
+budget. Local partition ties compare primary identity instead of IN-list order.
+Per-item merged cursors let an enclosing authenticated coordinator retain bounded
+RPC pages; continuations contain positions rather than cached documents.
+
+Ordered IN planning admits at most eight distinct scalar partitions. A public
+13,000-row/256-value/1,000-result regression preserves the ordinary sparse-seek
+plan under the default one-million-state budget. This prevents per-row merged
+continuation metadata from scaling with a large partition vector. The ordinary
+planner still evaluates every IN member and preserves the complete result.
+
+Public top-five regressions on 13,000 documents exercise both Lite and Directory.
+The equality-fixed composite prefix reads five anchors and spends 250 states,
+versus 6,500 anchors previously. The two-value IN union reads six anchors and
+spends 353 states, versus 13,000 anchors previously. Transparent WITH variants
+read five anchors with 139–164 states; SQL derived wrappers inherit the same
+five-row physical source certificate as direct GRAPH_TABLE queries. Tie-order
+checks compare complete node rows against ordinary execution across merge-page
+boundaries, and coercion failures retain authoritative predicates.

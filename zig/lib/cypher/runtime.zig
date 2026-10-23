@@ -6703,6 +6703,7 @@ const Engine = struct {
             .binary => |b| switch (b.op) {
                 .eq, .neq, .lt, .lte, .gt, .gte, .starts_with, .ends_with, .contains => self.totalExpression(b.left, shape) and self.totalExpression(b.right, shape),
                 .@"and", .@"or", .xor => self.totalPredicate(b.left, shape) and self.totalPredicate(b.right, shape),
+                .in => self.totalExpression(b.left, shape) and self.totalMembershipList(b.right, shape),
                 else => false,
             },
             .comparison => |c| blk: {
@@ -6713,6 +6714,16 @@ const Engine = struct {
                 for (c.operands) |operand| if (!self.totalExpression(operand, shape)) break :blk false;
                 break :blk true;
             },
+            else => false,
+        };
+    }
+    fn totalMembershipList(self: *Engine, expression: *const ast.Expr, shape: Row) bool {
+        return switch (expression.value) {
+            .list => |items| for (items) |item| {
+                if (!self.totalExpression(item, shape)) break false;
+            } else true,
+            .parameter => |name| if (lookup(self.parameters, name)) |value| value == .list or value == .null else false,
+            .literal => |value| value == .null,
             else => false,
         };
     }
@@ -9782,11 +9793,22 @@ const Engine = struct {
         }
     }
 
+    /// Only entity identity and direct property reads carry physical lineage.
+    /// Total computed expressions may flow alongside them without gaining an
+    /// order proof, and projection shadowing replaces the previous binding.
+    const NodeOrigin = struct { node: bool = false, property: ?[]const u8 = null };
+    fn nodeOrigin(expression: *const ast.Expr, lineage: std.StringHashMapUnmanaged(NodeOrigin)) ?NodeOrigin {
+        return switch (expression.value) {
+            .variable => |name| lineage.get(name),
+            .property => |property| if (property.base.value == .variable and (lineage.get(property.base.value.variable) orelse return null).node) .{ .property = property.name } else null,
+            else => null,
+        };
+    }
     fn planNodeOrder(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause) !?NodeOrder {
         // An ordinary empty scan may finish without spending an anchor. A
         // certificate cannot assume a zero-budget source is nonempty.
         if (self.stats.scanned_anchors >= self.limits.scanned_anchors) return null;
-        if (!self.read_only or self.backend.vtable.scan_ordered == null or input.len != 1 or middle.len != 0 or operation.optional or operation.paths.len != 1 or projection.distinct or projection.wildcard or projection.predicate != null or projection.order.len == 0 or projection.order.len > 32) return null;
+        if (!self.read_only or self.backend.vtable.scan_ordered == null or input.len != 1 or operation.optional or operation.paths.len != 1 or projection.distinct or projection.wildcard or projection.predicate != null or projection.order.len == 0 or projection.order.len > 32) return null;
         const path = operation.paths[0];
         if (path.edges.len != 0 or path.alias != null or path.selector != .all) return null;
         const node = path.nodes[0];
@@ -9796,10 +9818,42 @@ const Engine = struct {
         // replace the source node with a scalar or map, invalidating a native
         // certificate for properties of that node.
         for (projection.items) |item| if (item.alias) |name| if (std.mem.eql(u8, name, alias)) return null;
-        const shape = try self.pathShape(path, input[0]);
+        var shape = try self.pathShape(path, input[0]);
         if (operation.predicate) |predicate| if (!self.totalPredicate(predicate, shape)) return null;
         for (node.properties) |entry| if (self.constant(entry.value, input[0]) == null) return null;
-        for (projection.items) |item| if (!self.totalExpression(item.expression, shape)) return null;
+        var lineage: std.StringHashMapUnmanaged(NodeOrigin) = .empty;
+        try lineage.put(self.a, alias, .{ .node = true });
+        for (middle) |clause| {
+            try self.state();
+            if (clause.operation != .project) return null;
+            const step = clause.operation.project.value;
+            if (step.distinct or step.order.len != 0 or step.skip != null or step.limit != null) return null;
+            var next: std.StringHashMapUnmanaged(NodeOrigin) = .empty;
+            if (step.wildcard) {
+                var bindings = lineage.iterator();
+                while (bindings.next()) |entry| try next.put(self.a, entry.key_ptr.*, entry.value_ptr.*);
+            }
+            var next_shape: Row = if (step.wildcard) shape else &.{};
+            for (step.items) |item| {
+                try self.state();
+                if (!self.totalExpression(item.expression, shape)) return null;
+                const name = item.alias orelse try self.expressionName(item.expression);
+                const origin = nodeOrigin(item.expression, lineage);
+                if (origin) |known| try next.put(self.a, name, known) else _ = next.remove(name);
+                next_shape = try self.replace(next_shape, name, .{ .boolean = if (origin) |known| known.node else false });
+            }
+            var scope = shape;
+            for (next_shape) |entry| scope = try self.replace(scope, entry.name, entry.value);
+            if (step.predicate) |predicate| if (!self.totalPredicate(predicate, scope)) return null;
+            shape = next_shape;
+            lineage = next;
+        }
+        var projected = try lineage.clone(self.a);
+        for (projection.items) |item| {
+            if (!self.totalExpression(item.expression, shape)) return null;
+            const name = item.alias orelse try self.expressionName(item.expression);
+            if (nodeOrigin(item.expression, lineage)) |origin| try projected.put(self.a, name, origin) else _ = projected.remove(name);
+        }
         var table: ?[]const u8 = null;
         for (self.graph.labels, 0..) |label, index| if (self.firstTableLabel(index, node)) {
             if (table) |known| {
@@ -9808,15 +9862,8 @@ const Engine = struct {
         };
         const fields = try self.a.alloc(backend_mod.PropertyOrder, projection.order.len);
         for (projection.order, fields) |order, *field| {
-            var expression = order.expression;
-            if (expression.value == .variable) for (projection.items) |item| {
-                if (item.alias) |name| if (std.mem.eql(u8, name, expression.value.variable)) {
-                    expression = item.expression;
-                    break;
-                };
-            };
-            if (expression.value != .property or expression.value.property.base.value != .variable or !std.mem.eql(u8, expression.value.property.base.value.variable, alias)) return null;
-            field.* = .{ .property = expression.value.property.name, .descending = order.descending };
+            const origin = nodeOrigin(order.expression, projected) orelse return null;
+            field.* = .{ .property = origin.property orelse return null, .descending = order.descending };
         }
         return .{ .table = table orelse return null, .alias = alias, .fields = fields };
     }

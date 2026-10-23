@@ -7622,3 +7622,171 @@ def test_sql_graph_order_certificates_keep_null_order_and_source_ordinals(graph_
         graph_db.sql(f"SELECT g._id,g.id FROM {source} ORDER BY g.score DESC LIMIT 4")["rows"]
         == graph_db.sql(f"SELECT g._id,g.id FROM {source} ORDER BY g.score+0 DESC LIMIT 4")["rows"]
     )
+
+
+def test_composite_ordered_seeks_merge_disjoint_in_domains(graph_db):
+    for start in range(0, 13000, 500):
+        graph_db.sql(
+            "INSERT INTO docs (_id,id,score) VALUES "
+            + ",".join(f"('n{i:05}','{'a' if i % 2 == 0 else 'b'}',{i})" for i in range(start, start + 500))
+        )
+    # Both candidate orders must be considered regardless of catalog ordering.
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.sql("CREATE INDEX bucket_score ON docs(id,score DESC)")
+    for predicate, expected, ceiling in (
+        ("n.id='a'", list(range(12998, 12989, -2)), 5),
+        ("n.id IN ['b','a','b',null]", list(range(12999, 12994, -1)), 12),
+        ("n.id IN $buckets", list(range(12999, 12994, -1)), 12),
+    ):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) WHERE {predicate} RETURN n.score ORDER BY n.score DESC LIMIT 5",
+                "parameters": {"buckets": ["b", "a", "b", None]},
+                "limits": {"scanned_anchors": ceiling, "intermediate_states": 6000, "memory_bytes": 2 << 20},
+            },
+        )
+        assert [int(row[0]["value"]) for row in result["rows"]] == expected
+        assert result["stats"]["scanned_anchors"] <= ceiling
+    # Partition input order and duplicate operands must not change tie order.
+    graph_db.sql("UPDATE docs SET score=20000 WHERE score>=12936")
+    # Larger windows also cross native merge page/refill boundaries.
+    for skip, limit in ((3, 17), (0, 193), (127, 65)):
+        query = f"MATCH (n:D) WHERE n.id IN ['b','a','b',null] RETURN n ORDER BY n.score DESC SKIP {skip} LIMIT {limit}"
+        actual = graph_db.cypher_json("g", {"query": query})
+        control = graph_db.cypher_json(
+            "g", {"query": f"MATCH (n:D) RETURN n ORDER BY n.score+0 DESC SKIP {skip} LIMIT {limit}"}
+        )
+        assert actual["rows"] == control["rows"]
+
+
+def test_order_lineage_survives_total_cypher_with_stages(graph_db):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    for query in (
+        "MATCH (n:D) WITH n RETURN n.score ORDER BY n.score DESC LIMIT 5",
+        "MATCH (n:D) WITH n AS m WITH m.score AS s RETURN s AS v ORDER BY v DESC LIMIT 5",
+        "MATCH (n:D) WITH * WHERE n.score>=0 RETURN n.score ORDER BY n.score DESC LIMIT 5",
+        "MATCH (n:D) WITH n.score AS n RETURN n ORDER BY n DESC LIMIT 5",
+    ):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": query,
+                "limits": {"scanned_anchors": 5, "intermediate_states": 3000, "memory_bytes": 1 << 20},
+            },
+        )
+        assert [int(row[0]["value"]) for row in result["rows"]] == list(range(12999, 12994, -1))
+        assert result["stats"]["scanned_anchors"] == 5
+    rejected_prefix = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) WITH n WHERE n.score<12950 RETURN n.score ORDER BY n.score DESC LIMIT 5",
+            "limits": {"scanned_anchors": 55},
+        },
+    )
+    assert [int(row[0]["value"]) for row in rejected_prefix["rows"]] == list(range(12949, 12944, -1))
+    assert rejected_prefix["stats"]["scanned_anchors"] == 55
+    with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+        graph_db.cypher_json(
+            "g", {"query": "MATCH (n:D) WITH n,1/n.score AS inv RETURN n.score ORDER BY n.score DESC LIMIT 5"}
+        )
+    staged = graph_db.cypher_json(
+        "g",
+        {"query": "MATCH (n:D) WITH n.score AS s ORDER BY s LIMIT 2 RETURN s ORDER BY s DESC LIMIT 1"},
+    )
+    assert staged["rows"] == [[{"type": "integer", "value": "1"}]]
+
+
+def test_sql_graph_order_lineage_survives_transparent_derived_tables(graph_db):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    source = "GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g"
+    for relation in (
+        f"(SELECT g.score AS s FROM {source}) d",
+        f"(SELECT g.score AS s FROM {source} WHERE g.score>=0) d",
+        f"(SELECT x.s FROM (SELECT g.score AS s FROM {source}) x) d",
+    ):
+        assert graph_db.sql(f"SELECT d.s FROM {relation} ORDER BY d.s DESC LIMIT 5")["rows"] == [
+            [str(i)] for i in range(12999, 12994, -1)
+        ]
+    assert graph_db.sql(
+        f"SELECT d.s FROM (SELECT g.score AS s FROM {source} ORDER BY g.score LIMIT 2) d ORDER BY d.s DESC LIMIT 1"
+    )["rows"] == [["1"]]
+    assert graph_db.sql(
+        f"SELECT d.s FROM (SELECT g.score AS s FROM {source} WHERE g.score<12950) d ORDER BY d.s DESC LIMIT 5"
+    )["rows"] == [[str(i)] for i in range(12949, 12944, -1)]
+    with pytest.raises(SQLStateError):
+        graph_db.sql(
+            "SELECT d.score FROM (SELECT g.inv,g.score FROM GRAPH_TABLE(g MATCH (n IS D) "
+            "COLUMNS(1/n.score AS inv,n.score AS score)) g WHERE g.inv>0) d ORDER BY d.score DESC LIMIT 1"
+        )
+
+
+def test_ordered_in_partitions_keep_required_conditions_on_storage_coercion(graph_db):
+    for suffix, column_type, first, second, outside in (
+        ("text", "TEXT", "a", "b", "oversized"),
+        ("int", "SMALLINT", 1, 2, 1000000),
+        ("bool", "BOOLEAN", True, False, None),
+    ):
+        name = f"narrow_{suffix}"
+        graph_db.sql(f"CREATE TABLE {name} (id {column_type},score BIGINT)")
+        graph_db.sql(f"INSERT INTO {name} (_id,id,score) VALUES ('a',{repr(first)},40),('b',{repr(second)},30)")
+        graph_db.sql(f"CREATE INDEX {name}_rank ON {name}(score DESC)")
+        with closing(graph_db.open_table(name)) as table:
+            table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+        graph_db.graph_catalog_json(
+            {
+                "action": "put",
+                "name": name,
+                "definition": {
+                    "labels": [{"name": "D", "table": name}],
+                    "relationships": [
+                        {"name": "R", "index": "links", "source_label": "D", "target_label": "D", "stored_type": "link"}
+                    ],
+                },
+            }
+        )
+        for predicate, other in (
+            ("n.id IN [$first,$other]", outside),
+            ("n.id IN [$first,$other] AND n.id=$first", second),
+        ):
+            result = graph_db.cypher_json(
+                name,
+                {
+                    "query": f"MATCH (n:D) WHERE {predicate} RETURN n.score ORDER BY n.score DESC LIMIT 5",
+                    "parameters": {"first": first, "other": other},
+                },
+            )
+            assert result["rows"] == [[{"type": "integer", "value": "40"}]]
+        graph_db.sql(f"CREATE INDEX {name}_prefix ON {name}(id,score DESC)")
+        bounded = graph_db.cypher_json(
+            name,
+            {
+                "query": "MATCH (n:D) WHERE n.id=$first RETURN n.score ORDER BY n.score DESC LIMIT 1",
+                "parameters": {"first": first},
+                "limits": {"scanned_anchors": 1},
+            },
+        )
+        assert bounded["rows"] == [[{"type": "integer", "value": "40"}]]
+        assert bounded["stats"]["scanned_anchors"] == 1
+
+
+def test_wide_ordered_in_domains_keep_bounded_planning_cost(graph_db):
+    for start in range(0, 13000, 500):
+        graph_db.sql(
+            "INSERT INTO docs (_id,id,score) VALUES "
+            + ",".join(f"('n{i:05}','b{i % 256}',{i})" for i in range(start, start + 500))
+        )
+    graph_db.sql("CREATE INDEX bucket_score ON docs(id,score DESC)")
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) WHERE n.id IN $ids RETURN n.score ORDER BY n.score DESC LIMIT 1000",
+            "parameters": {"ids": [f"b{i}" for i in range(256)]},
+            "limits": {"memory_bytes": 4 << 20},
+        },
+    )
+    assert [int(row[0]["value"]) for row in result["rows"]] == list(range(12999, 11999, -1))
+    assert result["stats"]["scanned_anchors"] == 13000
+    assert result["stats"]["intermediate_states"] < 1_000_000
