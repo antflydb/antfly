@@ -1,0 +1,20 @@
+{
+  "mode": "timeline",
+  "input": "../../.recordings/quickstart-full-raw.mp4",
+  "output": "../../.recordings/quickstart-full-human-60s.mp4",
+  "audio": false,
+  "fps": 25,
+  "duration": 60,
+  "clips": [
+    {
+      "start": 0,
+      "end": 47.52,
+      "rate": 1.2
+    },
+    {
+      "start": 47.72,
+      "end": 67.76,
+      "hold": 0.36
+    }
+  ]
+}

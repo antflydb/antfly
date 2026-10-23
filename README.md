@@ -4,7 +4,7 @@ Antfly is an open-source search-and-inference database written in Zig. One engin
 
 [![Quickstart](https://cdn.antfly.io/quickstart.gif)](https://cdn.antfly.io/quickstart.gif)
 
-[Recording source](quickstart.tape)
+[Recording source](quickstart.tape) · [Recording instructions](scripts/quickstart/README.md)
 
 ## Quick Start
 
