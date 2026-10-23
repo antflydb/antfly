@@ -41,7 +41,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Close preflight drains restore/rewrite cache callbacks with caller execution.
 // Projection supervision uses shared maintenance dispatch and controlled close.
 // Close preflight drains accepted HLL/repair/backend work in dependency order.
-pub const abi_version: u32 = 153;
+// Controlled close requires admitted metadata fencing and owning drain leases.
+pub const abi_version: u32 = 154;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

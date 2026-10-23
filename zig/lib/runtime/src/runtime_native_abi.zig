@@ -99,7 +99,8 @@ const builtin = @import("builtin");
 // Owned replay binding recipes and whole-operation refresh expand native state.
 // Owned assemblies retain checked memory state; native retries observe commits.
 // Projection supervisors own shared recurring registrations and join state.
-pub const abi_version: u32 = 93;
+// Durable drain leases own completion signals and pin their producing scope.
+pub const abi_version: u32 = 94;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

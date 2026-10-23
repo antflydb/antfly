@@ -635,8 +635,76 @@ pub const DbOpenConfigurator = struct {
     }
 };
 
+/// Owning completion observation. No registry address or borrowed admission
+/// control is retained. The producer and its allocator outlive this lease.
+pub const OwnerDrain = struct {
+    const Callbacks = struct { wait: *const fn (?*anyopaque) anyerror!void };
+    const Boundary = @import("named_callback.zig").Boundary(Callbacks);
+    context: ?*anyopaque = null,
+    ready_fn: *const fn (?*anyopaque) bool = readyEmpty,
+    wait_fn: *const fn (?*anyopaque) anyerror!void = waitEmpty,
+    release_fn: *const fn (?*anyopaque) void = releaseEmpty,
+    callback_dispatch: @import("named_callback.zig").Dispatch = Boundary.local_dispatch,
+    pub fn init(context: *anyopaque, ready_callback: *const fn (?*anyopaque) bool, wait_callback: *const fn (?*anyopaque) anyerror!void, release_callback: *const fn (?*anyopaque) void) OwnerDrain {
+        return .{ .context = context, .ready_fn = ready_callback, .wait_fn = wait_callback, .release_fn = release_callback };
+    }
+    pub fn ready(self: OwnerDrain) bool {
+        return self.ready_fn(self.context);
+    }
+    pub fn wait(self: OwnerDrain) !void {
+        try Boundary.call("wait", self.callback_dispatch, self.wait_fn, .{self.context});
+    }
+    pub fn release(self: *OwnerDrain) void {
+        self.release_fn(self.context);
+        self.* = .{};
+    }
+    fn readyEmpty(_: ?*anyopaque) bool {
+        return true;
+    }
+    fn waitEmpty(_: ?*anyopaque) !void {}
+    fn releaseEmpty(_: ?*anyopaque) void {}
+};
+
+const OwnerDrainSignal = struct {
+    allocator: Allocator,
+    io: Io,
+    refs: std.atomic.Value(usize) = .init(1),
+    done: Io.Event = .unset,
+    fn retain(self: *OwnerDrainSignal) void {
+        const prior = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(prior != 0 and prior != std.math.maxInt(usize));
+    }
+    fn drop(self: *OwnerDrainSignal) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+    fn ready(raw: ?*anyopaque) bool {
+        const self: *OwnerDrainSignal = @ptrCast(@alignCast(raw.?));
+        return self.done.isSet();
+    }
+    fn wait(raw: ?*anyopaque) !void {
+        const self: *OwnerDrainSignal = @ptrCast(@alignCast(raw.?));
+        self.done.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch |cause| switch (cause) {
+            error.Timeout => {},
+            else => return cause,
+        };
+    }
+    fn release(raw: ?*anyopaque) void {
+        const self: *OwnerDrainSignal = @ptrCast(@alignCast(raw.?));
+        self.drop();
+    }
+    fn lease(self: *OwnerDrainSignal) OwnerDrain {
+        return .init(self, ready, wait, release);
+    }
+    fn complete(self: *OwnerDrainSignal) void {
+        self.done.set(self.io);
+        self.drop();
+    }
+};
+
 pub const DurableJobLane = struct {
-    const NativeCallbacks = struct { wait_owner: @FieldType(DurableJobLane.VTable, "wait_owner"), quiesce_owner: @FieldType(DurableJobLane.VTable, "quiesce_owner"), submit: @FieldType(DurableJobLane.VTable, "submit"), pause_owner: @FieldType(DurableJobLane.VTable, "pause_owner"), resume_owner: @FieldType(DurableJobLane.VTable, "resume_owner"), reopen_owner: @FieldType(DurableJobLane.VTable, "reopen_owner"), poll: @FieldType(DurableJobLane.VTable, "poll") };
+    const NativeCallbacks = struct { begin_owner_drain: @FieldType(DurableJobLane.VTable, "begin_owner_drain"), wait_owner: @FieldType(DurableJobLane.VTable, "wait_owner"), quiesce_owner: @FieldType(DurableJobLane.VTable, "quiesce_owner"), submit: @FieldType(DurableJobLane.VTable, "submit"), pause_owner: @FieldType(DurableJobLane.VTable, "pause_owner"), resume_owner: @FieldType(DurableJobLane.VTable, "resume_owner"), reopen_owner: @FieldType(DurableJobLane.VTable, "reopen_owner"), poll: @FieldType(DurableJobLane.VTable, "poll") };
     const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);
     callback_dispatch: @import("named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
 
@@ -651,7 +719,12 @@ pub const DurableJobLane = struct {
         return error.BackgroundOwnerLifecycleUnsupported;
     }
 
+    fn drainUnsupported(_: *anyopaque, _: u64, _: @import("../common/read_admission.zig").Port) anyerror!OwnerDrain {
+        return error.ExecutionWaitUnsupported;
+    }
+
     pub const VTable = struct {
+        begin_owner_drain: *const fn (*anyopaque, u64, @import("../common/read_admission.zig").Port) anyerror!OwnerDrain = drainUnsupported,
         submit: *const fn (ptr: *anyopaque, job: Job) anyerror!void,
         quiesce_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!bool = quiesceUnsupported,
         wait_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!bool = quiesceUnsupported,
@@ -688,14 +761,21 @@ pub const DurableJobLane = struct {
         return NativeBoundary.call("wait_owner", self.callback_dispatch, self.vtable.wait_owner, .{ self.ptr, owner_id });
     }
 
+    pub fn beginOwnerDrain(self: DurableJobLane, owner_id: u64, original: @import("../common/read_admission.zig").Port) !OwnerDrain {
+        return NativeBoundary.call("begin_owner_drain", self.callback_dispatch, self.vtable.begin_owner_drain, .{ self.ptr, owner_id, original });
+    }
+
     pub fn quiesceOwnerWithAdmission(self: DurableJobLane, owner_id: u64, original: @import("../common/read_admission.zig").Port) !void {
         var trace: @import("../common/read_admission.zig").RejectionTrace = .{};
         const control = trace.bind(original).?;
         const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
         _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        try control.checkpoint();
+        var completion = try self.beginOwnerDrain(owner_id, control);
+        defer completion.release();
         while (true) {
             try control.checkpoint();
-            if (try self.quiesceOwner(owner_id)) return;
+            if (completion.ready()) return;
             try boundary.beginWait();
             var failure: ?anyerror = null;
             while (true) {
@@ -703,11 +783,11 @@ pub const DurableJobLane = struct {
                     failure = trace.failure orelse cause;
                     break;
                 };
-                const ready = self.waitOwner(owner_id) catch |cause| {
+                if (completion.ready()) break;
+                completion.wait() catch |cause| {
                     failure = cause;
                     break;
                 };
-                if (ready) break;
             }
             boundary.endWait() catch |cause| {
                 if (failure) |first| return first;
@@ -890,6 +970,7 @@ const OwnerRegistry = struct {
         closing: bool = false,
         paused: bool = false,
         in_flight: usize = 0,
+        drain_signal: ?*OwnerDrainSignal = null,
         maintenance_probe: ?OwnerMaintenanceProbe = null,
         maintenance_probe_running: bool = false,
         maintenance_probe_enqueued: bool = false,
@@ -907,6 +988,7 @@ const OwnerRegistry = struct {
     };
 
     alloc: Allocator,
+    drain_alloc: Allocator,
     sync_io: Io = if (builtin.os.tag == .freestanding) .failing else std.Io.Threaded.global_single_threaded.io(),
     mutex: Io.Mutex = .init,
     idle: Io.Condition = .init,
@@ -920,12 +1002,12 @@ const OwnerRegistry = struct {
     recovery_stopping: bool = false,
 
     fn init(alloc: Allocator) OwnerRegistry {
-        return .{ .alloc = alloc };
+        return .{ .alloc = alloc, .drain_alloc = alloc };
     }
 
     pub fn deinit(self: *OwnerRegistry) void {
         var iterator = self.states.valueIterator();
-        while (iterator.next()) |state| std.debug.assert(state.in_flight == 0);
+        while (iterator.next()) |state| std.debug.assert(state.in_flight == 0 and state.drain_signal == null);
         self.states.deinit(self.alloc);
         self.* = undefined;
     }
@@ -1001,12 +1083,15 @@ const OwnerRegistry = struct {
     }
 
     fn finishRecovery(self: *OwnerRegistry, owner_id: u64) void {
+        var completed: ?*OwnerDrainSignal = null;
+        defer if (completed) |signal| signal.complete();
         self.mutex.lockUncancelable(self.sync_io);
         defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id).?;
         std.debug.assert(state.recovery_running and state.in_flight > 0);
         state.recovery_running = false;
         state.in_flight -= 1;
+        completed = takeDrainSignal(state);
         // Closing/pausing stops new admission, never accepted work. Append a
         // successor behind other owners so a hot owner cannot monopolize FIFO.
         if (state.recovery_pending != null) self.enqueueRecoveryLocked(owner_id, state);
@@ -1033,6 +1118,8 @@ const OwnerRegistry = struct {
     }
 
     fn finishJob(self: *OwnerRegistry, owner_id: u64) void {
+        var completed: ?*OwnerDrainSignal = null;
+        defer if (completed) |signal| signal.complete();
         self.mutex.lockUncancelable(self.sync_io);
         defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id) orelse {
@@ -1040,6 +1127,7 @@ const OwnerRegistry = struct {
         };
         std.debug.assert(state.in_flight > 0);
         state.in_flight -= 1;
+        completed = takeDrainSignal(state);
         if (state.in_flight == 0) self.idle.broadcast(self.sync_io);
     }
 
@@ -1128,6 +1216,8 @@ const OwnerRegistry = struct {
     }
 
     fn finishMaintenanceProbe(self: *OwnerRegistry, owner_id: u64) void {
+        var completed: ?*OwnerDrainSignal = null;
+        defer if (completed) |signal| signal.complete();
         self.mutex.lockUncancelable(self.sync_io);
         defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id) orelse {
@@ -1137,6 +1227,7 @@ const OwnerRegistry = struct {
         std.debug.assert(state.in_flight > 0);
         state.maintenance_probe_running = false;
         state.in_flight -= 1;
+        completed = takeDrainSignal(state);
         if (state.in_flight == 0) self.idle.broadcast(self.sync_io);
         if (!state.closing and !state.paused and state.maintenance_probe != null) {
             self.enqueueMaintenanceProbeLocked(owner_id, state);
@@ -1170,6 +1261,45 @@ const OwnerRegistry = struct {
         state.maintenance_probe = null;
         if (state.maintenance_probe_enqueued) self.unlinkMaintenanceProbeLocked(owner_id, state);
         return true;
+    }
+
+    fn beginDrain(self: *OwnerRegistry, owner_id: u64, original: @import("../common/read_admission.zig").Port) !OwnerDrain {
+        var prepared: ?*OwnerDrainSignal = null;
+        defer if (prepared) |signal| signal.drop();
+        while (true) {
+            try @import("../common/cleanup_wait.zig").lockIo(&self.mutex, self.sync_io, original);
+            var held = true;
+            defer if (held) self.mutex.unlock(self.sync_io);
+            try original.checkLifetime();
+            const state = self.states.getPtr(owner_id) orelse return .{};
+            state.closing = true;
+            state.maintenance_probe = null;
+            if (state.maintenance_probe_enqueued) self.unlinkMaintenanceProbeLocked(owner_id, state);
+            if (state.in_flight == 0) return .{};
+            if (state.drain_signal) |signal| {
+                signal.retain();
+                return signal.lease();
+            }
+            if (prepared) |signal| {
+                signal.retain(); // Registry completion owns an independent ref.
+                state.drain_signal = signal;
+                prepared = null;
+                return signal.lease();
+            }
+            // Allocation and parent accounting run outside the registry guard.
+            self.mutex.unlock(self.sync_io);
+            held = false;
+            try original.checkpoint();
+            prepared = try self.drain_alloc.create(OwnerDrainSignal);
+            prepared.?.* = .{ .allocator = self.drain_alloc, .io = self.sync_io };
+        }
+    }
+
+    fn takeDrainSignal(state: *State) ?*OwnerDrainSignal {
+        if (state.in_flight != 0) return null;
+        const signal = state.drain_signal;
+        state.drain_signal = null;
+        return signal;
     }
 
     fn quiesce(self: *OwnerRegistry, owner_id: u64) bool {
@@ -1226,7 +1356,7 @@ const OwnerRegistry = struct {
         defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id) orelse return;
         std.debug.assert(state.closing);
-        std.debug.assert(state.in_flight == 0);
+        std.debug.assert(state.in_flight == 0 and state.drain_signal == null);
         std.debug.assert(!state.maintenance_probe_enqueued);
         std.debug.assert(!state.maintenance_probe_running);
         std.debug.assert(!state.recovery_running and !state.recovery_enqueued and state.recovery_pending == null);
@@ -1355,6 +1485,7 @@ pub const BackendRuntime = struct {
         const owner_registry = try alloc.create(OwnerRegistry);
         errdefer alloc.destroy(owner_registry);
         owner_registry.* = OwnerRegistry.init(alloc);
+        if (runtime_memory) |memory| owner_registry.drain_alloc = memory.controlAllocator();
         if (config.borrowed_io) |borrowed| owner_registry.sync_io = borrowed.general;
         errdefer owner_registry.deinit();
         const retired_generation_cleanup_owner_id: u64 = if (shared) |binding| try binding.client.allocOwnerId() else 1;
@@ -2770,6 +2901,11 @@ const InlineDurableJobLane = struct {
         return owners.waitIdleSlice(owner_id);
     }
 
+    fn beginOwnerDrain(ptr: *anyopaque, owner_id: u64, original: @import("../common/read_admission.zig").Port) !OwnerDrain {
+        const self: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        return self.beginDrain(owner_id, original);
+    }
+
     fn quiesceOwner(ptr: *anyopaque, owner_id: u64) !bool {
         const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
         return owners.quiesce(owner_id);
@@ -2807,6 +2943,7 @@ const InlineDurableJobLane = struct {
 };
 
 const inline_vtable = DurableJobLane.VTable{
+    .begin_owner_drain = InlineDurableJobLane.beginOwnerDrain,
     .submit = InlineDurableJobLane.submit,
     .wait_owner = InlineDurableJobLane.waitOwner,
     .quiesce_owner = InlineDurableJobLane.quiesceOwner,
@@ -2842,6 +2979,10 @@ const UnsupportedDurableJobLane = struct {
     }
 
     fn waitOwner(_: *anyopaque, _: u64) !bool {
+        return error.UnsupportedPlatform;
+    }
+
+    fn beginOwnerDrain(_: *anyopaque, _: u64, _: @import("../common/read_admission.zig").Port) !OwnerDrain {
         return error.UnsupportedPlatform;
     }
 
@@ -2995,6 +3136,11 @@ const NativeDurableJobLane = struct {
     fn waitOwner(ptr: *anyopaque, owner_id: u64) !bool {
         const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
         return self.owners.waitIdleSlice(owner_id);
+    }
+
+    fn beginOwnerDrain(ptr: *anyopaque, owner_id: u64, original: @import("../common/read_admission.zig").Port) !OwnerDrain {
+        const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        return self.owners.beginDrain(owner_id, original);
     }
 
     fn quiesceOwner(ptr: *anyopaque, owner_id: u64) !bool {
@@ -3176,6 +3322,7 @@ const NativeDurableJobLane = struct {
 };
 
 const threaded_vtable = DurableJobLane.VTable{
+    .begin_owner_drain = ThreadedDurableJobLane.beginOwnerDrain,
     .submit = ThreadedDurableJobLane.submit,
     .wait_owner = ThreadedDurableJobLane.waitOwner,
     .quiesce_owner = ThreadedDurableJobLane.quiesceOwner,
@@ -5534,7 +5681,7 @@ test "maintenance runtime durable owner wait lends the sole ordinary execution s
     const F = struct {
         io: Io,
         execution: *native.Execution,
-        idle: *Io.Condition,
+        completion: ?*Io.Event = null,
         entered: Io.Event = .unset,
         ran: bool = false,
         retired: bool = false,
@@ -5544,9 +5691,9 @@ test "maintenance runtime durable owner wait lends the sole ordinary execution s
             self.entered.set(self.io);
             try self.execution.enter(.background);
             const until = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
-            // Release the payload only after the closer has actually blocked
-            // on the registry condition, rather than inferring from a sleep.
-            while (self.idle.state.load(.acquire).waiters == 0) {
+            // Observe the actual completion-event wait, without depending on
+            // the retired registry-condition implementation or a sleep guess.
+            while (@atomicLoad(Io.Event, self.completion.?, .acquire) != .waiting) {
                 if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
                 platform.time.yieldNow();
             }
@@ -5585,7 +5732,7 @@ test "maintenance runtime durable owner wait lends the sole ordinary execution s
             try self.execution.enter(.query);
         }
     };
-    var f: F = .{ .io = io, .execution = &producer, .idle = &runtime.ptr().owner_registry.idle };
+    var f: F = .{ .io = io, .execution = &producer };
     defer {
         closer.finish();
         lane.closeOwner(owner);
@@ -5594,10 +5741,208 @@ test "maintenance runtime durable owner wait lends the sole ordinary execution s
     try f.entered.wait(io);
     var control: Control = .{ .execution = &closer };
     var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    var observation = try lane.beginOwnerDrain(owner, .init(&payload));
+    defer observation.release();
+    runtime.ptr().owner_registry.mutex.lockUncancelable(runtime.ptr().owner_registry.sync_io);
+    f.completion = &runtime.ptr().owner_registry.states.getPtr(owner).?.drain_signal.?.done;
+    runtime.ptr().owner_registry.mutex.unlock(runtime.ptr().owner_registry.sync_io);
     try lane.quiesceOwnerWithAdmission(owner, .init(&payload));
     try std.testing.expect(f.ran and f.retired);
     try std.testing.expectEqual(@as(usize, 1), control.begins);
     try std.testing.expectEqual(@as(usize, 1), control.ends);
     try std.testing.expectEqual(native.State.running, cpu.state(&closer.entry.?));
     try std.testing.expectEqual(native.State.running, cpu.state(&health.entry.?));
+}
+
+test "maintenance runtime durable drain leases survive registry relocation and generation retirement" {
+    const admission = @import("../common/read_admission.zig");
+    const Mode = enum { job, recovery, probe };
+    for (std.enums.values(Mode)) |mode| {
+        var owners = OwnerRegistry.init(std.testing.allocator);
+        defer owners.deinit();
+        owners.sync_io = std.testing.io;
+        try owners.register(1);
+        const F = struct {
+            fn check(_: *anyopaque) !void {}
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn unexpected(_: *anyopaque) !void {
+                return error.NotFound;
+            }
+            fn run(_: *anyopaque) !void {}
+            fn retire(_: *anyopaque) void {}
+            fn probe(_: *anyopaque) void {}
+        };
+        var marker: u8 = 0;
+        const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &marker, .begin = F.unexpected, .end = F.unexpected } };
+        const control = admission.Port.init(&payload);
+        switch (mode) {
+            .job => try owners.beginJob(1),
+            .recovery => {
+                try owners.submitRecovery(.{ .owner_id = 1, .class = .recovery, .ptr = &marker, .run = F.run, .deinit = F.retire });
+                _ = owners.waitRecovery().?;
+            },
+            .probe => {
+                try owners.armMaintenanceProbe(1, .{ .ptr = &marker, .run = F.probe });
+                _ = owners.beginNextMaintenanceProbe().?;
+            },
+        }
+        var first = try owners.beginDrain(1, control);
+        defer first.release();
+        var second = try owners.beginDrain(1, control);
+        defer second.release();
+        try std.testing.expect(first.context == second.context and !first.ready());
+        // Moving hash-map values cannot move an existing observer's signal.
+        for (2..258) |id| try owners.register(id);
+        try std.testing.expect(!second.ready());
+        switch (mode) {
+            .job => owners.finishJob(1),
+            .recovery => owners.finishRecovery(1),
+            .probe => owners.finishMaintenanceProbe(1),
+        }
+        try std.testing.expect(first.ready() and second.ready());
+        owners.close(1);
+        try owners.register(1);
+        try owners.beginJob(1);
+        var replacement = try owners.beginDrain(1, control);
+        defer replacement.release();
+        try std.testing.expect(replacement.context != first.context and !replacement.ready());
+        first.release();
+        second.release();
+        owners.finishJob(1);
+        try std.testing.expect(replacement.ready());
+        owners.close(1);
+        try std.testing.expect(replacement.ready());
+    }
+}
+
+test "maintenance runtime durable drain metadata rejection retains unfenced ownership until reentry" {
+    const admission = @import("../common/read_admission.zig");
+    const Mode = enum { success, begin_failure, end_failure, expired };
+    for (std.enums.values(Mode)) |mode| {
+        var owners = OwnerRegistry.init(std.testing.allocator);
+        defer owners.deinit();
+        owners.sync_io = std.testing.io;
+        try owners.register(1);
+        const F = struct {
+            owners: *OwnerRegistry,
+            mode: Mode,
+            held: bool = true,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.mode == .expired and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.mode == .begin_failure) return error.NotFound;
+                self.owners.mutex.unlock(self.owners.sync_io);
+                self.held = false;
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                try std.testing.expect(self.owners.mutex.tryLock());
+                self.owners.mutex.unlock(self.owners.sync_io);
+                if (self.mode == .end_failure) return error.Canceled;
+            }
+        };
+        try std.testing.expect(owners.mutex.tryLock());
+        var f: F = .{ .owners = &owners, .mode = mode };
+        defer if (f.held) owners.mutex.unlock(owners.sync_io);
+        const payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.begin, .end = F.end } };
+        const control = admission.Port.init(&payload);
+        const result = owners.beginDrain(1, control);
+        var lease: OwnerDrain = if (mode == .success) try result else blk: {
+            try std.testing.expectError(switch (mode) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .expired => error.DeadlineExceeded,
+                else => unreachable,
+            }, result);
+            if (f.held) {
+                owners.mutex.unlock(owners.sync_io);
+                f.held = false;
+            }
+            try std.testing.expect(!owners.states.get(1).?.closing);
+            f.mode = .success;
+            break :blk try owners.beginDrain(1, control);
+        };
+        defer lease.release();
+        try std.testing.expect(lease.ready() and owners.states.get(1).?.closing);
+        try std.testing.expectEqual(@as(usize, 1), f.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_failure) 0 else 1), f.ends);
+    }
+}
+
+test "maintenance runtime durable drain allocation failure and abandoned observers preserve accepted jobs" {
+    const admission = @import("../common/read_admission.zig");
+    var owners = OwnerRegistry.init(std.testing.allocator);
+    defer owners.deinit();
+    owners.sync_io = std.testing.io;
+    try owners.register(1);
+    try owners.beginJob(1);
+    const F = struct {
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn unexpected(_: *anyopaque) !void {
+            return error.NotFound;
+        }
+    };
+    var marker: u8 = 0;
+    const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &marker, .begin = F.unexpected, .end = F.unexpected } };
+    const control = admission.Port.init(&payload);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    owners.drain_alloc = failing.allocator();
+    const rejected = owners.beginDrain(1, control);
+    owners.drain_alloc = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, rejected);
+    try std.testing.expect(owners.states.get(1).?.closing and owners.states.get(1).?.in_flight == 1);
+    try std.testing.expectError(error.BackgroundOwnerClosing, owners.beginJob(1));
+    var abandoned = try owners.beginDrain(1, control);
+    abandoned.release();
+    // The registry's independent signal ref remains until mandatory retirement.
+    try std.testing.expect(owners.states.get(1).?.drain_signal != null);
+    owners.finishJob(1);
+    owners.close(1);
+    var completed = try owners.beginDrain(1, control);
+    defer completed.release();
+    try std.testing.expect(completed.ready());
+}
+
+test "maintenance runtime controlled durable drain rejects a missing owning completion capability" {
+    const admission = @import("../common/read_admission.zig");
+    const F = struct {
+        legacy_calls: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn unexpected(_: *anyopaque) !void {
+            return error.NotFound;
+        }
+        fn submit(_: *anyopaque, _: Job) !void {}
+        fn close(_: *anyopaque, _: u64) void {}
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+        fn quiesce(raw: *anyopaque, _: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return true;
+        }
+    };
+    var f: F = .{};
+    const lane: DurableJobLane = .{ .ptr = &f, .vtable = &.{ .submit = F.submit, .drain_owner = F.close, .close_owner = F.close, .quiesce_owner = F.quiesce, .poll = F.poll } };
+    const payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.unexpected, .end = F.unexpected } };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, lane.quiesceOwnerWithAdmission(1, .init(&payload)));
+    try std.testing.expectEqual(@as(usize, 0), f.legacy_calls);
 }

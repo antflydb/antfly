@@ -1101,3 +1101,174 @@ test "execution services archive boundary ordered durable drain preserves depend
         try lane.quiesceOwnersWithAdmission(&ids, original);
     }
 }
+
+extern fn antfly_execution_fixture_drain_guard(*anyopaque, bool, bool) callconv(.c) void;
+extern fn antfly_execution_fixture_drain_try_guard(*anyopaque, bool) callconv(.c) bool;
+extern fn antfly_execution_fixture_drain_calls(*anyopaque) callconv(.c) usize;
+extern fn antfly_execution_fixture_drain_closing(*anyopaque) callconv(.c) bool;
+
+test "execution services archive boundary controlled drain lends CPU for both metadata guards" {
+    const Mode = enum { success, begin_failure, end_failure, expired };
+    for ([_]bool{ false, true }) |registry| for (std.enums.values(Mode)) |mode| {
+        var fixture: Fixture = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        var client = try services.Client.open(&fixture.offer);
+        defer client.close() catch @panic("scope close");
+        const scope = client.scope.?;
+        const lane = try client.durableJobs();
+        const owner = try client.allocOwnerId();
+        defer lane.closeOwner(owner);
+        const F = struct {
+            scope: *anyopaque,
+            registry: bool,
+            mode: Mode,
+            held: bool = true,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.mode == .expired and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.mode == .begin_failure) return error.NotFound;
+                antfly_execution_fixture_drain_guard(self.scope, self.registry, false);
+                self.held = false;
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                // Reentry occurs with neither producer-side guard held.
+                antfly_execution_fixture_drain_guard(self.scope, self.registry, true);
+                antfly_execution_fixture_drain_guard(self.scope, self.registry, false);
+                if (self.mode == .end_failure) return error.Canceled;
+            }
+            fn run(_: *anyopaque) !void {}
+            fn retire(_: *anyopaque) void {}
+        };
+        antfly_execution_fixture_drain_guard(scope, registry, true);
+        var f: F = .{ .scope = scope, .registry = registry, .mode = mode };
+        defer if (f.held) antfly_execution_fixture_drain_guard(scope, registry, false);
+        const admission = local.common_read_admission;
+        const payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.begin, .end = F.end } };
+        const original = admission.Port.init(&payload);
+        const result = lane.quiesceOwnerWithAdmission(owner, original);
+        if (mode == .success) try result else {
+            try std.testing.expectError(switch (mode) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .expired => error.DeadlineExceeded,
+                else => unreachable,
+            }, result);
+            if (f.held) {
+                antfly_execution_fixture_drain_guard(scope, registry, false);
+                f.held = false;
+            }
+            try std.testing.expectEqual(@as(usize, 0), antfly_execution_fixture_drain_calls(scope));
+            // Failed metadata reentry has not fenced this owner yet.
+            try lane.submit(.{ .owner_id = owner, .class = .maintenance, .ptr = &f, .run = F.run, .deinit = F.retire });
+            lane.drainOwner(owner);
+            f.mode = .success;
+            try lane.quiesceOwnerWithAdmission(owner, original);
+        }
+        try std.testing.expectEqual(@as(usize, 0), antfly_execution_fixture_drain_calls(scope));
+        try std.testing.expectEqual(@as(usize, 1), f.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_failure) 0 else 1), f.ends);
+    };
+}
+
+test "execution services archive boundary drain lease pins scope through lock-free release" {
+    var fixture: Fixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var client = try services.Client.open(&fixture.offer);
+    defer client.close() catch @panic("scope close");
+    const scope = client.scope.?;
+    const lane = try client.durableJobs();
+    const owner = try client.allocOwnerId();
+    const F = struct {
+        client: *services.Client,
+        entered: std.atomic.Value(bool) = .init(false),
+        permit: std.atomic.Value(bool) = .init(false),
+        retired: std.atomic.Value(bool) = .init(false),
+        closed: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+        fn run(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered.store(true, .release);
+            while (!self.permit.load(.acquire)) std.Thread.yield() catch {};
+        }
+        fn retire(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retired.store(true, .release);
+        }
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn unexpected(_: *anyopaque) !void {
+            return error.NotFound;
+        }
+        fn close(self: *@This()) void {
+            self.client.close() catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            self.closed.store(true, .release);
+        }
+    };
+    var f: F = .{ .client = &client };
+    defer {
+        f.permit.store(true, .release);
+        if (!f.closed.load(.acquire)) lane.closeOwner(owner);
+    }
+    try lane.submit(.{ .owner_id = owner, .class = .maintenance, .ptr = &f, .run = F.run, .deinit = F.retire });
+    try yieldUntil(&f.entered);
+    _ = antfly_execution_fixture_pressure(fixture.context.?, true);
+    defer _ = antfly_execution_fixture_pressure(fixture.context.?, false);
+    const admission = local.common_read_admission;
+    const payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.unexpected, .end = F.unexpected } };
+    var completion = try lane.beginOwnerDrain(owner, .init(&payload));
+    defer completion.release();
+    try std.testing.expect(!completion.ready());
+    try std.testing.expectEqual(@as(usize, 1), antfly_execution_fixture_drain_calls(scope));
+    var io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io.deinit();
+    var group: std.Io.Group = .init;
+    var guard_held = false;
+    defer {
+        if (guard_held) antfly_execution_fixture_drain_guard(scope, false, false);
+        f.permit.store(true, .release);
+        completion.release();
+        group.await(io.io()) catch unreachable;
+    }
+    try group.concurrent(io.io(), F.close, .{&f});
+    const end = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!antfly_execution_fixture_drain_closing(scope)) {
+        if (@import("antfly_platform").time.monotonicNs() >= end) return error.Timeout;
+        try io.io().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(!f.closed.load(.acquire));
+    f.permit.store(true, .release);
+    try yieldUntil(&f.retired);
+    while (!completion.ready()) {
+        if (@import("antfly_platform").time.monotonicNs() >= end) return error.Timeout;
+        try io.io().sleep(.fromMilliseconds(1), .awake);
+    }
+    while (!antfly_execution_fixture_drain_try_guard(scope, false)) {
+        if (@import("antfly_platform").time.monotonicNs() >= end) return error.Timeout;
+        try io.io().sleep(.fromMilliseconds(1), .awake);
+    }
+    guard_held = true;
+    completion.release();
+    try std.testing.expectEqual(@as(usize, 0), antfly_execution_fixture_drain_calls(scope));
+    antfly_execution_fixture_drain_guard(scope, false, false);
+    guard_held = false;
+    try group.await(io.io());
+    try std.testing.expect(f.closed.load(.acquire) and !f.failed.load(.acquire));
+}

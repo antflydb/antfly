@@ -316,7 +316,7 @@ const Scope = struct {
     changed: std.Io.Condition = .init,
     closing: bool = false,
     maintenance_closing: bool = false,
-    calls: usize = 0,
+    calls: std.atomic.Value(usize) = .init(0),
     resources: usize = 0,
     resource_head: ?*Token = null,
     io_slots: [@typeInfo(Purpose).@"enum".field_names.len]?std.Io = @splat(null),
@@ -329,14 +329,21 @@ const Scope = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.closing and !cleanup) return error.BackendRuntimeShuttingDown;
-        self.calls += 1;
+        _ = self.calls.fetchAdd(1, .monotonic);
     }
     fn end(self: *Scope) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        std.debug.assert(self.calls > 0);
-        self.calls -= 1;
-        self.changed.broadcast(self.io);
+        // The last decrement may permit physical scope destruction. No guard,
+        // notification or other access to self may follow it.
+        const previous = self.calls.fetchSub(1, .release);
+        std.debug.assert(previous != 0);
+    }
+    fn waitChangedLocked(self: *Scope) void {
+        // Calls retire without the scope mutex. A finite notification slice
+        // also covers a decrement racing predicate observation and waiter
+        // registration, without touching scope memory after the final release.
+        const protection = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(protection);
+        self.changed.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch {};
     }
     fn ownsLocked(self: *const Scope, owner: u64) bool {
         return std.mem.indexOfScalar(u64, self.owners.items, owner) != null;
@@ -424,7 +431,7 @@ const Scope = struct {
         try stopMaintenance(raw);
         self.mutex.lockUncancelable(self.io);
         self.closing = true;
-        while (self.calls != 0) self.changed.waitUncancelable(self.io, &self.mutex);
+        while (self.calls.load(.acquire) != 0) self.waitChangedLocked();
         self.mutex.unlock(self.io);
         // Registrations stop growing once closing is published. Never hold the
         // scope mutex across a join: a job may close a nested owner here.
@@ -434,7 +441,7 @@ const Scope = struct {
         const self = cast(raw);
         try quiesce(raw);
         self.mutex.lockUncancelable(self.io);
-        while (self.calls != 0 or self.resources != 0) self.changed.waitUncancelable(self.io, &self.mutex);
+        while (self.calls.load(.acquire) != 0 or self.resources != 0) self.waitChangedLocked();
         self.mutex.unlock(self.io);
         const allocator = self.allocator;
         var retention = self.retention;
@@ -742,6 +749,66 @@ const Scope = struct {
             .reopen => try self.runtime.durable_jobs.reopenOwner(id),
         }
     }
+    const Drain = struct {
+        scope: *Scope,
+        allocator: Allocator,
+        inner: background.OwnerDrain,
+        fn ready(raw: ?*anyopaque) bool {
+            const self: *Drain = @ptrCast(@alignCast(raw.?));
+            return self.inner.ready();
+        }
+        fn wait(raw: ?*anyopaque) !void {
+            const self: *Drain = @ptrCast(@alignCast(raw.?));
+            try self.inner.wait();
+        }
+        fn release(raw: ?*anyopaque) void {
+            const self: *Drain = @ptrCast(@alignCast(raw.?));
+            const scope = self.scope;
+            const allocator = self.allocator;
+            self.inner.release();
+            allocator.destroy(self);
+            scope.end();
+        }
+    };
+    fn beginOwnerDrain(raw: *anyopaque, id: u64, original: @import("../common/read_admission.zig").Port) !background.OwnerDrain {
+        const self = cast(raw);
+        try @import("../common/cleanup_wait.zig").lockIo(&self.mutex, self.io, original);
+        var held = true;
+        defer if (held) self.mutex.unlock(self.io);
+        // Owner membership remains checked on the producing side. Large
+        // scopes respect the original lifetime without yielding under a guard.
+        var owns = false;
+        for (self.owners.items) |owner_id| {
+            try original.checkLifetime();
+            if (owner_id == id) {
+                owns = true;
+                break;
+            }
+        }
+        if (!owns) return error.BackgroundOwnerClosed;
+        _ = self.calls.fetchAdd(1, .monotonic);
+        self.mutex.unlock(self.io);
+        held = false;
+        var retained = true;
+        errdefer if (retained) self.end();
+        try original.checkpoint();
+        var inner = try self.runtime.durable_jobs.beginOwnerDrain(id, original);
+        errdefer inner.release();
+        if (inner.ready()) {
+            inner.release();
+            retained = false;
+            self.end();
+            return .{};
+        }
+        // Pending cleanup metadata uses reserved control storage. Ready owners
+        // need no allocation, even when ordinary memory is exhausted.
+        const allocator = if (self.runtime.runtime_memory) |memory| memory.controlAllocator() else self.allocator;
+        const token = try allocator.create(Drain);
+        token.* = .{ .scope = self, .allocator = allocator, .inner = inner };
+        retained = false;
+        return .init(token, Drain.ready, Drain.wait, Drain.release);
+    }
+
     fn waitOwner(raw: *anyopaque, id: u64) !bool {
         const self = cast(raw);
         try self.begin(true);
@@ -869,6 +936,7 @@ const Token = struct {
     }
 };
 const threaded_jobs: background.DurableJobLane.VTable = .{
+    .begin_owner_drain = Scope.beginOwnerDrain,
     .submit = Scope.submit,
     .wait_owner = Scope.waitOwner,
     .quiesce_owner = Scope.quiesceOwner,
@@ -916,3 +984,34 @@ const producer_methods: Methods = .{
     .install_sql = Scope.installSql,
     .pdf_stats = Scope.pdfStats,
 };
+
+/// Independently compiled qualification fixture access; no production method
+/// table exposes these raw scope guards.
+pub fn qualifyDrainGuard(raw: *anyopaque, registry: bool, acquire: bool) void {
+    const root = @import("root");
+    if (!@hasDecl(root, "consumer_tests_only") or !root.consumer_tests_only) @compileError("qualification fixture only");
+    const self = Scope.cast(raw);
+    const mutex = if (registry) &self.runtime.owner_registry.mutex else &self.mutex;
+    const io = if (registry) self.runtime.owner_registry.sync_io else self.io;
+    if (acquire) std.debug.assert(mutex.tryLock()) else mutex.unlock(io);
+}
+pub fn qualifyDrainCalls(raw: *anyopaque) usize {
+    const root = @import("root");
+    if (!@hasDecl(root, "consumer_tests_only") or !root.consumer_tests_only) @compileError("qualification fixture only");
+    return Scope.cast(raw).calls.load(.acquire);
+}
+pub fn qualifyDrainClosing(raw: *anyopaque) bool {
+    const root = @import("root");
+    if (!@hasDecl(root, "consumer_tests_only") or !root.consumer_tests_only) @compileError("qualification fixture only");
+    const self = Scope.cast(raw);
+    if (!self.mutex.tryLock()) return false;
+    defer self.mutex.unlock(self.io);
+    return self.closing;
+}
+
+pub fn qualifyDrainTryGuard(raw: *anyopaque, registry: bool) bool {
+    const root = @import("root");
+    if (!@hasDecl(root, "consumer_tests_only") or !root.consumer_tests_only) @compileError("qualification fixture only");
+    const self = Scope.cast(raw);
+    return if (registry) self.runtime.owner_registry.mutex.tryLock() else self.mutex.tryLock();
+}

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Independently compiled producer for the native execution-services contract.
 const std = @import("std");
@@ -155,4 +155,18 @@ export fn antfly_execution_fixture_transaction_runtime(runtime_contract: *const 
     const factory = server.borrowedConfig(&config).factory.?;
     out.* = factory.create(factory.ptr, allocator.asStd(), store.*, backend, .{ .resolution_extra_hooks = .{}, .local_resolution_ctx = null, .resolve_local_fn = null }) catch |cause| return status.statusFromError(cause);
     return .ok;
+}
+
+export fn antfly_execution_fixture_drain_guard(scope: *anyopaque, registry: bool, acquire: bool) callconv(.c) void {
+    services.qualifyDrainGuard(scope, registry, acquire);
+}
+export fn antfly_execution_fixture_drain_calls(scope: *anyopaque) callconv(.c) usize {
+    return services.qualifyDrainCalls(scope);
+}
+export fn antfly_execution_fixture_drain_closing(scope: *anyopaque) callconv(.c) bool {
+    return services.qualifyDrainClosing(scope);
+}
+
+export fn antfly_execution_fixture_drain_try_guard(scope: *anyopaque, registry: bool) callconv(.c) bool {
+    return services.qualifyDrainTryGuard(scope, registry);
 }

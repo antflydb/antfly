@@ -24037,3 +24037,63 @@ attempt was superseded during compilation to preserve mandatory joins until
 fixture retirement checks succeed. The final run includes the corrected fixture
 and expanded protected-cleanup regression. Full GNU/Linux qualification was not
 run, as previously waived; the full design remains unfinished.
+
+### Owning durable-drain observations and admitted metadata guards
+
+Controlled durable-owner drainage now acquires registry and producing-scope
+metadata guards through the original finite execution control. It fences the
+owner and returns an owning completion observation. Waiting reads an atomic event
+and uses the producer's event wait, without reacquiring either metadata guard
+while CPU is parked. The original lifetime is checked around each finite wait and
+original reentry still precedes a successful return. Unsupported producers fail
+closed instead of falling back to the uncontrolled metadata operations.
+
+A pending owner shares one separately allocated signal among observers. The
+registry and each observer own independent references. Jobs, finite recovery
+steps and maintenance probes detach and complete that signal when the last
+accepted callback and payload retirement finish. Notification and final memory
+release happen after the registry guard is released. Hash-map relocation,
+physical owner retirement and later ID reuse do not change existing observations.
+Rejected waits release only their observation; mandatory accepted work retains
+its signal until retirement. Neither signals nor scoped wrappers store original
+admission controls or create a new execution lifetime.
+
+Ready owners need no new allocation. Pending signals and scoped observation
+wrappers use reserved control storage, retaining cleanup progress when ordinary
+memory is exhausted. A scoped observation pins its producing scope until signal
+and wrapper retirement complete. Scope calls now retire through an atomic final
+decrement, with no scope access or lock after the last release. Scope destruction
+uses finite notification slices under cancellation protection to cover a final
+call decrement racing waiter registration. Native ABI 94 and storage-owner ABI
+154 fence the changed capability, scope counter and owner metadata layouts.
+
+The legacy unadmitted registry/scope operations remain separate compatibility
+paths. Other runtime metadata operations, physical backend teardown, callback
+I/O/CPU cooperation, explicit runnable adoption, remaining parent metadata
+charging and broader cross-engine/fault/default-policy gates remain unfinished.
+Strong required providers remain disabled. The full goal remains active; full
+GNU/Linux qualification remains waived and Linux requires pinned Nix/glibc Zig.
+
+Pinned Darwin Debug foundation receipt `durable-drain-signals-v3` passes all 62
+build steps and 86 tests: 63 maintenance and 23 execution-service cases. The new
+cases cover shared signal coalescing, hash-map relocation, retired/reused owner
+IDs, job/recovery/probe completion, abandoned observers, allocation rejection and
+missing-capability refusal. The archive matrix exercises both producer-side
+metadata guards with successful, rejected and expired handoff/reentry. A concurrent
+scope-close test exhausts ordinary parent memory, retains a pending observation
+from reserved control storage, and releases the final pin while the scope mutex
+is held. Scope destruction completes without a scope-lock acquisition on release.
+
+The same source state passes all 73 steps in `durable-drain-signals-v4`, including
+two fresh linked C-entry close tests and the unchanged qualified metadata/archive
+artifacts. The simple runners pass 29 DB/finalization/cache/dependency and 21
+local-close cases without skips, failures or leaks. Error ABI (45), released
+status ABI (1) and failure identity (8) pass. Both receipts' 5,537 native/schema
+input hashes match the final source. The linked close regression continues to
+lend the protected cleanup CPU through accepted backend payload retirement.
+
+Intermediate receipts retain the constructor naming correction and two fixture
+updates: the ordinary-slot test observes the new completion event rather than
+the old registry condition, and the scope-pin test retries acquisition against a
+concurrently closing thread. Full GNU/Linux qualification remains waived; the
+full design remains unfinished.
