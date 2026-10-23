@@ -409,14 +409,19 @@ Scheduler version three installs these internal bindings through a resumable
 backfill, reusing unchanged embeddings before acknowledging indexed readiness.
 Bindings are retired with their entity or when discovery is disabled.
 
-Scheduler version four adds a query-role vector to each names/view projection.
+Scheduler version five splits query-role artifacts from names/view ANN documents.
 The owner builds both document and query roles for the same exact text and
 qualified model, outside writer leases and under the existing dependency and
 publication fences. The document role is checkpointed before invoking the query
 role, so a timeout or upgrade never forces a successful document embedding to be
-recomputed. Version-three projections remain unready during a resumable backfill;
-valid document vectors are reused. Query vectors are private derived payloads,
-not additional ANN indexes. They retire and invalidate with their projection.
+recomputed. Earlier projections remain unready during a resumable backfill;
+valid document vectors and version-four inline query vectors are reused. New ANN documents
+carry only their document-role vector; query-role vectors live in companion
+`entity-semantic-query/` records with the same complete entity, model, generation,
+view and dependency provenance. Candidate reads load only the seed’s companions.
+Both records are included in dependency manifests, retire together, and are
+validated against the live view independently of physical cleanup. Companion
+records create no additional ANN index.
 Ready candidate pages, including continuations, need no provider calls. They
 still render and authorize live views and validate the projection provenance
 before using either vector; no authorization decision is cached across requests.
@@ -433,10 +438,46 @@ assertions, evidence, entities, and projections within an operation, replaying
 assertion dependency and expiry/validity tracking on every cache hit. Overlay
 writes invalidate the affected decoded value; rollback clears all decoded values.
 
+Candidate projection, entity, lexical posting hydration and related-assertion
+reads use bounded batches of at most 64 exact document IDs. Routed hydration
+uses the shared table read-index query path and its key-owner routing, deadlines,
+cancellation and primary document hydration. Whole-source batches explicitly use
+the private `lookup` mode, so internal control/support rows have the same
+visibility and exact payloads as point lookup after reopen. Public query
+admission rejects this control. Primary hydration performs a sorted multi-get
+on the requested keys under the admitted primary read cut, preserving owner
+ranges, expiry and deduplication. Ordinary bounded positive-ID queries also
+probe only requested identities in the captured generation, preserving owner
+ranges and page bounds instead of scanning the primary population. Speculative prefetch is capped at four batches per frontier
+so wide support sets still reach policy work limits before loading excessive
+data. Embedded hydration uses the same native exact-ID plan. Missing rows remain missing and grants/provenance are
+checked by policy after hydration. These data-only snapshots never supply CAS
+versions or replace final publication reads. Hydration memoizes record data
+within the operation; policy authorization remains live. Envelope and routed source decoding validates JSON and borrows exact
+value slices, preserving numeric lexemes without constructing a payload DOM or
+serializing it a second time. Transport-owned buffers are copied before release.
+
+The native ABI ANN qualification accepts `ANTFLY_MEMORY_QUALIFY_SCALE` (up to
+10,000 entities) and `ANTFLY_MEMORY_QUALIFY_DIMS` (up to 1,536 dimensions) when
+launching its test executable. Routine runs use 128 entities and two dimensions.
+The fixture exercises real native vector indexes, routed encoding and primary
+hydration with a deterministic provider; it measures bounded retrieval work and
+payload cost separately from model quality.
+
+Debug retrieval qualification for this implementation:
+
+| Seeds | Dimensions | Bounded ANN calls | Full entity scans | Retrieval time |
+| ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 2 | 20,000 | 0 | 430,254 ms |
+| 128 | 1,536 | 256 | 0 | 8,676 ms |
+
 The transaction overlay retains its ordered commit list and a key-to-position
 index, making exact reads, replacements and deletions expected constant time
-instead of scanning every pending write. Rollback reconstructs the index from
-the checkpoint. Canonical identity components are built alongside the redirect
+instead of scanning every pending write. An ordered live-key tree also seeks
+prefix ranges in O(log W + K), where W is pending writes and K is the bounded
+matching window. Overlay scans merge replacements and tombstones into sorted,
+limited pages; unrelated writes are never visited. Rollback reconstructs both
+indexes from the checkpoint. Canonical identity components are built alongside the redirect
 index and reused by member lookups; policy replacement, deletion, rollback and
 final-publication snapshot reconstruction invalidate that derived membership.
 These optimizations add no separate store or public wire contract.

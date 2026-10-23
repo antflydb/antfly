@@ -92,6 +92,8 @@ pub const NeighborRequest = struct { index: []const u8, vector: []const f32, lim
 pub const Backend = struct {
     ptr: *anyopaque,
     get: *const fn (*anyopaque, A, []const u8) anyerror!?Row,
+    // Bounded data-only hydration; never used for control CAS tokens.
+    get_many: ?*const fn (*anyopaque, A, []const []const u8) anyerror![]const ?Row = null,
     scan: *const fn (*anyopaque, A, []const u8, ?[]const u8, u32) anyerror!Page,
     commit: *const fn (*anyopaque, A, ?Row, []const Change) anyerror!void,
     // Model integration must use Antfly's admitted provider/runtime. No model
@@ -365,6 +367,12 @@ pub const Service = struct {
 };
 
 const Run = struct {
+    const ChangeTree = std.Treap([]const u8, struct {
+        fn order(a: []const u8, b: []const u8) std.math.Order {
+            return std.mem.order(u8, a, b);
+        }
+    }.order);
+
     const ResourceRead = struct { reference: prov.Resource, snapshot: prov.Snapshot, epoch: u64 };
     const ResourceSet = std.StringHashMapUnmanaged(void);
     service: Service,
@@ -373,6 +381,7 @@ const Run = struct {
     lexical_query: ?lexical.PreparedQuery = null,
     state: t.State = undefined,
     state_row: ?Row = null,
+    change_ranges: ChangeTree = .{},
     changes: std.ArrayList(Change) = .empty,
     change_positions: std.StringHashMapUnmanaged(usize) = .empty,
     assertion_rows: std.StringHashMapUnmanaged(t.StoredAssertion) = .empty,
@@ -455,11 +464,19 @@ const Run = struct {
             try self.change_positions.put(self.a, owned, self.changes.items.len);
             try self.changes.append(self.a, .{ .key = owned, .json = json });
         }
+        const owned = self.changes.items[self.change_positions.get(path).?].key;
+        var entry = self.change_ranges.getEntryFor(owned);
+        if (json == null) {
+            entry.set(null);
+        } else if (entry.node == null) {
+            entry.set(try self.a.create(ChangeTree.Node));
+        }
     }
     // Rollback must restore the lookup index and every decoded overlay value.
     fn resetChanges(self: *Run, checkpoint: []const Change) !void {
         self.changes.clearRetainingCapacity();
         self.change_positions.clearRetainingCapacity();
+        self.change_ranges = .{};
         self.assertion_rows.clearRetainingCapacity();
         self.evidence_rows.clearRetainingCapacity();
         self.entity_rows.clearRetainingCapacity();
@@ -479,6 +496,37 @@ const Run = struct {
         const json = if (row) |value| value.json else null;
         try self.backend_rows.put(self.a, try self.a.dupe(u8, path), json);
         return if (json) |value| try self.parseRead(T, path, value) else null;
+    }
+    fn prefetch(self: *Run, paths: []const []const u8) !void {
+        var batch: std.ArrayList([]const u8) = .empty;
+        var seen: ResourceSet = .empty;
+        for (paths) |path| {
+            if (self.change_positions.contains(path) or self.backend_rows.contains(path) or seen.contains(path)) continue;
+            try seen.put(self.a, path, {});
+            try batch.append(self.a, path);
+            // Hydration is speculative. Wide support sets must still reach
+            // ordinary policy work/dependency budgets before loading a corpus.
+            if (batch.items.len == 256) break;
+        }
+        var offset: usize = 0;
+        while (offset < batch.items.len) {
+            try self.service.context.check();
+            const chunk = batch.items[offset..@min(offset + 64, batch.items.len)];
+            if (self.service.backend.get_many) |get_many| {
+                const rows = try get_many(self.service.backend.ptr, self.a, chunk);
+                if (rows.len != chunk.len) return error.MemoryCorruptState;
+                for (chunk, rows) |path, row| {
+                    if (row) |value| if (!eql(u8, path, value.key)) return error.MemoryCorruptState;
+                    try self.backend_rows.put(self.a, try self.a.dupe(u8, path), if (row) |value| value.json else null);
+                }
+            } else {
+                for (chunk) |path| {
+                    const row = try self.service.backend.get(self.service.backend.ptr, self.a, path);
+                    try self.backend_rows.put(self.a, try self.a.dupe(u8, path), if (row) |value| value.json else null);
+                }
+            }
+            offset += chunk.len;
+        }
     }
     fn decodedRows(self: *Run, comptime T: type) *std.StringHashMapUnmanaged(T) {
         if (T == t.StoredAssertion) return &self.assertion_rows;
@@ -1709,10 +1757,12 @@ const Run = struct {
         var before = self.*;
         before.changes = .empty;
         before.change_positions = .empty;
+        before.change_ranges = .{};
         before.assertion_rows = .empty;
         before.evidence_rows = .empty;
         before.entity_rows = .empty;
         before.projection_rows = .empty;
+        before.backend_rows = .empty;
         before.identity_members = .empty;
         before.identity_policy = null;
         before.identity_index = null;
@@ -2121,6 +2171,12 @@ const Run = struct {
             const page = try self.scanOverlay(prefix, null, @intCast(limit - scanned - 1));
             scanned += page.rows.len + 1;
             complete = complete and page.next == null;
+            var paths: std.ArrayList([]const u8) = .empty;
+            for (page.rows) |row| {
+                const entry = try parse(struct { child: []const u8 }, self.a, row.json);
+                try paths.append(self.a, try key(self.a, "assertion", entry.child));
+            }
+            try self.prefetch(paths.items);
             for (page.rows) |row| {
                 const entry = try parse(struct { child: []const u8 }, self.a, row.json);
                 const record = (try self.assertion(entry.child)) orelse continue;
@@ -2412,6 +2468,23 @@ const Run = struct {
             if (remove_index) try self.remove(path) else try self.put(path, .{ .id = record.entity.id });
         }
     }
+    fn candidateBindingRows(self: *Run, bindings: []const Row) ![]const Row {
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (bindings) |row| {
+            const binding = try parse(struct { id: []const u8 }, self.a, row.json);
+            try paths.append(self.a, try key(self.a, "entity", binding.id));
+        }
+        try self.prefetch(paths.items);
+        return self.cachedRows(paths.items);
+    }
+    fn cachedRows(self: *Run, paths: []const []const u8) ![]const Row {
+        var rows: std.ArrayList(Row) = .empty;
+        for (paths) |path| {
+            const json = if (self.change_positions.get(path)) |position| self.changes.items[position].json else self.backend_rows.get(path) orelse null;
+            if (json) |value| try rows.append(self.a, .{ .key = path, .json = value });
+        }
+        return rows.items;
+    }
     // Each page examines at most 64 postings, independently of space size.
     // Term position and physical posting position both survive continuation.
     fn candidatePage(self: *Run, seed: t.EntityRecord, request: t.EntityCandidateRequest) !Page {
@@ -2433,12 +2506,7 @@ const Run = struct {
             const after = if (position) |value| value[scope.len..] else null;
             if (after) |value| if (!std.mem.startsWith(u8, value, prefix)) return error.InvalidMemoryCursor;
             const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, after, 64);
-            var rows: std.ArrayList(Row) = .empty;
-            for (page.rows) |row| {
-                const binding = try parse(struct { id: []const u8 }, self.a, row.json);
-                if (try self.service.backend.get(self.service.backend.ptr, self.a, try key(self.a, "entity", binding.id))) |entity_row| try rows.append(self.a, entity_row);
-            }
-            return .{ .rows = rows.items, .next = if (page.next) |next| try std.fmt.allocPrint(self.a, "{s}{s}", .{ scope, next }) else null };
+            return .{ .rows = try self.candidateBindingRows(page.rows), .next = if (page.next) |next| try std.fmt.allocPrint(self.a, "{s}{s}", .{ scope, next }) else null };
         }
         const terms = try self.a.alloc([]const u8, name_terms.len + 1);
         @memcpy(terms[0..name_terms.len], name_terms);
@@ -2460,11 +2528,10 @@ const Run = struct {
             if (after) |value| if (!std.mem.startsWith(u8, value, prefix)) return error.InvalidMemoryCursor;
             const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, after, 64 - examined);
             examined += @intCast(page.rows.len);
-            for (page.rows) |row| {
-                const binding = try parse(struct { id: []const u8 }, self.a, row.json);
-                if (seen.contains(binding.id)) continue;
-                try seen.put(self.a, binding.id, {});
-                if (try self.service.backend.get(self.service.backend.ptr, self.a, try key(self.a, "entity", binding.id))) |entity_row| try rows.append(self.a, entity_row);
+            for (try self.candidateBindingRows(page.rows)) |row| {
+                if (seen.contains(row.key)) continue;
+                try seen.put(self.a, row.key, {});
+                try rows.append(self.a, row);
             }
             after = page.next;
             if (after == null) term += 1;
@@ -2478,6 +2545,9 @@ const Run = struct {
         if (try self.canonical(id)) |selected| if (!eql(u8, selected, id)) {
             try self.put(try key(self.a, "entity-semantic-work", selected), .{ .id = selected });
         };
+    }
+    fn semanticQueryKey(self: *Run, record: t.EntityRecord, kind: t.ProjectionKind) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "entity-semantic-query/{s}/{s}", .{ try self.semanticIndexName(record, kind), try hash(self.a, record.entity.id) });
     }
     fn semanticProjectionKey(self: *Run, record: t.EntityRecord, kind: t.ProjectionKind) ![]const u8 {
         return std.fmt.allocPrint(self.a, "entity-semantic/{s}/{s}", .{ try self.semanticIndexName(record, kind), try hash(self.a, record.entity.id) });
@@ -2579,6 +2649,8 @@ const Run = struct {
         inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
             const path = try self.semanticProjectionKey(record, kind);
             if (try self.read(t.EntityProjection, path) != null) try self.remove(path);
+            const query_path = try self.semanticQueryKey(record, kind);
+            if (try self.read(t.EntityProjection, query_path) != null) try self.remove(query_path);
         }
     }
     const SemanticTimer = struct { id: []const u8, at: i64 };
@@ -2718,8 +2790,11 @@ const Run = struct {
         // derived publications, including a currently unavailable branch.
         self.inferred = true;
         if (captured.result.view) |view| {
-            const paths = try self.a.alloc([]const u8, 2);
-            inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }, 0..) |kind, i| paths[i] = try self.semanticProjectionKey(record, kind);
+            const paths = try self.a.alloc([]const u8, 4);
+            inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }, 0..) |kind, i| {
+                paths[2 * i] = try self.semanticProjectionKey(record, kind);
+                paths[2 * i + 1] = try self.semanticQueryKey(record, kind);
+            }
             try self.semanticBindings(record.entity.id, captured.resources, paths, self.semantic_assertions);
             // A partially materialized entity retains its dependency and
             // temporal fences, but cannot certify generation readiness.
@@ -2727,7 +2802,9 @@ const Run = struct {
             inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
                 const path = try self.semanticProjectionKey(record, kind);
                 const existing = try self.read(t.EntityProjection, path);
-                if (existing == null or existing.?.query_embedding == null or !try self.semanticCurrent(existing.?, record, view)) {
+                const query_path = try self.semanticQueryKey(record, kind);
+                const query_prior = try self.read(t.EntityProjection, query_path);
+                if (existing == null or existing.?.query_embedding != null or !try self.semanticCurrent(existing.?, record, view) or query_prior == null or !try self.semanticCurrent(query_prior.?, record, view)) {
                     const text = if (kind == .names) try self.semanticNames(record.entity) else view.description;
                     const model = self.state.config.models.embedder.?;
                     const index_name = try self.semanticIndexName(record, kind);
@@ -2738,18 +2815,24 @@ const Run = struct {
                     };
                     if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
                     for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
-                    var projection: t.EntityProjection = .{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = embedding, .query_embedding = if (reusable) existing.?.query_embedding else null };
+                    const projection: t.EntityProjection = .{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = embedding };
                     // Checkpoint the document role before another provider call.
                     // Legacy backfills and retries never recompute that vector.
-                    if (existing == null or !try self.semanticCurrent(existing.?, record, view)) {
+                    if (existing == null or existing.?.query_embedding != null or !try self.semanticCurrent(existing.?, record, view)) {
                         try self.put(path, projection);
                         progressed.* = true;
                     }
-                    if (projection.query_embedding == null) {
-                        projection.query_embedding = try self.semanticEmbedding(record, model, text, captured.resources, progressed.*, true);
-                        try self.put(path, projection);
-                        progressed.* = true;
-                    }
+                    var query_projection = projection;
+                    query_projection.embedding = if (reusable and existing.?.query_embedding != null)
+                        existing.?.query_embedding.?
+                    else if (query_prior != null and query_prior.?.generation == projection.generation and eql(u8, query_prior.?.text, text) and eql(u8, try self.encode(query_prior.?.model), try self.encode(model)))
+                        query_prior.?.embedding
+                    else
+                        try self.semanticEmbedding(record, model, text, captured.resources, progressed.*, true);
+                    if (query_projection.embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
+                    for (query_projection.embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
+                    try self.put(query_path, query_projection);
+                    progressed.* = true;
                 }
             }
         } else {
@@ -2825,7 +2908,9 @@ const Run = struct {
             if (!try self.semanticCurrent(projection, seed, view)) return result;
             // Both roles were built under the same source/model fences. Ready
             // pages never call a provider, including lexical continuations.
-            const query = projection.query_embedding orelse return result;
+            const query_projection = (try self.read(t.EntityProjection, try self.semanticQueryKey(seed, kind))) orelse return result;
+            if (query_projection.kind != kind or !try self.semanticCurrent(query_projection, seed, view)) return result;
+            const query = query_projection.embedding;
             if (query.len != projection.embedding.len) return error.MemoryCorruptState;
             const self_score = try cosine(query, projection.embedding);
             if (!std.math.isFinite(self_score) or self_score <= 0) return result;
@@ -2848,6 +2933,24 @@ const Run = struct {
                     else => return err,
                 };
                 if (request.cursor == null and neighbors.len > self.state.config.semantic_discovery.neighbors) return error.MemoryCorruptState;
+                var paths: std.ArrayList([]const u8) = .empty;
+                for (neighbors) |neighbor| {
+                    const normalized = neighbor.similarity / self_score;
+                    const threshold = if (kind == .names) self.state.config.semantic_discovery.name_threshold else self.state.config.semantic_discovery.view_threshold;
+                    if (std.math.isFinite(normalized) and normalized >= threshold) try paths.append(self.a, neighbor.key);
+                }
+                try self.prefetch(paths.items);
+                const projection_paths = paths.items;
+                paths = .empty;
+                for (projection_paths) |path| if (try self.read(t.EntityProjection, path)) |other| {
+                    if (other.kind == kind) try paths.append(self.a, try key(self.a, "entity", other.entity_id));
+                };
+                try self.prefetch(paths.items);
+                var supports: std.ArrayList([]const u8) = .empty;
+                for (paths.items) |path| if (try self.read(t.EntityRecord, path)) |record| {
+                    for (record.entity.evidence) |ref| try supports.append(self.a, try key(self.a, "evidence", ref.id));
+                };
+                try self.prefetch(supports.items);
                 for (neighbors) |neighbor| {
                     if (!std.math.isFinite(neighbor.similarity)) continue;
                     const similarity = neighbor.similarity / self_score;
@@ -2916,9 +3019,10 @@ const Run = struct {
         var lexical_request = request;
         lexical_request.cursor = try self.encodeCursor(lexical_scope, continuation.lexical);
         const page = if (continuation.pending.len != 0) blk: {
-            var rows: std.ArrayList(Row) = .empty;
-            for (continuation.pending) |ref| if (try self.service.backend.get(self.service.backend.ptr, self.a, try key(self.a, "entity", ref.id))) |row| try rows.append(self.a, row);
-            break :blk Page{ .rows = rows.items, .next = continuation.lexical };
+            var paths: std.ArrayList([]const u8) = .empty;
+            for (continuation.pending) |ref| try paths.append(self.a, try key(self.a, "entity", ref.id));
+            try self.prefetch(paths.items);
+            break :blk Page{ .rows = try self.cachedRows(paths.items), .next = continuation.lexical };
         } else try self.candidatePage(seed, lexical_request);
         var rendered: std.StringHashMapUnmanaged(t.EntityView) = .empty;
         const semantic = try self.semanticCandidates(seed, request, continuation.pending, &rendered);
@@ -2936,6 +3040,14 @@ const Run = struct {
             try candidate_ids.put(self.a, record.entity.id, {});
             try candidate_records.append(self.a, record);
         }
+        var candidate_paths: std.ArrayList([]const u8) = .empty;
+        for (candidate_records.items) |candidate| {
+            for (candidate.entity.evidence) |ref| try candidate_paths.append(self.a, try key(self.a, "evidence", ref.id));
+            if (semantic.state == .indexed) inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
+                try candidate_paths.append(self.a, try self.semanticProjectionKey(candidate, kind));
+            };
+        }
+        try self.prefetch(candidate_paths.items);
         const seed_distinctions = try self.declaredDistinct(id);
         const seed_view = try self.candidateView(&rendered, id);
         const seed_terms = try self.candidateTerms(seed.entity);
@@ -3320,19 +3432,46 @@ const Run = struct {
     fn scanOverlay(self: *Run, prefix: []const u8, cursor: ?[]const u8, limit: u32) !Page {
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, cursor, limit);
         var rows: std.ArrayList(Row) = .empty;
-        for (page.rows) |row| try rows.append(self.a, row);
-        for (self.changes.items) |change| {
-            if (!std.mem.startsWith(u8, change.key, prefix)) continue;
-            if (cursor) |after| if (!std.mem.lessThan(u8, after, change.key)) continue;
-            if (page.next) |end| if (std.mem.lessThan(u8, end, change.key)) continue;
-            var exists = false;
-            for (rows.items) |row| if (eql(u8, row.key, change.key)) {
-                exists = true;
-                break;
-            };
-            if (!exists) if (change.json) |json| try rows.append(self.a, .{ .key = change.key, .json = json });
+        var present: ResourceSet = .empty;
+        for (page.rows) |row| {
+            if (self.change_positions.get(row.key)) |position| {
+                if (self.changes.items[position].json) |json| try rows.append(self.a, .{ .key = row.key, .json = json });
+            } else try rows.append(self.a, row);
+            try present.put(self.a, row.key, {});
         }
-        return .{ .rows = rows.items, .next = page.next };
+        // Seek directly to the requested range; unrelated import writes never
+        // participate in a prefix scan. The backend boundary still determines
+        // pagination, so pending writes cannot be skipped between pages.
+        const lower = cursor orelse prefix;
+        var search = self.change_ranges.root;
+        var first: ?*ChangeTree.Node = null;
+        while (search) |node| {
+            if (std.mem.order(u8, node.key, lower) == .lt or (cursor != null and eql(u8, node.key, lower))) {
+                search = node.children[1];
+            } else {
+                first = node;
+                search = node.children[0];
+            }
+        }
+        var added: usize = 0;
+        var node = first;
+        while (node) |current| : (node = current.next()) {
+            if (!std.mem.startsWith(u8, current.key, prefix)) break;
+            if (page.next) |end| if (std.mem.lessThan(u8, end, current.key)) break;
+            const change = self.changes.items[self.change_positions.get(current.key).?];
+            if (!present.contains(change.key)) if (change.json) |json| {
+                try rows.append(self.a, .{ .key = change.key, .json = json });
+                added += 1;
+                if (added > limit) break;
+            };
+        }
+        std.mem.sort(Row, rows.items, {}, struct {
+            fn less(_: void, left: Row, right: Row) bool {
+                return std.mem.lessThan(u8, left.key, right.key);
+            }
+        }.less);
+        const count = @min(rows.items.len, limit);
+        return .{ .rows = rows.items[0..count], .next = if (rows.items.len > count) rows.items[count - 1].key else page.next };
     }
     // A complete live branch can justify authority; an unavailable branch
     // cannot lend its strongest citation to an independently supported fact.
@@ -4002,10 +4141,11 @@ const Run = struct {
         } else if (std.mem.startsWith(u8, row.key, "generation-input/")) {
             const owner_key = row.key["generation-input/".len..];
             if (try self.read(std.json.Value, owner_key) == null) try self.remove(row.key);
-        } else if (std.mem.startsWith(u8, row.key, "entity-semantic/")) {
+        } else if (std.mem.startsWith(u8, row.key, "entity-semantic/") or std.mem.startsWith(u8, row.key, "entity-semantic-query/")) {
+            const query_role = std.mem.startsWith(u8, row.key, "entity-semantic-query/");
             const projection = try parse(t.EntityProjection, self.a, row.json);
             const record = try self.read(t.EntityRecord, try key(self.a, "entity", projection.entity_id));
-            if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?) or !eql(u8, row.key, try self.semanticProjectionKey(record.?, projection.kind))) {
+            if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?) or !eql(u8, row.key, if (query_role) try self.semanticQueryKey(record.?, projection.kind) else try self.semanticProjectionKey(record.?, projection.kind))) {
                 try self.remove(row.key);
             } else {
                 const selected = try self.canonical(record.?.entity.id);
@@ -5217,4 +5357,44 @@ test "memory performance identity components rebuild on policy replacement remov
     try std.testing.expectEqual(@as(usize, 1), (try run.identityMembers("first")).len);
     try run.resetChanges(checkpoint);
     try std.testing.expectEqual(@as(usize, 501), (try run.identityMembers("alias-123")).len);
+}
+
+test "memory performance overlay range pages merge replacements and tombstones among ten thousand unrelated writes" {
+    const BackendScan = struct {
+        fn scan(_: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) !Page {
+            const source = [_]Row{ .{ .key = "tree/0050", .json = "0" }, .{ .key = "tree/0060", .json = "0" }, .{ .key = "tree/0099", .json = "0" }, .{ .key = "tree/0200", .json = "200" } };
+            var begin: usize = 0;
+            while (begin < source.len and cursor != null and !std.mem.lessThan(u8, cursor.?, source[begin].key)) : (begin += 1) {}
+            const end = @min(source.len, begin + limit);
+            try std.testing.expectEqualStrings("tree/", prefix);
+            return .{ .rows = try a.dupe(Row, source[begin..end]), .next = if (end < source.len) source[end - 1].key else null };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = performanceTestRun(a);
+    run.service.backend = .{ .ptr = &run, .get = undefined, .scan = BackendScan.scan, .commit = undefined };
+    for (0..10000) |i| try run.put(try std.fmt.allocPrint(a, "unrelated/{d}", .{i}), @as(u64, @intCast(i)));
+    for (0..100) |i| try run.put(try std.fmt.allocPrint(a, "tree/{d:0>4}", .{i}), @as(u64, @intCast(i)));
+    try run.put("tree/0050", @as(u64, 999));
+    try run.remove("tree/0060");
+    const checkpoint = try a.dupe(Change, run.changes.items);
+    try run.remove("tree/0051");
+    try run.resetChanges(checkpoint);
+    var cursor: ?[]const u8 = null;
+    var count: usize = 0;
+    while (true) {
+        const page = try run.scanOverlay("tree/", cursor, 7);
+        try std.testing.expect(page.rows.len <= 7);
+        for (page.rows) |row| {
+            if (cursor) |after| try std.testing.expect(std.mem.lessThan(u8, after, row.key));
+            try std.testing.expect(!eql(u8, row.key, "tree/0060"));
+            if (eql(u8, row.key, "tree/0050")) try std.testing.expectEqualStrings("999", row.json);
+            count += 1;
+        }
+        cursor = page.next;
+        if (cursor == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 100), count);
 }

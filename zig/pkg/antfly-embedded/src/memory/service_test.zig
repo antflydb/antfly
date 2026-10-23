@@ -5261,7 +5261,7 @@ test "memory semantic manifests retire prior generations and all bindings on dis
         if (!try @import("scheduling.zig").retentionDue(service.backend, a, service.context.now_ms, state)) break;
         _ = try service.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "disable-{d}", .{i}));
     } else return error.TestUnexpectedResult;
-    for ([_][]const u8{ "entity-semantic/", "entity-semantic-binding/", "dependency/semantic-resource/", "dependency/semantic-assertion/", "entity-semantic-due/", "entity-semantic-timer/", "entity-semantic-work/", "entity-semantic-blocked/" }) |prefix| try std.testing.expectEqual(@as(usize, 0), (try service.backend.scan(service.backend.ptr, a, prefix, null, 8)).rows.len);
+    for ([_][]const u8{ "entity-semantic/", "entity-semantic-query/", "entity-semantic-binding/", "dependency/semantic-resource/", "dependency/semantic-assertion/", "entity-semantic-due/", "entity-semantic-timer/", "entity-semantic-work/", "entity-semantic-blocked/" }) |prefix| try std.testing.expectEqual(@as(usize, 0), (try service.backend.scan(service.backend.ptr, a, prefix, null, 8)).rows.len);
 }
 
 test "memory semantic version one upgrade installs resource bindings without reembedding" {
@@ -6679,6 +6679,7 @@ test "memory performance version three query-role backfill reuses document vecto
         _ = value.object.swapRemove("query_embedding");
         try store.values.put(a, row.key, try std.json.Stringify.valueAlloc(a, value, .{}));
     }
+    for ((try Store.scan(&store, a, "entity-semantic-query/", null, 32)).rows) |row| _ = store.values.remove(row.key);
     var index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, store.values.get("entity-semantic-index").?, .{});
     index.version = 3;
     try store.values.put(a, "entity-semantic-index", try std.json.Stringify.valueAlloc(a, index, .{}));
@@ -6733,7 +6734,9 @@ test "memory performance query-role failure checkpoints document work without st
     try std.testing.expectEqual(@as(usize, 3), documents);
     for ((try Store.scan(&store, a, "entity-semantic/", null, 32)).rows) |row| {
         const projection = try std.json.parseFromSliceLeaky(m.types.EntityProjection, a, row.json, .{});
-        if (std.mem.eql(u8, projection.entity_id, "healthy")) try std.testing.expect(projection.query_embedding != null) else try std.testing.expect(projection.query_embedding == null);
+        try std.testing.expect(projection.query_embedding == null);
+        const query_path = try std.fmt.allocPrint(a, "entity-semantic-query/{s}", .{row.key["entity-semantic/".len..]});
+        try std.testing.expectEqual(std.mem.eql(u8, projection.entity_id, "healthy"), store.values.contains(query_path));
     }
     store.public_output = true;
     service.context.now_ms = 30000;
@@ -6742,4 +6745,78 @@ test "memory performance query-role failure checkpoints document work without st
     try std.testing.expectEqual(documents + 1, store.decisions);
     const ready = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "healthy", "{}", ""), .{});
     try std.testing.expectEqual(.indexed, ready.semantic_discovery);
+}
+
+test "memory performance bounded candidate hydration matches point reads and preserves live source admission" {
+    const Batch = struct {
+        var calls: usize = 0;
+        var largest: usize = 0;
+        fn getMany(ptr: *anyopaque, a: A, paths: []const []const u8) ![]const ?m.Row {
+            calls += 1;
+            largest = @max(largest, paths.len);
+            if (paths.len == 0 or paths.len > 64) return error.InvalidMemoryRequest;
+            const rows = try a.alloc(?m.Row, paths.len);
+            for (paths, rows) |path, *row| row.* = try Store.get(ptr, a, path);
+            return rows;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = SemanticFixture.service(&store, 1);
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, m.types.Config{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true, .neighbors = 64 } }, .{}), "create");
+    var entities: [70]m.types.Entity = undefined;
+    for (&entities, 0..) |*entity, i| entity.* = .{ .id = try std.fmt.allocPrint(a, "entity-{d}", .{i}), .name = "graph", .evidence = &.{.{ .id = "e" }} };
+    _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &[_]m.types.Evidence{.{ .id = "e", .resource_selector = .{ .table = "business", .id = "approval" } }}, .entities = entities }, .{}), "observe");
+    try drainSemantic(svc, a, "ready");
+    const point = try svc.execute(a, .entity_candidates, "entity-0", "{\"limit\":64}", "");
+    Batch.calls = 0;
+    Batch.largest = 0;
+    svc.backend.get_many = Batch.getMany;
+    const batched = try svc.execute(a, .entity_candidates, "entity-0", "{\"limit\":64}", "");
+    try std.testing.expectEqualStrings(point, batched);
+    try std.testing.expect(Batch.calls > 0 and Batch.largest <= 64);
+    const page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, batched, .{});
+    if (page.next_cursor) |cursor| {
+        const request = try std.json.Stringify.valueAlloc(a, m.types.EntityCandidateRequest{ .cursor = cursor }, .{});
+        _ = try svc.execute(a, .entity_candidates, "entity-0", request, "");
+    }
+    store.resource_state = .denied;
+    try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .entity_candidates, "entity-0", "{}", ""));
+}
+
+test "memory performance version four inline query migration needs no provider calls" {
+    const Provider = struct {
+        fn unavailable(_: *anyopaque, _: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            return error.MemoryCapabilityUnavailable;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = SemanticFixture.service(&store, 1);
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, m.types.Config{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } }, .{}), "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"}],\"entities\":[{\"id\":\"a\",\"name\":\"graph\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"b\",\"name\":\"graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    try drainSemantic(svc, a, "initial");
+    for ((try Store.scan(&store, a, "entity-semantic/", null, 32)).rows) |row| {
+        var projection = try std.json.parseFromSliceLeaky(m.types.EntityProjection, a, row.json, .{});
+        const query_key = try std.fmt.allocPrint(a, "entity-semantic-query/{s}", .{row.key["entity-semantic/".len..]});
+        const query = try std.json.parseFromSliceLeaky(m.types.EntityProjection, a, store.values.get(query_key).?, .{});
+        projection.query_embedding = query.embedding;
+        try store.values.put(a, row.key, try std.json.Stringify.valueAlloc(a, projection, .{}));
+        _ = store.values.remove(query_key);
+    }
+    var index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, store.values.get("entity-semantic-index").?, .{});
+    index.version = 4;
+    try store.values.put(a, "entity-semantic-index", try std.json.Stringify.valueAlloc(a, index, .{}));
+    svc.backend.embed = Provider.unavailable;
+    svc.backend.embed_document = Provider.unavailable;
+    try drainSemantic(svc, a, "upgrade");
+    for ((try Store.scan(&store, a, "entity-semantic/", null, 32)).rows) |row| {
+        const projection = try std.json.parseFromSliceLeaky(m.types.EntityProjection, a, row.json, .{});
+        try std.testing.expect(projection.query_embedding == null);
+    }
+    try std.testing.expectEqual(@as(usize, 4), (try Store.scan(&store, a, "entity-semantic-query/", null, 32)).rows.len);
+    const page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try svc.execute(a, .entity_candidates, "a", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, page.semantic_discovery);
 }

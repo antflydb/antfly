@@ -28,24 +28,13 @@ fn encodeRow(a: A, json: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "{{\"memory_record_version\":1,\"value\":{s}}}", .{json});
 }
 pub fn decodeRow(a: A, json: []const u8) ![]const u8 {
-    // Preserve full-width integer fields instead of round-tripping via f64.
-    const value = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }) catch |err| switch (err) {
+    var fields: [2]?[]const u8 = undefined;
+    @import("antfly-json").objectFields(a, json, &.{ "memory_record_version", "value" }, &fields) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.MemoryCorruptState,
     };
-    return decodeValue(a, value);
-}
-fn decodeValue(a: A, value: std.json.Value) ![]const u8 {
-    if (value != .object) return error.MemoryCorruptState;
-    const version = value.object.get("memory_record_version") orelse return error.MemoryCorruptState;
-    const current_version = switch (version) {
-        .integer => version.integer == 1,
-        .number_string => std.mem.eql(u8, version.number_string, "1"),
-        else => false,
-    };
-    if (!current_version) return error.MemoryCorruptState;
-    const payload = value.object.get("value") orelse return error.MemoryCorruptState;
-    return std.json.Stringify.valueAlloc(a, payload, .{});
+    if (!std.mem.eql(u8, fields[0] orelse return error.MemoryCorruptState, "1")) return error.MemoryCorruptState;
+    return fields[1] orelse error.MemoryCorruptState;
 }
 
 fn encodeChange(a: A, path: []const u8, json: []const u8) ![]const u8 {
@@ -59,6 +48,10 @@ fn encodeChange(a: A, path: []const u8, json: []const u8) ![]const u8 {
 }
 fn vectorIndexConfig(a: A, dims: u32) ![]const u8 {
     return std.json.Stringify.valueAlloc(a, .{ .field = "embedding", .dims = dims, .metric = "cosine", .external = true }, .{});
+}
+fn hydrationRequest(keys: []const []const u8) !db_types.SearchRequest {
+    if (keys.len == 0 or keys.len > 64) return error.InvalidMemoryRequest;
+    return .{ .filter_doc_ids = keys, .filter_doc_ids_positive = true, .limit = @intCast(keys.len), .include_stored = true, .document_authority_mode = .lookup };
 }
 fn neighborRequest(input: service.NeighborRequest) !db_types.SearchRequest {
     if (input.limit == 0 or input.limit > 64 or !std.mem.startsWith(u8, input.index, "memory_")) return error.InvalidMemoryRequest;
@@ -75,7 +68,7 @@ pub const Routed = struct {
     request: @import("../api/operation.zig").RequestContext = .{},
 
     pub fn backend(self: *Routed) service.Backend {
-        return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex };
+        return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex };
     }
     fn ensureVectorIndex(ptr: *anyopaque, a: A, name: []const u8, dims: u32) !void {
         const self: *Routed = @ptrCast(@alignCast(ptr));
@@ -107,6 +100,18 @@ pub const Routed = struct {
         const self: *Routed = @ptrCast(@alignCast(ptr));
         return self.resource_fn.?(self.resource_ptr.?, a, reference);
     }
+    fn getMany(ptr: *anyopaque, a: A, keys: []const []const u8) ![]const ?service.Row {
+        const self: *Routed = @ptrCast(@alignCast(ptr));
+        try self.context.check();
+        var request = try hydrationRequest(keys);
+        request.execution_deadline_ns = self.request.deadline_ns;
+        request.cancellation = self.request.cancellation;
+        var documents = (try self.reads.hydrateDocuments(a, self.table, request, .read_index)) orelse return error.MemorySpaceNotFound;
+        defer documents.deinit();
+        const rows = try a.alloc(?service.Row, keys.len);
+        for (documents.rows, keys, rows) |document, key, *out| out.* = if (document) |json| .{ .key = key, .json = try a.dupe(u8, try decodeRow(a, json)) } else null;
+        return rows;
+    }
     fn get(ptr: *anyopaque, a: A, key: []const u8) !?service.Row {
         const self: *Routed = @ptrCast(@alignCast(ptr));
         try self.context.check();
@@ -122,13 +127,11 @@ pub const Routed = struct {
         var rows: std.ArrayList(service.Row) = .empty;
         var lines = std.mem.tokenizeScalar(u8, response.ndjson, '\n');
         while (lines.next()) |line| {
-            var value = try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{ .parse_numbers = false });
-            const id = value.object.get("_id") orelse return error.MemoryCorruptState;
-            if (id != .string or !std.mem.startsWith(u8, id.string, prefix)) return error.MemoryCorruptState;
-            _ = value.object.swapRemove("_id");
-            _ = value.object.swapRemove("_content_hash");
-            const document = value.object.get("_source") orelse value;
-            try rows.append(a, .{ .key = id.string, .json = try decodeValue(a, document) });
+            var fields: [2]?[]const u8 = undefined;
+            try @import("antfly-json").objectFields(a, line, &.{ "_id", "_source" }, &fields);
+            const id = try std.json.parseFromSliceLeaky([]const u8, a, fields[0] orelse return error.MemoryCorruptState, .{});
+            if (!std.mem.startsWith(u8, id, prefix)) return error.MemoryCorruptState;
+            try rows.append(a, .{ .key = id, .json = try decodeRow(a, fields[1] orelse line) });
         }
         const count = @min(rows.items.len, limit);
         return .{ .rows = rows.items[0..count], .next = if (rows.items.len > count) rows.items[count - 1].key else null };
@@ -157,7 +160,7 @@ pub fn Native(comptime DB: type) type {
         resource_fn: ?*const fn (*anyopaque, A, service.types.provenance.Resource) anyerror!service.types.provenance.Snapshot = null,
         const Self = @This();
         pub fn backend(self: *Self) service.Backend {
-            return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex };
+            return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex };
         }
         fn ensureVectorIndex(ptr: *anyopaque, a: A, name: []const u8, dims: u32) !void {
             const self: *Self = @ptrCast(@alignCast(ptr));
@@ -180,6 +183,24 @@ pub fn Native(comptime DB: type) type {
         fn resource(ptr: *anyopaque, a: A, reference: service.types.provenance.Resource) !service.types.provenance.Snapshot {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return self.resource_fn.?(self.resource_ptr.?, a, reference);
+        }
+        fn getMany(ptr: *anyopaque, a: A, keys: []const []const u8) ![]const ?service.Row {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try self.context.check();
+            var response = try self.db.search(a, try hydrationRequest(keys));
+            defer response.deinit();
+            const rows = try a.alloc(?service.Row, keys.len);
+            @memset(rows, null);
+            for (response.hits) |hit| {
+                const json = hit.stored_data orelse return error.MemoryCorruptState;
+                var found = false;
+                for (keys, rows) |key, *out| if (std.mem.eql(u8, key, hit.id)) {
+                    out.* = .{ .key = key, .json = try a.dupe(u8, try decodeRow(a, json)) };
+                    found = true;
+                };
+                if (!found) return error.MemoryCorruptState;
+            }
+            return rows;
         }
         fn get(ptr: *anyopaque, a: A, key: []const u8) !?service.Row {
             const self: *Self = @ptrCast(@alignCast(ptr));

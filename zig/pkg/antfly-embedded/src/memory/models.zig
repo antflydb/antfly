@@ -37,7 +37,7 @@ pub const Bridge = struct {
     }
 
     pub fn backend(self: *Bridge) service.Backend {
-        return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .embed_document = embedDocument, .neighbors = if (self.base.neighbors != null) neighbors else null, .ensure_vector_index = if (self.base.ensure_vector_index != null) ensureVectorIndex else null, .validate_models = validate };
+        return .{ .ptr = self, .get = get, .get_many = if (self.base.get_many != null) getMany else null, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .embed_document = embedDocument, .neighbors = if (self.base.neighbors != null) neighbors else null, .ensure_vector_index = if (self.base.ensure_vector_index != null) ensureVectorIndex else null, .validate_models = validate };
     }
     fn neighbors(ptr: *anyopaque, a: A, request: service.NeighborRequest) ![]const service.Neighbor {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
@@ -50,6 +50,10 @@ pub const Bridge = struct {
     fn get(ptr: *anyopaque, a: A, key: []const u8) anyerror!?service.Row {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
         return self.base.get(self.base.ptr, a, key);
+    }
+    fn getMany(ptr: *anyopaque, a: A, keys: []const []const u8) anyerror![]const ?service.Row {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        return self.base.get_many.?(self.base.ptr, a, keys);
     }
     fn scan(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) anyerror!service.Page {
         const self: *Bridge = @ptrCast(@alignCast(ptr));

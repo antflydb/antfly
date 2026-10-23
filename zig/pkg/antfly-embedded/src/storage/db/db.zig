@@ -41284,7 +41284,43 @@ pub const DB = struct {
         return try self.searchLockedWithExecutionContextImpl(alloc, identity_prefix_filter.req, exec_ctx, true, null);
     }
 
+    fn hydratePrimaryDocuments(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(alloc);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(alloc);
+        for (req.filter_doc_ids) |key| {
+            try db_query_search.checkSearchRequestDeadline(req);
+            if (!self.core.byteRange().contains(key) or (try seen.getOrPut(alloc, key)).found_existing) continue;
+            if (try isExpiredDocumentKey(self, alloc, key)) continue;
+            try keys.append(alloc, key);
+        }
+        const values = try loadStoredSearchDocumentsMany(self, alloc, keys.items, null);
+        defer freeOptionalOwnedBytes(alloc, values);
+        var hits: std.ArrayList(types.SearchHit) = .empty;
+        errdefer {
+            for (hits.items) |*hit| hit.deinit(alloc);
+            hits.deinit(alloc);
+        }
+        for (keys.items, values) |key, *value| {
+            const json = value.* orelse continue;
+            const id = try alloc.dupe(u8, key);
+            errdefer alloc.free(id);
+            try hits.append(alloc, .{ .id = id, .score = 1, .stored_data = json });
+            value.* = null;
+        }
+        return .{ .alloc = alloc, .total_hits = @intCast(hits.items.len), .hits = try hits.toOwnedSlice(alloc), .graph_results = &.{} };
+    }
+
     fn searchLockedWithExecutionContextImpl(self: *DB, alloc: Allocator, req: types.SearchRequest, exec_ctx: types.ExecutionContext, externalize_artifact_ids: bool, dense_profile_sink: ?*db_query_search.DenseSearchProfile) !types.SearchResult {
+        // Trusted whole-source hydration is a primary read, not a ranked live
+        // relation. Memory/control/support rows must agree with point lookup
+        // even when their ordinary search visibility differs. The outer read
+        // lease and routed read barrier still own admission and consistency.
+        if (req.document_authority_mode == .lookup and req.include_stored and req.query == .match_all and req.filter_doc_ids_positive and req.filter_doc_ids.len <= 64 and req.index_name == null and req.fields.len == 0 and req.include_all_fields and req.offset == 0 and req.limit >= req.filter_doc_ids.len and req.full_text == null and req.full_text_queries.len == 0 and req.dense == null and req.dense_queries.len == 0 and req.sparse == null and req.sparse_queries.len == 0 and req.graph_queries.len == 0 and req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and req.resolved_doc_filter == null and req.exclude_doc_ids.len == 0 and req.filter_prefix.len == 0 and req.order_by.len == 0 and !req.count_only) {
+            return self.hydratePrimaryDocuments(alloc, req);
+        }
+        if (req.document_authority_mode == .lookup) return error.InvalidQueryRequest;
         var request = req;
         // A caller cannot promote a mutable DB into an immutable cache scope.
         request.value_search_scope = self.retained_value_scope;
@@ -45068,6 +45104,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try db_query_search.collectMatchAllCandidatesWithOptions(alloc, req, .{
             .ctx = self,
+            .primary_key_range = self.core.byteRange(),
             .scan_store_range = scanStoreRangeCallback,
             .scan_store_range_with_context = scanStoreRangeWithContextCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
@@ -45090,6 +45127,7 @@ pub const DB = struct {
         var identity_scan = PrimaryMatchAllIdentityScan{ .db = self, .req = req };
         return try db_query_search.streamMatchAllCandidatesWithOptions(alloc, req, .{
             .ctx = self,
+            .primary_key_range = self.core.byteRange(),
             .scan_ids_ctx = &identity_scan,
             .scan_ids = PrimaryMatchAllIdentityScan.scan,
             .scan_store_range = scanStoreRangeCallback,

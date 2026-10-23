@@ -199,14 +199,23 @@ test "capi native memory ANN projections use shared native indexes and routed ne
     const context: memory.Context = .{ .principal = "owner", .admin = true, .now_ms = 1, .table_id = db.core.identity_namespace.table_id, .space = "ann" };
     var native: engine.Native(h.db_mod.DB) = .{ .db = db, .context = context };
     const Fixture = struct {
-        fn embed(_: *anyopaque, allocator: std.mem.Allocator, _: memory.types.Model, _: []const u8) ![]const f32 {
-            return allocator.dupe(f32, &.{ 1, 0 });
+        fn embed(_: *anyopaque, allocator: std.mem.Allocator, model: memory.types.Model, _: []const u8) ![]const f32 {
+            const vector = try allocator.alloc(f32, model.dimensions.?);
+            @memset(vector, 0);
+            vector[0] = 1;
+            return vector;
         }
         fn remoteNeighbors(ptr: *anyopaque, allocator: std.mem.Allocator, request: memory.NeighborRequest) ![]const memory.Neighbor {
             const owner: *engine.Native(h.db_mod.DB) = @ptrCast(@alignCast(ptr));
             var routed: engine.Routed = .{ .table = "memory_ann", .reads = .{ .ptr = owner.db, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } }, .writes = undefined, .context = owner.context };
             const remote = routed.backend();
             return remote.neighbors.?(remote.ptr, allocator, request);
+        }
+        fn remoteGetMany(ptr: *anyopaque, allocator: std.mem.Allocator, keys: []const []const u8) ![]const ?memory.Row {
+            const owner: *engine.Native(h.db_mod.DB) = @ptrCast(@alignCast(ptr));
+            var routed: engine.Routed = .{ .table = "memory_ann", .reads = .{ .ptr = owner.db, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } }, .writes = undefined, .context = owner.context };
+            const remote = routed.backend();
+            return remote.get_many.?(remote.ptr, allocator, keys);
         }
         fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: h.db_mod.types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) anyerror!?@import("../api/table_read_source.zig").LookupResponse {
             return error.UnexpectedLookup;
@@ -225,7 +234,9 @@ test "capi native memory ANN projections use shared native indexes and routed ne
     backend.embed = Fixture.embed;
     backend.embed_document = Fixture.embed;
     const service: memory.Service = .{ .backend = backend, .context = context };
-    const config: memory.types.Config = .{ .models = .{ .embedder = .{ .provider = "fixture", .model = "role-test", .revision = "v1", .dimensions = 2 } }, .semantic_discovery = .{ .enabled = true } };
+    const dimensions = if (std.c.getenv("ANTFLY_MEMORY_QUALIFY_DIMS")) |raw| try std.fmt.parseInt(u32, std.mem.span(raw), 10) else @as(u32, 2);
+    if (dimensions == 0 or dimensions > 1536) return error.InvalidMemoryRequest;
+    const config: memory.types.Config = .{ .models = .{ .embedder = .{ .provider = "fixture", .model = "role-test", .revision = "v1", .dimensions = dimensions } }, .semantic_discovery = .{ .enabled = true } };
     _ = try service.execute(alloc, .create, "", try std.json.Stringify.valueAlloc(alloc, config, .{}), "create");
     _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"A knowledge graph is a KG\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"kg\",\"name\":\"KG\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
     _ = try service.execute(alloc, .advance, "", "{}", "backfill");
@@ -237,16 +248,27 @@ test "capi native memory ANN projections use shared native indexes and routed ne
     try std.testing.expectEqual(@as(usize, 4), projection_rows.rows.len);
     var routed: engine.Routed = .{ .table = "memory_ann", .reads = .{ .ptr = db, .vtable = &.{ .lookup = Fixture.lookup, .scan = Fixture.scan, .query = Fixture.query } }, .writes = undefined, .context = context };
     const remote = routed.backend();
+    const hydration_keys: []const []const u8 = &.{ "control", "missing", projection_rows.rows[0].key, "control" };
+    const native_rows = try backend.get_many.?(backend.ptr, alloc, hydration_keys);
+    const remote_rows = try remote.get_many.?(remote.ptr, alloc, hydration_keys);
+    try std.testing.expect(native_rows[1] == null and remote_rows[1] == null);
+    for (native_rows, remote_rows) |local, distant| {
+        if (local) |row| {
+            try std.testing.expectEqualStrings(row.key, distant.?.key);
+            try std.testing.expectEqualStrings(row.json, distant.?.json);
+        }
+    }
     for (projection_rows.rows) |row| {
         const rest = row.key["entity-semantic/".len..];
         const slash = std.mem.indexOfScalar(u8, rest, '/').?;
-        const request: memory.NeighborRequest = .{ .index = rest[0..slash], .vector = &.{ 1, 0 }, .limit = 4 };
+        const request: memory.NeighborRequest = .{ .index = rest[0..slash], .vector = (try std.json.parseFromSliceLeaky(memory.types.EntityProjection, alloc, row.json, .{})).embedding, .limit = 4 };
         const local_neighbors = try backend.neighbors.?(backend.ptr, alloc, request);
         const remote_neighbors = try remote.neighbors.?(remote.ptr, alloc, request);
         try std.testing.expectEqualDeep(local_neighbors, remote_neighbors);
     }
     var remote_service = service;
     remote_service.backend.neighbors = Fixture.remoteNeighbors;
+    remote_service.backend.get_many = Fixture.remoteGetMany;
     const remote_page = try std.json.parseFromSliceLeaky(memory.types.EntityCandidatePage, alloc, try remote_service.execute(alloc, .entity_candidates, "graph", "{}", ""), .{});
     try std.testing.expectEqualDeep(page, remote_page);
     try qualifyAnnScale(alloc, &native, service, projection_rows.rows);
@@ -288,6 +310,19 @@ test "capi native memory semantic deadlines survive reopen and refresh both vali
             const config: memory.types.Config = .{ .models = .{ .embedder = .{ .provider = "fixture", .model = "timer", .revision = "v1", .dimensions = 2 } }, .semantic_discovery = .{ .enabled = true } };
             _ = try service.execute(alloc, .create, "", try std.json.Stringify.valueAlloc(alloc, config, .{}), "create");
             _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Graph\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}],\"assertions\":[{\"id\":\"d\",\"subject\":\"graph\",\"predicate\":\"description\",\"value\":\"graph\",\"statement\":\"Timed graph description\",\"valid_from\":100,\"valid_to\":300,\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+        }
+        // Primary hydration must match point reads for temporal facts and
+        // internal scheduler rows, including immediately after reopening.
+        const raw = try backend.scan(backend.ptr, alloc, "", null, 64);
+        const paths = try alloc.alloc([]const u8, raw.rows.len);
+        for (raw.rows, paths) |row, *key| key.* = row.key;
+        if (paths.len != 0) {
+            const batch = try backend.get_many.?(backend.ptr, alloc, paths);
+            for (paths, batch) |key, row| {
+                const point = (try backend.get(backend.ptr, alloc, key)).?;
+                try std.testing.expect(row != null);
+                try std.testing.expectEqualStrings(point.json, row.?.json);
+            }
         }
         for (0..16) |i| {
             _ = try service.execute(alloc, .advance, "", "{}", try std.fmt.allocPrint(alloc, "phase-{d}-{d}", .{ phase, i }));
@@ -505,6 +540,9 @@ fn qualifyAnnScale(allocator: std.mem.Allocator, native: *engine.Native(h.db_mod
             projection.fingerprint = view.fingerprint;
             projection.dependencies = view.dependencies;
             try changes.append(allocator, .{ .key = try std.fmt.allocPrint(allocator, "entity-semantic/{s}/{s}", .{ index_names[slot], try Helpers.digest(allocator, id) }), .json = try std.json.Stringify.valueAlloc(allocator, projection, .{}) });
+            var query_projection = projection;
+            query_projection.embedding = projection.embedding;
+            try changes.append(allocator, .{ .key = try std.fmt.allocPrint(allocator, "entity-semantic-query/{s}/{s}", .{ index_names[slot], try Helpers.digest(allocator, id) }), .json = try std.json.Stringify.valueAlloc(allocator, query_projection, .{}) });
         }
     }
     control = (try baseline.get(baseline.ptr, allocator, "control")).?;

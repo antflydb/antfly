@@ -59708,11 +59708,7 @@ test "native memory worker budgets slow semantic publication independently from 
     try std.testing.expect(!partial.complete and !partial.backfill_complete and partial.cursor != null);
     const checkpointed = try backend.scan(backend.ptr, alloc, "entity-semantic/", null, 32);
     try std.testing.expectEqual(@as(usize, 6), checkpointed.rows.len);
-    var query_ready: usize = 0;
-    for (checkpointed.rows) |row| {
-        const projection = try std.json.parseFromSliceLeaky(memory.memory.types.EntityProjection, alloc, row.json, .{});
-        if (projection.query_embedding != null) query_ready += 1;
-    }
+    const query_ready = (try backend.scan(backend.ptr, alloc, "entity-semantic-query/", null, 32)).rows.len;
     // Eleven provider calls succeeded: six document roles and five query
     // roles. The timed-out query retains its completed document projection.
     try std.testing.expectEqual(@as(usize, 5), query_ready);
