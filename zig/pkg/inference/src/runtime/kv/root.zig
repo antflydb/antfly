@@ -25,6 +25,7 @@ pub const attention_match = @import("attention_match.zig");
 pub const attention_match_checkpoint = @import("attention_match_checkpoint.zig");
 pub const attention_match_resume = @import("attention_match_resume.zig");
 pub const attention_match_engine = @import("attention_match_engine.zig");
+pub const attention_match_quantized = @import("attention_match_quantized.zig");
 pub const attention_match_queries = @import("attention_match_queries.zig");
 pub const attention_match_transaction = @import("attention_match_transaction.zig");
 pub const attention_match_snapshot = @import("attention_match_snapshot.zig");
@@ -46,6 +47,7 @@ test {
     _ = attention_match_checkpoint;
     _ = attention_match_resume;
     _ = attention_match_engine;
+    _ = attention_match_quantized;
     _ = attention_match_queries;
     _ = attention_match_transaction;
     _ = attention_match_snapshot;

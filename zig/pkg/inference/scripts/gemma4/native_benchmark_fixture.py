@@ -1,4 +1,4 @@
-"""Extract benchmark token IDs from an already qualified V2 checkpoint.
+"""Extract benchmark token IDs from an already qualified V2/V3/V4 checkpoint.
 
 This verifies bounded framing, token counts/IDs, model identity, the full integrity
 footer and the digest recorded by qualification. It does not revalidate numerical
@@ -27,8 +27,10 @@ def extract_tokens(path,expected_sha256,expected_identity):
     if not 208<=size<=MAX_CHECKPOINT:raise ValueError('checkpoint file exceeds limits')
     with path.open('rb') as source:
         header=read_exact(source,152)
-        if struct.unpack('<8sIIQ',header[:24])!=(b'ANTFLYKV',2,0,size-184):
-            raise ValueError('invalid V2 checkpoint header')
+        magic,version,flags,payload_bytes=struct.unpack('<8sIIQ',header[:24])
+        if (magic!=b'ANTFLYKV' or version not in (2,3,4) or payload_bytes!=size-184
+                or (version in (2,4) and flags!=0) or (version==3 and flags not in (0,1))):
+            raise ValueError('invalid native checkpoint header')
         identity={name:header[24+i*32:56+i*32].hex()
                   for i,name in enumerate(('weights','tokenizer','template','layout'))}
         if identity!=expected_identity:raise ValueError('model identity mismatch')

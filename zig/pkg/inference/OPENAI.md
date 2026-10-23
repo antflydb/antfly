@@ -99,10 +99,13 @@ For some ONNX generation paths, prompt token accounting may be approximate or un
 
 Tool-call parsing and streaming are supported through antfly-inference-zig's existing tool parser integration. When a model emits tool calls, antfly-inference-zig maps them into OpenAI-style `tool_calls` structures in both full responses and streaming deltas.
 
-### Portable native KV checkpoints (under qualification)
+### Portable native KV checkpoints
 
-Native KV checkpoints preserve numerical attention state for Gemma 4 E4B Q4 on
-CUDA with f16 KV storage. The public endpoints are:
+Native KV checkpoints preserve numerical attention state for Gemma 4 E4B Q4_0.
+The bounded production qualification covers NVIDIA L4, eager CUDA, f16 base KV,
+and FP16/FP8/rotated4 checkpoint encodings at 8K and 32K. See the
+[qualification record](../../../docs/design/inference/native-kv-compaction.md#bounded-qualification-2026-10-23)
+for the exact model revision, measurements and limits. The public endpoints are:
 
 ```text
 POST /ai/v1/chat/context/checkpoint
@@ -112,8 +115,42 @@ POST /ai/v1/chat/context/resume
 Preparation accepts a generation request with the full messages, tool definitions
 and template options. It emits no answer and requires `stream: false`. The
 response contains metadata and one binary checkpoint in an `AFATT001` attachment
-envelope. Use the [Python SDK streaming helpers](../../../py/packages/sdk/README.md#native-kv-checkpoints-under-qualification)
+envelope. Use the [Python SDK streaming helpers](../../../py/packages/sdk/README.md#native-kv-checkpoints)
 to validate and save the checkpoint without buffering the whole response.
+
+Checkpoint export defaults to V3 `f16` storage: K/V values occupy two bytes on
+disk and restore exactly to the supported f16 serving cache. Positions, coverage,
+biases and continuation logits retain their original precision. Set the
+`X-Antfly-KV-Encoding` request header to select:
+
+| Encoding | Wire version | Behavior |
+| --- | --- | --- |
+| `f16` (default) | 3 | Lossless storage of the supported f16 cache; halves K/V payload bytes versus V2. |
+| `fp8` (opt-in) | 3 | E4M3FN for fitted historical ranges that pass whole-head validation after dequantization; rejected attempts keep the validated f16 fit. |
+| `rotated4` (opt-in) | 4 | Rotated 4-bit keys and int8 values for accepted fitted history; compressed rows remain resident on CUDA. |
+| `f32` | 2 | Legacy export for older readers. |
+
+FP8 uses independent power-of-two K/V scales per accepted head. Protected prefix
+and recent rows and all local windows remain exact f16; attention biases remain
+f32. `fp8_heads` and `fp8_fallback_heads` report accepted and rejected FP8 attempts
+on a successfully compacted checkpoint. An insufficient-savings fallback stays
+entirely exact, even when FP8 was requested. Restore automatically detects the
+wire encoding and expands to f16 serving state; GPU memory savings are unchanged.
+Older SDKs/readers need V2 export or an upgrade. File-size savings exclude unchanged
+metadata and scales. The bounded quality gate includes fresh-question
+continuations with actual FP8 coverage in every task category; qualification
+does not establish answer preservation for arbitrary workloads.
+
+Rotated4 first validates the FP16 fit, then validates the combined fitting and
+quantization error against the original cache. Rows with the highest estimated
+attention error remain FP16; rejected heads retain their validated FP16 fit. Protected prefix/recent rows and
+local windows stay exact. Accepted rotated4 rows reduce both checkpoint and
+resident KV storage. The metadata reports accepted and fallback head counts plus eligible,
+compressed, and retained-exact row counts. Unchanged fallbacks never count as
+quantization coverage. FP8 and rotated4 are alternative export encodings.
+Rotated4 requires no experimental process switch; the default remains f16.
+See the [codec and qualification record](TURBOQUANT.md#attention-matched-caches-rotated4-checkpoints-and-cuda)
+for the V4 representation and tested scope.
 
 Resume sends that checkpoint with the complete messages and the same tool/template
 options. Their rendered tokens must extend the saved token prefix exactly. The
@@ -136,13 +173,34 @@ does not reset logical positions or increase this limit. Metadata is limited to
 2 MiB and checkpoint files to 2 GiB. Consume and validate the complete transfer
 before publishing a file; a partial HTTP 200 response is not a usable checkpoint.
 
-The current qualification configuration uses eager CUDA execution, disabled decode
+The qualified configuration uses eager CUDA execution, disabled decode
 graph replay and disabled continuous batching. When using the Gemma tuning wrapper,
 set `ANTFLY_SERVER_DECODE_GRAPH_REPLAY=off`,
 `ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING=1` and
 `ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS=0`. Native checkpoints do not support
 media, draft models, prompt-cache keys, compiled/graph execution, or combining the
 request with `context_management`, `kv_cache` or `cache_compaction_ratio`.
+
+The recorded L4 campaign additionally uses these backend and tuning settings:
+
+```sh
+export ANTFLY_INFERENCE_PREFERRED_BACKEND=cuda
+export ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda
+export ANTFLY_SERVER_DECODE_GRAPH_REPLAY=off
+export ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING=1
+export ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS=0
+export ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=flash-f16-sm89
+export ANTFLY_INFERENCE_CUDA_Q4_0_CUBLAS_PREFILL=1
+export ANTFLY_INFERENCE_CUDA_FUSED_GATE_UP_BF16=1
+export ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT=1
+export ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION=0
+export ANTFLY_INFERENCE_CUDA_E4B_SHARED_KV_PREFILL=1
+```
+
+Shared-KV fast prefill applies to eligible ordinary generation. Native checkpoint
+preparation and append retain the full model path. Portable restore latency
+excludes initial preparation, and appended-input restore can be slower than full
+replay; the qualification record reports both observations.
 
 Preparation reserves host scratch from model geometry and prompt length, bounded
 by a 3,840 MiB fitting ceiling plus 128 MiB auxiliary allowance. The default
@@ -174,9 +232,11 @@ preparation costs.
 | `507` | Inspect the configured inference memory budgets and available resources. Repeating the same request does not resolve an insufficient configured budget. |
 
 The [implementation and release-gate record](../../../docs/design/inference/native-kv-compaction.md)
-tracks the measured scope and remaining qualification. Production readiness is
-not yet established. Automatic mid-generation compaction and other models/backends
-require separate qualification.
+records the passing 16-case quality suites, 20-sample warm latency checks and
+100-request/10-compaction reliability run per codec. The same three full-KV
+model failures remain separate from the zero added compaction/codec failures.
+Automatic mid-generation compaction, graph execution, extended stress profiles
+and other models/backends require separate qualification.
 
 ### Context preparation and bounded chat
 

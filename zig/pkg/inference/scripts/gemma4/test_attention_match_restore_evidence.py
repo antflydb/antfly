@@ -7,6 +7,9 @@ class RestoreEvidence(unittest.TestCase):
         self.row=dict(source_tokens=8189,logical_tokens=8194,greedy_comparisons=6,appended_tokens=5,attention_calls=210,donor_appends=120,checkpoint_roundtrip=1,fresh_owner=1,replayed_tokens=0,bitwise_logits=1,source_unchanged=1,invalid=0)
         self.requests=[{'response':{'usage':{'prompt_tokens':8189}}}]
     def test_complete(self):validate_restore_evidence([self.row],self.requests)
+    def test_v4_cannot_be_satisfied_by_fp16_fallback_restore(self):
+        with self.assertRaises(AssertionError):validate_restore_evidence([self.row],self.requests,4)
+        validate_restore_evidence([{**self.row,"wire_version":4}],self.requests,4)
     def test_every_contract_flag(self):
         for key in ('checkpoint_roundtrip','fresh_owner','replayed_tokens','bitwise_logits','source_unchanged','invalid'):
             changed=dict(self.row);changed[key]^=1

@@ -156,6 +156,7 @@ def unified_server(args, label, evidence, scripts):
     overrides = {'ANTFLY_INFERENCE_PREFERRED_BACKEND': 'cuda', 'ANTFLY_INFERENCE_REQUIRED_BACKEND': 'cuda',
                  'ANTFLY_SERVER_DECODE_GRAPH_REPLAY': 'off', 'ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS': '0',
                  'ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING': '1'}
+    overrides['ANTFLY_INFERENCE_EXPERIMENTAL_ROTATED4_CHECKPOINTS'] = str(int(getattr(args, 'experimental_rotated4', False)))
     if getattr(args, 'generation_timing', False): overrides['TERMITE_SERVER_GENERATE_TIMING'] = '1'
     environment.update(overrides)
     command = standalone_command(args, scripts, data_dir)

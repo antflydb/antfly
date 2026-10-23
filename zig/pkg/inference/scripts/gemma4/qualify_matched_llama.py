@@ -25,6 +25,7 @@ from qualify_attention_match_queries import active_group_members
 
 
 from native_benchmark_fixture import qualified_fixture
+from native_phase_timing import latency_sampling_qualified
 
 
 def percentiles(values,allow_zero=False):
@@ -65,6 +66,26 @@ def read_completion(response,started):
     raise AssertionError('excessive completion events')
 
 
+def content_token_count(result):
+    """Compare content tokens while retaining llama's raw EOS-inclusive counters.
+
+    The pinned Gemma GGUF maps 106 to <turn|>, an Antfly stop token. Antfly
+    excludes that token from completion_tokens; this llama release includes it.
+    Only that verified terminal token may account for a one-token difference.
+    """
+    count=result.get('tokens_predicted');tokens=result.get('tokens')
+    if (type(count) is not int or count <= 0 or not isinstance(tokens,list) or
+            len(tokens)!=count or any(type(t) is not int or t<0 for t in tokens) or
+            type(result.get('timings',{}).get('predicted_n')) is not int or
+            result['timings']['predicted_n']!=count):
+        raise AssertionError('invalid generated token IDs or raw output accounting')
+    if 106 in tokens:
+        if result.get('stop_type')!='eos' or tokens[-1]!=106 or 106 in tokens[:-1]:
+            raise AssertionError('invalid terminal Gemma turn token')
+        return count-1
+    return count
+
+
 def validate_result(result,logical_tokens,output_tokens,expected_content,mode):
     timings=result['timings']
     for key in ('prompt_n','cache_n','predicted_n'):
@@ -74,7 +95,7 @@ def validate_result(result,logical_tokens,output_tokens,expected_content,mode):
     if result.get('truncated') is not False:raise AssertionError('context truncation/shift occurred')
     if result.get('tokens_evaluated')!=logical_tokens or timings['prompt_n']+timings['cache_n']!=logical_tokens:
         raise AssertionError('actual prompt differs from checkpoint token IDs')
-    if result.get('tokens_predicted')!=output_tokens or timings['predicted_n']!=output_tokens:
+    if content_token_count(result)!=output_tokens:
         raise AssertionError('output token count differs from Antfly reference')
     if result.get('content','').strip()!=expected_content.strip() or result.get('stop_type')!='eos':
         raise AssertionError('deterministic answer or EOS behavior differs')
@@ -159,6 +180,7 @@ def finish_campaign(evidence,process,sampler,timeout=30):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--assets-root',type=Path,default=ROOT,help='Root containing the pinned .models and .cache/llama-* assets')
     parser.add_argument('--size',choices=['8k','32k'],required=True)
     parser.add_argument('--mode',choices=['replay','resident'],default='replay')
     parser.add_argument('--reference',type=Path,required=True,help='passing Antfly public checkpoint campaign for this exact token fixture')
@@ -166,17 +188,21 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--port',type=int,default=8522)
     parser.add_argument('--warmups',type=int,default=5)
-    parser.add_argument('--samples',type=int,default=100)
+    parser.add_argument('--sampling-profile',choices=['bounded','extended'],default='bounded')
+    parser.add_argument('--samples',type=int)
     parser.add_argument('--smoke',action='store_true',help='permit fewer samples; never qualifies release sampling')
     args=parser.parse_args()
+    if args.samples is None: args.samples={'bounded':20,'extended':100}[args.sampling_profile]
+    args.assets_root=args.assets_root.resolve()
     if args.warmups<0 or args.samples<1:parser.error('invalid sample counts')
-    if not args.smoke and (args.warmups<5 or args.samples<100):parser.error('release sampling requires 5 warmups and 100 measurements')
+    if not args.smoke and not latency_sampling_qualified(args.sampling_profile,args.warmups,args.samples):parser.error('sampling requires five warmups and 20 bounded or 100 extended measurements')
     if args.output.exists():raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True,exist_ok=True)
     evidence={'passed':False,'production_ready':False,'generation_latency_gate_qualified':False,
               'scope':__doc__,'mode':args.mode,'size':args.size,'smoke':args.smoke,
-              'warmups_requested':args.warmups,'samples_requested':args.samples,'observations':[],
-              'runner_sha256':sha256_file(Path(__file__)),'reference_sha256':sha256_file(args.reference)}
+              'warmups_requested':args.warmups,'samples_requested':args.samples,'sampling_profile':args.sampling_profile,'observations':[],
+              'runner_sha256':sha256_file(Path(__file__)),'reference_sha256':sha256_file(args.reference),
+              'assets_root':str(args.assets_root)}
     def publish():
         temporary=args.output.with_suffix('.json.part')
         temporary.write_text(json.dumps(evidence,indent=2)+'\n');temporary.replace(args.output)
@@ -195,12 +221,12 @@ def main():
             raise AssertionError('Antfly reference used different checkpoint tokens')
         expected_output=expected['choices'][0]['message']['content']
         expected_count=expected['usage']['completion_tokens']
-        model=ROOT/'.models/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf'
+        model=args.assets_root/'.models/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf'
         expected_model='676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee'
         if sha256_file(model)!=expected_model:raise AssertionError('GGUF revision changed')
-        release=ROOT/'.cache/llama-release/llama-b11669'
-        runtime=ROOT/'.cache/llama-runtime/usr/lib/x86_64-linux-gnu'
-        cuda=ROOT/'.cache/llama-release/cudart-llama-b11669-bin-ubuntu-cuda-12.8-x64'
+        release=args.assets_root/'.cache/llama-release/llama-b11669'
+        runtime=args.assets_root/'.cache/llama-runtime/usr/lib/x86_64-linux-gnu'
+        cuda=args.assets_root/'.cache/llama-release/cudart-llama-b11669-bin-ubuntu-cuda-12.8-x64'
         binary=release/'llama-server';loader=runtime/'ld-linux-x86-64.so.2'
         files={p.resolve() for directory in (release,runtime,cuda) for p in directory.iterdir()
                if p.is_file() and ('.so' in p.name or p.name=='llama-server')}
@@ -262,6 +288,9 @@ def main():
                     row.update(read_completion(response,started))
                 finally:connection.close()
                 validate_result(row['result'],len(token_ids),expected_count,expected_output,'replay' if index==0 else args.mode)
+                row['output_accounting']={'raw_predicted_tokens':row['result']['tokens_predicted'],
+                    'content_tokens':content_token_count(row['result']),
+                    'terminal_turn_token_count':int(row['result']['tokens'][-1]==106)}
                 if generated_tokens is None:generated_tokens=row['result']['tokens']
                 elif row['result']['tokens']!=generated_tokens:raise AssertionError('generated token IDs changed between runs')
                 row['passed']=True;publish()
@@ -277,7 +306,7 @@ def main():
         if sha256_file(Path(__file__))!=evidence['runner_sha256']:raise AssertionError('runner changed')
         if sha256_file(BASE/'native_benchmark_fixture.py')!=evidence['fixture_helper_sha256'] or sha256_file(args.checkpoint)!=fixture['checkpoint_sha256_to_reverify']:
             raise AssertionError('checkpoint or fixture extractor changed')
-        evidence.update(passed=True,sampling_qualified=not args.smoke and len(measured)>=100 and args.warmups>=5)
+        evidence.update(passed=True,sampling_qualified=latency_sampling_qualified(args.sampling_profile,args.warmups,len(measured),args.smoke))
     except Exception as error:evidence.update(passed=False,error=f'{type(error).__name__}: {error}')
     finally:
         finish_campaign(evidence,process,sampler)

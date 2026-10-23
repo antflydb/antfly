@@ -31,7 +31,6 @@ const cuda_context = @import("ops/cuda/context.zig");
 const cuda_driver = @import("ops/cuda/driver.zig");
 
 const heads: usize = 8;
-const kv_heads: usize = 1;
 const page_size: usize = 16;
 const canonical_query_tile: usize = 16;
 const canonical_key_tile: usize = 16;
@@ -60,12 +59,16 @@ const BaselineRoute = enum {
     warp,
     flash,
     prototype_flash,
+    scalar,
+    mma,
 
     fn label(self: BaselineRoute) []const u8 {
         return switch (self) {
             .warp => "canonical-warp",
             .flash => "qualified-flash-v1",
             .prototype_flash => "standalone-flash-v1",
+            .scalar => "standalone-scalar-reference",
+            .mma => "canonical-mma-q16",
         };
     }
 };
@@ -146,6 +149,7 @@ const Config = struct {
     candidate_cubin_path: ?[]const u8 = null,
     baseline_cubin_path: ?[]const u8 = null,
     head_dim: ?u16 = null,
+    kv_heads: u8 = 1,
     q_len: ?u16 = null,
     prefix: ?u32 = null,
     baseline_route: BaselineRoute = .warp,
@@ -153,6 +157,7 @@ const Config = struct {
     candidate_key_tile: u16 = 16,
     candidate_head_group: u8 = 1,
     candidate_gqa2_concurrent_layout: bool = false,
+    candidate_e4b_warp_layout: bool = false,
     layout: LayoutSelection = .all,
     pattern: PatternSelection = .all,
     seed: u64 = 0x6a09_e667_f3bc_c909,
@@ -197,6 +202,7 @@ const Config = struct {
 };
 
 const CaseSpec = struct {
+    kv_heads: u8 = 1,
     head_dim: u16,
     q_len: u16,
     prefix: u32,
@@ -321,8 +327,8 @@ const BaselineFunctions = struct {
 
     fn selected(self: BaselineFunctions, route: BaselineRoute, head_dim: u16) cuda_driver.CUfunction {
         return switch (route) {
-            .warp => self.warp,
-            .flash, .prototype_flash => if (head_dim == 256) self.flash256 else self.flash512,
+            .warp, .mma => self.warp,
+            .flash, .prototype_flash, .scalar => if (head_dim == 256) self.flash256 else self.flash512,
         };
     }
 };
@@ -360,6 +366,11 @@ const Module = struct {
 
     fn baselineFunctions(self: Module, ctx: *cuda_context.CudaContext, route: BaselineRoute) !BaselineFunctions {
         return switch (route) {
+            .mma => .{
+                .warp = try loadFunction(ctx, self.module, "termite_gqa_attention_prefill_turboquant_mma_f32"),
+                .flash256 = null,
+                .flash512 = null,
+            },
             .warp => .{
                 .warp = try loadFunction(ctx, self.module, canonical_warp),
                 .flash256 = null,
@@ -369,6 +380,11 @@ const Module = struct {
                 .warp = null,
                 .flash256 = try loadFunction(ctx, self.module, canonical_flash_hd256),
                 .flash512 = try loadFunction(ctx, self.module, canonical_flash_hd512),
+            },
+            .scalar => .{
+                .warp = null,
+                .flash256 = try loadFunction(ctx, self.module, reference_hd256),
+                .flash512 = try loadFunction(ctx, self.module, reference_hd512),
             },
             .prototype_flash => .{
                 .warp = null,
@@ -429,12 +445,19 @@ fn flashSharedBytes(head_dim: usize, query_rows: usize, key_rows: usize, head_gr
 
 fn baselineSharedBytes(head_dim: usize, route: BaselineRoute) !u32 {
     return switch (route) {
-        .warp => 0,
+        .warp, .scalar => 0,
+        .mma => try toU32(if (head_dim <= 256) 224 * head_dim + 7936 else 160 * head_dim + 7424),
         .flash, .prototype_flash => flashSharedBytes(head_dim, canonical_query_tile, canonical_key_tile, 1),
     };
 }
 
 fn candidateSharedBytes(cfg: Config, head_dim: usize) !u32 {
+    if (cfg.candidate_e4b_warp_layout) {
+        if (cfg.kv_heads != 2 or cfg.candidate_query_tile != 64 or cfg.candidate_key_tile != 16 or
+            cfg.candidate_head_group != 1 or cfg.candidate_gqa2_concurrent_layout) return error.InvalidE4bWarpLayout;
+        if (head_dim != 256 and head_dim != 512) return error.InvalidHeadDim;
+        return try toU32(96 * head_dim * @sizeOf(f16) + 64 * 16 * @sizeOf(f16) + 17 * @sizeOf(u32) + 3 * 64 * @sizeOf(f32));
+    }
     if (cfg.candidate_gqa2_concurrent_layout) {
         if (cfg.candidate_query_tile != 16 or cfg.candidate_key_tile != 16 or
             cfg.candidate_head_group != 2) return error.InvalidGqa2ConcurrentLayout;
@@ -460,6 +483,8 @@ fn parseBaselineRoute(value: []const u8) !BaselineRoute {
     if (std.mem.eql(u8, value, "warp")) return .warp;
     if (std.mem.eql(u8, value, "flash")) return .flash;
     if (std.mem.eql(u8, value, "prototype-flash")) return .prototype_flash;
+    if (std.mem.eql(u8, value, "mma")) return .mma;
+    if (std.mem.eql(u8, value, "scalar")) return .scalar;
     return error.InvalidBaselineRoute;
 }
 
@@ -496,6 +521,10 @@ fn parseConfig(args: []const []const u8) !Config {
             index += 1;
             if (index >= args.len) return error.MissingValue;
             cfg.head_dim = if (std.mem.eql(u8, args[index], "all")) null else try std.fmt.parseInt(u16, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--kv-heads")) {
+            index += 1;
+            if (index >= args.len) return error.MissingValue;
+            cfg.kv_heads = try std.fmt.parseInt(u8, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--q-len")) {
             index += 1;
             if (index >= args.len) return error.MissingValue;
@@ -520,6 +549,8 @@ fn parseConfig(args: []const []const u8) !Config {
             index += 1;
             if (index >= args.len) return error.MissingValue;
             cfg.candidate_head_group = try std.fmt.parseInt(u8, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--candidate-e4b-warp-layout")) {
+            cfg.candidate_e4b_warp_layout = true;
         } else if (std.mem.eql(u8, arg, "--candidate-gqa2-concurrent-layout")) {
             cfg.candidate_gqa2_concurrent_layout = true;
         } else if (std.mem.eql(u8, arg, "--layout")) {
@@ -589,11 +620,21 @@ fn validateConfig(cfg: Config) !void {
         else => return err,
     };
     _ = try candidateSharedBytes(cfg, 256);
-    if (cfg.q_len) |value| if (value != 512 and value != 3) return error.InvalidQueryLength;
-    if (cfg.prefix) |value| {
-        if (cfg.q_len == null) return error.AmbiguousPrefix;
-        if (cfg.q_len == 3 and value != 2048) return error.InvalidPrefix;
-        if (cfg.q_len == 512 and value != 0 and value != 512 and value != 1024 and value != 1536) return error.InvalidPrefix;
+    if (cfg.kv_heads != 1 and cfg.kv_heads != 2) return error.InvalidKvHeads;
+    if (cfg.kv_heads == 2) {
+        // The canonical E2B warp/Flash kernels cannot serve two KV heads.
+        if (cfg.baseline_route != .scalar and cfg.baseline_route != .prototype_flash and cfg.baseline_route != .mma) return error.InvalidBaselineRoute;
+        const q_len = cfg.q_len orelse return error.InvalidQueryLength;
+        if (q_len < 2 or q_len > 8192) return error.InvalidQueryLength;
+        const prefix = cfg.prefix orelse return error.AmbiguousPrefix;
+        if (prefix > 32768 - @as(u32, q_len)) return error.InvalidPrefix;
+    } else {
+        if (cfg.q_len) |value| if (value != 512 and value != 3) return error.InvalidQueryLength;
+        if (cfg.prefix) |value| {
+            if (cfg.q_len == null) return error.AmbiguousPrefix;
+            if (cfg.q_len == 3 and value != 2048) return error.InvalidPrefix;
+            if (cfg.q_len == 512 and value != 0 and value != 512 and value != 1024 and value != 1536) return error.InvalidPrefix;
+        }
     }
     if (cfg.repeats < 2 or cfg.repeats > 100) return error.InvalidRepeats;
     if (cfg.iterations > 1_000_000) return error.InvalidIterations;
@@ -638,6 +679,7 @@ fn fillCaseSpecs(cfg: Config, specs: []CaseSpec) !void {
                 for (0..cfg.layout.count()) |layout_index| {
                     for (0..cfg.pattern.count()) |pattern_index| {
                         specs[cursor] = .{
+                            .kv_heads = cfg.kv_heads,
                             .head_dim = head_dim,
                             .q_len = q_len,
                             .prefix = cfg.prefixAt(q_len, prefix_index),
@@ -684,13 +726,13 @@ fn fillInputs(q: []f32, k: []f16, v: []f16, spec: CaseSpec) void {
                 q[(query * heads + head) * head_dim + dimension] =
                     @floatCast(sign * (0.03125 + perturb * 0.00003125));
             };
-            for (0..spec.kvLen()) |token| for (0..head_dim) |dimension| {
+            for (0..spec.kvLen()) |token| for (0..spec.kv_heads) |kv_head| for (0..head_dim) |dimension| {
                 const sign: f32 = if ((dimension & 1) == 0) 1 else -1;
-                const perturb: f32 = @floatFromInt((token * 17 + dimension * 3) % 11);
-                k[token * head_dim + dimension] =
+                const perturb: f32 = @floatFromInt((token * 17 + kv_head * 7 + dimension * 3) % 11);
+                k[(token * spec.kv_heads + kv_head) * head_dim + dimension] =
                     @floatCast(sign * (0.03125 + perturb * 0.00000025));
-                const value_sign: f32 = if (((token + dimension) & 1) == 0) 1 else -1;
-                v[token * head_dim + dimension] =
+                const value_sign: f32 = if (((token + kv_head + dimension) & 1) == 0) 1 else -1;
+                v[(token * spec.kv_heads + kv_head) * head_dim + dimension] =
                     @floatCast(value_sign * (0.25 + @as(f32, @floatFromInt(token % 29)) * 0.0005));
             };
         },
@@ -702,13 +744,13 @@ fn fillInputs(q: []f32, k: []f16, v: []f16, spec: CaseSpec) void {
                 q[(query * heads + head) * head_dim + dimension] =
                     @floatCast(sign * (0.125 + perturb * 0.00001));
             };
-            for (0..spec.kvLen()) |token| for (0..head_dim) |dimension| {
+            for (0..spec.kvLen()) |token| for (0..spec.kv_heads) |kv_head| for (0..head_dim) |dimension| {
                 const dimension_sign: f32 = if ((dimension & 1) == 0) 1 else -1;
-                const token_sign: f32 = if ((token & 1) == 0) 1 else -1;
+                const token_sign: f32 = if (((token + kv_head) & 1) == 0) 1 else -1;
                 const perturb: f32 = @floatFromInt((token * 19 + dimension) % 13);
-                k[token * head_dim + dimension] =
+                k[(token * spec.kv_heads + kv_head) * head_dim + dimension] =
                     @floatCast(dimension_sign * (token_sign * 0.125 + perturb * 0.00001));
-                v[token * head_dim + dimension] =
+                v[(token * spec.kv_heads + kv_head) * head_dim + dimension] =
                     @floatCast(token_sign * (0.5 + @as(f32, @floatFromInt(dimension % 17)) * 0.0001));
             };
         },
@@ -784,7 +826,7 @@ fn cpuReferenceColumns(
     var accumulators = [_]f32{ 0, 0, 0 };
     for (range.begin..range.end) |token| {
         var dot: f32 = 0;
-        const kv_offset = token * head_dim;
+        const kv_offset = (token * spec.kv_heads + head / (heads / spec.kv_heads)) * head_dim;
         for (0..head_dim) |dimension| {
             dot += @as(f32, q[q_offset + dimension]) * @as(f32, k[kv_offset + dimension]);
         }
@@ -951,6 +993,7 @@ fn loadFunction(ctx: *cuda_context.CudaContext, module: cuda_driver.CUmodule, na
 const LaunchKind = enum {
     candidate,
     canonical_warp_baseline,
+    canonical_mma_baseline,
     canonical_flash_baseline,
     scalar_reference,
 };
@@ -976,7 +1019,7 @@ fn launchAttention(
     var q_seq_len: u32 = spec.q_len;
     var kv_seq_len = try toU32(spec.kvLen());
     var num_heads: u32 = heads;
-    var num_kv_heads: u32 = kv_heads;
+    var num_kv_heads: u32 = spec.kv_heads;
     var head_dim: u32 = spec.head_dim;
     var query_position_offset = spec.prefix;
     var kv_position_offset: u32 = 0;
@@ -984,7 +1027,7 @@ fn launchAttention(
     var total_sequence_len = try toU32(spec.kvLen());
     var mask_len: u32 = 0;
     var bias_mode: u32 = 0;
-    var key_row_bytes = try toU32(try checkedMul(spec.head_dim, @sizeOf(f16)));
+    var key_row_bytes = try toU32(try checkedMul(@as(usize, spec.head_dim) * spec.kv_heads, @sizeOf(f16)));
     var base_key_row_bytes = key_row_bytes;
     var value_row_bytes = key_row_bytes;
     var block_count = block_count_value;
@@ -1013,17 +1056,18 @@ fn launchAttention(
     const tiled = kind != .scalar_reference;
     const tile_rows: usize = switch (kind) {
         .candidate => cfg.candidate_query_tile,
-        .canonical_warp_baseline, .canonical_flash_baseline => canonical_query_tile,
+        .canonical_warp_baseline, .canonical_flash_baseline, .canonical_mma_baseline => canonical_query_tile,
         .scalar_reference => 1,
     };
     const grid_x: u32 = switch (kind) {
         .candidate => @intCast(heads / cfg.candidate_head_group),
-        .canonical_warp_baseline, .canonical_flash_baseline, .scalar_reference => heads,
+        .canonical_warp_baseline, .canonical_flash_baseline, .canonical_mma_baseline, .scalar_reference => heads,
     };
     const grid_y: u32 = if (tiled) try toU32(ceilDiv(spec.q_len, tile_rows)) else spec.q_len;
     const block_x: u32 = if (tiled) threads else spec.head_dim;
     const dynamic_shared: u32 = switch (kind) {
         .candidate => try candidateSharedBytes(cfg, spec.head_dim),
+        .canonical_mma_baseline => try baselineSharedBytes(spec.head_dim, .mma),
         .canonical_flash_baseline => try baselineSharedBytes(spec.head_dim, .flash),
         .canonical_warp_baseline, .scalar_reference => 0,
     };
@@ -1082,6 +1126,8 @@ fn runTimings(
     const baseline_kind: LaunchKind = switch (cfg.baseline_route) {
         .flash, .prototype_flash => .canonical_flash_baseline,
         .warp => .canonical_warp_baseline,
+        .scalar => .scalar_reference,
+        .mma => .canonical_mma_baseline,
     };
     var stats = TimingStats{ .pairs = cfg.timing_pairs, .iterations = cfg.iterations };
     for (0..cfg.timing_pairs) |pair_index| {
@@ -1112,10 +1158,11 @@ fn runCase(
 ) !CaseResult {
     const head_dim: usize = spec.head_dim;
     const q_count = try checkedMul(try checkedMul(spec.q_len, heads), head_dim);
-    const kv_count = try checkedMul(spec.kvLen(), head_dim);
+    const kv_width = head_dim * spec.kv_heads;
+    const kv_count = try checkedMul(spec.kvLen(), kv_width);
     const mapped_blocks = ceilDiv(spec.kvLen(), page_size);
     const physical_capacity = try checkedMul(mapped_blocks, page_size);
-    const physical_count = try checkedMul(physical_capacity, head_dim);
+    const physical_count = try checkedMul(physical_capacity, kv_width);
     const output_bytes = try checkedMul(q_count, @sizeOf(f32));
     const output_image_bytes = try checkedAdd(output_bytes, 2 * guard_bytes);
 
@@ -1135,8 +1182,8 @@ fn runCase(
     defer allocator.free(host_k);
     const host_v = try allocator.alloc(f16, physical_count);
     defer allocator.free(host_v);
-    try packPaged(host_k, logical_k, block_table, head_dim);
-    try packPaged(host_v, logical_v, block_table, head_dim);
+    try packPaged(host_k, logical_k, block_table, kv_width);
+    try packPaged(host_v, logical_v, block_table, kv_width);
 
     const reference_image = try allocator.alloc(u8, output_image_bytes);
     defer allocator.free(reference_image);
@@ -1206,6 +1253,8 @@ fn runCase(
     const baseline_kind: LaunchKind = switch (cfg.baseline_route) {
         .flash, .prototype_flash => .canonical_flash_baseline,
         .warp => .canonical_warp_baseline,
+        .scalar => .scalar_reference,
+        .mma => .canonical_mma_baseline,
     };
     try launchAttention(ctx, candidate_functions.reference(spec.head_dim), .scalar_reference, cfg, spec, reference_buffers, block_count_value, physical_capacity_u32);
     try launchAttention(ctx, baseline_function, baseline_kind, cfg, spec, baseline_buffers, block_count_value, physical_capacity_u32);
@@ -1398,8 +1447,9 @@ fn writeResultsJson(
         const baseline_us = result.timing.baselineMean();
         const candidate_us = result.timing.candidateMean();
         try writer.print(
-            "{{\"head_dim\":{d},\"policy\":\"{s}\",\"q_len\":{d},\"prefix\":{d},\"kv_len\":{d},\"layout\":\"{s}\",\"pattern\":\"{s}\",\"seed\":{d},\"pass\":{s},",
+            "{{\"kv_heads\":{d},\"head_dim\":{d},\"policy\":\"{s}\",\"q_len\":{d},\"prefix\":{d},\"kv_len\":{d},\"layout\":\"{s}\",\"pattern\":\"{s}\",\"seed\":{d},\"pass\":{s},",
             .{
+                spec.kv_heads,
                 spec.head_dim,
                 if (spec.sliding_window == 0) "global" else "swa512",
                 spec.q_len,
@@ -1480,15 +1530,17 @@ fn writeUsage(writer: *std.Io.Writer) !void {
         \\Options:
         \\  --candidate-cubin PATH          Standalone WMMA prototype artifact
         \\  --baseline-cubin PATH           Checked-in canonical CUDA cubin
+        \\  --kv-heads 1|2                 E4B requires explicit q-len/prefix and scalar/MMA baseline
         \\  --head-dim all|256|512          Default: all
         \\  --q-len all|512|3               Default: all
         \\  --prefix all|0|512|1024|1536|2048
         \\                                  q512 defaults to 0/512/1024/1536; q3 to 2048
-        \\  --baseline-route warp|flash|prototype-flash
+        \\  --baseline-route warp|flash|prototype-flash|scalar|mma
         \\                                  Default: warp; prototype-flash compares two standalone v1 artifacts
         \\  --candidate-query-tile 16|32|64 Candidate launch/output rows per CTA
         \\  --candidate-key-tile 16|32|64   Candidate shared-memory key/value tile
         \\  --candidate-head-group 1|2|4    Query heads sharing each K/V tile
+        \\  --candidate-e4b-warp-layout     Exact E4B q64/k16 shared layout
         \\  --candidate-gqa2-concurrent-layout
         \\                                  q16/k16/g2 shared layout (standalone v3)
         \\  --layout all|identity|explicit-reversed|explicit-permuted
@@ -1623,7 +1675,7 @@ test "prototype config is fail-closed and covers only locked production shapes" 
     try std.testing.expectError(error.AmbiguousPrefix, parseConfig(&.{ "--candidate-cubin", "x", "--baseline-cubin", "y", "--prefix", "2048" }));
     try std.testing.expectError(error.InvalidPrefix, parseConfig(&.{ "--candidate-cubin", "x", "--baseline-cubin", "y", "--q-len", "3", "--prefix", "1536" }));
     try std.testing.expectError(error.InvalidLayout, parseConfig(&.{ "--candidate-cubin", "x", "--baseline-cubin", "y", "--layout", "fixed" }));
-    try std.testing.expectError(error.InvalidBaselineRoute, parseConfig(&.{ "--candidate-cubin", "x", "--baseline-cubin", "y", "--baseline-route", "scalar" }));
+    try std.testing.expectError(error.InvalidBaselineRoute, parseConfig(&.{ "--candidate-cubin", "x", "--baseline-cubin", "y", "--baseline-route", "invalid" }));
     try std.testing.expectError(error.InvalidTile, parseConfig(&.{ "--candidate-cubin", "x", "--baseline-cubin", "y", "--candidate-query-tile", "48" }));
     try std.testing.expectError(error.InvalidHeadGroup, parseConfig(&.{ "--candidate-cubin", "x", "--baseline-cubin", "y", "--candidate-head-group", "8" }));
     try std.testing.expectError(error.InvalidGqa2ConcurrentLayout, parseConfig(&.{ "--candidate-cubin", "x", "--baseline-cubin", "y", "--candidate-head-group", "2", "--candidate-query-tile", "32", "--candidate-gqa2-concurrent-layout" }));
@@ -1813,4 +1865,39 @@ test "machine-readable evidence is valid versioned JSON" {
     try std.testing.expect(!root.get("runtime_integrated").?.bool);
     try std.testing.expect(root.get("pass").?.bool);
     try std.testing.expectEqual(@as(usize, 1), root.get("results").?.array.items.len);
+}
+
+test "E4B oracle addresses both KV heads and bounds query chunks" {
+    const cfg = try parseConfig(&.{ "--candidate-cubin", "x", "--baseline-cubin", "y", "--baseline-route", "scalar", "--kv-heads", "2", "--q-len", "2048", "--prefix", "30720" });
+    try std.testing.expectEqual(@as(u8, 2), cfg.kv_heads);
+    var large = cfg;
+    large.q_len = 8192;
+    large.prefix = 24576;
+    try validateConfig(large);
+    large.q_len = 8193;
+    try std.testing.expectError(error.InvalidQueryLength, validateConfig(large));
+    var invalid = cfg;
+    invalid.prefix = 30721;
+    try std.testing.expectError(error.InvalidPrefix, validateConfig(invalid));
+    invalid = cfg;
+    invalid.baseline_route = .warp;
+    try std.testing.expectError(error.InvalidBaselineRoute, validateConfig(invalid));
+    const spec = CaseSpec{ .kv_heads = 2, .head_dim = 256, .q_len = 2, .prefix = 0, .sliding_window = 512, .layout = .identity, .pattern = .random, .seed = 1 };
+    const q: [2 * heads * 256]f32 = @splat(0);
+    const k: [2 * 2 * 256]f16 = @splat(0);
+    var v: [2 * 2 * 256]f16 = undefined;
+    for (0..2) |token| {
+        @memset(v[token * 512 ..][0..256], 1);
+        @memset(v[token * 512 + 256 ..][0..256], -2);
+    }
+    try std.testing.expectEqual([_]f32{ 1, 1, 1 }, cpuReferenceColumns(&q, &k, &v, spec, 1, 3, .{ 0, 128, 255 }));
+    try std.testing.expectEqual([_]f32{ -2, -2, -2 }, cpuReferenceColumns(&q, &k, &v, spec, 1, 4, .{ 0, 128, 255 }));
+}
+
+test "E4B warp shared layout matches the production allocation and rejects mismatched geometry" {
+    var cfg = Config{ .kv_heads = 2, .candidate_query_tile = 64, .candidate_e4b_warp_layout = true };
+    try std.testing.expectEqual(@as(u32, 52_036), try candidateSharedBytes(cfg, 256));
+    try std.testing.expectEqual(@as(u32, 101_188), try candidateSharedBytes(cfg, 512));
+    cfg.candidate_query_tile = 16;
+    try std.testing.expectError(error.InvalidE4bWarpLayout, candidateSharedBytes(cfg, 512));
 }

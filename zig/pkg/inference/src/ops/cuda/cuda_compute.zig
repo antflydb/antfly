@@ -6959,6 +6959,9 @@ pub const CudaTunedRouteGates = struct {
     // single concatenated cuBLASLt GEMM. Kept out of promotedDefaultsForTarget
     // so they can be A/B'd against the cuBLASLt-BF16 mirror before promotion.
     q4_0_tc_hmma_prefill: bool = false,
+    /// Opt-in bounded, per-projection BF16 expansion. Reuses the temporary
+    /// pool rather than retaining a dense copy of every model weight.
+    q4_0_cublas_prefill: bool = false,
     fused_gate_up_bf16: bool = false,
 
     /// Defaults when every env variable is unset. The promoted battery is
@@ -7009,6 +7012,7 @@ pub const CudaTunedRouteGates = struct {
             .q6_k_lm_head_q8_1 = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1", defaults.q6_k_lm_head_q8_1),
             .lm_head_q8_1_argmax = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX", defaults.lm_head_q8_1_argmax),
             .async_i32_download_staging = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING", defaults.async_i32_download_staging),
+            .q4_0_cublas_prefill = env.getenvBool("ANTFLY_INFERENCE_CUDA_Q4_0_CUBLAS_PREFILL"),
             .q4_0_tc_hmma_prefill = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_TC_HMMA_PREFILL", defaults.q4_0_tc_hmma_prefill),
             .fused_gate_up_bf16 = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_FUSED_GATE_UP_BF16", defaults.fused_gate_up_bf16),
         };
@@ -9138,11 +9142,33 @@ fn ensureBf16PairMirror(
     return combined;
 }
 
+fn boundedQ4PairHalfBytes(in_dim: usize, out_dim: usize, gate_elements: usize, up_elements: usize) ?usize {
+    if (in_dim == 0 or out_dim == 0 or in_dim % 32 != 0) return null;
+    const elements = std.math.mul(usize, in_dim, out_dim) catch return null;
+    if (elements != gate_elements or elements != up_elements) return null;
+    // The complete pair, rather than each individual matrix, shares the
+    // ordinary 128 MiB temporary-weight ceiling.
+    if (elements > 128 * 1024 * 1024 / (2 * @sizeOf(u16))) return null;
+    return elements * @sizeOf(u16);
+}
+
+test "E4B Flash bounded fused Q4 pair checks geometry and total residency" {
+    try std.testing.expectEqual(@as(?usize, 52_428_800), boundedQ4PairHalfBytes(2560, 10240, 26_214_400, 26_214_400));
+    try std.testing.expectEqual(@as(?usize, 64 * 1024 * 1024), boundedQ4PairHalfBytes(4096, 8192, 4096 * 8192, 4096 * 8192));
+    try std.testing.expect(boundedQ4PairHalfBytes(4096, 8193, 4096 * 8193, 4096 * 8193) == null);
+    try std.testing.expect(boundedQ4PairHalfBytes(0, 10240, 0, 0) == null);
+    try std.testing.expect(boundedQ4PairHalfBytes(31, 32, 31 * 32, 31 * 32) == null);
+    try std.testing.expect(boundedQ4PairHalfBytes(32, 32, 1024, 1023) == null);
+    try std.testing.expect(boundedQ4PairHalfBytes(std.math.maxInt(usize) - 31, 32, 0, 0) == null);
+}
+
 // Fused gate/up prefill: one cuBLASLt GEMM against the concatenated [2*ffn,
 // in_dim] BF16 mirror producing [rows, 2*ffn] (gate cols then up cols per row),
 // then the strided act(gate)*up epilogue in a single kernel → [rows, ffn].
-// Returns null (fall through to the two-GEMM pair path) when either mirror is
-// absent or staging is unavailable. Opt-in via fused_gate_up_bf16.
+// The bounded Q4_0 prefill route can build the same concatenated weight in
+// temporary storage, avoiding persistent mirrors for every model layer.
+// Returns null when neither weight representation or staging is available.
+// Opt-in via fused_gate_up_bf16.
 fn tryFusedGateUpBf16(
     self: *CudaCompute,
     input: CT,
@@ -9154,9 +9180,26 @@ fn tryFusedGateUpBf16(
     activation: ops.DecoderRuntimeActivationKind,
 ) !?CT {
     if (!self.tuned_route_gates.fused_gate_up_bf16 or rows <= 1) return null;
-    const gate_mirror = weightBf16MirrorForRows(self, gate_weight, rows) orelse return null;
-    const up_mirror = weightBf16MirrorForRows(self, up_weight, rows) orelse return null;
-    const combined = (try ensureBf16PairMirror(self, gate_mirror, up_mirror, ffn, in_dim)) orelse return null;
+    var pair_profile_scope = beginPrefillProfile(self, .bf16_pair, rows);
+    defer if (pair_profile_scope) |*scope| scope.end();
+    var temporary_weight = buffer_mod.DeviceBuffer{};
+    defer releaseDeviceBuffer(self, &temporary_weight);
+    const combined = weight: {
+        if (weightBf16MirrorForRows(self, gate_weight, rows)) |gate_mirror| {
+            if (weightBf16MirrorForRows(self, up_weight, rows)) |up_mirror| {
+                break :weight (try ensureBf16PairMirror(self, gate_mirror, up_mirror, ffn, in_dim)) orelse return null;
+            }
+        }
+        if (!q4_0CublasPrefillEligible(self, gate_weight, rows, in_dim, ffn) or
+            !q4_0CublasPrefillEligible(self, up_weight, rows, in_dim, ffn)) return null;
+        const half_bytes = boundedQ4PairHalfBytes(in_dim, ffn, gate_weight.elem_count, up_weight.elem_count) orelse return null;
+        temporary_weight = try allocDeviceBuffer(self, half_bytes * 2);
+        const gate_dense = buffer_mod.DeviceBuffer{ .ptr = temporary_weight.ptr, .len = half_bytes };
+        const up_dense = buffer_mod.DeviceBuffer{ .ptr = temporary_weight.ptr + half_bytes, .len = half_bytes };
+        try self.kernels.launchDequantQ4_0Bf16(&self.ctx, gate_dense, gate_weight.buffer, gate_weight.elem_count / 32);
+        try self.kernels.launchDequantQ4_0Bf16(&self.ctx, up_dense, up_weight.buffer, up_weight.elem_count / 32);
+        break :weight temporary_weight;
+    };
 
     const input_tensor = tensorFromCt(input);
     const input_bf16 = try stageBf16ActivationForCublasLt(self, input_tensor, rows, in_dim) orelse return null;
@@ -15711,6 +15754,21 @@ fn launchQ4KTcHmmaNoBias(
     return true;
 }
 
+fn q4_0CublasPrefillEligible(
+    self: *const CudaCompute,
+    weight: *const CudaTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) bool {
+    const elements = std.math.mul(usize, in_dim, out_dim) catch return false;
+    return self.tuned_route_gates.q4_0_cublas_prefill and rows >= 128 and
+        !self.kernels.attention_match_repeat and isKnownQuant(weight, .Q4_0) and
+        self.cublaslt != null and self.kernels.dequant_q4_0_bf16 != null and
+        !self.ctx.debug_graph_capture_active and !self.debug_cuda_graph_capture_active and
+        elements <= 128 * 1024 * 1024 / @sizeOf(u16);
+}
+
 // W4A16 Q4_0 tensor-core prefill route. Returns true if it consumed the launch
 // (packed weight present + kernel launched); false to fall through to the
 // standard dispatch (mirror/cuBLASLt/SIMT). Only fires for rows > 1: decode
@@ -15719,23 +15777,38 @@ fn launchQ4_0TcHmmaNoBias(
     self: *CudaCompute,
     variant: kernels_mod.QMatmulVariant,
     dst: buffer_mod.DeviceBuffer,
-    input: buffer_mod.DeviceBuffer,
+    input: *const CudaTensor,
     weight: *const CudaTensor,
     rows: usize,
     in_dim: usize,
     out_dim: usize,
 ) !bool {
     if (variant != .tc_hmma) return false;
+    if (q4_0CublasPrefillEligible(self, weight, rows, in_dim, out_dim)) {
+        const weight_bytes = try checkedMul(try checkedMul(in_dim, out_dim), @sizeOf(u16));
+        // Bound additional residency, including unusually large output heads.
+        // Allocation stays in the ordinary budgeted temporary pool; a caller
+        // cannot use this route to bypass the owner's GPU memory admission.
+        var dense = try allocDeviceBuffer(self, weight_bytes);
+        defer releaseDeviceBuffer(self, &dense);
+        try self.kernels.launchDequantQ4_0Bf16(&self.ctx, dense, weight.buffer, weight.elem_count / 32);
+        if (try tryCublasLtBf16Linear(self, dst, input, dense, rows, in_dim, out_dim)) {
+            self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .dense_lt, .none, .none, rows, in_dim, out_dim, weight_bytes);
+            return true;
+        }
+    }
     const packed_buffer = tcQuantBuffer(weight, .q4_0_hmma) orelse return false;
     // Prefer the BF16-fragment kernel: bf16 has f32's exponent range, so it
     // stays accurate on Gemma's large activations where the f16 tc kernel loses
     // precision (diverges from the exact reference). Fall back to f16 only if
     // the bf16 symbol is unavailable (e.g. artifacts not yet regenerated).
     if (self.kernels.linear_q4_0_f32_tc_hmma_bf16 != null) {
-        self.kernels.launchLinearQ4_0TcHmmaBf16F32(&self.ctx, dst, input, packed_buffer, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+        self.kernels.launchLinearQ4_0TcHmmaBf16F32(&self.ctx, dst, input.buffer, packed_buffer, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+        self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .q4_tc_hmma, .none, .none, rows, in_dim, out_dim, 0);
         return true;
     }
-    self.kernels.launchLinearQ4_0TcHmmaF32(&self.ctx, dst, input, packed_buffer, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+    self.kernels.launchLinearQ4_0TcHmmaF32(&self.ctx, dst, input.buffer, packed_buffer, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+    self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .q4_tc_hmma, .none, .none, rows, in_dim, out_dim, 0);
     return true;
 }
 
@@ -16547,13 +16620,12 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
     defer if (prefill_profile_scope) |*scope| scope.end();
     const bf16_mirror = weightBf16MirrorForRows(self, weight_tensor, rows);
     if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, bf16_mirror != null) and
-        try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device, input_tensor.buffer, weight_tensor, rows, in_dim, out_dim))
+        try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device, input_tensor, weight_tensor, rows, in_dim, out_dim))
     {
         // W4A16 tensor-core prefill route (default on SM89). It DEFERS to the
         // BF16 mirror when present: cuBLASLt BF16 is faster than this WMMA kernel
         // AND equal quality, so the mirror wins when the user opted into its
         // +VRAM; W4A16 is the win over DP4A when no mirror is attached (default).
-        self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .q4_tc_hmma, .none, .none, rows, in_dim, out_dim, 0);
     } else if (bf16_mirror) |mirror_buffer| {
         if (try tryCublasLtBf16Linear(self, device, input_tensor, mirror_buffer, rows, in_dim, out_dim)) {
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
@@ -18680,12 +18752,11 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, use_hybrid_bf16) and
         tcQuantBuffer(weight_a_tensor, .q4_0_hmma) != null and
         tcQuantBuffer(weight_b_tensor, .q4_0_hmma) != null and
-        try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device_a, input_tensor.buffer, weight_a_tensor, rows, in_dim, out_dim) and
-        try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device_b, input_tensor.buffer, weight_b_tensor, rows, in_dim, out_dim))
+        try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device_a, input_tensor, weight_a_tensor, rows, in_dim, out_dim) and
+        try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device_b, input_tensor, weight_b_tensor, rows, in_dim, out_dim))
     {
         // W4A16 tensor-core gate/up pair. Defers to the BF16 mirror pair when
         // present (use_hybrid_bf16): cuBLASLt is faster + equal quality.
-        self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .q4_tc_hmma, .pair, .none, rows, in_dim, out_dim, 0);
     } else if (use_f16) {
         if (!try tryCublasLtF16LinearPair(
             self,
@@ -20490,9 +20561,12 @@ fn linearNoBiasGatedDown(
         self.stats.gated_down_fallbacks += 1;
         return null;
     }
-    // Hybrid residency: prefill-shaped gated-down goes through the caller's
-    // activation-multiply + BF16-mirror linear fallback instead of Q8_1 kernels.
-    if (weightBf16MirrorForRows(self, weight_tensor, rows) != null) {
+    // Let the caller materialize activation-multiply and use the tensor-core
+    // linear route for admitted prefill. Decode and compaction-repeat retain
+    // their existing fused Q8_1 path; dense residency remains bounded.
+    if (q4_0CublasPrefillEligible(self, weight_tensor, rows, in_dim, out_dim) or
+        weightBf16MirrorForRows(self, weight_tensor, rows) != null)
+    {
         self.stats.gated_down_fallbacks += 1;
         return null;
     }
@@ -22386,12 +22460,21 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     split_attention_blk: {
         const configured_chunk_size = cudaTurboquantSplitAttentionChunkSize();
         if (configured_chunk_size == 0) break :split_attention_blk;
-        const split_capacity = @max(layer.capacity_tokens, attention.kv_sequence_len);
+        const warp_f16 = self.kernels.e4bF16WarpSplitSelected(num_heads, num_kv_heads, head_dim, paged.format, layer.value_format);
+        const full_capacity = @max(layer.capacity_tokens, attention.kv_sequence_len);
+        // The F16 warp kernel partitions the visible window from its first
+        // key. Keep this capacity fixed across graph replays as the prefix
+        // grows; compressed kernels retain their absolute-key partitioning.
+        const split_capacity = if (warp_f16 and attention.sliding_window != 0)
+            @min(full_capacity, attention.sliding_window)
+        else
+            full_capacity;
         // Grow the chunk size as capacity grows instead of abandoning the
         // split kernel: falling back to the serial per-key decode kernel is
         // a multi-x cliff for long-generation runs with large forced KV
         // capacities.
-        const chunk_size = @max(configured_chunk_size, (split_capacity + 127) / 128);
+        const minimum_chunk_size: usize = if (warp_f16) (if (attention.sliding_window != 0) 64 else 128) else configured_chunk_size;
+        const chunk_size = @max(@max(configured_chunk_size, minimum_chunk_size), (split_capacity + 127) / 128);
         const chunk_count = (split_capacity + chunk_size - 1) / chunk_size;
         if (chunk_count <= 1 or chunk_count > 128) break :split_attention_blk;
         const partial_acc_count = checkedMul(try checkedMul(num_heads, chunk_count), head_dim) catch break :split_attention_blk;

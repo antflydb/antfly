@@ -8,7 +8,8 @@ import hashlib
 import json
 from pathlib import Path
 
-from qualify_matched_llama import percentiles
+from qualify_matched_llama import percentiles,content_token_count
+from native_phase_timing import latency_sampling_qualified
 from native_benchmark_fixture import LOGICAL_TOKENS,MODEL_IDENTITY
 
 
@@ -17,7 +18,7 @@ def measured_rows(report):
         raise ValueError('passing non-smoke sampled campaign required')
     if report.get('mode')!='replay':raise ValueError('only full prompt replay is comparable here')
     warmups=report['warmups_requested'];samples=report['samples_requested']
-    if type(warmups) is not int or type(samples) is not int or warmups<5 or samples<100:
+    if type(warmups) is not int or type(samples) is not int or not latency_sampling_qualified(report.get('sampling_profile','extended'),warmups,samples):
         raise ValueError('insufficient declared sampling')
     rows=report['observations']
     if len(rows)!=1+warmups+samples:raise ValueError('incomplete observation count')
@@ -32,6 +33,8 @@ def measured_rows(report):
 
 def compare(native,llama):
     a=measured_rows(native);b=measured_rows(llama)
+    if native.get('sampling_profile','extended')!=llama.get('sampling_profile','extended'):
+        raise ValueError('sampling profiles differ')
     size=native['size']
     if size not in LOGICAL_TOKENS or llama['size']!=size:raise ValueError('different workload sizes')
     logical=LOGICAL_TOKENS[size]
@@ -66,10 +69,12 @@ def compare(native,llama):
                 if usage['prompt_tokens']!=logical or usage.get('cached_prompt_tokens',0)!=0:
                     raise ValueError('Antfly replay reused or changed the prompt')
             else:
-                timing=result['timings'];count=result['tokens_predicted'];text=result['content'].strip()
+                timing=result['timings'];raw_count=result['tokens_predicted'];text=result['content'].strip()
                 if (result['tokens_evaluated']!=logical or timing['prompt_n']!=logical or timing['cache_n']!=0 or
-                        timing['predicted_n']!=count or result['stop_type']!='eos' or result['truncated'] is not False):
+                        timing['predicted_n']!=raw_count or result['stop_type']!='eos' or result['truncated'] is not False):
                     raise ValueError('llama replay reused, truncated or changed the workload')
+                try:count=content_token_count(result)
+                except AssertionError as error:raise ValueError(str(error)) from error
             if type(count) is not int or not 0<count<=16 or text!='violet-729':raise ValueError('invalid generated answer/count')
             if expected_count is None:expected_count=count;expected_text=text
             if (count,text)!=(expected_count,expected_text):raise ValueError('output lengths or answers differ')
@@ -80,7 +85,10 @@ def compare(native,llama):
     limits={'p50':1.25,'p95':1.5}
     return {'scope':'One designated full-prompt-replay workload; total wall latency gate, first-content ratios reported separately',
             'size':size,'logical_tokens':logical,'output_tokens':expected_count,'comparable':True,
-            'samples':{'antfly':len(a),'llama':len(b)},'latency_seconds':summaries,'antfly_over_llama':ratios,
+            'output_accounting':'Content tokens exclude the verified terminal Gemma turn token (106). Raw counters and full completion wall time remain unchanged.',
+            'samples':{'antfly':len(a),'llama':len(b)},'sampling_profile':native.get('sampling_profile','extended'),
+            'sampling_scope':'Observed workload percentiles; bounded sampling does not establish extended-run tail reliability.',
+            'latency_seconds':summaries,'antfly_over_llama':ratios,
             'total_latency_ratio_limits':limits,
             'latency_thresholds_met':all(ratios['total_seconds'][q]<=limit for q,limit in limits.items()),
             'production_ready':False,'portable_restore_comparison_qualified':False}

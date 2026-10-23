@@ -546,12 +546,16 @@ pub const Client = struct {
 
     /// Prepare a portable native KV checkpoint
     /// POST /ai/v1/chat/context/checkpoint
-    pub fn prepareNativeKvCheckpoint(self: *@This(), body: types.InferenceGenerateRequest) !RawResponse {
+    pub fn prepareNativeKvCheckpoint(self: *@This(), body: types.InferenceGenerateRequest, x_antfly_kv_encoding: ?[]const u8) !RawResponse {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/chat/context/checkpoint", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_kv_encoding) |value| try request_headers.append(self.allocator, .{ "X-Antfly-KV-Encoding", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         defer resp.deinit();
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }

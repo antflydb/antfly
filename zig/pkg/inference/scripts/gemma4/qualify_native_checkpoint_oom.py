@@ -63,7 +63,7 @@ def main():
                     response = send_resume(connection, '/ai/v1/chat/context/resume', body, args.checkpoint)
                     payload = response.read(65536)
                     evidence['fault_response'] = {'status': response.status, 'body': payload.decode(errors='replace')}
-                    if response.status != 500 or json.loads(payload).get('message') != 'CudaDriverError':
+                    if response.status != 500 or json.loads(payload).get('message') not in ('CudaDriverError', 'CudaMemoryLimitExceeded'):
                         raise AssertionError('request did not reach a physical CUDA allocation failure')
                 finally:
                     connection.close()

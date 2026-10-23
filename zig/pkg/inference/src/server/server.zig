@@ -1365,7 +1365,10 @@ pub const GenerationBatchingConfig = struct {
             .max_step_items = @min(@max(self.max_step_items, 1), validated_max_items),
             .max_step_query_tokens = @max(self.max_step_query_tokens, 1),
             .max_decode_wait_us = if (self.mode == .on) self.max_decode_wait_us else 0,
-            .max_idle_prefill_chunk_size = @min(@max(self.max_idle_prefill_chunk_size, 32), 2048),
+            // Larger chunks are explicit opt-ins. Model-specific ceilings,
+            // shared-request fairness and scratch admission still constrain
+            // the executable plan; the default remains 2048 rows.
+            .max_idle_prefill_chunk_size = @min(@max(self.max_idle_prefill_chunk_size, 32), 4096),
             // Wider active sets currently lose response equivalence even when
             // individual steps are capped to two rows. Preserve the proven
             // direct path until the multi-wave row scheduler is validated.
@@ -12882,7 +12885,9 @@ pub const Node = struct {
         if (requestUsesAttachmentEnvelope(ctx)) return nativeCheckpointErrorResponse(ctx, error.InvalidNativeCheckpointRequest);
         const metadata = (try ctx.body()) orelse return nativeCheckpointErrorResponse(ctx, error.InvalidNativeCheckpointRequest);
         if (metadata.len > 2 * 1024 * 1024) return nativeCheckpointErrorResponse(ctx, error.NativeKvFrameLimit);
-        var prepare: generation.NativeCheckpointPrepare = .{};
+        const encoding = runtime.kv.attention_match_checkpoint.Encoding.parse(ctx.header("X-Antfly-KV-Encoding") orelse "f16") catch |err|
+            return nativeCheckpointErrorResponse(ctx, err);
+        var prepare: generation.NativeCheckpointPrepare = .{ .encoding = encoding };
         defer prepare.deinit();
         var transfer: NativeCheckpointTransfer = .{ .metadata = metadata, .lease = &lease, .prepare = &prepare };
         return self.completeNativeOrOrdinaryGeneration(ctx, &transfer);
@@ -12921,11 +12926,19 @@ pub const Node = struct {
         const checkpoint = runtime.kv.attention_match_checkpoint;
         const limits: checkpoint.Limits = .{ .max_file_bytes = 2 * 1024 * 1024 * 1024, .max_state_bytes = 2 * 1024 * 1024 * 1024 };
         var work: NativeCheckpointWork = .{ .execution = execution };
-        const bytes = try checkpoint.encodedSizeWithControl(result.checkpoint.state, limits, work.control());
+        const bytes = try checkpoint.encodedSize(result.checkpoint.state, limits, request.encoding, work.control());
         const compacted = result.outcome == .compacted;
         const metadata = try std.json.Stringify.valueAlloc(ctx.allocator, .{
             .version = "attention_match_v1",
-            .wire_version = 2,
+            .wire_version = request.encoding.wireVersion(),
+            .encoding = @tagName(request.encoding),
+            .fp8_heads = if (compacted) result.stats.fp8_heads else @as(usize, 0),
+            .fp8_fallback_heads = if (compacted) result.stats.fp8_fallback_heads else @as(usize, 0),
+            .rotated4_heads = if (compacted) result.stats.rotated4_heads else @as(usize, 0),
+            .rotated4_fallback_heads = if (compacted) result.stats.rotated4_fallback_heads else @as(usize, 0),
+            .rotated4_eligible_rows = if (compacted) result.stats.rotated4_eligible_rows else @as(usize, 0),
+            .rotated4_compressed_rows = if (compacted) result.stats.rotated4_compressed_rows else @as(usize, 0),
+            .rotated4_exact_rows = if (compacted) result.stats.rotated4_exact_rows else @as(usize, 0),
             .model = model,
             .outcome = @tagName(result.outcome),
             .logical_tokens = result.checkpoint.state.logical_length,
@@ -12946,13 +12959,13 @@ pub const Node = struct {
         };
         var sink: Sink = .{ .writer = &writer };
         _ = try native_kv_wire.writeStart(&sink, metadata, bytes, .{}, work.control());
-        const exported = try checkpoint.exportV2(result.checkpoint.state, limits, &sink, work.control());
+        const exported = try checkpoint.exportEncoded(result.checkpoint.state, limits, request.encoding, &sink, work.control());
         if (exported.bytes != bytes) return error.InvalidNativeCheckpointResult;
         // These are disjoint work intervals, not the complete HTTP request.
         // Export includes framing and write backpressure; owner retirement and
         // terminal close happen later. Clients must still validate checksum/EOF.
         const export_finished_ns = embedTimingNowNs();
-        std.log.info("native_checkpoint_prepare_work source_tokens={d} outcome={s} query_ns={d} snapshot_ns={d} fit_ns={d} export_write_ns={d} export_clock_valid={d} checkpoint_bytes={d} terminal_complete=0", .{
+        std.log.info("native_checkpoint_prepare_work source_tokens={d} outcome={s} query_ns={d} snapshot_ns={d} fit_ns={d} export_write_ns={d} export_clock_valid={d} checkpoint_bytes={d} retention_retries={d} fitted_savings_ratio={d} candidate_savings_ratio={d} terminal_complete=0", .{
             result.checkpoint.state.logical_length,
             @tagName(result.outcome),
             result.query_ns,
@@ -12961,6 +12974,9 @@ pub const Node = struct {
             if (export_started_ns > 0 and export_finished_ns >= export_started_ns) export_finished_ns - export_started_ns else 0,
             @intFromBool(export_started_ns > 0 and export_finished_ns > export_started_ns),
             exported.bytes,
+            result.stats.retention_retries,
+            result.stats.fitted_global_savings_ratio,
+            result.stats.actual_global_savings_ratio,
         });
         // A validated export requires EOF after its checksum. Publish that EOF
         // only after the generation scope, checkpoint owner and native lease
@@ -14019,9 +14035,10 @@ pub const Node = struct {
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const native_host_reservation: usize = if (native_transfer) |transfer|
             if (transfer.prepare) |request| blk: {
-                const plan = generation.NativeCheckpointPrepare.hostPlan(gpt_config, prompt_tokens) catch |err| return nativeCheckpointErrorResponse(ctx, err);
+                const plan = generation.NativeCheckpointPrepare.hostPlan(gpt_config, prompt_tokens, request.encoding) catch |err| return nativeCheckpointErrorResponse(ctx, err);
                 request.planned_fit_host_bytes = plan.fit_bytes;
-                std.log.info("native_checkpoint_host_plan source_tokens={d} source_bytes={d} head_workspace_bytes={d} fit_bytes={d} reservation_bytes={d} workers={d}", .{ prompt_tokens, plan.source_bytes, plan.head_workspace_bytes, plan.fit_bytes, plan.reservation_bytes, generation.NativeCheckpointPrepare.fit_workers });
+                request.planned_fit_workers = plan.workers;
+                std.log.info("native_checkpoint_host_plan source_tokens={d} source_bytes={d} head_workspace_bytes={d} fit_bytes={d} reservation_bytes={d} workers={d}", .{ prompt_tokens, plan.source_bytes, plan.head_workspace_bytes, plan.fit_bytes, plan.reservation_bytes, plan.workers });
                 break :blk plan.reservation_bytes;
             } else 2 * 1024 * 1024 * 1024
         else
@@ -31654,8 +31671,12 @@ test "generation batching keeps the experimental CUDA envelope default-off" {
         (GenerationBatchingConfig{ .max_idle_prefill_chunk_size = 1 }).schedulerPolicy().max_idle_prefill_chunk_size,
     );
     try std.testing.expectEqual(
-        @as(usize, 2048),
+        @as(usize, 4096),
         (GenerationBatchingConfig{ .max_idle_prefill_chunk_size = 4096 }).schedulerPolicy().max_idle_prefill_chunk_size,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 4096),
+        (GenerationBatchingConfig{ .max_idle_prefill_chunk_size = 8192 }).schedulerPolicy().max_idle_prefill_chunk_size,
     );
 }
 
@@ -37349,6 +37370,7 @@ fn nativeCheckpointErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Resp
         error.InvalidKvCheckpoint,
         error.KvCheckpointChecksum,
         error.KvStoragePrecisionMismatch,
+        error.UnsupportedKvCheckpointEncoding,
         error.KvCheckpointModelMismatch,
         error.KvCheckpointLayoutMismatch,
         error.KvCheckpointPrefixMismatch,

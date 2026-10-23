@@ -1234,10 +1234,14 @@ const GqaF16PrefillRequest = struct {
 };
 
 fn gqaF16PrefillEligibility(request: GqaF16PrefillRequest) GqaF16PrefillEligibility {
+    return gqaF16PrefillEligibilityForKvHeads(request, 1);
+}
+
+fn gqaF16PrefillEligibilityForKvHeads(request: GqaF16PrefillRequest, kv_heads: usize) GqaF16PrefillEligibility {
     if (request.batch != 1 or
         request.q_seq_len <= 1 or
         request.num_heads != 8 or
-        request.num_kv_heads != 1 or
+        request.num_kv_heads != kv_heads or
         (request.head_dim != 256 and request.head_dim != 512) or
         request.mask_len != 0 or
         request.bias_mode != 0)
@@ -1246,7 +1250,7 @@ fn gqaF16PrefillEligibility(request: GqaF16PrefillRequest) GqaF16PrefillEligibil
     }
     if (request.format != 2 or request.value_format != 2)
         return .storage_format_ineligible;
-    const expected_row_bytes = std.math.mul(usize, request.head_dim, @sizeOf(u16)) catch
+    const expected_row_bytes = std.math.mul(usize, request.head_dim, kv_heads * @sizeOf(u16)) catch
         return .row_bytes_ineligible;
     if (request.key_row_bytes != expected_row_bytes or
         request.base_key_row_bytes != expected_row_bytes or
@@ -1354,7 +1358,8 @@ fn gqaFlashPrefillEligibility(request: GqaFlashPrefillRequest) GqaFlashPrefillEl
     if (request.compute_major != 8 or request.compute_minor != 9) {
         return .compute_capability_ineligible;
     }
-    const base = gqaF16PrefillEligibility(request.base);
+    const kv_heads: usize = if (request.base.num_kv_heads == 2) 2 else 1;
+    const base = gqaF16PrefillEligibilityForKvHeads(request.base, kv_heads);
     if (base != .eligible) return .{ .base = base };
     // Flash qualification covers unique production-style pages, not an
     // aliased physical ring. The host cannot inspect device table entries at
@@ -1367,7 +1372,11 @@ fn gqaFlashPrefillEligibility(request: GqaFlashPrefillRequest) GqaFlashPrefillEl
     if (request.base.page_size_tokens != cuda_kernel_renderer.generated_flash_prefill_page_size_tokens) {
         return .page_size_ineligible;
     }
-    if (!cuda_kernel_renderer.FlashPrefillQueryLengthPolicy.gemma4_q512_or_q3_v1.accepts(
+    const policy: cuda_kernel_renderer.FlashPrefillQueryLengthPolicy = if (kv_heads == 2)
+        .gemma4_e4b_q2_to_8192_32k_v1
+    else
+        .gemma4_q512_or_q3_v1;
+    if (!policy.accepts(
         request.base.q_seq_len,
         request.query_position_offset,
     )) {
@@ -2391,7 +2400,9 @@ pub const KernelModule = struct {
     gqa_attention_prefill_tiled_f16_exact_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_tiled_f16_warp_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_flash_sm89_hd256_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_flash_sm89_e4b_hd256_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_flash_sm89_hd512_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_flash_sm89_e4b_hd512_f32: driver_mod.CUfunction = null,
     gqa_repeat_hd256: driver_mod.CUfunction = null,
     gqa_repeat_hd512: driver_mod.CUfunction = null,
     gqa_repeat_split_scores: driver_mod.CUfunction = null,
@@ -2420,6 +2431,10 @@ pub const KernelModule = struct {
     /// once per module load (per function).
     gqa_prefill_mma_smem_opted_in: bool = false,
     gqa_prefill_mma_m32_smem_opted_in: bool = false,
+    gqa_prefill_flash_e4b_smem_functions: [2]driver_mod.CUfunction = .{ null, null },
+    gqa_attention_decode_f16_warp_stage1_f32: driver_mod.CUfunction = null,
+    e4b_f16_warp_split_enabled: bool = false,
+    e4b_f16_warp_split_used: bool = false,
     gqa_attention_decode_turboquant_split_stage1_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_split_stage2_f32: driver_mod.CUfunction = null,
@@ -2727,8 +2742,16 @@ pub const KernelModule = struct {
                     &self.gqa_attention_prefill_flash_sm89_hd256_f32,
                     artifact.kernel_id,
                 ),
+                .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32 => RuntimeJitFunctionMapping.one(
+                    &self.gqa_attention_prefill_flash_sm89_e4b_hd256_f32,
+                    artifact.kernel_id,
+                ),
                 .gqa_prefill_flash_sm89_hd512_global_f32 => RuntimeJitFunctionMapping.one(
                     &self.gqa_attention_prefill_flash_sm89_hd512_f32,
+                    artifact.kernel_id,
+                ),
+                .gqa_prefill_flash_sm89_e4b_hd512_global_f32 => RuntimeJitFunctionMapping.one(
+                    &self.gqa_attention_prefill_flash_sm89_e4b_hd512_f32,
                     artifact.kernel_id,
                 ),
             };
@@ -3558,10 +3581,23 @@ pub const KernelModule = struct {
             module,
             cuda_kernel_renderer.generated_flash_prefill_hd256_kernel_id,
         );
+        // compute_75 PTX carries compatibility stubs for the E4B Ampere MMA
+        // bodies. Never expose those as callable implementations on a newer
+        // device merely because its driver can JIT that portable image.
+        const gqa_attention_prefill_flash_sm89_e4b_hd256_f32 = if (cuda_artifact.uses_jit) null else loadOptionalFunction(
+            ctx,
+            module,
+            cuda_kernel_renderer.generated_flash_prefill_e4b_hd256_kernel_id,
+        );
         const gqa_attention_prefill_flash_sm89_hd512_f32 = loadOptionalFunction(
             ctx,
             module,
             cuda_kernel_renderer.generated_flash_prefill_hd512_kernel_id,
+        );
+        const gqa_attention_prefill_flash_sm89_e4b_hd512_f32 = if (cuda_artifact.uses_jit) null else loadOptionalFunction(
+            ctx,
+            module,
+            cuda_kernel_renderer.generated_flash_prefill_e4b_hd512_kernel_id,
         );
         const gqa_attention_decode_splitk_online_sm89_hd256_f32 = loadOptionalFunction(
             ctx,
@@ -3602,6 +3638,7 @@ pub const KernelModule = struct {
             return error.CudaKernelUnavailable;
         }
         const gqa_attention_decode_turboquant_split_stage1_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_f32");
+        const gqa_attention_decode_f16_warp_stage1_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_f16_warp_stage1_f32");
         const gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32");
         const gqa_attention_decode_turboquant_split_stage2_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage2_f32");
         const gqa_attention_decode_turboquant_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_f32");
@@ -4044,7 +4081,9 @@ pub const KernelModule = struct {
             .gqa_attention_prefill_tiled_f16_exact_f32 = gqa_attention_prefill_tiled_f16_exact_f32,
             .gqa_attention_prefill_tiled_f16_warp_f32 = gqa_attention_prefill_tiled_f16_warp_f32,
             .gqa_attention_prefill_flash_sm89_hd256_f32 = gqa_attention_prefill_flash_sm89_hd256_f32,
+            .gqa_attention_prefill_flash_sm89_e4b_hd256_f32 = gqa_attention_prefill_flash_sm89_e4b_hd256_f32,
             .gqa_attention_prefill_flash_sm89_hd512_f32 = gqa_attention_prefill_flash_sm89_hd512_f32,
+            .gqa_attention_prefill_flash_sm89_e4b_hd512_f32 = gqa_attention_prefill_flash_sm89_e4b_hd512_f32,
             .gqa_repeat_hd256 = loadOptionalFunction(ctx, module, "antfly_gqa_repeat_prefill_exact_hd256_f32"),
             .gqa_repeat_hd512 = loadOptionalFunction(ctx, module, "antfly_gqa_repeat_prefill_exact_hd512_f32"),
             .gqa_repeat_split_scores = loadOptionalFunction(ctx, module, "antfly_gqa_repeat_split_scores_f32"),
@@ -4054,6 +4093,8 @@ pub const KernelModule = struct {
             .gqa_score_prework_mode = gqa_score_prework_mode,
             .gqa_score_prework_consumer_mode = gqa_score_prework_consumer_mode,
             .gqa_attention_decode_turboquant_split_stage1_f32 = gqa_attention_decode_turboquant_split_stage1_f32,
+            .gqa_attention_decode_f16_warp_stage1_f32 = gqa_attention_decode_f16_warp_stage1_f32,
+            .e4b_f16_warp_split_enabled = ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT", false),
             .gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32,
             .gqa_attention_decode_turboquant_split_stage2_f32 = gqa_attention_decode_turboquant_split_stage2_f32,
             .gqa_attention_decode_turboquant_f32 = gqa_attention_decode_turboquant_f32,
@@ -4489,7 +4530,9 @@ pub const KernelModule = struct {
             self.gqa_attention_prefill_tiled_f16_exact_f32 = null;
             self.gqa_attention_prefill_tiled_f16_warp_f32 = null;
             self.gqa_attention_prefill_flash_sm89_hd256_f32 = null;
+            self.gqa_attention_prefill_flash_sm89_e4b_hd256_f32 = null;
             self.gqa_attention_prefill_flash_sm89_hd512_f32 = null;
+            self.gqa_attention_prefill_flash_sm89_e4b_hd512_f32 = null;
             self.gqa_repeat_hd256 = null;
             self.gqa_repeat_hd512 = null;
             self.gqa_repeat_split_scores = null;
@@ -4508,6 +4551,10 @@ pub const KernelModule = struct {
             self.gqa_flash_prefill_telemetry_word.store(0, .monotonic);
             self.gqa_prefill_mma_smem_opted_in = false;
             self.gqa_prefill_mma_m32_smem_opted_in = false;
+            self.gqa_prefill_flash_e4b_smem_functions = .{ null, null };
+            self.gqa_attention_decode_f16_warp_stage1_f32 = null;
+            self.e4b_f16_warp_split_enabled = false;
+            self.e4b_f16_warp_split_used = false;
             self.gqa_attention_decode_turboquant_split_stage1_f32 = null;
             self.gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = null;
             self.gqa_attention_decode_turboquant_split_stage2_f32 = null;
@@ -11548,14 +11595,14 @@ pub const KernelModule = struct {
             self.gqa_prefill_profile != .tiled_f16_exact))
             return error.CudaKernelUnavailable;
         const flash_prefill_function = switch (head_dim) {
-            256 => self.gqa_attention_prefill_flash_sm89_hd256_f32,
-            512 => self.gqa_attention_prefill_flash_sm89_hd512_f32,
+            256 => if (num_kv_heads == 2) self.gqa_attention_prefill_flash_sm89_e4b_hd256_f32 else self.gqa_attention_prefill_flash_sm89_hd256_f32,
+            512 => if (num_kv_heads == 2) self.gqa_attention_prefill_flash_sm89_e4b_hd512_f32 else self.gqa_attention_prefill_flash_sm89_hd512_f32,
             else => null,
         };
         const flash_prefill_launch = selectGqaFlashPrefillLaunch(
             self.gqa_prefill_profile,
             flash_prefill_eligibility,
-            flash_prefill_function != null,
+            flash_prefill_function != null and (num_kv_heads != 2 or self.gqa_prefill_profile != .automatic),
         );
         const f16_prefill_launch = selectGqaF16PrefillLaunch(
             self.gqa_prefill_profile,
@@ -11778,8 +11825,8 @@ pub const KernelModule = struct {
             grid_y = try toU32((q_seq_len + 15) / 16);
         } else if (launch_kind == .prefill_flash_f16_sm89) {
             const plan = cuda_kernel_renderer.flashPrefillPlanFor(switch (head_dim) {
-                256 => .gqa_prefill_flash_sm89_hd256_swa512_f32,
-                512 => .gqa_prefill_flash_sm89_hd512_global_f32,
+                256 => if (num_kv_heads == 2) .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32 else .gqa_prefill_flash_sm89_hd256_swa512_f32,
+                512 => if (num_kv_heads == 2) .gqa_prefill_flash_sm89_e4b_hd512_global_f32 else .gqa_prefill_flash_sm89_hd512_global_f32,
                 else => unreachable,
             });
             block = @intCast(plan.launch.threads_per_block);
@@ -11789,6 +11836,16 @@ pub const KernelModule = struct {
             shared_bytes = @intCast(plan.launch.dynamic_shared_memory_bytes);
         }
         try ctx.makeCurrent();
+        if (launch_kind == .prefill_flash_f16_sm89 and shared_bytes > 48 * 1024) {
+            // Both E4B specializations exceed the default limit. Track the
+            // concrete function so a JIT replacement receives its own opt-in.
+            const slot: usize = if (head_dim == 256) 0 else 1;
+            if (self.gqa_prefill_flash_e4b_smem_functions[slot] != function) {
+                const set_attr = ctx.driver.fns.cuFuncSetAttribute orelse return error.CudaKernelUnavailable;
+                try ctx.driver.check(set_attr(function, 8, @intCast(shared_bytes)));
+                self.gqa_prefill_flash_e4b_smem_functions[slot] = function;
+            }
+        }
         if (launch_kind == .prefill_mma and !self.gqa_prefill_mma_smem_opted_in) {
             // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8. The
             // attribute must cover this function's largest launch: 89344 for
@@ -12254,6 +12311,13 @@ pub const KernelModule = struct {
         };
     }
 
+    pub fn e4bF16WarpSplitSelected(self: *const KernelModule, num_heads: usize, num_kv_heads: usize, head_dim: usize, format: u32, value_format: u32) bool {
+        return self.e4b_f16_warp_split_enabled and self.gqa_attention_decode_f16_warp_stage1_f32 != null and
+            self.gqa_attention_decode_turboquant_split_stage2_f32 != null and
+            num_heads == 8 and num_kv_heads == 2 and (head_dim == 256 or head_dim == 512) and
+            format == 2 and value_format == 2;
+    }
+
     pub fn launchGqaAttentionDecodeTurboquantSplitF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -12283,7 +12347,10 @@ pub const KernelModule = struct {
         chunk_size: usize,
         chunk_count: usize,
     ) driver_mod.Error!bool {
-        const stage1 = if (format == 0 and value_format == 1 and block_count == 0)
+        const warp_f16 = self.e4bF16WarpSplitSelected(num_heads, num_kv_heads, head_dim, format, value_format);
+        const stage1 = if (warp_f16)
+            self.gqa_attention_decode_f16_warp_stage1_f32.?
+        else if (format == 0 and value_format == 1 and block_count == 0)
             (self.gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 orelse self.gqa_attention_decode_turboquant_split_stage1_f32 orelse return false)
         else
             (self.gqa_attention_decode_turboquant_split_stage1_f32 orelse return false);
@@ -12351,7 +12418,11 @@ pub const KernelModule = struct {
             @ptrCast(&chunk_size_u32),
             @ptrCast(&chunk_count_u32),
         };
-        try launch2d(stage1, ctx, num_heads, chunk_count, if (head_dim <= 256) 256 else 512, &stage1_params);
+        try launch2d(stage1, ctx, num_heads, chunk_count, if (warp_f16 or head_dim <= 256) 256 else 512, &stage1_params);
+        if (warp_f16 and !self.e4b_f16_warp_split_used) {
+            self.e4b_f16_warp_split_used = true;
+            std.log.info("cuda_e4b_f16_warp_split: status=active kernel=termite_gqa_attention_decode_f16_warp_stage1_f32", .{});
+        }
 
         var stage2_params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
@@ -25364,4 +25435,55 @@ test "attention match split scratch is bounded before allocation" {
     try std.testing.expectError(error.UnsupportedCompactionQueryRoute, attentionMatchSplitScratchBytes(std.math.maxInt(usize)));
     try std.testing.expectEqual(@as(usize, 67125248), try attentionMatchSplitScratchBytes(256));
     try std.testing.expect((try attentionMatchSplitScratchBytes(512)) < 160 * 1024 * 1024);
+}
+
+test "E4B Flash selector checks two-head strides and long-context bounds" {
+    var request = GqaFlashPrefillRequest{
+        .compute_major = 8,
+        .compute_minor = 9,
+        .query_position_offset = 30720,
+        .kv_position_offset = 0,
+        .sliding_window = 0,
+        .total_sequence_len = 32768,
+        .base = .{ .batch = 1, .q_seq_len = 2048, .kv_seq_len = 32768, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .mask_len = 0, .bias_mode = 0, .key_row_bytes = 2048, .base_key_row_bytes = 2048, .value_row_bytes = 2048, .block_count = 2048, .page_size_tokens = 16, .format = 2, .value_format = 2, .physical_token_capacity = 32768, .block_table_present = true, .decode_scalars_present = false },
+    };
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
+    // The old one-KV-head exact/warp entry points must still reject E4B.
+    try std.testing.expect(gqaF16PrefillEligibility(request.base) == .shape_ineligible);
+    request.base.value_row_bytes = 1024;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .base);
+    request.base.value_row_bytes = 2048;
+    request.query_position_offset += 1;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .query_length_policy_ineligible);
+    request.query_position_offset = 30720;
+    request.kv_position_offset = 16;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .position_policy_ineligible);
+    request.kv_position_offset = 0;
+    request.query_position_offset = 24576;
+    request.base.q_seq_len = 8192;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
+    request.query_position_offset = 24575;
+    request.base.q_seq_len = 8193;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .query_length_policy_ineligible);
+}
+
+test "E4B Flash warp decode selection preserves compressed and E2B routes" {
+    var module: KernelModule = undefined;
+    module.e4b_f16_warp_split_enabled = true;
+    module.gqa_attention_decode_f16_warp_stage1_f32 = @ptrFromInt(1);
+    module.gqa_attention_decode_turboquant_split_stage2_f32 = @ptrFromInt(1);
+    try std.testing.expect(module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
+    try std.testing.expect(module.e4bF16WarpSplitSelected(8, 2, 512, 2, 2));
+    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 1, 256, 2, 2));
+    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 128, 2, 2));
+    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 0, 1));
+    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 1));
+    module.e4b_f16_warp_split_enabled = false;
+    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
+    module.e4b_f16_warp_split_enabled = true;
+    module.gqa_attention_decode_turboquant_split_stage2_f32 = null;
+    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
+    module.gqa_attention_decode_turboquant_split_stage2_f32 = @ptrFromInt(1);
+    module.gqa_attention_decode_f16_warp_stage1_f32 = null;
+    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
 }

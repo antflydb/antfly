@@ -3546,6 +3546,22 @@ pub const ModelsResponse = struct {
 pub const NativeKvCheckpointMetadata = struct {
     version: []const u8,
     wire_version: i64,
+    /// V2 uses f32; V3 uses f16 or mixed validated FP8/f16 storage, restored to f16 on the GPU. V4 uses mixed rotated4/f16 storage and serves compressed rows directly on the GPU.
+    encoding: ?[]const u8 = null,
+    /// Heads whose decoded FP8 fitted history passed whole-head validation against the original cache.
+    fp8_heads: ?i64 = null,
+    /// Validated fitted heads retained in f16 after a rejected FP8 attempt.
+    fp8_fallback_heads: ?i64 = null,
+    /// Heads containing accepted rotated4 fitted rows. Required for rotated4; zero for other encodings.
+    rotated4_heads: ?i64 = null,
+    /// Validated fitted heads retained entirely in f16 after rotated4 validation. Together with rotated4_heads, equals validated_heads for rotated4.
+    rotated4_fallback_heads: ?i64 = null,
+    /// Newly fitted historical rows eligible for rotated4 across heads; excludes protected prefix and recent rows.
+    rotated4_eligible_rows: ?i64 = null,
+    /// Eligible rows stored in rotated4. Compressed and exact eligible rows sum to rotated4_eligible_rows.
+    rotated4_compressed_rows: ?i64 = null,
+    /// Eligible fitted rows retained in f16; excludes protected prefix and recent rows. All rotated4 counters are zero for unchanged fallback and other encodings.
+    rotated4_exact_rows: ?i64 = null,
     model: []const u8,
     outcome: []const u8,
     logical_tokens: i64,
@@ -3554,6 +3570,90 @@ pub const NativeKvCheckpointMetadata = struct {
     global_savings_ratio: f64,
     validated_heads: i64,
     preserved_heads: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "wire_version", "wire_version", false },
+        .{ "encoding", "encoding", true },
+        .{ "fp8_heads", "fp8_heads", true },
+        .{ "fp8_fallback_heads", "fp8_fallback_heads", true },
+        .{ "rotated4_heads", "rotated4_heads", true },
+        .{ "rotated4_fallback_heads", "rotated4_fallback_heads", true },
+        .{ "rotated4_eligible_rows", "rotated4_eligible_rows", true },
+        .{ "rotated4_compressed_rows", "rotated4_compressed_rows", true },
+        .{ "rotated4_exact_rows", "rotated4_exact_rows", true },
+        .{ "model", "model", false },
+        .{ "outcome", "outcome", false },
+        .{ "logical_tokens", "logical_tokens", false },
+        .{ "checkpoint_bytes", "checkpoint_bytes", false },
+        .{ "global_savings_ratio", "global_savings_ratio", false },
+        .{ "validated_heads", "validated_heads", false },
+        .{ "preserved_heads", "preserved_heads", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("wire_version");
+        try jw.write(self.wire_version);
+        if (self.encoding) |value| {
+            try jw.objectField("encoding");
+            try jw.write(value);
+        }
+        if (self.fp8_heads) |value| {
+            try jw.objectField("fp8_heads");
+            try jw.write(value);
+        }
+        if (self.fp8_fallback_heads) |value| {
+            try jw.objectField("fp8_fallback_heads");
+            try jw.write(value);
+        }
+        if (self.rotated4_heads) |value| {
+            try jw.objectField("rotated4_heads");
+            try jw.write(value);
+        }
+        if (self.rotated4_fallback_heads) |value| {
+            try jw.objectField("rotated4_fallback_heads");
+            try jw.write(value);
+        }
+        if (self.rotated4_eligible_rows) |value| {
+            try jw.objectField("rotated4_eligible_rows");
+            try jw.write(value);
+        }
+        if (self.rotated4_compressed_rows) |value| {
+            try jw.objectField("rotated4_compressed_rows");
+            try jw.write(value);
+        }
+        if (self.rotated4_exact_rows) |value| {
+            try jw.objectField("rotated4_exact_rows");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("outcome");
+        try jw.write(self.outcome);
+        try jw.objectField("logical_tokens");
+        try jw.write(self.logical_tokens);
+        try jw.objectField("checkpoint_bytes");
+        try jw.write(self.checkpoint_bytes);
+        try jw.objectField("global_savings_ratio");
+        try jw.write(self.global_savings_ratio);
+        try jw.objectField("validated_heads");
+        try jw.write(self.validated_heads);
+        try jw.objectField("preserved_heads");
+        try jw.write(self.preserved_heads);
+        try jw.endObject();
+    }
 };
 
 pub const PredictRequest = struct {

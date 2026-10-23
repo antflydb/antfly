@@ -1,9 +1,64 @@
 import copy
 import unittest
+from unittest import mock
 import qualify_attention_match_queries as qualification
 
 
+class ReadinessTests(unittest.TestCase):
+    def test_both_launchers_require_a_successful_health_response(self):
+        for address in ('127.0.0.1:8531', 'http://127.0.0.1:8531'):
+            with self.subTest(address=address):
+                process = mock.Mock()
+                process.poll.return_value = None
+                log = mock.Mock()
+                log.read_text.return_value = f'listening on {address}\n'
+                with mock.patch.object(qualification.urllib.request, 'urlopen') as health:
+                    health.return_value.__enter__.return_value.status = 200
+                    qualification.wait_server_ready(process, log, 8531, timeout=0)
+                    health.assert_called_once_with('http://127.0.0.1:8531/healthz', timeout=1)
+
+    def test_unrelated_listener_cannot_satisfy_readiness(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        log = mock.Mock()
+        log.read_text.return_value = 'listening on http://127.0.0.1:85310\n'
+        with mock.patch.object(qualification.urllib.request, 'urlopen') as health:
+            with self.assertRaises(TimeoutError):
+                qualification.wait_server_ready(process, log, 8531, timeout=0)
+            health.assert_not_called()
+
+    def test_startup_log_alone_does_not_prove_readiness(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        log = mock.Mock()
+        log.read_text.return_value = 'listening on http://127.0.0.1:8531\n'
+        with mock.patch.object(qualification.urllib.request, 'urlopen', side_effect=OSError):
+            with self.assertRaises(TimeoutError):
+                qualification.wait_server_ready(process, log, 8531, timeout=0)
+        process.poll.return_value = 1
+        with self.assertRaises(RuntimeError):
+            qualification.wait_server_ready(process, log, 8531, timeout=0)
+
+
 class CycleEvidenceTests(unittest.TestCase):
+    def test_rotated4_coverage_rejects_fallback_only_and_malformed_counts(self):
+        valid = dict(rotated4_heads=2, rotated4_fallback_heads=6, validated_heads=8,
+                     rotated4_eligible_rows=80, rotated4_compressed_rows=15, rotated4_exact_rows=65)
+        qualification.validate_quantization_evidence([valid], "rotated4")
+        self.assertEqual(qualification.checkpoint_wire_version("rotated4"), 4)
+        with self.assertRaises(AssertionError):
+            qualification.validate_quantization_evidence([], "rotated4")
+        for key, value in (("rotated4_heads", 0), ("rotated4_heads", True),
+                           ("rotated4_fallback_heads", -1), ("validated_heads", 9),
+                           ("validated_heads", True)):
+            with self.subTest(key=key, value=value), self.assertRaises(AssertionError):
+                qualification.validate_quantization_evidence([{**valid, key: value}], "rotated4")
+        for key in valid:
+            changed = dict(valid)
+            del changed[key]
+            with self.subTest(missing=key), self.assertRaises(AssertionError):
+                qualification.validate_quantization_evidence([changed], "rotated4")
+
     def fixture(self):
         requests = [{"response": {"usage": {"prompt_tokens": 8189}}}]
         rows, fits = [], []
@@ -40,6 +95,26 @@ class CycleEvidenceTests(unittest.TestCase):
         self.validate(self.fixture())
         parsed = qualification.parse_capture("incremental_savings_ratio=1.25 max_logit_relative_l2=0.01 answer_appends=2")
         self.assertEqual(parsed, dict(incremental_savings_ratio=1.25, max_logit_relative_l2=.01, answer_appends=2))
+
+    def test_fp8_cycles_require_actual_quantization_and_current_policy(self):
+        evidence = self.fixture()
+        for fit in evidence[1]:
+            fit.update(export_version=3, fp8_heads=5, fp8_fallback_heads=1, min_retention_divisor=2)
+        def validate(rows):
+            qualification.validate_cycle_evidence(*rows, cycles=2, append_tokens=512, answer_tokens=4,
+                minimum_savings=1.01, first_minimum_savings=1.2, encoding="fp8", native_policy=True)
+        validate(evidence)
+        for key, value in (("export_version", 2), ("fp8_heads", 0), ("fp8_heads", True),
+                           ("fp8_fallback_heads", 0), ("fp8_fallback_heads", -1), ("min_retention_divisor", 4)):
+            changed = copy.deepcopy(evidence)
+            changed[1][-1][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(AssertionError):
+                validate(changed)
+        for key in ("fp8_heads", "fp8_fallback_heads", "min_retention_divisor"):
+            changed = copy.deepcopy(evidence)
+            del changed[1][-1][key]
+            with self.subTest(missing=key), self.assertRaises(AssertionError):
+                validate(changed)
 
     def test_rejects_missing_or_misordered_cycles_and_false_success(self):
         for key, value in (("cycle", 1), ("source_unchanged", 0), ("invalid", 1), ("checkpoint_roundtrip", 0),

@@ -92,15 +92,54 @@ def _invalid_constant(_: str) -> Any:
 def _validate_metadata(metadata: Any, size: int, model: str) -> dict[str, Any]:
     if not isinstance(metadata, dict):
         raise ValueError("checkpoint metadata must be an object")
-    if (metadata.get("version"), metadata.get("wire_version"), metadata.get("model")) != (
-        "attention_match_v1",
-        2,
-        model,
+    if (
+        metadata.get("version") != "attention_match_v1"
+        or metadata.get("wire_version") not in (2, 3, 4)
+        or metadata.get("model") != model
     ):
         raise ValueError("checkpoint metadata has an unexpected version or model")
+    if metadata["wire_version"] == 4 and metadata.get("encoding") != "rotated4":
+        raise ValueError("checkpoint metadata encoding disagrees with wire version")
+    if metadata["wire_version"] == 3 and metadata.get("encoding") not in ("f16", "fp8"):
+        raise ValueError("checkpoint metadata has an unsupported encoding")
+    if metadata["wire_version"] == 2 and metadata.get("encoding", "f32") != "f32":
+        raise ValueError("checkpoint metadata encoding disagrees with wire version")
     for name in ("wire_version", "logical_tokens", "checkpoint_bytes", "validated_heads", "preserved_heads"):
         if type(metadata.get(name)) is not int or metadata[name] < 0:
             raise ValueError(f"invalid checkpoint metadata field: {name}")
+    fp8 = metadata.get("encoding") == "fp8"
+    for name in ("fp8_heads", "fp8_fallback_heads"):
+        if fp8 or name in metadata:
+            if type(metadata.get(name)) is not int or metadata[name] < 0:
+                raise ValueError(f"invalid checkpoint metadata for wire encoding: {name}")
+    quantized = metadata.get("fp8_heads", 0)
+    fallback = metadata.get("fp8_fallback_heads", 0)
+    if (fp8 and quantized + fallback != metadata["validated_heads"]) or (not fp8 and (quantized or fallback)):
+        raise ValueError("checkpoint head accounting disagrees with wire encoding")
+    rotated = metadata.get("encoding") == "rotated4"
+    rotated_fields = (
+        "rotated4_heads",
+        "rotated4_fallback_heads",
+        "rotated4_eligible_rows",
+        "rotated4_compressed_rows",
+        "rotated4_exact_rows",
+    )
+    for name in rotated_fields:
+        if rotated or name in metadata:
+            if type(metadata.get(name)) is not int or metadata[name] < 0:
+                raise ValueError(f"invalid checkpoint metadata for wire encoding: {name}")
+    heads, fallback, eligible, compressed, exact = (metadata.get(name, 0) for name in rotated_fields)
+    if rotated:
+        if (
+            heads + fallback != metadata["validated_heads"]
+            or compressed + exact != eligible
+            or bool(heads) != bool(compressed)
+            or heads > compressed
+            or fallback > exact
+        ):
+            raise ValueError("checkpoint row/head accounting disagrees with wire encoding")
+    elif any((heads, fallback, eligible, compressed, exact)):
+        raise ValueError("checkpoint row/head accounting disagrees with wire encoding")
     if metadata["checkpoint_bytes"] != size or not 0 < metadata["logical_tokens"] <= 32768:
         raise ValueError("checkpoint metadata has an invalid size or logical length")
     ratio = metadata.get("global_savings_ratio")
@@ -124,12 +163,28 @@ def _validate_metadata(metadata: Any, size: int, model: str) -> dict[str, Any]:
     return metadata
 
 
-def _copy_checkpoint(reader: Reader, size: int, output: BinaryIO | None = None) -> tuple[str, dict[str, str], int]:
+def _copy_checkpoint(
+    reader: Reader, size: int, output: BinaryIO | None = None, *, metadata: dict[str, Any] | None = None
+) -> tuple[str, dict[str, str], int]:
     if not 192 <= size <= MAX_CHECKPOINT_BYTES:
         raise ValueError("native checkpoint exceeds file limits")
     header = _read_exact(reader, 152)
-    if struct.unpack("<8sIIQ", header[:24]) != (b"ANTFLYKV", 2, 0, size - 184):
+    magic, version, flags, payload_size = struct.unpack("<8sIIQ", header[:24])
+    if (
+        magic != b"ANTFLYKV"
+        or version not in (2, 3, 4)
+        or payload_size != size - 184
+        or (version == 2 and flags != 0)
+        or (version == 3 and flags not in (0, 1))
+        or (version == 4 and flags != 0)
+    ):
         raise ValueError("invalid native checkpoint header")
+    if metadata is not None and (
+        version != metadata["wire_version"]
+        or (version == 3 and flags != int(metadata["encoding"] == "fp8"))
+        or (version == 4 and metadata.get("encoding") != "rotated4")
+    ):
+        raise ValueError("checkpoint metadata disagrees with wire encoding")
     integrity = hashlib.sha256(header)
     file_hash = hashlib.sha256(header)
     if output is not None:
@@ -184,7 +239,7 @@ def receive_checkpoint(reader: Reader, destination: str | Path, model: str) -> N
     try:
         with partial.open("xb") as output:
             created = True
-            digest, identity, logical_tokens = _copy_checkpoint(reader, size, output)
+            digest, identity, logical_tokens = _copy_checkpoint(reader, size, output, metadata=metadata)
             if logical_tokens != metadata["logical_tokens"]:
                 raise ValueError("checkpoint metadata disagrees with saved logical length")
             if reader.read(1):
@@ -199,7 +254,11 @@ def receive_checkpoint(reader: Reader, destination: str | Path, model: str) -> N
 
 
 def checkpoint_upload(source: BinaryIO, metadata: dict[str, Any]) -> tuple[int, Iterator[bytes]]:
-    """Validate a file before sending; stream the same open descriptor without replay."""
+    """Validate a file before sending; stream the same descriptor without replay.
+
+    Includes V4 rotated4 files; model compatibility is checked by the server.
+    Payload/codec semantics are validated by the server before installation.
+    """
     before = os.fstat(source.fileno())
     size = before.st_size
     _copy_checkpoint(source, size)

@@ -1,7 +1,8 @@
-"""Sustained public native-KV requests on one real worker, without retries.
+"""Repeated public native-KV requests on one real worker, without retries.
 
-This 8K fact fixture tests retained-state integrity and memory over 1,000 mixed
-requests and 100 actual compactions. It does not qualify diverse task quality,
+The bounded profile uses 100 mixed requests and 10 actual compactions; extended
+uses 1,000 requests and 100 compactions. Bounded evidence does not establish
+extended-run reliability. Neither profile qualifies diverse task quality,
 32K stress, cancellation, physical OOM, concurrent execution, or latency parity.
 """
 import argparse
@@ -46,28 +47,33 @@ def memory_observation(record):
     return row
 
 
-def summarize_blocks(blocks):
-    if len(blocks) < 20:
-        raise AssertionError('at least 20 complete blocks required')
+def summarize_blocks(blocks, profile='extended'):
+    minimum_blocks = {'bounded': 2, 'extended': 20}[profile]
+    if len(blocks) < minimum_blocks:
+        raise AssertionError(f'at least {minimum_blocks} complete blocks required')
     if any(not block.get('passed') for block in blocks):
         raise AssertionError('incomplete or failed stress block')
+    if any(tuple(op['kind'] for op in block['operations']) != TEN_REQUESTS*5 for block in blocks):
+        raise AssertionError('incomplete or reordered mixed request block')
     operations = [op for block in blocks for op in block['operations']]
-    if len(operations) < 1000 or any(not op.get('passed') for op in operations):
-        raise AssertionError('at least 1,000 successful expected outcomes required')
+    if len(operations) < minimum_blocks*50 or any(not op.get('passed') for op in operations):
+        raise AssertionError(f'at least {minimum_blocks*50} successful expected outcomes required')
     compactions = [op for op in operations if op['kind'] == 'prepare']
-    if len(compactions) < 100 or any(op.get('outcome') != 'compacted' for op in compactions):
-        raise AssertionError('at least 100 actual compactions required; unchanged fallbacks do not count')
+    if len(compactions) < minimum_blocks*5 or any(op.get('outcome') != 'compacted' for op in compactions):
+        raise AssertionError(f'at least {minimum_blocks*5} actual compactions required; unchanged fallbacks do not count')
     growth = {}
+    window = min(5, len(blocks)//2)
     for key in ('host_rss_bytes', 'gpu_memory_bytes'):
         values = [block['quiescent_memory'][key] for block in blocks]
-        first = statistics.median(values[:5]); last = statistics.median(values[-5:])
+        first = statistics.median(values[:window]); last = statistics.median(values[-window:])
         # A conservative diagnostic trigger, additional to the documented hard
         # memory caps. Preserve every block sample to allow independent review.
-        growth[key] = {'first_five_median': first, 'last_five_median': last,
+        growth[key] = {'first_window_median': first, 'last_window_median': last, 'window_blocks': window,
                        'delta_bytes': last-first, 'maximum_bytes': max(values)}
         if last-first > 128*1024**2:
             raise AssertionError(f'sustained quiescent memory growth: {key}: {last-first}')
     return {'mixed_requests': len(operations), 'actual_compactions': len(compactions),
+            'profile': profile, 'extended_run_qualified': profile == 'extended',
             'quiescent_growth': growth, 'growth_diagnostic_limit_bytes': 128*1024**2}
 
 
@@ -82,21 +88,26 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--port', type=int, default=8516)
     parser.add_argument('--timeout', type=float, default=1800)
-    parser.add_argument('--blocks', type=int, default=20)
+    parser.add_argument('--profile', choices=['bounded', 'extended'], default='extended')
+    parser.add_argument('--blocks', type=int)
+    parser.add_argument('--encoding', choices=['f32', 'f16', 'fp8', 'rotated4'], default='f16')
+    parser.add_argument('--experimental-rotated4', action='store_true')
     args = parser.parse_args()
-    if args.blocks < 20: parser.error('fewer than 20 blocks cannot satisfy the sustained gate')
+    minimum_blocks = {'bounded': 2, 'extended': 20}[args.profile]
+    if args.blocks is None: args.blocks = minimum_blocks
+    if args.blocks < minimum_blocks: parser.error(f'{args.profile} requires at least {minimum_blocks} blocks')
     if not math.isfinite(args.timeout) or args.timeout <= 0: parser.error('invalid timeout')
     args.fixture = 'fact'; args.expected_outcome = 'compacted'; args.minimum_savings = 1.5
     args.checkpoint = args.output.with_suffix('.working.kv')
     if args.output.exists() or args.checkpoint.exists(): raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     evidence = {'passed': False, 'production_ready': False, 'scope': __doc__,
-                'server_kind': args.server_kind, 'source': git_provenance(REPO),
+                'server_kind': args.server_kind, 'encoding': args.encoding, 'source': git_provenance(REPO),
                 'binary_sha256': sha256_file(args.server),
                 'reference_sha256': sha256_file(args.reference),
                 'reference_checkpoint_sha256': sha256_file(args.reference_checkpoint),
                 'runner_sha256': sha256_file(Path(__file__)), 'blocks': [],
-                'retries': 0, 'warmups': 5, 'block_size': 50}
+                'retries': 0, 'warmups': 5, 'block_size': 50, 'profile': args.profile}
     def publish():
         temporary = args.output.with_suffix('.json.part')
         temporary.write_text(json.dumps(evidence, indent=2)+'\n'); temporary.replace(args.output)
@@ -109,6 +120,13 @@ def main():
             if len(matches) != 1: raise AssertionError(f'missing/ambiguous reference: {kind}')
             return matches[0]
         prepared = prior_result('prepare')
+        if prepared['metadata'].get('encoding', 'f32') != args.encoding:
+            raise AssertionError('reference encoding differs from stress campaign')
+        if args.encoding == 'rotated4':
+            from qualify_attention_match_queries import validate_quantization_evidence
+            validate_quantization_evidence([prepared['metadata']], 'rotated4')
+        if args.encoding == 'fp8' and prepared['metadata'].get('fp8_heads', 0) < 1:
+            raise AssertionError('FP8 stress requires actually quantized state')
         if prepared['file_sha256'] != evidence['reference_checkpoint_sha256']:
             raise AssertionError('reference checkpoint changed')
         if prepared['metadata']['logical_tokens'] != 8189:
@@ -168,7 +186,7 @@ def main():
                 block['passed'] = True; publish()
                 print(json.dumps({'block': index, 'mixed_requests': (index+1)*50,
                                   'actual_compactions': (index+1)*5}), flush=True)
-        evidence['summary'] = summarize_blocks(evidence['blocks'])
+        evidence['summary'] = summarize_blocks(evidence['blocks'], args.profile)
         memory = evidence['worker']['memory']
         if memory['samples'] < 2 or memory['errors'] or not memory['gpu_uuids']:
             raise AssertionError('incomplete memory sampling')

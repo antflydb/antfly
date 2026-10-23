@@ -7,6 +7,9 @@
 //! fingerprints and bounded allocation before any state may replace a cache.
 const std = @import("std");
 const Control = @import("attention_match.zig").Control;
+pub const codec = @import("attention_match_codec.zig");
+pub const Encoding = codec.Encoding;
+pub const packed_storage = @import("attention_match_packed.zig");
 
 pub const Identity = struct {
     weights: [32]u8,
@@ -34,6 +37,9 @@ pub const Head = struct {
     keys: []const f32 = &.{},
     values: []const f32 = &.{},
     bias: []const f32 = &.{},
+    /// Storage-only annotation; these values have already passed attention validation.
+    fp8: codec.Fp8 = .{},
+    compressed: packed_storage.Packed = .{},
 
     pub fn visible(self: Head, row: usize, query_position: u64) bool {
         return self.coverage_ends[row] != 0 and self.coverage_ends[row] - 1 <= query_position;
@@ -85,10 +91,12 @@ pub const State = struct {
                 donor.heads.len == 0 or donor.heads.len > limits.max_kv_heads) return error.InvalidKvCheckpoint;
             for (donor.heads) |head| {
                 const rows = head.positions.len;
+                try validateFp8(head, donor.window);
                 if (head.dim == 0 or head.dim > limits.max_head_dim or head.dim != donor.heads[0].dim or
                     head.compacted_until > self.logical_length or (donor.window != 0 and head.compacted_until != 0) or
                     rows == 0 or rows > self.logical_length or head.coverage_ends.len != rows or head.bias.len != rows or
                     head.keys.len != try mul(rows, head.dim) or head.values.len != head.keys.len) return error.InvalidKvCheckpoint;
+                try validatePacked(head, donor.window, control);
                 try finiteWithControl(head.keys, control);
                 try finiteWithControl(head.values, control);
                 try finiteWithControl(head.bias, control);
@@ -129,6 +137,7 @@ pub const State = struct {
             for (donor.heads) |head| {
                 size = try add(size, try mul(head.positions.len, 20));
                 size = try add(size, try mul(head.keys.len, 8));
+                size = try add(size, head.compressed.bytes());
             }
         }
         return size;
@@ -158,6 +167,8 @@ pub const Owned = struct {
                 a.free(head.keys);
                 a.free(head.values);
                 a.free(head.bias);
+                var compressed = head.compressed;
+                compressed.deinit(a);
             }
             a.free(donor.heads);
         }
@@ -202,15 +213,33 @@ fn hashWithControl(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8, contro
 }
 
 fn fileBytes(state: State) !usize {
+    return fileBytesEncoded(state, .f32);
+}
+
+fn fileBytesEncoded(state: State, encoding: Encoding) !usize {
     // logical_length; token, logit, layer, donor counts
     var size = try add(header_bytes, 8 + 4 * 4);
     size = try add(size, try mul(try add(try add(state.tokens.len, state.logits.len), state.layer_donors.len), 4));
     for (state.donors) |donor| {
         size = try add(size, 12);
         for (donor.heads) |head| {
+            if (encoding != .rotated4 and head.compressed.spans.len != 0) return error.KvStoragePrecisionMismatch;
             size = try add(size, 16);
             size = try add(size, try mul(head.positions.len, 20)); // pos, end, bias
-            size = try add(size, try mul(head.keys.len, 8)); // K, V
+            if (encoding == .rotated4) {
+                size = try add(size, 16);
+                size = try add(size, head.compressed.bytes());
+                size = try add(size, try mul(try mul(head.positions.len - head.compressed.rows(), head.dim), 4));
+            } else if (encoding == .f32) {
+                size = try add(size, try mul(head.keys.len, 8)); // K, V
+            } else {
+                const fp8 = if (encoding == .fp8) head.fp8 else codec.Fp8{};
+                size = try add(size, 16); // range and K/V scales
+                const dense = try mul(head.keys.len, 4);
+                const saved = try mul(try mul(fp8.rows, head.dim), 2);
+                if (saved > dense) return error.InvalidKvCheckpoint;
+                size = try add(size, dense - saved);
+            }
         }
     }
     return size;
@@ -264,6 +293,95 @@ pub fn encode(allocator: std.mem.Allocator, state: State, limits: Limits) ![]u8 
 }
 
 pub const ExportDigest = struct { integrity_sha256: [32]u8, file_sha256: [32]u8, bytes: usize };
+
+fn validateFp8(head: Head, window: u32) !void {
+    const q = head.fp8;
+    if (!codec.validScale(q.key_scale) or !codec.validScale(q.value_scale)) return error.InvalidKvCheckpoint;
+    if (q.rows == 0) {
+        if (q.first_row != 0 or q.key_scale != 1 or q.value_scale != 1) return error.InvalidKvCheckpoint;
+        return;
+    }
+    if (window != 0 or q.first_row > head.positions.len or q.rows > head.positions.len - q.first_row or
+        head.coverage_ends.len != head.positions.len) return error.InvalidKvCheckpoint;
+    const last = @as(usize, q.first_row) + q.rows - 1;
+    if (head.positions[last] >= head.compacted_until or head.coverage_ends[last] > head.compacted_until)
+        return error.InvalidKvCheckpoint;
+}
+
+fn encodedValue(value: f32, scale: f32, fp8: bool) !u16 {
+    if (!codec.halfExact(value)) return error.KvStoragePrecisionMismatch;
+    if (!fp8) return @bitCast(@as(f16, @floatCast(value)));
+    const bits = try codec.encode(value, scale);
+    // Export never introduces unvalidated rounding, including repeated exports.
+    if (@as(u32, @bitCast(try codec.decode(bits, scale))) != @as(u32, @bitCast(value)))
+        return error.KvStoragePrecisionMismatch;
+    return bits;
+}
+
+pub fn encodedSize(state: State, limits: Limits, encoding: Encoding, control: Control) !usize {
+    if (encoding == .f32) return encodedSizeWithControl(state, limits, control);
+    try state.validateWithControl(limits, control);
+    if (try state.residentBytes() > limits.max_state_bytes) return error.KvCheckpointLimit;
+    for (state.donors) |donor| for (donor.heads) |head| {
+        const q = if (encoding == .fp8) head.fp8 else codec.Fp8{};
+        const begin = @as(usize, q.first_row) * head.dim;
+        const end = begin + @as(usize, q.rows) * head.dim;
+        var compressed_row = false;
+        for (head.keys, head.values, 0..) |k, v, i| {
+            if (i % 4096 == 0) try control.check();
+            if (encoding == .rotated4 and i % head.dim == 0) compressed_row = head.compressed.index(i / head.dim) == .compressed;
+            if (compressed_row) continue;
+            _ = try encodedValue(k, q.key_scale, i >= begin and i < end);
+            _ = try encodedValue(v, q.value_scale, i >= begin and i < end);
+        }
+    };
+    const size = try fileBytesEncoded(state, encoding);
+    if (size > limits.max_file_bytes) return error.KvCheckpointLimit;
+    try control.check();
+    return size;
+}
+
+/// V3 retains V2 framing/integrity and stores K/V as exact f16 or validated
+/// E4M3FN ranges. Metadata, biases and saved logits retain their full precision.
+pub fn exportEncoded(state: State, limits: Limits, encoding: Encoding, sink: anytype, control: Control) !ExportDigest {
+    if (encoding == .f32) return exportV2(state, limits, sink, control);
+    const size = try encodedSize(state, limits, encoding, control);
+    var header: [digest_offset]u8 = undefined;
+    var h: Encoder = .{ .bytes = &header };
+    try h.raw(magic);
+    try h.int(u32, encoding.wireVersion());
+    try h.int(u32, @intFromBool(encoding == .fp8));
+    try h.int(u64, size - header_bytes);
+    inline for (.{ "weights", "tokenizer", "template", "layout" }) |field| try h.raw(&@field(state.identity, field));
+    var w: StreamEncoder(@TypeOf(sink)) = .{ .sink = sink, .control = control, .streaming_hash = true };
+    try w.slice(u8, &header);
+    try writePayloadEncoded(&w, state, encoding);
+    try w.flush();
+    try control.check();
+    const digest = w.hash.peek();
+    try sink.writeAll(&digest);
+    w.hash.update(&digest);
+    try control.check();
+    return .{ .integrity_sha256 = digest, .file_sha256 = w.hash.finalResult(), .bytes = size };
+}
+
+pub fn encodeWithEncoding(allocator: std.mem.Allocator, state: State, limits: Limits, encoding: Encoding, control: Control) ![]u8 {
+    const bytes = try allocator.alloc(u8, try encodedSize(state, limits, encoding, control));
+    errdefer allocator.free(bytes);
+    const Sink = struct {
+        bytes: []u8,
+        offset: usize = 0,
+        pub fn writeAll(self: *@This(), data: []const u8) !void {
+            if (data.len > self.bytes.len - self.offset) return error.InvalidKvCheckpoint;
+            @memcpy(self.bytes[self.offset..][0..data.len], data);
+            self.offset += data.len;
+        }
+    };
+    var sink: Sink = .{ .bytes = bytes };
+    const result = try exportEncoded(state, limits, encoding, &sink, control);
+    if (result.bytes != sink.offset or sink.offset != bytes.len) return error.InvalidKvCheckpoint;
+    return bytes;
+}
 
 /// Validate before emitting transport headers, without allocating a wire copy.
 /// Both supported checkpoint versions have the same encoded length. Callers
@@ -347,6 +465,10 @@ pub fn encodeV2WithControl(allocator: std.mem.Allocator, state: State, limits: L
 }
 
 fn writePayload(w: anytype, state: State) !void {
+    return writePayloadEncoded(w, state, .f32);
+}
+
+fn writePayloadEncoded(w: anytype, state: State, encoding: Encoding) !void {
     try w.int(u64, state.logical_length);
     try w.int(u32, @intCast(state.tokens.len));
     try w.int(u32, @intCast(state.logits.len));
@@ -363,13 +485,79 @@ fn writePayload(w: anytype, state: State) !void {
             try w.int(u32, head.dim);
             try w.int(u32, @intCast(head.positions.len));
             try w.int(u64, head.compacted_until);
+            const q = if (encoding == .fp8) head.fp8 else codec.Fp8{};
+            if (encoding == .rotated4) {
+                try w.int(u32, head.compressed.version);
+                try w.int(u32, @intCast(head.compressed.spans.len));
+                try w.int(u32, @intCast(head.compressed.rows()));
+                try w.int(u32, 0);
+                for (head.compressed.spans) |span| {
+                    try w.int(u32, span.first);
+                    try w.int(u32, span.rows);
+                    try w.int(u32, span.offset);
+                }
+            } else if (encoding != .f32) {
+                try w.int(u32, q.first_row);
+                try w.int(u32, q.rows);
+                try w.int(u32, @bitCast(q.key_scale));
+                try w.int(u32, @bitCast(q.value_scale));
+            }
             try w.slice(u64, head.positions);
             try w.slice(u64, head.coverage_ends);
-            try w.slice(f32, head.keys);
-            try w.slice(f32, head.values);
+            if (encoding == .rotated4) {
+                try w.slice(u8, head.compressed.keys);
+                try w.slice(u8, head.compressed.values);
+                for ([_][]const f32{ head.keys, head.values }) |values| {
+                    for (0..head.positions.len) |row| {
+                        if (head.compressed.index(row) == .compressed) continue;
+                        for (values[row * head.dim ..][0..head.dim]) |value|
+                            try w.int(u16, try encodedValue(value, 1, false));
+                    }
+                }
+            } else if (encoding == .f32) {
+                try w.slice(f32, head.keys);
+                try w.slice(f32, head.values);
+            } else {
+                try writeValues(w, head.keys, head.dim, q, q.key_scale);
+                try writeValues(w, head.values, head.dim, q, q.value_scale);
+            }
             try w.slice(f32, head.bias);
         }
     }
+}
+
+fn writeValues(w: anytype, values: []const f32, dim: u32, q: codec.Fp8, scale: f32) !void {
+    const begin = @as(usize, q.first_row) * dim;
+    const end = begin + @as(usize, q.rows) * dim;
+    for (values, 0..) |value, i| {
+        const fp8 = i >= begin and i < end;
+        const bits = try encodedValue(value, scale, fp8);
+        if (fp8) try w.int(u8, @intCast(bits)) else try w.int(u16, bits);
+    }
+}
+
+fn readValues(r: anytype, elements: usize, head: Head, scale: f32) ![]f32 {
+    const begin = try mul(head.fp8.first_row, head.dim);
+    const quantized = try mul(head.fp8.rows, head.dim);
+    if (try mul(elements, 2) - quantized > r.wireRemaining()) return error.InvalidKvCheckpoint;
+    const values = try r.alloc(f32, elements);
+    errdefer r.allocator.free(values);
+    var buffer: [16384]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < elements) {
+        try r.control.check();
+        const fp8 = offset >= begin and offset < begin + quantized;
+        const stop = if (offset < begin) begin else if (fp8) begin + quantized else elements;
+        const width: usize = if (fp8) 1 else 2;
+        const count = @min(stop - offset, buffer.len / width);
+        try r.read(buffer[0 .. count * width]);
+        for (values[offset..][0..count], 0..) |*value, i| {
+            value.* = if (fp8) try codec.decode(buffer[i], scale) else @as(f16, @bitCast(std.mem.readInt(u16, buffer[i * 2 ..][0..2], .little)));
+            if (!std.math.isFinite(value.*)) return error.InvalidKvCheckpoint;
+        }
+        offset += count;
+    }
+    return values;
 }
 
 /// Bounded two-pass export of the v1 wire format. The caller holds the state
@@ -475,7 +663,9 @@ pub fn cloneHead(allocator: std.mem.Allocator, source: Head) !Head {
     const values = try allocator.dupe(f32, source.values);
     errdefer allocator.free(values);
     const bias = try allocator.dupe(f32, source.bias);
-    return .{ .dim = source.dim, .compacted_until = source.compacted_until, .positions = positions, .coverage_ends = ends, .keys = keys, .values = values, .bias = bias };
+    errdefer allocator.free(bias);
+    const compressed = try source.compressed.clone(allocator);
+    return .{ .compressed = compressed, .fp8 = source.fp8, .dim = source.dim, .compacted_until = source.compacted_until, .positions = positions, .coverage_ends = ends, .keys = keys, .values = values, .bias = bias };
 }
 
 const Decoder = struct {
@@ -484,6 +674,12 @@ const Decoder = struct {
     allocator: std.mem.Allocator,
     remaining_allocation: usize,
     offset: usize = 0,
+    fn wireRemaining(self: *Decoder) usize {
+        return self.bytes.len - self.offset;
+    }
+    fn read(self: *Decoder, bytes: []u8) !void {
+        @memcpy(bytes, try self.raw(bytes.len));
+    }
     fn raw(self: *Decoder, count: usize) ![]const u8 {
         if (count > self.bytes.len - self.offset) return error.InvalidKvCheckpoint;
         const value = self.bytes[self.offset..][0..count];
@@ -536,7 +732,9 @@ pub fn decodeWithControl(allocator: std.mem.Allocator, bytes: []const u8, expect
     if (bytes.len < header_bytes or !std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidKvCheckpoint;
     var r: Decoder = .{ .bytes = bytes, .allocator = allocator, .remaining_allocation = limits.max_state_bytes, .offset = 8, .control = control };
     const wire_version = try r.int(u32);
-    if ((wire_version != version and wire_version != 2) or try r.int(u32) != 0) return error.UnsupportedKvCheckpoint;
+    const flags = try r.int(u32);
+    if ((wire_version != version and wire_version != 2 and wire_version != 3 and wire_version != 4) or
+        (wire_version < 3 and flags != 0) or (wire_version == 3 and flags > 1) or (wire_version == 4 and flags != 0)) return error.UnsupportedKvCheckpoint;
     if (try r.int(u64) != bytes.len - header_bytes) return error.InvalidKvCheckpoint;
     var identity: Identity = undefined;
     inline for (.{ "weights", "tokenizer", "template", "layout" }) |field| @memcpy(&@field(identity, field), try r.raw(32));
@@ -554,7 +752,7 @@ pub fn decodeWithControl(allocator: std.mem.Allocator, bytes: []const u8, expect
         if (!std.mem.eql(u8, bytes[end..], &digest)) return error.KvCheckpointChecksum;
         r.bytes = bytes[0..end];
     }
-    var owned = try decodePayload(&r, allocator, identity, limits);
+    var owned = try decodePayload(&r, allocator, identity, limits, wire_version, flags);
     errdefer owned.deinit();
     if (r.offset != r.bytes.len) return error.InvalidKvCheckpoint;
     try owned.state.validateWithControl(limits, control);
@@ -562,7 +760,7 @@ pub fn decodeWithControl(allocator: std.mem.Allocator, bytes: []const u8, expect
     return owned;
 }
 
-fn decodePayload(r: anytype, allocator: std.mem.Allocator, identity: Identity, limits: Limits) !Owned {
+fn decodePayload(r: anytype, allocator: std.mem.Allocator, identity: Identity, limits: Limits, wire_version: u32, flags: u32) !Owned {
     var owned: Owned = .{ .allocator = allocator, .state = .{ .identity = identity, .logical_length = try r.int(u64) } };
     errdefer owned.deinit();
     const nt = try r.int(u32);
@@ -590,11 +788,26 @@ fn decodePayload(r: anytype, allocator: std.mem.Allocator, identity: Identity, l
             const nr = try r.int(u32);
             head.compacted_until = try r.int(u64);
             if (head.dim == 0 or head.dim > limits.max_head_dim or nr == 0 or nr > nt) return error.InvalidKvCheckpoint;
+            if (wire_version == 3) {
+                head.fp8 = .{ .first_row = try r.int(u32), .rows = try r.int(u32), .key_scale = @bitCast(try r.int(u32)), .value_scale = @bitCast(try r.int(u32)) };
+                if (head.fp8.first_row > nr or head.fp8.rows > nr - head.fp8.first_row or
+                    (flags == 0 and head.fp8.rows != 0)) return error.InvalidKvCheckpoint;
+            }
+            var compressed_rows: usize = 0;
+            if (wire_version == 4) compressed_rows = try readPackedHeader(r, head, nr);
             head.positions = try r.slice(u64, nr);
             head.coverage_ends = try r.slice(u64, nr);
             const elements = try mul(nr, head.dim);
-            head.keys = try r.slice(f32, elements);
-            head.values = try r.slice(f32, elements);
+            if (wire_version == 4) {
+                try readPackedValues(r, head, nr, compressed_rows);
+            } else if (wire_version == 3) {
+                try validateFp8(head.*, donor.window);
+                head.keys = try readValues(r, elements, head.*, head.fp8.key_scale);
+                head.values = try readValues(r, elements, head.*, head.fp8.value_scale);
+            } else {
+                head.keys = try r.slice(f32, elements);
+                head.values = try r.slice(f32, elements);
+            }
             head.bias = try r.slice(f32, nr);
         }
     }
@@ -1035,7 +1248,9 @@ pub fn decodeReaderWithControl(allocator: std.mem.Allocator, reader: anytype, fi
     if (!std.mem.eql(u8, header[0..8], magic)) return error.InvalidKvCheckpoint;
     var h: Decoder = .{ .bytes = &header, .allocator = allocator, .remaining_allocation = 0, .offset = 8, .control = control };
     const wire_version = try h.int(u32);
-    if ((wire_version != 1 and wire_version != 2) or try h.int(u32) != 0) return error.UnsupportedKvCheckpoint;
+    const flags = try h.int(u32);
+    if ((wire_version != 1 and wire_version != 2 and wire_version != 3 and wire_version != 4) or
+        (wire_version < 3 and flags != 0) or (wire_version == 3 and flags > 1) or (wire_version == 4 and flags != 0)) return error.UnsupportedKvCheckpoint;
     if (try h.int(u64) != file_length - header_bytes) return error.InvalidKvCheckpoint;
     var identity: Identity = undefined;
     inline for (.{ "weights", "tokenizer", "template", "layout" }) |field| @memcpy(&@field(identity, field), try h.raw(32));
@@ -1050,10 +1265,10 @@ pub fn decodeReaderWithControl(allocator: std.mem.Allocator, reader: anytype, fi
         .remaining_allocation = limits.max_state_bytes,
     };
     r.hash.update(&header);
-    var owned = try decodePayload(&r, allocator, identity, limits);
+    var owned = try decodePayload(&r, allocator, identity, limits, wire_version, flags);
     errdefer owned.deinit();
     if (r.remaining_wire_bytes != 0) return error.InvalidKvCheckpoint;
-    if (wire_version == 2) try readCheckpointExact(reader, &expected_digest, control);
+    if (wire_version >= 2) try readCheckpointExact(reader, &expected_digest, control);
     const digest = r.hash.finalResult();
     if (!std.mem.eql(u8, &expected_digest, &digest)) return error.KvCheckpointChecksum;
     try owned.state.validateWithControl(limits, control);
@@ -1079,6 +1294,9 @@ fn StreamingDecoder(comptime Reader: type) type {
         remaining_wire_bytes: usize,
         remaining_allocation: usize,
         hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
+        fn wireRemaining(self: *@This()) usize {
+            return self.remaining_wire_bytes;
+        }
         fn read(self: *@This(), bytes: []u8) !void {
             if (bytes.len > self.remaining_wire_bytes) return error.InvalidKvCheckpoint;
             var offset: usize = 0;
@@ -1266,4 +1484,334 @@ test "checkpoint streaming import bounds large array reads and unwinds a partial
     try std.testing.expect(reader.calls > 22);
     var failure: CheckpointChunkReader = .{ .bytes = bytes, .chunk = 8191, .fail_at = 22 };
     try std.testing.expectError(error.InjectedReadFailure, decodeReaderWithControl(a, &failure, bytes.len, test_identity, .{}, .{}));
+}
+
+const codec_test_values: [24]f32 = .{ -0.0, 0.000000059604644775390625, 65504, -65504, 1.0625, 2, 3, 4 } ++ @as([8]f32, @splat(1.125)) ++ @as([8]f32, @splat(1.0625));
+const codec_test_head: Head = .{ .dim = 8, .compacted_until = 2, .positions = &.{ 0, 1, 2 }, .coverage_ends = &.{ 1, 2, 3 }, .keys = &codec_test_values, .values = &codec_test_values, .bias = &.{ 0, 0.69, 0 }, .fp8 = .{ .first_row = 1, .rows = 1 } };
+const codec_test_state: State = .{ .identity = test_identity, .logical_length = 3, .tokens = &.{ 0, 0, 0 }, .logits = &.{0.1234567}, .layer_donors = &.{0}, .donors = &.{.{ .heads = &.{codec_test_head} }} };
+
+fn codecAllocationFailures(a: std.mem.Allocator, encoding: Encoding) !void {
+    const bytes = try encodeWithEncoding(a, codec_test_state, .{}, encoding, .{});
+    defer a.free(bytes);
+    var reader: CheckpointChunkReader = .{ .bytes = bytes, .chunk = 3 };
+    var restored = try decodeReaderWithControl(a, &reader, bytes.len, test_identity, .{}, .{});
+    defer restored.deinit();
+    var memory = try decode(a, bytes, test_identity, .{});
+    defer memory.deinit();
+}
+
+test "checkpoint V3 exact f16 and validated FP8 preserve continuation data and reexport" {
+    const a = std.testing.allocator;
+    const old = try encodeV2(a, codec_test_state, .{});
+    defer a.free(old);
+    for ([_]Encoding{ .f16, .fp8 }) |encoding| {
+        const bytes = try encodeWithEncoding(a, codec_test_state, .{}, encoding, .{});
+        defer a.free(bytes);
+        try std.testing.expect(bytes.len < old.len);
+        try std.testing.expectEqual(old.len - 24 * 4 + 16 - @as(usize, if (encoding == .fp8) 16 else 0), bytes.len);
+        var decoded = try decode(a, bytes, test_identity, .{});
+        defer decoded.deinit();
+        const head = decoded.state.donors[0].heads[0];
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&codec_test_values), std.mem.sliceAsBytes(head.keys));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&codec_test_values), std.mem.sliceAsBytes(head.values));
+        try std.testing.expectEqualSlices(f32, codec_test_state.logits, decoded.state.logits);
+        try std.testing.expectEqualSlices(f32, codec_test_head.bias, head.bias);
+        const again = try encodeWithEncoding(a, decoded.state, .{}, encoding, .{});
+        defer a.free(again);
+        try std.testing.expectEqualSlices(u8, bytes, again);
+        for ([_]usize{ 1, 3, 8191 }) |chunk| {
+            var reader: CheckpointChunkReader = .{ .bytes = bytes, .chunk = chunk };
+            var streamed = try decodeReaderWithControl(a, &reader, bytes.len, test_identity, .{}, .{});
+            defer streamed.deinit();
+            try std.testing.expectEqualSlices(f32, head.keys, streamed.state.donors[0].heads[0].keys);
+        }
+        // Wire shrinkage must not weaken the independent expanded-state bound.
+        var reader: CheckpointChunkReader = .{ .bytes = bytes };
+        try std.testing.expectError(error.KvCheckpointLimit, decodeReaderWithControl(a, &reader, bytes.len, test_identity, .{ .max_state_bytes = try decoded.state.residentBytes() - 1 }, .{}));
+        try std.testing.checkAllAllocationFailures(a, codecAllocationFailures, .{encoding});
+    }
+}
+
+test "checkpoint V3 refuses new rounding and hostile quantization metadata" {
+    const a = std.testing.allocator;
+    var head = codec_test_head;
+    var donor = codec_test_state.donors[0];
+    donor.heads = @as(*const [1]Head, @ptrCast(&head));
+    var state = codec_test_state;
+    state.donors = @as(*const [1]Donor, @ptrCast(&donor));
+    var keys = codec_test_values;
+    head.keys = &keys;
+    keys[8] = 1.0625;
+    try std.testing.expectError(error.KvStoragePrecisionMismatch, encodeWithEncoding(a, state, .{}, .fp8, .{}));
+    keys[8] = 0.1;
+    try std.testing.expectError(error.KvStoragePrecisionMismatch, encodeWithEncoding(a, state, .{}, .f16, .{}));
+    keys = codec_test_values;
+    head.fp8.rows = 3;
+    try std.testing.expectError(error.InvalidKvCheckpoint, encodeWithEncoding(a, state, .{}, .fp8, .{}));
+    head = codec_test_head;
+    donor.window = 3;
+    try std.testing.expectError(error.InvalidKvCheckpoint, encodeWithEncoding(a, state, .{}, .fp8, .{}));
+    const bytes = try encodeWithEncoding(a, codec_test_state, .{}, .fp8, .{});
+    defer a.free(bytes);
+    // Header (152), state counts (24), tokens/logits/mapping (20), donor (12),
+    // head geometry (16), quantization (16), positions/ends (48), K/V then bias.
+    const quantization_offset = 152 + 24 + 20 + 12 + 16;
+    for ([_]usize{ quantization_offset, quantization_offset + 4, quantization_offset + 8, quantization_offset + 12, quantization_offset + 16 + 48 + 16 }) |offset| {
+        const original = bytes[offset];
+        bytes[offset] = if (offset >= quantization_offset + 16) 0x7f else 0xff;
+        std.crypto.hash.sha2.Sha256.hash(bytes[0 .. bytes.len - 32], bytes[bytes.len - 32 ..][0..32], .{});
+        var reader: CheckpointChunkReader = .{ .bytes = bytes, .chunk = 7 };
+        try std.testing.expectError(error.InvalidKvCheckpoint, decodeReaderWithControl(a, &reader, bytes.len, test_identity, .{}, .{}));
+        try std.testing.expectError(error.InvalidKvCheckpoint, decode(a, bytes, test_identity, .{}));
+        bytes[offset] = original;
+    }
+}
+
+test "checkpoint V3 streaming cancels and rejects every truncated file" {
+    const a = std.testing.allocator;
+    for ([_]Encoding{ .f16, .fp8 }) |encoding| {
+        var export_counter: CancelAt = .{};
+        const bytes = try encodeWithEncoding(a, codec_test_state, .{}, encoding, export_counter.control());
+        defer a.free(bytes);
+        for (1..export_counter.calls + 1) |at| {
+            var cancel: CancelAt = .{ .at = at };
+            try std.testing.expectError(error.CompactionCancelled, encodeWithEncoding(a, codec_test_state, .{}, encoding, cancel.control()));
+        }
+        for (0..bytes.len) |length| {
+            var reader: CheckpointChunkReader = .{ .bytes = bytes[0..length], .chunk = 7 };
+            try std.testing.expectError(error.InvalidKvCheckpoint, decodeReaderWithControl(a, &reader, bytes.len, test_identity, .{}, .{}));
+        }
+        var counter: CancelAt = .{};
+        var reader: CheckpointChunkReader = .{ .bytes = bytes, .chunk = 7 };
+        var restored = try decodeReaderWithControl(a, &reader, bytes.len, test_identity, .{}, counter.control());
+        restored.deinit();
+        for (1..counter.calls + 1) |at| {
+            reader = .{ .bytes = bytes, .chunk = 7 };
+            var cancel: CancelAt = .{ .at = at };
+            try std.testing.expectError(error.CompactionCancelled, decodeReaderWithControl(a, &reader, bytes.len, test_identity, .{}, cancel.control()));
+        }
+    }
+}
+
+// V4 stores a canonical span table, untouched rotated4/int8 bytes, and exact
+// FP16 rows. Expanded host arrays are charged separately and checked against
+// the compressed representation; export never silently requantizes values.
+fn validatePacked(head: Head, window: u32, control: Control) !void {
+    try head.compressed.validate(head.positions.len, head.dim);
+    if (head.compressed.spans.len == 0) return;
+    if (window != 0 or head.fp8.rows != 0) return error.InvalidKvCheckpoint;
+    var keys: [512]f32 = undefined;
+    var values: [512]f32 = undefined;
+    for (head.compressed.spans) |span| {
+        for (0..span.rows) |i| {
+            try control.check();
+            const row = span.first + i;
+            if (head.positions[row] >= head.compacted_until or head.coverage_ends[row] > head.compacted_until) return error.InvalidKvCheckpoint;
+            try head.compressed.decodeRow(head.dim, span.offset + i, keys[0..head.dim], values[0..head.dim]);
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(keys[0..head.dim]), std.mem.sliceAsBytes(head.keys[row * head.dim ..][0..head.dim])) or
+                !std.mem.eql(u8, std.mem.sliceAsBytes(values[0..head.dim]), std.mem.sliceAsBytes(head.values[row * head.dim ..][0..head.dim]))) return error.InvalidKvCheckpoint;
+        }
+    }
+}
+
+fn readPackedHeader(r: anytype, head: *Head, nr: usize) !usize {
+    head.compressed.version = try r.int(u32);
+    const count = try r.int(u32);
+    const rows = try r.int(u32);
+    if (try r.int(u32) != 0 or count > nr or rows > nr or
+        (count == 0 and (rows != 0 or head.compressed.version != 0)) or
+        (count != 0 and (head.compressed.version != 1 or !@import("turboquant_rotated.zig").supported(head.dim)))) return error.InvalidKvCheckpoint;
+    if (try mul(count, 12) > r.wireRemaining()) return error.InvalidKvCheckpoint;
+    const spans = try r.alloc(packed_storage.Span, count);
+    head.compressed.spans = spans;
+    var end: usize = 0;
+    var offset: usize = 0;
+    for (spans, 0..) |*span, i| {
+        span.* = .{ .first = try r.int(u32), .rows = try r.int(u32), .offset = try r.int(u32) };
+        if (span.rows == 0 or span.first > nr or span.rows > nr - span.first or (i > 0 and span.first <= end) or span.offset != offset) return error.InvalidKvCheckpoint;
+        end = @as(usize, span.first) + span.rows;
+        offset += span.rows;
+    }
+    if (offset != rows) return error.InvalidKvCheckpoint;
+    return rows;
+}
+
+fn readPackedValues(r: anytype, head: *Head, nr: usize, rows: usize) !void {
+    const key_bytes = try mul(rows, @import("turboquant_rotated.zig").rowBytes(head.dim));
+    const value_bytes = try mul(rows, packed_storage.valueBytes(head.dim));
+    const exact_bytes = try mul(try mul(nr - rows, head.dim), 4);
+    if (try add(try add(key_bytes, value_bytes), exact_bytes) > r.wireRemaining()) return error.InvalidKvCheckpoint;
+    head.compressed.keys = try r.slice(u8, key_bytes);
+    head.compressed.values = try r.slice(u8, value_bytes);
+    try head.compressed.validate(nr, head.dim);
+    const keys = try r.alloc(f32, try mul(nr, head.dim));
+    head.keys = keys;
+    const values = try r.alloc(f32, keys.len);
+    head.values = values;
+    for ([_][]f32{ keys, values }) |output| {
+        // Exact rows are contiguous on the wire even when their destinations
+        // are separated by compressed spans. Batch reads across these gaps:
+        // per-row reads multiply transport and cancellation-probe overhead.
+        // A refill checks cancellation and consumes at most 16 KiB, just like
+        // the V3 reader. Never read into the following values/bias payload.
+        var buffer: [16384]u8 = undefined;
+        var buffered: usize = 0;
+        var used: usize = 0;
+        var remaining = try mul(nr - rows, head.dim);
+        var runs = head.compressed.exactRuns(nr);
+        while (runs.next()) |run| {
+            var offset = run.first * head.dim;
+            const end = offset + run.rows * head.dim;
+            while (offset < end) {
+                if (used == buffered) {
+                    try r.control.check();
+                    buffered = @min(remaining, buffer.len / 2);
+                    used = 0;
+                    try r.read(buffer[0 .. buffered * 2]);
+                    remaining -= buffered;
+                }
+                const count = @min(end - offset, buffered - used);
+                for (output[offset..][0..count], 0..) |*value, d|
+                    value.* = @as(f16, @bitCast(std.mem.readInt(u16, buffer[(used + d) * 2 ..][0..2], .little)));
+                offset += count;
+                used += count;
+            }
+        }
+    }
+    for (head.compressed.spans) |span| for (0..span.rows) |i| {
+        try r.control.check();
+        const start = (span.first + i) * head.dim;
+        try head.compressed.decodeRow(head.dim, span.offset + i, keys[start..][0..head.dim], values[start..][0..head.dim]);
+    };
+}
+
+fn packedCheckpointFixture(a: std.mem.Allocator) !void {
+    var keys: [6 * 64]f32 = @splat(0.25);
+    var values: [6 * 64]f32 = @splat(2);
+    var first = try (packed_storage.Packed{}).append(a, 1, 64, keys[64..128], values[64..128], .{});
+    defer first.deinit(a);
+    var compressed = try first.append(a, 3, 64, keys[192..256], values[192..256], .{});
+    defer compressed.deinit(a);
+    try compressed.decodeRow(64, 0, keys[64..128], values[64..128]);
+    try compressed.decodeRow(64, 1, keys[192..256], values[192..256]);
+    const head: Head = .{ .dim = 64, .compacted_until = 4, .positions = &.{ 0, 1, 2, 3, 4, 5 }, .coverage_ends = &.{ 1, 2, 3, 4, 5, 6 }, .keys = &keys, .values = &values, .bias = &.{ 0, 0, 0, 0, 0, 0 }, .compressed = compressed };
+    const state: State = .{ .identity = test_identity, .logical_length = 6, .tokens = &.{ 0, 0, 0, 0, 0, 0 }, .logits = &.{1}, .layer_donors = &.{ 0, 0 }, .donors = &.{.{ .heads = &.{head} }} };
+    const encoded = try encodeWithEncoding(a, state, .{}, .rotated4, .{});
+    defer a.free(encoded);
+    try std.testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, encoded[8..12], .little));
+    var restored = try decode(a, encoded, test_identity, .{});
+    defer restored.deinit();
+    const again = try encodeWithEncoding(a, restored.state, .{}, .rotated4, .{});
+    defer a.free(again);
+    try std.testing.expectEqualSlices(u8, encoded, again);
+    try std.testing.expectEqualSlices(f32, &keys, restored.state.donors[0].heads[0].keys);
+    try std.testing.expectEqualSlices(u8, compressed.keys, restored.state.donors[0].heads[0].compressed.keys);
+    var clone = try cloneMetadata(a, state);
+    defer clone.deinit();
+    @constCast(clone.state.donors[0].heads)[0] = try cloneHead(a, head);
+    try std.testing.expectEqualSlices(u8, compressed.values, clone.state.donors[0].heads[0].compressed.values);
+    try checkpointStreamingAllocationFailure(a, encoded);
+    for ([_]Encoding{ .f32, .f16, .fp8 }) |encoding|
+        try std.testing.expectError(error.KvStoragePrecisionMismatch, encodedSize(state, .{}, encoding, .{}));
+    try std.testing.expectError(error.KvCheckpointLimit, decode(std.testing.allocator, encoded, test_identity, .{ .max_state_bytes = (try state.residentBytes()) - 1 }));
+    // Expanded host data cannot disagree with the authoritative stored bytes.
+    keys[64] += 1;
+    try std.testing.expectError(error.InvalidKvCheckpoint, state.validate(.{}));
+    keys[64] -= 1;
+}
+
+test "rotated4 checkpoint preserves mixed spans exact rows and ownership through every allocation failure" {
+    try packedCheckpointFixture(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, packedCheckpointFixture, .{});
+}
+
+test "rotated4 streaming exact rows cross bounded slabs and compressed gaps without consuming the next frame" {
+    const a = std.testing.allocator;
+    const rows = 80;
+    const dim = 512;
+    var keys: [rows * dim]f32 = undefined;
+    var values: [rows * dim]f32 = undefined;
+    var positions: [rows]u64 = undefined;
+    var ends: [rows]u64 = undefined;
+    const tokens: [rows]u32 = @splat(0);
+    const bias: [rows]f32 = @splat(0);
+    for ([_]enum { exact, mixed, compressed }{ .exact, .mixed, .compressed }) |kind| {
+        for (&keys, &values, 0..) |*key, *value, i| {
+            key.* = @as(f32, @floatFromInt(i % 31)) / 32;
+            value.* = -@as(f32, @floatFromInt(i % 17)) / 16;
+        }
+        for (&positions, &ends, 0..) |*pos, *end, i| {
+            pos.* = i;
+            end.* = i + 1;
+        }
+        var all = try (packed_storage.Packed{}).append(a, 0, dim, &keys, &values, .{});
+        defer all.deinit(a);
+        var selected: [rows]bool = undefined;
+        for (&selected, 0..) |*keep, row| keep.* = kind == .compressed or (kind == .mixed and row % 2 == 1);
+        var compressed = try all.selectNew(a, 0, &selected, dim, .{});
+        defer compressed.deinit(a);
+        for (compressed.spans) |span| for (0..span.rows) |i| {
+            const first = (span.first + i) * dim;
+            try compressed.decodeRow(dim, span.offset + i, keys[first..][0..dim], values[first..][0..dim]);
+        };
+        const head: Head = .{ .dim = dim, .compacted_until = rows, .positions = &positions, .coverage_ends = &ends, .keys = &keys, .values = &values, .bias = &bias, .compressed = compressed };
+        const state: State = .{ .identity = test_identity, .logical_length = rows, .tokens = &tokens, .logits = &.{1}, .layer_donors = &.{0}, .donors = &.{.{ .heads = &.{head} }} };
+        const encoded = try encodeWithEncoding(a, state, .{}, .rotated4, .{});
+        defer a.free(encoded);
+        const framed = try a.alloc(u8, encoded.len + 3);
+        defer a.free(framed);
+        @memcpy(framed[0..encoded.len], encoded);
+        @memcpy(framed[encoded.len..], "END");
+        for ([_]usize{ 97, 16384 }) |chunk| {
+            var reader: CheckpointChunkReader = .{ .bytes = framed, .chunk = chunk };
+            var restored = try decodeReaderWithControl(a, &reader, encoded.len, test_identity, .{}, .{});
+            defer restored.deinit();
+            try std.testing.expectEqual(encoded.len, reader.offset);
+            try std.testing.expect(reader.maximum_requested <= 16384);
+            try std.testing.expectEqualSlices(f32, &keys, restored.state.donors[0].heads[0].keys);
+            try std.testing.expectEqualSlices(f32, &values, restored.state.donors[0].heads[0].values);
+            const again = try encodeWithEncoding(a, restored.state, .{}, .rotated4, .{});
+            defer a.free(again);
+            try std.testing.expectEqualSlices(u8, encoded, again);
+        }
+    }
+}
+
+test "rotated4 checkpoint rejects malformed span metadata and cancels streaming at every boundary" {
+    const a = std.testing.allocator;
+    var keys: [64]f32 = @splat(0);
+    var values: [64]f32 = @splat(2);
+    var compressed = try (packed_storage.Packed{}).append(a, 0, 64, &keys, &values, .{});
+    defer compressed.deinit(a);
+    try compressed.decodeRow(64, 0, &keys, &values);
+    const head: Head = .{ .dim = 64, .compacted_until = 2, .positions = &.{0}, .coverage_ends = &.{2}, .bias = &.{0.5}, .keys = &keys, .values = &values, .compressed = compressed };
+    const state: State = .{ .identity = test_identity, .logical_length = 2, .tokens = &.{ 0, 0 }, .logits = &.{0}, .layer_donors = &.{0}, .donors = &.{.{ .heads = &.{head} }} };
+    const bytes = try encodeWithEncoding(a, state, .{}, .rotated4, .{});
+    defer a.free(bytes);
+    var counter: CancelAt = .{};
+    var reader: CheckpointChunkReader = .{ .bytes = bytes };
+    var restored = try decodeReaderWithControl(a, &reader, bytes.len, test_identity, .{}, counter.control());
+    defer restored.deinit();
+    for (1..counter.calls + 1) |at| {
+        var cancel: CancelAt = .{ .at = at };
+        reader = .{ .bytes = bytes };
+        try std.testing.expectError(error.CompactionCancelled, decodeReaderWithControl(a, &reader, bytes.len, test_identity, .{}, cancel.control()));
+    }
+    for (0..bytes.len) |length| {
+        reader = .{ .bytes = bytes[0..length] };
+        try std.testing.expectError(error.InvalidKvCheckpoint, decodeReaderWithControl(a, &reader, bytes.len, test_identity, .{}, .{}));
+    }
+    // Recompute integrity to exercise structural validation, not just checksum.
+    const packed_header = digest_offset + 24 + 16 + 12 + 16;
+    for ([_]usize{ packed_header, packed_header + 4, packed_header + 8, packed_header + 12, packed_header + 16, packed_header + 20, packed_header + 24 }) |offset| {
+        const previous = std.mem.readInt(u32, bytes[offset..][0..4], .little);
+        std.mem.writeInt(u32, bytes[offset..][0..4], std.math.maxInt(u32), .little);
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes[0 .. bytes.len - 32], &hash, .{});
+        @memcpy(bytes[bytes.len - 32 ..], &hash);
+        try std.testing.expectError(error.InvalidKvCheckpoint, decode(a, bytes, test_identity, .{}));
+        reader = .{ .bytes = bytes };
+        try std.testing.expectError(error.InvalidKvCheckpoint, decodeReaderWithControl(a, &reader, bytes.len, test_identity, .{}, .{}));
+        std.mem.writeInt(u32, bytes[offset..][0..4], previous, .little);
+    }
 }

@@ -5,17 +5,32 @@ exports a portable binary checkpoint tied to the same model revision. It uses
 native Zig/CUDA and the existing grammar engine. Structured text memory is a
 separate context-management feature.
 
-The current scope is Gemma 4 E4B Q4 on NVIDIA L4 with f16 KV and eager CUDA
-execution. Broader answer quality and complete production qualification remain
-open. Numerical validation alone does not establish answer quality.
+The bounded production qualification covers Gemma 4 E4B Q4_0 on NVIDIA L4
+with f16 base KV and eager CUDA execution. FP16, FP8 disk encoding and rotated4
+compressed CUDA checkpoints passed the scoped quality, serving, reliability
+and latency gates below. This qualification applies to the recorded model
+revision and runtime configuration; it is not a guarantee for arbitrary inputs.
+
+The opt-in `ANTFLY_INFERENCE_CUDA_E4B_SHARED_KV_PREFILL=1` optimization
+uses E4B's 24 KV-producing layers for every prompt row, then evaluates its 18
+shared-KV layers only for the final output row. Intermediate KV-only chunks
+omit that suffix. This follows the same model dependency used by
+[vLLM's shared-KV fast prefill](https://github.com/vllm-project/vllm/blob/6d1909a1f23e62d38ad25c029dd43a71106a3990/vllm/model_executor/models/gemma4.py#L1229).
+Checkpoint preparation/restoration, query capture, hidden-state consumers and
+unsupported request shapes retain the full path. This optimization remains
+default-off; the recorded full-replay comparison enables it.
 
 ## Preparation and restore
 
 1. Ingest the exact prompt and preserve its tokens and next-token logits.
-2. Clone the live KV prefix into an isolated CUDA owner. Replay its last 512
-   tokens in 256-token chunks, collecting 320 post-RoPE queries per global
-   consumer: 256 training and 64 held out. Capture every shared consumer's
-   query heads; never use cached keys as proxy queries.
+2. Clone the live KV prefix into an isolated CUDA owner. For long prefixes,
+   build a 512-token self-study sequence from four historical 64-token windows
+   ranked by token rarity, in their original order, followed by the latest 256
+   tokens. Append this sequence to the clone in 256-token chunks, collecting
+   320 post-RoPE queries per global consumer: 256 training and 64 held out.
+   Capture every shared consumer's query heads. The authoritative history stays
+   unchanged, future questions are excluded, and cached keys never substitute
+   for queries.
 3. Preserve local sliding-window donors, the first 128 global positions and
    the most recent 2,048 global positions exactly. Fit older global history in
    1,024-row chunks, targeting one retained row per four eligible rows. Shared
@@ -24,16 +39,33 @@ open. Numerical validation alone does not establish answer quality.
    regularized value fitting. Store mass adjustments as attention-logit biases.
    Validate complete heads after rounding to serving precision, requiring
    relative mass error and normalized output RMSE at most 0.05.
-5. Preserve heads whose numerical fits are rejected. Accept the complete
+5. On numerical rejection, retry the affected head from its immutable source at
+   3:1 and then 2:1 eligible-row retention. The error limits stay unchanged; use
+   the first accepted fit and preserve the original head if all attempts fail.
+   OOM, cancellation and invalid inputs never trigger a retention retry. Accept the complete
    candidate only if actual global device bytes, including metadata, improve
    by at least 1.5x. Otherwise export the original exact state with the explicit
    outcome `unchanged_insufficient_savings`. Cancellation, OOM and invalid
    inputs remain errors.
-6. Export wire-version-2 state: model/tokenizer/template/layout identities,
+6. Export wire-version-3 state by default (legacy V2 remains available): model/tokenizer/template/layout identities,
    tokens, logical positions, donor mappings, exact and fitted KV, coverage,
    biases and continuation logits. Resume validates the complete transfer and
    exact rendered-token prefix, uploads independently owned state, and evaluates
    only appended input. An unchanged prompt uses saved next-token logits.
+
+The V3 disk codec stores exact f16 K/V by default, retaining f32 biases/logits
+and full integer metadata. Explicit `X-Antfly-KV-Encoding: fp8` requests try
+E4M3FN with separate power-of-two key/value scales for each fitted historical
+head range. The fitter tests dequantized values against the original whole head
+on held-out consumer queries, with the same 5% mass/output limits. Only accepted
+ranges replace the candidate values; failures retain the validated f16 fit.
+Protected prefix/recent rows, local windows and insufficient-savings fallbacks
+remain exact. This storage optimization does not change resident GPU precision
+or global-device savings. Fresh-question answer-quality checks include actual
+FP8 ranges in every category of the bounded suite. V1/V2 decoding remains supported;
+`f32` export selects V2 for older clients. Decoding budgets expanded host state
+independently of compressed wire bytes and publishes only after checksum and
+semantic validation.
 
 The checkpoint stays immutable and supports a fresh process with matching
 identity. Physical compaction preserves logical positions; it does not enlarge
@@ -42,10 +74,12 @@ and the full prompt plus reserved output must fit the window.
 
 The fitting planner and HTTP admission use the same geometry-derived allocation
 bound: original state, worst-case candidate, task metadata and the largest
-workspace for each of four fit workers. Fitting has a 3,840 MiB host ceiling,
+workspace for each admitted fit worker, including the largest 2:1 retry.
+Up to four workers fit concurrently; the planner reduces this to three at
+32K on the designated model. Fitting has a 3,840 MiB host ceiling,
 with 128 MiB additional preparation allowance. Whole-head validation is limited
-to one worker at a time. For the designated 32K fixture, the total reservation
-is 4,049,665,584 bytes; this is an allocation bound, not measured RSS.
+to one worker at a time. The reservation is recomputed from geometry, including per-head codec metadata;
+this allocation bound is separate from measured RSS.
 
 During upload, admission reserves bounded host memory before acquiring GPU
 execution resources. Transfer ownership holds that lease through destruction.
@@ -67,101 +101,162 @@ checkpoint upload is held; only one native checkpoint operation is admitted.
 Public endpoints are `POST /ai/v1/chat/context/checkpoint` and
 `POST /ai/v1/chat/context/resume`. The Python SDK provides streaming file
 helpers; JSON and SSE continuations use the same checkpoint contract.
-See [API usage and supported configurations](../../../zig/pkg/inference/OPENAI.md#portable-native-kv-checkpoints-under-qualification)
-and [SDK usage](../../../py/packages/sdk/README.md#native-kv-checkpoints-under-qualification).
+See [API usage and supported configurations](../../../zig/pkg/inference/OPENAI.md#portable-native-kv-checkpoints)
+and [SDK usage](../../../py/packages/sdk/README.md#native-kv-checkpoints).
 The legacy compaction/selected-KV paths are separate and do not qualify this engine.
 
-## Recorded evidence, 2026-10-20
+## Rotated4 resident encoding
 
-The pre-merge standalone ReleaseFast candidate
-`9ee66204fb1b4df5557f68bbac3ce66c6039e941104cf9a57b8c84febd751deb`
-passed public 8K/32K export, SDK repeat preparation, byte-identical re-export,
-fresh-process restore, wrong-prefix/checksum rejection and recovery, and
-context-limit rejection.
+Explicit `X-Antfly-KV-Encoding: rotated4` exports V4. Newly fitted old rows use
+seeded signed Hadamard rotations, 4-bit keys and int8 values. The highest-risk
+quarter of eligible rows remains FP16, selected using training queries. The
+combined fitting and quantization error must still pass the original whole-head
+held-out limits; rejected heads retain their validated FP16 fit. Publication
+requires the FP16 fitted geometry to meet the savings gate before new codec
+savings are counted, so quantization cannot bypass insufficient-savings fallback.
+Protected prefix/recent rows and local windows stay exact.
 
-| Public-path observation | 8K | 32K |
+CUDA scores compressed keys and accumulates decoded values directly, preserving
+compressed history through append, clone, grow and rollback. This reduces both
+wire and resident KV storage. FP8 and rotated4 are alternative encodings; FP16
+remains the default. No experimental process switch is required for rotated4.
+This is a TurboQuant-inspired MSE codec, not the paper's full Haar/QJL algorithm.
+See [representation and CUDA ownership](../../../zig/pkg/inference/TURBOQUANT.md#attention-matched-caches-rotated4-checkpoints-and-cuda).
+
+## Bounded qualification, 2026-10-23
+
+The frozen suite contains synthetic multi-step facts, instruction priority,
+code reasoning and typed tool calls. Sixteen critical cases were selected before
+execution, four per category, at each context length. Checkpoint preparation
+sees the archive only; the question is appended after export. Every restore must
+attest saved-prefix reuse and equal prompt token accounting.
+
+| Quality observation | 8K | 32K |
 | --- | ---: | ---: |
-| Logical prefix tokens | 8,189 | 32,752 |
-| Actual global-KV savings | 1.686994x | 2.085466x |
-| Validated / preserved global heads | 6 / 2 | 6 / 2 |
-| Checkpoint bytes | 201,728,532 | 555,662,840 |
-| Warm saved-prefix resume | 2.411 s | 6.265 s |
-| Complete initial prepare/export request | 102.611 s | 403.763 s |
-| Fresh-process restore, including model load/identity hashing | 70.082 s | 74.347 s |
-| Peak exporter listener + worker RSS | 5.422 GiB | 7.541 GiB |
-| Peak exporter GPU memory | 11.658 GiB | 12.424 GiB |
+| Cases per encoding | 16 | 16 |
+| Correct with full KV / FP16 / FP8 / rotated4 | 13 / 13 / 13 / 13 | 13 / 13 / 13 / 13 |
+| New compaction or codec failures | 0 | 0 |
+| Actually compacted cases per encoding | 10 | 16 |
+| Unchanged insufficient-savings fallbacks | 6 | 0 |
+| Categories with actual FP8 and rotated4 coverage | 4/4 | 4/4 |
 
-These are individual observations, not preparation or general serving
-percentiles. Global-KV savings do not describe total GPU memory or checkpoint
-file compression. The 8K checkpoint plus a 1,437-token suffix resumes in
-9.214 s versus 40.746 s for full replay of the same conversation.
-A separate saved-prefix completion campaign with five warmups and 100 samples
-measures 2.385 s p50, 2.478 s p95 and 2.731 s maximum, for a five-token answer.
+The shared model failures are `v2-code-01`, `v2-code-03` and
+`v2-instruction-03`; they are not counted as compaction successes. Fallbacks
+never count as quantization coverage. These synthetic cases establish the
+approved bounded gate, not universal answer preservation or an external benchmark.
+The 8K and 32K manifest SHA-256 values are respectively
+`11b587964826b3e84a90881363b845964e5d857294ec148d2bf799a12dd8a14e` and
+`8b52a176ebca0fc3ab49465ad03e6f747fb0e3d36eff605885e00bc4b21ba8f4`.
 
-The same candidate passed cancellation during upload, prefill, fitting and
-export; physical restore OOM/recovery; SSE abort/recovery; and terminal cleanup.
-Ordinary generation completed during a held partial upload, competing native
-operations failed promptly, and reset released the guard in 11.797 ms.
-This qualifies bounded request overlap, not simultaneous GPU model execution.
+The final query-selection fix addresses a real 32K tool-argument regression:
+two historical calibration windows had both selected tool declarations and
+missed an identifier. Four rarity-ranked historical windows plus recent context
+preserved the answer with real compaction. The total 512-token study budget,
+1,024-row fit blocks, 5% numerical limits and savings gates were unchanged.
+A smaller-fit-block alternative was rejected because it only preserved the
+answer through unchanged-cache fallback and increased preparation time.
 
-After merging main at `e0fa87c69f`, 130 native CPU tests passed, with one
-CUDA-only skip covered by the 18/18 L4 CUDA checks. Go SDK tests passed;
-Python SDK had 38 passes, TypeScript 493 passes/one skip plus typecheck,
-OpenAPI 10 passes, and isolated grammar/tokenizer 37 passes.
-These are recorded checks, not a substitute for final-candidate qualification.
+### Final public standalone measurements
 
-The post-merge focused inference server
-`6a43b29c70a0ad1eee752d223dd1117311dbbce41398e3088ddfe17538607d8d`
-reproduces the 8K reference checkpoint byte for byte and restores its correct
-answer. Its digest is
-`5b09989a64944c79c14990b9d7bea167dc45509323527452ce038825b7a63c8a`.
-The complete standalone campaign has not been repeated on the merged candidate.
+These are the designated public fact fixtures, distinct from the quality-suite
+latency case. Warm portable restore includes transfer, validation, upload and
+a short continuation. Each encoding uses five warmups and 20 measured samples
+in an independent warmed process; these are not interleaved pairs.
 
-## Answer quality
+| Prefix | Encoding | File MiB | Global-KV savings | Warm restore p50 / p95 (s) | Initial prepare/export (s) | Peak host / GPU GiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 8,189 | f16 | 94.32 | 1.755x | 1.872 / 2.029 | 84.88 | 5.46 / 11.30 |
+| 8,189 | fp8 | 83.06 | 1.755x | 1.924 / 1.970 | 85.93 | 5.46 / 11.74 |
+| 8,189 | rotated4 | 87.50 | 1.937x | 1.972 / 1.999 | 85.32 | 5.46 / 11.74 |
+| 32,752 | f16 | 226.74 | 2.494x | 4.255 / 4.514 | 134.46 | 7.45 / 12.46 |
+| 32,752 | fp8 | 179.45 | 2.494x | 4.438 / 4.513 | 140.50 | 7.45 / 12.46 |
+| 32,752 | rotated4 | 203.60 | 2.811x | 4.578 / 4.671 | 137.11 | 7.47 / 12.46 |
 
-`prepare_native_quality_suite.py` generates the frozen V2 suite: 64 synthetic
-cases, 16 per category, crossing four task families with archive positions at
-10%, 25%, 45% and 60%. Sixteen cases are designated critical before execution.
-The archive is checkpointed before the final question; restore appends the
-question and must attest saved-prefix reuse and equal full-prompt token counts.
-The suite digest remains
-`11b587964826b3e84a90881363b845964e5d857294ec148d2bf799a12dd8a14e`.
+The 8K FP16 fixture with a 1,437-token appended suffix resumed in 6.91 s,
+versus 2.87 s for warm full replay of that complete conversation. These are
+single functional-test observations, not percentile qualification. Native
+checkpoint append retains the full model path, whereas ordinary E4B replay
+uses shared-KV fast prefill. Compaction therefore does not guarantee a latency
+win on appended input; its memory savings remain a separate benefit.
 
-All 16 critical cases were exercised in two diagnostic runs:
+Initial preparation includes prompt ingestion, cold model-identity work, fitting
+and export; it is not warm restore latency. Historical 10 s/30 s preparation
+targets were accepted as nonblocking. Global-KV savings do not describe total
+GPU memory or whole-file savings. In the compacted quality cases, FP8 reduces
+whole-file size versus FP16 by a median 8.87% at 8K and 15.27% at 32K;
+protected/exact ranges and metadata prevent a blanket 50% saving.
 
-| Category | Full-KV correct | Restored correct | Actually compacted |
+Both codecs passed the relative restore limits against FP16: p50 at most 1.25x
+and p95 at most 1.5x for total, first-content and remaining-decode latency.
+Separately, the quality campaign's interleaved FP16/rotated4 measurements passed
+those same six limits at both sizes. Final exact-token full replay also passed
+the p50/p95 limits against llama.cpp at both sizes. Full replay and portable
+restore are different operations; the restore table does not establish
+llama.cpp speedup.
+
+Public checks cover fresh-process restore, byte-identical repeat export,
+JSON/SSE continuation, appended multi-chunk input, unchanged fallback,
+checksum/prefix rejection, 32K context-limit rejection and recovery. FP8 and
+rotated4 each passed physical OOM/recovery, cancellation during upload/prefill/
+fitting/export, competing-upload admission, SSE abort and terminal cleanup.
+The physical OOM check covers checkpoint restore on the same loaded worker;
+it does not qualify live-cache replacement under physical GPU OOM.
+Each also passed 100 mixed requests with 10 fresh actual compactions, the hard
+8 GiB combined listener/worker RSS and 18 GiB GPU caps, and the 128 MiB
+quiescent-growth diagnostic. Request overlap is bounded; GPU execution is serial.
+The 20 successive real-model compaction cycles were explicitly deferred.
+
+### Matched full replay
+
+The same model and exact prompt tokens are replayed from scratch, with five
+warmups and 20 samples per runtime. The designated answer has five content
+tokens; the comparator reconciles Gemma turn-token accounting explicitly.
+
+| Prefix tokens | Antfly full replay p50 / p95 (s) | llama.cpp p50 / p95 (s) | Antfly / llama.cpp p50 |
 | --- | ---: | ---: | ---: |
-| Multi-step facts | 4/4 | 4/4 | 0/4 |
-| Instructions | 3/4 | 3/4 | 0/4 |
-| Code reasoning | 2/4 | 2/4 | 0/4 |
-| Typed tool calls | 4/4 | 4/4 | 0/4 |
+| 8,189 | 2.125 / 2.177 | 1.975 / 1.999 | 1.076x |
+| 32,752 | 11.248 / 11.494 | 10.586 / 10.625 | 1.063x |
 
-All used `unchanged_insufficient_savings`. Equal 13/16 scores establish no added
-failures on exact fallback; they do **not** establish quality under compaction.
-The full 64-case campaign has not passed. The failures are `v2-code-01`
-(filtered sum 17 instead of 25), `v2-code-03` (JSON count 16 instead of 19),
-and `v2-instruction-03` (`ready.` instead of `ready`, without credential exposure).
-The code answer keys agree with Python execution. On identical native tokens,
-llama.cpp b11669 reproduces the first arithmetic failure at short and long
-context; that is a scoped diagnostic, not broad runtime parity.
+### Provenance and scope
 
-Scoring rejects malformed/duplicate-key/nonfinite JSON, wrong argument types,
-extra fields/calls, truncated answers and changed/reordered requests. It
-separates baseline failures, regressions and improvements. Unchanged fallbacks
-cannot conceal failures on the actually compacted subset; interrupted runs
-retain completed pairs without passing full-suite gates. Older evidence remains
-readable, but new runs require an explicit frozen suite path.
+The loaded-model weights identity is
+`fd904d45d8efe0c9c71bc74586f43b6f48334c65c164bdcc0b4963b4a6707987`
+(the native domain-separated identity, not the raw GGUF file hash).
 
-A private fit-only diagnostic on the 8,253-token code archive found:
+The final standalone binary SHA-256 is
+`be249c4fbebcd50a33b4a60b4302283eab7e12ae4007a4f67b5faa8fd65f5402`;
+its frozen source snapshot is
+`c409206ce0b2fc4f5d63de729ecb5c76e50f057e21fd32c9b89a8bd2575394bc`.
+The full numerical quality suites ran on focused inference-server binary
+`632d4e4ed1f340f7e915aeb6a29cb9cb5bdc9a14589ad98f012de5b4cc9c6306`.
+The final public candidate retains all 409 recorded numerical/runtime source
+hashes; the intervening changes expose the qualified codec through the public
+API/SDK and regenerate their schemas. The final standalone then ran the public,
+reliability and latency matrix. Documentation-only qualification updates are
+recorded separately from the tested runtime snapshot.
 
-| Calibration replay | Validated / preserved heads | Candidate savings | Query collection |
-| --- | ---: | ---: | ---: |
-| Last 512 tokens | 3 / 5 | 1.248935x | 0.941 s |
-| Full prefix | 2 / 6 | 1.148928x | 16.840 s |
+Final candidate SDK checks passed: Python 363 tests, Go SDK tests, TypeScript
+493 tests with one skip plus typecheck, and checkpoint harness 70 tests with
+450 subtests. Generated OpenAPI and Python SDK consistency checks passed.
+Kernel correctness and CUDA memcheck/racecheck evidence covers the unchanged
+fitted-attention implementation.
 
-Neither passes the public 1.5x gate. No candidate was installed or production
-threshold changed. Including the final question before checkpointing produces
-1.513153x savings on that code prompt, but does not validate unseen questions.
+Evidence is retained locally under
+`.cache/turboquant-selective/e4b-compaction-readiness/`:
+`final-qualification.json` hashes all contributing artifacts;
+`study-balanced-{quality,fp8-quality}-{8k,32k}.json` record quality;
+`final-http-*`, `final-restore-*`, `final-stress-*` and
+`final-replay-comparison-*` record standalone behavior and timing.
+Earlier rejected fits, fallback-only pilots and publication-policy regressions
+remain historical evidence under `.cache/turboquant-selective/` and
+`.cache/fp8-readiness/`; they are not passing release evidence.
+
+Use the [serving configuration](../../../zig/pkg/inference/OPENAI.md#portable-native-kv-checkpoints)
+including its tuning flags and memory budgets. Other model revisions, devices,
+graph replay, continuous batching, automatic mid-generation compaction and
+legacy `polar4`/`turbo3` require separate qualification. Extended 64-case quality,
+100-sample latency and 1,000-request stress profiles remain available; this
+bounded record does not claim those larger campaigns passed.
 
 ## Reproducing checks
 
@@ -182,14 +277,27 @@ py/packages/sdk/.venv/bin/python \
   zig/pkg/inference/scripts/gemma4/qualify_native_checkpoint_quality.py \
   --server zig/zig-out/bin/antfly --server-kind standalone --models-dir .models \
   --suite .cache/native-compaction/native-quality-suite-v2.jsonl \
+  --quality-profile bounded --size 8k --encoding fp8 \
+  --cases v2-fact-00 v2-instruction-00 v2-code-00 v2-tool_call-00 \
+          v2-fact-01 v2-instruction-01 v2-code-01 v2-tool_call-01 \
+          v2-fact-02 v2-instruction-02 v2-code-02 v2-tool_call-02 \
+          v2-fact-03 v2-instruction-03 v2-code-03 v2-tool_call-03 \
   --output zig/zig-out/qualification/context-cuda/quality.json \
   --checkpoint .cache/native-compaction/quality-current.kv
 ```
+
+For the 32K quality suite, generate with `--lines 2900` and qualify with
+`--size 32k`. The designated public 32,752-token latency fixture instead uses
+`--padding-lines 2975`. Rotated4 whole-system qualification uses
+`qualify_rotated4_checkpoint.py --quality-profile bounded --require-full-kv-preservation`
+with the same cases, and `--samples 20 --warmups 5` for paired latency.
+Do not treat unchanged fallbacks as actual codec coverage.
 
 Retained entry points under `zig/pkg/inference/scripts/gemma4/`:
 
 | Purpose | Runner |
 | --- | --- |
+| Full-model rotated4 quality and paired latency | `qualify_rotated4_checkpoint.py` |
 | Public export, SDK roundtrip and fresh-process restore | `qualify_native_checkpoint_http.py` |
 | Prepare-phase sampling; terminal ownership and resume sampling | `qualify_native_prepare_sampling.py`; `qualify_completion.py` |
 | Cancellation, physical OOM, upload overlap, SSE abort | `qualify_native_cancellation.py`, `qualify_native_checkpoint_oom.py`, `qualify_native_concurrency.py`, `qualify_native_sse_abort.py` |
@@ -206,33 +314,3 @@ staged Q4 projection (`qualify_attention_match_fit.{cu,py}`,
 `qualify_q4_bf16_staged.cu`). The repeat `_kernel` file supplies the independent
 chronological trace oracle; it is not a spare prototype. CUDA regeneration
 scripts and shipped artifacts remain required.
-
-## Release gates and next work
-
-| Area | Required evidence |
-| --- | --- |
-| Quality | At most 2 percentage points aggregate drop and 5 per category versus full KV; all designated critical cases pass; actual compaction in every category with the same limits on the compacted subset |
-| Compression | Nominal 4x eligible-old-row retention and at least 2x actual global-KV savings on the designated 32K workload; public candidate minimum remains 1.5x |
-| Memory | At most 8 GiB combined listener/worker RSS and 18 GiB GPU memory, including temporary fitting/replacement allocations |
-| Latency | Matched full-replay p50 at most 1.25x and p95 at most 1.5x llama.cpp; at least five warmups and 100 samples per designated workload |
-| Reliability | 1,000 mixed requests, 100 compactions and 20 successive real-model compaction cycles; no corrupt state, leaked admission or unbounded growth |
-
-First measure per-head rejection causes and evaluate bounded fit/retention
-alternatives for archive-only prefixes. Full-prefix replay alone did not help.
-Keep baseline reasoning/format failures separate from compaction regressions.
-Freeze a successor before the remaining 48 quality cases and complete matrix,
-then broaden histories and 32K coverage. Final-candidate sustained testing,
-live-replacement failure checks, matched latency and merged standalone
-requalification remain open. Historical 10 s/30 s compaction targets were
-accepted as nonblocking by the user; continue recording phase timings separately
-from ingestion. Automatic mid-generation compaction and additional models or
-backends need separate qualification.
-
-Evidence lives locally under `zig/zig-out/qualification/context-cuda/`:
-`public-checkpoint-deferred-upload-admission-{8k,32k,cancellation,oom,concurrency,sse-abort,completion}.json`,
-`quality-v2-critical-summary.json` (with both source fingerprints),
-`quality-v2-merged-reference-diagnostic.json`, `quality-v2-code-token-capture.json`,
-`quality-v2-llama-code-diagnostic.json`, and `quality-v2-calibration-diagnostic.json`.
-The first quality run stopped intentionally after eight complete cases; the
-second finished with `passed=false` and no infrastructure error. Historical
-experiment chronology is available in Git rather than duplicated here.

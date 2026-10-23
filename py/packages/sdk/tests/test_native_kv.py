@@ -8,7 +8,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-
 from antfly import AntflyClient, AntflyException, NativeKvCheckpoint
 from antfly.client_generated.models import InferenceGenerateRequest
 from antfly.native_kv import (
@@ -22,13 +21,14 @@ from antfly.native_kv import (
 )
 
 
-def fixture(payload_size=40, outcome="compacted"):
+def fixture(payload_size=40, outcome="compacted", version=2, encoding="f32"):
     payload = struct.pack("<Q", 12) + b"x" * payload_size
-    header = struct.pack("<8sIIQ", b"ANTFLYKV", 2, 0, len(payload)) + bytes(range(128))
+    header = struct.pack("<8sIIQ", b"ANTFLYKV", version, int(encoding == "fp8"), len(payload)) + bytes(range(128))
     checkpoint = header + payload + hashlib.sha256(header + payload).digest()
     metadata = {
         "version": "attention_match_v1",
-        "wire_version": 2,
+        "wire_version": version,
+        "encoding": encoding,
         "model": "gemma",
         "outcome": outcome,
         "logical_tokens": 12,
@@ -37,6 +37,18 @@ def fixture(payload_size=40, outcome="compacted"):
         "validated_heads": 2 if outcome == "compacted" else 0,
         "preserved_heads": 6,
     }
+    if encoding == "fp8":
+        metadata.update(
+            fp8_heads=1 if outcome == "compacted" else 0, fp8_fallback_heads=1 if outcome == "compacted" else 0
+        )
+    if encoding == "rotated4":
+        metadata.update(
+            rotated4_heads=1 if outcome == "compacted" else 0,
+            rotated4_fallback_heads=1 if outcome == "compacted" else 0,
+            rotated4_eligible_rows=8 if outcome == "compacted" else 0,
+            rotated4_compressed_rows=5 if outcome == "compacted" else 0,
+            rotated4_exact_rows=3 if outcome == "compacted" else 0,
+        )
     encoded = json.dumps(metadata).encode()
     frame = struct.pack("<8sQIIIIQ", b"AFATT001", len(encoded), 1, 0, len(CHECKPOINT_MIME), 0, len(checkpoint))
     return frame + encoded + CHECKPOINT_MIME + checkpoint, checkpoint, metadata
@@ -265,3 +277,154 @@ def test_chunk_reader_skips_empty_chunks_and_retains_partial_reads():
     assert reader.read(2) == b"c"
     assert reader.read(2) == b"d"
     assert reader.read(2) == b""
+
+
+@pytest.mark.parametrize("encoding", ["f16", "fp8"])
+def test_v3_encoding_streams_and_checks_metadata(tmp_path, encoding):
+    frame, checkpoint, metadata = fixture(version=3, encoding=encoding)
+    destination = tmp_path / "v3.kv"
+    saved = receive_checkpoint(io.BytesIO(frame), destination, "gemma")
+    assert saved.metadata["encoding"] == encoding
+    assert destination.read_bytes() == checkpoint
+    with destination.open("rb") as source:
+        length, chunks = checkpoint_upload(source, {"model": "gemma"})
+        uploaded = b"".join(chunks)
+    assert len(uploaded) == length
+    assert uploaded.endswith(checkpoint)
+    wrong = frame.replace(b'"wire_version": 3', b'"wire_version": 2', 1)
+    with pytest.raises(ValueError):
+        receive_checkpoint(io.BytesIO(wrong), destination, "gemma")
+    assert destination.read_bytes() == checkpoint
+    wrong = frame.replace(
+        b'"encoding": "' + encoding.encode() + b'"',
+        b'"encoding": "' + (b"fp8" if encoding == "f16" else b"f16") + b'"',
+        1,
+    )
+    with pytest.raises(ValueError, match="wire encoding"):
+        receive_checkpoint(io.BytesIO(wrong), destination, "gemma")
+
+
+@pytest.mark.parametrize("encoding", ["f32", "f16", "fp8", "rotated4"])
+def test_checkpoint_encoding_option_reaches_transport(tmp_path, encoding):
+    frame, _, _ = fixture(version={"f32": 2, "f16": 3, "fp8": 3, "rotated4": 4}[encoding], encoding=encoding)
+
+    def handler(request):
+        assert request.headers["X-Antfly-KV-Encoding"] == encoding
+        return httpx.Response(200, headers={"Content-Type": CONTENT_TYPE}, stream=Stream(frame))
+
+    client = client_with_transport(handler)
+    saved = client.prepare_native_kv_checkpoint(
+        InferenceGenerateRequest(model="gemma", messages=[]), tmp_path / "saved.kv", encoding=encoding
+    )
+    assert saved.metadata["encoding"] == encoding
+    with pytest.raises(ValueError, match="encoding"):
+        client.prepare_native_kv_checkpoint(
+            InferenceGenerateRequest(model="gemma", messages=[]), tmp_path / "saved.kv", encoding="unknown"
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("fp8_heads", -1), ("fp8_heads", True), ("fp8_heads", 3), ("fp8_fallback_heads", None), ("fp8_fallback_heads", 0)],
+)
+def test_invalid_fp8_accounting_does_not_replace_saved_file(tmp_path, field, value):
+    frame, checkpoint, metadata = fixture(version=3, encoding="fp8")
+    destination = tmp_path / "saved.kv"
+    receive_checkpoint(io.BytesIO(frame), destination, "gemma")
+    metadata[field] = value
+    encoded = json.dumps(metadata).encode()
+    header = struct.pack("<8sQIIIIQ", b"AFATT001", len(encoded), 1, 0, len(CHECKPOINT_MIME), 0, len(checkpoint))
+    with pytest.raises(ValueError, match="wire encoding"):
+        receive_checkpoint(io.BytesIO(header + encoded + CHECKPOINT_MIME + checkpoint), destination, "gemma")
+    assert destination.read_bytes() == checkpoint
+
+
+def test_diagnostic_rotated4_checkpoint_upload_preserves_bytes(tmp_path):
+    _, checkpoint, _ = fixture(CHUNK_BYTES * 2, version=4, encoding="rotated4")
+    path = tmp_path / "rotated4.kv"
+    path.write_bytes(checkpoint)
+    request = {"model": "gemma", "messages": [], "stream": False}
+    with path.open("rb") as source:
+        length, chunks = checkpoint_upload(source, request)
+        uploaded = b"".join(chunks)
+    assert len(uploaded) == length
+    assert uploaded.endswith(checkpoint)
+    assert path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("flags", [1, 2, 0xFFFFFFFF])
+def test_rotated4_upload_rejects_unknown_flags_before_sending(tmp_path, flags):
+    _, checkpoint, _ = fixture(version=4, encoding="rotated4")
+    corrupted = bytearray(checkpoint)
+    struct.pack_into("<I", corrupted, 12, flags)
+    corrupted[-32:] = hashlib.sha256(corrupted[:-32]).digest()
+    path = tmp_path / "rotated4.kv"
+    path.write_bytes(corrupted)
+    with path.open("rb") as source, pytest.raises(ValueError, match="header"):
+        checkpoint_upload(source, {"model": "gemma"})
+
+
+@pytest.mark.parametrize("outcome", ["compacted", "unchanged_insufficient_savings"])
+def test_rotated4_export_publishes_verified_metadata(tmp_path, outcome):
+    frame, checkpoint, metadata = fixture(version=4, encoding="rotated4", outcome=outcome)
+    destination = tmp_path / "saved.kv"
+    saved = receive_checkpoint(io.BytesIO(frame), destination, "gemma")
+    assert saved.metadata == metadata
+    assert destination.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("rotated4_heads", -1),
+        ("rotated4_heads", True),
+        ("rotated4_heads", 3),
+        ("rotated4_fallback_heads", None),
+        ("rotated4_fallback_heads", 0),
+        ("rotated4_eligible_rows", 7),
+        ("rotated4_compressed_rows", 0),
+        ("rotated4_exact_rows", 4),
+        ("rotated4_compressed_rows", False),
+        ("fp8_heads", 1),
+    ],
+)
+def test_rotated4_bad_accounting_preserves_existing_checkpoint(tmp_path, field, value):
+    frame, checkpoint, metadata = fixture(version=4, encoding="rotated4")
+    destination = tmp_path / "saved.kv"
+    receive_checkpoint(io.BytesIO(frame), destination, "gemma")
+    metadata[field] = value
+    encoded = json.dumps(metadata).encode()
+    header = struct.pack("<8sQIIIIQ", b"AFATT001", len(encoded), 1, 0, len(CHECKPOINT_MIME), 0, len(checkpoint))
+    with pytest.raises(ValueError, match="wire encoding"):
+        receive_checkpoint(io.BytesIO(header + encoded + CHECKPOINT_MIME + checkpoint), destination, "gemma")
+    assert destination.read_bytes() == checkpoint
+
+
+def test_f16_metadata_cannot_claim_rotated_rows(tmp_path):
+    _, checkpoint, metadata = fixture(version=3, encoding="f16")
+    metadata.update(
+        rotated4_heads=1,
+        rotated4_fallback_heads=1,
+        rotated4_eligible_rows=8,
+        rotated4_compressed_rows=5,
+        rotated4_exact_rows=3,
+    )
+    encoded = json.dumps(metadata).encode()
+    header = struct.pack("<8sQIIIIQ", b"AFATT001", len(encoded), 1, 0, len(CHECKPOINT_MIME), 0, len(checkpoint))
+    with pytest.raises(ValueError, match="wire encoding"):
+        receive_checkpoint(io.BytesIO(header + encoded + CHECKPOINT_MIME + checkpoint), tmp_path / "saved.kv", "gemma")
+
+
+@pytest.mark.parametrize("heads,fallback,compressed,exact", [(2, 0, 1, 7), (1, 1, 8, 0)])
+def test_rotated4_each_reported_head_requires_eligible_rows(tmp_path, heads, fallback, compressed, exact):
+    _, checkpoint, metadata = fixture(version=4, encoding="rotated4")
+    metadata.update(
+        rotated4_heads=heads,
+        rotated4_fallback_heads=fallback,
+        rotated4_compressed_rows=compressed,
+        rotated4_exact_rows=exact,
+    )
+    encoded = json.dumps(metadata).encode()
+    header = struct.pack("<8sQIIIIQ", b"AFATT001", len(encoded), 1, 0, len(CHECKPOINT_MIME), 0, len(checkpoint))
+    with pytest.raises(ValueError, match="wire encoding"):
+        receive_checkpoint(io.BytesIO(header + encoded + CHECKPOINT_MIME + checkpoint), tmp_path / "saved.kv", "gemma")

@@ -1,5 +1,6 @@
-"""Matched Antfly full replay or portable restore on the production standalone host.
+"""Matched Antfly full replay or portable restore on the selected server host.
 
+Standalone is the default; inference-only runs do not qualify standalone parity.
 Use the same verified checkpoints/token fixtures as qualify_matched_llama.py.
 Full prompt replay can be compared with llama replay. Portable checkpoint restore
 and llama resident reuse are different operations and must not be called parity.
@@ -24,6 +25,7 @@ from qualify_matched_llama import percentiles,require_idle
 
 
 from native_benchmark_fixture import qualified_fixture
+from native_phase_timing import latency_sampling_qualified
 from native_phase_timing import GENERATION_PHASES, generation_timing, request_log
 
 
@@ -83,6 +85,7 @@ def validate_observation(row,expected,logical_tokens,mode):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--server',type=Path,required=True)
+    parser.add_argument('--server-kind',choices=['inference','standalone'],default='standalone')
     parser.add_argument('--models-dir',type=Path,default=Path('.models'))
     parser.add_argument('--model',default='google/gemma-4-E4B-it-qat-q4_0-gguf')
     parser.add_argument('--reference',type=Path,required=True)
@@ -91,21 +94,23 @@ def main():
     parser.add_argument('--size',choices=['8k','32k'],required=True)
     parser.add_argument('--mode',choices=['replay','portable_restore'],required=True)
     parser.add_argument('--warmups',type=int,default=5)
-    parser.add_argument('--samples',type=int,default=100)
+    parser.add_argument('--sampling-profile',choices=['bounded','extended'],default='bounded')
+    parser.add_argument('--samples',type=int)
     parser.add_argument('--smoke',action='store_true')
     parser.add_argument('--port',type=int,default=8524)
     parser.add_argument('--timeout',type=float,default=1800)
-    args=parser.parse_args();args.server_kind='standalone'
+    args=parser.parse_args()
+    if args.samples is None: args.samples={'bounded':20,'extended':100}[args.sampling_profile]
     args.generation_timing=True
     if args.warmups<0 or args.samples<1 or not math.isfinite(args.timeout) or args.timeout<=0:
         parser.error('invalid sampling counts or timeout')
-    if not args.smoke and (args.warmups<5 or args.samples<100):
-        parser.error('release sampling requires five warmups and 100 measured requests')
+    if not args.smoke and not latency_sampling_qualified(args.sampling_profile,args.warmups,args.samples):
+        parser.error('sampling requires five warmups and 20 bounded or 100 extended measurements')
     if args.output.exists():raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True,exist_ok=True)
     evidence={'passed':False,'production_ready':False,'generation_latency_gate_qualified':False,
-              'scope':__doc__,'mode':args.mode,'size':args.size,'smoke':args.smoke,
-              'warmups_requested':args.warmups,'samples_requested':args.samples,'observations':[],
+              'scope':__doc__,'mode':args.mode,'size':args.size,'smoke':args.smoke,'server_kind':args.server_kind,
+              'warmups_requested':args.warmups,'samples_requested':args.samples,'sampling_profile':args.sampling_profile,'observations':[],
               'source':git_provenance(ROOT),'binary_sha256':sha256_file(args.server),
               'reference_sha256':sha256_file(args.reference),'runner_sha256':sha256_file(Path(__file__))}
     def publish():
@@ -176,7 +181,7 @@ def main():
             for key in ('total_seconds','first_content_seconds','first_content_to_done_seconds')}
         evidence['pipeline_timing_ms']={key:percentiles([r['pipeline_timing_ms'][key] for r in measured],allow_zero=True)
             for key in GENERATION_PHASES+('total',)}
-        evidence.update(passed=True,sampling_qualified=not args.smoke and args.warmups>=5 and len(measured)>=100)
+        evidence.update(passed=True,sampling_qualified=latency_sampling_qualified(args.sampling_profile,args.warmups,len(measured),args.smoke))
     except Exception as error:evidence.update(passed=False,sampling_qualified=False,error=f'{type(error).__name__}: {error}')
     finally:publish()
     print(json.dumps({'passed':evidence['passed'],'sampling_qualified':evidence.get('sampling_qualified',False),'error':evidence.get('error')}),flush=True)

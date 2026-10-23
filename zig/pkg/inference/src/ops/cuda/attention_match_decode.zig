@@ -19,9 +19,14 @@ const Descriptor = extern struct {
     rows: u64,
     capacity: u64,
     start: u64,
+    encoded_keys: u64,
+    encoded_values: u64,
+    spans: u64,
+    compressed_rows: u64,
+    span_count: u64,
 };
 comptime {
-    if (@sizeOf(Descriptor) != 64 or @offsetOf(Descriptor, "rows") != 40) @compileError("CUDA head ABI mismatch");
+    if (@sizeOf(Descriptor) != 104 or @offsetOf(Descriptor, "rows") != 40) @compileError("CUDA head ABI mismatch");
 }
 
 pub const Request = struct {
@@ -45,6 +50,10 @@ pub const Runner = struct {
     append_f16: driver.CUfunction,
     append_f32: driver.CUfunction,
     merge: driver.CUfunction,
+    rotated_f16: driver.CUfunction = null,
+    rotated_f32: driver.CUfunction = null,
+    rotate_queries: driver.CUfunction = null,
+    rotated_queries: Buffer = .{},
     descriptors: Buffer = .{},
     partials: Buffer = .{},
     status: Buffer = .{},
@@ -63,6 +72,9 @@ pub const Runner = struct {
         try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.append_f16, module, "attention_match_append_f16"));
         try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.append_f32, module, "attention_match_append_f32"));
         try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.merge, module, "attention_match_merge"));
+        try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.rotated_f16, module, "attention_match_rotated_f16"));
+        try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.rotated_f32, module, "attention_match_rotated_f32"));
+        try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.rotate_queries, module, "attention_match_rotate_queries"));
         return result;
     }
 
@@ -72,6 +84,7 @@ pub const Runner = struct {
         self.descriptors.free(self.context);
         self.partials.free(self.context);
         self.status.free(self.context);
+        self.rotated_queries.free(self.context);
         _ = self.context.driver.fns.cuModuleUnload(self.module);
         self.* = undefined;
     }
@@ -107,10 +120,11 @@ pub const Runner = struct {
         const count = rows * heads.len * dim;
         if (keys.ptr == 0 or values.ptr == 0 or keys.len < count * 4 or values.len < count * 4) return error.InvalidAttentionShape;
         for (heads, 0..) |head, i| {
+            try storage.validateCompressed(head);
             if (head.head != i or head.dim != dim or head.logical_length != first_position or head.rows > head.capacity or
                 head.capacity == 0 or head.capacity > 262144 or head.start >= head.capacity or head.window > 131072)
                 return error.InvalidAttentionShape;
-            for ([_]Buffer{ head.keys, head.values, head.bias, head.positions, head.coverage_ends }) |source|
+            for ([_]Buffer{ head.keys, head.values, head.bias, head.positions, head.coverage_ends, head.encoded_keys, head.encoded_values, head.spans }) |source|
                 if (overlaps(keys, source) or overlaps(values, source)) return error.InvalidAttentionShape;
         }
         var descriptors: [64]Descriptor = undefined;
@@ -118,7 +132,7 @@ pub const Runner = struct {
             const required = head.rows + rows;
             const capacity = if (head.window == 0) ((required + 255) / 256) * 256 else @max(required, @as(usize, head.window) + 512);
             try state.grow(head, capacity, self.max_device_bytes, control);
-            descriptors[i] = .{ .keys = head.keys.ptr, .values = head.values.ptr, .bias = head.bias.ptr, .positions = head.positions.ptr, .coverage_ends = head.coverage_ends.ptr, .rows = head.rows, .capacity = head.capacity, .start = head.start };
+            descriptors[i] = .{ .keys = head.keys.ptr, .values = head.values.ptr, .bias = head.bias.ptr, .positions = head.positions.ptr, .coverage_ends = head.coverage_ends.ptr, .rows = head.rows, .capacity = head.capacity, .start = head.start, .encoded_keys = head.encoded_keys.ptr, .encoded_values = head.encoded_values.ptr, .spans = head.spans.ptr, .compressed_rows = head.compressed_rows, .span_count = head.span_count };
         }
         try self.reserve(&self.descriptors, heads.len * @sizeOf(Descriptor));
         try self.reserve(&self.status, @sizeOf(c_int));
@@ -161,28 +175,34 @@ pub const Runner = struct {
             overlaps(mass, request.queries) or overlaps(mass, request.output)) return error.InvalidAttentionShape;
         var descriptors: [64]Descriptor = undefined;
         var max_rows: usize = 0;
+        var compressed = false;
         for (request.heads, 0..) |head, i| {
             if (head.dim != dim or head.layer != request.heads[0].layer or head.window != request.heads[0].window or
                 head.head != i or head.rows == 0 or head.rows > head.capacity or head.capacity > 262144 or
-                head.start >= head.capacity or head.keys.ptr == 0 or head.values.ptr == 0 or head.bias.ptr == 0 or
+                head.start >= head.capacity or head.bias.ptr == 0 or
                 head.positions.ptr == 0 or head.coverage_ends.ptr == 0)
                 return error.InvalidAttentionShape;
-            const kv_bytes = head.capacity * dim * @as(usize, if (request.precision == .f16) 2 else 4);
+            try storage.validateCompressed(head);
+            compressed = compressed or head.compressed_rows != 0;
+            const kv_bytes = (head.capacity - head.compressed_rows) * dim * @as(usize, if (request.precision == .f16) 2 else 4);
+            if (kv_bytes != 0 and (head.keys.ptr == 0 or head.values.ptr == 0)) return error.InvalidAttentionShape;
             if (head.keys.len < kv_bytes or head.values.len < kv_bytes or head.bias.len < head.capacity * 4 or
                 head.positions.len < head.capacity * 8 or head.coverage_ends.len < head.capacity * 8) return error.InvalidAttentionShape;
-            for ([_]Buffer{ head.keys, head.values, head.bias, head.positions, head.coverage_ends }) |source| {
+            for ([_]Buffer{ head.keys, head.values, head.bias, head.positions, head.coverage_ends, head.encoded_keys, head.encoded_values, head.spans }) |source| {
                 if (overlaps(request.output, source)) return error.InvalidAttentionShape;
                 if (request.log_mass) |mass| if (overlaps(mass, source)) return error.InvalidAttentionShape;
             }
             max_rows = @max(max_rows, head.rows);
-            descriptors[i] = .{ .keys = head.keys.ptr, .values = head.values.ptr, .bias = head.bias.ptr, .positions = head.positions.ptr, .coverage_ends = head.coverage_ends.ptr, .rows = head.rows, .capacity = head.capacity, .start = head.start };
+            descriptors[i] = .{ .keys = head.keys.ptr, .values = head.values.ptr, .bias = head.bias.ptr, .positions = head.positions.ptr, .coverage_ends = head.coverage_ends.ptr, .rows = head.rows, .capacity = head.capacity, .start = head.start, .encoded_keys = head.encoded_keys.ptr, .encoded_values = head.encoded_values.ptr, .spans = head.spans.ptr, .compressed_rows = head.compressed_rows, .span_count = head.span_count };
         }
         const splits = (max_rows + 255) / 256;
         const per_row = request.query_heads * splits * (dim + 2) * 4;
-        const chunk_rows = @min(@as(usize, 16), self.max_scratch_bytes / per_row);
+        const rotation_per_row = if (compressed) request.query_heads * dim * 4 else 0;
+        const chunk_rows = @min(@as(usize, 16), self.max_scratch_bytes / (per_row + rotation_per_row));
         if (chunk_rows == 0) return error.CompactionWorkspaceLimit;
         try self.reserve(&self.descriptors, @sizeOf(Descriptor) * request.heads.len);
         try self.reserve(&self.partials, @min(request.query_rows, chunk_rows) * per_row);
+        if (compressed) try self.reserve(&self.rotated_queries, @min(request.query_rows, chunk_rows) * rotation_per_row);
         // Keep stack descriptors alive on all paths, including launch/cancel
         // failures after an asynchronous copy was queued.
         errdefer self.context.synchronize() catch {};
@@ -195,7 +215,12 @@ pub const Runner = struct {
             const out = request.output.ptr + offset * request.query_heads * dim * 4;
             const mass = if (request.log_mass) |buffer| buffer.ptr + offset * request.query_heads * 4 else @as(usize, 0);
             const position = request.first_query_position + offset;
-            try self.launch(if (request.precision == .f16) self.partial_f16 else self.partial_f32, splits, rows * request.query_heads, .{ q, self.descriptors.ptr, self.partials.ptr, int(request.query_heads), int(request.heads.len), int(dim), int(splits), position, request.scale, request.softcap, @as(u64, request.heads[0].window) });
+            if (compressed) {
+                try self.launch(self.rotate_queries, rows * request.query_heads, 1, .{ q, self.rotated_queries.ptr, int(dim) });
+                try self.launch(if (request.precision == .f16) self.rotated_f16 else self.rotated_f32, splits, rows * request.query_heads, .{ q, self.rotated_queries.ptr, self.descriptors.ptr, self.partials.ptr, int(request.query_heads), int(request.heads.len), int(dim), int(splits), position, request.scale, request.softcap, @as(u64, request.heads[0].window) });
+            } else {
+                try self.launch(if (request.precision == .f16) self.partial_f16 else self.partial_f32, splits, rows * request.query_heads, .{ q, self.descriptors.ptr, self.partials.ptr, int(request.query_heads), int(request.heads.len), int(dim), int(splits), position, request.scale, request.softcap, @as(u64, request.heads[0].window) });
+            }
             try self.launch(self.merge, rows * request.query_heads, 1, .{ self.partials.ptr, out, mass, int(dim), int(splits) });
             // Bound cancellation latency and retire scratch before reuse.
             try self.context.synchronize();

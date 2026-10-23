@@ -4472,7 +4472,7 @@ export interface paths {
          *
          *     The response is an AFATT001 envelope: JSON metadata followed by exactly
          *     one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
-         *     a V2 binary file containing original token positions, fitted global KV,
+         *     a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions, fitted global KV,
          *     exact local KV, saved next-token logits, loaded-model fingerprints and
          *     an integrity digest. It is usable only with the same model revision,
          *     tokenizer, chat template and KV layout. Metadata reports the actual
@@ -33308,7 +33308,10 @@ export interface operations {
     prepareNativeKvCheckpoint: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Checkpoint encoding. f16 is lossless for the supported cache. fp8 stores validated fitted history in FP8 and restores it to f16, with per-head f16 fallback. rotated4 stores and serves validated fitted rows in a mixed rotated 4-bit/f16 representation, preserving protected rows exactly. f32 exports legacy V2. */
+                "X-Antfly-KV-Encoding"?: "f32" | "f16" | "fp8" | "rotated4";
+            };
             path?: never;
             cookie?: never;
         };

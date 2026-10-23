@@ -24,12 +24,40 @@ def reports():
                     'choices':[{'finish_reason':'stop','message':{'content':'violet-729'}}]}
             else:
                 row['result']={'tokens_evaluated':8189,'tokens_predicted':5,'content':'violet-729',
+                    'tokens':[68002,236772,236832,236778,236819],
                     'stop_type':'eos','truncated':False,'timings':{'prompt_n':8189,'cache_n':0,'predicted_n':5}}
             report['observations'].append(row)
     return native,llama
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_eos_inclusive_llama_count_preserves_full_wall_latency(self):
+        a,b=reports()
+        for row in b['observations']:
+            row['result']['tokens'].append(106)
+            row['result']['tokens_predicted']=6
+            row['result']['timings']['predicted_n']=6
+        value=compare(a,b)
+        self.assertEqual(value['output_tokens'],5)
+        self.assertEqual(value['latency_seconds']['llama']['total_seconds']['p50'],1.)
+        self.assertAlmostEqual(value['antfly_over_llama']['total_seconds']['p50'],1.2)
+        self.assertEqual(b['observations'][0]['result']['tokens_predicted'],6)
+
+    def test_bounded_profile_requires_explicit_matching_scope_and_complete_samples(self):
+        a,b=reports()
+        for report in (a,b):
+            report.update(sampling_profile='bounded',samples_requested=20)
+            report['observations']=report['observations'][:26]
+        result=compare(a,b)
+        self.assertEqual(result['samples'],{'antfly':20,'llama':20})
+        self.assertEqual(result['sampling_profile'],'bounded')
+        self.assertTrue(result['latency_thresholds_met'])
+        b.pop('sampling_profile')
+        with self.assertRaises(ValueError): compare(a,b)
+        b['sampling_profile']='bounded'
+        b['observations'].pop()
+        with self.assertRaises(ValueError): compare(a,b)
+
     def test_matched_complete_campaign_meets_only_scoped_gate(self):
         a,b=reports();result=compare(a,b)
         self.assertTrue(result['latency_thresholds_met'])
@@ -70,6 +98,7 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'reused'):compare(a,b)
         a,b=reports();b['observations'][20]['result'].update(tokens_predicted=6)
         b['observations'][20]['result']['timings']['predicted_n']=6
+        b['observations'][20]['result']['tokens'].append(7)
         with self.assertRaisesRegex(ValueError,'output lengths'):compare(a,b)
         a,b=reports();a['observations'][20]['result']['usage']['cached_prompt_tokens']=8189
         with self.assertRaisesRegex(ValueError,'reused'):compare(a,b)

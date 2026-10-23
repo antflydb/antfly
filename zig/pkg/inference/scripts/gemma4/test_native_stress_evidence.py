@@ -15,6 +15,28 @@ def completed_blocks():
 
 
 class StressEvidenceTests(unittest.TestCase):
+    def test_bounded_profile_reports_its_actual_scope(self):
+        blocks = completed_blocks()[:2]
+        result = summarize_blocks(blocks, 'bounded')
+        self.assertEqual(result['mixed_requests'], 100)
+        self.assertEqual(result['actual_compactions'], 10)
+        self.assertFalse(result['extended_run_qualified'])
+        self.assertEqual(result['quiescent_growth']['host_rss_bytes']['window_blocks'], 1)
+        with self.assertRaises(AssertionError): summarize_blocks(blocks)
+        with self.assertRaises(AssertionError): summarize_blocks(blocks[:1], 'bounded')
+        blocks[-1]['quiescent_memory']['host_rss_bytes'] += 129*1024**2
+        with self.assertRaisesRegex(AssertionError, 'quiescent memory growth'):
+            summarize_blocks(blocks, 'bounded')
+
+    def test_bounded_profile_rejects_missing_work_and_fallbacks(self):
+        blocks = completed_blocks()[:2]
+        blocks[0]['operations'].pop()
+        with self.assertRaises(AssertionError): summarize_blocks(blocks, 'bounded')
+        blocks = completed_blocks()[:2]
+        blocks[0]['operations'][0]['outcome'] = 'unchanged_insufficient_savings'
+        with self.assertRaisesRegex(AssertionError, 'actual compactions'):
+            summarize_blocks(blocks, 'bounded')
+
     def test_only_complete_campaign_counts(self):
         blocks = completed_blocks()
         result = summarize_blocks(blocks)

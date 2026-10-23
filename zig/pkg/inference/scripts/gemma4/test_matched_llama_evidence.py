@@ -4,16 +4,35 @@ import json
 import time
 import unittest
 
-from qualify_matched_llama import percentiles,read_completion,validate_result
+from qualify_matched_llama import percentiles,read_completion,validate_result,content_token_count
 
 
 def result():
     return {'content':'violet-729','stop_type':'eos','truncated':False,
+            'tokens':[68002,236772,236832,236778,236819],
             'tokens_evaluated':8189,'tokens_predicted':5,
             'timings':{'prompt_n':8189,'cache_n':0,'predicted_n':5,'prompt_ms':2000.,'predicted_ms':100.}}
 
 
 class MatchedLlamaEvidenceTests(unittest.TestCase):
+    def test_terminal_turn_token_is_excluded_without_mutating_raw_counters(self):
+        value=result();value['tokens'].append(106);value['tokens_predicted']=6
+        value['timings']['predicted_n']=6;original=copy.deepcopy(value)
+        validate_result(value,8189,5,'violet-729','replay')
+        self.assertEqual(content_token_count(value),5)
+        self.assertEqual(value,original)
+
+    def test_eos_normalization_cannot_hide_extra_content_or_invalid_token_accounting(self):
+        for tokens in ([68002,236772,236832,236778,236819,7],
+                       [68002,236772,236832,236778,236819,7,106],
+                       [106,68002,236772,236832,236778,236819],
+                       [106,68002,236772,236832,236778,236819,106],
+                       [68002,236772,236832,236778,True,106]):
+            value=result();value.update(tokens=tokens,tokens_predicted=len(tokens))
+            value['timings']['predicted_n']=len(tokens)
+            with self.subTest(tokens=tokens),self.assertRaises(AssertionError):
+                validate_result(value,8189,5,'violet-729','replay')
+
     def test_replay_cannot_hide_cached_prefix(self):
         value=result();validate_result(value,8189,5,'violet-729','replay')
         value['timings'].update(prompt_n=1,cache_n=8188)
@@ -43,12 +62,12 @@ class MatchedLlamaEvidenceTests(unittest.TestCase):
 
     def test_stream_preserves_final_accounting_and_first_token(self):
         final=result();final.update(stop=True,content='',tokens=[])
-        chunks=[{'index':0,'stop':False,'content':'violet','tokens':[1]},
-                {'index':0,'stop':False,'content':'-729','tokens':[2,3,4]},final]
+        chunks=[{'index':0,'stop':False,'content':'violet','tokens':[68002]},
+                {'index':0,'stop':False,'content':'-729','tokens':[236772,236832,236778,236819]},final]
         wire=b''.join(('data: '+json.dumps(row)+'\n\n').encode() for row in chunks)
         observation=read_completion(io.BytesIO(wire),time.monotonic())
         self.assertEqual(observation['result']['content'],'violet-729')
-        self.assertEqual(observation['result']['tokens'],[1,2,3,4])
+        self.assertEqual(observation['result']['tokens'],result()['tokens'])
         self.assertGreater(observation['ttft_seconds'],0)
         validate_result(observation['result'],8189,5,'violet-729','replay')
 

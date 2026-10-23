@@ -30,6 +30,10 @@ pub const Options = struct {
     /// Optional diagnostics survive a rejected candidate; never authorize it.
     stats: ?*Stats = null,
     retention_divisor: usize = 4,
+    /// On numerical rejection, retry with successively more retained rows down
+    /// to this divisor. Every attempt uses the original source and the same
+    /// whole-head error limits; admission must reserve the largest attempt.
+    min_retention_divisor: ?usize = null,
     /// Reject by default. Explicit fallback preserves the original head only
     /// for a rejected numerical fit; cancellation, OOM and corrupt input fail.
     rejected_head_policy: enum { reject, preserve_original } = .reject,
@@ -38,8 +42,14 @@ pub const Options = struct {
     min_global_savings_ratio: ?f64 = null,
     source_has_metadata: bool = false,
     /// Round fitted K/V to the serving precision BEFORE held-out validation.
-    /// Portable checkpoints still represent these exact rounded values as f32.
+    /// In-memory checkpoint state represents these exact rounded values as f32.
     storage_precision: enum { f32, f16 } = .f32,
+    /// Experimental disk encoding. Validate decoded FP8 against the original
+    /// whole head; rejected FP8 attempts retain the already validated f16 fit.
+    fp8_checkpoint: bool = false,
+    /// Compress an eligible FP16 fit. The byte savings from newly quantized
+    /// rows must not turn an otherwise rejected fit into a published cache.
+    rotated4_checkpoint: bool = false,
     recent_rows: usize = 2048,
     /// Preserve these initial logical positions exactly, including across cycles.
     prefix_rows: usize = 0,
@@ -71,9 +81,19 @@ pub const Stats = struct {
     validating_head: bool = false,
     validated_heads: usize = 0,
     preserved_heads: usize = 0,
+    retention_retries: usize = 0,
+    rotated4_heads: usize = 0,
+    rotated4_fallback_heads: usize = 0,
+    rotated4_eligible_rows: usize = 0,
+    rotated4_compressed_rows: usize = 0,
+    rotated4_exact_rows: usize = 0,
+    fp8_heads: usize = 0,
+    fp8_fallback_heads: usize = 0,
     convergence_fallbacks: usize = 0,
     source_global_bytes: usize = 0,
     candidate_global_bytes: usize = 0,
+    fitted_global_bytes: usize = 0,
+    fitted_global_savings_ratio: f64 = 1,
     actual_global_savings_ratio: f64 = 1,
     max_rejected_mass_error: f64 = 0,
     max_rejected_output_rmse: f64 = 0,
@@ -114,6 +134,20 @@ pub fn headWorkspaceBytes(
         return error.InvalidFitConfig;
     const query_bytes = try mul(try add(train_elements, heldout_elements), 8);
     const replacement_bytes = try mul(target_rows, try add(20, try mul(d, 8)));
+    // Cloned prior state, encoded candidate and filtered candidate coexist.
+    const packed_bytes = if (options.rotated4_checkpoint)
+        try mul(target_rows, try add(60, try mul(d, 6)))
+    else
+        try mul(target_rows, try add(40, try mul(d, 4)));
+    const samples = @min(train_elements / d, 64);
+    const selection_bytes = if (options.rotated4_checkpoint)
+        try add(try mul(target_rows, try add(17, try mul(samples, 16))), try mul(samples, try add(16, try mul(d, 8))))
+    else
+        0;
+    const selection_backend_bytes = if (options.rotated4_checkpoint and options.fit.backend != null)
+        try options.fit.backend.?.workspace_fn(options.fit.backend.?.context, target_rows, 1, samples, d)
+    else
+        0;
     const conversion_bytes = try mul(try add(try mul(block_rows, try add(try mul(d, 4), 6)), try mul(d, 2)), 8);
     const scratch_max = try solver.fitWorkspaceBytes(block_rows, std.math.divCeil(usize, block_rows, options.retention_divisor) catch unreachable, train_elements / d, d, heldout_elements / d, options.fit);
     const head_validation_bytes = if (options.validation == .whole_head)
@@ -121,7 +155,7 @@ pub fn headWorkspaceBytes(
     else
         0;
     return .{
-        .bytes = try add(query_bytes, try add(replacement_bytes, @max(head_validation_bytes, try add(conversion_bytes, scratch_max)))),
+        .bytes = try add(try add(try add(query_bytes, packed_bytes), try add(selection_bytes, selection_backend_bytes)), try add(replacement_bytes, @max(head_validation_bytes, try add(conversion_bytes, scratch_max)))),
         .solver_bytes = scratch_max,
     };
 }
@@ -339,7 +373,9 @@ fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_ind
     @memcpy(keys[out * d ..], original.keys[old_rows * d ..]);
     @memcpy(values[out * d ..], original.values[old_rows * d ..]);
     std.debug.assert(out + remaining == target_rows);
-    const result: checkpoint.Head = .{ .dim = d, .compacted_until = original.coverage_ends[old_rows - 1], .positions = positions, .coverage_ends = ends, .keys = keys, .values = values, .bias = biases };
+    var result: checkpoint.Head = .{ .dim = d, .compacted_until = original.coverage_ends[old_rows - 1], .positions = positions, .coverage_ends = ends, .keys = keys, .values = values, .bias = biases };
+    result.compressed = try original.compressed.clone(allocator);
+    errdefer result.compressed.deinit(allocator);
     if (options.validation == .whole_head) {
         // Bound simultaneous whole-head FP64 conversions at long contexts.
         // Chunk fitting still runs on all independently owned workers.
@@ -370,6 +406,23 @@ fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_ind
         var cfg = options.fit;
         if (options.stats) |stats| cfg.metrics = &stats.rounded_fit;
         try validateRounded(allocator, h, compact, heldout, cfg);
+        if (options.fp8_checkpoint) {
+            const accepted = try quantizeCheckpointHead(allocator, h, compact, &result, prefix, out, heldout, cfg);
+            if (options.stats) |stats| {
+                if (accepted) stats.fp8_heads += 1 else stats.fp8_fallback_heads += 1;
+            }
+        }
+        if (options.rotated4_checkpoint and @import("turboquant_rotated.zig").supported(d)) {
+            const previous_rows = result.compressed.rows();
+            const accepted = try quantizeRotatedHead(allocator, h, compact, &result, prefix, out, train, heldout, cfg);
+            if (options.stats) |stats| {
+                if (accepted) stats.rotated4_heads += 1 else stats.rotated4_fallback_heads += 1;
+                const compressed_rows = result.compressed.rows() - previous_rows;
+                stats.rotated4_eligible_rows += out - prefix;
+                stats.rotated4_compressed_rows += compressed_rows;
+                stats.rotated4_exact_rows += out - prefix - compressed_rows;
+            }
+        }
         if (options.stats) |stats| {
             stats.validated_heads += 1;
             stats.max_head_mass_error = @max(stats.max_head_mass_error, stats.rounded_fit.max_relative_mass_error);
@@ -377,6 +430,41 @@ fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_ind
         }
     }
     return result;
+}
+
+fn quantizeCheckpointHead(allocator: std.mem.Allocator, original: solver.Head, compact: solver.Head, result: *checkpoint.Head, first: usize, end: usize, queries: []const f64, cfg: solver.Config) !bool {
+    const codec = checkpoint.codec;
+    const begin_element = first * result.dim;
+    const end_element = end * result.dim;
+    const keys = @constCast(compact.keys[begin_element..end_element]);
+    const values = @constCast(compact.values[begin_element..end_element]);
+    const key_scale = codec.scaleFor(keys);
+    const value_scale = codec.scaleFor(values);
+    var offset: usize = 0;
+    while (offset < keys.len) {
+        try cfg.control.check();
+        const count = @min(@as(usize, 4096), keys.len - offset);
+        codec.round(keys[offset..][0..count], key_scale) catch return false;
+        codec.round(values[offset..][0..count], value_scale) catch return false;
+        offset += count;
+    }
+    var metrics: solver.Metrics = .{};
+    var validation = cfg;
+    validation.metrics = &metrics;
+    validateRounded(allocator, original, compact, queries, validation) catch |err| {
+        if (err == error.CompactionFitRejected) return false;
+        return err;
+    };
+    // Publication happens only after combined fitting + quantization passes.
+    // The unmodified f32 arrays retain the f16 fallback until this point.
+    for (keys, values, begin_element..) |k, v, i| {
+        if (i % 4096 == 0) try cfg.control.check();
+        @constCast(result.keys)[i] = @floatCast(k);
+        @constCast(result.values)[i] = @floatCast(v);
+    }
+    result.fp8 = .{ .first_row = @intCast(first), .rows = @intCast(end - first), .key_scale = key_scale, .value_scale = value_scale };
+    if (cfg.metrics) |out_metrics| out_metrics.* = metrics;
+    return true;
 }
 
 fn validateRounded(allocator: std.mem.Allocator, original: solver.Head, compact: solver.Head, queries: []const f64, cfg: solver.Config) !void {
@@ -400,9 +488,27 @@ pub fn globalStorageBytes(state_value: checkpoint.State, precision: @FieldType(O
     for (state_value.donors) |donor| {
         if (donor.window != 0) continue;
         for (donor.heads) |head| {
-            const kv_bytes = try mul(head.keys.len, if (precision == .f16) 4 else 8);
+            const exact_elements = try mul(head.positions.len - head.compressed.rows(), head.dim);
+            const kv_bytes = try add(try mul(exact_elements, if (precision == .f16) 4 else 8), head.compressed.bytes());
             const metadata = if (staged or head.compacted_until != 0) try mul(head.positions.len, 20) else 0;
             total = try add(total, try add(kv_bytes, metadata));
+        }
+    }
+    return total;
+}
+
+/// Cost of the same fitted geometry before this operation's quantization.
+/// Existing compressed history is immutable and keeps its actual storage cost;
+/// only newly fitted rows are priced at the serving precision. This separates
+/// the fit's publication decision from the optional codec's additional savings.
+fn fittedGlobalStorageBytes(source: checkpoint.State, candidate: checkpoint.State, precision: @FieldType(Options, "storage_precision")) !usize {
+    var total: usize = 0;
+    for (source.donors, candidate.donors) |before, after| {
+        if (after.window != 0) continue;
+        for (before.heads, after.heads) |original, fitted| {
+            const exact_rows = std.math.sub(usize, fitted.positions.len, original.compressed.rows()) catch return error.InvalidKvCheckpoint;
+            const exact_bytes = try mul(try mul(exact_rows, fitted.dim), if (precision == .f16) 4 else 8);
+            total = try add(total, try add(try add(exact_bytes, original.compressed.bytes()), try mul(fitted.positions.len, 20)));
         }
     }
     return total;
@@ -429,22 +535,32 @@ pub fn prepareParallel(source: checkpoint.State, batches: []const ReferenceBatch
 fn preparedHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_index: usize, head_index: usize, batches: []const ReferenceBatch, layout: Layout, options: Options, resident: usize, validation_gate: ?*HeadValidationGate) !checkpoint.Head {
     try options.fit.control.check();
     const donor = source.donors[donor_index];
-    const replacement = if (donor.window == 0)
-        compactHead(allocator, source, donor_index, head_index, batches, layout, options, resident, validation_gate) catch |err| fallback: {
-            if (options.rejected_head_policy != .preserve_original or
-                (err != error.CompactionFitRejected and err != error.MassFitDidNotConverge)) return err;
+    const replacement = if (donor.window == 0) attempt: {
+        var attempt_options = options;
+        while (true) {
             try options.fit.control.check();
-            if (options.stats) |stats| {
-                stats.preserved_heads += 1;
-                if (err == error.MassFitDidNotConverge) stats.convergence_fallbacks += 1;
-                const metrics = if (stats.validating_storage) stats.rounded_fit else stats.last_fit;
-                stats.max_rejected_mass_error = @max(stats.max_rejected_mass_error, metrics.max_relative_mass_error);
-                stats.max_rejected_output_rmse = @max(stats.max_rejected_output_rmse, metrics.relative_output_rmse);
-            }
-            break :fallback null;
+            break :attempt compactHead(allocator, source, donor_index, head_index, batches, layout, attempt_options, resident, validation_gate) catch |err| {
+                if (err != error.CompactionFitRejected and err != error.MassFitDidNotConverge) return err;
+                try options.fit.control.check();
+                if (options.stats) |stats| {
+                    const metrics = if (stats.validating_storage) stats.rounded_fit else stats.last_fit;
+                    stats.max_rejected_mass_error = @max(stats.max_rejected_mass_error, metrics.max_relative_mass_error);
+                    stats.max_rejected_output_rmse = @max(stats.max_rejected_output_rmse, metrics.relative_output_rmse);
+                }
+                if (attempt_options.retention_divisor > (options.min_retention_divisor orelse options.retention_divisor)) {
+                    attempt_options.retention_divisor -= 1;
+                    if (options.stats) |stats| stats.retention_retries += 1;
+                    continue;
+                }
+                if (options.rejected_head_policy != .preserve_original) return err;
+                if (options.stats) |stats| {
+                    stats.preserved_heads += 1;
+                    if (err == error.MassFitDidNotConverge) stats.convergence_fallbacks += 1;
+                }
+                break :attempt null;
+            };
         }
-    else
-        null;
+    } else null;
     return replacement orelse try checkpoint.cloneHead(allocator, donor.heads[head_index]);
 }
 
@@ -555,7 +671,7 @@ fn mergeStats(total: *Stats, part: Stats) void {
     total.rounded_fit = part.rounded_fit;
     total.validating_storage = part.validating_storage;
     total.validating_head = part.validating_head;
-    inline for (.{ "attempted_chunks", "completed_chunks", "validated_heads", "preserved_heads", "convergence_fallbacks" }) |field|
+    inline for (.{ "attempted_chunks", "completed_chunks", "validated_heads", "preserved_heads", "retention_retries", "convergence_fallbacks", "fp8_heads", "fp8_fallback_heads", "rotated4_heads", "rotated4_fallback_heads", "rotated4_eligible_rows", "rotated4_compressed_rows", "rotated4_exact_rows" }) |field|
         @field(total, field) += @field(part, field);
     inline for (.{ "max_nnls_sweeps", "max_rejected_mass_error", "max_rejected_output_rmse", "max_head_mass_error", "max_head_output_rmse" }) |field|
         @field(total, field) = @max(@field(total, field), @field(part, field));
@@ -620,6 +736,13 @@ fn prepareWithBackends(allocator: std.mem.Allocator, source: checkpoint.State, b
     try options.fit.control.check();
     try source.validateWithControl(options.checkpoint_limits, options.fit.control);
     if (options.max_parallel_validations == 0 or options.max_parallel_validations > 4) return error.InvalidFitConfig;
+    if ((options.fp8_checkpoint and options.rotated4_checkpoint) or ((options.fp8_checkpoint or options.rotated4_checkpoint) and (options.storage_precision != .f16 or options.validation != .whole_head))) return error.InvalidFitConfig;
+    if (options.fp8_checkpoint) for (source.donors) |donor| for (donor.heads) |head| {
+        if (head.compressed.spans.len != 0) return error.InvalidFitConfig;
+    };
+    if (options.min_retention_divisor) |minimum| {
+        if (minimum < 2 or minimum > options.retention_divisor or options.validation != .whole_head) return error.InvalidFitConfig;
+    }
     if (options.chunk_rows < 2 or options.retention_divisor < 2 or options.retention_divisor > 4 or options.max_queries_per_consumer == 0)
         return error.InvalidFitConfig;
     if (options.min_global_savings_ratio) |minimum| {
@@ -644,16 +767,25 @@ fn prepareWithBackends(allocator: std.mem.Allocator, source: checkpoint.State, b
     try candidate.state.validateWithControl(options.checkpoint_limits, options.fit.control);
     const source_global = try globalStorageBytes(source, options.storage_precision, options.source_has_metadata);
     const candidate_global = try globalStorageBytes(candidate.state, options.storage_precision, true);
+    const fitted_global = if (options.rotated4_checkpoint)
+        try fittedGlobalStorageBytes(source, candidate.state, options.storage_precision)
+    else
+        candidate_global;
     const ratio = if (candidate_global == 0) @as(f64, 1) else @as(f64, @floatFromInt(source_global)) / @as(f64, @floatFromInt(candidate_global));
+    const fitted_ratio = if (fitted_global == 0) @as(f64, 1) else @as(f64, @floatFromInt(source_global)) / @as(f64, @floatFromInt(fitted_global));
     if (options.stats) |stats| {
         stats.source_global_bytes = source_global;
         stats.candidate_global_bytes = candidate_global;
+        stats.fitted_global_bytes = fitted_global;
+        stats.fitted_global_savings_ratio = fitted_ratio;
         stats.actual_global_savings_ratio = ratio;
     }
     // Diagnostic callers may prepare an identity state without a saving gate.
     // An explicit minimum is a strict acceptance condition, never a hint.
     if (options.min_global_savings_ratio) |minimum| {
-        if (ratio < minimum) return error.CompactionSavingsInsufficient;
+        // Preserve the FP16 policy's exact-state fallback. A smaller codec is
+        // not evidence that a previously unpublished fit preserves answers.
+        if (fitted_ratio < minimum or ratio < minimum) return error.CompactionSavingsInsufficient;
     }
     try options.fit.control.check();
     return candidate;
@@ -1109,4 +1241,479 @@ test "attention_match one-permit validation gate releases cancellation reservati
 test "attention_match validation concurrency rejects unbounded configurations" {
     const batches = batchesFixture();
     for ([_]usize{ 0, 5 }) |maximum| try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .max_parallel_validations = maximum }));
+}
+
+fn fp8EngineAllocationFailures(a: std.mem.Allocator) !void {
+    const batches = batchesFixture();
+    var stats: Stats = .{};
+    var result = try prepare(a, state, &batches, layout_fixture, .{ .stats = &stats, .recent_rows = 1, .prefix_rows = 1, .validation = .whole_head, .storage_precision = .f16, .fp8_checkpoint = true });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), stats.fp8_heads);
+    const head = result.state.donors[0].heads[0];
+    try std.testing.expectEqual(@as(u32, 1), head.fp8.first_row);
+    try std.testing.expectEqual(@as(u32, 1), head.fp8.rows);
+    try std.testing.expectEqual(global.keys[0], head.keys[0]);
+    try std.testing.expectEqual(global.values[0], head.values[0]);
+    try std.testing.expectEqual(@as(f32, 8), head.values[head.values.len - 1]);
+    try std.testing.expectEqualSlices(f32, local.values, result.state.donors[1].heads[0].values);
+    try std.testing.expectEqual(@as(u32, 0), result.state.donors[1].heads[0].fp8.rows);
+    const bytes = try checkpoint.encodeWithEncoding(a, result.state, .{}, .fp8, .{});
+    defer a.free(bytes);
+    var restored = try checkpoint.decode(a, bytes, identity, .{});
+    defer restored.deinit();
+    try std.testing.expectEqualSlices(f32, head.values, restored.state.donors[0].heads[0].values);
+}
+
+test "attention_match FP8 validates all consumers and preserves protected rows under allocation failure" {
+    try fp8EngineAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, fp8EngineAllocationFailures, .{});
+}
+
+test "attention_match FP8 rejection measures combined error and keeps the f16 candidate" {
+    const original: solver.Head = .{ .dim = 1, .rows = 1, .scale = 1, .keys = &.{0}, .values = &.{1.099609375}, .bias = &.{0} };
+    var keys64 = [_]f64{0};
+    var values64 = [_]f64{1.0625};
+    const compact: solver.Head = .{ .dim = 1, .rows = 1, .scale = 1, .keys = &keys64, .values = &values64, .bias = &.{0} };
+    var keys = [_]f32{0};
+    var values = [_]f32{1.0625};
+    var result: checkpoint.Head = .{ .dim = 1, .compacted_until = 1, .positions = &.{0}, .coverage_ends = &.{1}, .keys = &keys, .values = &values, .bias = &.{0} };
+    const cfg: solver.Config = .{ .target_rows = 1 };
+    try validateRounded(std.testing.allocator, original, compact, &.{0}, cfg);
+    try std.testing.expect(!try quantizeCheckpointHead(std.testing.allocator, original, compact, &result, 0, 1, &.{0}, cfg));
+    try std.testing.expectEqual(@as(f32, 1.0625), values[0]);
+    try std.testing.expectEqual(@as(u32, 0), result.fp8.rows);
+}
+
+test "attention_match FP8 requires serving half precision and whole-head validation" {
+    const batches = batchesFixture();
+    try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .fp8_checkpoint = true }));
+    try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .fp8_checkpoint = true, .storage_precision = .f16 }));
+}
+
+fn retryBatches() [8]ReferenceBatch {
+    var batches = batchesFixture();
+    for (&batches) |*batch| {
+        batch.train = &.{ -1, 1 };
+        batch.heldout = &.{ -0.5, 0.5 };
+        batch.train_positions = &.{ 4, 5 };
+        batch.heldout_positions = &.{ 6, 7 };
+    }
+    return batches;
+}
+
+fn retryOptions() Options {
+    return .{ .recent_rows = 0, .chunk_rows = 4, .validation = .whole_head, .min_retention_divisor = 2, .rejected_head_policy = .preserve_original, .storage_precision = .f16, .fp8_checkpoint = true, .fit = .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set } };
+}
+
+fn retentionRetryAllocationFailures(a: std.mem.Allocator) !void {
+    const source = rejectedFixture();
+    const batches = retryBatches();
+    var stats: Stats = .{};
+    var options = retryOptions();
+    options.stats = &stats;
+    var result = try prepare(a, source, &batches, layout_fixture, options);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), stats.retention_retries);
+    try std.testing.expectEqual(@as(usize, 2), stats.validated_heads);
+    try std.testing.expectEqual(@as(usize, 0), stats.preserved_heads);
+    try std.testing.expectEqual(@as(usize, 2), result.state.donors[0].heads[0].positions.len);
+    try std.testing.expect(stats.max_rejected_mass_error > 0.05);
+    try std.testing.expect(stats.max_head_mass_error <= 0.05);
+    try std.testing.expect(stats.max_head_output_rmse <= 0.05);
+    try std.testing.expectEqualSlices(f32, &.{ -1, -1, 1, 1 }, source.donors[0].heads[0].keys);
+    try std.testing.expectEqualSlices(f32, local.values, result.state.donors[1].heads[0].values);
+}
+
+test "attention_match bounded retention retries preserve error gates and unwind allocations" {
+    try retentionRetryAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, retentionRetryAllocationFailures, .{});
+}
+
+test "attention_match retention retry cancellation cannot preserve or publish a failed head" {
+    const Cancel = struct {
+        fn check(raw: ?*anyopaque) !void {
+            const stats: *Stats = @ptrCast(@alignCast(raw.?));
+            if (stats.retention_retries != 0) return error.CompactionCancelled;
+        }
+    };
+    var stats: Stats = .{};
+    var options = retryOptions();
+    options.stats = &stats;
+    options.fit.control = .{ .context = &stats, .check_fn = Cancel.check };
+    const batches = retryBatches();
+    try std.testing.expectError(error.CompactionCancelled, prepare(std.testing.allocator, rejectedFixture(), &batches, layout_fixture, options));
+    try std.testing.expectEqual(@as(usize, 0), stats.validated_heads);
+    try std.testing.expectEqual(@as(usize, 0), stats.preserved_heads);
+}
+
+test "attention_match retention retries obey parallel admission and match serial results" {
+    const source = rejectedFixture();
+    const batches = retryBatches();
+    var options = retryOptions();
+    var serial = try prepare(std.testing.allocator, source, &batches, layout_fixture, options);
+    defer serial.deinit();
+    const expected = try checkpoint.encodeWithEncoding(std.testing.allocator, serial.state, .{}, .fp8, .{});
+    defer std.testing.allocator.free(expected);
+    const backends: [4]solver.Backend = @splat(ParallelTestBackend.backend);
+    options.fit.backend = ParallelTestBackend.backend;
+    var planned = options;
+    planned.retention_divisor = 2;
+    const workspace = try headWorkspaceBytes(4, 2, 4, 8, 8, 1, planned);
+    for (2..5) |workers| {
+        var stats: Stats = .{};
+        options.stats = &stats;
+        options.max_transient_host_bytes = try parallelHostBytes(try source.residentBytes(), 2, workspace.bytes, workers);
+        var result = try prepareParallel(source, &batches, layout_fixture, options, backends[0..workers]);
+        defer result.deinit();
+        const actual = try checkpoint.encodeWithEncoding(std.testing.allocator, result.state, .{}, .fp8, .{});
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        try std.testing.expectEqual(@as(usize, 1), stats.retention_retries);
+        options.max_transient_host_bytes -= 1;
+        try std.testing.expectError(error.CompactionWorkspaceLimit, prepareParallel(source, &batches, layout_fixture, options, backends[0..workers]));
+    }
+}
+
+test "attention_match retention retry configuration is bounded and requires whole-head validation" {
+    const batches = batchesFixture();
+    for ([_]usize{ 0, 1, 5 }) |minimum| {
+        try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .min_retention_divisor = minimum, .validation = .whole_head }));
+    }
+    try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .min_retention_divisor = 2 }));
+    try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .retention_divisor = 2, .min_retention_divisor = 3, .validation = .whole_head }));
+}
+
+fn quantizeRotatedHead(allocator: std.mem.Allocator, original: solver.Head, compact: solver.Head, result: *checkpoint.Head, first: usize, end: usize, train: []const f64, queries: []const f64, cfg: solver.Config) !bool {
+    const dim = result.dim;
+    var candidate = result.compressed.append(allocator, first, dim, result.keys[first * dim .. end * dim], result.values[first * dim .. end * dim], cfg.control) catch |err| {
+        if (err == error.InvalidQuantizedRow or err == error.NonFiniteAttention or err == error.InvalidKvCheckpoint) return false;
+        return err;
+    };
+    defer candidate.deinit(allocator);
+    // Training queries select rows. Held-out queries authorize publication only
+    // once, against the original whole head with the unchanged error limits.
+    const count = end - first;
+    const samples = @min(train.len / dim, 64);
+    if (samples == 0) return error.InvalidCompactionQueries;
+    const sampled = try allocator.alloc(f64, samples * dim);
+    defer allocator.free(sampled);
+    for (0..samples) |i| {
+        const q = if (samples == 1) 0 else i * (train.len / dim - 1) / (samples - 1);
+        @memcpy(sampled[i * dim ..][0..dim], train[q * dim ..][0..dim]);
+    }
+    const baseline = try allocator.alloc(f64, samples * compact.rows);
+    defer allocator.free(baseline);
+    const probabilities = try allocator.alloc(f64, baseline.len);
+    defer allocator.free(probabilities);
+    var baseline_mass: [64]f64 = undefined;
+    var candidate_mass: [64]f64 = undefined;
+    try solver.attendBatch(allocator, compact, sampled, baseline, null, baseline_mass[0..samples], cfg);
+    var keys: [512]f32 = undefined;
+    var values: [512]f32 = undefined;
+    for (first..end) |row| {
+        try cfg.control.check();
+        try candidate.decodeRow(dim, candidate.index(row).compressed, keys[0..dim], values[0..dim]);
+        for (keys[0..dim], values[0..dim], 0..) |k, v, d| {
+            @constCast(compact.keys)[row * dim + d] = k;
+            @constCast(compact.values)[row * dim + d] = v;
+        }
+    }
+    try solver.attendBatch(allocator, compact, sampled, probabilities, null, candidate_mass[0..samples], cfg);
+    const risk = try allocator.alloc(f64, count);
+    defer allocator.free(risk);
+    @memset(risk, 0);
+    for (0..samples) |q| {
+        try cfg.control.check();
+        const ratio = @exp(candidate_mass[q] - baseline_mass[q]);
+        if (!std.math.isFinite(ratio)) return false;
+        for (risk, 0..) |*score, i| {
+            const offset = q * compact.rows + first + i;
+            score.* = @max(score.*, @abs(probabilities[offset] * ratio - baseline[offset]));
+        }
+    }
+    const order = try allocator.alloc(usize, count);
+    defer allocator.free(order);
+    for (order, 0..) |*row, i| row.* = i;
+    const Sort = struct {
+        fn less(scores: []const f64, lhs: usize, rhs: usize) bool {
+            return if (scores[lhs] == scores[rhs]) lhs < rhs else scores[lhs] > scores[rhs];
+        }
+    };
+    std.mem.sort(usize, order, @as([]const f64, risk), Sort.less);
+    const selected = try allocator.alloc(bool, count);
+    defer allocator.free(selected);
+    @memset(selected, true);
+    // Fixed policy; never tune the retained fraction on held-out results.
+    for (order[0 .. count / 4]) |i| {
+        try cfg.control.check();
+        selected[i] = false;
+        for (0..dim) |d| {
+            const offset = (first + i) * dim + d;
+            @constCast(compact.keys)[offset] = result.keys[offset];
+            @constCast(compact.values)[offset] = result.values[offset];
+        }
+    }
+    const filtered = try candidate.selectNew(allocator, first, selected, dim, cfg.control);
+    candidate.deinit(allocator);
+    candidate = filtered;
+    var metrics: solver.Metrics = .{};
+    var validation = cfg;
+    validation.metrics = &metrics;
+    validateRounded(allocator, original, compact, queries, validation) catch |err| {
+        if (err == error.CompactionFitRejected) return false;
+        return err;
+    };
+    try cfg.control.check();
+    for (first * dim..end * dim) |i| {
+        @constCast(result.keys)[i] = @floatCast(compact.keys[i]);
+        @constCast(result.values)[i] = @floatCast(compact.values[i]);
+    }
+    result.compressed.deinit(allocator);
+    result.compressed = candidate;
+    candidate = .{};
+    if (cfg.metrics) |out| out.* = metrics;
+    return true;
+}
+
+fn rotatedEngineAllocationFailures(a: std.mem.Allocator) !void {
+    const keys: [4 * 64]f32 = @splat(0);
+    const values: [4 * 64]f32 = @splat(2);
+    const query: [64]f32 = @splat(0.5);
+    const head: checkpoint.Head = .{ .dim = 64, .positions = &.{ 0, 1, 2, 3 }, .coverage_ends = &.{ 1, 2, 3, 4 }, .keys = &keys, .values = &values, .bias = &.{ 0, 0, 0, 0 } };
+    const input: checkpoint.State = .{ .identity = identity, .logical_length = 4, .tokens = &.{ 0, 0, 0, 0 }, .logits = &.{0}, .layer_donors = &.{0}, .donors = &.{.{ .heads = &.{head} }} };
+    const batches = [_]ReferenceBatch{.{ .consumer_layer = 0, .query_head = 0, .train = &query, .heldout = &query, .train_positions = &.{4}, .heldout_positions = &.{5} }};
+    const layout: Layout = .{ .query_heads_by_layer = &.{1}, .scales_by_donor = &.{0.125}, .softcaps_by_donor = &.{0} };
+    var stats: Stats = .{};
+    const options: Options = .{ .stats = &stats, .prefix_rows = 1, .recent_rows = 1, .validation = .whole_head, .storage_precision = .f16, .rotated4_checkpoint = true };
+    var result = try prepare(a, input, &batches, layout, options);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), stats.rotated4_heads);
+    const fitted = result.state.donors[0].heads[0];
+    try std.testing.expectEqual(@as(usize, 1), fitted.compressed.rows());
+    try std.testing.expectEqual(@as(u32, 1), fitted.compressed.spans[0].first);
+    try std.testing.expectEqualSlices(f32, keys[0..64], fitted.keys[0..64]);
+    try std.testing.expectEqualSlices(f32, values[192..], fitted.values[128..]);
+    const bytes = try checkpoint.encodeWithEncoding(a, result.state, .{}, .rotated4, .{});
+    defer a.free(bytes);
+    var restored = try checkpoint.decode(a, bytes, identity, .{});
+    defer restored.deinit();
+    // With no newly eligible history the old compressed representation is cloned,
+    // not rounded again, even when quantization is disabled for the next cycle.
+    var next_options = options;
+    next_options.rotated4_checkpoint = false;
+    var again = try prepare(a, restored.state, &batches, layout, next_options);
+    defer again.deinit();
+    try std.testing.expectEqualSlices(u8, fitted.compressed.keys, again.state.donors[0].heads[0].compressed.keys);
+    try std.testing.expectEqualSlices(u8, fitted.compressed.values, again.state.donors[0].heads[0].compressed.values);
+}
+
+test "rotated4 engine validates quantization preserves protected rows and unwinds allocation failures" {
+    try rotatedEngineAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, rotatedEngineAllocationFailures, .{});
+}
+
+test "rotated4 savings cannot publish a fit rejected by the FP16 policy" {
+    const a = std.testing.allocator;
+    const keys: [4 * 64]f32 = @splat(0);
+    const values: [4 * 64]f32 = @splat(2);
+    const query: [64]f32 = @splat(0.5);
+    const head: checkpoint.Head = .{ .dim = 64, .positions = &.{ 0, 1, 2, 3 }, .coverage_ends = &.{ 1, 2, 3, 4 }, .keys = &keys, .values = &values, .bias = &.{ 0, 0, 0, 0 } };
+    const input: checkpoint.State = .{ .identity = identity, .logical_length = 4, .tokens = &.{ 0, 0, 0, 0 }, .logits = &.{0}, .layer_donors = &.{0}, .donors = &.{.{ .heads = &.{head} }} };
+    const batches = [_]ReferenceBatch{.{ .consumer_layer = 0, .query_head = 0, .train = &query, .heldout = &query, .train_positions = &.{4}, .heldout_positions = &.{5} }};
+    const layout: Layout = .{ .query_heads_by_layer = &.{1}, .scales_by_donor = &.{0.125}, .softcaps_by_donor = &.{0} };
+    var stats: Stats = .{};
+    var options: Options = .{ .stats = &stats, .prefix_rows = 1, .recent_rows = 1, .validation = .whole_head, .storage_precision = .f16 };
+    var baseline = try prepare(a, input, &batches, layout, options);
+    defer baseline.deinit();
+    const fp16_bytes = stats.candidate_global_bytes;
+    const fp16_ratio = stats.actual_global_savings_ratio;
+    options.rotated4_checkpoint = true;
+    var compressed = try prepare(a, input, &batches, layout, options);
+    defer compressed.deinit();
+    try std.testing.expect(stats.rotated4_heads > 0);
+    try std.testing.expectEqual(fp16_bytes, stats.fitted_global_bytes);
+    try std.testing.expectEqual(fp16_ratio, stats.fitted_global_savings_ratio);
+    try std.testing.expect(stats.actual_global_savings_ratio > fp16_ratio);
+    options.min_global_savings_ratio = (fp16_ratio + stats.actual_global_savings_ratio) / 2;
+    try std.testing.expectError(error.CompactionSavingsInsufficient, prepare(a, input, &batches, layout, options));
+    const backends: [2]solver.Backend = @splat(ParallelTestBackend.backend);
+    try std.testing.expectError(error.CompactionSavingsInsufficient, prepareParallel(input, &batches, layout, options, &backends));
+    options.rotated4_checkpoint = false;
+    try std.testing.expectError(error.CompactionSavingsInsufficient, prepare(a, input, &batches, layout, options));
+    // The same geometry remains eligible when the FP16 fit itself qualifies.
+    options.min_global_savings_ratio = fp16_ratio;
+    options.rotated4_checkpoint = true;
+    var accepted = try prepare(a, input, &batches, layout, options);
+    defer accepted.deinit();
+    try std.testing.expect(accepted.state.donors[0].heads[0].compressed.rows() > 0);
+    try std.testing.expectEqualSlices(f32, &keys, input.donors[0].heads[0].keys);
+    try std.testing.expectEqualSlices(f32, &values, input.donors[0].heads[0].values);
+}
+
+test "rotated4 repeated fitting preserves compressed bytes across an exact fallback gap" {
+    const a = std.testing.allocator;
+    const query: [64]f32 = @splat(0.5);
+    const keys: [4 * 64]f32 = @splat(0);
+    const values: [4 * 64]f32 = @splat(2);
+    const tokens: [16]u32 = @splat(0);
+    const original: checkpoint.Head = .{ .dim = 64, .positions = &.{ 0, 1, 2, 3 }, .coverage_ends = &.{ 1, 2, 3, 4 }, .keys = &keys, .values = &values, .bias = &.{ 0, 0, 0, 0 } };
+    const source: checkpoint.State = .{ .identity = identity, .logical_length = 4, .tokens = tokens[0..4], .logits = &.{0}, .layer_donors = &.{0}, .donors = &.{.{ .heads = &.{original} }} };
+    var train_positions = [_]u64{4};
+    var heldout_positions = [_]u64{5};
+    const batches = [_]ReferenceBatch{.{ .consumer_layer = 0, .query_head = 0, .train = &query, .heldout = &query, .train_positions = &train_positions, .heldout_positions = &heldout_positions }};
+    const layout: Layout = .{ .query_heads_by_layer = &.{1}, .scales_by_donor = &.{0.125}, .softcaps_by_donor = &.{0} };
+    var options: Options = .{ .prefix_rows = 1, .recent_rows = 1, .validation = .whole_head, .storage_precision = .f16, .rotated4_checkpoint = true };
+    var current = try prepare(a, source, &batches, layout, options);
+    defer current.deinit();
+    for ([_]bool{ false, true, true }) |quantize| {
+        const old = current.state.donors[0].heads[0];
+        const n = old.positions.len;
+        var positions: [16]u64 = undefined;
+        var ends: [16]u64 = undefined;
+        var bias: [16]f32 = @splat(0);
+        var k: [16 * 64]f32 = @splat(0);
+        var v: [16 * 64]f32 = @splat(2);
+        @memcpy(positions[0..n], old.positions);
+        @memcpy(ends[0..n], old.coverage_ends);
+        @memcpy(bias[0..n], old.bias);
+        @memcpy(k[0 .. n * 64], old.keys);
+        @memcpy(v[0 .. n * 64], old.values);
+        for (0..2) |i| {
+            positions[n + i] = current.state.logical_length + i;
+            ends[n + i] = positions[n + i] + 1;
+        }
+        var appended = old;
+        appended.positions = positions[0 .. n + 2];
+        appended.coverage_ends = ends[0 .. n + 2];
+        appended.bias = bias[0 .. n + 2];
+        appended.keys = k[0 .. (n + 2) * 64];
+        appended.values = v[0 .. (n + 2) * 64];
+        var input = current.state;
+        input.logical_length += 2;
+        input.tokens = tokens[0..@intCast(input.logical_length)];
+        input.donors = &.{.{ .heads = &.{appended} }};
+        train_positions[0] = input.logical_length;
+        heldout_positions[0] = input.logical_length + 1;
+        options.rotated4_checkpoint = quantize;
+        var next = try prepare(a, input, &batches, layout, options);
+        errdefer next.deinit();
+        // An independently prepared unquantized fit retains the older packed
+        // history, including the gap. Pricing must match it even when new spans
+        // merge with a preceding span in the quantized candidate.
+        var fp16_options = options;
+        fp16_options.rotated4_checkpoint = false;
+        var fp16_fit = try prepare(a, input, &batches, layout, fp16_options);
+        defer fp16_fit.deinit();
+        try std.testing.expectEqual(try globalStorageBytes(fp16_fit.state, .f16, true), try fittedGlobalStorageBytes(input, next.state, .f16));
+        const stored = next.state.donors[0].heads[0].compressed;
+        try std.testing.expectEqualSlices(u8, old.compressed.keys, stored.keys[0..old.compressed.keys.len]);
+        try std.testing.expectEqualSlices(u8, old.compressed.values, stored.values[0..old.compressed.values.len]);
+        if (quantize) try std.testing.expectEqual(@as(usize, 2), stored.spans.len);
+        const wire = try checkpoint.encodeWithEncoding(a, next.state, .{}, .rotated4, .{});
+        defer a.free(wire);
+        var restored = try checkpoint.decode(a, wire, identity, .{});
+        restored.deinit();
+        current.deinit();
+        current = next;
+    }
+}
+
+test "rotated4 numerical rejection preserves independently validated FP16 and prior packed ownership" {
+    const a = std.testing.allocator;
+    var keys: [128]f32 = undefined;
+    var values: [128]f32 = @splat(2);
+    for (&keys, 0..) |*k, i| k.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) / 16;
+    var stored = try (checkpoint.packed_storage.Packed{}).append(a, 0, 64, keys[0..64], values[0..64], .{});
+    defer stored.deinit(a);
+    try stored.decodeRow(64, 0, keys[0..64], values[0..64]);
+    var result: checkpoint.Head = .{ .dim = 64, .keys = &keys, .values = &values, .bias = &.{ 0, 0 }, .compressed = stored };
+    const original_keys = keys;
+    var k64: [128]f64 = undefined;
+    const v64: [128]f64 = @splat(2);
+    for (&k64, keys) |*k, value| k.* = value;
+    var candidate_keys = k64;
+    var candidate_values = v64;
+    const query: [64]f64 = @splat(1);
+    const original: solver.Head = .{ .keys = &k64, .values = &v64, .bias = &.{ 0, 0 }, .rows = 2, .dim = 64, .scale = 0.125 };
+    var compact = original;
+    compact.keys = &candidate_keys;
+    compact.values = &candidate_values;
+    const accepted = try quantizeRotatedHead(a, original, compact, &result, 1, 2, &query, &query, .{ .target_rows = 1, .max_relative_mass_error = 0, .max_relative_output_rmse = 0 });
+    try std.testing.expect(!accepted);
+    try std.testing.expectEqual(stored.keys.ptr, result.compressed.keys.ptr);
+    try std.testing.expectEqualSlices(f32, &original_keys, result.keys);
+    try std.testing.expectEqual(@as(usize, 1), result.compressed.rows());
+}
+
+fn selectiveRotatedAllocationTest(a: std.mem.Allocator) !void {
+    const n = 10;
+    const d = 64;
+    var keys: [n * d]f32 = undefined;
+    var values: [n * d]f32 = undefined;
+    var original_keys: [n * d]f64 = undefined;
+    var original_values: [n * d]f64 = undefined;
+    const bias: [n]f64 = @splat(0);
+    const bias32: [n]f32 = @splat(0);
+    for (&keys, &values, &original_keys, &original_values, 0..) |*k, *v, *ok, *ov, i| {
+        k.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 17) % 83)) - 41)) / 16;
+        v.* = @as(f32, @floatFromInt(i % 13)) / 8;
+        ok.* = k.*;
+        ov.* = v.*;
+    }
+    const saved_keys = keys;
+    const saved_values = values;
+    var compact_keys = original_keys;
+    var compact_values = original_values;
+    const train: [d]f64 = @splat(0.5);
+    const heldout: [d]f64 = @splat(-0.25);
+    const original: solver.Head = .{ .keys = &original_keys, .values = &original_values, .bias = &bias, .rows = n, .dim = d, .scale = 0.125 };
+    var compact = original;
+    compact.keys = &compact_keys;
+    compact.values = &compact_values;
+    // Independent scalar oracle ranks the training-query partition contribution.
+    var all = try (checkpoint.packed_storage.Packed{}).append(a, 1, d, keys[d .. 9 * d], values[d .. 9 * d], .{});
+    defer all.deinit(a);
+    var k: [d]f32 = undefined;
+    var v: [d]f32 = undefined;
+    for (1..9) |row| {
+        try all.decodeRow(d, row - 1, &k, &v);
+        for (0..d) |j| {
+            compact_keys[row * d + j] = k[j];
+            compact_values[row * d + j] = v[j];
+        }
+    }
+    var po: [n]f64 = undefined;
+    var pc: [n]f64 = undefined;
+    const mo = try solver.attend(original, &train, &po, null);
+    const mc = try solver.attend(compact, &train, &pc, null);
+    var risks: [n]f64 = @splat(-1);
+    for (1..9) |row| risks[row] = @abs(pc[row] * @exp(mc - mo) - po[row]);
+    var exact: [n]bool = @splat(false);
+    for (0..2) |_| {
+        var best: usize = 1;
+        for (2..9) |row| if (risks[row] > risks[best]) {
+            best = row;
+        };
+        exact[best] = true;
+        risks[best] = -1;
+    }
+    compact_keys = original_keys;
+    compact_values = original_values;
+    var result: checkpoint.Head = .{ .dim = d, .keys = &keys, .values = &values, .bias = &bias32 };
+    defer result.compressed.deinit(a);
+    try std.testing.expect(try quantizeRotatedHead(a, original, compact, &result, 1, 9, &train, &heldout, .{ .target_rows = 1, .max_relative_mass_error = 1e6, .max_relative_output_rmse = 1e6 }));
+    try result.compressed.validate(n, d);
+    try std.testing.expectEqual(@as(usize, 6), result.compressed.rows());
+    for (0..n) |row| {
+        if (row == 0 or row == 9 or exact[row]) {
+            try std.testing.expect(result.compressed.index(row) == .exact);
+            try std.testing.expectEqualSlices(f32, saved_keys[row * d ..][0..d], result.keys[row * d ..][0..d]);
+            try std.testing.expectEqualSlices(f32, saved_values[row * d ..][0..d], result.values[row * d ..][0..d]);
+        } else try std.testing.expect(result.compressed.index(row) == .compressed);
+    }
+}
+
+test "rotated4 selective retention follows training risk preserves exact rows and unwinds allocations" {
+    try selectiveRotatedAllocationTest(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, selectiveRotatedAllocationTest, .{});
 }

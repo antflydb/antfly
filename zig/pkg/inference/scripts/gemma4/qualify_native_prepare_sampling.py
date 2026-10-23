@@ -1,4 +1,4 @@
-"""Sample real standalone checkpoint preparation at 8K or 32K.
+"""Sample real checkpoint preparation at 8K or 32K on the selected server host.
 
 Full request wall time includes ingestion, model setup and client file validation.
 The separate query/snapshot/fitting/export-write intervals exclude those costs;
@@ -34,6 +34,9 @@ def validate_export(actual, expected, logical_tokens):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--server', type=Path, required=True)
+    parser.add_argument('--server-kind', choices=['inference', 'standalone'], default='standalone')
+    parser.add_argument('--encoding', choices=['f32', 'f16', 'fp8', 'rotated4'], default='f16')
+    parser.add_argument('--experimental-rotated4', action='store_true')
     parser.add_argument('--models-dir', type=Path, default=Path('.models'))
     parser.add_argument('--model', default='google/gemma-4-E4B-it-qat-q4_0-gguf')
     parser.add_argument('--reference', type=Path, required=True)
@@ -50,14 +53,13 @@ def main():
         parser.error('invalid sampling counts or timeout')
     if not args.smoke and (args.warmups < 5 or args.samples < 100):
         parser.error('release sampling requires five warmups and 100 measured requests')
-    args.server_kind = 'standalone'
     args.expected_outcome = 'compacted'
     args.minimum_savings = 1.5 if args.size == '8k' else 2
     args.checkpoint = args.output.with_suffix('.working.kv')
     if args.output.exists() or args.checkpoint.exists(): raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     evidence = {'passed': False, 'production_ready': False, 'sampling_qualified': False,
-                'scope': __doc__, 'size': args.size, 'smoke': args.smoke,
+                'scope': __doc__, 'size': args.size, 'smoke': args.smoke, 'encoding': args.encoding, 'server_kind': args.server_kind,
                 'warmups_requested': args.warmups, 'samples_requested': args.samples,
                 'source': git_provenance(ROOT), 'binary_sha256': sha256_file(args.server),
                 'observations': [], 'retries': 0,
@@ -72,6 +74,13 @@ def main():
         if reference['source'] != evidence['source'] or reference['binary_sha256'] != evidence['binary_sha256']:
             raise AssertionError('reference must qualify this exact source and binary')
         expected = next(row['result'] for row in reference['exporter']['requests'] if row['kind'] == 'prepare')
+        if expected['metadata'].get('encoding', 'f32') != args.encoding:
+            raise AssertionError('reference encoding differs from sampling campaign')
+        if args.encoding == 'rotated4':
+            from qualify_attention_match_queries import validate_quantization_evidence
+            validate_quantization_evidence([expected['metadata']], 'rotated4')
+        if args.encoding == 'fp8' and expected['metadata'].get('fp8_heads', 0) < 1:
+            raise AssertionError('FP8 sampling requires actually quantized state')
         pinned = {args.server: evidence['binary_sha256'], args.reference: sha256_file(args.reference),
                   args.reference_checkpoint: fixture['checkpoint_sha256_to_reverify'],
                   Path(__file__): sha256_file(Path(__file__))}

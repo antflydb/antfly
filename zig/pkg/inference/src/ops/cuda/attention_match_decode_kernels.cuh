@@ -10,6 +10,8 @@
 
 // Explicit ABI shared with attention_match_decode.zig. Rows can wrap in a
 // local-window ring; distinct heads need not have the same physical length.
+struct AntflyMatchSpan { uint32_t first, rows, offset; };
+static_assert(sizeof(AntflyMatchSpan) == 12, "span ABI");
 struct AntflyMatchHead {
     const void* keys;
     const void* values;
@@ -19,17 +21,72 @@ struct AntflyMatchHead {
     uint64_t rows;
     uint64_t capacity;
     uint64_t start;
+    const uint8_t* encoded_keys;
+    const uint8_t* encoded_values;
+    const AntflyMatchSpan* spans;
+    uint64_t compressed_rows;
+    uint64_t span_count;
 };
-static_assert(sizeof(AntflyMatchHead) == 64, "head ABI");
+static_assert(sizeof(AntflyMatchHead) == 104, "head ABI");
+
+// Nonnegative => packed row; negative => -(exact row + 1).
+__device__ int64_t am_index(const AntflyMatchHead& head, uint64_t row) {
+    uint64_t low = 0, high = head.span_count;
+    while (low < high) {
+        const uint64_t mid = low + (high - low) / 2;
+        if (head.spans[mid].first <= row) low = mid + 1; else high = mid;
+    }
+    if (!low) return -int64_t(row) - 1;
+    const AntflyMatchSpan span = head.spans[low - 1];
+    if (row - span.first < span.rows) return int64_t(span.offset) + row - span.first;
+    return -int64_t(row - (uint64_t(span.offset) + span.rows)) - 1;
+}
+__device__ __constant__ float am_centroids[16] = {
+    -2.73258957099535f, -2.06901722653160f, -1.61804638602210f, -1.25623119734739f,
+    -0.94234045648714f, -0.65675911853260f, -0.38804829949038f, -0.12839502985118f,
+    0.12839502985118f, 0.38804829949038f, 0.65675911853260f, 0.94234045648714f,
+    1.25623119734739f, 1.61804638602210f, 2.06901722653160f, 2.73258957099535f
+};
+__device__ float am_sign(int round, int d) {
+    uint64_t x = (round ? 0x24d8a6511b73c409ULL : 0x8f3f73b5cf1c9adeULL) + uint64_t(d) * 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return ((x ^ (x >> 31)) & 1) ? -1.f : 1.f;
+}
+extern "C" __global__ void attention_match_rotate_queries(const float* input, float* output, int dim) {
+    __shared__ float values[512];
+    const int tid = threadIdx.x;
+    const size_t base = size_t(blockIdx.x) * dim;
+    for (int d = tid; d < dim; d += 256) values[d] = input[base + d];
+    __syncthreads();
+    const float norm = __fdiv_rn(1.f, __fsqrt_rn(float(dim)));
+    for (int round = 0; round < 2; ++round) {
+        for (int d = tid; d < dim; d += 256) values[d] *= am_sign(round, d);
+        __syncthreads();
+        for (int width = 1; width < dim; width *= 2) {
+            if (tid < dim / 2) {
+                const int a = (tid / width) * (2 * width) + tid % width;
+                const float left = values[a], right = values[a + width];
+                values[a] = left + right;
+                values[a + width] = left - right;
+            }
+            __syncthreads();
+        }
+        for (int d = tid; d < dim; d += 256) values[d] *= norm;
+        __syncthreads();
+    }
+    for (int d = tid; d < dim; d += 256) output[base + d] = values[d];
+}
 
 template<class T> __device__ float am_load(const T* p) { return float(*p); }
 template<> __device__ float am_load(const __half* p) { return __half2float(*p); }
 
 template<class T>
-__device__ void am_decode_partial(const float* queries, const AntflyMatchHead* heads,
+__device__ void am_decode_partial(const float* queries, const float* rotated_queries, const AntflyMatchHead* heads,
     float* partials, int query_heads, int kv_heads, int dim, int splits,
     uint64_t first_query_position, float scale, float softcap, uint64_t window) {
     __shared__ float scores[256];
+    __shared__ int64_t row_indices[256];
     __shared__ float scratch[256];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int query = blockIdx.y;
@@ -48,11 +105,26 @@ __device__ void am_decode_partial(const float* queries, const AntflyMatchHead* h
             visible = end && end - 1 <= qp && pos <= qp && (!window || pos >= first);
         }
         float dot = 0;
-        if (visible) for (int d = lane; d < dim; d += 32)
-            dot = fmaf(q[d], am_load(keys + row * dim + d), dot);
+        int64_t index = -1;
+        if (visible) {
+            index = am_index(head, row);
+            if (index >= 0) {
+                const uint8_t* k = head.encoded_keys + size_t(index) * (4 + dim / 2);
+                const float* qr = rotated_queries + size_t(query) * dim;
+                for (int d = lane; d < dim; d += 32) {
+                    const int code = (k[4 + d / 2] >> ((d & 1) * 4)) & 15;
+                    dot = fmaf(qr[d], am_centroids[code], dot);
+                }
+                dot *= *reinterpret_cast<const float*>(k);
+            } else {
+                const size_t exact = size_t(-index - 1);
+                for (int d = lane; d < dim; d += 32) dot = fmaf(q[d], am_load(keys + exact * dim + d), dot);
+            }
+        }
         for (int offset = 16; offset; offset >>= 1)
             dot += __shfl_down_sync(0xffffffff, dot, offset);
         if (lane == 0) {
+            row_indices[r] = index;
             dot *= scale;
             if (softcap > 0) dot = softcap * tanhf(dot / softcap);
             scores[r] = visible ? dot + head.bias[row] : -CUDART_INF_F;
@@ -82,8 +154,13 @@ __device__ void am_decode_partial(const float* queries, const AntflyMatchHead* h
         for (int r = 0; r < 256; ++r) {
             const uint64_t logical_row = uint64_t(blockIdx.x) * 256 + r;
             if (logical_row < head.rows && scores[r] != 0) {
-                const uint64_t row = (head.start + logical_row) % head.capacity;
-                sum = fmaf(scores[r], am_load(values + row * dim + d), sum);
+                const int64_t index = row_indices[r];
+                float value;
+                if (index >= 0) {
+                    const uint8_t* v = head.encoded_values + size_t(index) * (dim + 4);
+                    value = float(reinterpret_cast<const int8_t*>(v + 4)[d]) * *reinterpret_cast<const float*>(v);
+                } else value = am_load(values + size_t(-index - 1) * dim + d);
+                sum = fmaf(scores[r], value, sum);
             }
         }
         out[d] = sum;
@@ -94,12 +171,22 @@ __device__ void am_decode_partial(const float* queries, const AntflyMatchHead* h
 extern "C" __global__ void NAME(const float* q, const AntflyMatchHead* heads, float* partials, \
     int query_heads, int kv_heads, int dim, int splits, uint64_t first_query_position, \
     float scale, float softcap, uint64_t window) { \
-    am_decode_partial<TYPE>(q, heads, partials, query_heads, kv_heads, dim, splits, \
+    am_decode_partial<TYPE>(q, nullptr, heads, partials, query_heads, kv_heads, dim, splits, \
         first_query_position, scale, softcap, window); \
 }
 AM_PARTIAL(attention_match_partial_f16, __half)
 AM_PARTIAL(attention_match_partial_f32, float)
 #undef AM_PARTIAL
+#define AM_ROTATED(NAME, TYPE) \
+extern "C" __global__ void NAME(const float* q, const float* qr, const AntflyMatchHead* heads, float* partials, \
+    int query_heads, int kv_heads, int dim, int splits, uint64_t first_query_position, \
+    float scale, float softcap, uint64_t window) { \
+    am_decode_partial<TYPE>(q, qr, heads, partials, query_heads, kv_heads, dim, splits, \
+        first_query_position, scale, softcap, window); \
+}
+AM_ROTATED(attention_match_rotated_f16, __half)
+AM_ROTATED(attention_match_rotated_f32, float)
+#undef AM_ROTATED
 
 extern "C" __global__ void attention_match_merge(const float* partials, float* output,
     float* log_mass, int dim, int splits) {
@@ -151,8 +238,9 @@ __device__ void am_append(const float* keys, const float* values, const AntflyMa
     // The host reserves an unused tail before dispatch. Failed validation or
     // cancellation can discard the tail without altering any published row.
     const size_t physical = (head.start + head.rows + r) % head.capacity;
-    const_cast<T*>(static_cast<const T*>(head.keys))[physical * dim + d] = T(k);
-    const_cast<T*>(static_cast<const T*>(head.values))[physical * dim + d] = T(v);
+    const size_t exact = physical - head.compressed_rows;
+    const_cast<T*>(static_cast<const T*>(head.keys))[exact * dim + d] = T(k);
+    const_cast<T*>(static_cast<const T*>(head.values))[exact * dim + d] = T(v);
     if (d == 0) {
         const_cast<float*>(head.bias)[physical] = 0;
         const_cast<uint64_t*>(head.positions)[physical] = first_position + r;

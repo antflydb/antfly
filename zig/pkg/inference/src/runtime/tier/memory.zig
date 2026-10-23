@@ -4226,6 +4226,40 @@ test "cuda Gemma4 prefill rejects unsafe 2051 row physical envelope" {
     try std.testing.expectEqual(admission.max_scratch_bytes, budget.scratchTotalBytes());
 }
 
+test "cuda E4B explicit 4096 prefill backs off to the admitted scratch budget" {
+    const cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .intermediate_size = 10240,
+        .vocab_size = 262144,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .ple_hidden_size = 256,
+        .position_encoding = .rope,
+    };
+    const components = [_]GptGenerationBudgetComponent{
+        .{ .backend = .cuda, .kv_dtype = .f16, .config = cfg },
+    };
+    for ([_]usize{ 8192, 32768 }) |prompt_tokens| {
+        var roomy = RunBudget.init(.{ .scratch_limit_bytes = 8 * 1024 * 1024 * 1024 });
+        const admitted = try reserveGptGenerationPrefill(&roomy, &components, prompt_tokens, 256, 4096);
+        try std.testing.expectEqual(@as(usize, 4096), admitted.max_chunk_rows);
+        try std.testing.expectEqual(admitted.max_scratch_bytes, roomy.scratchTotalBytes());
+
+        var bounded = RunBudget.init(.{ .scratch_limit_bytes = 6 * 1024 * 1024 * 1024 });
+        const reduced = try reserveGptGenerationPrefill(&bounded, &components, prompt_tokens, 256, 4096);
+        try std.testing.expectEqual(@as(usize, 2048), reduced.max_chunk_rows);
+        try std.testing.expect(reduced.max_scratch_bytes <= 6 * 1024 * 1024 * 1024);
+        try std.testing.expectEqual(reduced.max_scratch_bytes, bounded.scratchTotalBytes());
+        try std.testing.expectEqual(roomy.kvTotalBytes(), bounded.kvTotalBytes());
+    }
+}
+
 test "cuda Gemma4 measured 512 ceiling returns plan scratch metadata" {
     const cfg = gpt_mod.Config{
         .family = .gemma,

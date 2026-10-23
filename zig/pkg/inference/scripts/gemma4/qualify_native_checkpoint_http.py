@@ -35,7 +35,11 @@ def server(args, label, evidence):
     overrides = {'ANTFLY_INFERENCE_PREFERRED_BACKEND': 'cuda', 'ANTFLY_INFERENCE_REQUIRED_BACKEND': 'cuda',
                  'ANTFLY_SERVER_DECODE_GRAPH_REPLAY': 'off', 'ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS': '0',
                  'ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING': '1'}
+    overrides['ANTFLY_INFERENCE_EXPERIMENTAL_ROTATED4_CHECKPOINTS'] = str(int(getattr(args, 'experimental_rotated4', False)))
     environment.update(overrides)
+    if getattr(args, 'generation_timing', False):
+        overrides['TERMITE_SERVER_GENERATE_TIMING'] = '1'
+        environment['TERMITE_SERVER_GENERATE_TIMING'] = '1'
     command = ['bash', str(SCRIPTS / 'with_gemma4_qat_cuda_tuning.sh'), str(args.server.resolve()),
                'run', '--host', '127.0.0.1', '--port', str(args.port), '--models-dir', str(args.models_dir.resolve()),
                '--max-concurrent-requests', str(capacity), '--host-budget-mb', '8192', '--backend-budget-mb', '18432',
@@ -91,17 +95,25 @@ def prepare(args, body, record):
     connection = http.client.HTTPConnection('127.0.0.1', args.port, timeout=args.timeout)
     try:
         start = time.monotonic()
-        connection.request('POST', '/ai/v1/chat/context/checkpoint', json.dumps(body).encode(), {'Content-Type': 'application/json'})
+        connection.request('POST', '/ai/v1/chat/context/checkpoint', json.dumps(body).encode(), {'Content-Type': 'application/json', 'X-Antfly-KV-Encoding': getattr(args, 'encoding', 'f16')})
         response = connection.getresponse()
         if response.status != 200: raise RuntimeError(f'prepare HTTP {response.status}: {response.read(65536)!r}')
         headers = response_headers(response, record)
         if headers.get('content-type', '').split(';')[0] != CONTENT_TYPE: raise AssertionError('wrong export content type')
-        result = receive_checkpoint(response, args.checkpoint)
+        result = receive_checkpoint(response, args.checkpoint, allow_rotated4=getattr(args, 'encoding', 'f16') == 'rotated4')
         metadata = result['metadata']
+        encoding = getattr(args, 'encoding', 'f16')
+        if metadata.get('encoding') != encoding or metadata.get('wire_version') != {'f32': 2, 'f16': 3, 'fp8': 3, 'rotated4': 4}[encoding]:
+            raise AssertionError('checkpoint did not use the requested encoding')
         if metadata['model'] != args.model or metadata['outcome'] != args.expected_outcome: raise AssertionError(metadata)
         if metadata['outcome'] == 'compacted':
             savings = metadata['global_savings_ratio']
             if not math.isfinite(savings) or savings < args.minimum_savings: raise AssertionError(metadata)
+        if encoding == 'rotated4':
+            from qualify_attention_match_queries import validate_quantization_evidence
+            validate_quantization_evidence([metadata], encoding, require_actual=args.expected_outcome == 'compacted')
+        if metadata.get('fp8_heads', 0) < getattr(args, 'minimum_fp8_heads', 0):
+            raise AssertionError('FP8 campaign did not exercise enough quantized heads')
         record['requests'].append({'kind': 'prepare', 'seconds': time.monotonic() - start, 'headers': headers, 'result': result})
         return result
     finally: connection.close()
@@ -154,7 +166,7 @@ def python_sdk_roundtrip(args, body, record, prepared):
         validate_fixture_choice(result['choices'][0], args.fixture)
         if result['usage']['cached_prompt_tokens'] != prepared['metadata']['logical_tokens']:
             raise AssertionError('SDK resume did not reuse saved prefix')
-        exported = client.prepare_native_kv_checkpoint(request, temporary)
+        exported = client.prepare_native_kv_checkpoint(request, temporary, encoding=getattr(args, 'encoding', 'f16'))
         if exported.sha256 != prepared['file_sha256']:
             raise AssertionError('SDK export differs from identical raw HTTP preparation')
         record['requests'].append({'kind': 'python_sdk_roundtrip', 'seconds': time.monotonic()-start,
@@ -182,6 +194,8 @@ def main():
     parser.add_argument('--model', default='google/gemma-4-E4B-it-qat-q4_0-gguf')
     parser.add_argument('--port', type=int, default=8500)
     parser.add_argument('--padding-lines', type=int, default=742)
+    parser.add_argument('--encoding', choices=['f32', 'f16', 'fp8', 'rotated4'], default='f16')
+    parser.add_argument('--experimental-rotated4', action='store_true')
     parser.add_argument('--fixture', choices=['fact', 'tool_call'], default='fact')
     parser.add_argument('--expected-outcome', choices=['compacted', 'unchanged_insufficient_savings'], default='compacted')
     parser.add_argument('--timeout', type=float, default=1800)
@@ -191,13 +205,14 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--checkpoint', type=Path, required=True)
     args = parser.parse_args()
+    args.minimum_fp8_heads = 1 if args.encoding == 'fp8' and args.expected_outcome == 'compacted' else 0
     if not math.isfinite(args.minimum_savings) or not 1.5 <= args.minimum_savings <= 4:
         parser.error('--minimum-savings must be finite and between 1.5 and 4')
     if args.append_mode == 'limit_rejection' and args.fixture != 'fact':
         parser.error('--append-mode limit_rejection requires --fixture fact')
     args.output.parent.mkdir(parents=True, exist_ok=True); args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
     evidence = {'passed': False, 'scope': 'public native checkpoint roundtrip and restart; not full production qualification',
-                'server_kind': args.server_kind, 'append_mode': args.append_mode, 'minimum_savings': args.minimum_savings,
+                'server_kind': args.server_kind, 'encoding': args.encoding, 'append_mode': args.append_mode, 'minimum_savings': args.minimum_savings,
                 'source': git_provenance(REPO), 'binary_sha256': sha256_file(args.server),
                 'runner_sha256': sha256_file(Path(__file__)), 'transport_sha256': sha256_file(Path(__file__).with_name('native_checkpoint_transport.py'))}
     try:

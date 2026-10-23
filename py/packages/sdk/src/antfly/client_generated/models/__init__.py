@@ -1197,6 +1197,7 @@ from .phrase_query import PhraseQuery
 from .predicate_decision_question import PredicateDecisionQuestion
 from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
+from .prepare_native_kv_checkpoint_x_antfly_kv_encoding import PrepareNativeKvCheckpointXAntflyKVEncoding
 from .prior_artifact_context import PriorArtifactContext
 from .prune_stats import PruneStats
 from .pruner import Pruner
@@ -2844,6 +2845,7 @@ __all__ = (
     "PredicateDecisionQuestion",
     "PredicateDecisionQuestionType",
     "PrefixQuery",
+    "PrepareNativeKvCheckpointXAntflyKVEncoding",
     "PriorArtifactContext",
     "Pruner",
     "PruneStats",

@@ -9,14 +9,19 @@ from ...client import AuthenticatedClient, Client
 from ...models.inference_error import InferenceError
 from ...models.inference_generate_request import InferenceGenerateRequest
 from ...models.inference_transient_capacity_error import InferenceTransientCapacityError
-from ...types import File, Response
+from ...models.prepare_native_kv_checkpoint_x_antfly_kv_encoding import PrepareNativeKvCheckpointXAntflyKVEncoding
+from ...types import File, Response, Unset
 
 
 def _get_kwargs(
     *,
     body: InferenceGenerateRequest,
+    x_antfly_kv_encoding: PrepareNativeKvCheckpointXAntflyKVEncoding
+    | Unset = PrepareNativeKvCheckpointXAntflyKVEncoding.F16,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+    if not isinstance(x_antfly_kv_encoding, Unset):
+        headers["X-Antfly-KV-Encoding"] = str(x_antfly_kv_encoding)
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -85,6 +90,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceGenerateRequest,
+    x_antfly_kv_encoding: PrepareNativeKvCheckpointXAntflyKVEncoding
+    | Unset = PrepareNativeKvCheckpointXAntflyKVEncoding.F16,
 ) -> Response[File | InferenceError | InferenceTransientCapacityError]:
     """Prepare a portable native KV checkpoint
 
@@ -99,7 +106,8 @@ def sync_detailed(
 
     The response is an AFATT001 envelope: JSON metadata followed by exactly
     one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
-    a V2 binary file containing original token positions, fitted global KV,
+    a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions,
+    fitted global KV,
     exact local KV, saved next-token logits, loaded-model fingerprints and
     an integrity digest. It is usable only with the same model revision,
     tokenizer, chat template and KV layout. Metadata reports the actual
@@ -113,6 +121,8 @@ def sync_detailed(
     concurrent native checkpoint work and returns a retryable response when busy.
 
     Args:
+        x_antfly_kv_encoding (PrepareNativeKvCheckpointXAntflyKVEncoding | Unset):  Default:
+            PrepareNativeKvCheckpointXAntflyKVEncoding.F16.
         body (InferenceGenerateRequest):
 
     Raises:
@@ -125,6 +135,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         body=body,
+        x_antfly_kv_encoding=x_antfly_kv_encoding,
     )
 
     response = client.get_httpx_client().request(
@@ -138,6 +149,8 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceGenerateRequest,
+    x_antfly_kv_encoding: PrepareNativeKvCheckpointXAntflyKVEncoding
+    | Unset = PrepareNativeKvCheckpointXAntflyKVEncoding.F16,
 ) -> File | InferenceError | InferenceTransientCapacityError | None:
     """Prepare a portable native KV checkpoint
 
@@ -152,7 +165,8 @@ def sync(
 
     The response is an AFATT001 envelope: JSON metadata followed by exactly
     one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
-    a V2 binary file containing original token positions, fitted global KV,
+    a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions,
+    fitted global KV,
     exact local KV, saved next-token logits, loaded-model fingerprints and
     an integrity digest. It is usable only with the same model revision,
     tokenizer, chat template and KV layout. Metadata reports the actual
@@ -166,6 +180,8 @@ def sync(
     concurrent native checkpoint work and returns a retryable response when busy.
 
     Args:
+        x_antfly_kv_encoding (PrepareNativeKvCheckpointXAntflyKVEncoding | Unset):  Default:
+            PrepareNativeKvCheckpointXAntflyKVEncoding.F16.
         body (InferenceGenerateRequest):
 
     Raises:
@@ -179,6 +195,7 @@ def sync(
     return sync_detailed(
         client=client,
         body=body,
+        x_antfly_kv_encoding=x_antfly_kv_encoding,
     ).parsed
 
 
@@ -186,6 +203,8 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceGenerateRequest,
+    x_antfly_kv_encoding: PrepareNativeKvCheckpointXAntflyKVEncoding
+    | Unset = PrepareNativeKvCheckpointXAntflyKVEncoding.F16,
 ) -> Response[File | InferenceError | InferenceTransientCapacityError]:
     """Prepare a portable native KV checkpoint
 
@@ -200,7 +219,8 @@ async def asyncio_detailed(
 
     The response is an AFATT001 envelope: JSON metadata followed by exactly
     one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
-    a V2 binary file containing original token positions, fitted global KV,
+    a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions,
+    fitted global KV,
     exact local KV, saved next-token logits, loaded-model fingerprints and
     an integrity digest. It is usable only with the same model revision,
     tokenizer, chat template and KV layout. Metadata reports the actual
@@ -214,6 +234,8 @@ async def asyncio_detailed(
     concurrent native checkpoint work and returns a retryable response when busy.
 
     Args:
+        x_antfly_kv_encoding (PrepareNativeKvCheckpointXAntflyKVEncoding | Unset):  Default:
+            PrepareNativeKvCheckpointXAntflyKVEncoding.F16.
         body (InferenceGenerateRequest):
 
     Raises:
@@ -226,6 +248,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         body=body,
+        x_antfly_kv_encoding=x_antfly_kv_encoding,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -237,6 +260,8 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceGenerateRequest,
+    x_antfly_kv_encoding: PrepareNativeKvCheckpointXAntflyKVEncoding
+    | Unset = PrepareNativeKvCheckpointXAntflyKVEncoding.F16,
 ) -> File | InferenceError | InferenceTransientCapacityError | None:
     """Prepare a portable native KV checkpoint
 
@@ -251,7 +276,8 @@ async def asyncio(
 
     The response is an AFATT001 envelope: JSON metadata followed by exactly
     one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
-    a V2 binary file containing original token positions, fitted global KV,
+    a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions,
+    fitted global KV,
     exact local KV, saved next-token logits, loaded-model fingerprints and
     an integrity digest. It is usable only with the same model revision,
     tokenizer, chat template and KV layout. Metadata reports the actual
@@ -265,6 +291,8 @@ async def asyncio(
     concurrent native checkpoint work and returns a retryable response when busy.
 
     Args:
+        x_antfly_kv_encoding (PrepareNativeKvCheckpointXAntflyKVEncoding | Unset):  Default:
+            PrepareNativeKvCheckpointXAntflyKVEncoding.F16.
         body (InferenceGenerateRequest):
 
     Raises:
@@ -279,5 +307,6 @@ async def asyncio(
         await asyncio_detailed(
             client=client,
             body=body,
+            x_antfly_kv_encoding=x_antfly_kv_encoding,
         )
     ).parsed

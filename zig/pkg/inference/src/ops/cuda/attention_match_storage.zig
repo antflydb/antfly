@@ -9,6 +9,8 @@ const half_exact = @import("half_exact.zig");
 const context_mod = @import("context.zig");
 const buffer_mod = @import("buffer.zig");
 const checkpoint = @import("../../runtime/kv/attention_match_checkpoint.zig");
+const packed_storage = checkpoint.packed_storage;
+const rotated = @import("../../runtime/kv/turboquant_rotated.zig");
 const Control = @import("../../runtime/kv/attention_match.zig").Control;
 
 pub const Precision = enum { f16, f32 };
@@ -24,6 +26,11 @@ pub const Head = struct {
     compacted_until: u64 = 0,
     /// Earliest position recoverable without restoring evicted local rows.
     rollback_floor: u64 = 0,
+    compressed_rows: usize = 0,
+    span_count: usize = 0,
+    encoded_keys: buffer_mod.DeviceBuffer = .{},
+    encoded_values: buffer_mod.DeviceBuffer = .{},
+    spans: buffer_mod.DeviceBuffer = .{},
     keys: buffer_mod.DeviceBuffer = .{},
     values: buffer_mod.DeviceBuffer = .{},
     bias: buffer_mod.DeviceBuffer = .{},
@@ -50,9 +57,10 @@ pub const DeviceState = struct {
         var bytes: usize = 0;
         for (self.heads) |head| {
             if (head.logical_length != self.logical_length or head.rows == 0 or head.rows > head.capacity or head.start >= head.capacity or head.capacity > 262144 or head.dim == 0 or head.dim > 1024) return error.InvalidAttentionShape;
+            try validateCompressed(head);
             const width = try mul(head.dim, if (self.precision == .f16) 2 else 4);
-            if (head.keys.len < try mul(head.capacity, width) or head.values.len < try mul(head.capacity, width) or head.bias.len < try mul(head.capacity, 4) or head.positions.len < try mul(head.capacity, 8) or head.coverage_ends.len < try mul(head.capacity, 8)) return error.InvalidAttentionShape;
-            bytes = try add(bytes, try mul(head.rows, try add(try mul(width, 2), 20)));
+            if (head.keys.len < try mul(head.capacity - head.compressed_rows, width) or head.values.len < try mul(head.capacity - head.compressed_rows, width) or head.bias.len < try mul(head.capacity, 4) or head.positions.len < try mul(head.capacity, 8) or head.coverage_ends.len < try mul(head.capacity, 8)) return error.InvalidAttentionShape;
+            bytes = try add(bytes, try deviceBytes(head, head.rows, self.precision));
         }
         if (try add(self.context.device_allocations.snapshot().live, bytes) > max_bytes) return error.CudaMemoryLimitExceeded;
         var result: DeviceState = .{ .allocator = allocator, .context = self.context, .precision = self.precision, .logical_length = self.logical_length, .initial_logical_length = self.initial_logical_length };
@@ -61,15 +69,16 @@ pub const DeviceState = struct {
         @memset(result.heads, .{});
         for (self.heads, result.heads) |source, *dest| {
             try control.check();
-            dest.* = .{ .layer = source.layer, .head = source.head, .window = source.window, .dim = source.dim, .rows = source.rows, .capacity = source.rows, .logical_length = source.logical_length, .compacted_until = source.compacted_until, .rollback_floor = source.rollback_floor };
+            dest.* = .{ .layer = source.layer, .head = source.head, .window = source.window, .dim = source.dim, .rows = source.rows, .capacity = source.rows, .logical_length = source.logical_length, .compacted_until = source.compacted_until, .rollback_floor = source.rollback_floor, .compressed_rows = source.compressed_rows, .span_count = source.span_count };
             const width = try mul(source.dim, if (self.precision == .f16) 2 else 4);
-            dest.keys = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(source.rows, width));
-            dest.values = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(source.rows, width));
+            dest.keys = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(source.rows - source.compressed_rows, width));
+            dest.values = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(source.rows - source.compressed_rows, width));
             dest.bias = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(source.rows, 4));
             dest.positions = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(source.rows, 8));
             dest.coverage_ends = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(source.rows, 8));
-            try copyRing(self.context, dest.keys, source.keys, source, width);
-            try copyRing(self.context, dest.values, source.values, source, width);
+            try cloneCompressed(self.context, dest, source);
+            try copyRing(self.context, dest.keys, source.keys, exactHead(source), width);
+            try copyRing(self.context, dest.values, source.values, exactHead(source), width);
             try copyRing(self.context, dest.bias, source.bias, source, 4);
             try copyRing(self.context, dest.positions, source.positions, source, 8);
             try copyRing(self.context, dest.coverage_ends, source.coverage_ends, source, 8);
@@ -100,9 +109,14 @@ pub const DeviceState = struct {
         if (head.rows == 0 or head.rows > head.capacity or head.start >= head.capacity or capacity > 262144)
             return error.InvalidAttentionShape;
         const row_bytes = try mul(head.dim, if (self.precision == .f16) 2 else 4);
-        const bytes = try mul(capacity, try add(try mul(row_bytes, 2), 20));
+        try validateCompressed(head.*);
+        // Compressed buffers remain immutable and transfer only after the fence.
+        const bytes = try add(try mul(capacity - head.compressed_rows, 2 * row_bytes), try mul(capacity, 20));
         if (try add(self.context.device_allocations.snapshot().live, bytes) > max_bytes) return error.CudaMemoryLimitExceeded;
         var replacement = head.*;
+        replacement.encoded_keys = .{};
+        replacement.encoded_values = .{};
+        replacement.spans = .{};
         replacement.keys = .{};
         replacement.values = .{};
         replacement.bias = .{};
@@ -114,19 +128,25 @@ pub const DeviceState = struct {
             self.context.synchronize() catch {};
             freeHead(self.context, &replacement);
         }
-        replacement.keys = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(capacity, row_bytes));
-        replacement.values = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(capacity, row_bytes));
+        replacement.keys = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(capacity - head.compressed_rows, row_bytes));
+        replacement.values = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(capacity - head.compressed_rows, row_bytes));
         replacement.bias = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(capacity, 4));
         replacement.positions = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(capacity, 8));
         replacement.coverage_ends = try buffer_mod.DeviceBuffer.alloc(self.context, try mul(capacity, 8));
-        try copyRing(self.context, replacement.keys, head.keys, head.*, row_bytes);
-        try copyRing(self.context, replacement.values, head.values, head.*, row_bytes);
+        try copyRing(self.context, replacement.keys, head.keys, exactHead(head.*), row_bytes);
+        try copyRing(self.context, replacement.values, head.values, exactHead(head.*), row_bytes);
         try copyRing(self.context, replacement.bias, head.bias, head.*, 4);
         try copyRing(self.context, replacement.positions, head.positions, head.*, 8);
         try copyRing(self.context, replacement.coverage_ends, head.coverage_ends, head.*, 8);
         try self.context.synchronize();
         try control.check();
-        const old_bytes = head.capacity * (2 * row_bytes + 20);
+        const old_bytes = (head.capacity - head.compressed_rows) * 2 * row_bytes + head.capacity * 20;
+        replacement.encoded_keys = head.encoded_keys;
+        replacement.encoded_values = head.encoded_values;
+        replacement.spans = head.spans;
+        head.encoded_keys = .{};
+        head.encoded_values = .{};
+        head.spans = .{};
         freeHead(self.context, head);
         head.* = replacement;
         self.allocated_bytes = self.allocated_bytes - old_bytes + bytes;
@@ -196,7 +216,8 @@ pub const DeviceState = struct {
                     head.dim == 0 or head.dim > limits.max_head_dim or head.rows == 0 or head.rows > head.capacity or
                     head.capacity > 262144 or head.start >= head.capacity or (head.window > 0 and head.rows != @min(head.window, self.logical_length)))
                     return error.InvalidKvCheckpoint;
-                required = try add(required, try mul(head.rows, try add(20, try mul(head.dim, 8))));
+                try validateCompressed(head);
+                required = try add(required, try add(compressedBytes(head), try mul(head.rows, try add(20, try mul(head.dim, 8)))));
             }
         }
         if (count != self.heads.len or required > limits.max_state_bytes) return error.KvCheckpointLimit;
@@ -220,13 +241,62 @@ pub const DeviceState = struct {
                 try self.readRing(source.positions, source, 8, std.mem.sliceAsBytes(@constCast(head.positions)), control);
                 try self.readRing(source.coverage_ends, source, 8, std.mem.sliceAsBytes(@constCast(head.coverage_ends)), control);
                 try self.readRing(source.bias, source, 4, std.mem.sliceAsBytes(@constCast(head.bias)), control);
-                try self.readValues(source.keys, source, @constCast(head.keys), staging, control);
-                try self.readValues(source.values, source, @constCast(head.values), staging, control);
+                if (source.compressed_rows == 0) {
+                    try self.readValues(source.keys, source, @constCast(head.keys), staging, control);
+                    try self.readValues(source.values, source, @constCast(head.values), staging, control);
+                } else {
+                    try self.downloadCompressed(allocator, source, head, staging, control);
+                }
             }
         }
         try control.check();
-        try result.state.validate(limits);
+        try result.state.validateWithControl(limits, control);
         return result;
+    }
+
+    fn downloadCompressed(self: *DeviceState, allocator: std.mem.Allocator, source: Head, head: *checkpoint.Head, staging: []f16, control: Control) !void {
+        head.compressed.version = rotated.version;
+        head.compressed.spans = try allocator.alloc(packed_storage.Span, source.span_count);
+        head.compressed.keys = try allocator.alloc(u8, source.encoded_keys.len);
+        head.compressed.values = try allocator.alloc(u8, source.encoded_values.len);
+        // Each copy is fenced before its destination can unwind.
+        try self.readRaw(source.spans, std.mem.sliceAsBytes(@constCast(head.compressed.spans)), control);
+        try self.readRaw(source.encoded_keys, @constCast(head.compressed.keys), control);
+        try self.readRaw(source.encoded_values, @constCast(head.compressed.values), control);
+        try head.compressed.validate(source.rows, source.dim);
+        if (head.compressed.rows() != source.compressed_rows) return error.InvalidKvCheckpoint;
+        var row: usize = 0;
+        while (row < source.rows) {
+            try control.check();
+            switch (head.compressed.index(row)) {
+                .compressed => |index| {
+                    try head.compressed.decodeRow(source.dim, index, @constCast(head.keys[row * source.dim ..][0..source.dim]), @constCast(head.values[row * source.dim ..][0..source.dim]));
+                    row += 1;
+                },
+                .exact => |index| {
+                    const first = row;
+                    while (row < source.rows and head.compressed.index(row) == .exact) : (row += 1) {}
+                    var part = exactHead(source);
+                    part.start = index;
+                    part.rows = row - first;
+                    try self.readValues(source.keys, part, @constCast(head.keys[first * source.dim .. row * source.dim]), staging, control);
+                    try self.readValues(source.values, part, @constCast(head.values[first * source.dim .. row * source.dim]), staging, control);
+                },
+            }
+        }
+    }
+
+    fn readRaw(self: *DeviceState, source: buffer_mod.DeviceBuffer, output: []u8, control: Control) !void {
+        errdefer self.context.synchronize() catch {};
+        var offset: usize = 0;
+        while (offset < output.len) {
+            try control.check();
+            const count = @min(output.len - offset, 256 * 1024);
+            const part: buffer_mod.DeviceBuffer = .{ .ptr = source.ptr + offset, .len = count };
+            try part.copyToHost(self.context, output[offset..][0..count]);
+            try self.synchronize();
+            offset += count;
+        }
     }
 
     fn readRing(self: *DeviceState, buffer: buffer_mod.DeviceBuffer, head: Head, width: usize, output: []u8, control: Control) !void {
@@ -285,6 +355,9 @@ fn snapshotHead(head: Head) Head {
     return result;
 }
 fn freeHead(context: *context_mod.CudaContext, head: *Head) void {
+    head.encoded_keys.free(context);
+    head.encoded_values.free(context);
+    head.spans.free(context);
     head.keys.free(context);
     head.values.free(context);
     head.bias.free(context);
@@ -315,15 +388,22 @@ pub fn allocationBytesWithControl(state: checkpoint.State, precision: Precision,
     var bytes: usize = 0;
     for (state.donors) |donor| for (donor.heads) |head| {
         try control.check();
-        bytes = try add(bytes, try add(try mul(head.keys.len, if (precision == .f16) 4 else 8), try mul(head.positions.len, 20)));
+        const exact_elements = try mul(head.positions.len - head.compressed.rows(), head.dim);
+        bytes = try add(bytes, try add(head.compressed.bytes(), try add(try mul(exact_elements, if (precision == .f16) 4 else 8), try mul(head.positions.len, 20))));
         if (precision == .f16) {
             for ([_][]const f32{ head.keys, head.values }) |values| {
-                var offset: usize = 0;
-                while (offset < values.len) {
-                    try control.check();
-                    const end = offset + @min(@as(usize, 4096), values.len - offset);
-                    for (values[offset..end]) |value| if (!half_exact.isRepresentable(value)) return error.KvStoragePrecisionMismatch;
-                    offset = end;
+                var runs = head.compressed.exactRuns(head.positions.len);
+                while (runs.next()) |run| {
+                    var offset = run.first * head.dim;
+                    const limit = offset + run.rows * head.dim;
+                    while (offset < limit) {
+                        try control.check();
+                        const end = offset + @min(@as(usize, 4096), limit - offset);
+                        for (values[offset..end]) |value| {
+                            if (!half_exact.isRepresentable(value)) return error.KvStoragePrecisionMismatch;
+                        }
+                        offset = end;
+                    }
                 }
             }
         }
@@ -374,14 +454,22 @@ pub const Backend = struct {
             head.logical_length = state.logical_length;
             head.rollback_floor = state.logical_length;
             head.compacted_until = source.compacted_until;
-            const kv_bytes = try mul(source.keys.len, if (self.precision == .f16) 2 else 4);
+            head.compressed_rows = source.compressed.rows();
+            head.span_count = source.compressed.spans.len;
+            const kv_bytes = try mul(try mul(head.rows - head.compressed_rows, head.dim), if (self.precision == .f16) 2 else 4);
             head.keys = try buffer_mod.DeviceBuffer.alloc(self.context, kv_bytes);
             head.values = try buffer_mod.DeviceBuffer.alloc(self.context, kv_bytes);
             head.bias = try buffer_mod.DeviceBuffer.alloc(self.context, source.bias.len * 4);
             head.positions = try buffer_mod.DeviceBuffer.alloc(self.context, source.positions.len * 8);
             head.coverage_ends = try buffer_mod.DeviceBuffer.alloc(self.context, source.coverage_ends.len * 8);
-            try self.uploadValues(head.keys, source.keys, staging, control);
-            try self.uploadValues(head.values, source.values, staging, control);
+            head.encoded_keys = try buffer_mod.DeviceBuffer.alloc(self.context, source.compressed.keys.len);
+            head.encoded_values = try buffer_mod.DeviceBuffer.alloc(self.context, source.compressed.values.len);
+            head.spans = try buffer_mod.DeviceBuffer.alloc(self.context, source.compressed.spans.len * @sizeOf(packed_storage.Span));
+            try head.encoded_keys.copyFromHost(self.context, source.compressed.keys);
+            try head.encoded_values.copyFromHost(self.context, source.compressed.values);
+            try head.spans.copyFromHost(self.context, std.mem.sliceAsBytes(source.compressed.spans));
+            try self.uploadExact(head.keys, source.keys, source, staging, control);
+            try self.uploadExact(head.values, source.values, source, staging, control);
             try head.bias.copyFromHost(self.context, std.mem.sliceAsBytes(source.bias));
             try head.positions.copyFromHost(self.context, std.mem.sliceAsBytes(source.positions));
             try head.coverage_ends.copyFromHost(self.context, std.mem.sliceAsBytes(source.coverage_ends));
@@ -392,20 +480,44 @@ pub const Backend = struct {
         return result;
     }
 
-    fn uploadValues(self: Backend, buffer: buffer_mod.DeviceBuffer, values: []const f32, staging: []f16, control: Control) !void {
-        if (self.precision == .f32) return buffer.copyFromHost(self.context, std.mem.sliceAsBytes(values));
-        // The reusable staging array must survive every queued copy, on failure too.
+    fn uploadExact(self: Backend, buffer: buffer_mod.DeviceBuffer, values: []const f32, source: checkpoint.Head, staging: []f16, control: Control) !void {
+        // Keep the slab alive on failures as well as successful uploads. Pack
+        // across exact-run boundaries so fragmented retention does not force a
+        // small transfer and stream fence for each run.
         errdefer self.context.synchronize() catch {};
-        var offset: usize = 0;
-        while (offset < values.len) {
+        var runs = source.compressed.exactRuns(source.positions.len);
+        var staged: usize = 0;
+        var uploaded: usize = 0;
+        while (runs.next()) |run| {
             try control.check();
-            const count: usize = @min(staging.len, values.len - offset);
-            for (staging[0..count], values[offset..][0..count]) |*out, value| out.* = half_exact.encode(value);
-            const target: buffer_mod.DeviceBuffer = .{ .ptr = buffer.ptr + offset * 2, .len = count * 2 };
-            try target.copyFromHost(self.context, std.mem.sliceAsBytes(staging[0..count]));
-            try self.context.synchronize();
-            offset += count;
+            const exact = values[run.first * source.dim ..][0 .. run.rows * source.dim];
+            if (self.precision == .f32) {
+                const dest: buffer_mod.DeviceBuffer = .{ .ptr = buffer.ptr + run.offset * source.dim * 4, .len = exact.len * 4 };
+                try dest.copyFromHost(self.context, std.mem.sliceAsBytes(exact));
+                continue;
+            }
+            var offset: usize = 0;
+            while (offset < exact.len) {
+                try control.check();
+                const count = @min(staging.len - staged, exact.len - offset);
+                for (staging[staged..][0..count], exact[offset..][0..count]) |*out, value| out.* = half_exact.encode(value);
+                staged += count;
+                offset += count;
+                if (staged == staging.len) {
+                    try self.uploadStaged(buffer, staging, uploaded, control);
+                    uploaded += staged;
+                    staged = 0;
+                }
+            }
         }
+        if (staged > 0) try self.uploadStaged(buffer, staging[0..staged], uploaded, control);
+    }
+
+    fn uploadStaged(self: Backend, buffer: buffer_mod.DeviceBuffer, staging: []const f16, offset: usize, control: Control) !void {
+        try control.check();
+        const target: buffer_mod.DeviceBuffer = .{ .ptr = buffer.ptr + offset * 2, .len = staging.len * 2 };
+        try target.copyFromHost(self.context, std.mem.sliceAsBytes(staging));
+        try self.context.synchronize();
     }
 };
 
@@ -495,4 +607,41 @@ test "attention match CUDA storage preflight cancellation covers large arrays" {
         var cancel: Cancel = .{ .fail_at = fail_at };
         try std.testing.expectError(error.Cancelled, allocationBytesWithControl(state, .f16, .{}, cancel.control()));
     }
+}
+
+fn exactHead(head: Head) Head {
+    var result = head;
+    result.rows -= head.compressed_rows;
+    result.capacity -= head.compressed_rows;
+    return result;
+}
+
+fn compressedBytes(head: Head) usize {
+    return head.encoded_keys.len + head.encoded_values.len + head.spans.len;
+}
+
+fn deviceBytes(head: Head, capacity: usize, precision: Precision) !usize {
+    return add(compressedBytes(head), try add(try mul(capacity, 20), try mul(try mul(capacity - head.compressed_rows, head.dim), if (precision == .f16) 4 else 8)));
+}
+
+pub fn validateCompressed(head: Head) !void {
+    if (head.compressed_rows == 0) {
+        if (head.span_count != 0 or compressedBytes(head) != 0) return error.InvalidAttentionShape;
+        return;
+    }
+    if (head.compressed_rows > head.rows or head.rows > head.capacity or head.span_count == 0 or head.span_count > head.compressed_rows or
+        head.start != 0 or head.window != 0 or !rotated.supported(head.dim) or
+        head.encoded_keys.ptr == 0 or head.encoded_values.ptr == 0 or head.spans.ptr == 0 or
+        head.encoded_keys.len != head.compressed_rows * rotated.rowBytes(head.dim) or
+        head.encoded_values.len != head.compressed_rows * packed_storage.valueBytes(head.dim) or
+        head.spans.len != head.span_count * @sizeOf(packed_storage.Span)) return error.InvalidAttentionShape;
+}
+
+fn cloneCompressed(context: *context_mod.CudaContext, dest: *Head, source: Head) !void {
+    dest.encoded_keys = try buffer_mod.DeviceBuffer.alloc(context, source.encoded_keys.len);
+    dest.encoded_values = try buffer_mod.DeviceBuffer.alloc(context, source.encoded_values.len);
+    dest.spans = try buffer_mod.DeviceBuffer.alloc(context, source.spans.len);
+    try dest.encoded_keys.copyFromDevice(context, source.encoded_keys, source.encoded_keys.len);
+    try dest.encoded_values.copyFromDevice(context, source.encoded_values, source.encoded_values.len);
+    try dest.spans.copyFromDevice(context, source.spans, source.spans.len);
 }

@@ -1100,7 +1100,7 @@ class AntflyClient:
             )
 
     def prepare_native_kv_checkpoint(
-        self, request: InferenceGenerateRequest, destination: str | Path
+        self, request: InferenceGenerateRequest, destination: str | Path, *, encoding: str = "f16"
     ) -> NativeKvCheckpoint:
         """Stream a same-model KV checkpoint to disk and publish it atomically.
 
@@ -1110,13 +1110,16 @@ class AntflyClient:
         """
         from .native_kv import CHUNK_BYTES, CONTENT_TYPE, ChunkReader, receive_checkpoint
 
+        if encoding not in ("f32", "f16", "fp8", "rotated4"):
+            raise ValueError("checkpoint encoding must be f32, f16, fp8, or rotated4")
+
         body = request.to_dict()
         body["stream"] = False
         with self._client.get_httpx_client().stream(
             "POST",
             "/ai/v1/chat/context/checkpoint",
             json=body,
-            headers={"Accept": CONTENT_TYPE},
+            headers={"Accept": CONTENT_TYPE, "X-Antfly-KV-Encoding": encoding},
             follow_redirects=False,
         ) as response:
             if response.status_code != 200:

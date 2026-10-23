@@ -10,12 +10,16 @@ from native_benchmark_fixture import extract_tokens,qualified_fixture
 IDENTITY={name:bytes([index])*32 for index,name in enumerate(('weights','tokenizer','template','layout'),1)}
 
 
-def checkpoint(logical=2,tokens=(0,1),vocab=4,version=2,tail=b''):
+def checkpoint(logical=2,tokens=(0,1),vocab=4,version=2,flags=0,tail=b''):
     payload=struct.pack('<QIIII',logical,len(tokens),vocab,1,1)+struct.pack('<'+'I'*len(tokens),*tokens)
     payload+=struct.pack('<4fI',0.,1.,2.,3.,0)
     payload+=struct.pack('<III',0,0,1)+struct.pack('<IIQ',2,2,0)
-    payload+=struct.pack('<4Q',0,1,1,2)+struct.pack('<10f',*([0.]*10))
-    header=struct.pack('<8sIIQ',b'ANTFLYKV',version,0,len(payload))+b''.join(IDENTITY.values())
+    if version==4:
+        payload+=struct.pack('<4I',0,0,0,0)
+        payload+=struct.pack('<4Q',0,1,1,2)+struct.pack('<8e2f',*([0.]*10))
+    else:
+        payload+=struct.pack('<4Q',0,1,1,2)+struct.pack('<10f',*([0.]*10))
+    header=struct.pack('<8sIIQ',b'ANTFLYKV',version,flags,len(payload))+b''.join(IDENTITY.values())
     prefix=header+payload
     return prefix+hashlib.sha256(prefix).digest()+tail
 
@@ -32,6 +36,15 @@ class FixtureTests(unittest.TestCase):
         value=self.extract(checkpoint())
         self.assertEqual(value['token_ids'],[0,1])
         self.assertEqual(value['token_bytes_sha256'],hashlib.sha256(struct.pack('<II',0,1)).hexdigest())
+
+    def test_v4_tokens_and_reserved_flags(self):
+        self.assertEqual(self.extract(checkpoint(version=4))['token_ids'], [0, 1])
+        for flags in (1, 2, 0xffffffff):
+            with self.subTest(flags=flags), self.assertRaisesRegex(ValueError, 'header'):
+                self.extract(checkpoint(version=4, flags=flags))
+        corrupted = bytearray(checkpoint(version=4)); corrupted[-33] ^= 1
+        with self.assertRaisesRegex(ValueError, 'integrity'):
+            self.extract(bytes(corrupted))
 
     def test_integrity_and_qualified_file_digest_are_independent(self):
         data=bytearray(checkpoint());data[-33]^=1

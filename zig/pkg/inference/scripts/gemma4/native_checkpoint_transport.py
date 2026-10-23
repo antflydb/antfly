@@ -36,8 +36,9 @@ def envelope_prefix(metadata, checkpoint_bytes):
     return struct.pack('<8sQIIIIQ', b'AFATT001', len(data), 1, 0, len(MIME), 0, checkpoint_bytes) + data + MIME
 
 
-def receive_checkpoint(response, destination):
-    """Publish only after bounded framing, V2 integrity, metadata and EOF checks."""
+def receive_checkpoint(response, destination, *, allow_rotated4=False):
+    """Publish after bounded framing, integrity and EOF; V4 needs explicit opt-in."""
+    versions = (2, 3, 4) if allow_rotated4 else (2, 3)
     magic, metadata_bytes, count, flags, mime_bytes, attachment_flags, size = struct.unpack('<8sQIIIIQ', read_exact(response, 40))
     if (magic, count, flags, mime_bytes, attachment_flags) != (b'AFATT001', 1, 0, len(MIME), 0):
         raise ValueError('invalid native checkpoint envelope')
@@ -48,7 +49,7 @@ def receive_checkpoint(response, destination):
         raise ValueError('invalid checkpoint metadata')
     if read_exact(response, mime_bytes) != MIME:
         raise ValueError('invalid checkpoint MIME')
-    if (metadata.get('version'), metadata.get('wire_version'), metadata.get('checkpoint_bytes')) != ('attention_match_v1', 2, size):
+    if metadata.get('version') != 'attention_match_v1' or metadata.get('wire_version') not in versions or metadata.get('checkpoint_bytes') != size:
         raise ValueError('checkpoint metadata does not attest payload')
     if metadata.get('outcome') not in ('compacted', 'unchanged_insufficient_savings'):
         raise ValueError('invalid checkpoint outcome')
@@ -61,7 +62,12 @@ def receive_checkpoint(response, destination):
             created = True
             header = read_exact(response, 152)
             magic, version, reserved, payload_bytes = struct.unpack('<8sIIQ', header[:24])
-            if (magic, version, reserved, payload_bytes) != (b'ANTFLYKV', 2, 0, size - 184):
+            if (magic != b'ANTFLYKV' or version not in versions or payload_bytes != size - 184
+                    or (version in (2, 4) and reserved != 0) or (version == 3 and reserved not in (0, 1))
+                    or version != metadata['wire_version']
+                    or (version == 4 and metadata.get('encoding') != 'rotated4')
+                    or (version == 2 and metadata.get('encoding', 'f32') != 'f32')
+                    or (version == 3 and metadata.get('encoding') != ('fp8' if reserved else 'f16'))):
                 raise ValueError('invalid native checkpoint header')
             integrity = hashlib.sha256(header)
             file_hash = hashlib.sha256(header)

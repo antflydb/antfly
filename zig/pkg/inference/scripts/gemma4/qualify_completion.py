@@ -111,7 +111,8 @@ def main():
             probe_connection = http.client.HTTPConnection('127.0.0.1',args.port,timeout=args.timeout)
             try:
                 connection.request('POST','/ai/v1/chat/context/checkpoint',json.dumps(cold_body).encode(),
-                                   {'Content-Type':'application/json'})
+                                   {'Content-Type':'application/json',
+                                    'X-Antfly-KV-Encoding':prepared['metadata'].get('encoding', 'f32')})
                 response = connection.getresponse()
                 if response.status != 200:
                     raise AssertionError(f'prepare HTTP {response.status}: {response.read(65536)!r}')

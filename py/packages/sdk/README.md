@@ -82,15 +82,20 @@ user = client.get(table="users", key="user:1")
 - **Error Handling**: Comprehensive error handling with custom exceptions
 - **Auto-generated Client**: Based on OpenAPI specification for accuracy
 
-## Native KV checkpoints (under qualification)
+## Native KV checkpoints
 
 The native Gemma 4 E4B CUDA route can export a binary checkpoint and resume it
 with the same model revision, tokenizer, template, and KV layout. The streaming
 helpers keep checkpoint transfers out of Python's full-response buffers and
 publish a downloaded file only after integrity checks succeed.
 
+FP16, FP8 and rotated4 checkpoints passed the bounded E4B Q4_0/L4/eager-CUDA
+production qualification at 8K and 32K. The
+[qualification record](../../../docs/design/inference/native-kv-compaction.md#bounded-qualification-2026-10-23)
+documents the tested model revision, answer-quality coverage and latency limits.
+
 Configure the serving runtime and inference memory budgets using the
-[native checkpoint serving guide](../../../zig/pkg/inference/OPENAI.md#portable-native-kv-checkpoints-under-qualification).
+[native checkpoint serving guide](../../../zig/pkg/inference/OPENAI.md#portable-native-kv-checkpoints).
 The default scratch budget is insufficient for preparation.
 
 ```python
@@ -106,7 +111,12 @@ request = InferenceGenerateRequest.from_dict({
     "temperature": 0,
     "chat_template_kwargs": {"enable_thinking": False},
 })
-checkpoint = client.prepare_native_kv_checkpoint(request, "history.kv")
+checkpoint = client.prepare_native_kv_checkpoint(request, "history.kv")  # lossless f16 storage
+# Optional fitted-history FP8 disk encoding with validated f16 fallback:
+# checkpoint = client.prepare_native_kv_checkpoint(request, "history-fp8.kv", encoding="fp8")
+# Optional V4 compressed CUDA state; no experimental process switch required:
+# checkpoint = client.prepare_native_kv_checkpoint(request, "history-rotated4.kv", encoding="rotated4")
+# Use encoding="f32" for legacy V2 readers.
 print(checkpoint.metadata["outcome"], checkpoint.metadata["global_savings_ratio"])
 
 # The server can be restarted before this call, using the same model revision.
