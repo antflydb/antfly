@@ -612,7 +612,7 @@ fn printBackupUsage() void {
         \\  Network backups are written by the server through the named connection.
         \\  --connection names an entry in the server's connections configuration.
         \\  It must grant backup.write (and restore.read to restore). For example:
-        \\    {"connections":{"bk":{"kind":"external_io","capabilities":["backup.write","restore.read"],"external_io":{"protocol":"filesystem","root":"/srv/backups"}}}}
+        \\    {{"connections":{{"bk":{{"kind":"external_io","capabilities":["backup.write","restore.read"],"external_io":{{"protocol":"filesystem","root":"/srv/backups"}}}}}}}}
         \\  Use --connection bk --location file:///srv/backups with this configuration.
         \\  Table and cluster backups default to the portable format.
         \\  Backup listing returns one page and includes next_cursor when more results remain.
