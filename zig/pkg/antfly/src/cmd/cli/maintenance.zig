@@ -163,7 +163,7 @@ fn parse(resource: Resource, args: anytype) !Options {
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *client_mod.AntflyClient, resource: Resource, args: *std.process.Args.Iterator) !void {
-    const options = parse(resource, args) catch |err| cli.fatal("invalid {s} maintenance arguments: {s}; run {s} --help", .{ @tagName(resource), @errorName(err), @tagName(resource) });
+    const options = parse(resource, args) catch |err| cli.argumentError("invalid {s} maintenance arguments: {s}; run {s} --help", .{ @tagName(resource), @errorName(err), @tagName(resource) });
     if (options.action == .replay) return runReplay(allocator, io, client, options);
     if (options.job) |job| {
         var response = switch (options.action) {

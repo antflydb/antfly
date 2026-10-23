@@ -20,23 +20,23 @@ const index_readiness = @import("index_readiness.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const subcommand = args.next() orelse {
-        cli.fatal("agents requires a subcommand: retrieval, research, query-builder", .{});
+        cli.argumentError("agents requires a subcommand: retrieval, research, query-builder", .{});
     };
 
     if (std.mem.eql(u8, subcommand, "retrieval")) return retrieval(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "research")) return research(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "query-builder")) return queryBuilder(allocator, io, client, args);
 
-    cli.fatal("unknown agents subcommand: {s}", .{subcommand});
+    cli.argumentError("unknown agents subcommand: {s}", .{subcommand});
 }
 
 fn takeUniqueValue(args: *std.process.Args.Iterator, slot: *?[]const u8, flag: []const u8) void {
-    if (slot.* != null) cli.fatal("{s} may only be provided once", .{flag});
-    slot.* = args.next() orelse cli.fatal("{s} requires a value", .{flag});
+    if (slot.* != null) cli.argumentError("{s} may only be provided once", .{flag});
+    slot.* = args.next() orelse cli.argumentError("{s} requires a value", .{flag});
 }
 
 fn takeUniqueSwitch(seen: *bool, flag: []const u8) void {
-    if (seen.*) cli.fatal("{s} may only be provided once", .{flag});
+    if (seen.*) cli.argumentError("{s} may only be provided once", .{flag});
     seen.* = true;
 }
 
@@ -53,7 +53,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     var limit: i64 = 5;
     var prompt: ?[]const u8 = null;
     var system_prompt: ?[]const u8 = null;
-    var streaming = true;
+    var streaming = false;
     var classify = false;
     var reasoning = false;
     var generate = false;
@@ -92,18 +92,18 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
             takeUniqueValue(args, &pruner_json, arg);
         } else if (std.mem.eql(u8, arg, "--limit")) {
             takeUniqueSwitch(&limit_set, arg);
-            const raw = args.next() orelse cli.fatal("--limit requires a value", .{});
-            limit = std.fmt.parseInt(i64, raw, 10) catch cli.fatal("invalid --limit value: {s}", .{raw});
-            if (limit <= 0) cli.fatal("--limit must be greater than zero", .{});
+            const raw = args.next() orelse cli.argumentError("--limit requires a value", .{});
+            limit = std.fmt.parseInt(i64, raw, 10) catch cli.argumentError("invalid --limit value: {s}", .{raw});
+            if (limit <= 0) cli.argumentError("--limit must be greater than zero", .{});
         } else if (std.mem.eql(u8, arg, "--prompt") or std.mem.eql(u8, arg, "--intent")) {
             takeUniqueValue(args, &prompt, arg);
         } else if (std.mem.eql(u8, arg, "--system-prompt")) {
             takeUniqueValue(args, &system_prompt, arg);
         } else if (std.mem.eql(u8, arg, "--max-context-tokens")) {
-            if (max_context_tokens != null) cli.fatal("--max-context-tokens may only be provided once", .{});
-            const raw = args.next() orelse cli.fatal("--max-context-tokens requires a value", .{});
-            max_context_tokens = std.fmt.parseInt(i64, raw, 10) catch cli.fatal("invalid --max-context-tokens value: {s}", .{raw});
-            if (max_context_tokens.? <= 0) cli.fatal("--max-context-tokens must be greater than zero", .{});
+            if (max_context_tokens != null) cli.argumentError("--max-context-tokens may only be provided once", .{});
+            const raw = args.next() orelse cli.argumentError("--max-context-tokens requires a value", .{});
+            max_context_tokens = std.fmt.parseInt(i64, raw, 10) catch cli.argumentError("invalid --max-context-tokens value: {s}", .{raw});
+            if (max_context_tokens.? <= 0) cli.argumentError("--max-context-tokens must be greater than zero", .{});
         } else if (std.mem.eql(u8, arg, "--streaming")) {
             takeUniqueSwitch(&streaming_set, arg);
             streaming = true;
@@ -126,17 +126,17 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
             takeUniqueSwitch(&confidence_set, arg);
             confidence = true;
         } else {
-            cli.fatal("unknown agents retrieval flag: {s}", .{arg});
+            cli.argumentError("unknown agents retrieval flag: {s}", .{arg});
         }
     }
 
-    const gen_json = generator_json orelse cli.fatal("--generator is required", .{});
-    if (table_name == null and web_connection == null) cli.fatal("--table or --web-search-connection is required", .{});
-    if (table_name == null and (semantic_search != null or full_text_search != null or indexes_str != null or fields_str != null or reranker_json != null or pruner_json != null)) cli.fatal("database search options require --table", .{});
+    const gen_json = generator_json orelse cli.argumentError("--generator is required", .{});
+    if (table_name == null and web_connection == null) cli.argumentError("--table or --web-search-connection is required", .{});
+    if (table_name == null and (semantic_search != null or full_text_search != null or indexes_str != null or fields_str != null or reranker_json != null or pruner_json != null)) cli.argumentError("database search options require --table", .{});
     const intent_only = semantic_search == null and full_text_search == null;
-    if (intent_only and prompt == null) cli.fatal("provide --intent, --semantic-search, or --full-text-search", .{});
+    if (intent_only and prompt == null) cli.argumentError("provide --intent, --semantic-search, or --full-text-search", .{});
     const iterations = try parseIterations(iterations_arg orelse if (intent_only or web_connection != null) "8" else "0");
-    if ((intent_only or web_connection != null) and iterations == 0) cli.fatal("--intent without a query requires positive --max-internal-iterations", .{});
+    if ((intent_only or web_connection != null) and iterations == 0) cli.argumentError("--intent without a query requires positive --max-internal-iterations", .{});
     const query_text = prompt orelse semantic_search orelse full_text_search orelse "";
 
     var generator_value = parseJsonArg(antfly_client.types.GeneratorConfig, allocator, "--generator", gen_json);
@@ -202,7 +202,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
         .steps = steps,
     };
 
-    if (semantic_search != null) index_readiness.warnIfSelectedSemanticIndexesAreNotReadyForRetrieval(client, table_name.?, indexes);
+    if (!cli.isAgent() and semantic_search != null) index_readiness.warnIfSelectedSemanticIndexesAreNotReadyForRetrieval(client, table_name.?, indexes);
     return sendRetrieval(allocator, io, client, body);
 }
 
@@ -226,9 +226,9 @@ fn sendRetrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         const response_failed = resp.status_code >= 300 or
             isSseFailureResponse(resp.content_type, resp.body orelse "") or
             !try retrievalCompleted(allocator, resp.body);
+        cli.output.context = .{ .scope = .workflow, .execution = if (response_failed) .partial else .complete };
         if (resp.body) |response_body| {
-            cli.writeStdout(io, response_body);
-            cli.writeStdout(io, "\n");
+            if (resp.status_code >= 300 and cli.isAgent()) cli.output.httpDiagnostic(resp.status_code, response_body) else try cli.output.writeJsonResponseBytes(allocator, io, response_body);
         }
         if (response_failed) return error.RetrievalAgentResponseError;
     }
@@ -330,9 +330,9 @@ const StreamingSseWriter = struct {
 };
 
 fn parseBudgetValue(args: *std.process.Args.Iterator, slot: *?i64, flag: []const u8) void {
-    if (slot.* != null) cli.fatal("{s} may only be provided once", .{flag});
-    const raw = args.next() orelse cli.fatal("{s} requires a value", .{flag});
-    slot.* = std.fmt.parseInt(i64, raw, 10) catch cli.fatal("invalid {s} value: {s}", .{ flag, raw });
+    if (slot.* != null) cli.argumentError("{s} may only be provided once", .{flag});
+    const raw = args.next() orelse cli.argumentError("{s} requires a value", .{flag});
+    slot.* = std.fmt.parseInt(i64, raw, 10) catch cli.argumentError("invalid {s} value: {s}", .{ flag, raw });
 }
 
 /// `antfly agents research`: run the research agent synchronously (SSE or
@@ -360,7 +360,7 @@ fn research(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
     var limit: ?i64 = null;
     var verify = false;
     var job = false;
-    var streaming = true;
+    var streaming = false;
     var streaming_set = false;
 
     while (args.next()) |arg| {
@@ -412,15 +412,15 @@ fn research(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
             takeUniqueSwitch(&streaming_set, arg);
             streaming = std.mem.eql(u8, arg, "--streaming");
         } else {
-            cli.fatal("unknown agents research flag: {s}", .{arg});
+            cli.argumentError("unknown agents research flag: {s}", .{arg});
         }
     }
 
     if (resume_job) |job_id| return advanceResearchJobUntilDone(allocator, io, client, job_id);
-    const q = question orelse cli.fatal("--query is required", .{});
-    const gen_json = generator_json orelse cli.fatal("--generator is required", .{});
-    if (table_name == null and web_connection == null) cli.fatal("--table or --web-search-connection is required", .{});
-    if (job and streaming_set) cli.fatal("streaming flags do not apply to --job", .{});
+    const q = question orelse cli.argumentError("--query is required", .{});
+    const gen_json = generator_json orelse cli.argumentError("--generator is required", .{});
+    if (table_name == null and web_connection == null) cli.argumentError("--table or --web-search-connection is required", .{});
+    if (job and streaming_set) cli.argumentError("streaming flags do not apply to --job", .{});
 
     var generator_value = parseJsonArg(antfly_client.types.GeneratorConfig, allocator, "--generator", gen_json);
     defer generator_value.deinit();
@@ -474,7 +474,7 @@ fn research(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
         const record = started.data orelse return error.ResearchAgentResponseError;
         const job_id = try allocator.dupe(u8, record.value.job_id);
         defer allocator.free(job_id);
-        std.debug.print("research job {s}: {s} (phase {s})\n", .{ job_id, @tagName(record.value.state), @tagName(record.value.phase) });
+        cli.output.notice("research job {s}: {s} (phase {s})\n", .{ job_id, @tagName(record.value.state), @tagName(record.value.phase) });
         return advanceResearchJobUntilDone(allocator, io, client, job_id);
     }
     if (streaming) {
@@ -489,11 +489,12 @@ fn research(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
     }
     var resp = try client.researchAgent(body);
     defer resp.deinit();
+    const response_failed = resp.status_code >= 300 or !try retrievalCompleted(allocator, resp.body);
+    cli.output.context = .{ .scope = .workflow, .execution = if (response_failed) .partial else .complete };
     if (resp.body) |response_body| {
-        cli.writeStdout(io, response_body);
-        cli.writeStdout(io, "\n");
+        if (resp.status_code >= 300 and cli.isAgent()) cli.output.httpDiagnostic(resp.status_code, response_body) else try cli.output.writeJsonResponseBytes(allocator, io, response_body);
     }
-    if (resp.status_code >= 300 or !try retrievalCompleted(allocator, resp.body)) return error.ResearchAgentResponseError;
+    if (response_failed) return error.ResearchAgentResponseError;
 }
 
 /// Advance one phase per request until the job is terminal, reporting each
@@ -505,14 +506,15 @@ fn advanceResearchJobUntilDone(allocator: std.mem.Allocator, io: std.Io, client:
         const record = advanced.data orelse return error.ResearchAgentResponseError;
         const state = record.value.state;
         if (advanced.status_code == 409) {
-            std.debug.print("research job {s}: another advance is running; waiting\n", .{job_id});
+            cli.output.notice("research job {s}: another advance is running; waiting\n", .{job_id});
             io.sleep(.fromSeconds(2), .awake) catch {};
             continue;
         }
-        std.debug.print("research job {s}: {s} (phase {s}, advances {d})\n", .{ job_id, @tagName(state), @tagName(record.value.phase), record.value.advances orelse 0 });
+        cli.output.notice("research job {s}: {s} (phase {s}, advances {d})\n", .{ job_id, @tagName(state), @tagName(record.value.phase), record.value.advances orelse 0 });
         switch (state) {
             .queued, .running => continue,
             .succeeded, .failed, .cancelled => {
+                cli.output.context = .{ .scope = .workflow, .execution = if (state == .succeeded) .complete else .partial };
                 try cli.writeJson(allocator, io, record.value);
                 if (state != .succeeded) return error.ResearchAgentResponseError;
                 return;
@@ -529,7 +531,7 @@ fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
     var fields_arg: ?[]const u8 = null;
     var mode: ?[]const u8 = null;
     var execute = false;
-    var streaming = true;
+    var streaming = false;
     var streaming_set = false;
 
     while (args.next()) |arg| {
@@ -551,20 +553,20 @@ fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
             takeUniqueSwitch(&streaming_set, arg);
             streaming = std.mem.eql(u8, arg, "--streaming");
         } else {
-            cli.fatal("unknown agents query-builder flag: {s}", .{arg});
+            cli.argumentError("unknown agents query-builder flag: {s}", .{arg});
         }
     }
 
-    const i = intent orelse cli.fatal("--intent is required", .{});
-    const gen_json = generator_json orelse cli.fatal("--generator is required", .{});
+    const i = intent orelse cli.argumentError("--intent is required", .{});
+    const gen_json = generator_json orelse cli.argumentError("--generator is required", .{});
 
     var generator_value = parseJsonArg(antfly_client.types.GeneratorConfig, allocator, "--generator", gen_json);
     defer generator_value.deinit();
 
     const iterations = try parseIterations(iterations_arg orelse if (execute) "8" else "0");
-    if (execute and table_name == null) cli.fatal("--execute requires --table", .{});
-    if (execute and iterations == 0) cli.fatal("--execute requires positive --max-internal-iterations", .{});
-    if (streaming_set and !execute) cli.fatal("streaming flags require --execute", .{});
+    if (execute and table_name == null) cli.argumentError("--execute requires --table", .{});
+    if (execute and iterations == 0) cli.argumentError("--execute requires positive --max-internal-iterations", .{});
+    if (streaming_set and !execute) cli.argumentError("streaming flags require --execute", .{});
     const fields = if (fields_arg) |value| try cli.splitCommaListAlloc(allocator, value) else null;
     defer if (fields) |value| allocator.free(value);
 
@@ -597,6 +599,7 @@ fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
         return error.QueryBuilderResponseError;
     }
     const result = resp.data.?.value;
+    cli.output.context = .{ .scope = .workflow, .execution = if (result.status == .incomplete or result.status == .failed) .partial else .complete };
     try cli.writeJson(allocator, io, result);
     if (result.status == .incomplete or result.status == .failed) return error.QueryBuilderResponseError;
 }
@@ -656,7 +659,7 @@ fn parseJsonArg(comptime T: type, allocator: std.mem.Allocator, flag: []const u8
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch |err| {
-        cli.fatal("invalid JSON for {s}: {}", .{ flag, err });
+        cli.argumentError("invalid JSON for {s}: {}", .{ flag, err });
     };
 }
 

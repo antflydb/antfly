@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS wasmtime
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime-libraries
 
 ARG ZIG_VERSION=0.17.0
 ARG WASMTIME_VERSION=v45.0.2
@@ -20,6 +20,25 @@ RUN case "${TARGETARCH}" in \
     tar -xJf "/tmp/${archive}" -C /opt/wasmtime --strip-components=1 && \
     test -f /opt/wasmtime/lib/libwasmtime.so
 
+# GKE supplies the CUDA driver, but EmbeddingGemma 2 also requires cuBLASLt.
+# Pin the runtime redistributables from NVIDIA's CUDA 12.9.1 manifest:
+# https://developer.download.nvidia.com/compute/cuda/redist/redistrib_12.9.1.json
+# arm64 uses the server (SBSA) build. Keep headers and static libraries out of
+# the runtime image, and retain NVIDIA's redistribution license.
+RUN case "${TARGETARCH}" in \
+        amd64) cublas_arch="x86_64"; cublas_sha256="546addc4a9d82b8f23aa9ba9274b6bc0429a63008a31c759884ac24880796057" ;; \
+        arm64) cublas_arch="sbsa"; cublas_sha256="e99b074e6f66034e563508118804599d7579f73afc8424c55ad5fd8d12e085a5" ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    package="libcublas-linux-${cublas_arch}-12.9.1.4-archive" && \
+    curl -fsSL "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/linux-${cublas_arch}/${package}.tar.xz" -o /tmp/cublas.tar.xz && \
+    echo "${cublas_sha256}  /tmp/cublas.tar.xz" | sha256sum --check --strict && \
+    mkdir -p /opt/cublas && \
+    tar -xJf /tmp/cublas.tar.xz -C /opt/cublas --strip-components=1 \
+        --wildcards "${package}/lib/libcublasLt.so*" "${package}/LICENSE*" && \
+    test -f /opt/cublas/lib/libcublasLt.so.12 && \
+    rm /tmp/cublas.tar.xz
+
 FROM --platform=$TARGETPLATFORM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
@@ -29,7 +48,7 @@ LABEL org.opencontainers.image.licenses=Elastic-2.0
 ARG TARGETARCH
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates wget && \
+    apt-get install -y --no-install-recommends ca-certificates wget libstdc++6 && \
     if [ "${TARGETARCH}" = amd64 ]; then apt-get install -y --no-install-recommends libopenblas0-pthread; fi && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 10001 antfly && \
@@ -39,7 +58,9 @@ RUN apt-get update && \
 WORKDIR /
 COPY antfly /antfly
 COPY share/antfly /usr/share/antfly
-COPY --from=wasmtime /opt/wasmtime/lib/libwasmtime.so /usr/local/lib/libwasmtime.so
+COPY --from=runtime-libraries /opt/wasmtime/lib/libwasmtime.so /usr/local/lib/libwasmtime.so
+COPY --from=runtime-libraries /opt/cublas/lib/ /usr/local/lib/
+COPY --from=runtime-libraries /opt/cublas/LICENSE* /usr/share/doc/antfly/cublas/
 
 ENV ANTFLY_WASMTIME_LIB=/usr/local/lib/libwasmtime.so
 # GKE mounts the host CUDA driver here; keep Wasmtime's bundled library path.
@@ -48,9 +69,14 @@ ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/lib
 ENV ANTFLY_EXTENSION_PACKAGE_STORE=/tmp/antflydb/extensions
 
 # Exercise the target architecture's glibc loader during the image build.
-# Wasmtime is loaded at runtime, so verify its dynamic dependencies separately.
+# Wasmtime and cuBLASLt are loaded at runtime. Check cuBLASLt's dependencies
+# and relocations without requiring an NVIDIA driver or GPU on the builder.
 RUN ldd /antfly && \
     ldd /usr/local/lib/libwasmtime.so && \
+    ldd -r /usr/local/lib/libcublasLt.so.12 > /tmp/cublaslt-ldd.txt 2>&1 && \
+    cat /tmp/cublaslt-ldd.txt && \
+    ! grep -E 'not found|undefined symbol' /tmp/cublaslt-ldd.txt && \
+    rm /tmp/cublaslt-ldd.txt && \
     /antfly --version
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
