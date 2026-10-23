@@ -284,6 +284,7 @@
     "input_versions": "iv4/iv5 canonical bucketed Merkle commitments; no XOR reuse",
     "buckets_per_fragment": 256,
     "input_commitment_record_bytes": 9216,
+    "input_commitment_owner": "current native space; excluded from new and reused query coordinate views",
     "merkle_internal_levels": 8,
     "legacy_xor_collision_regression": "257 candidate updates; nonempty cancelling subset must change the planned native fragment",
     "navigation_quota_decline": "reclaim optional copies; required serial reads; charge once",

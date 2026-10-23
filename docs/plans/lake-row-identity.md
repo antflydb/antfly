@@ -750,6 +750,9 @@ their bounded commitment records; unchanged fragments require no evidence replay
 The ordinary identity dependency iterator retains these pages for readers, cloud
 certificates and both GC modes. Retired cohorts and split fragment records are
 removed when the corresponding census changes.
+The current native space owns the shared commitment root once. Both new and
+reused per-index query views omit it, preserving their exact coordinate metadata
+across unrelated cohort and schema changes without retaining obsolete censuses.
 
 Legacy `iv1`/`iv2`/`iv3` versions are readable but cannot seed incremental input
 commitments. New non-coordinate versions use `iv4`; stable text/vector coordinates

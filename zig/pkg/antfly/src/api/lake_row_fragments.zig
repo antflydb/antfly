@@ -595,6 +595,9 @@ fn changedRows(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, reci
 }
 pub fn indexSpace(self: *const Build, name: []const u8) identity.Space {
     var space = self.space;
+    // Query coordinate views never own the shared input proof census. The
+    // current native space alone retains it for subsequent publications.
+    space.input_commitments = null;
     for (self.provider.fragment_views) |view| if (std.mem.eql(u8, view.name, name)) {
         space.navigation = view.navigation;
         break;
@@ -1734,7 +1737,9 @@ test "external lake logical fragments skip unchanged input cohorts and hash only
         const next = (try prepare(a, &store, table, &physical, &provider, root, previous)).?;
         const views = next.provider.fragment_views;
         try std.testing.expectEqual(@as(usize, 2), views.len);
+        try std.testing.expect(next.space.input_commitments != null);
         for (views, 0..) |view, index| {
+            try std.testing.expect(indexSpace(next, view.name).input_commitments == null);
             var count: usize = 0;
             for (0..view.delta.count()) |i| if (view.delta.isChanged(i)) {
                 count += 1;
