@@ -199,6 +199,9 @@ fn sample(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anyty
     return sampleForReplay(server, a, snapshot, table, request, probe_owners, null);
 }
 fn sampleForReplay(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, probe_owners: bool, required: ?ReplayRequirement) !Sample {
+    return sampleForRequirements(server, a, snapshot, table, request, probe_owners, if (required) |value| &.{value} else &.{});
+}
+fn sampleForRequirements(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, probe_owners: bool, required: []const ReplayRequirement) !Sample {
     var result: Sample = .{};
     for (snapshot.ranges) |range| if (range.table_id == table.table_id) try result.groups.put(a, range.group_id, {});
     var statuses = try server.localTableRuntimeStatusesWithSnapshot(table.name, snapshot);
@@ -257,7 +260,9 @@ fn sampleForReplay(server: anytype, a: std.mem.Allocator, snapshot: anytype, tab
                 row.resolution.applied_sequence < row.resolution.target_sequence or
                 (cfg.promote and (!row.promotion.enabled or row.promotion.blocked or row.promotion.catch_up_required or row.promotion.applied_sequence < row.promotion.target_sequence))) break true;
         } else false;
-        const behind_requested = if (required) |target| result.needsReplayProbe(group, target) else false;
+        const behind_requested = for (required) |target| {
+            if (result.needsReplayProbe(group, target)) break true;
+        } else false;
         if (needs_probe or behind_requested) try probes.append(a, .{ .group = group });
     }
     var offset: usize = 0;
@@ -780,12 +785,9 @@ fn observeProposalDecision(server: anytype, alloc: std.mem.Allocator, a: std.mem
                 return response(alloc, 202, .{ .proposal = proposal, .changed = false, .complete = true, .atomicity = "namespace", .applied = false, .results = std.json.Value{ .array = results } });
             },
         };
-        const deadline = @import("antfly_platform").time.monotonicNs() +| @as(u64, if (wait) |w| w.timeout_ms else 0) * std.time.ns_per_ms;
-        for (replay.consumers.items) |consumer| {
+        const observations = try observeConsumers(server, a, replay.consumers.items, replay.namespaces, wait, request);
+        for (replay.consumers.items, observations) |consumer, progress| {
             const namespace = replay.namespaces.get(consumer.key_template).?;
-            const remaining_ns = deadline -| @import("antfly_platform").time.monotonicNs();
-            const remaining = (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
-            const progress = try observeAccepted(server, a, consumer.table_name, consumer.target, namespace.revision, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request);
             applied = applied and progress.applied;
             try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .changed = false, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
         }
@@ -968,12 +970,9 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     const stamp = if (changed) try server.source.replaceTableDefinitionStamped(entity_table.*, replacement) else null;
     var results = std.json.Array.init(a);
     var applied = true;
-    const deadline = @import("antfly_platform").time.monotonicNs() +| @as(u64, if (input.wait) |wait| wait.timeout_ms else 0) * std.time.ns_per_ms;
-    for (discovery.consumers.items) |consumer| {
+    const observations = try observeConsumers(server, a, discovery.consumers.items, namespaces, input.wait, request);
+    for (discovery.consumers.items, observations) |consumer, progress| {
         const namespace = namespaces.get(consumer.key_template).?;
-        const remaining_ns = deadline -| @import("antfly_platform").time.monotonicNs();
-        const remaining = (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
-        const progress = try observeAccepted(server, a, consumer.table_name, consumer.target, namespace.revision, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request);
         applied = applied and progress.applied;
         try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .absorbed = absorbed_results.get(consumer.key_template) orelse &.{}, .changed = changed, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
     }
@@ -994,7 +993,41 @@ fn observeReplayAccepted(server: anytype, a: std.mem.Allocator, table_name: []co
     };
 }
 const ReplayFloor = struct { group: u64, sequence: u64 };
+fn observeConsumers(server: anytype, a: std.mem.Allocator, consumers: []const EntityConsumer, namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace), wait: ?resolver.curation.Wait, request: operation.RequestContext) ![]const Progress {
+    var tables: std.StringArrayHashMapUnmanaged(std.ArrayList(usize)) = .empty;
+    for (consumers, 0..) |consumer, i| {
+        const slot = try tables.getOrPut(a, consumer.table_name);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(a, i);
+    }
+    const result = try a.alloc(Progress, consumers.len);
+    const clock = @import("antfly_platform").time;
+    const deadline = clock.monotonicNs() +| @as(u64, if (wait) |value| value.timeout_ms else 0) * std.time.ns_per_ms;
+    for (tables.keys(), tables.values()) |table, selected| {
+        const targets = try a.alloc(ReplayRequirement, selected.items.len);
+        for (selected.items, targets) |index, *target| {
+            const consumer = consumers[index];
+            target.* = .{ .target = consumer.target, .revision = namespaces.get(consumer.key_template).?.revision, .floor = null };
+        }
+        const remaining = (deadline -| clock.monotonicNs() +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms;
+        const progress = observeReplayTargets(server, a, table, targets, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => try pendingProgress(a, targets.len, @errorName(err)),
+        };
+        for (selected.items, progress) |index, value| result[index] = value;
+    }
+    return result;
+}
+
+fn pendingProgress(a: std.mem.Allocator, count: usize, failure: []const u8) ![]const Progress {
+    const result = try a.alloc(Progress, count);
+    @memset(result, .{ .applied = false, .shards = &.{}, .observation_error = failure });
+    return result;
+}
 fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const u8, cfg: ObservationTarget, revision: u64, wait: ?resolver.curation.Wait, request: operation.RequestContext, floor: ?ReplayFloor) !Progress {
+    return (try observeReplayTargets(server, a, table_name, &.{.{ .target = cfg, .revision = revision, .floor = floor }}, wait, request))[0];
+}
+fn observeReplayTargets(server: anytype, a: std.mem.Allocator, table_name: []const u8, targets: []const ReplayRequirement, wait: ?resolver.curation.Wait, request: operation.RequestContext) ![]const Progress {
     const clock = @import("antfly_platform").time;
     const deadline = clock.monotonicNs() +| @as(u64, if (wait) |w| w.timeout_ms else 0) * std.time.ns_per_ms;
     while (true) {
@@ -1007,34 +1040,43 @@ fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const
         const scoped = server.source.vtable.supports_resolver_catalog_read;
         const page: ?catalog_read.Page = if (scoped) readResolverCatalog(server, scratch, .{ .table_name = table_name }, observation_request) catch |err| {
             try request.ensureActive();
-            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{}, .observation_error = @errorName(err) };
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return pendingProgress(a, targets.len, @errorName(err));
             return err;
         } else null;
         var snapshot = if (page) |*value| value.snapshot() else (server.source.linearizableSnapshot(observation_request) catch |err| {
             try request.ensureActive();
-            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{}, .observation_error = @errorName(err) };
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return pendingProgress(a, targets.len, @errorName(err));
             return err;
         }) orelse return error.TableNotFound;
         const table = tableByName(&snapshot, table_name) catch |err| {
             if (!scoped) server.source.freeAdminSnapshot(&snapshot);
             return err;
         };
-        const observation = sampleForReplay(server, scratch, &snapshot, table, observation_request, wait != null, .{ .target = cfg, .revision = revision, .floor = floor }) catch |err| {
+        const observation = sampleForRequirements(server, scratch, &snapshot, table, observation_request, wait != null, targets) catch |err| {
             if (!scoped) server.source.freeAdminSnapshot(&snapshot);
             try request.ensureActive();
-            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{}, .observation_error = @errorName(err) };
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return pendingProgress(a, targets.len, @errorName(err));
             return err;
         };
         if (!scoped) server.source.freeAdminSnapshot(&snapshot);
-        const progress = try observation.progressForReplay(scratch, .{ .target = cfg, .revision = revision, .floor = floor });
+        const progress = try scratch.alloc(Progress, targets.len);
+        var applied = true;
+        for (targets, progress) |target, *out| {
+            out.* = try observation.progressForReplay(scratch, target);
+            applied = applied and out.applied;
+        }
         const borrow = request.fanout_io orelse request.deadline_io;
-        if (progress.applied or clock.monotonicNs() >= deadline or borrow == null) {
-            const rows = try a.dupe(GroupProgress, progress.shards);
-            for (rows) |*row| {
-                row.resolution.blocked_reason = try a.dupe(u8, row.resolution.blocked_reason);
-                row.promotion.blocked_reason = try a.dupe(u8, row.promotion.blocked_reason);
+        if (applied or clock.monotonicNs() >= deadline or borrow == null) {
+            const owned = try a.alloc(Progress, progress.len);
+            for (progress, owned) |value, *out| {
+                const rows = try a.dupe(GroupProgress, value.shards);
+                for (rows) |*row| {
+                    row.resolution.blocked_reason = try a.dupe(u8, row.resolution.blocked_reason);
+                    row.promotion.blocked_reason = try a.dupe(u8, row.promotion.blocked_reason);
+                }
+                out.* = .{ .applied = value.applied, .shards = rows };
             }
-            return .{ .applied = progress.applied, .shards = rows };
+            return owned;
         }
         var receiver = try borrow.?.receive();
         try receiver.io().sleep(.fromNanoseconds(@intCast(@min(100 * std.time.ns_per_ms, deadline -| clock.monotonicNs()))), .awake);
@@ -1494,4 +1536,52 @@ test "resolver curation HTTP namespace edits preserve resolver-shaped proposal e
     const declaring = try owners(a, plan.indexes_json, "r");
     try std.testing.expectEqual(@as(usize, 1), declaring.len);
     try std.testing.expectEqualStrings("graph", declaring[0]);
+}
+
+test "resolver curation progress shares catalog and status reads across namespace consumers" {
+    const Snapshot = @import("../metadata/api.zig").AdminSnapshot;
+    const Source = struct {
+        vtable: struct { supports_resolver_catalog_read: bool = false } = .{},
+        reads: usize = 0,
+        snapshot: Snapshot,
+        pub fn systemCatalog(_: *@This(), _: std.mem.Allocator, _: operation.RequestContext, _: anytype) ![]u8 {
+            return error.UnsupportedOperation;
+        }
+        pub fn linearizableSnapshot(self: *@This(), _: operation.RequestContext) !?Snapshot {
+            self.reads += 1;
+            return self.snapshot;
+        }
+        pub fn freeAdminSnapshot(_: *@This(), _: *Snapshot) void {}
+    };
+    const Server = struct {
+        alloc: std.mem.Allocator,
+        source: Source,
+        samples: usize = 0,
+        pub fn localTableRuntimeStatusesWithSnapshot(self: *@This(), _: []const u8, _: anytype) !?runtime_status.LocalTableRuntimeStatuses {
+            self.samples += 1;
+            var row: runtime_status.LocalTableRuntimeStatus = .{ .group_id = 7, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{} };
+            row.stats.resolution = .{ .enabled = true };
+            row.stats.resolver_replay.resolvers = &.{ .{ .name = "concepts", .curation_revision = 4 }, .{ .name = "events", .curation_revision = 4 } };
+            var rows = [_]runtime_status.LocalTableRuntimeStatus{row};
+            const statuses: runtime_status.LocalTableRuntimeStatuses = .{ .items = &rows };
+            return try statuses.clone(self.alloc);
+        }
+        pub fn executeResolverOperation(_: *@This(), _: std.mem.Allocator, _: []const u8, _: u64, _: []const u8, _: operation.RequestContext) ![]u8 {
+            return error.UnsupportedOperation;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tables = [_]@import("../metadata/table_manager.zig").TableRecord{.{ .name = "source", .table_id = 1, .indexes_json = "{}" }};
+    var ranges = [_]@import("../metadata/table_manager.zig").RangeRecord{.{ .table_id = 1, .group_id = 7, .start_key = "" }};
+    var server: Server = .{ .alloc = std.testing.allocator, .source = .{ .snapshot = .{ .status = .{ .metadata_group_id = 0, .metrics = .{} }, .tables = &tables, .ranges = &ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} } } };
+    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+    try namespaces.put(a, "concept/{{ _entity.text }}", .{ .key_template = "concept/{{ _entity.text }}", .revision = 4 });
+    try namespaces.put(a, "event/{{ _entity.text }}", .{ .key_template = "event/{{ _entity.text }}", .revision = 5 });
+    const progress = try observeConsumers(&server, a, &.{ .{ .table_name = "source", .key_template = namespaces.keys()[0], .target = .{ .name = "concepts", .config_generation = 0, .promote = false } }, .{ .table_name = "source", .key_template = namespaces.keys()[1], .target = .{ .name = "events", .config_generation = 0, .promote = false } } }, namespaces, null, .{});
+    try std.testing.expectEqual(@as(usize, 1), server.source.reads);
+    try std.testing.expectEqual(@as(usize, 1), server.samples);
+    try std.testing.expect(progress[0].applied);
+    try std.testing.expect(!progress[1].applied);
 }

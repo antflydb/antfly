@@ -849,18 +849,42 @@ vector publication update projections atomically with their source. A phase-two
 readiness acknowledgement follows the native full-index publication barrier,
 current control/configuration checks, source dependency checks and live admin
 grant revalidation. Denied sources remain timed, fairly paginated readiness debt.
+A deadline or work limit on a later record checkpoints earlier completed records
+under the background owner's bounded publication window. A record that cannot
+fit a fresh quantum becomes timed retry debt, so it cannot starve later work.
 Recall and entity-semantic maintenance alternate when both are due. Configuration
 cutover retains the active projection generation while preparing the replacement;
 forgetting immediately excludes candidates, independently of physical cleanup.
 
-Ready searches fetch at most 128 ranked identities per page from a bounded
-4,096-candidate window. Only these projections and assertion records are hydrated;
+Full-text lane names are stable across configuration generations. Vector lane
+names remain qualified by generation and model. A durable `memory-index/`
+creation intent precedes native DDL; retirement can therefore find an index even
+if its projection publication was interrupted. Cleanup retires obsolete vector
+definitions after checking active and pending generations and current admin
+publication authority. Stable lexical definitions remain reusable.
+
+Ready searches create a fixed 4,096-identity ranked window before returning its
+first page, then hydrate at most 128 ranked identities per page. Only these projections and assertion records are hydrated;
 live policy still checks source authority, retention, lifecycle, temporal filters,
 canonical identities and history before recomputing lexical/cosine scores. Since
 assertion statements are immutable, current search projections also discover
 historical revisions; mutable lifecycle or verdict metadata is never used as
 indexed truth. Continuations bind the query and filters as well as principal,
-space and revision. The final window reports truncation without a continuation
+space and revision. ANN k and the fusion window stay fixed across all pages;
+continuations do not rerank successively larger prefixes. A content digest binds
+the identity sequence and query vector. A data-only cache holds at most 32 windows
+and 32 MiB for five minutes. Continuations normally reuse that window without
+another search or query embedding. After eviction or ingress failover, the same
+fixed search can reconstruct it; a different digest returns `MemoryCursorStale`.
+Expiry also returns a stale cursor. Authorization and source admission remain
+live on every page, including cache hits.
+
+Immutable predicate, scope, kind, environment and task filters constrain native
+lexical/ANN discovery before the ranked bound. Exact digest tokens live in each
+lane's indexed field; environment and task include the existing null wildcard.
+Each private/team lane applies its own indexed filter before fusion. Mutable
+lifecycle and time-dependent truth continue through live policy and historical
+validation. The final window reports truncation without a continuation
 when the ranked bound is exhausted. Full enumeration and spaces whose initial
 or replacement index is not yet ready retain the bounded primary scan, including
 existing scan continuations. Explicit graph seeds retain indexed adjacency.
@@ -875,7 +899,10 @@ Debug qualification of the first sparse lexical query after bulk publication:
 
 | Assertions | Indexed searches | Hydrated candidates | Primary assertion scans | Query time |
 | ---: | ---: | ---: | ---: | ---: |
-| 10,002 | 1 | 1 | 0 | 408.643 ms |
+| 10,002 | 1 | 1 | 0 | 434.030 ms |
+
+The same run also selects one `sparse-filter` predicate among 10,000 common-term
+assertions and hydrates exactly that candidate with no primary assertion scan.
 
 This fixture measures bounded retrieval and hydration on native storage, rather
 than semantic model quality or a production latency percentile.

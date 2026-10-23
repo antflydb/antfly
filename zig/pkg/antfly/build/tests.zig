@@ -6316,6 +6316,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     graph_runtime_test_step.dependOn(&addCuratedTestRunArtifact(b, graph_ordered_runtime_tests, &graph_ordered_runtime_filters).step);
 
+    const resolver_candidate_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"SourceCandidateProvider"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-resolver-candidate-test", "Verify bounded resolver candidate retrieval and provider batches")
+        .dependOn(&addFilteredTestRunArtifact(b, resolver_candidate_tests).step);
+
     const resolver_backfill_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "upsertResolver", "managed resolver", "resolver worker resumes durable backfill" },

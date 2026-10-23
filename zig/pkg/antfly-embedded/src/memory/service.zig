@@ -25,6 +25,8 @@ const prov = t.provenance;
 const A = std.mem.Allocator;
 const eql = std.mem.eql;
 const curation = @import("antfly_resolver").curation;
+const recall_filters = @import("recall_filters.zig");
+const recall_windows = @import("recall_windows.zig");
 const graph_recall = @import("graph_recall.zig");
 const lexical = @import("lexical.zig");
 const max_dependency_depth: u8 = 32;
@@ -94,6 +96,7 @@ pub const RecallSearchRequest = struct {
     text_indexes: []const []const u8,
     vector_indexes: []const []const u8 = &.{},
     query: []const u8,
+    filters: recall_filters.Filters = .{},
     embedding: ?[]const f32 = null,
     offset: u32 = 0,
     limit: u16 = 128,
@@ -114,6 +117,7 @@ pub const Backend = struct {
     embed: ?*const fn (*anyopaque, A, t.Model, []const u8) anyerror![]const f32 = null,
     embed_batch: ?*const fn (*anyopaque, A, t.Model, []const []const u8, EmbeddingRole) anyerror![]const []const f32 = null,
     embed_document: ?*const fn (*anyopaque, A, t.Model, []const u8) anyerror![]const f32 = null,
+    drop_index: ?*const fn (*anyopaque, A, []const u8) anyerror!void = null,
     ensure_text_index: ?*const fn (*anyopaque, A, []const u8) anyerror!void = null,
     search_assertions: ?*const fn (*anyopaque, A, RecallSearchRequest) anyerror!RecallSearchPage = null,
     ensure_vector_index: ?*const fn (*anyopaque, A, []const u8, u32) anyerror!void = null,
@@ -2809,7 +2813,7 @@ const Run = struct {
         }
         inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }, 0..) |kind, slot| {
             if (old_documents[slot] == null or old_documents[slot].?.query_embedding != null or !try self.semanticCurrent(old_documents[slot].?, record, view)) {
-                try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, try self.semanticIndexName(record, kind), model.dimensions.?);
+                try self.ensureMemoryIndex(try self.semanticIndexName(record, kind), .{ .kind = .semantic, .generation = self.state.config.embedding_generation }, model.dimensions.?);
                 try self.put(paths[slot], documents[slot]);
                 progressed.* = true;
             }
@@ -2921,7 +2925,7 @@ const Run = struct {
                         const text = if (kind == .names) try self.semanticNames(record.entity) else view.description;
                         const model = self.state.config.models.embedder.?;
                         const index_name = try self.semanticIndexName(record, kind);
-                        try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, index_name, model.dimensions.?);
+                        try self.ensureMemoryIndex(index_name, .{ .kind = .semantic, .generation = self.state.config.embedding_generation }, model.dimensions.?);
                         const reusable = if (existing) |prior| prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and eql(u8, prior.text, text) and valueEqual(t.Model, prior.model, model) else false;
                         const embedding = if (reusable) existing.?.embedding else blk: {
                             break :blk try self.semanticEmbedding(record, model, text, captured.resources, progressed.*, false);
@@ -3986,7 +3990,7 @@ const Run = struct {
     }
     const VectorProjection = struct { assertion_id: []const u8, generation: u64, model: t.Model, statement_hash: []const u8, embedding: []const f32 };
     fn recallScope(self: *Run, config: t.Config, audience: []const u8) ![]const u8 {
-        return hash(self.a, .{ config.generation, config.embedding_generation, config.models.embedder, audience });
+        return hash(self.a, .{ "recall/v2", config.generation, config.embedding_generation, config.models.embedder, audience });
     }
     fn recallProjectionKey(self: *Run, config: t.Config, id: []const u8) ![]const u8 {
         return std.fmt.allocPrint(self.a, "assertion-recall/{d:0>20}/{s}", .{ config.generation, try hash(self.a, id) });
@@ -3995,17 +3999,49 @@ const Run = struct {
         return if (record.assertion.visibility == .team) "team" else try std.fmt.allocPrint(self.a, "private/{s}", .{record.owner});
     }
     fn recallIndexName(self: *Run, config: t.Config, audience: []const u8, vector: bool) ![]const u8 {
-        return std.fmt.allocPrint(self.a, "memory_recall_{s}_{s}", .{ if (vector) "vector" else "text", try self.recallScope(config, audience) });
+        return std.fmt.allocPrint(self.a, "memory_recall_{s}_{s}", .{ if (vector) "vector" else "text", if (vector) try self.recallScope(config, audience) else try hash(self.a, .{ "lexical/v2", audience }) });
     }
     fn recallAudienceKey(self: *Run, config: t.Config, audience: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(self.a, "assertion-recall-audience/{s}", .{try self.recallScope(config, audience)});
+        return std.fmt.allocPrint(self.a, "assertion-recall-audience-v2/{s}", .{try self.recallScope(config, audience)});
+    }
+    const IndexLease = struct { kind: enum { lexical, recall, semantic }, generation: u64 };
+    fn ensureMemoryIndex(self: *Run, name: []const u8, lease: IndexLease, dimensions: ?u32) !void {
+        if (self.service.backend.drop_index != null) {
+            const path = try std.fmt.allocPrint(self.a, "memory-index/{s}", .{name});
+            if (try self.read(IndexLease, path) == null) {
+                // Publish the intent before DDL. An interrupted creation is
+                // discoverable even when its projection transaction aborts.
+                try self.requireAdmin();
+                try self.service.context.finish();
+                const encoded = try self.encode(lease);
+                try self.service.backend.commit(self.service.backend.ptr, self.a, self.state_row, &.{.{ .key = path, .json = encoded }});
+                try self.backend_rows.put(self.a, path, encoded);
+            }
+        }
+        if (dimensions) |dims| try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, name, dims) else try self.service.backend.ensure_text_index.?(self.service.backend.ptr, self.a, name);
+    }
+    fn indexLeaseLive(config: t.Config, lease: IndexLease) bool {
+        return switch (lease.kind) {
+            .lexical => true,
+            .recall => config.features.semantic_recall and lease.generation == config.generation,
+            .semantic => (config.semantic_discovery.enabled or config.features.semantic_recall) and lease.generation == config.embedding_generation,
+        };
+    }
+    fn dropMemoryIndex(self: *Run, name: []const u8) !void {
+        const drop = self.service.backend.drop_index orelse return;
+        try self.requireAdmin();
+        try self.service.context.finish();
+        const latest = (try self.service.backend.get(self.service.backend.ptr, self.a, "control")) orelse return error.MemorySpaceNotFound;
+        const expected = self.state_row orelse return error.MemorySpaceNotFound;
+        if (latest.version != expected.version or !eql(u8, latest.json, expected.json)) return error.MemoryRevisionConflict;
+        try drop(self.service.backend.ptr, self.a, name);
     }
     fn ensureRecallAudience(self: *Run, config: t.Config, audience: []const u8) !void {
         const path = try self.recallAudienceKey(config, audience);
         if (try self.read(bool, path) != null) return;
         try self.requireAdmin();
-        try self.service.backend.ensure_text_index.?(self.service.backend.ptr, self.a, try self.recallIndexName(config, audience, false));
-        if (config.features.semantic_recall) try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, try self.recallIndexName(config, audience, true), config.models.embedder.?.dimensions.?);
+        try self.ensureMemoryIndex(try self.recallIndexName(config, audience, false), .{ .kind = .lexical, .generation = 0 }, null);
+        if (config.features.semantic_recall) try self.ensureMemoryIndex(try self.recallIndexName(config, audience, true), .{ .kind = .recall, .generation = config.generation }, config.models.embedder.?.dimensions.?);
         try self.put(path, true);
     }
     fn updateRecallProjection(self: *Run, config: t.Config, record: t.StoredAssertion) anyerror!void {
@@ -4018,7 +4054,7 @@ const Run = struct {
         const embedding = if (config.features.semantic_recall) try self.vectorFor(config, record.assertion) else null;
         const statement_hash = try hash(self.a, record.assertion.statement);
         if (try self.read(t.RecallProjection, path)) |prior| {
-            if (prior.generation == config.generation and eql(u8, prior.owner, record.owner) and prior.visibility == record.assertion.visibility and eql(u8, prior.statement_hash, statement_hash) and valueEqual(?[]const f32, prior.embedding, embedding)) {
+            if (prior.version == 2 and prior.generation == config.generation and eql(u8, prior.owner, record.owner) and prior.visibility == record.assertion.visibility and eql(u8, prior.statement_hash, statement_hash) and valueEqual(?[]const f32, prior.embedding, embedding)) {
                 try self.remove(try key(self.a, "assertion-recall-work", record.assertion.id));
                 try self.remove(try key(self.a, "assertion-recall-blocked", record.assertion.id));
                 return;
@@ -4038,7 +4074,7 @@ const Run = struct {
             text_indexes[i] = try self.recallIndexName(config, scope, false);
             vector_indexes[i] = try self.recallIndexName(config, scope, true);
         }
-        try self.put(path, t.RecallProjection{ .assertion_id = record.assertion.id, .assertion_key = try key(self.a, "assertion", record.assertion.id), .generation = config.generation, .statement_hash = statement_hash, .owner = record.owner, .visibility = record.assertion.visibility, .text = record.assertion.statement, .text_indexes = &text_indexes, .vector_indexes = if (embedding != null) &vector_indexes else &.{}, .embedding = embedding });
+        try self.put(path, t.RecallProjection{ .version = 2, .assertion_id = record.assertion.id, .assertion_key = try key(self.a, "assertion", record.assertion.id), .generation = config.generation, .statement_hash = statement_hash, .owner = record.owner, .visibility = record.assertion.visibility, .text = record.assertion.statement, .filter_terms = try recall_filters.terms(self.a, record.assertion), .text_indexes = &text_indexes, .vector_indexes = if (embedding != null) &vector_indexes else &.{}, .embedding = embedding });
         const binding_key = try key(self.a, "assertion-recall-binding", record.assertion.id);
         const Binding = struct { paths: []const []const u8 = &.{} };
         const old = (try self.read(Binding, binding_key)) orelse Binding{};
@@ -4060,38 +4096,63 @@ const Run = struct {
         if (self.service.backend.search_assertions == null) return;
         try self.requireAdmin();
         var index = (try self.read(t.RecallIndex, "assertion-recall-index")) orelse t.RecallIndex{};
-        if (index.generation != self.state.config.generation) index = .{ .generation = self.state.config.generation };
+        if (index.version != 2 or index.generation != self.state.config.generation) {
+            if (index.version != 2) try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
+            index = .{ .generation = self.state.config.generation };
+        }
         index.complete = false;
         const initial = !index.backfill_complete;
         const blocked = !initial and (try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion-recall-work/", null, 1)).rows.len == 0;
         if (blocked and index.next_retry_at > self.service.context.now_ms) return;
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, if (initial) "assertion/" else if (blocked) "assertion-recall-blocked/" else "assertion-recall-work/", if (initial or blocked) index.cursor else null, 8);
+        var position = if (initial or blocked) index.cursor else null;
+        var progressed = false;
+        var yielded = false;
         for (page.rows) |row| {
+            const checkpoint = try self.a.dupe(Change, self.changes.items);
             const record = if (initial) try parse(t.StoredAssertion, self.a, row.json) else blk: {
                 const work = try parse(struct { id: []const u8 }, self.a, row.json);
                 break :blk (try self.assertion(work.id)) orelse {
                     try self.remove(row.key);
+                    progressed = true;
                     continue;
                 };
             };
-            try self.ensureRecallAudience(self.state.config, "all");
-            try self.ensureRecallAudience(self.state.config, try self.recallAudience(record));
-            self.updateRecallProjection(self.state.config, record) catch |err| {
-                if (err != error.MemorySourceAccessDenied) return err;
-                try self.put(try key(self.a, "assertion-recall-blocked", record.assertion.id), .{ .id = record.assertion.id });
-                try self.remove(try key(self.a, "assertion-recall-work", record.assertion.id));
+            self.recallRecord(record) catch |err| {
+                if (err == error.MemorySourceAccessDenied) {
+                    try self.resetChanges(checkpoint);
+                    try self.put(try key(self.a, "assertion-recall-blocked", record.assertion.id), .{ .id = record.assertion.id });
+                    try self.remove(try key(self.a, "assertion-recall-work", record.assertion.id));
+                } else if (isProcessingTimeout(err) or err == error.MemoryWorkLimit) {
+                    try self.resetChanges(checkpoint);
+                    if (isProcessingTimeout(err)) try self.service.context.beginCheckpoint();
+                    if (!progressed) {
+                        // A record that cannot fit a fresh quantum is durable,
+                        // timed debt. Advance past it so other records can run.
+                        try self.put(try key(self.a, "assertion-recall-blocked", record.assertion.id), .{ .id = record.assertion.id });
+                        try self.remove(try key(self.a, "assertion-recall-work", record.assertion.id));
+                        position = row.key;
+                    }
+                    yielded = true;
+                    break;
+                } else return err;
             };
-            if (initial) index.cursor = row.key;
+            position = row.key;
+            progressed = true;
         }
-        if (initial and page.next == null) {
-            index.backfill_complete = true;
-            index.cursor = null;
-        }
-        if (blocked) index.cursor = page.next;
+        if (initial) {
+            index.cursor = if (yielded) position else page.next;
+            index.backfill_complete = !yielded and page.next == null;
+        } else if (blocked) index.cursor = if (yielded) position else page.next;
         index.next_retry_at = self.service.context.now_ms +| (if (blocked and page.next != null) @as(i64, 0) else resource_check_interval_ms);
         index.yield_to_semantic = true;
-        self.recall_ready_after_commit = index.backfill_complete;
+        self.recall_ready_after_commit = index.backfill_complete and !yielded;
         try self.put("assertion-recall-index", index);
+    }
+    fn recallRecord(self: *Run, record: t.StoredAssertion) !void {
+        try self.ensureRecallAudience(self.state.config, "all");
+        try self.ensureRecallAudience(self.state.config, try self.recallAudience(record));
+        try self.updateRecallProjection(self.state.config, record);
     }
     fn finishRecallPublication(self: *Run) !void {
         if (!self.recall_ready_after_commit) return;
@@ -4424,13 +4485,31 @@ const Run = struct {
         } else if (std.mem.startsWith(u8, row.key, "generation-input/")) {
             const owner_key = row.key["generation-input/".len..];
             if (try self.read(std.json.Value, owner_key) == null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "memory-index/")) {
+            const lease = try parse(IndexLease, self.a, row.json);
+            if (!indexLeaseLive(self.state.config, lease) and (self.state.pending_config == null or !indexLeaseLive(self.state.pending_config.?, lease))) {
+                try self.dropMemoryIndex(row.key["memory-index/".len..]);
+                try self.remove(row.key);
+            }
+        } else if (std.mem.startsWith(u8, row.key, "assertion-recall-audience/")) {
+            const scope = row.key["assertion-recall-audience/".len..];
+            if (scope.len != 64) return error.MemoryCorruptState;
+            try self.dropMemoryIndex(try std.fmt.allocPrint(self.a, "memory_recall_text_{s}", .{scope}));
+            try self.dropMemoryIndex(try std.fmt.allocPrint(self.a, "memory_recall_vector_{s}", .{scope}));
+            try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "assertion-recall/")) {
             const projection = try parse(t.RecallProjection, self.a, row.json);
-            if ((projection.generation != self.state.config.generation and (self.state.pending_config == null or projection.generation != self.state.pending_config.?.generation)) or try self.assertion(projection.assertion_id) == null) try self.remove(row.key);
+            if (projection.version < 2 or (projection.generation != self.state.config.generation and (self.state.pending_config == null or projection.generation != self.state.pending_config.?.generation)) or try self.assertion(projection.assertion_id) == null) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "entity-semantic/") or std.mem.startsWith(u8, row.key, "entity-semantic-query/")) {
             const query_role = std.mem.startsWith(u8, row.key, "entity-semantic-query/");
             const projection = try parse(t.EntityProjection, self.a, row.json);
             const record = try self.read(t.EntityRecord, try key(self.a, "entity", projection.entity_id));
+            const lease: IndexLease = .{ .kind = .semantic, .generation = projection.generation };
+            if (!query_role and !indexLeaseLive(self.state.config, lease) and (self.state.pending_config == null or !indexLeaseLive(self.state.pending_config.?, lease))) {
+                const rest = row.key["entity-semantic/".len..];
+                const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.MemoryCorruptState;
+                try self.put(try std.fmt.allocPrint(self.a, "memory-index/{s}", .{rest[0..slash]}), lease);
+            }
             if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?) or !eql(u8, row.key, if (query_role) try self.semanticQueryKey(record.?, projection.kind) else try self.semanticProjectionKey(record.?, projection.kind))) {
                 try self.remove(row.key);
             } else {
@@ -5304,7 +5383,7 @@ const Run = struct {
         if (!relationsMatch(request, record.assertion)) return null;
         return .{ .memory = record, .score = score, .historical = historical, .citations = support.evidence };
     }
-    fn indexedRecallPage(self: *Run, request: t.Recall, vector: ?[]const f32, offset: u32) !struct { records: []const t.StoredAssertion, more: bool } {
+    fn recallWindow(self: *Run, request: t.Recall, vector: ?[]const f32) !recall_windows.Window {
         var text: std.ArrayList([]const u8) = .empty;
         var dense: std.ArrayList([]const u8) = .empty;
         const scopes: []const []const u8 = if (self.service.context.admin) &.{"all"} else &.{ "team", try std.fmt.allocPrint(self.a, "private/{s}", .{self.service.context.principal}) };
@@ -5313,16 +5392,20 @@ const Run = struct {
             try text.append(self.a, try self.recallIndexName(self.state.config, scope, false));
             if (vector != null) try dense.append(self.a, try self.recallIndexName(self.state.config, scope, true));
         }
-        if (text.items.len == 0) return .{ .records = &.{}, .more = false };
-        const page = self.service.backend.search_assertions.?(self.service.backend.ptr, self.a, .{ .text_indexes = text.items, .vector_indexes = dense.items, .query = request.query, .embedding = vector, .offset = offset }) catch |err| switch (err) {
+        if (text.items.len == 0) return .{ .keys = &.{}, .vector = vector, .truncated = false };
+        const page = self.service.backend.search_assertions.?(self.service.backend.ptr, self.a, .{ .text_indexes = text.items, .vector_indexes = dense.items, .query = request.query, .filters = .{ .predicate = request.predicate, .scope = request.scope, .kind = if (request.kind) |kind| @tagName(kind) else null, .environment = request.environment, .task = request.task }, .embedding = vector, .limit = recall_windows.max_candidates }) catch |err| switch (err) {
             error.IndexNotFound, error.IndexRebuilding => return error.MemoryCapabilityUnavailable,
             else => return err,
         };
-        if (page.keys.len > 128) return error.MemoryCorruptState;
-        try self.prefetch(page.keys);
+        if (page.keys.len > recall_windows.max_candidates) return error.MemoryCorruptState;
+        return .{ .keys = page.keys, .vector = vector, .truncated = page.more };
+    }
+    fn indexedRecallPage(self: *Run, keys: []const []const u8) ![]const t.StoredAssertion {
+        if (keys.len > recall_windows.page_size) return error.MemoryCorruptState;
+        try self.prefetch(keys);
         var projections: std.ArrayList(t.RecallProjection) = .empty;
         var paths: std.ArrayList([]const u8) = .empty;
-        for (page.keys) |path| {
+        for (keys) |path| {
             if (!std.mem.startsWith(u8, path, "assertion-recall/")) return error.MemoryCorruptState;
             const projection = (try self.read(t.RecallProjection, path)) orelse continue;
             if (projection.generation != self.state.config.generation) continue;
@@ -5339,7 +5422,7 @@ const Run = struct {
             try seen.put(self.a, record.assertion.id, {});
             try records.append(self.a, record);
         }
-        return .{ .records = records.items, .more = page.more };
+        return records.items;
     }
     fn recall(self: *Run, request: t.Recall) ![]const u8 {
         self.historical_resource_reads = request.known_at != null;
@@ -5355,44 +5438,72 @@ const Run = struct {
             if (request.embedding_model == null or !valueEqual(t.Model, request.embedding_model.?, model) or supplied.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
             for (supplied) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
         }
-        if (self.state.config.features.semantic_recall and vector == null and request.query.len > 0) vector = try self.embed(self.state.config.models.embedder.?, request.query, .empty);
         var more = false;
         if (request.graph) |options| try graph_recall.validate(options);
         const explicit_seeds = if (request.graph) |options| options.entity_seeds.len > 0 else false;
         if (explicit_seeds and request.cursor != null) return error.InvalidMemoryRequest;
         var scoped_request = request;
         scoped_request.cursor = null;
-        const indexed_scope = try std.fmt.allocPrint(self.a, "recall/v1/{s}/", .{try hash(self.a, scoped_request)});
+        const indexed_scope = try std.fmt.allocPrint(self.a, "recall/v2/{s}/", .{try hash(self.a, .{ scoped_request, self.state.table_id, self.state.database, self.state.namespace, self.state.space, self.state.created_at, self.state.revision, self.state.config.generation, self.service.context.principal })});
         const legacy_cursor = if (request.cursor) |cursor| blk: {
             const colon = std.mem.lastIndexOfScalar(u8, cursor, ':') orelse return error.InvalidMemoryCursor;
             break :blk std.mem.startsWith(u8, cursor[colon + 1 ..], "assertion/");
         } else false;
         const index = if (self.service.backend.search_assertions != null) try self.read(t.RecallIndex, "assertion-recall-index") else null;
-        const indexed = !explicit_seeds and !legacy_cursor and (request.query.len > 0 or vector != null) and index != null and index.?.version == 1 and index.?.complete and index.?.generation == self.state.config.generation and (try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion-recall-work/", null, 1)).rows.len == 0;
+        const indexed = !explicit_seeds and !legacy_cursor and (request.query.len > 0 or vector != null) and index != null and index.?.version == 2 and index.?.complete and index.?.generation == self.state.config.generation and (try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion-recall-work/", null, 1)).rows.len == 0;
         if (indexed) {
-            const position = try self.decodeCursor(indexed_scope, request.cursor);
-            const offset = if (position) |value| std.fmt.parseInt(u32, value[indexed_scope.len..], 10) catch return error.InvalidMemoryCursor else 0;
-            if (offset >= 4096 or offset % 128 != 0) return error.InvalidMemoryCursor;
-            const page = try self.indexedRecallPage(request, vector, offset);
-            scanned = page.records.len;
-            for (page.records) |record| if (try self.recallHit(record, request, vector, true)) |hit| try hits.append(self.a, hit);
-            more = page.more;
-            after = if (page.more and offset + 128 < 4096) try std.fmt.allocPrint(self.a, "{s}{d}", .{ indexed_scope, offset + 128 }) else null;
-        } else if (!explicit_seeds) {
-            after = try self.decodeCursor("assertion/", request.cursor);
-            while (!explicit_seeds) {
-                try self.service.context.check();
-                const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", after, 128);
-                for (page.rows) |row| {
-                    scanned += 1;
-                    const record = try parse(t.StoredAssertion, self.a, row.json);
-                    if (try self.recallHit(record, request, vector, true)) |hit| try hits.append(self.a, hit);
-                }
-                after = page.next;
-                if (after == null) break;
-                if (scanned >= 4096) {
-                    more = true;
-                    break;
+            const now = self.service.context.currentTime();
+            var offset: usize = 0;
+            var expected: ?[32]u8 = null;
+            var expires = now +| recall_windows.ttl_ms;
+            if (try self.decodeCursor(indexed_scope, request.cursor)) |position| {
+                var fields = std.mem.splitScalar(u8, position[indexed_scope.len..], '/');
+                const encoded = fields.next() orelse return error.InvalidMemoryCursor;
+                if (encoded.len != 64) return error.InvalidMemoryCursor;
+                var digest: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&digest, encoded) catch return error.InvalidMemoryCursor;
+                expected = digest;
+                offset = std.fmt.parseInt(usize, fields.next() orelse return error.InvalidMemoryCursor, 10) catch return error.InvalidMemoryCursor;
+                expires = std.fmt.parseInt(i64, fields.next() orelse return error.InvalidMemoryCursor, 10) catch return error.InvalidMemoryCursor;
+                if (fields.next() != null or offset == 0 or offset >= recall_windows.max_candidates or offset % recall_windows.page_size != 0) return error.InvalidMemoryCursor;
+                if (expires <= now or expires > now +| recall_windows.ttl_ms) return error.MemoryCursorStale;
+            }
+            var cached: ?recall_windows.Window = if (expected) |digest| try recall_windows.get(self.a, digest, now) else null;
+            if (cached == null) {
+                if (self.state.config.features.semantic_recall and vector == null and request.query.len > 0) vector = try self.embed(self.state.config.models.embedder.?, request.query, .empty);
+                cached = try self.recallWindow(request, vector);
+                const digest = try recall_windows.fingerprint(self.a, indexed_scope, cached.?);
+                if (expected) |prior| if (!eql(u8, &prior, &digest)) return error.MemoryCursorStale;
+                expected = digest;
+                try recall_windows.put(digest, now, cached.?);
+            }
+            const window = cached.?;
+            vector = window.vector;
+            if (offset > window.keys.len) return error.InvalidMemoryCursor;
+            const end = @min(window.keys.len, offset + recall_windows.page_size);
+            const records = try self.indexedRecallPage(window.keys[offset..end]);
+            scanned = records.len;
+            for (records) |record| if (try self.recallHit(record, request, vector, true)) |hit| try hits.append(self.a, hit);
+            more = end < window.keys.len or window.truncated;
+            after = if (end < window.keys.len) try std.fmt.allocPrint(self.a, "{s}{s}/{d}/{d}", .{ indexed_scope, std.fmt.bytesToHex(expected.?, .lower), end, expires }) else null;
+        } else {
+            if (self.state.config.features.semantic_recall and vector == null and request.query.len > 0) vector = try self.embed(self.state.config.models.embedder.?, request.query, .empty);
+            if (!explicit_seeds) {
+                after = try self.decodeCursor("assertion/", request.cursor);
+                while (!explicit_seeds) {
+                    try self.service.context.check();
+                    const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", after, 128);
+                    for (page.rows) |row| {
+                        scanned += 1;
+                        const record = try parse(t.StoredAssertion, self.a, row.json);
+                        if (try self.recallHit(record, request, vector, true)) |hit| try hits.append(self.a, hit);
+                    }
+                    after = page.next;
+                    if (after == null) break;
+                    if (scanned >= 4096) {
+                        more = true;
+                        break;
+                    }
                 }
             }
         }
@@ -5783,4 +5894,17 @@ test "memory projection provenance equality validates all values without allocat
     projection.text = "Name\nAlias";
     projection.embedding = &.{1};
     try std.testing.expect(!try run.semanticCurrent(projection, record, view));
+}
+
+test "memory index retirement retains an embedding generation still reserved by semantic recall" {
+    var config: t.Config = .{ .embedding_generation = 7, .features = .{ .semantic_recall = true } };
+    try std.testing.expect(Run.indexLeaseLive(config, .{ .kind = .semantic, .generation = 7 }));
+    try std.testing.expect(!Run.indexLeaseLive(config, .{ .kind = .semantic, .generation = 6 }));
+    config.features.semantic_recall = false;
+    try std.testing.expect(!Run.indexLeaseLive(config, .{ .kind = .semantic, .generation = 7 }));
+    // Re-enabling either semantic feature after both were disabled allocates a
+    // new embedding generation; a retired name cannot become current again.
+    config.embedding_generation = 8;
+    config.semantic_discovery.enabled = true;
+    try std.testing.expect(!Run.indexLeaseLive(config, .{ .kind = .semantic, .generation = 7 }));
 }

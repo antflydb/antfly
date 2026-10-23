@@ -37,7 +37,11 @@ pub const Bridge = struct {
     }
 
     pub fn backend(self: *Bridge) service.Backend {
-        return .{ .ptr = self, .get = get, .get_many = if (self.base.get_many != null) getMany else null, .ensure_text_index = if (self.base.ensure_text_index != null) ensureTextIndex else null, .search_assertions = if (self.base.search_assertions != null) searchAssertions else null, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .embed_document = embedDocument, .embed_batch = embedBatch, .neighbors = if (self.base.neighbors != null) neighbors else null, .ensure_vector_index = if (self.base.ensure_vector_index != null) ensureVectorIndex else null, .validate_models = validate };
+        return .{ .ptr = self, .get = get, .get_many = if (self.base.get_many != null) getMany else null, .drop_index = if (self.base.drop_index != null) dropIndex else null, .ensure_text_index = if (self.base.ensure_text_index != null) ensureTextIndex else null, .search_assertions = if (self.base.search_assertions != null) searchAssertions else null, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .embed_document = embedDocument, .embed_batch = embedBatch, .neighbors = if (self.base.neighbors != null) neighbors else null, .ensure_vector_index = if (self.base.ensure_vector_index != null) ensureVectorIndex else null, .validate_models = validate };
+    }
+    fn dropIndex(ptr: *anyopaque, a: A, name: []const u8) !void {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        return self.base.drop_index.?(self.base.ptr, a, name);
     }
     fn ensureTextIndex(ptr: *anyopaque, a: A, name: []const u8) anyerror!void {
         const self: *Bridge = @ptrCast(@alignCast(ptr));

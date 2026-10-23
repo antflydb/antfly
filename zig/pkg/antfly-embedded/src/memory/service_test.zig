@@ -28,6 +28,8 @@ const Store = struct {
     resource_digest: ?[32]u8 = null,
     resource_json: []const u8 = "{\"message\":\"Approved deployment\"}",
     resource_reads: usize = 0,
+    resource_failure_id: ?[]const u8 = null,
+    index_drops: usize = 0,
     reads: usize = 0,
     scans: usize = 0,
     entity_scans: usize = 0,
@@ -55,6 +57,7 @@ const Store = struct {
     fn resource(ptr: *anyopaque, a: A, reference: m.types.provenance.Resource) !m.types.provenance.Snapshot {
         const self: *Store = @ptrCast(@alignCast(ptr));
         self.resource_reads += 1;
+        if (self.resource_failure_id) |id| if (std.mem.eql(u8, reference.id, id)) return error.DeadlineExceeded;
         if ((reference.table_id != 0 and reference.table_id != 7) or !std.mem.eql(u8, reference.database, "default") or !std.mem.eql(u8, reference.namespace, "public")) return .{ .state = .denied };
         if (self.resource_state != .current) return .{ .state = self.resource_state };
         var snapshot = try m.types.provenance.snapshot(a, reference, 7, self.resource_revision, self.resource_json, self.resource_digest);
@@ -95,7 +98,10 @@ const Store = struct {
         for (changes) |change| {
             if (change.json) |json| try self.values.put(a, try a.dupe(u8, change.key), try a.dupe(u8, json)) else _ = self.values.remove(change.key);
         }
-        self.revision += 1;
+        for (changes) |change| if (std.mem.eql(u8, change.key, "control")) {
+            self.revision += 1;
+            break;
+        };
     }
     fn run(self: *Store, action: m.Action, id: []const u8, body: []const u8, token: []const u8, now: i64) ![]u8 {
         return self.service("alice", true, now).execute(std.testing.allocator, action, id, body, token);
@@ -6887,8 +6893,17 @@ test "memory indexed assertion recall has bounded hydration scoped cursors and i
     const page = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try svc.execute(a, .recall, "", "{\"query\":\"common\",\"token_budget\":8192}", ""), .{});
     try std.testing.expect(page.truncated and page.next_cursor != null);
     try std.testing.expectEqual(@as(usize, 128), page.scanned);
+    const query_count = store.query_calls;
     const next = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try svc.execute(a, .recall, "", try std.json.Stringify.valueAlloc(a, .{ .query = "common", .cursor = page.next_cursor, .token_budget = @as(u32, 8192) }, .{}), ""), .{});
     try std.testing.expectEqual(@as(usize, 2), next.scanned);
+    try std.testing.expectEqual(query_count, store.query_calls);
+    @import("recall_windows.zig").resetForTesting();
+    const reconstructed = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try svc.execute(a, .recall, "", try std.json.Stringify.valueAlloc(a, .{ .query = "common", .cursor = page.next_cursor, .token_budget = @as(u32, 8192) }, .{}), ""), .{});
+    try std.testing.expectEqualDeep(next, reconstructed);
+    try std.testing.expectEqual(query_count + 1, store.query_calls);
+    var expired = svc;
+    expired.context.now_ms += @import("recall_windows.zig").ttl_ms;
+    try std.testing.expectError(error.MemoryCursorStale, expired.execute(a, .recall, "", try std.json.Stringify.valueAlloc(a, .{ .query = "common", .cursor = page.next_cursor, .token_budget = @as(u32, 8192) }, .{}), ""));
     try std.testing.expectError(error.InvalidMemoryCursor, svc.execute(a, .recall, "", try std.json.Stringify.valueAlloc(a, .{ .query = "unicorn", .cursor = page.next_cursor, .token_budget = @as(u32, 8192) }, .{}), ""));
     try std.testing.expectEqual(scans, store.assertion_scans);
     _ = try svc.execute(a, .forget, "", "{\"assertion_ids\":[\"fact-129\"]}", "forget");
@@ -7081,4 +7096,73 @@ test "memory indexed assertion lanes isolate private owners without primary scan
         for (result.items) |hit| try std.testing.expect(hit.memory.assertion.visibility == .team or std.mem.eql(u8, principal, hit.memory.owner));
     }
     try std.testing.expectEqual(scans, store.assertion_scans);
+}
+
+test "memory recall checkpoints a completed assertion before a later source deadline" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = IndexedRecallFixture.service(&store, 10);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "",
+        \\{"evidence":[{"id":"a","resource_selector":{"table":"business","id":"good"}},{"id":"b","resource_selector":{"table":"business","id":"slow"}}],"assertions":[{"id":"a","subject":"s","predicate":"p","value":"a","statement":"good fact","evidence":[{"id":"a"}]},{"id":"b","subject":"s","predicate":"p","value":"b","statement":"slow fact","evidence":[{"id":"b"}]}]}
+    , "observe");
+    store.resource_failure_id = "slow";
+    _ = try svc.execute(a, .advance, "", "{}", "first");
+    var rows = try Store.scan(&store, a, "assertion-recall/", null, 8);
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+    var index = try std.json.parseFromSliceLeaky(m.types.RecallIndex, a, store.values.get("assertion-recall-index").?, .{});
+    try std.testing.expect(!index.complete);
+    try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "assertion-recall-work/", null, 8)).rows.len);
+    // A second fresh quantum cannot process the slow record: preserve it as
+    // retry debt and advance the scan rather than starving every later record.
+    _ = try svc.execute(a, .advance, "", "{}", "second");
+    try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "assertion-recall-blocked/", null, 8)).rows.len);
+    store.resource_failure_id = null;
+    var later = svc;
+    later.context.now_ms = 40000;
+    try IndexedRecallFixture.drain(later, a, "resume");
+    rows = try Store.scan(&store, a, "assertion-recall/", null, 8);
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+    index = try std.json.parseFromSliceLeaky(m.types.RecallIndex, a, store.values.get("assertion-recall-index").?, .{});
+    try std.testing.expect(index.complete);
+}
+
+test "memory index creation intents survive interrupted DDL and retire obsolete generations" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const Lifecycle = struct {
+        fn ensure(ptr: *anyopaque, _: A, _: []const u8) !void {
+            const self: *Store = @ptrCast(@alignCast(ptr));
+            if (self.failures > 0) {
+                self.failures -= 1;
+                return error.DeadlineExceeded;
+            }
+        }
+        fn drop(ptr: *anyopaque, _: A, _: []const u8) !void {
+            const self: *Store = @ptrCast(@alignCast(ptr));
+            self.index_drops += 1;
+        }
+    };
+    var svc = IndexedRecallFixture.service(&store, 10);
+    svc.backend.ensure_text_index = Lifecycle.ensure;
+    svc.backend.drop_index = Lifecycle.drop;
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", source, "evidence");
+    _ = try svc.execute(a, .assertions, "", helm, "assertions");
+    store.failures = 1;
+    _ = try svc.execute(a, .advance, "", "{}", "interrupted");
+    try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "memory-index/", null, 8)).rows.len);
+    svc.context.now_ms = 40000;
+    try IndexedRecallFixture.drain(svc, a, "resume");
+    const intents = try Store.scan(&store, a, "memory-index/", null, 8);
+    try std.testing.expectEqual(@as(usize, 2), intents.rows.len);
+    // An obsolete generation and its native definition can outlive the payload
+    // transaction. The durable intent alone is sufficient to retire it.
+    try store.values.put(a, "memory-index/retired-ann", "{\"kind\":\"semantic\",\"generation\":0}");
+    try store.values.put(a, "cleanup", "{\"cursor\":null}");
+    try IndexedRecallFixture.drain(svc, a, "cleanup");
+    try std.testing.expectEqual(@as(usize, 1), store.index_drops);
+    try std.testing.expectEqual(@as(usize, 2), (try Store.scan(&store, a, "memory-index/", null, 8)).rows.len);
 }

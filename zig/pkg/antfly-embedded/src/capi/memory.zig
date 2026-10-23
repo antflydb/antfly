@@ -314,6 +314,15 @@ test "capi native memory ANN projections use shared native indexes and routed ne
     const hybrid_remote = try remote.search_assertions.?(remote.ptr, alloc, hybrid_request);
     try std.testing.expect(hybrid_local.keys.len > 0 and hybrid_local.keys.len <= 2);
     try std.testing.expectEqualDeep(hybrid_local, hybrid_remote);
+    for ([_]@import("../memory/recall_filters.zig").Filters{ .{ .predicate = "fact", .environment = "production", .task = "deploy" }, .{ .predicate = "missing" } }) |filters| {
+        var filtered_request = hybrid_request;
+        filtered_request.filters = filters;
+        const local_filtered = try backend.search_assertions.?(backend.ptr, alloc, filtered_request);
+        const remote_filtered = try remote.search_assertions.?(remote.ptr, alloc, filtered_request);
+        try std.testing.expectEqualDeep(local_filtered, remote_filtered);
+        try std.testing.expectEqual(@as(usize, if (std.mem.eql(u8, filters.predicate.?, "fact")) 1 else 0), local_filtered.keys.len);
+    }
+
     try qualifyRecallScale(alloc, &native, service, projection);
     _ = try service.execute(alloc, .forget, "", "{\"assertion_ids\":[\"rare\"]}", "recall-forget");
     const forgotten = try std.json.parseFromSliceLeaky(memory.types.RecallResult, alloc, try service.execute(alloc, .recall, "", "{\"query\":\"pelagic\",\"token_budget\":8192}", ""), .{});
@@ -651,13 +660,14 @@ fn qualifyRecallScale(a: std.mem.Allocator, native: *engine.Native(h.db_mod.DB),
     for (0..count) |i| {
         const id = try std.fmt.allocPrint(a, "recall-scale-{d}", .{i});
         const digest = try Helpers.digest(a, id);
-        const record: memory.types.StoredAssertion = .{ .assertion = .{ .id = id, .subject = "graph", .predicate = "fact", .value = id, .statement = "unrelated copper hardware", .evidence = &.{.{ .id = "e" }} }, .owner = service.context.principal, .recorded_from = 1, .revision = 1, .config_generation = prototype.generation };
+        const record: memory.types.StoredAssertion = .{ .assertion = .{ .id = id, .subject = "graph", .predicate = if (i + 1 == count) "sparse-filter" else "fact", .value = id, .statement = "unrelated copper hardware", .evidence = &.{.{ .id = "e" }} }, .owner = service.context.principal, .recorded_from = 1, .revision = 1, .config_generation = prototype.generation };
         const path = try std.fmt.allocPrint(a, "assertion/{s}", .{digest});
         var projection = prototype;
         projection.assertion_id = id;
         projection.assertion_key = path;
         projection.statement_hash = try Helpers.digest(a, record.assertion.statement);
         projection.text = record.assertion.statement;
+        projection.filter_terms = try @import("../memory/recall_filters.zig").terms(a, record.assertion);
         projection.embedding = null;
         projection.vector_indexes = &.{};
         try changes.append(a, .{ .key = path, .json = try std.json.Stringify.valueAlloc(a, record, .{}) });
@@ -679,6 +689,13 @@ fn qualifyRecallScale(a: std.mem.Allocator, native: *engine.Native(h.db_mod.DB),
     try std.testing.expectEqual(@as(usize, 1), Helpers.searches);
     try std.testing.expectEqual(@as(usize, 0), Helpers.primary_scans);
     std.debug.print("memory recall scale: {d} assertions, {d} indexed searches, {d} hydrated candidates, {d} primary scans, {d} us\n", .{ count + 2, Helpers.searches, result.scanned, Helpers.primary_scans, elapsed / std.time.ns_per_us });
+    const filtered = try std.json.parseFromSliceLeaky(memory.types.RecallResult, a, try measured.execute(a, .recall, "", "{\"query\":\"copper\",\"predicate\":\"sparse-filter\",\"token_budget\":8192}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), filtered.items.len);
+    try std.testing.expectEqual(@as(usize, 1), filtered.scanned);
+    try std.testing.expectEqual(@as(usize, 0), Helpers.primary_scans);
+    const selected = memory.RecallSearchRequest{ .text_indexes = prototype.text_indexes[0..1], .query = "copper", .filters = .{ .predicate = "sparse-filter" } };
+    const filtered_keys = try backend.search_assertions.?(backend.ptr, a, selected);
+    try std.testing.expectEqual(@as(usize, 1), filtered_keys.keys.len);
 }
 
 test "capi native memory Codex semantic quality with a qualified managed embedder" {

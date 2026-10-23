@@ -31,7 +31,7 @@ pub fn attach(handle: *h.Handle, db: *h.db_mod.DB) void {
 
 /// Read-only candidate seam also used by ephemeral query resolution.
 pub fn candidateSource(handle: *h.Handle) callbacks.CandidateSource {
-    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .adjudicate = adjudicate, .adjudicate_batch = adjudicateBatch, .adjudicator_model_revision = adjudicatorModelRevision, .get_description = getDescription, .revisions = candidateRevisions, .embedding_cache_prepare = embeddingCachePrepare, .embedding_cache_flush = embeddingCacheFlush, .embedding_cache_get = embeddingCacheGet, .embedding_cache_put = embeddingCachePut, .load_vector = loadVector } };
+    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .embed_mentions = embedMentions, .adjudicate = adjudicate, .adjudicate_batch = adjudicateBatch, .adjudicator_model_revision = adjudicatorModelRevision, .get_description = getDescription, .revisions = candidateRevisions, .embedding_cache_prepare = embeddingCachePrepare, .embedding_cache_flush = embeddingCacheFlush, .embedding_cache_get = embeddingCacheGet, .embedding_cache_put = embeddingCachePut, .load_vector = loadVector } };
 }
 
 fn candidateRevisions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, index: []const u8, embedding: []const u8) anyerror!callbacks.CandidateSource.Revisions {
@@ -475,6 +475,18 @@ fn adjudicateBatch(ptr: *anyopaque, a: std.mem.Allocator, requests: []const @imp
     return @import("../functions/resolver_adjudication.zig").executeBatch(a, producer, .{ .io = io }, requests);
 }
 
+fn embedMentions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, embedding_name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+    const handle: *h.Handle = @ptrCast(@alignCast(ptr));
+    const database = try tables.get(handle, table);
+    if (database.resolution_embedder) |embedder| return embedder.embedDenseBatch(a, embedding_name, texts, dims);
+    if (database.enrichment_runtime) |runtime| if (runtime.config.dense_embedder) |embedder| return embedder.embedDenseBatch(a, embedding_name, texts, dims);
+    const config = try @import("db.zig").liteMergedIndexesForDatabaseJsonAlloc(handle.alloc, database);
+    defer handle.alloc.free(config);
+    var embedder = try h.managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(handle.alloc, config, .{ .antfly_provider = handle.liteAntflyProvider(), .io = database.backend_runtime.io(), .source_table = table });
+    defer embedder.deinit();
+    return embedder.denseInterface().embedDenseBatch(a, embedding_name, texts, dims);
+}
+
 fn embedMention(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32 {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     const database = try tables.get(handle, table);
@@ -642,7 +654,7 @@ fn candidateScan(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, prefix
 fn candidateNearest(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, query: callbacks.CandidateSource.NearestQuery, ctx: *anyopaque, consume: callbacks.CandidateSource.Consume) anyerror!void {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     const db = try tables.get(handle, name);
-    var result = try db.search(a, .{ .index_name = query.index_name, .query = .{ .dense_knn = .{ .vector = query.embedding, .k = @intCast(query.k) } }, .limit = @intCast(query.k), .include_stored = true, .include_all_fields = true });
+    var result = try db.search(a, .{ .index_name = query.index_name, .query = .{ .dense_knn = .{ .vector = query.embedding, .k = @intCast(query.k) } }, .limit = @intCast(query.k), .include_stored = true, .fields = query.fields, .include_all_fields = query.fields.len == 0 });
     defer result.deinit();
     if (query.vector_fields.len == 0) {
         for (result.hits) |hit| if (hit.stored_data) |json| try consume(ctx, hit.id, json);

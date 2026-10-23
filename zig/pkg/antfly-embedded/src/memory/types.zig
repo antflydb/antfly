@@ -84,6 +84,7 @@ pub const SemanticIndex = struct { version: u32 = 0, generation: u64 = 0, cursor
 /// Private assertion search projection; the immutable statement supports
 /// current and historical policy reads without indexing mutable verdict text.
 pub const RecallProjection = struct {
+    version: u16 = 1,
     assertion_id: []const u8,
     assertion_key: []const u8,
     generation: u64,
@@ -91,11 +92,12 @@ pub const RecallProjection = struct {
     owner: []const u8,
     visibility: Visibility,
     text: []const u8,
+    filter_terms: []const u8 = "",
     text_indexes: []const []const u8,
     vector_indexes: []const []const u8 = &.{},
     embedding: ?[]const f32 = null,
 };
-pub const RecallIndex = struct { version: u32 = 1, generation: u64 = 0, cursor: ?[]const u8 = null, backfill_complete: bool = false, complete: bool = false, next_retry_at: i64 = 0, yield_to_semantic: bool = false };
+pub const RecallIndex = struct { version: u32 = 2, generation: u64 = 0, cursor: ?[]const u8 = null, backfill_complete: bool = false, complete: bool = false, next_retry_at: i64 = 0, yield_to_semantic: bool = false };
 pub const Config = struct {
     version: u32 = schema_version,
     generation: u64 = 1,

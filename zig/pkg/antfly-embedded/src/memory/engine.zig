@@ -46,7 +46,7 @@ fn encodeChange(a: A, path: []const u8, json: []const u8) ![]const u8 {
             try output.writer.writeByte(',');
             try std.json.Stringify.value(name, .{}, &output.writer);
             try output.writer.writeByte(':');
-            try std.json.Stringify.value(projection.text, .{}, &output.writer);
+            try std.json.Stringify.value(try std.fmt.allocPrint(a, "{s}\n{s}", .{ projection.text, projection.filter_terms }), .{}, &output.writer);
         }
         if (projection.embedding) |vector| {
             try output.writer.writeAll(",\"_embeddings\":{");
@@ -82,7 +82,7 @@ fn neighborRequest(input: service.NeighborRequest) !db_types.SearchRequest {
 }
 
 fn assertionSearchRequest(a: A, input: service.RecallSearchRequest) !db_types.SearchRequest {
-    if (input.limit == 0 or input.limit > 128 or input.offset >= 4096 or input.text_indexes.len > 2 or input.vector_indexes.len > 2) return error.InvalidMemoryRequest;
+    if (input.limit == 0 or input.limit > 4096 or input.offset + input.limit > 4096 or input.text_indexes.len > 2 or input.vector_indexes.len > 2) return error.InvalidMemoryRequest;
     var text: std.ArrayList(db_types.NamedFullTextQuery) = .empty;
     var dense: std.ArrayList(db_types.NamedDenseQuery) = .empty;
     for (input.text_indexes) |name| {
@@ -94,7 +94,31 @@ fn assertionSearchRequest(a: A, input: service.RecallSearchRequest) !db_types.Se
         try dense.append(a, .{ .name = name, .index_name = name, .query = .{ .vector = vector, .k = input.offset + input.limit } });
     };
     if (text.items.len + dense.items.len == 0) return error.InvalidMemoryRequest;
-    return .{ .full_text_queries = text.items, .dense_queries = dense.items, .merge_config = .{ .window_size = input.offset + input.limit }, .offset = input.offset, .limit = input.limit, .include_stored = false };
+    const filter = if (input.filters.empty()) "" else try @import("recall_filters.zig").query(a, input.text_indexes[0], input.filters);
+    return .{ .full_text_queries = text.items, .dense_queries = dense.items, .primary_text_index_name = if (filter.len > 0) input.text_indexes[0] else null, .filter_query_json = filter, .merge_config = .{ .window_size = input.offset + input.limit }, .limit = input.offset + input.limit, .include_stored = false };
+}
+
+fn searchLanes(input: service.RecallSearchRequest) usize {
+    return if (input.filters.empty()) 1 else input.text_indexes.len;
+}
+fn laneRequest(input: service.RecallSearchRequest, lane: usize) service.RecallSearchRequest {
+    if (input.filters.empty()) return input;
+    var result = input;
+    result.text_indexes = input.text_indexes[lane..][0..1];
+    result.vector_indexes = if (input.embedding != null) input.vector_indexes[lane..][0..1] else &.{};
+    return result;
+}
+fn searchPage(a: A, input: service.RecallSearchRequest, hits: []service.Neighbor, truncated: bool) !service.RecallSearchPage {
+    std.mem.sort(service.Neighbor, hits, {}, struct {
+        fn less(_: void, l: service.Neighbor, r: service.Neighbor) bool {
+            return if (l.similarity == r.similarity) std.mem.lessThan(u8, l.key, r.key) else l.similarity > r.similarity;
+        }
+    }.less);
+    const start = @min(input.offset, hits.len);
+    const end = @min(start + input.limit, hits.len);
+    const keys = try a.alloc([]const u8, end - start);
+    for (hits[start..end], keys) |hit, *key| key.* = hit.key;
+    return .{ .keys = keys, .more = truncated or end < hits.len };
 }
 
 pub const Routed = struct {
@@ -107,7 +131,15 @@ pub const Routed = struct {
     request: @import("../api/operation.zig").RequestContext = .{},
 
     pub fn backend(self: *Routed) service.Backend {
-        return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+        return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .drop_index = dropIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+    }
+    fn dropIndex(ptr: *anyopaque, a: A, name: []const u8) !void {
+        const self: *Routed = @ptrCast(@alignCast(ptr));
+        try self.context.requireGrant(.admin);
+        self.writes.dropIndex(a, self.table, name) catch |err| switch (err) {
+            error.IndexNotFound => return,
+            else => return err,
+        } orelse return error.MemoryCapabilityUnavailable;
     }
     fn ensureTextIndex(ptr: *anyopaque, a: A, name: []const u8) !void {
         const self: *Routed = @ptrCast(@alignCast(ptr));
@@ -120,18 +152,22 @@ pub const Routed = struct {
     fn searchAssertions(ptr: *anyopaque, a: A, input: service.RecallSearchRequest) !service.RecallSearchPage {
         const self: *Routed = @ptrCast(@alignCast(ptr));
         try self.context.check();
-        var request = try assertionSearchRequest(a, input);
-        request.execution_deadline_ns = self.request.deadline_ns;
-        request.cancellation = self.request.cancellation;
-        var response = (try self.reads.query(a, self.table, request, .read_index)) orelse return error.MemorySpaceNotFound;
-        defer response.deinit(a);
-        const Wire = struct { responses: []const struct { hits: struct { hits: []const struct { _id: []const u8 } } } };
-        const value = try std.json.parseFromSliceLeaky(Wire, a, response.json, .{ .ignore_unknown_fields = true });
-        if (value.responses.len != 1 or value.responses[0].hits.hits.len > input.limit) return error.MemoryCorruptState;
-        const hits = value.responses[0].hits.hits;
-        const keys = try a.alloc([]const u8, hits.len);
-        for (hits, keys) |hit, *key| key.* = try a.dupe(u8, hit._id);
-        return .{ .keys = keys, .more = hits.len == input.limit };
+        var hits: std.ArrayList(service.Neighbor) = .empty;
+        var truncated = false;
+        for (0..searchLanes(input)) |lane| {
+            var request = try assertionSearchRequest(a, laneRequest(input, lane));
+            request.execution_deadline_ns = self.request.deadline_ns;
+            request.cancellation = self.request.cancellation;
+            var response = (try self.reads.query(a, self.table, request, .read_index)) orelse return error.MemorySpaceNotFound;
+            defer response.deinit(a);
+            const Wire = struct { responses: []const struct { hits: struct { hits: []const struct { _id: []const u8, _score: f64 } } } };
+            const value = try std.json.parseFromSliceLeaky(Wire, a, response.json, .{ .ignore_unknown_fields = true });
+            if (value.responses.len != 1 or value.responses[0].hits.hits.len > request.limit) return error.MemoryCorruptState;
+            const rows = value.responses[0].hits.hits;
+            truncated = truncated or rows.len == request.limit;
+            for (rows) |row| try hits.append(a, .{ .key = try a.dupe(u8, row._id), .similarity = row._score });
+        }
+        return searchPage(a, input, hits.items, truncated);
     }
     fn ensureVectorIndex(ptr: *anyopaque, a: A, name: []const u8, dims: u32) !void {
         const self: *Routed = @ptrCast(@alignCast(ptr));
@@ -223,7 +259,12 @@ pub fn Native(comptime DB: type) type {
         resource_fn: ?*const fn (*anyopaque, A, service.types.provenance.Resource) anyerror!service.types.provenance.Snapshot = null,
         const Self = @This();
         pub fn backend(self: *Self) service.Backend {
-            return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+            return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .drop_index = dropIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+        }
+        fn dropIndex(ptr: *anyopaque, _: A, name: []const u8) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try self.context.requireGrant(.admin);
+            _ = try self.db.deleteIndex(name);
         }
         fn ensureTextIndex(ptr: *anyopaque, a: A, name: []const u8) !void {
             const self: *Self = @ptrCast(@alignCast(ptr));
@@ -236,12 +277,17 @@ pub fn Native(comptime DB: type) type {
         fn searchAssertions(ptr: *anyopaque, a: A, input: service.RecallSearchRequest) !service.RecallSearchPage {
             const self: *Self = @ptrCast(@alignCast(ptr));
             try self.context.check();
-            var response = try self.db.search(a, try assertionSearchRequest(a, input));
-            defer response.deinit();
-            if (response.hits.len > input.limit) return error.MemoryCorruptState;
-            const keys = try a.alloc([]const u8, response.hits.len);
-            for (response.hits, keys) |hit, *key| key.* = try a.dupe(u8, hit.id);
-            return .{ .keys = keys, .more = response.hits.len == input.limit };
+            var hits: std.ArrayList(service.Neighbor) = .empty;
+            var truncated = false;
+            for (0..searchLanes(input)) |lane| {
+                const request = try assertionSearchRequest(a, laneRequest(input, lane));
+                var response = try self.db.search(a, request);
+                defer response.deinit();
+                if (response.hits.len > request.limit) return error.MemoryCorruptState;
+                truncated = truncated or response.hits.len == request.limit;
+                for (response.hits) |hit| try hits.append(a, .{ .key = try a.dupe(u8, hit.id), .similarity = hit.score orelse return error.MemoryCorruptState });
+            }
+            return searchPage(a, input, hits.items, truncated);
         }
         fn ensureVectorIndex(ptr: *anyopaque, a: A, name: []const u8, dims: u32) !void {
             const self: *Self = @ptrCast(@alignCast(ptr));

@@ -17,4 +17,6 @@
 test {
     _ = @import("memory/service_test.zig");
     _ = @import("memory/schema.zig");
+    _ = @import("memory/recall_windows.zig");
+    _ = @import("memory/recall_filters.zig");
 }

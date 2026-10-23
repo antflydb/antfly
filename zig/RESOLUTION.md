@@ -1918,3 +1918,47 @@ The HTTP convenience clients expose Go `ProposeCuration` / scoped variants,
 TypeScript `curationProposals` / `namespaceCurationProposals`, and Python
 `curation_proposals` with `in_namespace`. Entity suppression uses the typed
 `EntitySuppressRequest` in each SDK, including its absorbed-key disposition.
+
+
+### Bounded resolver candidate work and policy reuse
+
+Within one resolution work unit, missing mention texts are deduplicated and sent
+through the configured Antfly embedding provider in batches of at most 64.
+Embedding identity, role, dimensions and existing source/publication fences stay
+unchanged. Providers without a batch callback retain their scalar adapter.
+
+ANN discovery deduplicates identical vectors and uses the shared native
+`nearest_many` callback in batches of at most 64 queries. Routed adapters execute
+at most eight neighbor queries concurrently; embedded adapters use their native
+owner lease. This is bounded fanout over Antfly's existing indexes. It does not
+introduce another vector store or pretend that one RPC replaces all neighbor
+queries. Distinct redirect targets are bulk-read once per table and work unit,
+including missing targets. Repeated mentions share immutable decoded candidates.
+ANN requests hydrate scorer inputs and canonical/type/redirect metadata instead
+of full documents. Routed hit decoding borrows the `_source` JSON slice rather
+than building and serializing a source DOM.
+
+Resolver execution caches immutable compiled suppression, distinct-pair and
+redirect indexes by the exact alias and policy content. The process cache holds
+at most 32 entries and 32 MiB. Each executing resolver holds a reference-counted
+lease, so eviction cannot free an active reader's policy. Content changes,
+including removal of a correction, select a different compiled policy. Grants,
+authorized documents, and decision results are not cached.
+
+Entity and terminal proposal progress observations group consumers by source
+table. Every polling round shares one source catalog cut, one local status sample,
+and at most one owner probe per group across its resolvers. Each resolver still
+checks its own namespace revision, configuration generation, journal floor and
+promotion requirements. An overall wait budget covers all source tables.
+
+The remaining curation write scalability limit is the destination table's full
+`indexes_json` compare-and-swap. Compiled policy reuse does not remove that write
+cost. Replacing it requires a versioned shared native record authority for
+namespace heads, redirects and incoming redirects, suppression/cascade records,
+distinct-pair endpoints, and proposals indexed by entity, state and action.
+Mutations must publish a bounded component delta under the namespace revision,
+with the same final grants and dependency fences. Native metadata Raft apply,
+standalone persistence, backup/restore and consumer replay must adopt that
+contract together; a process cache or uncoordinated auxiliary table is not an
+authoritative replacement. This record-authority migration is not implemented
+by the candidate batching and observation changes above.

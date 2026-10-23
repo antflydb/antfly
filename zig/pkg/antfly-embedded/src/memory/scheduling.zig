@@ -57,7 +57,7 @@ pub fn recallDue(backend: m.Backend, a: A, now: i64, state: m.types.State) !bool
         const row = try backend.get(backend.ptr, a, "assertion-recall-index");
         if (row == null) return true;
         const index = try std.json.parseFromSliceLeaky(m.types.RecallIndex, a, row.?.json, .{});
-        if (index.generation != state.config.generation or !index.backfill_complete or (try backend.scan(backend.ptr, a, "assertion-recall-work/", null, 1)).rows.len != 0 or (!index.complete and index.next_retry_at <= now)) return true;
+        if (index.version != 2 or index.generation != state.config.generation or !index.backfill_complete or (try backend.scan(backend.ptr, a, "assertion-recall-work/", null, 1)).rows.len != 0 or (!index.complete and index.next_retry_at <= now)) return true;
     }
     return false;
 }
