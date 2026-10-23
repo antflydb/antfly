@@ -108,7 +108,8 @@ const builtin = @import("builtin");
 // Storage durability grants retain reusable worker, descriptor and buffer ownership.
 // Durability grants include bounded atomic control replacement and directory creation.
 // DB close retains bounded mutable-snapshot fencing and accounting preflight.
-pub const abi_version: u32 = 104;
+// Final status owns prepaid capture, packed input and canonical WAL preparation.
+pub const abi_version: u32 = 105;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

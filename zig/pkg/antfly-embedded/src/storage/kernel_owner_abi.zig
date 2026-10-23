@@ -50,7 +50,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Storage durability grants retain reusable worker, descriptor and buffer ownership.
 // Durability grants include bounded atomic control replacement and directory creation.
 // DB close retains bounded mutable-snapshot fencing and accounting preflight.
-pub const abi_version: u32 = 164;
+// Final status owns prepaid capture, packed input and canonical WAL preparation.
+pub const abi_version: u32 = 165;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

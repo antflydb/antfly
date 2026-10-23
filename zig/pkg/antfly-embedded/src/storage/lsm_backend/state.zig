@@ -201,22 +201,36 @@ const SharedEntry = struct {
     }
 };
 
-fn initSharedEntry(allocator: Allocator, namespace: backend_types.Namespace, key: []const u8, value: []const u8, tombstone: bool) !OwnedEntry {
-    const namespace_len = if (namespace.name) |name| name.len else 0;
-    const allocation = try allocator.alignedAlloc(u8, .of(SharedEntry), @sizeOf(SharedEntry) + namespace_len + key.len + value.len);
+pub fn sharedEntryAllocationBytes(namespace_len: ?usize, key_len: usize, value_len: usize) !usize {
+    var size = std.math.add(usize, @sizeOf(SharedEntry), namespace_len orelse 0) catch return error.ResourceBudgetExceeded;
+    size = std.math.add(usize, size, key_len) catch return error.ResourceBudgetExceeded;
+    return std.math.add(usize, size, value_len) catch return error.ResourceBudgetExceeded;
+}
+
+/// Allocate one owned packed entry without copying unbounded input. The caller
+/// initializes every exposed byte before publishing or retaining this entry;
+/// last release remains safe when preparation is interrupted midway.
+pub fn allocateSharedEntry(allocator: Allocator, namespace_len: ?usize, key_len: usize, value_len: usize, tombstone: bool) !OwnedEntry {
+    const ns_len = namespace_len orelse 0;
+    const allocation = try allocator.alignedAlloc(u8, .of(SharedEntry), try sharedEntryAllocationBytes(namespace_len, key_len, value_len));
     const owner: *SharedEntry = @ptrCast(allocation.ptr);
     owner.* = .{ .allocator = allocator, .allocation_len = allocation.len };
     const bytes = allocation[@sizeOf(SharedEntry)..];
-    if (namespace.name) |name| @memcpy(bytes[0..namespace_len], name);
-    @memcpy(bytes[namespace_len..][0..key.len], key);
-    @memcpy(bytes[namespace_len + key.len ..], value);
     return .{
         .shared = owner,
-        .namespace_name = if (namespace.name != null) bytes[0..namespace_len] else null,
-        .key = bytes[namespace_len..][0..key.len],
-        .value = bytes[namespace_len + key.len ..],
+        .namespace_name = if (namespace_len != null) bytes[0..ns_len] else null,
+        .key = bytes[ns_len..][0..key_len],
+        .value = bytes[ns_len + key_len ..],
         .tombstone = tombstone,
     };
+}
+
+fn initSharedEntry(allocator: Allocator, namespace: backend_types.Namespace, key: []const u8, value: []const u8, tombstone: bool) !OwnedEntry {
+    const entry = try allocateSharedEntry(allocator, if (namespace.name) |name| name.len else null, key.len, value.len, tombstone);
+    if (namespace.name) |name| @memcpy(entry.namespace_name.?, name);
+    @memcpy(entry.key, key);
+    @memcpy(entry.value, value);
+    return entry;
 }
 
 pub const State = struct {

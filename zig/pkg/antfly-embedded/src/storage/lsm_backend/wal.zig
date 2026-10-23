@@ -2989,6 +2989,29 @@ test "controlled physical sync WAL coordinator rejects corrupt metadata and neve
     }
 }
 
+/// Checked allocation planning shared by capture and canonical encoding. A
+/// rejected addition leaves the entire plan unchanged, including row count.
+pub const StateRecordSize = struct {
+    count: u32 = 0,
+    payload: u32 = 4,
+
+    pub fn add(self: *@This(), namespace_len: usize, key_len: usize, value_len: usize) !void {
+        const count = std.math.add(u32, self.count, 1) catch return error.ResourceBudgetExceeded;
+        var size = std.math.add(u32, self.payload, entry_header_len) catch return error.ResourceBudgetExceeded;
+        for ([_]usize{ namespace_len, key_len, value_len }) |len| {
+            if (len > std.math.maxInt(u32)) return error.ResourceBudgetExceeded;
+            size = std.math.add(u32, size, @intCast(len)) catch return error.ResourceBudgetExceeded;
+        }
+        _ = std.math.add(usize, size, record_header_len) catch return error.ResourceBudgetExceeded;
+        self.count = count;
+        self.payload = size;
+    }
+
+    pub fn total(self: @This()) usize {
+        return if (self.count == 0) 0 else @as(usize, self.payload) + record_header_len;
+    }
+};
+
 /// Canonical state-record preparation on admitted CPU, before publication and
 /// physical dispatch. The stable source outlives this synchronous call only.
 pub fn prepareStateRecordWithAdmission(allocator: Allocator, state: anytype, original: @import("../../common/read_admission.zig").Port) ![]u8 {
@@ -2996,19 +3019,15 @@ pub fn prepareStateRecordWithAdmission(allocator: Allocator, state: anytype, ori
     const count = state.entryCount();
     if (count == 0) return allocator.alloc(u8, 0);
     if (count > std.math.maxInt(u32)) return error.ResourceBudgetExceeded;
-    var size: usize = 4;
+    var plan: StateRecordSize = .{};
     for (0..count) |index| {
         try original.checkpoint();
         const entry = state.entryAt(index);
         const ns = entry.namespace_name orelse "";
-        size = std.math.add(usize, size, entry_header_len) catch return error.ResourceBudgetExceeded;
-        for ([_]usize{ ns.len, entry.key.len, entry.value.len }) |len| {
-            if (len > std.math.maxInt(u32)) return error.ResourceBudgetExceeded;
-            size = std.math.add(usize, size, len) catch return error.ResourceBudgetExceeded;
-        }
-        if (size > std.math.maxInt(u32)) return error.ResourceBudgetExceeded;
+        try plan.add(ns.len, entry.key.len, entry.value.len);
     }
-    const total = std.math.add(usize, size, record_header_len) catch return error.ResourceBudgetExceeded;
+    const size = plan.payload;
+    const total = plan.total();
     const record = try allocator.alloc(u8, total);
     errdefer allocator.free(record);
     const payload = record[record_header_len..];
@@ -3359,6 +3378,24 @@ const AppendTestPublication = struct {
         self.releases.* += 1;
     }
 };
+
+test "controlled physical sync WAL record planning rejects overflow without advancing its cursor" {
+    var plan: StateRecordSize = .{};
+    try std.testing.expectEqual(@as(usize, 0), plan.total());
+    try std.testing.expectError(error.ResourceBudgetExceeded, plan.add(std.math.maxInt(usize), 0, 0));
+    try std.testing.expectEqual(@as(u32, 0), plan.count);
+    try std.testing.expectEqual(@as(u32, 4), plan.payload);
+    try plan.add(0, 3, 72);
+    try std.testing.expectEqual(@as(usize, record_header_len + 4 + entry_header_len + 3 + 72), plan.total());
+    const before = plan;
+    try std.testing.expectError(error.ResourceBudgetExceeded, plan.add(0, std.math.maxInt(usize), 1));
+    try std.testing.expectEqual(before, plan);
+    plan.count = std.math.maxInt(u32);
+    const full = plan;
+    try std.testing.expectError(error.ResourceBudgetExceeded, plan.add(0, 1, 1));
+    try std.testing.expectEqual(full, plan);
+    try std.testing.expectError(error.ResourceBudgetExceeded, @import("state.zig").sharedEntryAllocationBytes(null, std.math.maxInt(usize), 1));
+}
 
 test "controlled physical sync WAL record preparation preserves canonical bytes and bounds copy checksum work" {
     const a = std.testing.allocator;

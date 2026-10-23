@@ -24905,3 +24905,34 @@ The queued snapshot still needs admitted physical retirement alongside final
 backend flush/retirement. Lite/object provider adoption and the complete default
 pooling gate remain open; the full goal stays active and full GNU qualification
 remains waived.
+
+
+### Prepaid final status capture and owned WAL preparation
+
+Controlled LSM close plans frozen catalog names before allocating status rows.
+A retained manager reservation covers packed shared entries, fixed row chunks,
+the append-only input descriptors and credit metadata. Capture resumes across
+original-control rejection and allocation refusal. Input preparation retains the
+same entries; canonical WAL encoding has a separate prepaid reservation and
+checked record sizing. Empty captures require no retained credit.
+
+Retained credits use manager-owned payload retirement metadata, freeing scarce
+construction slots immediately. Large payloads are freed before publishing
+constant-size retirement metadata; ledger contention retains the charge until
+manager cleanup completes. Eighty simultaneous programs with both capture and
+WAL credit leave construction capacity available.
+
+Native ABI 105 and storage-owner ABI 165 fence these changes. Receipt
+`close-status-owned-preparation-v2` passed 76/76 build steps, 35 physical/WAL
+cases, 32 storage-read cases, 28 embedded close cases, host/archive boundary
+checks and 45/1/8 identity cases. All 5,541 source inputs remained unchanged.
+Tests cover each original rejection checkpoint, allocation failures, capacity
+refusal, canonical WAL bytes, long names and contended credit retirement.
+
+Only prepaid capture is integrated into default close. Owned input and encoded
+WAL preparation are foundations for the final commit continuation; frozen append
+credit, manifest admission, owning WAL publication and admitted final retirement
+remain unfinished. The existing resource-manager payload-retirement scan also
+needs an audit of cooperative checkpoints under its registry guard before broad
+scheduler adoption. Lite/object adoption and the full default pooling gate remain
+open. Full GNU qualification remains waived; the full design is incomplete.

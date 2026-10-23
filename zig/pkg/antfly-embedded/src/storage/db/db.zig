@@ -37483,6 +37483,23 @@ pub const DB = struct {
         try program.acquire(io, original);
         defer program.release();
         if (program.complete) return;
+        planning: while (!program.planning_complete and program.plan_group < 4) {
+            try original.checkpoint();
+            inline for (.{ "text_indexes", "dense_indexes", "sparse_indexes", "graph_indexes" }, 0..) |field, group| {
+                if (program.plan_group == group) {
+                    const items = @field(manager, field).items;
+                    if (program.plan_index == items.len) {
+                        program.plan_group += 1;
+                        program.plan_index = 0;
+                        continue :planning;
+                    }
+                    try program.planName(items[program.plan_index].config.name);
+                    program.plan_index += 1;
+                    continue :planning;
+                }
+            }
+        }
+        try program.reserveCaptureWithAdmission(manager.resource_manager, original);
         // Serving, producer and catalog mutation admission is already fenced.
         // Borrow one stable name/entry at a time, never a cloned config array.
         capture: while (program.group < 4) {
